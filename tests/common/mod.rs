@@ -185,8 +185,17 @@ impl Term {
 
     /// Closes the terminal under the client (like closing the terminal window).
     pub fn hangup(&mut self) {
-        *self.writer.lock().unwrap() = Box::new(std::io::sink());
-        self.master = None;
+        // Unix: what the kernel does when a terminal closes. (Dropping portable-pty's
+        // writer there would type ^D into the terminal first.)
+        #[cfg(unix)]
+        if let Some(pid) = self.child.process_id() {
+            let _ = std::process::Command::new("kill").args(["-HUP", &pid.to_string()]).status();
+        }
+        #[cfg(windows)]
+        {
+            *self.writer.lock().unwrap() = Box::new(std::io::sink());
+            self.master = None;
+        }
     }
 
     pub fn raw_text(&self) -> String {

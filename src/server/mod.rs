@@ -435,6 +435,8 @@ pub struct Server {
 }
 
 pub fn run(config: Option<String>) -> io::Result<()> {
+    // stderr is /dev/null for the detached server: keep panics in the log
+    std::panic::set_hook(Box::new(|info| log(&format!("panic: {info}"))));
     let Some(listener) = ipc::listen_exclusive()? else {
         return Ok(()); // another server already owns the endpoint
     };
@@ -907,6 +909,7 @@ impl Server {
     }
 
     fn pane_exited(&mut self, id: PaneId, status: Option<i32>) {
+        log(&format!("pane %{id} exited with {status:?}"));
         // popup?
         let popup_owner = self.clients.values().find(|c| matches!(&c.overlay, Some(Overlay::Popup(p)) if p.pane == id)).map(|c| c.id);
         if let Some(cid) = popup_owner {
