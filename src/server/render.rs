@@ -166,7 +166,7 @@ const BORDER_SETS: [(&str, [&str; 11]); 4] = [
 
 impl Server {
     pub fn render_all(&mut self) {
-        let ids: Vec<ClientId> = self.clients.iter().filter(|(_, c)| c.dirty && c.attached && !c.suspended && c.session.is_some()).map(|(id, _)| *id).collect();
+        let ids: Vec<ClientId> = self.clients.iter().filter(|(_, c)| c.dirty && c.attached && !c.suspended && c.control == 0 && c.session.is_some()).map(|(id, _)| *id).collect();
         for id in ids {
             self.render(id);
         }

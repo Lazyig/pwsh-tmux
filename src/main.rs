@@ -43,7 +43,7 @@ fn main() {
         };
         std::process::exit(code);
     }
-    let mut g = client::Global { config: None, no_start: false };
+    let mut g = client::Global { config: None, no_start: false, control: 0 };
     let mut shell_cmd = None;
     // global flags before the command
     while let Some(a) = args.first().cloned() {
@@ -75,7 +75,8 @@ fn main() {
                     print!("{USAGE}");
                     return;
                 }
-                '2' | 'C' | 'D' | 'l' | 'u' | 'v' => {}
+                'C' => g.control = (g.control + 1).min(2),
+                '2' | 'D' | 'l' | 'u' | 'v' => {}
                 '-' => {
                     if a == "--help" {
                         print!("{USAGE}");

@@ -80,6 +80,34 @@ impl Server {
 }
 
 impl Vars for VarCtx<'_> {
+    /// Like tmux: run the command in the background, show its last output line until the
+    /// next run, and re-run at most every status-interval seconds.
+    fn shell(&self, command: &str) -> Option<String> {
+        let srv = self.srv;
+        let interval = Duration::from_secs(srv.opt_session_num(self.t.sid, "status-interval").max(1) as u64);
+        let mut cache = srv.shell_cache.borrow_mut();
+        let stale = cache.get(command).is_none_or(|e| !e.2 && e.1.elapsed() >= interval);
+        if stale {
+            let prev = cache.get(command).map(|e| e.0.clone()).unwrap_or_default();
+            cache.insert(command.to_string(), (prev, Instant::now(), true));
+            let tx = srv.tx.clone();
+            let cmd = command.to_string();
+            let cwd = self.t.pane.and_then(|p| srv.panes.get(&p)).map(|p| p.current_path.clone());
+            thread::spawn(move || {
+                let mut c = procinfo::job_command(&cmd);
+                c.stdin(std::process::Stdio::null());
+                if let Some(d) = cwd.filter(|d| std::path::Path::new(d).is_dir()) {
+                    c.current_dir(d);
+                }
+                let out = c.output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+                // tmux shows the last line of output
+                let line = out.trim_end().lines().last().unwrap_or("").to_string();
+                let _ = tx.send(Event::FormatShell(cmd, line));
+            });
+        }
+        cache.get(command).map(|e| e.0.clone())
+    }
+
     fn get(&self, name: &str) -> Option<String> {
         if let Some(v) = self.extra.get(name) {
             return Some(v.clone());
@@ -128,7 +156,19 @@ impl Vars for VarCtx<'_> {
                     .collect::<Vec<_>>()
                     .join(", ")
             }),
-            "session_group" | "session_grouped" | "session_group_size" => Some(String::new()),
+            "session_grouped" => sess.map(|s| b(s.group.is_some())),
+            "session_group" | "session_group_size" | "session_group_list" | "session_group_attached" => {
+                let s = sess?;
+                let Some(g) = s.group else { return Some(if name == "session_group_size" || name == "session_group_attached" { "0".into() } else { String::new() }) };
+                let members: Vec<&Session> = srv.sessions.values().filter(|x| x.group == Some(g)).collect();
+                Some(match name {
+                    // tmux names a group after its first session
+                    "session_group" => members.iter().min_by_key(|x| x.created).map(|x| x.name.clone()).unwrap_or_default(),
+                    "session_group_size" => members.len().to_string(),
+                    "session_group_attached" => members.iter().map(|x| srv.clients.values().filter(|c| c.attached && c.session == Some(x.id)).count()).sum::<usize>().to_string(),
+                    _ => members.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(","),
+                })
+            }
             "session_format" => Some(b(sess.is_some())),
             "session_width" => sess.map(|s| s.cols.to_string()),
             "session_height" => sess.map(|s| s.rows.to_string()),

@@ -69,10 +69,22 @@ tmux config, put `source-file ~/.tmux.conf` in it.
   `#{pane_current_command}` / automatic-rename from the shell's descendant processes.
   On Unix they come from `/proc` and the pty's foreground process group.
 
+## Also supported
+
+- **Control mode** (`-C`, `-CC`): `%begin/%end/%error` replies, `%output`, and
+  `%session-changed`, `%sessions-changed`, `%session-renamed`, `%session-window-changed`,
+  `%window-add/close/renamed`, `%window-pane-changed`, `%layout-change`,
+  `%pane-mode-changed`, `%exit`; `refresh-client -C WxH` sizes the session.
+- **Session groups** (`new-session -t`): shared window list, per-session current window,
+  `#{session_group*}` variables.
+- **`#(command)` in formats**: run in the background, last output line cached and refreshed
+  every `status-interval`.
+
 ## Not supported (yet)
 
-- Control mode (`-C`), session groups (`new-session -t`), `#(shell)` in formats,
-  `server-access`, terminal features (`-T`) negotiation, extended keys output.
+- `server-access`, terminal features (`-T`) negotiation, extended keys output, control-mode
+  flow control (`%pause`/`%continue`) and subscriptions.
+- Window sizes are capped at 1000x1000 (the terminal emulator allocates every cell).
 - On Windows `suspend-client` does nothing and `lock-*` needs `lock-command`.
 
 ## Tests

@@ -369,3 +369,96 @@ fn review_regressions() {
     assert_eq!(ctx.fmt("r", "#{window_width}x#{window_height}"), "1000x1000");
     ctx.ok(&["resize-window", "-A", "-t", "r"]);
 }
+
+#[test]
+fn format_shell_commands() {
+    let ctx = Ctx::new("fshell");
+    ctx.ok(&["new-session", "-d", "-s", "f"]);
+    ctx.ok(&["set", "-g", "status-interval", "1"]);
+    // runs in the background; later expansions show the cached last line
+    wait_for("#() output", || ctx.fmt("f", "[#(echo shell-out)]") == "[shell-out]");
+    // formats inside the command are expanded first
+    wait_for("#() with format", || ctx.fmt("f", "#(echo #{session_name}-x)") == "f-x");
+}
+
+#[test]
+fn session_groups() {
+    let ctx = Ctx::new("groups");
+    ctx.ok(&["new-session", "-d", "-s", "g1", "-n", "one"]);
+    ctx.ok(&["new-window", "-t", "g1", "-n", "two"]);
+    ctx.ok(&["new-session", "-d", "-t", "g1", "-s", "g2"]);
+    let names = |s: &str| ctx.ok(&["lsw", "-t", s, "-F", "#W"]).lines().map(String::from).collect::<Vec<_>>();
+    assert_eq!(names("g2"), vec!["one", "two"]);
+    assert_eq!(ctx.fmt("g2", "#{session_grouped} #{session_group} #{session_group_size} #{session_group_list}"), "1 g1 2 g1,g2");
+    // the current window is per session
+    ctx.ok(&["select-window", "-t", "g2:0"]);
+    assert_eq!(ctx.fmt("g1", "#W"), "two");
+    assert_eq!(ctx.fmt("g2", "#W"), "one");
+    // window list changes propagate both ways
+    ctx.ok(&["new-window", "-t", "g2", "-n", "three"]);
+    assert_eq!(names("g1"), vec!["one", "two", "three"]);
+    ctx.ok(&["kill-window", "-t", "g1:three"]);
+    assert_eq!(names("g2"), vec!["one", "two"]);
+    ctx.ok(&["rename-window", "-t", "g1:one", "uno"]);
+    assert_eq!(names("g2"), vec!["uno", "two"]);
+    // killing one member keeps the windows for the other
+    ctx.ok(&["kill-session", "-t", "g1"]);
+    assert_eq!(names("g2"), vec!["uno", "two"]);
+    assert_eq!(ctx.fmt("g2", "#{session_grouped}"), "0");
+}
+
+#[test]
+fn control_mode() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::{Arc, Mutex};
+    let ctx = Ctx::new("control");
+    ctx.ok(&["new-session", "-d", "-s", "c"]);
+    ctx.wait_prompt("c");
+    let mut child = ctx
+        .command()
+        .args(["-C", "attach", "-t", "c"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = Arc::new(Mutex::new(String::new()));
+    {
+        let out = out.clone();
+        let stdout = child.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                out.lock().unwrap().push_str(&(line + "\n"));
+            }
+        });
+    }
+    let mut stdin = child.stdin.take().unwrap();
+    let mut send = |l: &str| {
+        stdin.write_all(format!("{l}\n").as_bytes()).unwrap();
+        stdin.flush().unwrap();
+    };
+    let text = || out.lock().unwrap().clone();
+    wait_for("attach reply", || text().contains("%end ") && text().contains("%session-changed $"));
+    send("display-message -p 'hello #{session_name}'");
+    wait_for("command block", || text().contains("hello c\n%end"));
+    send("send-keys 'echo ctl-out-42' Enter");
+    wait_for("%output", || text().lines().any(|l| l.starts_with("%output %") && l.contains("ctl-out-42")));
+    send("new-window -n extra");
+    wait_for("%window-add", || text().contains("%window-add @"));
+    wait_for("%session-window-changed", || text().contains("%session-window-changed $"));
+    send("rename-window renamed-win");
+    wait_for("%window-renamed", || text().contains("renamed-win\n") && text().contains("%window-renamed @"));
+    send("split-window");
+    wait_for("%layout-change", || text().contains("%layout-change @"));
+    send("kill-window");
+    wait_for("%window-close", || text().contains("%window-close @"));
+    send("no-such-command");
+    wait_for("%error", || text().contains("%error "));
+    send("refresh-client -C 120x40");
+    wait_for("control size", || ctx.fmt("c", "#{window_width}x#{window_height}") == "120x39");
+    // an empty line detaches
+    send("");
+    wait_for("%exit", || text().contains("%exit"));
+    wait_for("client exit", || child.try_wait().unwrap().is_some());
+    assert!(ctx.ok(&["ls"]).contains("c: 1 windows"));
+}

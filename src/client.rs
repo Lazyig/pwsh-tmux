@@ -14,6 +14,8 @@ use std::time::Duration;
 pub struct Global {
     pub config: Option<String>,
     pub no_start: bool,
+    /// -C (1) / -CC (2): control mode
+    pub control: u8,
 }
 
 fn spawn_server(config: Option<&str>) -> std::io::Result<()> {
@@ -168,6 +170,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
         std::env::var("TERM").unwrap_or_default(),
         std::process::id().to_string(),
         std::env::var("PWSH_TMUX_PANE").ok().filter(|_| std::env::var_os("PWSH_TMUX").is_some()).unwrap_or_default(),
+        g.control.to_string(),
     ];
     ident.extend(std::env::vars().map(|(k, v)| format!("{k}={v}")));
     let stream = Arc::new(stream);
@@ -186,6 +189,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
     }
 
     let mut raw: Option<term::RawMode> = None;
+    let mut control_started = false;
     // Set while a lock command or a suspended shell owns the terminal.
     let paused = Arc::new(AtomicBool::new(false));
     let mut out = std::io::stdout();
@@ -223,6 +227,28 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                 }
                 let _ = std::io::stdout().flush();
                 return code as i32;
+            }
+            Ok((S_ATTACHED, _)) if g.control > 0 => {
+                if !control_started {
+                    control_started = true;
+                    if g.control == 2 {
+                        // -CC: the whole session is wrapped in a DCS for the terminal (iTerm2)
+                        let _ = out.write_all(b"\x1bP1000p");
+                        let _ = out.flush();
+                    }
+                    let line_post = post.clone();
+                    thread::spawn(move || {
+                        use std::io::BufRead;
+                        for line in std::io::stdin().lock().lines() {
+                            let Ok(line) = line else { break };
+                            if !line_post(C_CONTROL_LINE, line.as_bytes()) {
+                                return;
+                            }
+                        }
+                        // EOF on stdin detaches, like an empty line
+                        line_post(C_CONTROL_LINE, b"");
+                    });
+                }
             }
             Ok((S_ATTACHED, _)) => {
                 if raw.is_none() {
@@ -272,6 +298,13 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                         }
                     });
                 }
+            }
+            Ok((S_EXIT, _)) if g.control > 0 => {
+                if g.control == 2 {
+                    let _ = out.write_all(b"\x1b\\");
+                }
+                let _ = out.flush();
+                std::process::exit(0);
             }
             Ok((S_EXIT, p)) => {
                 drop(raw.take());

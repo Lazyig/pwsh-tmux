@@ -5,6 +5,7 @@
 //! and client connections run on helper threads that only send `Event`s.
 
 mod cmds;
+mod control;
 mod input;
 mod modes;
 pub mod procinfo;
@@ -56,6 +57,8 @@ pub enum Event {
     PaneData(PaneId, u32, Vec<u8>),
     PaneExit(PaneId, u32, Option<i32>),
     Job(u32, i32, String),
+    /// A `#(command)` from a format finished: (command, output).
+    FormatShell(String, String),
 }
 
 /// Answers terminal queries and collects title / bell / cwd reports from a pane.
@@ -256,6 +259,8 @@ pub struct Session {
     pub activity: u64,
     pub last_attached: u64,
     pub alerts: BTreeMap<u32, u8>,
+    /// Session group (new-session -t): members share one window list.
+    pub group: Option<u32>,
 }
 
 impl Session {
@@ -343,11 +348,27 @@ pub struct Client {
     pub last_click: Option<(Instant, u16, u16, u8)>,
     /// Where the last button press landed (drag events are named after it).
     pub mouse_down: Option<(input::MouseCtx, &'static str)>,
+    /// Control mode: 0 = normal client, 1 = -C, 2 = -CC.
+    pub control: u8,
+    /// Size set with refresh-client -C (control clients don't size windows otherwise).
+    pub control_size: Option<(u16, u16)>,
+    pub control_seq: u64,
+    pub seen: control::Seen,
 }
 
 impl Client {
     pub fn send(&self, kind: u8, payload: &[u8]) {
         let _ = self.tx.send(frame(kind, payload));
+    }
+
+    /// Ends an attached client; control clients get %exit first.
+    pub fn send_exit(&self, msg: &str) {
+        if self.control > 0 {
+            let reason = msg.trim_matches(['[', ']']);
+            let line = if reason.is_empty() { "%exit\n".to_string() } else { format!("%exit {reason}\n") };
+            self.send(S_OUTPUT, line.as_bytes());
+        }
+        self.send(S_EXIT, msg.as_bytes());
     }
     pub fn name(&self) -> String {
         format!("client-{}", self.id)
@@ -380,6 +401,8 @@ pub struct Ctx {
     pub hook_depth: u8,
     /// True when run from a key binding (output goes to view mode).
     pub from_key: bool,
+    /// Command number of a control-mode command (reply goes in a %begin/%end block).
+    pub control_seq: Option<u64>,
 }
 
 pub struct Queue {
@@ -432,6 +455,10 @@ pub struct Server {
     pub quit: bool,
     pub had_session: bool,
     pub last_tick: Instant,
+    /// `#(command)` results: last output, when it last started, whether it is running.
+    pub shell_cache: std::cell::RefCell<HashMap<String, (String, Instant, bool)>>,
+    /// Last synced window list of each session group.
+    pub groups: HashMap<u32, BTreeMap<u32, WinId>>,
 }
 
 pub fn run(config: Option<String>) -> io::Result<()> {
@@ -488,6 +515,8 @@ pub fn run(config: Option<String>) -> io::Result<()> {
         quit: false,
         had_session: false,
         last_tick: Instant::now(),
+        shell_cache: Default::default(),
+        groups: HashMap::new(),
     };
     srv.opts_session.set("default-shell", procinfo::default_shell());
     srv.load_config(config);
@@ -510,7 +539,9 @@ pub fn run(config: Option<String>) -> io::Result<()> {
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
+        srv.sync_groups();
         srv.timers();
+        srv.control_notify();
         srv.render_all();
         let exit_empty = options::is_on(srv.opts_server.get("exit-empty").unwrap_or("on"));
         let idle = srv.sessions.is_empty() && exit_empty && (srv.had_session || started.elapsed() > Duration::from_secs(30));
@@ -683,6 +714,13 @@ impl Server {
                 }
             }
             Event::Job(id, status, output) => self.job_done(id, status, output),
+            Event::FormatShell(command, output) => {
+                if let Some(e) = self.shell_cache.borrow_mut().get_mut(&command) {
+                    e.0 = output;
+                    e.2 = false;
+                }
+                self.mark_all_dirty();
+            }
         }
     }
 
@@ -736,6 +774,10 @@ impl Server {
                 suspended: false,
                 last_click: None,
                 mouse_down: None,
+                control: 0,
+                control_size: None,
+                control_seq: 0,
+                seen: Default::default(),
             },
         );
     }
@@ -767,9 +809,11 @@ impl Server {
                     term: get(4),
                     pid: get(5).parse().unwrap_or(0),
                     ctx_pane: get(6).strip_prefix('%').and_then(|s| s.parse().ok()),
-                    env: a.iter().skip(7).filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect(),
+                    env: a.iter().skip(8).filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect(),
                 };
+                let control = get(7).parse().unwrap_or(0);
                 if let Some(c) = self.clients.get_mut(&cid) {
+                    c.control = control;
                     c.size = (ident.cols.max(1), ident.rows.max(1));
                     c.ident = Some(ident);
                 }
@@ -778,7 +822,12 @@ impl Server {
                 let argv = decode_args(&payload);
                 let cmds = crate::cmdparse::split_commands(&argv);
                 let pane = self.clients.get(&cid).and_then(|c| c.ident.as_ref()).and_then(|i| i.ctx_pane).filter(|p| self.panes.contains_key(p));
-                let ctx = Ctx { client: Some(cid), reply: Some(cid), pane, ..Ctx::default() };
+                // control clients get the reply to their command line in a %begin block too
+                let control_seq = self.clients.get_mut(&cid).filter(|c| c.control > 0).map(|c| {
+                    c.control_seq += 1;
+                    c.control_seq
+                });
+                let ctx = Ctx { client: Some(cid), reply: Some(cid), pane, control_seq, ..Ctx::default() };
                 self.run_queue(Queue { cmds: cmds.into_iter().filter(|c| !c.is_empty()).collect(), ctx , soft: 0 });
             }
             C_INPUT => {
@@ -797,6 +846,10 @@ impl Server {
                     self.update_session_size(sid);
                 }
             }
+            C_CONTROL_LINE => {
+                let line = String::from_utf8_lossy(&payload).into_owned();
+                self.control_line(cid, &line);
+            }
             C_RESUMED => {
                 if let Some(c) = self.clients.get_mut(&cid) {
                     c.suspended = false;
@@ -809,10 +862,11 @@ impl Server {
     }
 
     fn pane_data(&mut self, id: PaneId, generation: u32, data: &[u8]) {
-        let Some(p) = self.panes.get_mut(&id) else { return };
-        if p.generation != generation {
+        if !self.panes.get(&id).is_some_and(|p| p.generation == generation) {
             return;
         }
+        self.control_output(id, data);
+        let p = self.panes.get_mut(&id).unwrap();
         p.parser.process(data);
         p.last_output = Instant::now();
         if let Some(pipe) = &p.pipe {
@@ -898,7 +952,7 @@ impl Server {
                     self.set_message(cid, &format!("{what} in window {idx}"));
                 }
                 if flag == ALERT_BELL && vis != "on" {
-                    if let Some(c) = self.clients.get(&cid) {
+                    if let Some(c) = self.clients.get(&cid).filter(|c| c.control == 0) {
                         c.send(S_OUTPUT, b"\x07");
                     }
                 }
@@ -1149,7 +1203,7 @@ impl Server {
         }
         for c in self.clients.values() {
             if c.attached {
-                c.send(S_EXIT, b"[server exited]");
+                c.send_exit("[server exited]");
             } else {
                 c.send(S_REPLY, &encode_reply(0, ""));
             }
@@ -1373,6 +1427,59 @@ impl Server {
         }
     }
 
+    /// Propagates window-list changes between the sessions of each group: the member
+    /// whose links differ from the group's last synced list is the one that changed.
+    pub fn sync_groups(&mut self) {
+        let gids: Vec<u32> = self.groups.keys().copied().collect();
+        for gid in gids {
+            let members: Vec<SessId> = self.sessions.values().filter(|s| s.group == Some(gid)).map(|s| s.id).collect();
+            if members.len() < 2 {
+                for m in &members {
+                    self.sessions.get_mut(m).unwrap().group = None;
+                }
+                self.groups.remove(&gid);
+                continue;
+            }
+            let canonical = self.groups[&gid].clone();
+            let Some(changed) = members.iter().find(|m| self.sessions[m].links != canonical).copied() else { continue };
+            let links = self.sessions[&changed].links.clone();
+            for m in &members {
+                let s = self.sessions.get_mut(m).unwrap();
+                if s.links == links {
+                    continue;
+                }
+                s.links = links.clone();
+                s.last.retain(|i| s.links.contains_key(i));
+                s.alerts.retain(|i, _| s.links.contains_key(i));
+                if !s.links.contains_key(&s.active) {
+                    s.active = s.last.first().copied().or_else(|| s.links.keys().next().copied()).unwrap_or(0);
+                }
+                let id = s.id;
+                self.mark_session_dirty(id);
+            }
+            self.groups.insert(gid, links.clone());
+            // windows that left the group's list and are linked nowhere else
+            for wid in canonical.values() {
+                if !links.values().any(|w| w == wid) && self.windows.contains_key(wid) && self.links_of(*wid).is_empty() {
+                    if let Some(w) = self.windows.remove(wid) {
+                        for p in w.layout.panes() {
+                            self.destroy_pane(p);
+                        }
+                    }
+                }
+            }
+            if links.is_empty() {
+                for m in members {
+                    self.kill_session(m, true);
+                }
+            } else {
+                for m in members {
+                    self.update_session_size(m);
+                }
+            }
+        }
+    }
+
     pub fn renumber(&mut self, sid: SessId) {
         let base = self.opt_session_num(Some(sid), "base-index").max(0) as u32;
         let s = self.sessions.get_mut(&sid).unwrap();
@@ -1418,7 +1525,7 @@ impl Server {
                     if let Some(c) = self.clients.get_mut(&cid) {
                         c.session = None;
                         c.attached = false;
-                        c.send(S_EXIT, b"[exited]");
+                        c.send_exit("[exited]");
                     }
                 }
             }
@@ -1503,7 +1610,7 @@ impl Server {
         let sid = c.session;
         c.attached = false;
         c.session = None;
-        c.send(S_EXIT, msg.as_bytes());
+        c.send_exit(msg);
         if let Some(sid) = sid {
             self.update_session_size(sid);
             self.run_hook(Some(sid), "client-detached", Ctx::default());
@@ -1566,10 +1673,16 @@ impl Server {
     pub fn update_session_size(&mut self, sid: SessId) {
         let Some(s) = self.sessions.get(&sid) else { return };
         let status = self.status_lines(Some(sid));
-        let clients: Vec<&Client> = self.clients.values().filter(|c| c.attached && c.session == Some(sid)).collect();
-        let latest = clients.iter().max_by_key(|c| c.activity).map(|c| c.size);
-        let smallest = clients.iter().map(|c| c.size).reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)));
-        let largest = clients.iter().map(|c| c.size).reduce(|a, b| (a.0.max(b.0), a.1.max(b.1)));
+        // control clients only count once they set a size (refresh-client -C)
+        let clients: Vec<(u64, (u16, u16))> = self
+            .clients
+            .values()
+            .filter(|c| c.attached && c.session == Some(sid))
+            .filter_map(|c| if c.control > 0 { c.control_size.map(|s| (c.activity, s)) } else { Some((c.activity, c.size)) })
+            .collect();
+        let latest = clients.iter().max_by_key(|c| c.0).map(|c| c.1);
+        let smallest = clients.iter().map(|c| c.1).reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)));
+        let largest = clients.iter().map(|c| c.1).reduce(|a, b| (a.0.max(b.0), a.1.max(b.1)));
         let links: Vec<WinId> = s.links.values().copied().collect();
         let mut size = None;
         for wid in links {
@@ -1645,6 +1758,7 @@ impl Server {
                     q.ctx.out.push('\n');
                 }
                 Ok(Flow::Next) => {
+                    self.sync_groups();
                     if q.ctx.hook_depth == 0 {
                         if let Some(full) = cmds::canonical(&name) {
                             let sid = q.ctx.pane.and_then(|p| self.session_of_pane(p)).map(|(s, _)| s).or_else(|| q.ctx.client.and_then(|c| self.client_session(c)));
@@ -1702,6 +1816,15 @@ impl Server {
 
     pub fn finish_queue(&mut self, q: Queue, err: Option<String>) {
         let ctx = q.ctx;
+        if let (Some(seq), Some(cid)) = (ctx.control_seq, ctx.client) {
+            self.control_block(cid, seq, &ctx.out, err.as_deref());
+            // a one-shot `pwsh-tmux -C command` that didn't attach ends here
+            if let Some(c) = ctx.reply.and_then(|r| self.clients.get(&r)).filter(|c| !c.attached) {
+                c.send(S_OUTPUT, b"%exit\n");
+                c.send(S_REPLY, &encode_reply(if err.is_some() { 1 } else { 0 }, ""));
+            }
+            return;
+        }
         let attached = ctx.client.and_then(|c| self.clients.get(&c)).is_some_and(|c| c.attached);
         if let Some(rc) = ctx.reply {
             let Some(c) = self.clients.get(&rc) else { return };

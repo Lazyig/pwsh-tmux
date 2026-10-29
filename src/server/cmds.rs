@@ -61,7 +61,7 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("pipe-pane", "pipep", "IOo", "t"),
     ("previous-layout", "prevl", "", "t"),
     ("previous-window", "prev", "a", "t"),
-    ("refresh-client", "refresh", "cDlLRSU", "AfFt"),
+    ("refresh-client", "refresh", "cDlLRSU", "ABCfFt"),
     ("rename-session", "rename", "", "t"),
     ("rename-window", "renamew", "", "t"),
     ("resize-pane", "resizep", "DLMRTUZ", "txy"),
@@ -615,6 +615,7 @@ impl Server {
                 activity: now,
                 last_attached: 0,
                 alerts: BTreeMap::new(),
+                group: None,
             },
         );
         let status = self.status_lines(Some(sid));
@@ -796,7 +797,7 @@ impl Server {
         }
         let clip = self.opt_server("set-clipboard");
         if clip != "off" {
-            if let Some(c) = cid.and_then(|c| self.clients.get(&c)) {
+            if let Some(c) = cid.and_then(|c| self.clients.get(&c)).filter(|c| c.control == 0) {
                 let enc = base64(text.as_bytes());
                 c.send(S_OUTPUT, format!("\x1b]52;c;{enc}\x07").as_bytes());
             }
@@ -849,10 +850,10 @@ impl Server {
         match cmd {
             // ---------------------------------------------------------------- sessions
             "new-session" => {
-                if o.has('t') {
-                    return err("session groups (new-session -t) are not supported");
-                }
                 let name = o.get('s').map(String::from);
+                if let Some(target) = o.get('t') {
+                    return self.new_grouped_session(ctx, name, target, o.has('d'), o.has('P'), o.get('F'));
+                }
                 if o.has('A') {
                     if let Some(n) = &name {
                         if let Some(sid) = self.sessions.values().find(|s| &s.name == n).map(|s| s.id) {
@@ -864,7 +865,9 @@ impl Server {
                 let ident_size = cid.and_then(|c| self.clients.get(&c)).and_then(|c| c.ident.as_ref()).filter(|i| i.tty).map(|i| (i.cols, i.rows));
                 let default = self.opt_session(None, "default-size");
                 let (dx, dy) = default.split_once('x').map(|(a, b)| (a.parse().unwrap_or(80), b.parse().unwrap_or(24))).unwrap_or((80, 24));
-                let detached = o.has('d') || ident_size.is_none() && ctx.client.and_then(|c| self.clients.get(&c)).is_none_or(|c| !c.attached);
+                let control = cid.is_some_and(|c| self.is_control(c));
+                let detached = o.has('d') || ident_size.is_none() && !control && ctx.client.and_then(|c| self.clients.get(&c)).is_none_or(|c| !c.attached);
+                let ident_size = if control { None } else { ident_size };
                 let (mut cols, mut rows) = if detached { (dx, dy) } else { ident_size.unwrap_or((dx, dy)) };
                 if let Some(x) = o.get('x').and_then(|v| v.parse().ok()) {
                     cols = x;
@@ -1083,6 +1086,21 @@ impl Server {
             }
             "refresh-client" => {
                 let cid = self.resolve_client(ctx, t)?;
+                if let Some(size) = o.get('C') {
+                    // control clients: -C WxH (or W,H)
+                    let (w, h) = size.split_once(['x', ',']).ok_or_else(|| format!("bad size: {size}"))?;
+                    let (w, h): (u16, u16) = (w.parse().map_err(|_| format!("bad size: {size}"))?, h.parse().map_err(|_| format!("bad size: {size}"))?);
+                    if let Some(c) = self.clients.get_mut(&cid) {
+                        c.control_size = Some((w.clamp(1, MAX_SIZE), h.clamp(1, MAX_SIZE)));
+                    }
+                    if let Some(sid) = self.client_session(cid) {
+                        self.update_session_size(sid);
+                    }
+                    return Ok(Flow::Next);
+                }
+                if o.get('A').is_some() || o.get('B').is_some() || o.get('f').is_some() || o.get('F').is_some() {
+                    return Ok(Flow::Next); // output pausing / subscriptions / flags: accepted, not used
+                }
                 if o.has('S') {
                     if let Some(c) = self.clients.get_mut(&cid) {
                         c.dirty = true;
@@ -2610,6 +2628,60 @@ impl Server {
         }
     }
 
+    /// new-session -t: a session sharing the target's windows (a session group).
+    fn new_grouped_session(&mut self, ctx: &mut Ctx, name: Option<String>, target: &str, detached: bool, print: bool, fmt: Option<&str>) -> Result<Flow, String> {
+        let tsid = self.find_session(ctx, target)?;
+        let name = match name {
+            Some(n) if n.is_empty() || n.contains([':', '.']) => return err(format!("invalid session: {n}")),
+            Some(n) if self.sessions.values().any(|s| s.name == n) => return err(format!("duplicate session: {n}")),
+            Some(n) => n,
+            None => (0..).map(|i: u32| i.to_string()).find(|n| !self.sessions.values().any(|s| &s.name == n)).unwrap(),
+        };
+        let gid = match self.sessions[&tsid].group {
+            Some(g) => g,
+            None => {
+                let g = self.id();
+                self.sessions.get_mut(&tsid).unwrap().group = Some(g);
+                self.groups.insert(g, self.sessions[&tsid].links.clone());
+                g
+            }
+        };
+        let sid = self.id();
+        let now = now_secs();
+        let t = &self.sessions[&tsid];
+        let session = Session {
+            id: sid,
+            name,
+            links: t.links.clone(),
+            active: t.active,
+            last: Vec::new(),
+            cols: t.cols,
+            rows: t.rows,
+            cwd: t.cwd.clone(),
+            options: Options::default(),
+            env: t.env.clone(),
+            hooks: BTreeMap::new(),
+            created: now,
+            activity: now,
+            last_attached: 0,
+            alerts: BTreeMap::new(),
+            group: Some(gid),
+        };
+        self.sessions.insert(sid, session);
+        self.run_hook(Some(sid), "session-created", Ctx { client: ctx.client, ..Ctx::default() });
+        if print {
+            let s = self.expand(Target { sid: Some(sid), ..Target::default() }, None, fmt.unwrap_or("#{session_name}:"));
+            ctx.out.push_str(&s);
+            ctx.out.push('\n');
+        }
+        let cid = ctx.reply.or(ctx.client);
+        let attachable = cid.and_then(|c| self.clients.get(&c)).is_some_and(|c| c.attached || c.ident.as_ref().is_some_and(|i| i.tty));
+        if !detached && attachable {
+            return self.attach_or_switch(ctx, sid, false, false, false);
+        }
+        Ok(Flow::Next)
+    }
+
     fn attach_or_switch(&mut self, ctx: &mut Ctx, sid: SessId, detach_others: bool, readonly: bool, _no_env: bool) -> Result<Flow, String> {
         let cid = ctx.reply.or(ctx.client).ok_or("no client")?;
         let c = self.clients.get(&cid).ok_or("no client")?;
@@ -2618,7 +2690,7 @@ impl Server {
             if ident.is_some_and(|i| i.ctx_pane.is_some()) {
                 return err("sessions should be nested with care, unset PWSH_TMUX to force");
             }
-            if !ident.is_some_and(|i| i.tty) {
+            if !ident.is_some_and(|i| i.tty) && c.control == 0 {
                 return err("open terminal failed: not a terminal");
             }
         }

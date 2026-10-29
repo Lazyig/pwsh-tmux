@@ -10,6 +10,11 @@ use vt100::Color;
 pub trait Vars {
     /// Value of a format variable such as "session_name", "window_index", "pane_current_path".
     fn get(&self, name: &str) -> Option<String>;
+    /// Output of a `#(command)` (already format-expanded). Callers usually run it
+    /// asynchronously and return the last cached result; None expands to nothing.
+    fn shell(&self, _command: &str) -> Option<String> {
+        None
+    }
 }
 
 impl Vars for HashMap<String, String> {
@@ -223,7 +228,6 @@ impl Expander<'_> {
                     }
                 },
                 b'(' => {
-                    // TODO: #(shell command) is not executed yet; it expands to nothing.
                     let mut d = 0;
                     let mut j = i + 1;
                     while j < b.len() {
@@ -238,6 +242,10 @@ impl Expander<'_> {
                             _ => {}
                         }
                         j += 1;
+                    }
+                    if j < b.len() {
+                        let command = self.expand(&s[i + 2..j], depth + 1);
+                        out.push_str(self.vars.shell(&command).unwrap_or_default().trim_end_matches(['\r', '\n']));
                     }
                     i = (j + 1).min(b.len());
                 }
