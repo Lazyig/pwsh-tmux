@@ -28,6 +28,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+/// Largest window/client dimension accepted. tmux allows 10000, but vt100 allocates
+/// every cell up front, so a smaller bound keeps a hostile size from exhausting memory.
+pub const MAX_SIZE: u16 = 1000;
+
 pub type PaneId = u32;
 pub type WinId = u32;
 pub type SessId = u32;
@@ -237,7 +241,8 @@ pub struct Session {
 
 impl Session {
     pub fn active_window(&self) -> WinId {
-        self.links[&self.active]
+        // a session always has at least one link; fall back if `active` is stale
+        self.links.get(&self.active).or_else(|| self.links.values().next()).copied().expect("session without windows")
     }
 }
 
@@ -361,12 +366,15 @@ pub struct Ctx {
 pub struct Queue {
     pub cmds: VecDeque<Vec<String>>,
     pub ctx: Ctx,
+    /// How many commands at the front have soft errors.
+    pub soft: usize,
 }
 
 pub enum Flow {
     Next,
-    /// The queue was parked (async job, wait-for); it resumes later.
-    Park,
+    /// Run these commands next, before the rest of the queue (source-file, if-shell -F, run-shell -C).
+    /// With `soft`, their errors are reported but don't stop the queue (like config files).
+    Inject(Vec<Vec<String>>, bool),
 }
 
 pub enum JobKind {
@@ -408,10 +416,9 @@ pub struct Server {
 }
 
 pub fn run(config: Option<String>) -> io::Result<()> {
-    if ipc::connect().is_ok() {
-        return Ok(());
-    }
-    let listener = ipc::listen()?;
+    let Some(listener) = ipc::listen_exclusive()? else {
+        return Ok(()); // another server already owns the endpoint
+    };
     log(&format!("server started on {}", ipc::describe()));
     let (tx, rx) = mpsc::channel();
     let atx = tx.clone();
@@ -525,7 +532,7 @@ impl Server {
             }
             args.push(f);
             let ctx = Ctx::default();
-            self.run_queue(Queue { cmds: VecDeque::from([args]), ctx });
+            self.run_queue(Queue { cmds: VecDeque::from([args]), ctx , soft: 0 });
         }
     }
 
@@ -732,8 +739,8 @@ impl Server {
                 let a = decode_args(&payload);
                 let get = |i: usize| a.get(i).cloned().unwrap_or_default();
                 let ident = Identity {
-                    cols: get(0).parse().unwrap_or(80),
-                    rows: get(1).parse().unwrap_or(24),
+                    cols: get(0).parse::<u16>().unwrap_or(80).min(MAX_SIZE),
+                    rows: get(1).parse::<u16>().unwrap_or(24).min(MAX_SIZE),
                     tty: get(2) == "1",
                     cwd: get(3),
                     term: get(4),
@@ -751,7 +758,7 @@ impl Server {
                 let cmds = crate::cmdparse::split_commands(&argv);
                 let pane = self.clients.get(&cid).and_then(|c| c.ident.as_ref()).and_then(|i| i.ctx_pane).filter(|p| self.panes.contains_key(p));
                 let ctx = Ctx { client: Some(cid), reply: Some(cid), pane, ..Ctx::default() };
-                self.run_queue(Queue { cmds: cmds.into_iter().filter(|c| !c.is_empty()).collect(), ctx });
+                self.run_queue(Queue { cmds: cmds.into_iter().filter(|c| !c.is_empty()).collect(), ctx , soft: 0 });
             }
             C_INPUT => {
                 if let Some(c) = self.clients.get_mut(&cid) {
@@ -762,7 +769,7 @@ impl Server {
             C_RESIZE => {
                 let Some((cols, rows)) = decode_size(&payload) else { return };
                 let Some(c) = self.clients.get_mut(&cid) else { return };
-                c.size = (cols.max(1), rows.max(1));
+                c.size = (cols.clamp(1, MAX_SIZE), rows.clamp(1, MAX_SIZE));
                 c.prev = None;
                 c.dirty = true;
                 if let Some(sid) = c.session {
@@ -1068,20 +1075,22 @@ impl Server {
         // automatic-rename
         let wids: Vec<WinId> = self.windows.keys().copied().collect();
         for wid in wids {
+            // alert hooks run below may have removed windows
+            let Some(active) = self.windows.get(&wid).map(|w| w.active) else { continue };
             if !self.opt_window_on(Some(wid), "automatic-rename") {
                 continue;
             }
-            let active = self.windows[&wid].active;
             let fmt = self.opt_window(Some(wid), "automatic-rename-format");
             let name = self.expand_for_pane(active, &fmt);
-            if !name.is_empty() && self.windows[&wid].name != name {
+            if !name.is_empty() && self.windows.get(&wid).is_some_and(|w| w.name != name) {
                 self.windows.get_mut(&wid).unwrap().name = name;
                 self.mark_window_dirty(wid);
             }
             // silence
             let secs = self.opt_window_num(Some(wid), "monitor-silence");
             if secs > 0 {
-                let quiet = self.windows[&wid]
+                let Some(w) = self.windows.get(&wid) else { continue };
+                let quiet = w
                     .layout
                     .panes()
                     .iter()
@@ -1286,7 +1295,8 @@ impl Server {
 
     /// Kills a window everywhere it is linked.
     pub fn kill_window(&mut self, wid: WinId) {
-        for (sid, idx) in self.links_of(wid) {
+        // re-query: unlink may renumber the remaining links
+        while let Some(&(sid, idx)) = self.links_of(wid).first() {
             self.unlink(sid, idx);
         }
         if let Some(w) = self.windows.remove(&wid) {
@@ -1577,13 +1587,28 @@ impl Server {
             }
         }
         let ctx = Ctx { reply: None, out: String::new(), hook_depth: ctx.hook_depth + 1, ..ctx };
-        self.run_queue(Queue { cmds: list, ctx });
+        self.run_queue(Queue { cmds: list, ctx , soft: 0 });
     }
 
     pub fn run_queue(&mut self, mut q: Queue) {
         while let Some(cmd) = q.cmds.pop_front() {
             let name = cmd.first().cloned().unwrap_or_default();
+            let soft = q.soft > 0;
+            q.soft = q.soft.saturating_sub(1);
             match self.exec(cmd, &mut q.ctx) {
+                Ok(Flow::Inject(cmds, soft_errors)) => {
+                    let n = cmds.len();
+                    for c in cmds.into_iter().rev() {
+                        q.cmds.push_front(c);
+                    }
+                    q.soft = if soft_errors { q.soft + n } else { q.soft };
+                }
+                Err(e) if soft && !e.starts_with('\0') => {
+                    log(&format!("{e}"));
+                    self.add_message(&e);
+                    q.ctx.out.push_str(&e);
+                    q.ctx.out.push('\n');
+                }
                 Ok(Flow::Next) => {
                     if q.ctx.hook_depth == 0 {
                         if let Some(full) = cmds::canonical(&name) {
@@ -1593,16 +1618,15 @@ impl Server {
                         }
                     }
                 }
-                Ok(Flow::Park) => return,
-                Err(e) if e.starts_with(' ') => {
+                Err(e) if e.starts_with('\0') => {
                     // async commands: park the rest of the queue
-                    let parts: Vec<String> = e.split(' ').map(String::from).collect();
+                    let parts: Vec<String> = e.split('\0').map(String::from).collect();
                     let get = |i: usize| parts.get(i).cloned().unwrap_or_default();
                     match get(1).as_str() {
                         "job-if" => {
                             let kind = JobKind::IfShell { then: get(3), otherwise: Some(get(4)).filter(|s| !s.is_empty()) };
                             if get(5) == "b" {
-                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: String::new(), ..q.ctx.clone() } };
+                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: String::new(), ..q.ctx.clone() }, soft: 0 };
                                 self.spawn_job(&get(2), None, kind, sub);
                                 continue;
                             }
@@ -1615,7 +1639,7 @@ impl Server {
                             let cwd = Some(get(3)).filter(|s| !s.is_empty());
                             let kind = JobKind::RunShell { pane, background };
                             if background {
-                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: String::new(), ..q.ctx.clone() } };
+                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: String::new(), ..q.ctx.clone() }, soft: 0 };
                                 self.spawn_job(&get(2), cwd, kind, sub);
                                 continue;
                             }

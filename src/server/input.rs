@@ -385,7 +385,7 @@ impl Server {
         match crate::cmdparse::parse(cmd) {
             Ok(cmds) => {
                 let ctx = Ctx { client: Some(cid), pane, from_key: true, ..Ctx::default() };
-                self.run_queue(Queue { cmds: cmds.into(), ctx });
+                self.run_queue(Queue { cmds: cmds.into(), ctx , soft: 0 });
             }
             Err(e) => self.set_message(cid, &e),
         }
@@ -439,7 +439,7 @@ impl Server {
                             self.run_string(c, &cmd, Some(pane));
                         } else {
                             let cmds = crate::cmdparse::parse(&cmd).unwrap_or_default();
-                            self.run_queue(Queue { cmds: cmds.into(), ctx: Ctx { pane: Some(pane), ..Ctx::default() } });
+                            self.run_queue(Queue { cmds: cmds.into(), ctx: Ctx { pane: Some(pane), ..Ctx::default() } , soft: 0 });
                         }
                         if kill {
                             if let Some(PaneMode::Tree(mut t)) = self.panes.get_mut(&pane).and_then(|p| p.mode.take()) {
@@ -654,14 +654,14 @@ impl Server {
             }
             KeyCode::Up => {
                 if hist_len > 0 {
-                    let pos = pr.history_pos.map(|p| p.saturating_sub(1)).unwrap_or(hist_len - 1);
+                    let pos = pr.history_pos.map(|p| p.min(hist_len).saturating_sub(1)).unwrap_or(hist_len - 1);
                     pr.history_pos = Some(pos);
                     pr.input = self.prompt_history[pos].chars().collect();
                     pr.cursor = pr.input.len();
                 }
             }
             KeyCode::Down => {
-                if let Some(p) = pr.history_pos {
+                if let Some(p) = pr.history_pos.map(|p| p.min(hist_len)) {
                     if p + 1 < hist_len {
                         pr.history_pos = Some(p + 1);
                         pr.input = self.prompt_history[p + 1].chars().collect();
@@ -771,6 +771,9 @@ impl Server {
     fn handle_mouse(&mut self, cid: ClientId, m: Mouse) {
         // overlays first
         let Some(c) = self.clients.get_mut(&cid) else { return };
+        if c.overlay.is_some() || c.prompt.is_some() {
+            c.mouse_down = None;
+        }
         if let Some(Overlay::Menu(menu)) = &mut c.overlay {
             let action = match m.kind {
                 MouseKind::Down => menu.click(m.x, m.y, false),
@@ -865,6 +868,7 @@ impl Server {
         let (mut ctx, mut area) = self.mouse_ctx(cid, &m);
         match m.kind {
             MouseKind::Down => self.clients.get_mut(&cid).unwrap().mouse_down = Some((ctx.clone(), area)),
+            MouseKind::Up => self.clients.get_mut(&cid).unwrap().mouse_down = None,
             MouseKind::Drag => {
                 // tmux names drags after where the button went down (MouseDrag1Border ...)
                 if let Some((down, a)) = self.clients[&cid].mouse_down.clone() {
@@ -904,7 +908,7 @@ impl Server {
             Some(cmd) => match crate::cmdparse::parse(&cmd) {
                 Ok(cmds) => {
                     let qctx = Ctx { client: Some(cid), pane: pane.or_else(|| self.client_active_pane(cid)), mouse: Some(ctx), from_key: true, ..Ctx::default() };
-                    self.run_queue(Queue { cmds: cmds.into(), ctx: qctx });
+                    self.run_queue(Queue { cmds: cmds.into(), ctx: qctx , soft: 0 });
                     // the drag that started a border resize / selection also moves it
                     if m.kind == MouseKind::Drag && self.clients.get(&cid).is_some_and(|c| c.drag.is_some()) {
                         self.handle_mouse(cid, m);
@@ -971,8 +975,8 @@ impl Server {
 
     pub fn start_border_drag(&mut self, cid: ClientId, mouse: Option<MouseCtx>) {
         let Some(mc) = mouse else { return };
-        let Some(wid) = mc.wid else { return };
-        let (_, ch) = self.clients[&cid].size;
+        let Some(wid) = mc.wid.filter(|w| self.windows.contains_key(w)) else { return };
+        let Some((_, ch)) = self.clients.get(&cid).map(|c| c.size) else { return };
         let sid = self.client_session(cid);
         let top = self.opt_session(sid, "status-position") == "top";
         let oy = if top { self.status_lines(sid).min(ch.saturating_sub(1)) } else { 0 };

@@ -6,6 +6,7 @@ use crate::protocol::*;
 use crate::term;
 use interprocess::local_socket::Stream;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -100,7 +101,8 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
             let mut data = String::new();
             let _ = std::io::stdin().read_to_string(&mut data);
             let last = args.len() - 1;
-            args[last] = format!("\0stdin:{data}");
+            // NUL separates protocol arguments, so mark inline data with \x01
+            args[last] = format!("\x01stdin:{data}");
         }
     }
     let stream = match connect(starts && !g.no_start, g.config.as_deref()) {
@@ -138,6 +140,8 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
     }
 
     let mut raw: Option<term::RawMode> = None;
+    // Set while a lock command or a suspended shell owns the terminal.
+    let paused = Arc::new(AtomicBool::new(false));
     let mut out = std::io::stdout();
     let restore = |out: &mut std::io::Stdout| {
         let _ = out.write_all(b"\x1b[0m\x1b[?25h\x1b[?1l\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1004l\x1b[0 q\x1b[?1049l");
@@ -186,11 +190,19 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                     let _ = out.write_all(b"\x1b[?1049h\x1b[H\x1b[2J");
                     let _ = out.flush();
                     let input_post = post.clone();
+                    let paused = paused.clone();
                     thread::spawn(move || {
                         let mut input = term::Input::default();
-                        while let Ok(data) = input.read() {
-                            if data.is_empty() || !input_post(C_INPUT, &data) {
-                                break;
+                        loop {
+                            if paused.load(Ordering::SeqCst) || !input.wait(100) {
+                                if paused.load(Ordering::SeqCst) {
+                                    thread::sleep(Duration::from_millis(50));
+                                }
+                                continue;
+                            }
+                            match input.read() {
+                                Ok(data) if !data.is_empty() && input_post(C_INPUT, &data) => {}
+                                _ => break,
                             }
                         }
                     });
@@ -218,6 +230,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                 std::process::exit(0);
             }
             Ok((S_SUSPEND, _)) => {
+                paused.store(true, Ordering::SeqCst);
                 drop(raw.take());
                 restore(&mut out);
                 #[cfg(unix)]
@@ -229,9 +242,13 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                 let _ = out.flush();
                 let (c, r) = term::size();
                 post(C_RESIZE, &encode_size(c, r));
+                paused.store(false, Ordering::SeqCst);
                 post(C_RESUMED, b"");
             }
             Ok((S_SHELL, p)) => {
+                paused.store(true, Ordering::SeqCst);
+                // give the reader a moment to leave its wait
+                thread::sleep(Duration::from_millis(150));
                 drop(raw.take());
                 restore(&mut out);
                 let cmd = String::from_utf8_lossy(&p).into_owned();
@@ -239,6 +256,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                 raw = term::RawMode::enter().ok();
                 let _ = out.write_all(b"\x1b[?1049h");
                 let _ = out.flush();
+                paused.store(false, Ordering::SeqCst);
                 post(C_RESUMED, b"");
             }
             Ok(_) => {}

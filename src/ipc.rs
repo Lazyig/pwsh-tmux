@@ -16,7 +16,8 @@ fn pipe_name() -> String {
     if let Some(p) = std::env::var("PWSH_TMUX_SOCKET_PATH").ok().filter(|s| !s.is_empty()) {
         return p.trim_start_matches("\\\\.\\pipe\\").to_string();
     }
-    let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
+    // The SID (not USERNAME) identifies the user unambiguously across domains.
+    let user = win::own_sid_string().unwrap_or_else(|| std::env::var("USERNAME").unwrap_or_else(|_| "user".into()));
     format!("pwsh-tmux-{}-{}", user, label())
 }
 
@@ -76,22 +77,58 @@ pub fn describe() -> String {
     }
 }
 
+/// Connects to the server, refusing one that runs as a different user
+/// (e.g. a squatted pipe name on a shared Windows host).
 pub fn connect() -> io::Result<Stream> {
+    use interprocess::local_socket::traits::StreamCommon;
     #[cfg(unix)]
-    {
+    let s = {
         use interprocess::local_socket::GenericFilePath;
         let path = socket_path()?;
-        Stream::connect(path.as_path().to_fs_name::<GenericFilePath>()?)
+        Stream::connect(path.as_path().to_fs_name::<GenericFilePath>()?)?
+    };
+    #[cfg(windows)]
+    let s = {
+        use interprocess::local_socket::GenericNamespaced;
+        Stream::connect(pipe_name().to_ns_name::<GenericNamespaced>()?)?
+    };
+    let creds = s.peer_creds()?;
+    #[cfg(unix)]
+    let same = creds.euid().is_none_or(|u| u == unsafe { libc::geteuid() });
+    #[cfg(windows)]
+    let same = creds.pid().is_some_and(|p| win::same_user(p as u32));
+    if !same {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{} is owned by another user", describe())));
+    }
+    Ok(s)
+}
+
+/// Creates the endpoint unless a server already answers on it (then `None`).
+pub fn listen_exclusive() -> io::Result<Option<Listener>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // Serialise check + bind so two autostarting clients can't both bind.
+        let mut lock_path = socket_path()?.into_os_string();
+        lock_path.push(".lock");
+        let lock = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&lock_path)?;
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+        if connect().is_ok() {
+            return Ok(None);
+        }
+        listen().map(Some)
     }
     #[cfg(windows)]
     {
-        use interprocess::local_socket::GenericNamespaced;
-        Stream::connect(pipe_name().to_ns_name::<GenericNamespaced>()?)
+        if connect().is_ok() {
+            return Ok(None);
+        }
+        // FIRST_PIPE_INSTANCE makes a concurrent second server fail here.
+        listen().map(Some)
     }
 }
 
-/// Caller must have verified that no server answers on the endpoint.
-pub fn listen() -> io::Result<Listener> {
+fn listen() -> io::Result<Listener> {
     #[cfg(unix)]
     {
         use interprocess::local_socket::GenericFilePath;
@@ -105,9 +142,73 @@ pub fn listen() -> io::Result<Listener> {
     #[cfg(windows)]
     {
         use interprocess::local_socket::GenericNamespaced;
-        ListenerOptions::new()
-            .name(pipe_name().to_ns_name::<GenericNamespaced>()?)
-            .create_sync()
+        use interprocess::os::windows::local_socket::ListenerOptionsExt;
+        use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+        let mut opts = ListenerOptions::new().name(pipe_name().to_ns_name::<GenericNamespaced>()?);
+        // Only this user (and SYSTEM) may open the pipe.
+        if let Some(sid) = win::own_sid_string() {
+            let sddl = widestring::U16CString::from_str(format!("D:P(A;;GA;;;{sid})(A;;GA;;;SY)"))
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            opts = opts.security_descriptor(SecurityDescriptor::deserialize(&sddl)?);
+        }
+        opts.create_sync()
+    }
+}
+
+#[cfg(windows)]
+mod win {
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{EqualSid, GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    /// TOKEN_USER of a process, in a u64 buffer for alignment.
+    fn token_user(process: HANDLE) -> Option<Vec<u64>> {
+        unsafe {
+            let mut tok: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(process, TOKEN_QUERY, &mut tok) == 0 {
+                return None;
+            }
+            let mut len = 0u32;
+            GetTokenInformation(tok, TokenUser, std::ptr::null_mut(), 0, &mut len);
+            let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+            let ok = GetTokenInformation(tok, TokenUser, buf.as_mut_ptr().cast(), (buf.len() * 8) as u32, &mut len);
+            CloseHandle(tok);
+            (ok != 0).then_some(buf)
+        }
+    }
+
+    pub fn own_sid_string() -> Option<String> {
+        let buf = token_user(unsafe { GetCurrentProcess() })?;
+        unsafe {
+            let tu = &*(buf.as_ptr() as *const TOKEN_USER);
+            let mut p: *mut u16 = std::ptr::null_mut();
+            if ConvertSidToStringSidW(tu.User.Sid, &mut p) == 0 || p.is_null() {
+                return None;
+            }
+            let mut n = 0;
+            while *p.add(n) != 0 {
+                n += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
+            LocalFree(p.cast());
+            Some(s)
+        }
+    }
+
+    pub fn same_user(pid: u32) -> bool {
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return false;
+            }
+            let other = token_user(h);
+            CloseHandle(h);
+            let (Some(other), Some(mine)) = (other, token_user(GetCurrentProcess())) else { return false };
+            let a = &*(other.as_ptr() as *const TOKEN_USER);
+            let b = &*(mine.as_ptr() as *const TOKEN_USER);
+            EqualSid(a.User.Sid, b.User.Sid) != 0
+        }
     }
 }
 

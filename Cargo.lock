@@ -424,6 +424,7 @@ dependencies = [
  "portable-pty",
  "unicode-width",
  "vt100",
+ "widestring",
  "windows-sys",
 ]
 

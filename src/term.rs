@@ -86,6 +86,35 @@ pub struct Input {
 }
 
 impl Input {
+    /// Waits up to `ms` for typed input; false on timeout. Lets the reader thread stay
+    /// out of `read` while a lock command or suspended shell owns the terminal.
+    pub fn wait(&self, ms: u32) -> bool {
+        #[cfg(unix)]
+        {
+            let mut fds = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+            unsafe { libc::poll(&mut fds, 1, ms as i32) > 0 }
+        }
+        #[cfg(windows)]
+        unsafe {
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+            if WaitForSingleObject(win::stdin(), ms) != 0 {
+                return false;
+            }
+            // Drop non-key records (focus, resize, menu) so a later read can't block on them.
+            loop {
+                let mut rec: win::INPUT_RECORD = std::mem::zeroed();
+                let mut n = 0u32;
+                if win::PeekConsoleInputW(win::stdin(), &mut rec, 1, &mut n) == 0 || n == 0 {
+                    return false;
+                }
+                if rec.EventType as u32 == win::KEY_EVENT as u32 && rec.Event.KeyEvent.bKeyDown != 0 {
+                    return true;
+                }
+                win::ReadConsoleInputW(win::stdin(), &mut rec, 1, &mut n);
+            }
+        }
+    }
+
     /// Returns an empty vec on EOF.
     pub fn read(&mut self) -> io::Result<Vec<u8>> {
         #[cfg(unix)]

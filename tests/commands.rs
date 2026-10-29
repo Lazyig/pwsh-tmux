@@ -314,3 +314,58 @@ fn split_window_options() {
     let d = ctx.ok(&["split-window", "-t", "s", "-c", &dir.to_string_lossy(), "-P", "-F", "#{pane_start_path}"]);
     assert_eq!(std::path::Path::new(d.trim()), dir.as_path());
 }
+
+/// Scenarios from the code review; each used to panic the server or destroy the wrong window.
+#[test]
+fn review_regressions() {
+    let ctx = Ctx::new("review");
+    ctx.ok(&["new-session", "-d", "-s", "r", "-n", "w0"]);
+    // respawn-window must not leave last-pane pointing at a destroyed pane
+    ctx.ok(&["split-window", "-t", "r"]);
+    ctx.ok(&["respawn-window", "-k", "-t", "r"]);
+    ctx.fails(&["last-pane", "-t", "r"]);
+    ctx.ok(&["swap-pane", "-U", "-t", "r"]);
+    // kill-window -a with renumber-windows keeps the target window
+    ctx.ok(&["set", "-g", "renumber-windows", "on"]);
+    ctx.ok(&["new-window", "-t", "r", "-n", "w1"]);
+    ctx.ok(&["new-window", "-t", "r", "-n", "w2"]);
+    ctx.ok(&["kill-window", "-a", "-t", "r:w2"]);
+    assert_eq!(ctx.ok(&["lsw", "-t", "r", "-F", "#W"]).trim(), "w2");
+    // move-window -a inside one session
+    ctx.ok(&["new-window", "-t", "r", "-n", "w3"]);
+    ctx.ok(&["new-window", "-t", "r", "-n", "w4"]);
+    ctx.ok(&["move-window", "-a", "-s", "r:w4", "-t", "r:w2"]);
+    assert_eq!(ctx.ok(&["lsw", "-t", "r", "-F", "#W"]).lines().collect::<Vec<_>>(), vec!["w2", "w4", "w3"]);
+    // a window linked twice into one session, then killed
+    ctx.ok(&["link-window", "-s", "r:w3", "-t", "r:9"]);
+    ctx.fails(&["kill-window", "-t", "r:w3"]); // ambiguous, like tmux
+    ctx.ok(&["kill-window", "-t", "r:9"]);
+    assert_eq!(ctx.ok(&["lsw", "-t", "r", "-F", "#W"]).lines().collect::<Vec<_>>(), vec!["w2", "w4"]);
+    // new-window -k replacing the only window keeps the session
+    ctx.ok(&["new-session", "-d", "-s", "solo"]);
+    ctx.ok(&["new-window", "-k", "-t", "solo:0", "-n", "replaced"]);
+    assert_eq!(ctx.fmt("solo", "#W"), "replaced");
+    // join-pane from a single-pane session removes that session cleanly
+    ctx.ok(&["join-pane", "-s", "solo:", "-t", "r:"]);
+    ctx.fails(&["has-session", "-t", "solo"]);
+    assert_eq!(ctx.fmt("r", "#{window_panes}"), "2");
+    // run-shell / if-shell inside a sourced file run (asynchronously) in order
+    let conf = std::env::temp_dir().join(format!("pt-rv-{}.conf", std::process::id()));
+    std::fs::write(&conf, "if-shell 'exit 0' 'set -g @rv yes' 'set -g @rv no'\nset -g @after 1\nnot-a-command\nset -g @tail ok\n").unwrap();
+    let (_, out) = ctx.cmd(&["source-file", &conf.to_string_lossy()]);
+    let _ = std::fs::remove_file(&conf);
+    assert!(out.contains("unknown command"), "{out}");
+    assert_eq!(ctx.fmt("r", "#{@rv} #{@after} #{@tail}"), "yes 1 ok");
+    // load-buffer - reads stdin
+    let mut child = ctx.command().args(["load-buffer", "-b", "stdin", "-"]).stdin(std::process::Stdio::piped()).spawn().unwrap();
+    {
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(b"from stdin").unwrap();
+    }
+    assert!(child.wait().unwrap().success());
+    assert_eq!(ctx.ok(&["show-buffer", "-b", "stdin"]), "from stdin");
+    // absurd sizes are clamped instead of exhausting memory
+    ctx.ok(&["resize-window", "-t", "r", "-x", "60000", "-y", "60000"]);
+    assert_eq!(ctx.fmt("r", "#{window_width}x#{window_height}"), "1000x1000");
+    ctx.ok(&["resize-window", "-A", "-t", "r"]);
+}
