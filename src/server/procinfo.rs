@@ -144,7 +144,7 @@ pub fn current_path(pid: Option<u32>, fg_pgrp: Option<i32>) -> Option<String> {
 }
 
 #[cfg(windows)]
-mod win {
+pub mod win {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -168,6 +168,22 @@ mod win {
             CloseHandle(snap);
         }
         out
+    }
+
+    /// Pids of direct children of `parent` with the given executable name.
+    pub fn children_named(parent: u32, name: &str) -> Vec<u32> {
+        processes().into_iter().filter(|p| p.1 == parent && p.2.eq_ignore_ascii_case(name)).map(|p| p.0).collect()
+    }
+
+    pub fn terminate(pid: u32) {
+        use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+        unsafe {
+            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !h.is_null() {
+                TerminateProcess(h, 1);
+                CloseHandle(h);
+            }
+        }
     }
 
     pub fn deepest_descendant(root: u32) -> Option<String> {

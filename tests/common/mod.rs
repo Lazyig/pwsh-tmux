@@ -86,7 +86,7 @@ pub struct Term {
     pub screen: Arc<Mutex<vt100::Parser>>,
     pub raw: Arc<Mutex<Vec<u8>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    pub master: Box<dyn MasterPty + Send>,
+    pub master: Option<Box<dyn MasterPty + Send>>,
     pub child: Box<dyn Child + Send + Sync>,
 }
 
@@ -128,7 +128,7 @@ impl Term {
                 }
             });
         }
-        Term { screen, raw, writer, master: pair.master, child }
+        Term { screen, raw, writer, master: Some(pair.master), child }
     }
 
     pub fn contents(&self) -> String {
@@ -181,6 +181,12 @@ impl Term {
             std::thread::sleep(Duration::from_millis(100));
         }
         panic!("client did not exit");
+    }
+
+    /// Closes the terminal under the client (like closing the terminal window).
+    pub fn hangup(&mut self) {
+        *self.writer.lock().unwrap() = Box::new(std::io::sink());
+        self.master = None;
     }
 
     pub fn raw_text(&self) -> String {

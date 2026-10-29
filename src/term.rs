@@ -86,31 +86,48 @@ pub struct Input {
 }
 
 impl Input {
-    /// Waits up to `ms` for typed input; false on timeout. Lets the reader thread stay
+    /// Waits up to `ms` for typed input; Ok(false) on timeout, Err when the terminal is gone. Lets the reader thread stay
     /// out of `read` while a lock command or suspended shell owns the terminal.
-    pub fn wait(&self, ms: u32) -> bool {
+    pub fn wait(&self, ms: u32) -> io::Result<bool> {
         #[cfg(unix)]
         {
             let mut fds = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
-            unsafe { libc::poll(&mut fds, 1, ms as i32) > 0 }
+            match unsafe { libc::poll(&mut fds, 1, ms as i32) } {
+                // POLLHUP/POLLERR also count as ready: the following read reports them
+                n if n > 0 => Ok(true),
+                0 => Ok(false),
+                _ => {
+                    let e = io::Error::last_os_error();
+                    if e.kind() == io::ErrorKind::Interrupted { Ok(false) } else { Err(e) }
+                }
+            }
         }
         #[cfg(windows)]
         unsafe {
+            use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
             use windows_sys::Win32::System::Threading::WaitForSingleObject;
-            if WaitForSingleObject(win::stdin(), ms) != 0 {
-                return false;
+            match WaitForSingleObject(win::stdin(), ms) {
+                0 => {}
+                WAIT_TIMEOUT => return Ok(false),
+                // the console went away (terminal closed)
+                _ => return Err(io::Error::last_os_error()),
             }
             // Drop non-key records (focus, resize, menu) so a later read can't block on them.
             loop {
                 let mut rec: win::INPUT_RECORD = std::mem::zeroed();
                 let mut n = 0u32;
-                if win::PeekConsoleInputW(win::stdin(), &mut rec, 1, &mut n) == 0 || n == 0 {
-                    return false;
+                if win::PeekConsoleInputW(win::stdin(), &mut rec, 1, &mut n) == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if n == 0 {
+                    return Ok(false);
                 }
                 if rec.EventType as u32 == win::KEY_EVENT as u32 && rec.Event.KeyEvent.bKeyDown != 0 {
-                    return true;
+                    return Ok(true);
                 }
-                win::ReadConsoleInputW(win::stdin(), &mut rec, 1, &mut n);
+                if win::ReadConsoleInputW(win::stdin(), &mut rec, 1, &mut n) == 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
         }
     }

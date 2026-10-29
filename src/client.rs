@@ -35,24 +35,8 @@ fn spawn_server(config: Option<&str>) -> std::io::Result<()> {
     };
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
-        use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
-        // std spawns with handle inheritance on, which would leak our stdio
-        // (e.g. a caller's capture pipe) into the long-lived server.
-        for h in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-            unsafe { SetHandleInformation(GetStdHandle(h), HANDLE_FLAG_INHERIT, 0) };
-        }
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-        let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
-        // Breaking away from the job keeps the server alive when e.g. an SSH
-        // session's job object is closed; not every job allows it.
-        if make().creation_flags(base | CREATE_BREAKAWAY_FROM_JOB).spawn().is_ok() {
-            return Ok(());
-        }
-        make().creation_flags(base).spawn().map(drop)
+        let _ = make;
+        win_spawn_detached(&exe, config)
     }
     #[cfg(unix)]
     {
@@ -66,6 +50,68 @@ fn spawn_server(config: Option<&str>) -> std::io::Result<()> {
         }
         c.spawn().map(drop)
     }
+}
+
+/// Starts the server with CreateProcessW directly: std's Command always enables handle
+/// inheritance, which leaks whatever inheritable handles the client got from its parent
+/// (e.g. sshd's session pipes, keeping `ssh host pwsh-tmux new -d` from ever returning).
+#[cfg(windows)]
+fn win_spawn_detached(exe: &std::path::Path, config: Option<&str>) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessW, CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, PROCESS_INFORMATION, STARTUPINFOW,
+    };
+    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\\\""));
+    let mut cmdline = format!("{} __server", quote(&exe.to_string_lossy()));
+    if let Some(f) = config {
+        cmdline.push(' ');
+        cmdline.push_str(&quote(f));
+    }
+    let mut cmdline: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
+    // environment block without our nesting markers
+    let mut env: Vec<u16> = Vec::new();
+    for (k, v) in std::env::vars_os() {
+        if k == "PWSH_TMUX" || k == "PWSH_TMUX_PANE" {
+            continue;
+        }
+        env.extend(k.encode_wide());
+        env.push('=' as u16);
+        env.extend(v.encode_wide());
+        env.push(0);
+    }
+    env.push(0);
+    let home: Option<Vec<u16>> = std::env::var_os("USERPROFILE").map(|h| h.encode_wide().chain(std::iter::once(0)).collect());
+    let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT;
+    // Breaking away from the job keeps the server alive when e.g. an SSH
+    // session's job object is closed; not every job allows it.
+    for flags in [base | CREATE_BREAKAWAY_FROM_JOB, base] {
+        let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            CreateProcessW(
+                std::ptr::null(),
+                cmdline.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0, // bInheritHandles = FALSE
+                flags,
+                env.as_ptr().cast(),
+                home.as_ref().map_or(std::ptr::null(), |h| h.as_ptr()),
+                &si,
+                &mut pi,
+            )
+        };
+        if ok != 0 {
+            unsafe {
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+            }
+            return Ok(());
+        }
+    }
+    Err(std::io::Error::last_os_error())
 }
 
 fn connect(autostart: bool, config: Option<&str>) -> Result<Stream, String> {
@@ -194,14 +240,19 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                     thread::spawn(move || {
                         let mut input = term::Input::default();
                         loop {
-                            if paused.load(Ordering::SeqCst) || !input.wait(100) {
-                                if paused.load(Ordering::SeqCst) {
-                                    thread::sleep(Duration::from_millis(50));
-                                }
+                            if paused.load(Ordering::SeqCst) {
+                                thread::sleep(Duration::from_millis(50));
                                 continue;
+                            }
+                            match input.wait(100) {
+                                Ok(false) => continue,
+                                Ok(true) => {}
+                                // terminal gone: exit like tmux on SIGHUP (the server detaches us)
+                                Err(_) => std::process::exit(1),
                             }
                             match input.read() {
                                 Ok(data) if !data.is_empty() && input_post(C_INPUT, &data) => {}
+                                Ok(data) if data.is_empty() => std::process::exit(1),
                                 _ => break,
                             }
                         }

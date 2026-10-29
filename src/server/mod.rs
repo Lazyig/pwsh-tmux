@@ -147,6 +147,9 @@ pub struct Pane {
     pub created: u64,
     pub current_cmd: String,
     pub current_path: String,
+    /// The conhost.exe hosting this pane's pseudoconsole (Windows).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub host_pid: Option<u32>,
 }
 
 impl Pane {
@@ -183,6 +186,15 @@ impl Pane {
         }
     }
 
+    /// Ends the pseudoconsole host too: older conhost builds (Windows 10, Server 2022)
+    /// can block ClosePseudoConsole or spin when their client goes away.
+    pub fn kill_host(&mut self) {
+        #[cfg(windows)]
+        if let Some(pid) = self.host_pid.take() {
+            procinfo::win::terminate(pid);
+        }
+    }
+
     pub fn fg_pgrp(&self) -> Option<i32> {
         #[cfg(unix)]
         {
@@ -197,7 +209,8 @@ impl Pane {
 
 /// Drops a pane off the main loop: on older Windows (10, Server 2022) ClosePseudoConsole
 /// blocks until conhost exits, which would freeze every client.
-fn release(p: Pane) {
+fn release(mut p: Pane) {
+    p.kill_host();
     thread::spawn(move || drop(p));
 }
 
@@ -1128,6 +1141,7 @@ impl Server {
         for id in ids {
             if let Some(p) = self.panes.get_mut(&id) {
                 p.kill();
+                p.kill_host();
             }
         }
         for c in self.clients.values() {
@@ -1172,7 +1186,14 @@ impl Server {
             many => many.to_vec(),
         };
         let start_cmd = cmd.join(" ");
+        #[cfg(windows)]
+        let hosts_before = procinfo::win::children_named(std::process::id(), "conhost.exe");
         let pair = self.pty.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).map_err(|e| format!("openpty: {e}"))?;
+        // panes are spawned one at a time on this thread, so the new conhost is ours
+        #[cfg(windows)]
+        let host_pid = procinfo::win::children_named(std::process::id(), "conhost.exe").into_iter().find(|p| !hosts_before.contains(p));
+        #[cfg(not(windows))]
+        let host_pid = None;
         let mut cb = CommandBuilder::new(&argv[0]);
         cb.args(&argv[1..]);
         cb.env_clear();
@@ -1261,6 +1282,7 @@ impl Server {
                 created: now,
                 current_cmd: prog,
                 current_path: dir,
+                host_pid,
             },
         );
         if let Some(old) = previous {

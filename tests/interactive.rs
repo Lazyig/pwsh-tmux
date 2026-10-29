@@ -196,3 +196,14 @@ fn detach_attach_and_nesting() {
     ctx.ok(&["kill-server"]);
     c.wait_screen("server exited", |_| c.raw_text().contains("[server exited]") || c.raw_text().contains("[exited]"));
 }
+
+#[test]
+fn terminal_closed_under_client() {
+    let ctx = Ctx::new("hangup");
+    let mut t = start(&ctx, "h");
+    t.hangup();
+    // the client exits (no busy loop on a dead console) and the session stays, detached
+    t.wait_exit();
+    wait_for("detached", || !ctx.ok(&["ls"]).contains("attached"));
+    ctx.ok(&["has-session", "-t", "h"]);
+}
