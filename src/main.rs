@@ -1,3 +1,5 @@
+#[allow(dead_code)]
+mod cells;
 mod client;
 mod ipc;
 mod layout;
