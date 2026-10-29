@@ -148,7 +148,8 @@ fn escape_for(template: &str, at: usize, input: &str) -> String {
     match before {
         Some('\'') => input.replace('\'', "'\\''"),
         Some('"') => input.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$"),
-        _ => input.chars().flat_map(|c| if " ;\"'\\{}$#".contains(c) { vec!['\\', c] } else { vec![c] }).collect(),
+        // unquoted: inserted as-is, so a bare %% / %1 template runs the input as a command
+        _ => input.to_string(),
     }
 }
 
@@ -534,7 +535,8 @@ impl Server {
             }
             Action::Prompt { label, command } => {
                 if let Some(c) = cid {
-                    let template = format!("send-keys -t %{pane} -X {command} '%%'");
+                    // the pane is the prompt's context target (a %id in the template would read as %N)
+                    let template = format!("send-keys -X {command} '%%'");
                     self.open_prompt(c, PromptKind::Command, vec![(label, String::new())], template, Some(pane), false, false);
                 }
             }
@@ -574,7 +576,7 @@ impl Server {
                 let mut pr = c.prompt.take().unwrap();
                 let input: String = pr.input.iter().collect();
                 pr.answers.push(input.clone());
-                if !input.is_empty() && !pr.template.starts_with("send-keys -t %") {
+                if !input.is_empty() && !pr.template.starts_with("send-keys -X ") {
                     self.prompt_history.retain(|h| h != &input);
                     self.prompt_history.push(input);
                     let lim = self.opt_server_num("prompt-history-limit").max(1) as usize;
@@ -860,7 +862,18 @@ impl Server {
                 }
             }
         }
-        let (mut ctx, area) = self.mouse_ctx(cid, &m);
+        let (mut ctx, mut area) = self.mouse_ctx(cid, &m);
+        match m.kind {
+            MouseKind::Down => self.clients.get_mut(&cid).unwrap().mouse_down = Some((ctx.clone(), area)),
+            MouseKind::Drag => {
+                // tmux names drags after where the button went down (MouseDrag1Border ...)
+                if let Some((down, a)) = self.clients[&cid].mouse_down.clone() {
+                    area = a;
+                    ctx = MouseCtx { event: Some(m), x: down.x, y: down.y, ..down };
+                }
+            }
+            _ => {}
+        }
         // double / triple click
         let mut name = keys::mouse_key_name(&m, area);
         if m.kind == MouseKind::Down {
@@ -892,6 +905,10 @@ impl Server {
                 Ok(cmds) => {
                     let qctx = Ctx { client: Some(cid), pane: pane.or_else(|| self.client_active_pane(cid)), mouse: Some(ctx), from_key: true, ..Ctx::default() };
                     self.run_queue(Queue { cmds: cmds.into(), ctx: qctx });
+                    // the drag that started a border resize / selection also moves it
+                    if m.kind == MouseKind::Drag && self.clients.get(&cid).is_some_and(|c| c.drag.is_some()) {
+                        self.handle_mouse(cid, m);
+                    }
                 }
                 Err(e) => self.set_message(cid, &e),
             },
@@ -1004,8 +1021,8 @@ mod tests {
     #[test]
     fn templates() {
         assert_eq!(fill_template("rename-window -- '%%'", &["it's".into()]), "rename-window -- 'it'\\''s'");
-        assert_eq!(fill_template("a %1 b %2", &["x".into(), "y z".into()]), "a x b y\\ z");
-        assert_eq!(fill_template("%%", &["new-window -n x".into()]), "new-window\\ -n\\ x");
+        assert_eq!(fill_template("a %1 b %2", &["x".into(), "y z".into()]), "a x b y z");
+        assert_eq!(fill_template("%%", &["new-window -n x".into()]), "new-window -n x");
         let b = default_bindings();
         assert!(b["prefix"].contains_key("%"));
         assert!(b["prefix"].contains_key("\""));

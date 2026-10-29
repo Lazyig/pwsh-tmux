@@ -317,6 +317,8 @@ pub struct Client {
     pub title: String,
     pub suspended: bool,
     pub last_click: Option<(Instant, u16, u16, u8)>,
+    /// Where the last button press landed (drag events are named after it).
+    pub mouse_down: Option<(input::MouseCtx, &'static str)>,
 }
 
 impl Client {
@@ -705,6 +707,7 @@ impl Server {
                 title: String::new(),
                 suspended: false,
                 last_click: None,
+                mouse_down: None,
             },
         );
     }

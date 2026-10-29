@@ -216,6 +216,13 @@ impl Vars for VarCtx<'_> {
                 Some(PaneMode::Copy(c)) => Some(c.scroll_offset().to_string()),
                 _ => None,
             }),
+            "copy_cursor_x" | "copy_cursor_y" => pane.and_then(|p| match &p.mode {
+                Some(PaneMode::Copy(c)) => {
+                    let (x, y) = c.render().1;
+                    Some(if name == "copy_cursor_x" { x } else { y }.to_string())
+                }
+                _ => None,
+            }),
             "selection_present" => pane.map(|p| b(matches!(&p.mode, Some(PaneMode::Copy(c)) if c.selection_active()))),
             "mouse_any_flag" => pane.map(|p| b(p.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None)),
             "mouse_standard_flag" => pane.map(|p| b(matches!(p.screen().mouse_protocol_mode(), vt100::MouseProtocolMode::PressRelease | vt100::MouseProtocolMode::Press))),

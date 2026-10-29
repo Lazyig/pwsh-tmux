@@ -1,0 +1,316 @@
+//! Command-level behaviour checked through the CLI against a private server.
+
+mod common;
+use common::*;
+use std::time::Duration;
+
+fn ids(ctx: &Ctx, t: &str) -> Vec<String> {
+    ctx.ok(&["list-panes", "-t", t, "-F", "#{pane_id}"]).lines().map(String::from).collect()
+}
+
+#[test]
+fn options_and_formats() {
+    let ctx = Ctx::new("opts");
+    ctx.ok(&["new-session", "-d", "-s", "o", "-x", "100", "-y", "30"]);
+    ctx.ok(&["set-option", "-g", "status-left", "LEFT"]);
+    assert_eq!(ctx.ok(&["show-options", "-gv", "status-left"]).trim(), "LEFT");
+    ctx.ok(&["set", "-g", "@user", "val ue"]);
+    assert_eq!(ctx.fmt("o", "#{@user}"), "val ue");
+    ctx.ok(&["setw", "-t", "o", "synchronize-panes", "on"]);
+    assert_eq!(ctx.ok(&["show-window-options", "-v", "-t", "o", "synchronize-panes"]).trim(), "on");
+    // flag without value toggles
+    ctx.ok(&["set", "-g", "mouse"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "mouse"]).trim(), "on");
+    ctx.ok(&["set", "-u", "-g", "mouse"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "mouse"]).trim(), "off");
+    ctx.fails(&["set", "-g", "no-such-option", "1"]);
+    ctx.fails(&["set", "-g", "base-index", "abc"]);
+    ctx.ok(&["set", "-ag", "status-left", "+X"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "status-left"]).trim(), "LEFT+X");
+    ctx.ok(&["set", "-o", "-q", "-g", "status-left", "ignored"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "status-left"]).trim(), "LEFT+X");
+    // session option overrides global, -A shows inherited
+    ctx.ok(&["set", "-t", "o", "status-right", "R"]);
+    assert!(ctx.ok(&["show", "-t", "o"]).contains("status-right R"));
+    assert!(ctx.ok(&["show", "-A", "-t", "o"]).contains("status-left*"));
+    // formats
+    assert_eq!(ctx.fmt("o", "#{?#{==:#{session_name},o},yes,no}"), "yes");
+    assert_eq!(ctx.fmt("o", "#S:#I.#P #{window_panes}"), "o:0.0 1");
+    assert_eq!(ctx.fmt("o", "#{=2:#{l:abcdef}}"), "ab");
+    assert_eq!(ctx.fmt("o", "#{e|+|:2,3}"), "5");
+    assert_eq!(ctx.fmt("o", "#{pane_width}x#{pane_height}"), "100x29");
+    assert!(ctx.ok(&["display-message", "-a", "-t", "o"]).contains("session_name=o"));
+}
+
+#[test]
+fn buffers_and_paste() {
+    let ctx = Ctx::new("buf");
+    ctx.ok(&["new-session", "-d", "-s", "b"]);
+    ctx.wait_prompt("b");
+    ctx.ok(&["set-buffer", "-b", "one", "first"]);
+    ctx.ok(&["set-buffer", "second"]);
+    assert_eq!(ctx.ok(&["show-buffer", "-b", "one"]), "first");
+    assert_eq!(ctx.ok(&["show-buffer"]), "second");
+    let list = ctx.ok(&["list-buffers"]);
+    assert!(list.contains("one: 5 bytes: \"first\"") && list.contains("buffer0: 6 bytes"), "{list}");
+    ctx.ok(&["set-buffer", "-a", "-b", "one", "+more"]);
+    assert_eq!(ctx.ok(&["show-buffer", "-b", "one"]), "first+more");
+    ctx.ok(&["set-buffer", "-b", "one", "-n", "renamed"]);
+    assert_eq!(ctx.ok(&["show-buffer", "-b", "renamed"]), "first+more");
+    let file = std::env::temp_dir().join(format!("pt-buf-{}.txt", std::process::id()));
+    let fpath = file.to_string_lossy().to_string();
+    ctx.ok(&["save-buffer", "-b", "renamed", &fpath]);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "first+more");
+    std::fs::write(&file, "loaded-text").unwrap();
+    ctx.ok(&["load-buffer", "-b", "ld", &fpath]);
+    assert_eq!(ctx.ok(&["show-buffer", "-b", "ld"]), "loaded-text");
+    let _ = std::fs::remove_file(&file);
+    // paste into the shell and run it
+    ctx.ok(&["set-buffer", "-b", "cmd", "echo pasted-42"]);
+    ctx.ok(&["paste-buffer", "-b", "cmd", "-t", "b", "-d"]);
+    ctx.ok(&["send-keys", "-t", "b", "Enter"]);
+    wait_for("pasted output", || ctx.capture("b").matches("pasted-42").count() >= 2);
+    ctx.fails(&["show-buffer", "-b", "cmd"]);
+    ctx.ok(&["delete-buffer", "-b", "ld"]);
+    ctx.fails(&["show-buffer", "-b", "ld"]);
+}
+
+#[test]
+fn copy_mode_commands() {
+    let ctx = Ctx::new("copy");
+    ctx.ok(&["new-session", "-d", "-s", "c", "-x", "80", "-y", "24"]);
+    ctx.wait_prompt("c");
+    ctx.ok(&["send-keys", "-t", "c", "echo copy-me-123", "Enter"]);
+    wait_for("output", || ctx.capture("c").matches("copy-me-123").count() >= 2);
+    ctx.ok(&["copy-mode", "-t", "c"]);
+    assert_eq!(ctx.fmt("c", "#{pane_in_mode} #{pane_mode}"), "1 copy-mode");
+    ctx.ok(&["send-keys", "-t", "c", "-X", "search-backward", "copy-me-123"]);
+    ctx.ok(&["send-keys", "-t", "c", "-X", "select-line"]);
+    ctx.ok(&["send-keys", "-t", "c", "-X", "copy-selection-and-cancel"]);
+    assert_eq!(ctx.fmt("c", "#{pane_in_mode}"), "0");
+    let buf = ctx.ok(&["show-buffer"]);
+    assert!(buf.contains("copy-me-123"), "{buf:?}");
+    // key names sent to a pane in copy mode drive the mode (q quits)
+    ctx.ok(&["copy-mode", "-t", "c"]);
+    ctx.ok(&["send-keys", "-t", "c", "q"]);
+    assert_eq!(ctx.fmt("c", "#{pane_in_mode}"), "0");
+    // view mode for command output from clock / clear-history
+    ctx.ok(&["clock-mode", "-t", "c"]);
+    assert_eq!(ctx.fmt("c", "#{pane_mode}"), "clock-mode");
+    ctx.ok(&["send-keys", "-t", "c", "q"]);
+    assert_eq!(ctx.fmt("c", "#{pane_in_mode}"), "0");
+    ctx.ok(&["clear-history", "-t", "c"]);
+    assert_eq!(ctx.fmt("c", "#{history_size}"), "0");
+}
+
+#[test]
+fn layouts_swaps_and_moves() {
+    let ctx = Ctx::new("layout");
+    ctx.ok(&["new-session", "-d", "-s", "l", "-x", "121", "-y", "41"]);
+    for _ in 0..3 {
+        ctx.ok(&["split-window", "-t", "l"]);
+    }
+    assert_eq!(ids(&ctx, "l").len(), 4);
+    ctx.ok(&["select-layout", "-t", "l", "even-horizontal"]);
+    let widths: Vec<u32> = ctx.ok(&["lsp", "-t", "l", "-F", "#{pane_width}"]).lines().map(|w| w.parse().unwrap()).collect();
+    assert!(widths.iter().max().unwrap() - widths.iter().min().unwrap() <= 1, "{widths:?}");
+    ctx.ok(&["select-layout", "-t", "l", "tiled"]);
+    let layout = ctx.fmt("l", "#{window_layout}");
+    ctx.ok(&["select-layout", "-t", "l", "main-vertical"]);
+    ctx.ok(&["select-layout", "-t", "l", &layout]);
+    assert_eq!(ctx.fmt("l", "#{window_layout}"), layout);
+    ctx.ok(&["next-layout", "-t", "l"]);
+    // swap and rotate
+    let before = ids(&ctx, "l");
+    ctx.ok(&["swap-pane", "-s", &before[0], "-t", &before[1]]);
+    let after = ids(&ctx, "l");
+    assert_eq!((after[0].clone(), after[1].clone()), (before[1].clone(), before[0].clone()));
+    ctx.ok(&["rotate-window", "-t", "l"]);
+    let rotated = ids(&ctx, "l");
+    assert_eq!(rotated[0], after[1]);
+    // resize and zoom
+    ctx.ok(&["select-layout", "-t", "l", "even-horizontal"]);
+    let first = rotated[0].clone();
+    let w0: u32 = ctx.fmt(&first, "#{pane_width}").parse().unwrap();
+    ctx.ok(&["resize-pane", "-t", &first, "-R", "5"]);
+    let w1: u32 = ctx.fmt(&first, "#{pane_width}").parse().unwrap();
+    assert_eq!(w1, w0 + 5);
+    ctx.ok(&["resize-pane", "-t", &first, "-x", "50"]);
+    assert_eq!(ctx.fmt(&first, "#{pane_width}"), "50");
+    ctx.ok(&["resize-pane", "-Z", "-t", &first]);
+    assert_eq!(ctx.fmt("l", "#{window_zoomed_flag} #{pane_width}"), "1 121");
+    ctx.ok(&["resize-pane", "-Z", "-t", &first]);
+    // break and join
+    ctx.ok(&["break-pane", "-s", &first, "-d"]);
+    assert_eq!(ctx.ok(&["lsw", "-t", "l"]).lines().count(), 2);
+    ctx.ok(&["join-pane", "-s", &first, "-t", "l:0", "-h"]);
+    assert_eq!(ctx.ok(&["lsw", "-t", "l"]).lines().count(), 1);
+    assert_eq!(ids(&ctx, "l").len(), 4);
+    // kill-pane -a keeps only the target
+    ctx.ok(&["kill-pane", "-a", "-t", &first]);
+    assert_eq!(ids(&ctx, "l"), vec![first.clone()]);
+    // select-pane -T sets the title, -m marks
+    ctx.ok(&["select-pane", "-t", &first, "-T", "my title"]);
+    assert_eq!(ctx.fmt(&first, "#{pane_title}"), "my title");
+    ctx.ok(&["select-pane", "-m", "-t", &first]);
+    assert_eq!(ctx.fmt(&first, "#{pane_marked}"), "1");
+}
+
+#[test]
+fn windows_and_sessions() {
+    let ctx = Ctx::new("win");
+    ctx.ok(&["new-session", "-d", "-s", "a", "-n", "zero"]);
+    ctx.ok(&["new-window", "-t", "a", "-n", "one"]);
+    ctx.ok(&["new-window", "-t", "a", "-n", "two", "-d"]);
+    assert_eq!(ctx.fmt("a", "#{window_index}"), "1");
+    ctx.ok(&["move-window", "-s", "a:two", "-t", "a:7"]);
+    assert_eq!(ctx.ok(&["lsw", "-t", "a", "-F", "#{window_index}"]).lines().collect::<Vec<_>>(), vec!["0", "1", "7"]);
+    ctx.ok(&["swap-window", "-s", "a:0", "-t", "a:7"]);
+    assert_eq!(ctx.fmt("a:0", "#{window_name}"), "two");
+    ctx.ok(&["move-window", "-r", "-t", "a"]);
+    assert_eq!(ctx.ok(&["lsw", "-t", "a", "-F", "#{window_index}:#{window_name}"]).lines().collect::<Vec<_>>(), vec!["0:two", "1:one", "2:zero"]);
+    ctx.ok(&["select-window", "-t", "a:2"]);
+    ctx.ok(&["last-window", "-t", "a"]);
+    assert_eq!(ctx.fmt("a", "#{window_index}"), "1");
+    ctx.ok(&["next-window", "-t", "a"]);
+    assert_eq!(ctx.fmt("a", "#{window_index}"), "2");
+    ctx.ok(&["previous-window", "-t", "a"]);
+    assert_eq!(ctx.fmt("a", "#{window_index}"), "1");
+    ctx.ok(&["rename-window", "-t", "a:1", "uno"]);
+    assert_eq!(ctx.fmt("a:1", "#W #{automatic-rename}"), "uno off");
+    ctx.ok(&["find-window", "-t", "a", "-N", "zero"]);
+    assert_eq!(ctx.fmt("a", "#{window_name}"), "zero");
+    // link into another session
+    ctx.ok(&["new-session", "-d", "-s", "b"]);
+    ctx.ok(&["link-window", "-s", "a:uno", "-t", "b:5"]);
+    assert_eq!(ctx.fmt("b:5", "#{window_name} #{window_linked}"), "uno 1");
+    ctx.ok(&["unlink-window", "-t", "b:5"]);
+    assert_eq!(ctx.ok(&["lsw", "-t", "b"]).lines().count(), 1);
+    // base-index and renumber-windows
+    ctx.ok(&["set", "-g", "base-index", "1"]);
+    ctx.ok(&["set", "-g", "renumber-windows", "on"]);
+    ctx.ok(&["new-session", "-d", "-s", "c"]);
+    assert_eq!(ctx.fmt("c", "#{window_index}"), "1");
+    ctx.ok(&["new-window", "-t", "c"]);
+    ctx.ok(&["new-window", "-t", "c"]);
+    ctx.ok(&["kill-window", "-t", "c:2"]);
+    assert_eq!(ctx.ok(&["lsw", "-t", "c", "-F", "#I"]).lines().collect::<Vec<_>>(), vec!["1", "2"]);
+    // sessions
+    ctx.ok(&["rename-session", "-t", "c", "cee"]);
+    ctx.ok(&["has-session", "-t", "cee"]);
+    ctx.fails(&["new-session", "-d", "-s", "cee"]);
+    ctx.ok(&["kill-session", "-a", "-t", "cee"]);
+    assert_eq!(ctx.ok(&["ls", "-F", "#S"]).trim(), "cee");
+    // prefix matching and $id targets
+    let id = ctx.fmt("ce", "#{session_id}");
+    assert_eq!(ctx.fmt(&id, "#S"), "cee");
+    ctx.fails(&["bogus-command"]);
+}
+
+#[test]
+fn hooks_shell_and_wait() {
+    let ctx = Ctx::new("hooks");
+    ctx.ok(&["new-session", "-d", "-s", "h"]);
+    ctx.ok(&["set-hook", "-g", "after-new-window", "set -g @hooked yes"]);
+    ctx.ok(&["new-window", "-t", "h"]);
+    assert_eq!(ctx.fmt("h", "#{@hooked}"), "yes");
+    assert!(ctx.ok(&["show-hooks", "-g"]).contains("after-new-window"));
+    ctx.ok(&["set-hook", "-gu", "after-new-window"]);
+    // run-shell output goes to stdout for CLI clients
+    assert_eq!(ctx.ok(&["run-shell", "echo from-shell"]).trim(), "from-shell");
+    ctx.ok(&["if-shell", "exit 0", "set -g @if yes", "set -g @if no"]);
+    assert_eq!(ctx.fmt("h", "#{@if}"), "yes");
+    ctx.ok(&["if-shell", "exit 1", "set -g @if yes", "set -g @if no"]);
+    assert_eq!(ctx.fmt("h", "#{@if}"), "no");
+    ctx.ok(&["if-shell", "-F", "#{==:#S,h}", "set -g @iff match"]);
+    assert_eq!(ctx.fmt("h", "#{@iff}"), "match");
+    // command lists with ;
+    ctx.ok(&["set", "-g", "@a", "1", ";", "set", "-g", "@b", "2"]);
+    assert_eq!(ctx.fmt("h", "#{@a}#{@b}"), "12");
+    // wait-for blocks until signalled
+    let mut waiter = ctx.command().args(["wait-for", "chan"]).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(waiter.try_wait().unwrap().is_none(), "wait-for returned early");
+    ctx.ok(&["wait-for", "-S", "chan"]);
+    wait_for("waiter exit", || waiter.try_wait().unwrap().is_some());
+    // environment
+    ctx.ok(&["set-environment", "-t", "h", "FOO_PT", "bar"]);
+    assert!(ctx.ok(&["show-environment", "-t", "h", "FOO_PT"]).contains("FOO_PT=bar"));
+    ctx.ok(&["set-environment", "-t", "h", "-u", "FOO_PT"]);
+    assert!(!ctx.ok(&["show-environment", "-t", "h"]).contains("FOO_PT"));
+}
+
+#[test]
+fn keys_config_and_capture() {
+    let ctx = Ctx::new("keys");
+    ctx.ok(&["new-session", "-d", "-s", "k"]);
+    ctx.ok(&["bind-key", "-T", "prefix", "y", "display-message", "hi"]);
+    assert!(ctx.ok(&["list-keys", "-T", "prefix", "y"]).contains("display-message hi"));
+    ctx.ok(&["unbind-key", "y"]);
+    assert!(!ctx.ok(&["list-keys", "-T", "prefix"]).contains("display-message hi"));
+    assert!(ctx.ok(&["list-keys", "-N"]).contains("Split window horizontally"));
+    // config file in tmux syntax
+    let conf = std::env::temp_dir().join(format!("pt-conf-{}.conf", std::process::id()));
+    std::fs::write(
+        &conf,
+        "# comment\nset -g @conf loaded\nbind -n F5 { set -g @f5 pressed ; display done }\nset -g status-right '#[fg=yellow]%H:%M'\n%if #{==:#{host},#{host}}\nset -g @cond yes\n%endif\n",
+    )
+    .unwrap();
+    ctx.ok(&["source-file", &conf.to_string_lossy()]);
+    let _ = std::fs::remove_file(&conf);
+    assert_eq!(ctx.fmt("k", "#{@conf} #{@cond}"), "loaded yes");
+    assert!(ctx.ok(&["list-keys", "-T", "root", "F5"]).contains("set -g @f5 pressed"));
+    ctx.fails(&["source-file", "/no/such/file.conf"]);
+    ctx.ok(&["source-file", "-q", "/no/such/file.conf"]);
+    // send-keys variants and capture-pane
+    ctx.wait_prompt("k");
+    ctx.ok(&["send-keys", "-t", "k", "-l", "echo literal-Enter"]);
+    ctx.ok(&["send-keys", "-t", "k", "-H", "0d"]);
+    wait_for("literal", || ctx.capture("k").matches("literal-Enter").count() >= 2);
+    ctx.ok(&["send-keys", "-t", "k", "-N", "3", "x"]);
+    wait_for("repeat", || ctx.capture("k").contains("xxx"));
+    ctx.ok(&["send-keys", "-t", "k", "C-u"]);
+    let all = ctx.ok(&["capture-pane", "-p", "-t", "k", "-S", "-", "-E", "-"]);
+    assert!(all.contains("literal-Enter"));
+    let esc = ctx.ok(&["capture-pane", "-p", "-e", "-t", "k"]);
+    assert!(!esc.is_empty());
+    ctx.ok(&["capture-pane", "-t", "k", "-b", "cap"]);
+    assert!(ctx.ok(&["show-buffer", "-b", "cap"]).contains("literal-Enter"));
+}
+
+#[test]
+fn respawn_and_remain_on_exit() {
+    let ctx = Ctx::new("respawn");
+    ctx.ok(&["new-session", "-d", "-s", "r"]);
+    ctx.ok(&["set", "-g", "remain-on-exit", "on"]);
+    ctx.wait_prompt("r");
+    ctx.ok(&["send-keys", "-t", "r", "exit", "Enter"]);
+    wait_for("pane dead", || ctx.fmt("r", "#{pane_dead}") == "1");
+    assert!(ctx.capture("r").contains("Pane is dead"));
+    ctx.ok(&["respawn-pane", "-t", "r"]);
+    wait_for("pane alive", || ctx.fmt("r", "#{pane_dead}") == "0");
+    ctx.fails(&["respawn-pane", "-t", "r"]); // still running without -k
+    ctx.ok(&["respawn-pane", "-k", "-t", "r"]);
+    ctx.ok(&["set", "-g", "remain-on-exit", "off"]);
+    ctx.ok(&["split-window", "-t", "r"]);
+    ctx.ok(&["respawn-window", "-k", "-t", "r"]);
+    assert_eq!(ids(&ctx, "r").len(), 1);
+}
+
+#[test]
+fn split_window_options() {
+    let ctx = Ctx::new("split");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "101", "-y", "41"]);
+    let p = ctx.ok(&["split-window", "-h", "-l", "30", "-t", "s", "-P", "-F", "#{pane_id}"]).trim().to_string();
+    assert_eq!(ctx.fmt(&p, "#{pane_width}"), "30");
+    let q = ctx.ok(&["split-window", "-v", "-b", "-l", "25%", "-t", &p, "-P", "-F", "#{pane_id}"]).trim().to_string();
+    assert_eq!(ctx.fmt(&q, "#{pane_top} #{pane_height}"), "0 10");
+    ctx.ok(&["split-window", "-f", "-v", "-t", "s", "-d"]);
+    assert_eq!(ctx.fmt("s", "#{window_panes}"), "4");
+    let full = ids(&ctx, "s").last().unwrap().clone();
+    assert_eq!(ctx.fmt(&full, "#{pane_width}"), "101");
+    // -c sets the directory
+    let dir = std::env::temp_dir();
+    let d = ctx.ok(&["split-window", "-t", "s", "-c", &dir.to_string_lossy(), "-P", "-F", "#{pane_start_path}"]);
+    assert_eq!(std::path::Path::new(d.trim()), dir.as_path());
+}

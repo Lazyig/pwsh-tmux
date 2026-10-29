@@ -2615,11 +2615,11 @@ impl Server {
         let c = self.clients.get(&cid).ok_or("no client")?;
         if !c.attached {
             let ident = c.ident.as_ref();
-            if !ident.is_some_and(|i| i.tty) {
-                return err("not a terminal");
-            }
             if ident.is_some_and(|i| i.ctx_pane.is_some()) {
                 return err("sessions should be nested with care, unset PWSH_TMUX to force");
+            }
+            if !ident.is_some_and(|i| i.tty) {
+                return err("open terminal failed: not a terminal");
             }
         }
         if detach_others {

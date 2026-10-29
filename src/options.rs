@@ -103,7 +103,7 @@ pub static DEFS: &[OptDef] = &[
     d("visual-activity", Session, Choice(&["off", "on", "both"]), "off"),
     d("visual-bell", Session, Choice(&["off", "on", "both"]), "off"),
     d("visual-silence", Session, Choice(&["off", "on", "both"]), "off"),
-    d("word-separators", Session, Str, " "),
+    d("word-separators", Session, Str, "!\"#$%&'()*+,-./:;<=>?@[\\]^`{|}~"),
     // window
     d("aggressive-resize", Window, Flag, "off"),
     d("automatic-rename", Window, Flag, "on"),
