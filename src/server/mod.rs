@@ -195,6 +195,12 @@ impl Pane {
     }
 }
 
+/// Drops a pane off the main loop: on older Windows (10, Server 2022) ClosePseudoConsole
+/// blocks until conhost exits, which would freeze every client.
+fn release(p: Pane) {
+    thread::spawn(move || drop(p));
+}
+
 pub fn nz(v: u16) -> NonZeroU16 {
     NonZeroU16::new(v).unwrap_or(NonZeroU16::MIN)
 }
@@ -1233,7 +1239,7 @@ impl Server {
         let prog = procinfo::program_name(&argv[0]);
         let existing_opts = self.panes.get(&id).map(|p| p.options.clone()).unwrap_or_default();
         let title = self.panes.get(&id).map(|p| p.title.clone()).unwrap_or_else(|| self.host.clone());
-        self.panes.insert(
+        let previous = self.panes.insert(
             id,
             Pane {
                 id,
@@ -1257,6 +1263,9 @@ impl Server {
                 current_path: dir,
             },
         );
+        if let Some(old) = previous {
+            release(old); // respawn: the old pty
+        }
         Ok(())
     }
 
@@ -1264,6 +1273,7 @@ impl Server {
     pub fn destroy_pane(&mut self, id: PaneId) {
         if let Some(mut p) = self.panes.remove(&id) {
             p.kill();
+            release(p);
         }
         if self.marked == Some(id) {
             self.marked = None;

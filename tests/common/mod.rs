@@ -92,14 +92,19 @@ pub struct Term {
 
 impl Term {
     pub fn attach(ctx: &Ctx, args: &[&str], cols: u16, rows: u16) -> Term {
-        let pty = native_pty_system();
-        let pair = pty.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).unwrap();
         let mut cb = CommandBuilder::new(BIN);
         cb.args(args);
         cb.env("PWSH_TMUX_SOCKET", &ctx.socket);
         cb.env_remove("PWSH_TMUX");
         cb.env_remove("PWSH_TMUX_PANE");
         cb.env("TERM", "xterm-256color");
+        Term::spawn(cb, cols, rows)
+    }
+
+    /// Runs any program (e.g. `ssh -tt host pwsh-tmux ...`) in a pty.
+    pub fn spawn(cb: CommandBuilder, cols: u16, rows: u16) -> Term {
+        let pty = native_pty_system();
+        let pair = pty.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).unwrap();
         let child = pair.slave.spawn_command(cb).unwrap();
         drop(pair.slave);
         let screen = Arc::new(Mutex::new(vt100::Parser::new(nz(rows), nz(cols), 0)));
