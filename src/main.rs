@@ -1,72 +1,101 @@
-#[allow(dead_code)]
 mod cells;
 mod client;
+mod cmdparse;
+#[allow(dead_code)]
+mod copymode;
+mod format;
 mod ipc;
+#[allow(dead_code)]
+mod keys;
+#[allow(dead_code)]
 mod layout;
+mod options;
 mod opts;
 mod protocol;
 mod server;
 mod term;
 
 const USAGE: &str = "\
-usage: pwsh-tmux [-L socket] [command [flags]]
+usage: pwsh-tmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]
+                 [-S socket-path] [-T features] [command [flags]]
 
-Sessions
-  new-session [-d] [-s name] [-n window] [-c dir] [-x cols] [-y rows] [cmd...]
-  attach-session [-t target]        list-sessions (ls)
-  kill-session [-t target]          rename-session [-t target] name
-  has-session [-t target]           detach-client [-s target]
-  kill-server
+pwsh-tmux is a terminal multiplexer compatible with tmux's commands, key bindings,
+options and formats, for Windows (ConPTY) and Unix.
 
-Windows and panes
-  new-window [-d] [-t target] [-n name] [-c dir] [cmd...]
-  split-window [-h|-v] [-d] [-t target] [-c dir] [cmd...]
-  select-window -t target | -n | -p | -l     next-window, previous-window, last-window
-  select-pane [-t target] [-L|-R|-U|-D|-l]   resize-pane [-t target] -L|-R|-U|-D [n] | -Z
-  kill-window [-t target]  kill-pane [-t target]  rename-window [-t target] name
-  list-windows (lsw)  list-panes (lsp)
+Run `pwsh-tmux list-commands` for every command and `pwsh-tmux list-keys` for the
+key bindings (default prefix: C-b). Configuration is read from ~/.pwsh-tmux.conf
+or ~/.config/pwsh-tmux/pwsh-tmux.conf (tmux syntax; `source-file ~/.tmux.conf` works).
 
-Scripting
-  send-keys [-l] [-t target] key...   (Enter, Tab, Escape, BSpace, Up, C-c, M-x, ...)
-  capture-pane -p [-t target]         display-message -p [-t target] '#{session_name}'
-
-Targets: session, session:window, session:window.pane, %pane-id
-
-Keys (prefix Ctrl+b)
-  \"  split top/bottom     %  split left/right    arrows  move between panes
-  c  new window           n/p  next/prev window  0-9  select window   l  last window
-  o  next pane            ;  last pane           z  zoom pane        x  kill pane
-  &  kill window          d  detach              Ctrl/Alt+arrows  resize pane
-  Ctrl+b  send a literal Ctrl+b
-
-Environment: PWSH_TMUX_SHELL overrides the default shell (pwsh, then powershell
-on Windows; pwsh, then $SHELL on Unix).
+Environment: PWSH_TMUX_SHELL overrides the default shell (pwsh, then powershell on
+Windows; pwsh, then $SHELL on Unix).
 ";
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("-L") && args.len() >= 2 {
-        // Safe: no other threads exist yet.
-        unsafe { std::env::set_var("PWSH_TMUX_SOCKET", &args[1]) };
-        args.drain(..2);
-    }
-    let code = match args.first().map(String::as_str) {
-        Some("__server") => match server::run() {
+    if args.first().map(String::as_str) == Some("__server") {
+        let config = args.get(1).cloned();
+        let code = match server::run(config) {
             Ok(()) => 0,
             Err(e) => {
                 server::log(&format!("server failed: {e}"));
                 1
             }
-        },
-        Some("-V" | "--version" | "version") => {
-            println!("pwsh-tmux {}", env!("CARGO_PKG_VERSION"));
-            0
+        };
+        std::process::exit(code);
+    }
+    let mut g = client::Global { config: None, no_start: false };
+    let mut shell_cmd = None;
+    // global flags before the command
+    while let Some(a) = args.first().cloned() {
+        if !a.starts_with('-') || a == "-" {
+            break;
         }
-        Some("-h" | "--help" | "help") => {
-            print!("{USAGE}");
-            0
+        args.remove(0);
+        let mut chars = a[1..].chars().peekable();
+        while let Some(c) = chars.next() {
+            let mut value = || -> Option<String> {
+                let rest: String = chars.by_ref().collect();
+                if !rest.is_empty() { Some(rest) } else if !args.is_empty() { Some(args.remove(0)) } else { None }
+            };
+            match c {
+                // Safe: no other threads exist yet.
+                'L' => unsafe { std::env::set_var("PWSH_TMUX_SOCKET", value().unwrap_or_default()) },
+                'S' => unsafe { std::env::set_var("PWSH_TMUX_SOCKET_PATH", value().unwrap_or_default()) },
+                'f' => g.config = value(),
+                'c' => shell_cmd = value(),
+                'T' => {
+                    value();
+                }
+                'N' => g.no_start = true,
+                'V' => {
+                    println!("pwsh-tmux {}", env!("CARGO_PKG_VERSION"));
+                    return;
+                }
+                'h' => {
+                    print!("{USAGE}");
+                    return;
+                }
+                '2' | 'C' | 'D' | 'l' | 'u' | 'v' => {}
+                '-' => {
+                    if a == "--help" {
+                        print!("{USAGE}");
+                        return;
+                    }
+                    if a == "--version" {
+                        println!("pwsh-tmux {}", env!("CARGO_PKG_VERSION"));
+                        return;
+                    }
+                }
+                _ => {
+                    eprintln!("pwsh-tmux: unknown option -- {c}\n{USAGE}");
+                    std::process::exit(1);
+                }
+            }
         }
-        _ => client::main(args),
-    };
-    std::process::exit(code);
+    }
+    if let Some(cmd) = shell_cmd {
+        let status = server::procinfo::job_command(&cmd).status().map(|s| s.code().unwrap_or(1)).unwrap_or(127);
+        std::process::exit(status);
+    }
+    std::process::exit(client::main(args, g));
 }

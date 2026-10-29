@@ -1,0 +1,641 @@
+//! Composes a client's screen (panes, borders, status line, overlays) and sends the diff.
+
+use super::modes::{big_text, clock_text};
+use super::vars::Target;
+use super::*;
+use crate::cells::{Cell, Color, Line, Style, BLINK, BOLD, DIM, INVERSE, ITALIC, STRIKE, UNDERLINE};
+use crate::format::{self, Span};
+use std::fmt::Write as _;
+use unicode_width::UnicodeWidthChar;
+
+pub struct Frame {
+    pub w: u16,
+    pub h: u16,
+    pub cells: Vec<Cell>,
+}
+
+impl Frame {
+    pub fn new(w: u16, h: u16) -> Frame {
+        Frame { w, h, cells: vec![Cell::default(); w as usize * h as usize] }
+    }
+    pub fn set(&mut self, x: u16, y: u16, cell: Cell) {
+        if x < self.w && y < self.h {
+            let i = y as usize * self.w as usize + x as usize;
+            // Overwriting half of a wide char: blank the other half.
+            if self.cells[i].text.is_empty() && x > 0 {
+                self.cells[i - 1] = Cell { text: " ".into(), style: self.cells[i - 1].style };
+            }
+            if !cell.text.is_empty() && x + 1 < self.w && self.cells[i + 1].text.is_empty() && self.cells[i].text.chars().next().and_then(|c| c.width()) == Some(2) {
+                self.cells[i + 1] = Cell { text: " ".into(), style: self.cells[i + 1].style };
+            }
+            self.cells[i] = cell;
+        }
+    }
+    pub fn get(&self, x: u16, y: u16) -> Option<&Cell> {
+        (x < self.w && y < self.h).then(|| &self.cells[y as usize * self.w as usize + x as usize])
+    }
+    pub fn row(&self, y: u16) -> &[Cell] {
+        let w = self.w as usize;
+        &self.cells[y as usize * w..(y as usize + 1) * w]
+    }
+    /// Writes `text` from (x, y) up to column `limit`; returns the next column.
+    pub fn text(&mut self, mut x: u16, y: u16, text: &str, style: Style, limit: u16) -> u16 {
+        for ch in text.chars() {
+            let cw = ch.width().unwrap_or(0) as u16;
+            if cw == 0 {
+                continue;
+            }
+            if x + cw > limit.min(self.w) {
+                break;
+            }
+            self.set(x, y, Cell { text: ch.to_string(), style });
+            if cw == 2 {
+                self.set(x + 1, y, Cell { text: String::new(), style });
+            }
+            x += cw;
+        }
+        x
+    }
+    pub fn put_cells(&mut self, x: u16, y: u16, cells: &[Cell]) {
+        for (i, c) in cells.iter().enumerate() {
+            self.set(x + i as u16, y, c.clone());
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub struct Modes {
+    pub app_cursor: bool,
+    pub bracketed_paste: bool,
+    pub mouse: bool,
+    pub focus: bool,
+    pub cursor_style: u8,
+}
+
+pub fn draw_box(f: &mut Frame, x: u16, y: u16, w: u16, h: u16, style: Style, title: &str) {
+    if w < 2 || h < 2 {
+        return;
+    }
+    for i in x + 1..x + w - 1 {
+        f.set(i, y, Cell { text: "─".into(), style });
+        f.set(i, y + h - 1, Cell { text: "─".into(), style });
+    }
+    for j in y + 1..y + h - 1 {
+        f.set(x, j, Cell { text: "│".into(), style });
+        f.set(x + w - 1, j, Cell { text: "│".into(), style });
+    }
+    f.set(x, y, Cell { text: "┌".into(), style });
+    f.set(x + w - 1, y, Cell { text: "┐".into(), style });
+    f.set(x, y + h - 1, Cell { text: "└".into(), style });
+    f.set(x + w - 1, y + h - 1, Cell { text: "┘".into(), style });
+    if !title.is_empty() && w > 4 {
+        f.text(x + 2, y, &format!(" {title} "), style, x + w - 2);
+    }
+}
+
+fn push_color(out: &mut String, c: Color, base: u8) {
+    match c {
+        Color::Default => {}
+        Color::Idx(i) if i < 8 => {
+            let _ = write!(out, ";{}", base + i);
+        }
+        Color::Idx(i) if i < 16 => {
+            let _ = write!(out, ";{}", base + 60 + i - 8);
+        }
+        Color::Idx(i) => {
+            let _ = write!(out, ";{};5;{}", base + 8, i);
+        }
+        Color::Rgb(r, g, b) => {
+            let _ = write!(out, ";{};2;{};{};{}", base + 8, r, g, b);
+        }
+    }
+}
+
+pub fn push_sgr(out: &mut String, st: &Style) {
+    out.push_str("\x1b[0");
+    for (bit, code) in [(BOLD, ";1"), (DIM, ";2"), (ITALIC, ";3"), (UNDERLINE, ";4"), (BLINK, ";5"), (INVERSE, ";7"), (STRIKE, ";9")] {
+        if st.attrs & bit != 0 {
+            out.push_str(code);
+        }
+    }
+    push_color(out, st.fg, 30);
+    push_color(out, st.bg, 40);
+    out.push('m');
+}
+
+/// capture-pane -e: text with SGR escapes.
+pub fn line_with_escapes(line: &Line) -> String {
+    let mut out = String::new();
+    let mut cur = Style::default();
+    for c in &line.cells {
+        if c.text.is_empty() {
+            continue;
+        }
+        if c.style != cur {
+            push_sgr(&mut out, &c.style);
+            cur = c.style;
+        }
+        out.push_str(&c.text);
+    }
+    let trimmed = out.trim_end_matches(' ').to_string();
+    if cur != Style::default() { trimmed + "\x1b[0m" } else { trimmed }
+}
+
+fn overlay_style(cell: &mut Style, over: Style) {
+    if cell.fg == Color::Default {
+        cell.fg = over.fg;
+    }
+    if cell.bg == Color::Default {
+        cell.bg = over.bg;
+    }
+}
+
+fn spans_cells(spans: &[Span], max: usize, fill: Style) -> Vec<Cell> {
+    let total: usize = spans.iter().map(|s| format::width(&s.text)).sum();
+    let left_aligned: Vec<Span> = spans.iter().map(|s| Span { align: format::Align::Left, ..s.clone() }).collect();
+    format::layout_line(&left_aligned, total.min(max), fill)
+}
+
+const BORDER_SETS: [(&str, [&str; 11]); 4] = [
+    // h, v, tl, tr, bl, br, cross, t-down, t-up, t-right, t-left
+    ("single", ["─", "│", "┌", "┐", "└", "┘", "┼", "┬", "┴", "├", "┤"]),
+    ("double", ["═", "║", "╔", "╗", "╚", "╝", "╬", "╦", "╩", "╠", "╣"]),
+    ("heavy", ["━", "┃", "┏", "┓", "┗", "┛", "╋", "┳", "┻", "┣", "┫"]),
+    ("simple", ["-", "|", "+", "+", "+", "+", "+", "+", "+", "+", "+"]),
+];
+
+impl Server {
+    pub fn render_all(&mut self) {
+        let ids: Vec<ClientId> = self.clients.iter().filter(|(_, c)| c.dirty && c.attached && !c.suspended && c.session.is_some()).map(|(id, _)| *id).collect();
+        for id in ids {
+            self.render(id);
+        }
+    }
+
+    fn status_style(&self, sid: SessId) -> Style {
+        let mut base = format::parse_style(&self.opt_session(Some(sid), "status-style"), Style::default()).unwrap_or_default();
+        if let Some(c) = format::parse_color(&self.opt_session(Some(sid), "status-fg")).filter(|c| *c != Color::Default) {
+            base.fg = c;
+        }
+        if let Some(c) = format::parse_color(&self.opt_session(Some(sid), "status-bg")).filter(|c| *c != Color::Default) {
+            base.bg = c;
+        }
+        base
+    }
+
+    fn status_line(&self, cid: ClientId, sid: SessId, width: u16) -> Vec<Cell> {
+        let s = &self.sessions[&sid];
+        let width = width as usize;
+        let base = self.status_style(sid);
+        let cur = Target { sid: Some(sid), idx: Some(s.active), wid: Some(s.active_window()), pane: Some(self.windows[&s.active_window()].active) };
+        let left_style = format::parse_style(&self.opt_session(Some(sid), "status-left-style"), base).unwrap_or(base);
+        let right_style = format::parse_style(&self.opt_session(Some(sid), "status-right-style"), base).unwrap_or(base);
+        let left = self.expand_time(cur, Some(cid), &self.opt_session(Some(sid), "status-left"));
+        let right = self.expand_time(cur, Some(cid), &self.opt_session(Some(sid), "status-right"));
+        let left_len = self.opt_session_num(Some(sid), "status-left-length").max(0) as usize;
+        let right_len = self.opt_session_num(Some(sid), "status-right-length").max(0) as usize;
+        let lcells = spans_cells(&format::spans(&left, left_style), left_len.min(width), base);
+        let rcells = spans_cells(&format::spans(&right, right_style), right_len.min(width.saturating_sub(lcells.len())), base);
+
+        // window list
+        let sep = self.opt_window(None, "window-status-separator");
+        let mut wcells: Vec<Cell> = Vec::new();
+        let mut cur_range = (0, 0);
+        let n = s.links.len();
+        for (k, (idx, wid)) in s.links.iter().enumerate() {
+            let wid = *wid;
+            let t = Target { sid: Some(sid), idx: Some(*idx), wid: Some(wid), pane: Some(self.windows[&wid].active) };
+            let is_cur = *idx == s.active;
+            let fmt = self.opt_window(Some(wid), if is_cur { "window-status-current-format" } else { "window-status-format" });
+            let mut st = format::parse_style(&self.opt_window(Some(wid), "window-status-style"), base).unwrap_or(base);
+            if is_cur {
+                st = format::parse_style(&self.opt_window(Some(wid), "window-status-current-style"), st).unwrap_or(st);
+            } else if s.last.first() == Some(idx) {
+                st = format::parse_style(&self.opt_window(Some(wid), "window-status-last-style"), st).unwrap_or(st);
+            }
+            let alerts = s.alerts.get(idx).copied().unwrap_or(0);
+            if alerts & ALERT_BELL != 0 {
+                st = format::parse_style(&self.opt_window(Some(wid), "window-status-bell-style"), st).unwrap_or(st);
+            } else if alerts & (ALERT_ACTIVITY | ALERT_SILENCE) != 0 {
+                st = format::parse_style(&self.opt_window(Some(wid), "window-status-activity-style"), st).unwrap_or(st);
+            }
+            let text = self.expand_time(t, Some(cid), &fmt);
+            let start = wcells.len();
+            wcells.extend(spans_cells(&format::spans(&text, st), usize::MAX, st));
+            if is_cur {
+                cur_range = (start, wcells.len());
+            }
+            if k + 1 < n {
+                wcells.extend(spans_cells(&format::spans(&sep, base), usize::MAX, base));
+            }
+        }
+        let avail = width.saturating_sub(lcells.len() + rcells.len());
+        // keep the current window visible when the list is too long
+        let (wstart, wlen) = if wcells.len() <= avail {
+            (0, wcells.len())
+        } else {
+            let start = if cur_range.1 > avail { cur_range.1 - avail } else { 0 };
+            (start, avail)
+        };
+        let mut wslice: Vec<Cell> = wcells[wstart..wstart + wlen].to_vec();
+        if let Some(c) = wslice.first_mut() {
+            if c.text.is_empty() {
+                *c = Cell { text: " ".into(), style: c.style };
+            }
+        }
+        if wstart > 0 {
+            if let Some(c) = wslice.first_mut() {
+                *c = Cell { text: "<".into(), style: c.style };
+            }
+        }
+        if wstart + wlen < wcells.len() {
+            if let Some(c) = wslice.last_mut() {
+                *c = Cell { text: ">".into(), style: c.style };
+            }
+        }
+        let mut line = vec![Cell { text: " ".into(), style: base }; width];
+        let justify = self.opt_session(Some(sid), "status-justify");
+        let wpos = match justify.as_str() {
+            "centre" => lcells.len() + (avail - wslice.len()) / 2,
+            "absolute-centre" => (width.saturating_sub(wslice.len()) / 2).max(lcells.len()),
+            "right" => lcells.len() + avail - wslice.len(),
+            _ => lcells.len(),
+        };
+        for (i, c) in lcells.into_iter().enumerate() {
+            line[i] = c;
+        }
+        for (i, c) in wslice.into_iter().enumerate() {
+            if wpos + i < width {
+                line[wpos + i] = c;
+            }
+        }
+        let rstart = width - rcells.len();
+        for (i, c) in rcells.into_iter().enumerate() {
+            line[rstart + i] = c;
+        }
+        // a wide char cut by a region boundary
+        for i in 0..width {
+            if line[i].text.is_empty() && (i == 0 || line[i - 1].text.chars().next().and_then(|c| c.width()) != Some(2)) {
+                line[i].text = " ".into();
+            }
+        }
+        line
+    }
+
+    fn compose(&self, cid: ClientId) -> Option<RenderState> {
+        let c = self.clients.get(&cid)?;
+        let sid = c.session?;
+        let s = self.sessions.get(&sid)?;
+        let (cw, ch) = (c.size.0.max(1), c.size.1.max(1));
+        let mut f = Frame::new(cw, ch);
+        let wid = s.active_window();
+        let win = &self.windows[&wid];
+        let nstatus = self.status_lines(Some(sid)).min(ch.saturating_sub(1));
+        let top = self.opt_session(Some(sid), "status-position") == "top";
+        let oy = if top { nstatus } else { 0 };
+        let (rects, seps) = self.rects(wid);
+        let mut cursor = None;
+        let mut modes = Modes { mouse: self.opt_session_on(Some(sid), "mouse"), focus: options::is_on(&self.opt_server("focus-events")), ..Modes::default() };
+        let active_rect = rects.iter().find(|(p, _)| *p == win.active).map(|(_, r)| *r);
+        let area_h = ch.saturating_sub(nstatus);
+        let border_status = self.opt_window(Some(wid), "pane-border-status");
+        let active_border = format::parse_style(&self.opt_window(Some(wid), "pane-active-border-style"), Style::default()).unwrap_or_default();
+        let inactive_border = format::parse_style(&self.opt_window(Some(wid), "pane-border-style"), Style::default()).unwrap_or_default();
+        let lines_kind = self.opt_window(Some(wid), "pane-border-lines");
+        let bset = BORDER_SETS.iter().find(|(n, _)| *n == lines_kind).map(|(_, s)| *s).unwrap_or(BORDER_SETS[0].1);
+
+        // panes
+        for (id, r) in &rects {
+            let Some(p) = self.panes.get(id) else { continue };
+            let cr = self.content_rect(wid, *r);
+            let is_active = *id == win.active;
+            let wstyle = format::parse_style(&self.opt_pane(*id, if is_active { "window-active-style" } else { "window-style" }), Style::default()).unwrap_or_default();
+            let wstyle = if is_active && wstyle == Style::default() { format::parse_style(&self.opt_pane(*id, "window-style"), Style::default()).unwrap_or_default() } else { wstyle };
+            let mode_lines: Option<(Vec<Line>, Option<(u16, u16)>)> = match &p.mode {
+                Some(PaneMode::Copy(cm)) => {
+                    let (lines, cur) = cm.render();
+                    Some((lines, Some(cur)))
+                }
+                Some(PaneMode::Tree(t)) => Some((t.render(self, cr.w, cr.h), None)),
+                Some(PaneMode::Clock) => Some((Vec::new(), None)),
+                None => None,
+            };
+            match &mode_lines {
+                Some((lines, _)) => {
+                    for (y, line) in lines.iter().enumerate().take(cr.h as usize) {
+                        for (x, cell) in line.cells.iter().enumerate().take(cr.w as usize) {
+                            let mut cell = cell.clone();
+                            overlay_style(&mut cell.style, wstyle);
+                            f.set(cr.x + x as u16, oy + cr.y + y as u16, cell);
+                        }
+                    }
+                }
+                None => {
+                    let scr = p.screen();
+                    for y in 0..cr.h {
+                        for x in 0..cr.w {
+                            let Some(vc) = scr.cell(y, x) else { continue };
+                            let mut cell = crate::cells::cell_from_vt(vc);
+                            if vc.is_wide() && (x + 1 >= cr.w || cr.x + x + 1 >= cw) {
+                                cell.text = " ".into();
+                            }
+                            overlay_style(&mut cell.style, wstyle);
+                            f.set(cr.x + x, oy + cr.y + y, cell);
+                        }
+                    }
+                }
+            }
+            if matches!(p.mode, Some(PaneMode::Clock)) {
+                let colour = format::parse_color(&self.opt_window(Some(wid), "clock-mode-colour")).unwrap_or(Color::Idx(4));
+                let text = clock_text(self.opt_window(Some(wid), "clock-mode-style") != "12");
+                let rr = Rect { y: oy + cr.y, ..cr };
+                if !big_text(&mut f, rr, &text, colour) {
+                    f.text(cr.x, oy + cr.y + cr.h / 2, &text, Style { fg: colour, ..Style::default() }, cr.x + cr.w);
+                }
+            }
+            if is_active {
+                match &mode_lines {
+                    Some((_, Some((cx, cy)))) => {
+                        if *cx < cr.w && *cy < cr.h {
+                            cursor = Some((cr.x + cx, oy + cr.y + cy));
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        let scr = p.screen();
+                        modes.app_cursor = scr.application_cursor();
+                        modes.bracketed_paste = scr.bracketed_paste();
+                        modes.cursor_style = scr.cursor_style() as u8;
+                        if !scr.hide_cursor() {
+                            let (cy, cx) = scr.cursor_position();
+                            if cx < cr.w && cy < cr.h {
+                                cursor = Some((cr.x + cx, oy + cr.y + cy));
+                            }
+                        }
+                    }
+                }
+            }
+            // pane border status line
+            if border_status != "off" && cr != *r {
+                let by = if border_status == "top" { r.y } else { r.bottom() - 1 };
+                let bstyle = if is_active { active_border } else { inactive_border };
+                for x in r.x..r.right() {
+                    f.set(x, oy + by, Cell { text: bset[0].into(), style: bstyle });
+                }
+                let text = self.expand_for_pane(*id, &self.opt_window(Some(wid), "pane-border-format"));
+                let cells = spans_cells(&format::spans(&text, bstyle), r.w.saturating_sub(2) as usize, bstyle);
+                f.put_cells(r.x + 1, oy + by, &cells);
+            }
+        }
+
+        // borders with junctions
+        let mut is_border = vec![false; cw as usize * area_h as usize];
+        for sep in &seps {
+            for k in 0..sep.len {
+                let (x, y) = if sep.vertical { (sep.x, sep.y + k) } else { (sep.x + k, sep.y) };
+                if x < cw && y < area_h {
+                    is_border[y as usize * cw as usize + x as usize] = true;
+                }
+            }
+        }
+        let at = |x: i32, y: i32| -> bool { x >= 0 && y >= 0 && (x as u16) < cw && (y as u16) < area_h && is_border[y as usize * cw as usize + x as usize] };
+        for y in 0..area_h {
+            for x in 0..cw {
+                if !is_border[y as usize * cw as usize + x as usize] {
+                    continue;
+                }
+                let (xi, yi) = (x as i32, y as i32);
+                let (u, d, l, r) = (at(xi, yi - 1), at(xi, yi + 1), at(xi - 1, yi), at(xi + 1, yi));
+                let ch = match (u, d, l, r) {
+                    (true, true, true, true) => bset[6],
+                    (false, true, true, true) => bset[7],
+                    (true, false, true, true) => bset[8],
+                    (true, true, false, true) => bset[9],
+                    (true, true, true, false) => bset[10],
+                    (true, _, false, false) | (_, true, false, false) => bset[1],
+                    _ => bset[0],
+                };
+                let near = active_rect.is_some_and(|a| x + 1 >= a.x && x <= a.right() && y + 1 >= a.y && y <= a.bottom()) && rects.len() > 1;
+                f.set(x, oy + y, Cell { text: ch.into(), style: if near { active_border } else { inactive_border } });
+            }
+        }
+        // marked pane: reverse its borders
+        if let Some(m) = self.marked.filter(|m| win.layout.panes().contains(m)) {
+            if let Some((_, r)) = rects.iter().find(|(p, _)| *p == m) {
+                for y in r.y.saturating_sub(1)..=r.bottom().min(area_h.saturating_sub(1)) {
+                    for x in r.x.saturating_sub(1)..=r.right().min(cw - 1) {
+                        if at(x as i32, y as i32) {
+                            if let Some(cell) = f.get(x, oy + y).cloned() {
+                                f.set(x, oy + y, Cell { style: Style { attrs: cell.style.attrs | INVERSE, ..cell.style }, ..cell });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // area outside the window (client bigger than window)
+        for y in 0..area_h {
+            for x in 0..cw {
+                if x >= win.sx || y >= win.sy {
+                    f.set(x, oy + y, Cell { text: "·".into(), style: Style { attrs: DIM, ..Style::default() } });
+                }
+            }
+        }
+
+        // overlays
+        if let Some(ov) = &c.overlay {
+            match ov {
+                Overlay::DisplayPanes { .. } => {
+                    let colour = format::parse_color(&self.opt_session(Some(sid), "display-panes-colour")).unwrap_or(Color::Idx(4));
+                    let acolour = format::parse_color(&self.opt_session(Some(sid), "display-panes-active-colour")).unwrap_or(Color::Idx(1));
+                    let base = self.opt_window_num(Some(wid), "pane-base-index").max(0) as usize;
+                    for (i, (id, r)) in rects.iter().enumerate() {
+                        let col = if *id == win.active { acolour } else { colour };
+                        let label = (i + base).to_string();
+                        let rr = Rect { y: oy + r.y, ..*r };
+                        if !big_text(&mut f, rr, &label, col) {
+                            f.text(r.x + r.w / 2, oy + r.y + r.h / 2, &label, Style { fg: col, ..Style::default() }, r.right());
+                        }
+                        let size = format!("{}x{}", r.w, r.h);
+                        f.text(r.right().saturating_sub(size.len() as u16), oy + r.y, &size, Style { fg: col, ..Style::default() }, r.right());
+                    }
+                }
+                Overlay::Menu(m) => {
+                    let st = format::parse_style(&self.opt_window(Some(wid), "popup-style"), Style::default()).unwrap_or_default();
+                    let bst = format::parse_style(&self.opt_window(Some(wid), "popup-border-style"), Style::default()).unwrap_or_default();
+                    m.draw(&mut f, st, bst);
+                    cursor = None;
+                }
+                Overlay::Popup(pp) => {
+                    let st = format::parse_style(&self.opt_window(Some(wid), "popup-style"), Style::default()).unwrap_or_default();
+                    let bst = format::parse_style(&self.opt_window(Some(wid), "popup-border-style"), Style::default()).unwrap_or_default();
+                    for y in pp.y..pp.y + pp.h {
+                        for x in pp.x..pp.x + pp.w {
+                            f.set(x, y, Cell { text: " ".into(), style: st });
+                        }
+                    }
+                    if pp.border {
+                        draw_box(&mut f, pp.x, pp.y, pp.w, pp.h, bst, &pp.title);
+                    }
+                    let (ix, iy, iw, ih) = pp.inner();
+                    cursor = None;
+                    if let Some(p) = self.panes.get(&pp.pane) {
+                        let scr = p.screen();
+                        for y in 0..ih {
+                            for x in 0..iw {
+                                if let Some(vc) = scr.cell(y, x) {
+                                    let mut cell = crate::cells::cell_from_vt(vc);
+                                    if vc.is_wide() && x + 1 >= iw {
+                                        cell.text = " ".into();
+                                    }
+                                    overlay_style(&mut cell.style, st);
+                                    f.set(ix + x, iy + y, cell);
+                                }
+                            }
+                        }
+                        modes.app_cursor = scr.application_cursor();
+                        modes.bracketed_paste = scr.bracketed_paste();
+                        if !scr.hide_cursor() {
+                            let (cy, cx) = scr.cursor_position();
+                            if cx < iw && cy < ih {
+                                cursor = Some((ix + cx, iy + cy));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // status lines
+        if nstatus > 0 {
+            let sy0 = if top { 0 } else { ch - nstatus };
+            let formats: Vec<String> = (0..nstatus).map(|i| self.opt_session(Some(sid), &format!("status-format[{i}]"))).collect();
+            for i in 0..nstatus {
+                let y = sy0 + i;
+                let custom = &formats[i as usize];
+                let line = if !custom.is_empty() {
+                    let base = self.status_style(sid);
+                    let cur = Target { sid: Some(sid), idx: Some(s.active), wid: Some(wid), pane: Some(win.active) };
+                    let text = self.expand_time(cur, Some(cid), custom);
+                    format::layout_line(&format::spans(&text, base), cw as usize, base)
+                } else if i == 0 {
+                    self.status_line(cid, sid, cw)
+                } else {
+                    vec![Cell { text: " ".into(), style: self.status_style(sid) }; cw as usize]
+                };
+                f.put_cells(0, y, &line);
+            }
+        }
+        // message / prompt replace the first status line (or the last row without a status line)
+        let my = if nstatus > 0 { if top { 0 } else { ch - nstatus } } else { ch - 1 };
+        if let Some(pr) = &c.prompt {
+            let st = format::parse_style(&self.opt_session(Some(sid), "message-style"), Style::default()).unwrap_or_default();
+            for x in 0..cw {
+                f.set(x, my, Cell { text: " ".into(), style: st });
+            }
+            let label = pr.label.clone() + if matches!(pr.kind, PromptKind::Confirm) || pr.label.ends_with(' ') || pr.label.is_empty() { "" } else { " " };
+            let lx = f.text(0, my, &label, st, cw);
+            let input: String = pr.input.iter().collect();
+            let before: String = pr.input[..pr.cursor].iter().collect();
+            let bw = format::width(&before) as u16;
+            let room = cw.saturating_sub(lx + 1);
+            let skip = bw.saturating_sub(room);
+            let mut x = lx;
+            let mut col = 0u16;
+            for ch in input.chars() {
+                let w = ch.width().unwrap_or(0) as u16;
+                if col >= skip {
+                    if x + w > cw {
+                        break;
+                    }
+                    f.set(x, my, Cell { text: ch.to_string(), style: st });
+                    if w == 2 {
+                        f.set(x + 1, my, Cell { text: String::new(), style: st });
+                    }
+                    x += w;
+                }
+                col += w;
+            }
+            cursor = Some(((lx + bw - skip).min(cw - 1), my));
+        } else if let Some((msg, _)) = &c.message {
+            let st = format::parse_style(&self.opt_session(Some(sid), "message-style"), Style::default()).unwrap_or_default();
+            for x in 0..cw {
+                f.set(x, my, Cell { text: " ".into(), style: st });
+            }
+            f.text(0, my, msg, st, cw);
+        }
+
+        Some(RenderState { frame: f, cursor, modes })
+    }
+
+    pub fn render(&mut self, cid: ClientId) {
+        let Some(next) = self.compose(cid) else { return };
+        // window title
+        let mut title_update = None;
+        if let Some(sid) = self.client_session(cid) {
+            if self.opt_session_on(Some(sid), "set-titles") {
+                let s = &self.sessions[&sid];
+                let wid = s.active_window();
+                let t = Target { sid: Some(sid), idx: Some(s.active), wid: Some(wid), pane: Some(self.windows[&wid].active) };
+                let title = self.expand_time(t, Some(cid), &self.opt_session(Some(sid), "set-titles-string"));
+                if self.clients[&cid].title != title {
+                    title_update = Some(title);
+                }
+            }
+        }
+        let c = self.clients.get_mut(&cid).unwrap();
+        c.dirty = false;
+        let prev = c.prev.as_ref().filter(|p| p.frame.w == next.frame.w && p.frame.h == next.frame.h);
+        let mut out = String::new();
+        if prev.is_none() {
+            out.push_str("\x1b[0m\x1b[H\x1b[2J");
+        }
+        let mut changed = false;
+        for y in 0..next.frame.h {
+            let row = next.frame.row(y);
+            if prev.is_some_and(|p| p.frame.row(y) == row) {
+                continue;
+            }
+            changed = true;
+            let _ = write!(out, "\x1b[{};1H", y + 1);
+            let mut cur: Option<Style> = None;
+            for cell in row {
+                if cell.text.is_empty() {
+                    continue;
+                }
+                if cur != Some(cell.style) {
+                    push_sgr(&mut out, &cell.style);
+                    cur = Some(cell.style);
+                }
+                out.push_str(&cell.text);
+            }
+        }
+        let pm = prev.map(|p| p.modes);
+        let modes_changed = pm != Some(next.modes);
+        let cursor_changed = prev.is_none_or(|p| p.cursor != next.cursor);
+        if let Some(t) = title_update {
+            let _ = write!(out, "\x1b]2;{}\x07", t);
+            c.title = t;
+            changed = true;
+        }
+        if !changed && !modes_changed && !cursor_changed {
+            c.prev = Some(next);
+            return;
+        }
+        out.insert_str(0, "\x1b[?25l");
+        out.push_str("\x1b[0m");
+        if modes_changed {
+            let m = next.modes;
+            out.push_str(if m.app_cursor { "\x1b[?1h" } else { "\x1b[?1l" });
+            out.push_str(if m.bracketed_paste { "\x1b[?2004h" } else { "\x1b[?2004l" });
+            out.push_str(if m.mouse { "\x1b[?1000h\x1b[?1002h\x1b[?1006h" } else { "\x1b[?1006l\x1b[?1002l\x1b[?1000l" });
+            out.push_str(if m.focus { "\x1b[?1004h" } else { "\x1b[?1004l" });
+            let _ = write!(out, "\x1b[{} q", m.cursor_style);
+        }
+        if let Some((x, y)) = next.cursor {
+            let _ = write!(out, "\x1b[{};{}H\x1b[?25h", y + 1, x + 1);
+        }
+        c.send(S_OUTPUT, out.as_bytes());
+        c.prev = Some(next);
+    }
+}

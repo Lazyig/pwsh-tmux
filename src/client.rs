@@ -1,53 +1,30 @@
-//! Command-line client: forwards commands to the server and runs the attach loop.
+//! Command-line client: sends the command line to the server (starting it if needed),
+//! prints replies, and becomes a terminal proxy when the server attaches it.
 
 use crate::ipc;
-use crate::opts::getopt;
 use crate::protocol::*;
 use crate::term;
 use interprocess::local_socket::Stream;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-pub fn main(mut args: Vec<String>) -> i32 {
-    if args.is_empty() {
-        args.push("new-session".into());
-    }
-    let result = match args[0].as_str() {
-        "new-session" | "new" => new_session(&args[1..]),
-        "attach-session" | "attach" | "a" | "at" => {
-            getopt(&args[1..], "dr", "t").and_then(|o| attach(o.get('t').unwrap_or("")))
-        }
-        _ => request(&args, false).and_then(|(code, text)| {
-            if code == 0 {
-                print!("{text}");
-                Ok(0)
-            } else {
-                Err(text)
-            }
-        }),
-    };
-    match result {
-        Ok(code) => code,
-        Err(e) => {
-            eprintln!("pwsh-tmux: {e}");
-            1
-        }
-    }
+pub struct Global {
+    pub config: Option<String>,
+    pub no_start: bool,
 }
 
-fn spawn_server() -> std::io::Result<()> {
+fn spawn_server(config: Option<&str>) -> std::io::Result<()> {
     use std::process::{Command, Stdio};
     let exe = std::env::current_exe()?;
     let make = || {
         let mut c = Command::new(&exe);
-        c.arg("__server")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .env_remove("PWSH_TMUX")
-            .env_remove("PWSH_TMUX_PANE");
+        c.arg("__server");
+        if let Some(f) = config {
+            c.arg(f);
+        }
+        c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).env_remove("PWSH_TMUX").env_remove("PWSH_TMUX_PANE");
         // Don't pin the client's cwd for the server's lifetime.
         let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
         if let Some(h) = std::env::var_os(home) {
@@ -90,13 +67,13 @@ fn spawn_server() -> std::io::Result<()> {
     }
 }
 
-fn connect(autostart: bool) -> Result<Stream, String> {
+fn connect(autostart: bool, config: Option<&str>) -> Result<Stream, String> {
     match ipc::connect() {
         Ok(s) => return Ok(s),
         Err(e) if !autostart => return Err(format!("no server running on {} ({e})", ipc::describe())),
         Err(_) => {}
     }
-    spawn_server().map_err(|e| format!("failed to start server: {e}"))?;
+    spawn_server(config).map_err(|e| format!("failed to start server: {e}"))?;
     for _ in 0..100 {
         thread::sleep(Duration::from_millis(50));
         if let Ok(s) = ipc::connect() {
@@ -106,122 +83,176 @@ fn connect(autostart: bool) -> Result<Stream, String> {
     Err("server did not start".into())
 }
 
-/// Sends a command, returns (exit code, text).
-fn request(args: &[String], autostart: bool) -> Result<(u8, String), String> {
-    let stream = connect(autostart)?;
-    let ctx = std::env::var("PWSH_TMUX_PANE").unwrap_or_default();
-    let mut payload = vec![ctx];
-    payload.extend(args.iter().cloned());
-    write_frame(&mut &stream, C_COMMAND, &encode_args(&payload)).map_err(|e| e.to_string())?;
-    loop {
-        let (kind, p) = read_frame(&mut &stream).map_err(|e| format!("lost server: {e}"))?;
-        if kind == S_REPLY {
-            return Ok(decode_reply(&p));
+fn is_tty() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+pub fn main(mut args: Vec<String>, g: Global) -> i32 {
+    if args.is_empty() {
+        args.push("new-session".into());
+    }
+    let cmds = crate::cmdparse::split_commands(&args);
+    let starts = cmds.iter().any(|c| matches!(c.first().map(String::as_str), Some("new-session" | "new" | "start-server" | "start")));
+    // load-buffer - reads the client's stdin
+    if let Some(pos) = args.iter().position(|a| a == "load-buffer" || a == "loadb") {
+        if args.get(pos + 1..).is_some_and(|r| r.last().map(String::as_str) == Some("-")) {
+            let mut data = String::new();
+            let _ = std::io::stdin().read_to_string(&mut data);
+            let last = args.len() - 1;
+            args[last] = format!("\0stdin:{data}");
         }
     }
-}
-
-fn check_nesting() -> Result<(), String> {
-    if std::env::var_os("PWSH_TMUX").is_some_and(|v| !v.is_empty()) {
-        return Err("sessions should be nested with care, unset PWSH_TMUX to force".into());
-    }
-    Ok(())
-}
-
-fn new_session(args: &[String]) -> Result<i32, String> {
-    let o = getopt(args, "dAD", "sxycnt")?;
-    let detached = o.has('d');
-    if !detached {
-        check_nesting()?;
-    }
-    let (cols, rows) = if detached { (80, 24) } else { term::size() };
-    let mut full = vec!["new-session".to_string(), "-x".into(), cols.to_string(), "-y".into(), rows.to_string()];
-    if let Ok(cwd) = std::env::current_dir() {
-        full.extend(["-c".to_string(), cwd.to_string_lossy().into_owned()]);
-    }
-    // User flags come later and override the defaults above.
-    full.extend(args.iter().cloned());
-    let (code, name) = request(&full, true)?;
-    if code != 0 {
-        return Err(name);
-    }
-    if detached {
-        return Ok(0);
-    }
-    attach(&name)
-}
-
-fn attach(target: &str) -> Result<i32, String> {
-    check_nesting()?;
-    let stream = connect(false)?;
+    let stream = match connect(starts && !g.no_start, g.config.as_deref()) {
+        Ok(s) => s,
+        Err(e) => {
+            // tmux prints nothing and fails for e.g. has-session with no server
+            eprintln!("{e}");
+            return 1;
+        }
+    };
     let (cols, rows) = term::size();
-    let mut hello = encode_size(cols, rows);
-    hello.extend_from_slice(target.as_bytes());
-
-    let raw = term::RawMode::enter().map_err(|e| format!("can't use terminal: {e}"))?;
+    let mut ident = vec![
+        cols.to_string(),
+        rows.to_string(),
+        if is_tty() { "1".into() } else { "0".into() },
+        std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+        std::env::var("TERM").unwrap_or_default(),
+        std::process::id().to_string(),
+        std::env::var("PWSH_TMUX_PANE").ok().filter(|_| std::env::var_os("PWSH_TMUX").is_some()).unwrap_or_default(),
+    ];
+    ident.extend(std::env::vars().map(|(k, v)| format!("{k}={v}")));
     let stream = Arc::new(stream);
-    // Input and resize threads both write; keep their frames whole.
     let write_lock = Arc::new(Mutex::new(()));
     let post = {
         let stream = stream.clone();
+        let lock = write_lock.clone();
         move |kind: u8, payload: &[u8]| -> bool {
-            let _guard = write_lock.lock().unwrap();
+            let _g = lock.lock().unwrap();
             write_frame(&mut &*stream, kind, payload).is_ok()
         }
     };
-    let mut out = std::io::stdout();
-    let _ = out.write_all(b"\x1b[?1049h\x1b[H\x1b[2J");
-    let _ = out.flush();
-
-    if !post(C_ATTACH, &hello) {
-        drop(raw);
-        return Err("lost server".into());
+    if !post(C_IDENTIFY, &encode_args(&ident)) || !post(C_COMMAND, &encode_args(&args)) {
+        eprintln!("lost server");
+        return 1;
     }
-    let input_post = post.clone();
-    thread::spawn(move || {
-        let mut input = term::Input::default();
-        while let Ok(data) = input.read() {
-            if data.is_empty() || !input_post(C_INPUT, &data) {
-                break;
-            }
-        }
-    });
-    let resize_post = post;
-    thread::spawn(move || {
-        let mut last = (cols, rows);
-        loop {
-            thread::sleep(Duration::from_millis(100));
-            let now = term::size();
-            if now != last {
-                last = now;
-                if !resize_post(C_RESIZE, &encode_size(now.0, now.1)) {
-                    break;
-                }
-            }
-        }
-    });
 
-    let (code, msg) = loop {
-        match read_frame(&mut &*stream) {
+    let mut raw: Option<term::RawMode> = None;
+    let mut out = std::io::stdout();
+    let restore = |out: &mut std::io::Stdout| {
+        let _ = out.write_all(b"\x1b[0m\x1b[?25h\x1b[?1l\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1004l\x1b[0 q\x1b[?1049l");
+        let _ = out.flush();
+    };
+    loop {
+        let frame = read_frame(&mut &*stream);
+        match frame {
             Ok((S_OUTPUT, p)) => {
                 let _ = out.write_all(&p);
                 let _ = out.flush();
             }
-            Ok((S_EXIT, p)) => break (0, String::from_utf8_lossy(&p).into_owned()),
+            Ok((S_STDOUT, p)) => {
+                let _ = out.write_all(&p);
+                let _ = out.flush();
+            }
             Ok((S_REPLY, p)) => {
                 let (code, text) = decode_reply(&p);
-                if code != 0 {
-                    break (1, format!("pwsh-tmux: {text}"));
+                if raw.is_some() {
+                    if code != 0 {
+                        // attach failed after we went raw
+                        drop(raw.take());
+                        restore(&mut out);
+                        eprintln!("{text}");
+                        return 1;
+                    }
+                    continue;
+                }
+                if code == 0 {
+                    print!("{text}");
+                } else {
+                    eprint!("{text}{}", if text.ends_with('\n') { "" } else { "\n" });
+                }
+                let _ = std::io::stdout().flush();
+                return code as i32;
+            }
+            Ok((S_ATTACHED, _)) => {
+                if raw.is_none() {
+                    match term::RawMode::enter() {
+                        Ok(r) => raw = Some(r),
+                        Err(e) => {
+                            eprintln!("can't use terminal: {e}");
+                            return 1;
+                        }
+                    }
+                    let _ = out.write_all(b"\x1b[?1049h\x1b[H\x1b[2J");
+                    let _ = out.flush();
+                    let input_post = post.clone();
+                    thread::spawn(move || {
+                        let mut input = term::Input::default();
+                        while let Ok(data) = input.read() {
+                            if data.is_empty() || !input_post(C_INPUT, &data) {
+                                break;
+                            }
+                        }
+                    });
+                    let resize_post = post.clone();
+                    thread::spawn(move || {
+                        let mut last = (cols, rows);
+                        loop {
+                            thread::sleep(Duration::from_millis(100));
+                            let now = term::size();
+                            if now != last {
+                                last = now;
+                                if !resize_post(C_RESIZE, &encode_size(now.0, now.1)) {
+                                    break;
+                                }
+                            }
+                        }
+                    });
                 }
             }
+            Ok((S_EXIT, p)) => {
+                drop(raw.take());
+                restore(&mut out);
+                println!("{}", String::from_utf8_lossy(&p));
+                // The input thread is blocked in a terminal read; exit without joining it.
+                std::process::exit(0);
+            }
+            Ok((S_SUSPEND, _)) => {
+                drop(raw.take());
+                restore(&mut out);
+                #[cfg(unix)]
+                unsafe {
+                    libc::raise(libc::SIGTSTP);
+                }
+                raw = term::RawMode::enter().ok();
+                let _ = out.write_all(b"\x1b[?1049h");
+                let _ = out.flush();
+                let (c, r) = term::size();
+                post(C_RESIZE, &encode_size(c, r));
+                post(C_RESUMED, b"");
+            }
+            Ok((S_SHELL, p)) => {
+                drop(raw.take());
+                restore(&mut out);
+                let cmd = String::from_utf8_lossy(&p).into_owned();
+                let _ = crate::server::procinfo::job_command(&cmd).status();
+                raw = term::RawMode::enter().ok();
+                let _ = out.write_all(b"\x1b[?1049h");
+                let _ = out.flush();
+                post(C_RESUMED, b"");
+            }
             Ok(_) => {}
-            Err(_) => break (1, "[lost server]".into()),
+            Err(_) => {
+                let was_attached = raw.is_some();
+                drop(raw.take());
+                if was_attached {
+                    restore(&mut out);
+                    println!("[lost server]");
+                } else {
+                    eprintln!("lost server");
+                }
+                std::process::exit(1);
+            }
         }
-    };
-    let _ = out.write_all(b"\x1b[0m\x1b[?25h\x1b[?1l\x1b[?2004l\x1b[?1049l");
-    let _ = out.flush();
-    drop(raw);
-    println!("{msg}");
-    // The input thread is blocked in a terminal read; exit without joining it.
-    std::process::exit(code);
+    }
 }

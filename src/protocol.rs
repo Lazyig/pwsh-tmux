@@ -3,15 +3,29 @@
 use std::io::{self, Read, Write};
 
 // client -> server
+/// argv of the command line (may hold several commands separated by ";").
 pub const C_COMMAND: u8 = 1;
-pub const C_ATTACH: u8 = 2;
 pub const C_INPUT: u8 = 3;
 pub const C_RESIZE: u8 = 4;
+/// Sent first: args [cols, rows, is_tty(0/1), cwd, term, pid, ctx_pane, KEY=VALUE...].
+pub const C_IDENTIFY: u8 = 5;
+/// Client finished a S_SHELL / S_SUSPEND and is back in raw mode.
+pub const C_RESUMED: u8 = 6;
 
 // server -> client
 pub const S_OUTPUT: u8 = 10;
+/// Detach/exit: payload is the message to print. Ends the client.
 pub const S_EXIT: u8 = 11;
+/// Command finished: code byte + text. Ends a non-attached client.
 pub const S_REPLY: u8 = 12;
+/// The client is now attached: enter raw mode and the alternate screen.
+pub const S_ATTACHED: u8 = 13;
+/// Suspend the client (Unix job control).
+pub const S_SUSPEND: u8 = 14;
+/// Leave raw mode, run this shell command in the client terminal, then send C_RESUMED.
+pub const S_SHELL: u8 = 15;
+/// Text to print on the client's stdout while it is not attached (e.g. command output before a reply).
+pub const S_STDOUT: u8 = 16;
 
 const MAX_FRAME: usize = 64 << 20;
 

@@ -13,6 +13,9 @@ fn label() -> String {
 
 #[cfg(windows)]
 fn pipe_name() -> String {
+    if let Some(p) = std::env::var("PWSH_TMUX_SOCKET_PATH").ok().filter(|s| !s.is_empty()) {
+        return p.trim_start_matches("\\\\.\\pipe\\").to_string();
+    }
     let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
     format!("pwsh-tmux-{}-{}", user, label())
 }
@@ -55,6 +58,9 @@ pub fn runtime_dir() -> io::Result<PathBuf> {
 
 #[cfg(unix)]
 fn socket_path() -> io::Result<PathBuf> {
+    if let Some(p) = std::env::var_os("PWSH_TMUX_SOCKET_PATH").filter(|s| !s.is_empty()) {
+        return Ok(PathBuf::from(p));
+    }
     Ok(runtime_dir()?.join(label()))
 }
 

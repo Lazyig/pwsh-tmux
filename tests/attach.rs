@@ -126,6 +126,8 @@ fn attach_split_type_detach() {
     // prefix Left moves to the left pane
     send(b"\x02\x1b[D");
     wait_for("select left", t, || ctx.ok(&["display-message", "-p", "-t", "t", "#{pane_index}"]).trim() == "0");
+    // arrow keys repeat (-r): let repeat-time pass before the next prefix
+    std::thread::sleep(Duration::from_millis(700));
 
     // prefix z zooms, again unzooms
     send(b"\x02z");
@@ -143,7 +145,7 @@ fn attach_split_type_detach() {
     // terminal resize propagates to the session
     pair.master.resize(PtySize { rows: 40, cols: 120, pixel_width: 0, pixel_height: 0 }).unwrap();
     screen.lock().unwrap().set_size(nz(40), nz(120));
-    wait_for("resize", t, || ctx.ok(&["ls"]).contains("[120x40]"));
+    wait_for("resize", t, || ctx.ok(&["display-message", "-p", "-t", "t", "#{session_width}x#{session_height} #{window_height}"]).trim() == "120x40 39");
 
     // prefix d detaches; the session survives
     send(b"\x02d");
