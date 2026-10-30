@@ -1,0 +1,8 @@
+# Keep LF in the repository and the working tree on every OS
+# (tests/*.sh run on Linux; Rust sources are byte-compared in some tests).
+* text=auto eol=lf
+*.rs text eol=lf
+*.sh text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+Cargo.lock text eol=lf

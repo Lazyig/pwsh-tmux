@@ -1,2 +1,17 @@
+# Build output
 /target
+# Release binaries handed out by hand
 /dist
+# Codex cross-review reports (codex_review.py writes them here)
+/reviews
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
