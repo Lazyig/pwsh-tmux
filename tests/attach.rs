@@ -114,7 +114,8 @@ fn attach_split_type_detach() {
     // typing reaches the shell, including wide (Korean) characters
     send("echo hi-from-pane 한글테스트\r".as_bytes());
     wait_for("echo output", t, || contents().matches("hi-from-pane").count() >= 2);
-    assert!(ctx.ok(&["capture-pane", "-p", "-t", "t"]).contains("한글테스트"));
+    // the shell may echo the typed line twice before the output arrives
+    wait_for("korean output", t, || ctx.ok(&["capture-pane", "-p", "-t", "t"]).lines().any(|l| l.trim() == "hi-from-pane 한글테스트"));
     wait_for("korean on screen", t, || contents().contains("한글테스트"));
 
     // prefix % splits left/right; a separator appears
