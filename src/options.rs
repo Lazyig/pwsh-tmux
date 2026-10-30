@@ -49,11 +49,13 @@ pub static DEFS: &[OptDef] = &[
     d("exit-empty", Server, Flag, "on"),
     d("exit-unattached", Server, Flag, "off"),
     d("extended-keys", Server, Choice(&["off", "on", "always"]), "off"),
+    d("extended-keys-format", Server, Choice(&["csi-u", "xterm"]), "xterm"),
     d("focus-events", Server, Flag, "off"),
     d("history-file", Server, Str, ""),
     d("message-limit", Server, Num, "1000"),
     d("prompt-history-limit", Server, Num, "100"),
     d("set-clipboard", Server, Choice(&["off", "external", "on"]), "external"),
+    d("terminal-features", Server, Array, "xterm*:clipboard:ccolour:cstyle:focus:title screen*:title rxvt*:ignorefkeys"),
     d("terminal-overrides", Server, Array, ""),
     d("user-keys", Server, Array, ""),
     // session

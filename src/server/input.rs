@@ -250,7 +250,20 @@ impl Server {
             return;
         }
         let app = p.screen().application_cursor();
-        let bytes = if matches!(k.code, KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End) && k.mods.is_empty() {
+        // extended-keys: on = only for applications that asked (CSI > 4 ; n m), always = everyone
+        let requested = p.parser.callbacks().ext_keys;
+        let csi_u = self.opt_server("extended-keys-format") == "csi-u";
+        let extended = match self.opt_server("extended-keys").as_str() {
+            "always" => keys::encode_extended(k, requested >= 2, csi_u),
+            "on" if requested > 0 => keys::encode_extended(k, requested >= 2, csi_u),
+            _ => None,
+        };
+        let bytes = if let Some(e) = extended {
+            e
+        } else if matches!(k.code, KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End) && k.mods.is_empty() {
+            keys::encode_key(k, app)
+        } else if raw.starts_with(b"\x1b[") && (raw.ends_with(b"u") || raw.starts_with(b"\x1b[27;")) {
+            // the outer terminal sent an extended key but this pane didn't ask for them
             keys::encode_key(k, app)
         } else {
             raw

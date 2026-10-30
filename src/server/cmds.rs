@@ -76,6 +76,7 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("select-window", "selectw", "lnpT", "t"),
     ("send-keys", "send", "FHKlMRX", "cNt"),
     ("send-prefix", "", "2", "t"),
+    ("server-access", "", "adlrw", ""),
     ("set-buffer", "setb", "aw", "bnt"),
     ("set-environment", "setenv", "Fhgru", "t"),
     ("set-hook", "", "agpRuw", "t"),
@@ -797,7 +798,7 @@ impl Server {
         }
         let clip = self.opt_server("set-clipboard");
         if clip != "off" {
-            if let Some(c) = cid.and_then(|c| self.clients.get(&c)).filter(|c| c.control == 0) {
+            if let Some(c) = cid.and_then(|c| self.clients.get(&c)).filter(|c| c.control == 0 && c.features.has("clipboard")) {
                 let enc = base64(text.as_bytes());
                 c.send(S_OUTPUT, format!("\x1b]52;c;{enc}\x07").as_bytes());
             }
@@ -840,6 +841,10 @@ impl Server {
         } else {
             Vec::new()
         };
+        // read-only users (server-access -r) may only look
+        if ctx.hook_depth == 0 && ctx.client.and_then(|c| self.clients.get(&c)).is_some_and(|c| c.acl_readonly) && !READ_ONLY_OK.contains(&full) {
+            return err("client is read-only");
+        }
         let o = getopt(&args, spec.2, spec.3).map_err(|e| format!("{full}: {e}"))?;
         self.command(full, o, env, ctx)
     }
@@ -1098,8 +1103,21 @@ impl Server {
                     }
                     return Ok(Flow::Next);
                 }
-                if o.get('A').is_some() || o.get('B').is_some() || o.get('f').is_some() || o.get('F').is_some() {
-                    return Ok(Flow::Next); // output pausing / subscriptions / flags: accepted, not used
+                let mut handled = false;
+                if let Some(a) = o.get('A') {
+                    self.control_pane_action(cid, a)?;
+                    handled = true;
+                }
+                if let Some(b) = o.get('B') {
+                    self.control_subscribe(cid, b)?;
+                    handled = true;
+                }
+                if let Some(f) = o.get('f').or(o.get('F')) {
+                    self.control_flags(cid, f)?;
+                    handled = true;
+                }
+                if handled {
+                    return Ok(Flow::Next);
                 }
                 if o.has('S') {
                     if let Some(c) = self.clients.get_mut(&cid) {
@@ -2624,6 +2642,62 @@ impl Server {
                 Ok(Flow::Next)
             }
             "clear-prompt" => Ok(Flow::Next),
+            "server-access" => {
+                if o.has('l') {
+                    for (id, write) in &self.acl {
+                        ctx.out.push_str(&format!("{} ({})\n", ipc::user_name_for_id(id), if *write { "W" } else { "R" }));
+                    }
+                    return Ok(Flow::Next);
+                }
+                if ctx.client.and_then(|c| self.clients.get(&c)).is_some_and(|c| c.user.as_ref().is_some_and(|u| *u != self.owner && !ipc::is_superuser(u))) {
+                    return err("only the server owner can change access");
+                }
+                let name = o.rest.first().ok_or("server-access needs a user")?;
+                let id = ipc::user_id_for_name(name).ok_or_else(|| format!("unknown user: {name}"))?;
+                if id == self.owner {
+                    return err("the server owner always has access");
+                }
+                let clients_of = |s: &Server| -> Vec<ClientId> { s.clients.values().filter(|c| c.user.as_deref() == Some(id.as_str())).map(|c| c.id).collect() };
+                if o.has('d') {
+                    self.acl.retain(|a| a.0 != id);
+                    for cid in clients_of(self) {
+                        if self.clients.get(&cid).is_some_and(|c| c.attached) {
+                            self.detach_client(cid, "[access not allowed]");
+                        }
+                        if let Some(c) = self.clients.get_mut(&cid) {
+                            c.denied = true;
+                        }
+                    }
+                    if self.acl.is_empty() {
+                        ipc::set_shared(false);
+                    }
+                    return Ok(Flow::Next);
+                }
+                let write = !o.has('r');
+                if o.has('a') {
+                    if self.acl.iter().any(|a| a.0 == id) {
+                        return err(format!("user {name} is already added"));
+                    }
+                    self.acl.push((id.clone(), write));
+                    ipc::set_shared(true);
+                    if cfg!(windows) && self.pipe_acl.as_ref().is_some_and(|p| !p.contains(&id)) {
+                        ctx.out.push_str("note: the named pipe's ACL is set when the server starts; put this in the config file or restart the server for it to take effect\n");
+                    }
+                } else if o.has('r') || o.has('w') {
+                    let e = self.acl.iter_mut().find(|a| a.0 == id).ok_or_else(|| format!("user {name} not found"))?;
+                    e.1 = o.has('w');
+                } else {
+                    return err("server-access needs -a, -d, -l, -r or -w");
+                }
+                let write = self.acl.iter().find(|a| a.0 == id).map_or(write, |a| a.1);
+                for cid in clients_of(self) {
+                    if let Some(c) = self.clients.get_mut(&cid) {
+                        c.acl_readonly = !write;
+                        c.readonly = !write;
+                    }
+                }
+                Ok(Flow::Next)
+            }
             _ => err(format!("{cmd}: not implemented")),
         }
     }
@@ -2959,6 +3033,13 @@ impl Server {
         }
     }
 }
+
+/// Commands a read-only (server-access -r) client may run.
+const READ_ONLY_OK: &[&str] = &[
+    "attach-session", "detach-client", "has-session", "list-sessions", "list-windows", "list-panes", "list-clients", "list-buffers", "list-keys",
+    "list-commands", "display-message", "show-options", "show-window-options", "show-environment", "show-hooks", "show-messages", "show-buffer",
+    "capture-pane", "refresh-client", "switch-client", "choose-tree", "server-access",
+];
 
 pub fn truthy(s: &str) -> bool {
     !s.is_empty() && s != "0"

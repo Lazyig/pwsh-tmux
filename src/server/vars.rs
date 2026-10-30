@@ -284,6 +284,8 @@ impl Vars for VarCtx<'_> {
             "client_prefix" => client.map(|c| b(c.key_table == "prefix")),
             "client_readonly" => client.map(|c| b(c.readonly)),
             "client_termname" | "client_termtype" => client.and_then(|c| c.ident.as_ref()).map(|i| i.term.clone()),
+            "client_termfeatures" => client.map(|c| c.features.list()),
+            "client_user" => client.and_then(|c| c.user.as_ref()).map(|u| ipc::user_name_for_id(u)),
             "client_created" => client.map(|c| c.created.to_string()),
             "client_activity" => client.map(|c| c.activity.to_string()),
             "client_utf8" => Some("1".into()),

@@ -80,12 +80,20 @@ tmux config, put `source-file ~/.tmux.conf` in it.
 - **`#(command)` in formats**: run in the background, last output line cached and refreshed
   every `status-interval`.
 
-## Not supported (yet)
+- **Terminal features** (`terminal-features`, `-T`): RGB / 256 / 16-colour downgrading,
+  synchronized output, clipboard, title, cursor style, focus, mouse, per client.
+- **Extended keys** (`extended-keys on|always`, `extended-keys-format csi-u|xterm`).
+- **Control mode flow control**: `refresh-client -f pause-after=N,no-output,wait-exit,read-only,ignore-size`,
+  `-A %pane:on|off|pause|continue` (`%pause`/`%continue`, `%extended-output`), `-B` subscriptions
+  (`%subscription-changed`).
+- **server-access** (`-a/-d/-r/-w/-l`): other users may attach with `-S <socket>`; read-only users
+  can only look. On Windows the named pipe's ACL is created at server start, so put
+  `server-access -a user` in the config file (or restart the server).
 
-- `server-access`, terminal features (`-T`) negotiation, extended keys output, control-mode
-  flow control (`%pause`/`%continue`) and subscriptions.
-- Window sizes are capped at 1000x1000 (the terminal emulator allocates every cell).
-- On Windows `suspend-client` does nothing and `lock-*` needs `lock-command`.
+## Limits
+
+- Window sizes are capped at 1000x1000 (the terminal emulator allocates every cell; tmux allows 10000).
+- On Windows `suspend-client` does nothing (no job control) and `lock-*` needs `lock-command`.
 
 ## Tests
 

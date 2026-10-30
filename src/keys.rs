@@ -864,6 +864,38 @@ fn ctrl_byte(c: char) -> Option<u8> {
     })
 }
 
+/// Extended-key encoding (tmux `extended-keys`) for keys whose modifiers the legacy encoding
+/// can't carry (C-Enter, S-Tab-like combos, C-1, C-S-a ...), or for every modified key when
+/// `all` (extended-keys always). `csi_u`: `ESC [ code ; mod u`, else xterm's
+/// `ESC [ 27 ; mod ; code ~`. None means the legacy encoding is fine.
+pub fn encode_extended(k: &Key, all: bool, csi_u: bool) -> Option<Vec<u8>> {
+    let k = normalize(k.clone());
+    let m = k.mods;
+    let n = m.xterm_param();
+    if n <= 1 {
+        return None;
+    }
+    let code: u32 = match k.code {
+        KeyCode::Char(c) => c as u32,
+        KeyCode::Enter => 13,
+        KeyCode::Tab => 9,
+        KeyCode::BSpace => 127,
+        KeyCode::Escape => 27,
+        KeyCode::Space => 32,
+        // arrows, F-keys, paging keys already carry modifiers (CSI 1;N X)
+        _ => return None,
+    };
+    let lossy = match k.code {
+        // C-letter and M-anything encode fine; C-S-letter, C-digit, C-punctuation don't
+        KeyCode::Char(c) => (m.ctrl && (m.shift || !(c.is_ascii_alphabetic() || "[\\]^_@ ".contains(c)))) || (m.shift && !m.ctrl && !m.meta),
+        _ => m.ctrl || m.shift,
+    };
+    if !lossy && !all {
+        return None;
+    }
+    Some(if csi_u { format!("\x1b[{code};{n}u") } else { format!("\x1b[27;{n};{code}~") }.into_bytes())
+}
+
 /// Encode a key for an application: respects `app_cursor` (DECCKM: ESC O A vs ESC [ A).
 /// Ctrl+letter → control byte, Meta → ESC prefix, modified arrows/F-keys → xterm CSI 1;N forms,
 /// Enter → "\r", BSpace → 0x7f. Keypad keys are sent as their plain characters.
@@ -1382,6 +1414,27 @@ mod tests {
             keys(b"\x1b[1\x01"),
             vec![meta(KeyCode::Char('[')), ch('1'), ctrl('a')]
         );
+    }
+
+    #[test]
+    fn extended_encoding() {
+        let k = |s: &str| parse_key_name(s).unwrap();
+        assert_eq!(encode_extended(&k("C-Enter"), false, true), Some(b"\x1b[13;5u".to_vec()));
+        assert_eq!(encode_extended(&k("C-Enter"), false, false), Some(b"\x1b[27;5;13~".to_vec()));
+        assert_eq!(encode_extended(&k("C-1"), false, true), Some(b"\x1b[49;5u".to_vec()));
+        assert_eq!(encode_extended(&k("C-a"), false, true), None);
+        assert_eq!(encode_extended(&k("C-a"), true, true), Some(b"\x1b[97;5u".to_vec()));
+        assert_eq!(encode_extended(&k("C-Up"), true, true), None);
+        assert_eq!(encode_extended(&k("Enter"), true, true), None);
+        // what we send parses back to the same key
+        for name in ["C-Enter", "C-Tab", "C-1", "C-S-a", "M-C-Enter"] {
+            let bytes = encode_extended(&k(name), true, true).unwrap();
+            let mut p = Parser::new();
+            match p.feed(&bytes).first() {
+                Some(Input::Key(key, _)) => assert_eq!(key_name(key), key_name(&k(name)), "{name}"),
+                other => panic!("{name}: {other:?}"),
+            }
+        }
     }
 
     #[test]

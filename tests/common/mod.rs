@@ -98,6 +98,8 @@ impl Term {
         cb.env_remove("PWSH_TMUX");
         cb.env_remove("PWSH_TMUX_PANE");
         cb.env("TERM", "xterm-256color");
+        // a known terminal: 256 colours, no truecolor unless a test asks for it
+        cb.env_remove("COLORTERM");
         Term::spawn(cb, cols, rows)
     }
 

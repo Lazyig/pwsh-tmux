@@ -6,6 +6,7 @@
 
 mod cmds;
 mod control;
+pub mod features;
 mod input;
 mod modes;
 pub mod procinfo;
@@ -59,6 +60,8 @@ pub enum Event {
     Job(u32, i32, String),
     /// A `#(command)` from a format finished: (command, output).
     FormatShell(String, String),
+    /// Who is on the other end of a connection (uid / SID), known after its first frame.
+    ClientUser(ClientId, Option<String>),
 }
 
 /// Answers terminal queries and collects title / bell / cwd reports from a pane.
@@ -68,6 +71,8 @@ pub struct PaneCb {
     pub bell: bool,
     pub title: Option<String>,
     pub cwd: Option<String>,
+    /// modifyOtherKeys level the application asked for (CSI > 4 ; n m).
+    pub ext_keys: u8,
 }
 
 fn decode_file_url(url: &str) -> Option<String> {
@@ -119,6 +124,7 @@ impl vt100::Callbacks for PaneCb {
             (None, 'n', 5) => self.replies.extend(b"\x1b[0n"),
             (None, 'c', 0) => self.replies.extend(b"\x1b[?1;2c"),
             (Some(b'>'), 'c', 0) => self.replies.extend(b"\x1b[>84;0;0c"),
+            (Some(b'>'), 'm', 4) => self.ext_keys = params.get(1).and_then(|p| p.first()).copied().unwrap_or(0) as u8,
             _ => {}
         }
     }
@@ -354,11 +360,39 @@ pub struct Client {
     pub control_size: Option<(u16, u16)>,
     pub control_seq: u64,
     pub seen: control::Seen,
+    /// What the client's terminal supports (terminal-features, -T).
+    pub features: features::Features,
+    /// Frames queued for the writer thread, and since when the queue has been non-empty
+    /// (ms since the epoch): how far behind the client is (control mode pause-after).
+    pub pending: Arc<std::sync::atomic::AtomicUsize>,
+    pub backlog_since: Arc<std::sync::atomic::AtomicU64>,
+    pub ctl: control::Flags,
+    /// Connecting user (uid / SID) and whether server-access lets it in / makes it read-only.
+    pub user: Option<String>,
+    pub denied: bool,
+    pub acl_readonly: bool,
+}
+
+pub fn now_ms() -> u64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 impl Client {
     pub fn send(&self, kind: u8, payload: &[u8]) {
+        use std::sync::atomic::Ordering;
+        if self.pending.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.backlog_since.store(now_ms(), Ordering::SeqCst);
+        }
         let _ = self.tx.send(frame(kind, payload));
+    }
+
+    /// How long output has been waiting to be written to this client.
+    pub fn lag(&self) -> Duration {
+        use std::sync::atomic::Ordering;
+        if self.pending.load(Ordering::SeqCst) == 0 {
+            return Duration::ZERO;
+        }
+        Duration::from_millis(now_ms().saturating_sub(self.backlog_since.load(Ordering::SeqCst)))
     }
 
     /// Ends an attached client; control clients get %exit first.
@@ -367,6 +401,11 @@ impl Client {
             let reason = msg.trim_matches(['[', ']']);
             let line = if reason.is_empty() { "%exit\n".to_string() } else { format!("%exit {reason}\n") };
             self.send(S_OUTPUT, line.as_bytes());
+            if self.ctl.wait_exit {
+                // wait-exit: the client leaves after its next line
+                self.ctl.exiting.set(true);
+                return;
+            }
         }
         self.send(S_EXIT, msg.as_bytes());
     }
@@ -459,29 +498,22 @@ pub struct Server {
     pub shell_cache: std::cell::RefCell<HashMap<String, (String, Instant, bool)>>,
     /// Last synced window list of each session group.
     pub groups: HashMap<u32, BTreeMap<u32, WinId>>,
+    /// The user running the server (always allowed).
+    pub owner: String,
+    /// server-access: (user id, may write)
+    pub acl: Vec<(String, bool)>,
+    /// Windows: users the named pipe's ACL was created for (None until listening).
+    pub pipe_acl: Option<Vec<String>>,
 }
 
 pub fn run(config: Option<String>) -> io::Result<()> {
     // stderr is /dev/null for the detached server: keep panics in the log
     std::panic::set_hook(Box::new(|info| log(&format!("panic: {info}"))));
-    let Some(listener) = ipc::listen_exclusive()? else {
+    if ipc::connect().is_ok() {
         return Ok(()); // another server already owns the endpoint
-    };
-    log(&format!("server started on {}", ipc::describe()));
+    }
     let (tx, rx) = mpsc::channel();
     let atx = tx.clone();
-    thread::spawn(move || {
-        for conn in listener.incoming() {
-            match conn {
-                Ok(s) => {
-                    if atx.send(Event::Conn(s)).is_err() {
-                        break;
-                    }
-                }
-                Err(e) => log(&format!("accept failed: {e}")),
-            }
-        }
-    });
 
     let mut env = BTreeMap::new();
     for (k, v) in std::env::vars() {
@@ -517,9 +549,34 @@ pub fn run(config: Option<String>) -> io::Result<()> {
         last_tick: Instant::now(),
         shell_cache: Default::default(),
         groups: HashMap::new(),
+        owner: ipc::own_user_id(),
+        acl: Vec::new(),
+        pipe_acl: None,
     };
     srv.opts_session.set("default-shell", procinfo::default_shell());
+    // config first: its server-access lines decide who may open the Windows pipe
     srv.load_config(config);
+    let allowed: Vec<String> = srv.acl.iter().map(|a| a.0.clone()).collect();
+    let Some(listener) = ipc::listen_exclusive(&allowed)? else {
+        return Ok(()); // another server won the race
+    };
+    srv.pipe_acl = Some(allowed);
+    if !srv.acl.is_empty() {
+        ipc::set_shared(true);
+    }
+    log(&format!("server started on {}", ipc::describe()));
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            match conn {
+                Ok(s) => {
+                    if atx.send(Event::Conn(s)).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => log(&format!("accept failed: {e}")),
+            }
+        }
+    });
 
     let started = Instant::now();
     loop {
@@ -714,6 +771,7 @@ impl Server {
                 }
             }
             Event::Job(id, status, output) => self.job_done(id, status, output),
+            Event::ClientUser(cid, user) => self.client_user(cid, user),
             Event::FormatShell(command, output) => {
                 if let Some(e) = self.shell_cache.borrow_mut().get_mut(&command) {
                     e.0 = output;
@@ -729,17 +787,34 @@ impl Server {
         let stream = Arc::new(stream);
         let recv = stream.clone();
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backlog_since = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writer_pending = pending.clone();
+        let writer_since = backlog_since.clone();
         thread::spawn(move || {
+            use std::sync::atomic::Ordering;
             let mut send = &*stream;
             for buf in rx {
                 if send.write_all(&buf).and_then(|_| send.flush()).is_err() {
                     break;
                 }
+                // still behind: the backlog now starts at this write
+                if writer_pending.fetch_sub(1, Ordering::SeqCst) > 1 {
+                    writer_since.store(now_ms(), Ordering::SeqCst);
+                }
             }
         });
         let etx = self.tx.clone();
         thread::spawn(move || {
+            let mut first = true;
             while let Ok((kind, payload)) = read_frame(&mut &*recv) {
+                if first {
+                    // who is connecting (Windows can only tell once data has been read)
+                    first = false;
+                    if etx.send(Event::ClientUser(cid, ipc::peer_user_id(&recv))).is_err() {
+                        return;
+                    }
+                }
                 if etx.send(Event::ClientMsg(cid, kind, payload)).is_err() {
                     return;
                 }
@@ -778,6 +853,13 @@ impl Server {
                 control_size: None,
                 control_seq: 0,
                 seen: Default::default(),
+                features: Default::default(),
+                pending,
+                backlog_since,
+                ctl: Default::default(),
+                user: None,
+                denied: false,
+                acl_readonly: false,
             },
         );
     }
@@ -796,7 +878,29 @@ impl Server {
         }
     }
 
+    /// server-access: let the owner, root/SYSTEM and allowed users in.
+    fn client_user(&mut self, cid: ClientId, user: Option<String>) {
+        let Some(c) = self.clients.get_mut(&cid) else { return };
+        let id = user.unwrap_or_default();
+        let entry = self.acl.iter().find(|a| a.0 == id).cloned();
+        let allowed = id == self.owner || ipc::is_superuser(&id) || entry.is_some();
+        c.user = Some(id.clone());
+        if !allowed {
+            c.denied = true;
+            c.send(S_REPLY, &encode_reply(1, "access not allowed"));
+            log(&format!("refused client from user {id}"));
+            return;
+        }
+        if entry.is_some_and(|e| !e.1) {
+            c.acl_readonly = true;
+            c.readonly = true;
+        }
+    }
+
     fn client_msg(&mut self, cid: ClientId, kind: u8, payload: Vec<u8>) {
+        if self.clients.get(&cid).is_some_and(|c| c.denied) {
+            return;
+        }
         match kind {
             C_IDENTIFY => {
                 let a = decode_args(&payload);
@@ -809,11 +913,15 @@ impl Server {
                     term: get(4),
                     pid: get(5).parse().unwrap_or(0),
                     ctx_pane: get(6).strip_prefix('%').and_then(|s| s.parse().ok()),
-                    env: a.iter().skip(8).filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect(),
+                    env: a.iter().skip(9).filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect(),
                 };
                 let control = get(7).parse().unwrap_or(0);
+                let colorterm = ident.env.iter().find(|(k, _)| k == "COLORTERM").map(|(_, v)| v.as_str()).unwrap_or("");
+                let table: Vec<String> = self.opts_server.0.iter().filter(|(k, _)| k.starts_with("terminal-features[")).map(|(_, v)| v.clone()).collect();
+                let features = features::compute(&ident.term, colorterm, &table, &get(8));
                 if let Some(c) = self.clients.get_mut(&cid) {
                     c.control = control;
+                    c.features = features;
                     c.size = (ident.cols.max(1), ident.rows.max(1));
                     c.ident = Some(ident);
                 }
@@ -1131,6 +1239,7 @@ impl Server {
     }
 
     fn tick_second(&mut self) {
+        self.control_subscriptions();
         let ids: Vec<PaneId> = self.panes.keys().copied().collect();
         for id in ids {
             let Some(p) = self.panes.get(&id) else { continue };
@@ -1678,7 +1787,7 @@ impl Server {
             .clients
             .values()
             .filter(|c| c.attached && c.session == Some(sid))
-            .filter_map(|c| if c.control > 0 { c.control_size.map(|s| (c.activity, s)) } else { Some((c.activity, c.size)) })
+            .filter_map(|c| if c.control > 0 { c.control_size.filter(|_| !c.ctl.ignore_size).map(|s| (c.activity, s)) } else { Some((c.activity, c.size)) })
             .collect();
         let latest = clients.iter().max_by_key(|c| c.0).map(|c| c.1);
         let smallest = clients.iter().map(|c| c.1).reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)));

@@ -16,6 +16,8 @@ pub struct Global {
     pub no_start: bool,
     /// -C (1) / -CC (2): control mode
     pub control: u8,
+    /// -T: extra terminal features ("RGB,sync,...")
+    pub features: String,
 }
 
 fn spawn_server(config: Option<&str>) -> std::io::Result<()> {
@@ -171,6 +173,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
         std::process::id().to_string(),
         std::env::var("PWSH_TMUX_PANE").ok().filter(|_| std::env::var_os("PWSH_TMUX").is_some()).unwrap_or_default(),
         g.control.to_string(),
+        g.features.clone(),
     ];
     ident.extend(std::env::vars().map(|(k, v)| format!("{k}={v}")));
     let stream = Arc::new(stream);
@@ -194,7 +197,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
     let paused = Arc::new(AtomicBool::new(false));
     let mut out = std::io::stdout();
     let restore = |out: &mut std::io::Stdout| {
-        let _ = out.write_all(b"\x1b[0m\x1b[?25h\x1b[?1l\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1004l\x1b[0 q\x1b[?1049l");
+        let _ = out.write_all(b"\x1b[0m\x1b[?25h\x1b[?1l\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1004l\x1b[>4m\x1b[0 q\x1b[?1049l");
         let _ = out.flush();
     };
     loop {

@@ -462,3 +462,76 @@ fn control_mode() {
     wait_for("client exit", || child.try_wait().unwrap().is_some());
     assert!(ctx.ok(&["ls"]).contains("c: 1 windows"));
 }
+
+#[test]
+fn control_mode_flow_and_subscriptions() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::{Arc, Mutex};
+    let ctx = Ctx::new("ctlflow");
+    ctx.ok(&["new-session", "-d", "-s", "c", "-n", "first"]);
+    ctx.wait_prompt("c");
+    let pane = ctx.fmt("c", "#{pane_id}");
+    let mut child = ctx.command().args(["-C", "attach", "-t", "c"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let out = Arc::new(Mutex::new(String::new()));
+    {
+        let out = out.clone();
+        let stdout = child.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                out.lock().unwrap().push_str(&(line + "\n"));
+            }
+        });
+    }
+    let mut stdin = child.stdin.take().unwrap();
+    let mut send = |l: &str| {
+        stdin.write_all(format!("{l}\n").as_bytes()).unwrap();
+        stdin.flush().unwrap();
+    };
+    let text = || out.lock().unwrap().clone();
+    let clear = || out.lock().unwrap().clear();
+    wait_for("attached", || text().contains("%session-changed"));
+    // pause / continue one pane
+    send(&format!("refresh-client -A '{pane}:pause'"));
+    wait_for("%pause", || text().contains(&format!("%pause {pane}")));
+    clear();
+    ctx.ok(&["send-keys", "-t", "c", "echo paused-out", "Enter"]);
+    wait_for("pane output", || ctx.capture("c").matches("paused-out").count() >= 2);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!text().contains("%output"), "output while paused: {}", text());
+    send(&format!("refresh-client -A '{pane}:continue'"));
+    wait_for("%continue", || text().contains(&format!("%continue {pane}")));
+    // no-output flag
+    send("refresh-client -f no-output");
+    std::thread::sleep(Duration::from_millis(300));
+    clear();
+    ctx.ok(&["send-keys", "-t", "c", "echo hidden-out", "Enter"]);
+    wait_for("pane output", || ctx.capture("c").matches("hidden-out").count() >= 2);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!text().contains("%output"));
+    // pause-after switches to %extended-output
+    send("refresh-client -f '!no-output,pause-after=5'");
+    std::thread::sleep(Duration::from_millis(300));
+    ctx.ok(&["send-keys", "-t", "c", "echo ext-out", "Enter"]);
+    wait_for("%extended-output", || text().lines().any(|l| l.starts_with(&format!("%extended-output {pane} ")) && l.contains(" : ")));
+    // subscriptions report changes
+    send("refresh-client -B 'wn::#{window_name}'");
+    wait_for("subscription", || text().contains("%subscription-changed wn $") && text().contains(" : first"));
+    ctx.ok(&["rename-window", "-t", "c", "second"]);
+    wait_for("subscription change", || text().contains(" : second"));
+    send("refresh-client -A 'bogus'");
+    wait_for("%error", || text().contains("%error"));
+    send("");
+    wait_for("client exit", || child.try_wait().unwrap().is_some());
+}
+
+#[test]
+fn server_access_commands() {
+    let ctx = Ctx::new("access");
+    ctx.ok(&["new-session", "-d", "-s", "a"]);
+    assert_eq!(ctx.ok(&["server-access", "-l"]), "");
+    assert!(ctx.fails(&["server-access", "-a", "no-such-user-pt-xyz"]).contains("unknown user"));
+    let me = if cfg!(windows) { std::env::var("USERNAME").unwrap() } else { std::env::var("USER").unwrap_or_else(|_| "root".into()) };
+    assert!(ctx.fails(&["server-access", "-a", &me]).contains("owner"));
+    ctx.fails(&["server-access", "-w", "no-such-user-pt-xyz"]);
+}

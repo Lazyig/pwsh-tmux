@@ -44,7 +44,8 @@ pub fn runtime_dir() -> io::Result<PathBuf> {
                 format!("{} is not a directory owned by this user", dir.display()),
             ));
         }
-        if meta.mode() & 0o077 != 0 {
+        // 0711 (traversable, set by server-access) is fine; readable/writable by others is not
+        if meta.mode() & 0o066 != 0 {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         }
         Ok(dir)
@@ -97,14 +98,19 @@ pub fn connect() -> io::Result<Stream> {
     let same = creds.euid().is_none_or(|u| u == unsafe { libc::geteuid() });
     #[cfg(windows)]
     let same = creds.pid().is_some_and(|p| win::same_user(p as u32));
-    if !same {
+    // -S names another user's shared server explicitly (server-access); otherwise refuse
+    let explicit = std::env::var_os("PWSH_TMUX_SOCKET_PATH").is_some_and(|p| !p.is_empty());
+    if !same && !explicit {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{} is owned by another user", describe())));
     }
     Ok(s)
 }
 
 /// Creates the endpoint unless a server already answers on it (then `None`).
-pub fn listen_exclusive() -> io::Result<Option<Listener>> {
+/// `extra_users`: Windows SIDs besides ours allowed to open the pipe (server-access).
+pub fn listen_exclusive(extra_users: &[String]) -> io::Result<Option<Listener>> {
+    #[cfg(unix)]
+    let _ = extra_users;
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -116,7 +122,7 @@ pub fn listen_exclusive() -> io::Result<Option<Listener>> {
         if connect().is_ok() {
             return Ok(None);
         }
-        listen().map(Some)
+        listen(extra_users).map(Some)
     }
     #[cfg(windows)]
     {
@@ -124,11 +130,11 @@ pub fn listen_exclusive() -> io::Result<Option<Listener>> {
             return Ok(None);
         }
         // FIRST_PIPE_INSTANCE makes a concurrent second server fail here.
-        listen().map(Some)
+        listen(extra_users).map(Some)
     }
 }
 
-fn listen() -> io::Result<Listener> {
+fn listen(#[cfg_attr(unix, allow(unused_variables))] extra_users: &[String]) -> io::Result<Listener> {
     #[cfg(unix)]
     {
         use interprocess::local_socket::GenericFilePath;
@@ -145,9 +151,10 @@ fn listen() -> io::Result<Listener> {
         use interprocess::os::windows::local_socket::ListenerOptionsExt;
         use interprocess::os::windows::security_descriptor::SecurityDescriptor;
         let mut opts = ListenerOptions::new().name(pipe_name().to_ns_name::<GenericNamespaced>()?);
-        // Only this user (and SYSTEM) may open the pipe.
+        // Only this user, SYSTEM and server-access users may open the pipe.
         if let Some(sid) = win::own_sid_string() {
-            let sddl = widestring::U16CString::from_str(format!("D:P(A;;GA;;;{sid})(A;;GA;;;SY)"))
+            let others: String = extra_users.iter().filter(|s| s.starts_with("S-1-")).map(|s| format!("(A;;GA;;;{s})")).collect();
+            let sddl = widestring::U16CString::from_str(format!("D:P(A;;GA;;;{sid})(A;;GA;;;SY){others}"))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
             opts = opts.security_descriptor(SecurityDescriptor::deserialize(&sddl)?);
         }
@@ -196,6 +203,87 @@ mod win {
         }
     }
 
+    unsafe fn sid_string(sid: windows_sys::Win32::Security::PSID) -> Option<String> {
+        let mut p: *mut u16 = std::ptr::null_mut();
+        if unsafe { ConvertSidToStringSidW(sid, &mut p) } == 0 || p.is_null() {
+            return None;
+        }
+        let mut n = 0;
+        while unsafe { *p.add(n) } != 0 {
+            n += 1;
+        }
+        let s = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, n) });
+        unsafe { LocalFree(p.cast()) };
+        Some(s)
+    }
+
+    /// SID of the process at the other end of a server pipe (after data has been read from it).
+    pub fn pipe_client_sid(pipe: HANDLE) -> Option<String> {
+        use windows_sys::Win32::Security::RevertToSelf;
+        use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+        unsafe {
+            if ImpersonateNamedPipeClient(pipe) == 0 {
+                return None;
+            }
+            let mut tok: HANDLE = std::ptr::null_mut();
+            let ok = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut tok);
+            RevertToSelf();
+            if ok == 0 {
+                return None;
+            }
+            let mut len = 0u32;
+            GetTokenInformation(tok, TokenUser, std::ptr::null_mut(), 0, &mut len);
+            let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+            let ok = GetTokenInformation(tok, TokenUser, buf.as_mut_ptr().cast(), (buf.len() * 8) as u32, &mut len);
+            CloseHandle(tok);
+            if ok == 0 {
+                return None;
+            }
+            sid_string((*(buf.as_ptr() as *const TOKEN_USER)).User.Sid)
+        }
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    pub fn lookup_account(name: &str) -> Option<String> {
+        use windows_sys::Win32::Security::{LookupAccountNameW, SID_NAME_USE};
+        let mut sid = vec![0u64; 16];
+        let mut sid_len = (sid.len() * 8) as u32;
+        let mut dom = vec![0u16; 256];
+        let mut dom_len = dom.len() as u32;
+        let mut kind: SID_NAME_USE = 0;
+        let ok = unsafe { LookupAccountNameW(std::ptr::null(), wide(name).as_ptr(), sid.as_mut_ptr().cast(), &mut sid_len, dom.as_mut_ptr(), &mut dom_len, &mut kind) };
+        if ok == 0 {
+            return None;
+        }
+        unsafe { sid_string(sid.as_mut_ptr().cast()) }
+    }
+
+    pub fn account_name(sid: &str) -> Option<String> {
+        use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+        use windows_sys::Win32::Security::{LookupAccountSidW, SID_NAME_USE};
+        unsafe {
+            let mut psid: windows_sys::Win32::Security::PSID = std::ptr::null_mut();
+            if ConvertStringSidToSidW(wide(sid).as_ptr(), &mut psid) == 0 {
+                return None;
+            }
+            let (mut name, mut dom) = (vec![0u16; 256], vec![0u16; 256]);
+            let (mut nlen, mut dlen) = (name.len() as u32, dom.len() as u32);
+            let mut kind: SID_NAME_USE = 0;
+            let ok = LookupAccountSidW(std::ptr::null(), psid, name.as_mut_ptr(), &mut nlen, dom.as_mut_ptr(), &mut dlen, &mut kind);
+            LocalFree(psid.cast());
+            if ok == 0 {
+                return None;
+            }
+            let n = String::from_utf16_lossy(&name[..nlen as usize]);
+            let d = String::from_utf16_lossy(&dom[..dlen as usize]);
+            Some(if d.is_empty() { n } else { format!("{d}\\{n}") })
+        }
+    }
+
     pub fn same_user(pid: u32) -> bool {
         unsafe {
             let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
@@ -210,6 +298,94 @@ mod win {
             EqualSid(a.User.Sid, b.User.Sid) != 0
         }
     }
+}
+
+// ---- users (server-access) -------------------------------------------------------------
+
+/// This process's user: the uid on Unix, the SID on Windows.
+pub fn own_user_id() -> String {
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() }.to_string()
+    }
+    #[cfg(windows)]
+    {
+        win::own_sid_string().unwrap_or_default()
+    }
+}
+
+/// root / SYSTEM always get in, like tmux.
+pub fn is_superuser(id: &str) -> bool {
+    id == "0" || id == "S-1-5-18"
+}
+
+/// The user at the other end of a server-side connection. On Windows this needs a frame
+/// to have been read from the pipe first.
+pub fn peer_user_id(s: &Stream) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use interprocess::local_socket::traits::StreamCommon;
+        s.peer_creds().ok()?.euid().map(|u| u.to_string())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsHandle, AsRawHandle};
+        match s {
+            Stream::NamedPipe(p) => win::pipe_client_sid(p.inner().as_handle().as_raw_handle()),
+        }
+    }
+}
+
+pub fn user_id_for_name(name: &str) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let c = std::ffi::CString::new(name).ok()?;
+        let pw = unsafe { libc::getpwnam(c.as_ptr()) };
+        if pw.is_null() {
+            return name.parse::<u32>().ok().map(|u| u.to_string());
+        }
+        Some(unsafe { (*pw).pw_uid }.to_string())
+    }
+    #[cfg(windows)]
+    {
+        if name.starts_with("S-1-") {
+            return Some(name.to_string());
+        }
+        win::lookup_account(name)
+    }
+}
+
+pub fn user_name_for_id(id: &str) -> String {
+    #[cfg(unix)]
+    {
+        let Ok(uid) = id.parse::<u32>() else { return id.to_string() };
+        let pw = unsafe { libc::getpwuid(uid) };
+        if pw.is_null() {
+            return id.to_string();
+        }
+        unsafe { std::ffi::CStr::from_ptr((*pw).pw_name) }.to_string_lossy().into_owned()
+    }
+    #[cfg(windows)]
+    {
+        win::account_name(id).unwrap_or_else(|| id.to_string())
+    }
+}
+
+/// Opens (or closes again) the endpoint to other users once server-access allows someone:
+/// the socket directory becomes traversable and the socket writable. The server checks each
+/// connecting user against its access list either way. On Windows the pipe's ACL is set
+/// when the server starts (see listen_exclusive), so this does nothing there.
+pub fn set_shared(shared: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let (Ok(dir), Ok(sock)) = (runtime_dir(), socket_path()) {
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(if shared { 0o711 } else { 0o700 }));
+            let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(if shared { 0o777 } else { 0o700 }));
+        }
+    }
+    #[cfg(windows)]
+    let _ = shared;
 }
 
 pub fn cleanup() {

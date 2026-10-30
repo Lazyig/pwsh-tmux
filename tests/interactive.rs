@@ -207,3 +207,25 @@ fn terminal_closed_under_client() {
     wait_for("detached", || !ctx.ok(&["ls"]).contains("attached"));
     ctx.ok(&["has-session", "-t", "h"]);
 }
+
+#[test]
+fn terminal_features_and_extended_keys() {
+    let ctx = Ctx::new("features");
+    ctx.ok(&["new-session", "-d", "-s", "f"]);
+    ctx.ok(&["set", "-g", "status-style", "bg=#ff0000,fg=#00ff00"]);
+    // xterm-256color without COLORTERM: truecolor is mapped to the 256-colour palette
+    let t = Term::attach(&ctx, &["attach", "-t", "f"], 80, 24);
+    t.wait_screen("status", |s| s.contains("[f]"));
+    let feats = ctx.ok(&["list-clients", "-F", "#{client_termfeatures}"]);
+    assert!(feats.contains("256") && feats.contains("clipboard") && !feats.contains("RGB"), "{feats}");
+    wait_for("256-colour status", || t.raw_text().contains("48;5;196"));
+    assert!(!t.raw_text().contains("48;2;255;0;0"));
+    drop(t);
+    // -T adds features: RGB keeps truecolor, sync wraps frames, extkeys lets extended-keys ask
+    ctx.ok(&["set", "-s", "extended-keys", "always"]);
+    let t = Term::attach(&ctx, &["-T", "RGB,sync,extkeys", "attach", "-t", "f"], 80, 24);
+    t.wait_screen("status", |s| s.contains("[f]"));
+    wait_for("truecolor status", || t.raw_text().contains("48;2;255;0;0"));
+    assert!(t.raw_text().contains("\x1b[?2026h"), "synchronized output");
+    assert!(t.raw_text().contains("\x1b[>4;2m"), "modifyOtherKeys requested");
+}

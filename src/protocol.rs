@@ -7,7 +7,8 @@ use std::io::{self, Read, Write};
 pub const C_COMMAND: u8 = 1;
 pub const C_INPUT: u8 = 3;
 pub const C_RESIZE: u8 = 4;
-/// Sent first: args [cols, rows, is_tty(0/1), cwd, term, pid, ctx_pane, control(0/1/2), KEY=VALUE...].
+/// Sent first: args [cols, rows, is_tty(0/1), cwd, term, pid, ctx_pane, control(0/1/2),
+/// features (-T), KEY=VALUE...].
 pub const C_IDENTIFY: u8 = 5;
 /// Client finished a S_SHELL / S_SUSPEND and is back in raw mode.
 pub const C_RESUMED: u8 = 6;

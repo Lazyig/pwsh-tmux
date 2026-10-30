@@ -43,7 +43,7 @@ fn main() {
         };
         std::process::exit(code);
     }
-    let mut g = client::Global { config: None, no_start: false, control: 0 };
+    let mut g = client::Global { config: None, no_start: false, control: 0, features: String::new() };
     let mut shell_cmd = None;
     // global flags before the command
     while let Some(a) = args.first().cloned() {
@@ -63,9 +63,7 @@ fn main() {
                 'S' => unsafe { std::env::set_var("PWSH_TMUX_SOCKET_PATH", value().unwrap_or_default()) },
                 'f' => g.config = value(),
                 'c' => shell_cmd = value(),
-                'T' => {
-                    value();
-                }
+                'T' => g.features = value().unwrap_or_default(),
                 'N' => g.no_start = true,
                 'V' => {
                     println!("pwsh-tmux {}", env!("CARGO_PKG_VERSION"));

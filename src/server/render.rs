@@ -70,6 +70,8 @@ pub struct Modes {
     pub mouse: bool,
     pub focus: bool,
     pub cursor_style: u8,
+    /// modifyOtherKeys level requested from the outer terminal (extended-keys).
+    pub extkeys: u8,
 }
 
 pub fn draw_box(f: &mut Frame, x: u16, y: u16, w: u16, h: u16, style: Style, title: &str) {
@@ -109,6 +111,16 @@ fn push_color(out: &mut String, c: Color, base: u8) {
             let _ = write!(out, ";{};2;{};{};{}", base + 8, r, g, b);
         }
     }
+}
+
+/// Colours and attributes the client's terminal can show.
+fn fit_style(mut st: Style, f: &super::features::Features) -> Style {
+    st.fg = super::features::fit_color(st.fg, f);
+    st.bg = super::features::fit_color(st.bg, f);
+    if !f.has("strikethrough") {
+        st.attrs &= !STRIKE;
+    }
+    st
 }
 
 pub fn push_sgr(out: &mut String, st: &Style) {
@@ -583,7 +595,24 @@ impl Server {
                 }
             }
         }
+        let ext_keys = self.opt_server("extended-keys");
         let c = self.clients.get_mut(&cid).unwrap();
+        let feats = c.features.clone();
+        if !feats.has("title") {
+            title_update = None;
+        }
+        let mut next = next;
+        next.modes.mouse &= feats.has("mouse");
+        next.modes.focus &= feats.has("focus");
+        next.modes.extkeys = if feats.has("extkeys") {
+            match ext_keys.as_str() {
+                "always" => 2,
+                "on" => 1,
+                _ => 0,
+            }
+        } else {
+            0
+        };
         c.dirty = false;
         let prev = c.prev.as_ref().filter(|p| p.frame.w == next.frame.w && p.frame.h == next.frame.h);
         let mut out = String::new();
@@ -604,7 +633,7 @@ impl Server {
                     continue;
                 }
                 if cur != Some(cell.style) {
-                    push_sgr(&mut out, &cell.style);
+                    push_sgr(&mut out, &fit_style(cell.style, &feats));
                     cur = Some(cell.style);
                 }
                 out.push_str(&cell.text);
@@ -630,10 +659,25 @@ impl Server {
             out.push_str(if m.bracketed_paste { "\x1b[?2004h" } else { "\x1b[?2004l" });
             out.push_str(if m.mouse { "\x1b[?1000h\x1b[?1002h\x1b[?1006h" } else { "\x1b[?1006l\x1b[?1002l\x1b[?1000l" });
             out.push_str(if m.focus { "\x1b[?1004h" } else { "\x1b[?1004l" });
-            let _ = write!(out, "\x1b[{} q", m.cursor_style);
+            if feats.has("cstyle") {
+                let _ = write!(out, "\x1b[{} q", m.cursor_style);
+            }
+            if pm.map_or(0, |p| p.extkeys) != m.extkeys {
+                // modifyOtherKeys: have the terminal report keys like C-Enter distinctly
+                out.push_str(match m.extkeys {
+                    2 => "\x1b[>4;2m",
+                    1 => "\x1b[>4;1m",
+                    _ => "\x1b[>4m",
+                });
+            }
         }
         if let Some((x, y)) = next.cursor {
             let _ = write!(out, "\x1b[{};{}H\x1b[?25h", y + 1, x + 1);
+        }
+        if feats.has("sync") {
+            // synchronized output: the terminal shows the whole frame at once
+            out.insert_str(0, "\x1b[?2026h");
+            out.push_str("\x1b[?2026l");
         }
         c.send(S_OUTPUT, out.as_bytes());
         c.prev = Some(next);
