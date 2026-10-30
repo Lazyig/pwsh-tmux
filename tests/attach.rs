@@ -115,7 +115,8 @@ fn attach_split_type_detach() {
     send("echo hi-from-pane 한글테스트\r".as_bytes());
     wait_for("echo output", t, || contents().matches("hi-from-pane").count() >= 2);
     // the shell may echo the typed line twice before the output arrives
-    wait_for("korean output", t, || ctx.ok(&["capture-pane", "-p", "-t", "t"]).lines().any(|l| l.trim() == "hi-from-pane 한글테스트"));
+    // (sh prints the words on one line, PowerShell's echo one per line)
+    wait_for("korean output", t, || ctx.ok(&["capture-pane", "-p", "-t", "t"]).lines().any(|l| matches!(l.trim(), "hi-from-pane 한글테스트" | "한글테스트")));
     wait_for("korean on screen", t, || contents().contains("한글테스트"));
 
     // prefix % splits left/right; a separator appears
