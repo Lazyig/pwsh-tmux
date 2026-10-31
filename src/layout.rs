@@ -197,7 +197,20 @@ pub fn neighbour(panes: &[(PaneId, Rect)], from: PaneId, dir: Dir, cursor: (u16,
 
 /// Names accepted by [`preset`], in tmux's `next-layout` order.
 #[allow(dead_code)] // wired up by the command layer
-pub const PRESETS: [&str; 5] = ["even-horizontal", "even-vertical", "main-horizontal", "main-vertical", "tiled"];
+pub const PRESETS: [&str; 7] = [
+    "even-horizontal", "even-vertical", "main-horizontal", "main-horizontal-mirrored",
+    "main-vertical", "main-vertical-mirrored", "tiled",
+];
+
+/// tmux accepts exact names or unambiguous prefixes of preset names.
+pub fn preset_name(name: &str) -> Option<&'static str> {
+    if let Some(&name) = PRESETS.iter().find(|&&p| p == name) {
+        return Some(name);
+    }
+    let mut matches = PRESETS.iter().copied().filter(|p| p.starts_with(name));
+    let name = matches.next()?;
+    matches.next().is_none().then_some(name)
+}
 
 /// tmux `PANE_MINIMUM`.
 const PANE_MIN: u16 = 1;
@@ -283,8 +296,8 @@ pub fn preset(name: &str, panes: &[PaneId], area: Rect, main_size: Option<u16>) 
     let node = match name {
         "even-horizontal" => even(panes, area.w, true),
         "even-vertical" => even(panes, area.h, false),
-        "main-horizontal" | "main-vertical" => {
-            let horizontal = name == "main-vertical";
+        "main-horizontal" | "main-vertical" | "main-horizontal-mirrored" | "main-vertical-mirrored" => {
+            let horizontal = name.starts_with("main-vertical");
             let total = along(horizontal, area);
             let avail = total.saturating_sub(1);
             let mut main = main_size.unwrap_or(if horizontal { 80 } else { 24 }).max(PANE_MIN);
@@ -293,7 +306,11 @@ pub fn preset(name: &str, panes: &[PaneId], area: Rect, main_size: Option<u16>) 
             }
             let other = avail.saturating_sub(main);
             let others = even(&panes[1..], along(!horizontal, area), !horizontal);
-            chain(vec![(Node::Leaf(panes[0]), main), (others, other)], horizontal)
+            let mut items = vec![(Node::Leaf(panes[0]), main), (others, other)];
+            if name.ends_with("-mirrored") {
+                items.reverse();
+            }
+            chain(items, horizontal)
         }
         _ => {
             // tiled (tmux layout_set_tiled).
@@ -714,20 +731,27 @@ impl Node {
         Some(true)
     }
 
-    /// Make every split even: each flattened group's items get equal sizes
-    /// (within one cell), recursively.
-    pub fn spread(&mut self, area: Rect) {
+    /// Spread the target's nearest sibling group that changes, climbing to its
+    /// ancestors only if that group already has tmux's even sizes.
+    pub fn spread(&mut self, target: PaneId, area: Rect) -> bool {
         let h = match self {
-            Node::Leaf(_) => return,
+            Node::Leaf(_) => return false,
             Node::Split { horizontal, .. } => *horizontal,
         };
-        let sizes = even_sizes(along(h, area), self.group_count(h));
-        self.assign_group(h, &sizes);
         let mut items = Vec::new();
         self.group_items(h, area, &mut items);
-        for (item, r) in items {
-            item.spread(r);
+        let Some(idx) = items.iter().position(|(n, _)| n.contains(target)) else { return false };
+        let (item, r) = items.swap_remove(idx);
+        if item.spread(target, r) {
+            return true;
         }
+        let mut items = Vec::new();
+        self.group_items(h, area, &mut items);
+        let sizes = even_sizes(along(h, area), items.len());
+        let changed = items.iter().zip(&sizes).any(|((_, r), size)| along(h, *r) != *size);
+        drop(items);
+        self.assign_group(h, &sizes);
+        changed
     }
 
     fn to_cell(&self, r: Rect) -> Cell {
@@ -909,7 +933,9 @@ mod tests {
                 for n in 1..=8u32 {
                     let panes: Vec<PaneId> = (1..=n).collect();
                     let t = preset(name, &panes, area(w, h), None).unwrap();
-                    assert_eq!(t.panes(), panes, "{name} {n}");
+                    let mut actual = t.panes();
+                    actual.sort_unstable();
+                    assert_eq!(actual, panes, "{name} {n}");
                     assert_cover(&t, area(w, h));
                 }
             }
@@ -1125,15 +1151,18 @@ mod tests {
         t.split(4, 5, false);
         t.split(5, 6, false);
         t.resize(5, Dir::Down, 7, a);
-        t.spread(a);
+        let first = rect_of(&t, a, 1);
+        t.spread(5, a);
         let r = rects(&t, a);
-        assert!(spread_of(r[..4].iter().map(|(_, r)| r.w)) <= 1, "{r:?}");
+        assert_eq!(rect_of(&t, a, 1), first, "unrelated group must stay unchanged");
         let col: Vec<u16> = r[3..].iter().map(|(_, r)| r.h).collect();
         assert_eq!(col, vec![16, 15, 15]);
+        assert!(t.spread(5, a), "already even siblings: spread the parent group");
+        assert_eq!(rect_of(&t, a, 1).w, 39);
         assert_eq!(t.panes(), vec![1, 2, 3, 4, 5, 6]);
         assert_cover(&t, a);
         let mut l = Node::Leaf(1);
-        l.spread(a);
+        assert!(!l.spread(1, a));
     }
 
     #[test]
@@ -1172,7 +1201,7 @@ mod tests {
                     assert_eq!(p.panes(), other);
                     // Re-dumping with the original ids gives the same string.
                     let mut q = p.clone();
-                    for (o, n) in other.iter().zip(&panes) {
+                    for (o, n) in other.iter().zip(t.panes().iter()) {
                         q.replace(*o, *n);
                     }
                     assert_eq!(q.to_layout_string(a), s);

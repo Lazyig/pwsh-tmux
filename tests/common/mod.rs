@@ -10,6 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_pwsh-tmux");
+pub fn binary() -> std::ffi::OsString {
+    std::env::var_os("PT_TEST_BIN").unwrap_or_else(|| BIN.into())
+}
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
 pub struct Ctx {
@@ -22,7 +25,7 @@ impl Ctx {
     }
 
     pub fn command(&self) -> Command {
-        let mut c = Command::new(BIN);
+        let mut c = Command::new(binary());
         c.env("PWSH_TMUX_SOCKET", &self.socket).env_remove("PWSH_TMUX").env_remove("PWSH_TMUX_PANE");
         c
     }
@@ -92,7 +95,7 @@ pub struct Term {
 
 impl Term {
     pub fn attach(ctx: &Ctx, args: &[&str], cols: u16, rows: u16) -> Term {
-        let mut cb = CommandBuilder::new(BIN);
+        let mut cb = CommandBuilder::new(binary());
         cb.args(args);
         cb.env("PWSH_TMUX_SOCKET", &ctx.socket);
         cb.env_remove("PWSH_TMUX");

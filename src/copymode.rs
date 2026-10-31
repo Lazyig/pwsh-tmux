@@ -6,7 +6,7 @@
 //! `top` is the absolute index of the first displayed line. The scroll offset reported to
 //! the user (tmux's `oy`) is `hsize - top` where `hsize = lines.len() - height`.
 
-use crate::cells::{Cell, Color, INVERSE, Line, Style};
+use crate::cells::{Cell, Color, Line, Style};
 
 /// Result of a key or command.
 #[derive(Clone, PartialEq, Debug)]
@@ -48,6 +48,7 @@ impl JumpKind {
 }
 
 type Pos = (usize, usize);
+type SearchOrigin = (Pos, usize, Option<(String, bool)>);
 
 /// tmux's default `word-separators` (tmux 3.0 - 3.2).
 pub const DEFAULT_WORD_SEPARATORS: &str = " -_@";
@@ -74,6 +75,8 @@ pub struct CopyMode {
     rect: bool,
     /// Last search: (text, forward).
     search: Option<(String, bool)>,
+    incremental_origin: Option<SearchOrigin>,
+    search_cache: std::cell::RefCell<(String, Option<fancy_regex::Regex>)>,
     /// Last jump: (kind, character).
     jump: Option<(JumpKind, String)>,
     /// A jump command waiting for its character argument.
@@ -82,6 +85,7 @@ pub struct CopyMode {
     separators: String,
     mark: Option<Pos>,
     show_position: bool,
+    search_marks: bool,
     exit_on_bottom: bool,
 }
 
@@ -102,12 +106,15 @@ impl CopyMode {
             line_mode: false,
             rect: false,
             search: None,
+            incremental_origin: None,
+            search_cache: std::cell::RefCell::new((String::new(), None)),
             jump: None,
             pending_jump: None,
             count: None,
             separators: DEFAULT_WORD_SEPARATORS.to_string(),
             mark: None,
             show_position: true,
+            search_marks: false,
             exit_on_bottom: false,
         };
         cm.pad();
@@ -142,6 +149,27 @@ impl CopyMode {
 
     pub fn selection_active(&self) -> bool {
         self.anchor.is_some()
+    }
+
+    pub fn begin_incremental_search(&mut self) {
+        self.incremental_origin = Some(((self.cy, self.cx), self.top, self.search.clone()));
+    }
+
+    pub fn preview_search(&mut self, text: &str, forward: bool) {
+        let Some((pos, top, search)) = self.incremental_origin.clone() else { return };
+        self.set_cursor(pos.0, pos.1);
+        self.top = top;
+        self.search = search;
+        if !text.is_empty() {
+            self.search_marks = true;
+            self.search = Some((text.into(), forward));
+            self.do_search(text, forward, 1);
+        }
+    }
+
+    pub fn finish_incremental_search(&mut self, cancel: bool) {
+        if cancel { self.preview_search("", true); }
+        self.incremental_origin = None;
     }
 
     pub fn resize(&mut self, width: u16, height: u16) {
@@ -189,6 +217,7 @@ impl CopyMode {
                 ("Escape", "clear-selection"),
                 ("Space", "begin-selection"),
                 ("#", "search-backward-text"),
+                ("%", "next-matching-bracket"),
                 ("$", "end-of-line"),
                 ("*", "search-forward-text"),
                 (",", "jump-reverse"),
@@ -230,8 +259,6 @@ impl CopyMode {
                 ("t", "jump-to-forward-prompt"),
                 ("v", "rectangle-toggle"),
                 ("w", "next-word"),
-                // Not a tmux default, but unbound there and universally expected.
-                ("y", "copy-selection-and-cancel"),
                 ("z", "scroll-middle"),
                 ("{", "previous-paragraph"),
                 ("}", "next-paragraph"),
@@ -286,7 +313,9 @@ impl CopyMode {
                 ("M->", "history-bottom"),
                 ("M-R", "top-line"),
                 ("M-b", "previous-word"),
+                ("C-M-b", "previous-matching-bracket"),
                 ("M-f", "next-word-end"),
+                ("C-M-f", "next-matching-bracket"),
                 ("M-m", "back-to-indentation"),
                 ("M-r", "middle-line"),
                 ("M-v", "page-up"),
@@ -347,6 +376,88 @@ impl CopyMode {
     /// Run a named copy-mode command (`send-keys -X name args`). A pending repeat count
     /// (from digit keys) is applied and consumed.
     pub fn run(&mut self, command: &str, args: &[String]) -> Action {
+        if command.starts_with("search-") {
+            self.search_marks = true;
+        } else if matches!(command,
+                "append-selection"
+                | "append-selection-and-cancel"
+                | "back-to-indentation"
+                | "begin-selection"
+                | "cancel"
+                | "clear-selection"
+                | "copy-end-of-line"
+                | "copy-end-of-line-and-cancel"
+                | "copy-line"
+                | "copy-line-and-cancel"
+                | "copy-pipe"
+                | "copy-pipe-and-cancel"
+                | "copy-pipe-end-of-line"
+                | "copy-pipe-end-of-line-and-cancel"
+                | "copy-pipe-line"
+                | "copy-pipe-line-and-cancel"
+                | "copy-selection"
+                | "copy-selection-and-cancel"
+                | "cursor-down-and-cancel"
+                | "halfpage-down-and-cancel"
+                | "jump-to-mark"
+                | "next-matching-bracket"
+                | "next-prompt"
+                | "page-down-and-cancel"
+                | "pipe"
+                | "pipe-and-cancel"
+                | "previous-matching-bracket"
+                | "previous-prompt"
+                | "rectangle-off"
+                | "rectangle-on"
+                | "rectangle-toggle"
+                | "refresh-from-pane"
+                | "scroll-bottom"
+                | "scroll-down-and-cancel"
+                | "scroll-middle"
+                | "scroll-top"
+                | "select-line"
+                | "select-word"
+                | "set-mark"
+                | "stop-selection"
+            ) || (!self.vi && matches!(command,
+                "bottom-line"
+                | "cursor-centre-horizontal"
+                | "cursor-centre-vertical"
+                | "cursor-down"
+                | "cursor-left"
+                | "cursor-right"
+                | "cursor-up"
+                | "end-of-line"
+                | "goto-line"
+                | "halfpage-down"
+                | "halfpage-up"
+                | "history-bottom"
+                | "history-top"
+                | "jump-again"
+                | "jump-backward"
+                | "jump-forward"
+                | "jump-reverse"
+                | "jump-to-backward"
+                | "jump-to-forward"
+                | "middle-line"
+                | "next-paragraph"
+                | "next-space"
+                | "next-space-end"
+                | "next-word"
+                | "next-word-end"
+                | "other-end"
+                | "page-down"
+                | "page-up"
+                | "previous-paragraph"
+                | "previous-space"
+                | "previous-word"
+                | "scroll-down"
+                | "scroll-up"
+                | "start-of-line"
+                | "top-line"
+            )) {
+            self.search_marks = false;
+        }
         let action = self.run_inner(command, args);
         let downward = matches!(command, "scroll-down" | "page-down" | "halfpage-down" | "cursor-down" | "history-bottom" | "scroll-down-and-cancel" | "page-down-and-cancel");
         if self.exit_on_bottom && downward && action == Action::None && self.scroll_offset() == 0 && self.anchor.is_none() {
@@ -381,6 +492,8 @@ impl CopyMode {
             "next-space-end" => self.repeat_move(n, |s, p| Some(s.next_word_end(p, ""))),
             "previous-word" => self.repeat_move(n, |s, p| Some(s.previous_word(p, &seps))),
             "previous-space" => self.repeat_move(n, |s, p| Some(s.previous_word(p, ""))),
+            "next-matching-bracket" => (0..n).for_each(|_| self.matching_bracket(true)),
+            "previous-matching-bracket" => (0..n).for_each(|_| self.matching_bracket(false)),
             "top-line" => self.set_cursor(self.top, 0),
             "middle-line" => {
                 let rows = self.height.min(self.lines.len() - self.top);
@@ -491,8 +604,15 @@ impl CopyMode {
                     None => self.word_under_cursor(),
                 };
                 if !text.is_empty() {
-                    self.search = Some((text.clone(), forward));
-                    self.do_search(&text, forward, n);
+                    // The -text commands search the word literally, even if it
+                    // contains regex metacharacters.
+                    let mut pattern = String::new();
+                    for c in text.chars() {
+                        if ".^$*+?()[]{}|\\".contains(c) { pattern.push('\\'); }
+                        pattern.push(c);
+                    }
+                    self.search = Some((pattern.clone(), forward));
+                    self.do_search(&pattern, forward, n);
                 }
             }
             "search-again" | "search-reverse" => {
@@ -561,6 +681,10 @@ impl CopyMode {
 
     /// The `height` lines to display plus the cursor position within them.
     pub fn render(&self) -> (Vec<Line>, (u16, u16)) {
+        self.render_with_style(Style { fg: BLACK, bg: YELLOW, attrs: 0 })
+    }
+
+    pub fn render_with_style(&self, mode_style: Style) -> (Vec<Line>, (u16, u16)) {
         let mut out = Vec::with_capacity(self.height);
         let needle = self.search.as_ref().map(|(t, _)| t.as_str()).filter(|t| !t.is_empty());
         for row in 0..self.height {
@@ -578,7 +702,7 @@ impl CopyMode {
                 }
             }
             line.cells.resize(self.width, Cell::default());
-            if let Some(needle) = needle {
+            if let Some(needle) = needle.filter(|_| self.search_marks) {
                 for (x0, x1) in self.row_matches(y, needle) {
                     let current = y == self.cy && x0 == self.cx;
                     let bg = if current { MAGENTA } else { CYAN };
@@ -590,13 +714,17 @@ impl CopyMode {
             }
             if let Some((x0, x1)) = self.sel_range(y) {
                 for c in line.cells.iter_mut().take(x1.min(self.width)).skip(x0) {
-                    c.style.attrs ^= INVERSE;
+                    c.style = mode_style;
                 }
             }
             out.push(line);
         }
         if self.show_position {
-            let ind = format!("[{}/{}]", self.scroll_offset(), self.hsize());
+            let mut ind = format!("[{}/{}]", self.scroll_offset(), self.hsize());
+            if let Some(needle) = needle {
+                let results: usize = (0..self.lines.len()).map(|y| self.row_matches(y, needle).len()).sum();
+                ind.push_str(&format!(" ({results} results)"));
+            }
             let len = ind.chars().count();
             if len <= self.width {
                 let start = self.width - len;
@@ -604,7 +732,7 @@ impl CopyMode {
                 if row[start].is_continuation() && start > 0 {
                     row[start - 1].text = " ".into();
                 }
-                let style = Style { fg: BLACK, bg: YELLOW, attrs: 0 };
+                let style = mode_style;
                 for (i, ch) in ind.chars().enumerate() {
                     row[start + i] = Cell { text: ch.to_string(), style };
                 }
@@ -955,6 +1083,47 @@ impl CopyMode {
 
     // ----------------------------------------------------------------- jump / search
 
+    fn matching_bracket(&mut self, next: bool) {
+        let original = (self.cy, self.cx);
+        let mut p = original;
+        let bracket = |s: &Self, p: Pos| s.cell(p.0, p.1).map(|c| c.text.as_str()).unwrap_or("").chars().next();
+        let opens = "{[(";
+        let closes = "}])";
+        let direction;
+        let found;
+        loop {
+            let ch = bracket(self, p).unwrap_or(' ');
+            if next && opens.contains(ch) { direction = true; found = ch; break; }
+            if (!next || self.vi) && closes.contains(ch) { direction = false; found = ch; break; }
+            if !self.vi {
+                let adjacent = if next { self.step_right(p) } else { self.step_left(p) };
+                if p == original && let Some(adjacent) = adjacent.filter(|a| a.0 == original.0) {
+                    p = adjacent;
+                    continue;
+                }
+                let p = if next { self.next_word_end(original, opens) } else { self.previous_word(original, closes) };
+                self.set_cursor(p.0, p.1);
+                return;
+            }
+            // vi scans for either bracket on the current logical (soft-wrapped) line.
+            if !next { return; }
+            let Some(q) = self.step_right(p) else { return };
+            if q.0 != p.0 && !self.wrapped(p.0) { return; }
+            p = q;
+        }
+        let other = if direction { closes.as_bytes()[opens.find(found).unwrap()] } else { opens.as_bytes()[closes.find(found).unwrap()] } as char;
+        let mut depth = 1;
+        while let Some(q) = if direction { self.step_right(p) } else { self.step_left(p) } {
+            p = q;
+            let ch = bracket(self, p).unwrap_or(' ');
+            if ch == found { depth += 1; }
+            else if ch == other {
+                depth -= 1;
+                if depth == 0 { self.set_cursor(p.0, p.1); return; }
+            }
+        }
+    }
+
     fn do_jump(&mut self, kind: JumpKind, ch: &str, n: usize) {
         for _ in 0..n {
             let y = self.cy;
@@ -977,9 +1146,10 @@ impl CopyMode {
     /// All matches of `needle` on row `y` as cell ranges [x0, x1).
     fn row_matches(&self, y: usize, needle: &str) -> Vec<(usize, usize)> {
         let Some(line) = self.lines.get(y) else { return Vec::new() };
+        let len = self.copy_len(y);
         let mut s = String::new();
         let mut starts: Vec<(usize, usize)> = Vec::new(); // (byte offset, column)
-        for (x, c) in line.cells.iter().enumerate() {
+        for (x, c) in line.cells.iter().take(len).enumerate() {
             if c.text.is_empty() {
                 continue;
             }
@@ -987,13 +1157,18 @@ impl CopyMode {
             s.push_str(&c.text);
         }
         let col_at = |b: usize| starts.iter().rev().find(|(o, _)| *o <= b).map_or(0, |(_, x)| *x);
-        let col_after = |e: usize| starts.iter().find(|(o, _)| *o >= e).map_or(line.cells.len(), |(_, x)| *x);
+        let col_after = |e: usize| starts.iter().find(|(o, _)| *o >= e).map_or(len, |(_, x)| *x);
         let mut out = Vec::new();
+        let mut cache = self.search_cache.borrow_mut();
+        if cache.0 != needle {
+            *cache = (needle.to_string(), crate::format::compile_regex(needle, false));
+        }
+        let Some(re) = &cache.1 else { return out };
         let mut from = 0;
         while from <= s.len() {
-            let Some(i) = s[from..].find(needle) else { break };
-            let b = from + i;
-            out.push((col_at(b), col_after(b + needle.len())));
+            let Ok(Some(found)) = re.find_from_pos(&s, from) else { break };
+            let b = found.start();
+            out.push((col_at(b), col_after(found.end())));
             from = b + s[b..].chars().next().map_or(1, char::len_utf8);
         }
         out
@@ -1523,7 +1698,7 @@ mod tests {
         let mut cm = CopyMode::new(lines(&["hello world", "second line"]), W, 2, (0, 0), true);
         keys(&mut cm, &["Space", "e"]);
         assert!(cm.selection_active());
-        let a = cm.key("y");
+        let a = cm.key("Enter");
         assert_eq!(a, Action::Copy { text: "hello".into(), cancel: true });
         // Multi-line, trailing spaces trimmed, newline between lines.
         let mut cm = CopyMode::new(lines(&["hello world", "second line"]), W, 2, (0, 6), true);
@@ -1562,7 +1737,7 @@ mod tests {
         let v = vec![line("aaaaaaaaaaaaaaaaaaaa", true), line("bbb   ", false), line("ccc", false)];
         let mut cm = CopyMode::new(v, W, 3, (0, 0), true);
         keys(&mut cm, &["Space", "j", "j", "$", "h"]);
-        assert_eq!(copied(cm.key("y")), format!("{}bbb\nccc", "a".repeat(20)));
+        assert_eq!(copied(cm.key("Enter")), format!("{}bbb\nccc", "a".repeat(20)));
     }
 
     #[test]
@@ -1570,24 +1745,24 @@ mod tests {
         let mut cm = CopyMode::new(lines(&["x 한국어 y"]), W, 1, (0, 2), true);
         keys(&mut cm, &["Space", "e"]);
         assert_eq!(cm.cx, 6);
-        assert_eq!(copied(cm.key("y")), "한국어");
+        assert_eq!(copied(cm.key("Enter")), "한국어");
     }
 
     #[test]
     fn line_selection() {
         let mut cm = CopyMode::new(lines(&["one", "two", "three"]), W, 3, (0, 1), true);
         keys(&mut cm, &["V", "j"]);
-        assert_eq!(copied(cm.key("y")), "one\ntwo\n");
+        assert_eq!(copied(cm.key("Enter")), "one\ntwo\n");
         let mut cm = CopyMode::new(lines(&["one", "two", "three"]), W, 3, (2, 2), true);
         keys(&mut cm, &["V", "k"]);
-        assert_eq!(copied(cm.key("y")), "two\nthree\n");
+        assert_eq!(copied(cm.key("Enter")), "two\nthree\n");
         let (view, _) = {
             let mut cm = CopyMode::new(lines(&["one", "two"]), W, 2, (0, 1), true);
             cm.key("V");
             cm.render()
         };
-        assert!(view[0].cells[..10].iter().all(|c| c.style.attrs & INVERSE != 0));
-        assert!(view[1].cells.iter().all(|c| c.style.attrs & INVERSE == 0));
+        assert!(view[0].cells[..10].iter().all(|c| c.style.bg == YELLOW && c.style.fg == BLACK));
+        assert!(view[1].cells.iter().all(|c| c.style.bg != YELLOW));
     }
 
     #[test]
@@ -1598,7 +1773,7 @@ mod tests {
         // v is rectangle-toggle in the default vi table.
         let mut cm = CopyMode::new(lines(&["abcdef", "ghijkl"]), W, 2, (0, 1), true);
         keys(&mut cm, &["Space", "v", "j", "l"]);
-        assert_eq!(copied(cm.key("y")), "bc\nhi");
+        assert_eq!(copied(cm.key("Enter")), "bc\nhi");
         let mut cm = CopyMode::new(lines(&["abcdef", "ghijkl"]), W, 2, (0, 1), false);
         keys(&mut cm, &["C-Space", "R", "Down", "Right", "Right"]);
         assert_eq!(copied(cm.key("M-w")), "bc\nhi");
@@ -1629,6 +1804,70 @@ mod tests {
         assert_eq!(cm.key("D"), Action::Copy { text: "line\n".into(), cancel: true });
         let mut cm = CopyMode::new(lines(&["first line"]), W, 1, (0, 6), false);
         assert_eq!(cm.key("C-k"), Action::Copy { text: "line".into(), cancel: true });
+    }
+
+    #[test]
+    fn regex_search_and_literal_text_search() {
+        let mut cm = CopyMode::new(lines(&["abc123", "a.b", "acb", "end"]), W, 4, (3, 0), true);
+        cm.run("search-backward", &["^abc[[:digit:]]+$".into()]);
+        assert_eq!(pos(&cm), (0, 0));
+        cm.run("search-forward-text", &["a.b".into()]);
+        assert_eq!(pos(&cm), (1, 0), "text search escapes the dot");
+        cm.run("search-again", &[]);
+        assert_eq!(pos(&cm), (1, 0), "literal text must not match acb");
+        cm.run("search-forward", &["a.b".into()]);
+        assert_eq!(pos(&cm), (2, 0), "ordinary search uses regex semantics");
+    }
+
+    #[test]
+    fn incremental_search_preview_commit_and_cancel() {
+        let mut cm = CopyMode::new(lines(&["foo", "food", "finish"]), W, 3, (2, 3), false);
+        let origin = pos(&cm);
+        cm.begin_incremental_search();
+        cm.preview_search("f", false);
+        assert_eq!(pos(&cm), (2, 0));
+        cm.preview_search("foo", false);
+        assert_eq!(pos(&cm), (1, 0));
+        cm.preview_search("food", false);
+        assert_eq!(pos(&cm), (1, 0), "typing extends the search from its original position");
+        cm.preview_search("", false);
+        assert_eq!(pos(&cm), origin, "deleting the query restores the cursor");
+        cm.preview_search("foo", false);
+        cm.finish_incremental_search(true);
+        assert_eq!(pos(&cm), origin, "cancel restores the original cursor");
+        cm.begin_incremental_search();
+        cm.preview_search("foo", false);
+        cm.finish_incremental_search(false);
+        assert_eq!(pos(&cm), (1, 0), "accept must not advance to the next match");
+        cm.run("search-again", &[]);
+        assert_eq!(pos(&cm), (0, 0));
+    }
+
+    #[test]
+    fn matching_brackets_and_default_keys() {
+        let mut cm = CopyMode::new(lines(&["x (a [b] (c)) end", "plain", "{가", "}"]), W, 4, (0, 0), true);
+        cm.key("%");
+        assert_eq!(pos(&cm), (0, 12), "vi scans to the first bracket and handles nesting");
+        cm.key("%");
+        assert_eq!(pos(&cm), (0, 2), "vi closing bracket jumps back");
+        cm.set_cursor(1, 0);
+        cm.key("%");
+        assert_eq!(pos(&cm), (1, 0), "vi does not scan beyond a hard line break");
+        cm.set_cursor(2, 0);
+        cm.key("%");
+        assert_eq!(pos(&cm), (3, 0), "a matching pair may span lines");
+        cm.run("previous-matching-bracket", &[]);
+        assert_eq!(pos(&cm), (2, 0));
+        cm.set_cursor(0, 0);
+        assert_eq!(cm.key("y"), Action::None, "y is unbound in tmux's default vi table");
+        let mut emacs = CopyMode::new(lines(&["(a (b))"]), W, 1, (0, 0), false);
+        emacs.key("C-M-f");
+        assert_eq!(pos(&emacs), (0, 6));
+        emacs.key("C-M-b");
+        assert_eq!(pos(&emacs), (0, 0));
+        let mut missing = CopyMode::new(lines(&["(no close"]), W, 1, (0, 0), true);
+        missing.key("%");
+        assert_eq!(pos(&missing), (0, 0));
     }
 
     #[test]
@@ -1719,9 +1958,9 @@ mod tests {
         assert!(view[0].cells[start..].iter().all(|c| c.style.bg == YELLOW && c.style.fg == BLACK));
         // Cursor line 12 is row 12 - top(9) = 3.
         assert_eq!(cur, (3, 3));
-        let inv: Vec<bool> = view[3].cells[..6].iter().map(|c| c.style.attrs & INVERSE != 0).collect();
+        let inv: Vec<bool> = view[3].cells[..6].iter().map(|c| c.style.bg == YELLOW).collect();
         assert_eq!(inv, vec![false, true, true, true, false, false]);
-        assert!(view[2].cells.iter().all(|c| c.style.attrs & INVERSE == 0));
+        assert!(view[2].cells.iter().all(|c| c.style.bg != YELLOW));
         cm.key("P");
         let (view, _) = cm.render();
         assert!(!view[0].cells.iter().any(|c| c.style.bg == YELLOW));
@@ -1732,11 +1971,30 @@ mod tests {
         let mut cm = CopyMode::new(lines(&["ab ab", "xab"]), W, 2, (0, 0), true);
         cm.run("search-forward", &["ab".into()]);
         assert_eq!(pos(&cm), (0, 3));
+        cm.show_position = false; // Test matches independently of the result-count overlay.
         let (view, _) = cm.render();
         assert_eq!(view[0].cells[0].style.bg, CYAN);
         assert_eq!(view[0].cells[3].style.bg, MAGENTA);
         assert_eq!(view[0].cells[2].style.bg, Color::Default);
         assert_eq!(view[1].cells[1].style.bg, CYAN);
+    }
+
+    #[test]
+    fn emacs_motion_clears_search_marks_but_keeps_query_and_selection_style() {
+        let mut cm = CopyMode::new(lines(&["first first", "last"]), 40, 2, (1, 0), false);
+        cm.run("search-backward", &["first".into()]);
+        assert!(cm.search_marks);
+        cm.run("start-of-line", &[]);
+        assert!(!cm.search_marks);
+        cm.run("begin-selection", &[]);
+        cm.run("cursor-right", &[]);
+        let selected = Style { fg: BLACK, bg: CYAN, attrs: 0 };
+        let (view,_) = cm.render_with_style(selected);
+        assert_eq!(view[0].cells[0].style, selected);
+        assert_eq!(view[0].cells[2].style.bg, Color::Default);
+        assert!(view[0].text().ends_with("(2 results)"));
+        cm.run("search-again", &[]);
+        assert!(cm.search_marks);
     }
 
     #[test]

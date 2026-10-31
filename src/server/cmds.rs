@@ -346,7 +346,7 @@ impl Server {
 
     fn find_pane_in(&self, wid: WinId, p: &str, cur_pane: Option<PaneId>, ctx: &Ctx) -> Result<PaneId, String> {
         let w = &self.windows[&wid];
-        let panes = w.layout.panes();
+        let panes = w.panes();
         let active = cur_pane.filter(|c| panes.contains(c)).unwrap_or(w.active);
         let pos = panes.iter().position(|&x| x == active).unwrap_or(0);
         let off = |n: i64| panes[((pos as i64 + n).rem_euclid(panes.len() as i64)) as usize];
@@ -521,12 +521,14 @@ impl Server {
                 id: wid,
                 name,
                 layout: Node::Leaf(pane),
+                pane_order: vec![pane],
                 active: pane,
                 last_active: None,
                 zoomed: false,
                 options: Options::default(),
                 alerts: 0,
-                layout_cycle: 0,
+                layout_cycle: None,
+                old_layout: None,
                 created: now,
                 activity: now,
                 sx,
@@ -713,6 +715,7 @@ impl Server {
         let cwd = cwd.or_else(|| self.panes.get(&target).map(|p| p.current_path.clone()));
         let new = self.spawn_pane(t.sid, w, h, cmd, cwd.as_deref(), env)?;
         let win = self.windows.get_mut(&wid).unwrap();
+        win.insert_pane(target, new, before);
         if full {
             let old = std::mem::replace(&mut win.layout, Node::Leaf(PaneId::MAX));
             let ratio_new = new_size as f32 / (total - 1) as f32;
@@ -826,14 +829,26 @@ impl Server {
     // ---- the dispatcher ---------------------------------------------------------------------
 
     pub fn exec(&mut self, argv: Vec<String>, ctx: &mut Ctx) -> Result<Flow, String> {
+        ctx.readonly |= self.readonly_context.get() || self.client_is_readonly(ctx.client) || self.client_is_readonly(ctx.reply);
+        let previous = self.readonly_context.replace(ctx.readonly);
+        let result = self.exec_inner(argv, ctx);
+        self.readonly_context.set(previous);
+        if ctx.out.overflowed() { err("command output limit exceeded") } else { result }
+    }
+
+    fn exec_inner(&mut self, argv: Vec<String>, ctx: &mut Ctx) -> Result<Flow, String> {
         let Some((name, rest)) = argv.split_first() else { return Ok(Flow::Next) };
         // NAME=value assignments from the command line
         if !name.starts_with('-') && name.contains('=') && rest.is_empty() {
+            if ctx.readonly { return err("client is read-only"); }
             let (k, v) = name.split_once('=').unwrap();
             self.env.insert(k.to_string(), Some(v.to_string()));
             return Ok(Flow::Next);
         }
         let full = canonical(name).ok_or_else(|| format!("unknown command: {name}"))?;
+        if matches!(full, "display-menu" | "display-popup" | "display-panes") && self.overlay_waits.len() >= 64 {
+            return err("too many waiting overlays");
+        }
         let spec = COMMANDS.iter().find(|c| c.0 == full).unwrap();
         let mut args = rest.to_vec();
         let env = if matches!(full, "new-session" | "new-window" | "split-window" | "respawn-pane" | "respawn-window" | "display-popup") {
@@ -842,11 +857,33 @@ impl Server {
             Vec::new()
         };
         // read-only users (server-access -r) may only look
-        if ctx.hook_depth == 0 && ctx.client.and_then(|c| self.clients.get(&c)).is_some_and(|c| c.acl_readonly) && !READ_ONLY_OK.contains(&full) {
+        if ctx.readonly && !READ_ONLY_OK.contains(&full) {
             return err("client is read-only");
         }
         let o = getopt(&args, spec.2, spec.3).map_err(|e| format!("{full}: {e}"))?;
+        if ctx.readonly {
+            self.check_readonly_command(full, &o, ctx)?;
+        }
         self.command(full, o, env, ctx)
+    }
+
+    fn check_readonly_command(&self, cmd: &str, o: &Opts, ctx: &Ctx) -> Result<(), String> {
+        let own = ctx.client.ok_or("client is read-only")?;
+        let pane_target = |s: &str| s.contains([':', '.']) || s.starts_with(['%', '@']);
+        let allowed = match cmd {
+            "attach-session" => !o.has('c') && !o.has('d') && !o.has('x') && !o.has('f')
+                && !o.get('t').is_some_and(pane_target),
+            "switch-client" => !o.has('T') && !o.has('r') && !o.has('Z') && !o.get('t').is_some_and(pane_target)
+                && self.resolve_client(ctx, o.get('c'))? == own,
+            "detach-client" => !['a', 's', 'P', 'E'].into_iter().any(|f| o.has(f))
+                && self.resolve_client(ctx, o.get('t').or(o.get('c')))? == own,
+            "refresh-client" => self.resolve_client(ctx, o.get('t'))? == own,
+            "capture-pane" => o.has('p'),
+            "display-message" => (o.has('p') || o.has('a')) && !o.has('I'),
+            "server-access" => o.has('l') && !['a', 'd', 'r', 'w'].into_iter().any(|f| o.has(f)),
+            _ => true,
+        };
+        if allowed { Ok(()) } else { err("client is read-only") }
     }
 
     fn command(&mut self, cmd: &str, o: Opts, env: Vec<(String, String)>, ctx: &mut Ctx) -> Result<Flow, String> {
@@ -880,7 +917,10 @@ impl Server {
                 if let Some(y) = o.get('y').and_then(|v| v.parse().ok()) {
                     rows = y;
                 }
+                // Detached/control dimensions describe the pane area; attached
+                // terminal dimensions also include the status line.
                 let (cols, rows) = (cols.min(MAX_SIZE), rows.min(MAX_SIZE));
+                let rows = if detached || control { rows.saturating_add(self.status_lines(None)) } else { rows };
                 if !detached {
                     // already attached clients switch, CLI clients attach
                     if let Some(c) = cid.and_then(|c| self.clients.get(&c)) {
@@ -930,6 +970,7 @@ impl Server {
                 }
                 if o.has('r') {
                     let c = self.clients.get_mut(&cid).unwrap();
+                    if c.is_readonly() { return err("client is read-only"); }
                     c.readonly = !c.readonly;
                     return Ok(Flow::Next);
                 }
@@ -939,6 +980,7 @@ impl Server {
                     v.sort_by(|a, b| a.name.cmp(&b.name));
                     v.iter().map(|s| s.id).collect()
                 };
+                if sorted.is_empty() { return err("no sessions"); }
                 let pos = cur.and_then(|c| sorted.iter().position(|s| *s == c)).unwrap_or(0);
                 let sid = if o.has('l') {
                     self.clients[&cid].last_session.filter(|s| self.sessions.contains_key(s)).ok_or("can't find last session")?
@@ -960,7 +1002,7 @@ impl Server {
                 if o.has('Z') {
                     let wid = self.sessions[&sid].active_window();
                     let w = self.windows.get_mut(&wid).unwrap();
-                    if w.layout.panes().len() > 1 {
+                    if w.panes().len() > 1 {
                         w.zoomed = true;
                         self.apply_layout(wid);
                     }
@@ -1369,7 +1411,7 @@ impl Server {
                     let w = &self.windows[&wid];
                     let m = |s: &str| if o.has('r') { s.contains(&pat) } else if o.has('i') { s.to_lowercase().contains(&pat.to_lowercase()) } else { fnmatch(&format!("*{pat}*"), s) };
                     let mut hit = (all || bn) && m(&w.name);
-                    for p in w.layout.panes() {
+                    for p in w.panes() {
                         if let Some(pp) = self.panes.get(&p) {
                             hit |= (all || bt) && m(&pp.title);
                             hit |= (all || bc) && m(&pp.screen().contents());
@@ -1400,8 +1442,8 @@ impl Server {
                     // kill all other panes
                     let w = &self.windows[&wid];
                     let keep = w.active;
-                    let alive: Vec<PaneId> = w.layout.panes().into_iter().filter(|p| *p != keep).collect();
-                    if !o.has('k') && w.layout.panes().iter().any(|p| self.panes.get(p).is_some_and(|x| x.dead.is_none())) {
+                    let alive: Vec<PaneId> = w.panes().into_iter().filter(|p| *p != keep).collect();
+                    if !o.has('k') && w.panes().iter().any(|p| self.panes.get(p).is_some_and(|x| x.dead.is_none())) {
                         return err(format!("window still active: {}", w.name));
                     }
                     for p in alive {
@@ -1433,53 +1475,61 @@ impl Server {
                 let wt = self.resolve_window(ctx, t)?;
                 let wid = wt.wid.unwrap();
                 let w = self.windows.get_mut(&wid).unwrap();
-                w.layout.rotate(o.has('D'));
+                let order = w.panes();
+                let mut rotated = order.clone();
+                if o.has('D') { rotated.rotate_right(1); } else { rotated.rotate_left(1); }
+                // Replace via temporary ids so cycles do not overwrite one another.
+                for (i, p) in order.iter().enumerate() { w.layout.replace(*p, PaneId::MAX - i as u32); }
+                for (i, p) in rotated.iter().enumerate() { w.layout.replace(PaneId::MAX - i as u32, *p); }
+                w.pane_order = rotated;
                 w.zoomed = false;
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
                 Ok(Flow::Next)
             }
             "select-layout" | "next-layout" | "previous-layout" => {
-                let wt = self.resolve_window(ctx, t)?;
+                let wt = if cmd == "select-layout" { self.resolve_pane(ctx, t)? } else { self.resolve_window(ctx, t)? };
                 let wid = wt.wid.unwrap();
                 let area = self.window_area(wid);
                 let main_size = |s: &Server, name: &str| -> Option<u16> {
-                    let v = s.opt_window_num(Some(wid), if name == "main-horizontal" { "main-pane-height" } else { "main-pane-width" });
+                    let v = s.opt_window_num(Some(wid), if name.starts_with("main-horizontal") { "main-pane-height" } else { "main-pane-width" });
                     (v > 0).then_some(v as u16)
                 };
                 let w = &self.windows[&wid];
-                let panes = w.layout.panes();
+                let panes = w.panes();
+                let old_layout = w.layout.to_layout_string(area);
                 let name: Option<String> = if cmd == "next-layout" || o.has('n') {
-                    Some(layout::PRESETS[(w.layout_cycle + 1) % layout::PRESETS.len()].to_string())
+                    Some(layout::PRESETS[w.layout_cycle.map_or(0, |i| (i + 1) % layout::PRESETS.len())].to_string())
                 } else if cmd == "previous-layout" || o.has('p') {
-                    Some(layout::PRESETS[(w.layout_cycle + layout::PRESETS.len() - 1) % layout::PRESETS.len()].to_string())
+                    Some(layout::PRESETS[w.layout_cycle.map_or(layout::PRESETS.len() - 1, |i| (i + layout::PRESETS.len() - 1) % layout::PRESETS.len())].to_string())
                 } else if o.has('E') {
                     let w = self.windows.get_mut(&wid).unwrap();
-                    w.layout.spread(area);
+                    w.old_layout = Some(old_layout);
+                    w.layout.spread(wt.pane.unwrap_or(w.active), area);
+                    w.zoomed = false;
                     self.apply_layout(wid);
                     self.mark_window_dirty(wid);
+                    self.run_hook(wt.sid, "window-layout-changed", Ctx::default());
                     return Ok(Flow::Next);
                 } else {
-                    o.rest.first().cloned().or_else(|| Some(layout::PRESETS[w.layout_cycle].to_string()))
+                    o.rest.first().cloned().or_else(|| {
+                        if o.has('o') { w.old_layout.clone() } else { w.layout_cycle.map(|i| layout::PRESETS[i].to_string()) }
+                    })
                 };
-                let name = name.unwrap();
-                let short = match name.as_str() {
-                    "even-h" | "eh" => "even-horizontal",
-                    "even-v" | "ev" => "even-vertical",
-                    "main-h" | "mh" => "main-horizontal",
-                    "main-v" | "mv" => "main-vertical",
-                    other => other,
-                }
-                .to_string();
-                let node = match layout::preset(&short, &panes, area, main_size(self, &short)) {
-                    Some(n) => {
+                let node = if let Some(name) = name {
+                    if let Some(preset) = layout::preset_name(&name).filter(|_| !o.has('o')) {
+                        let n = layout::preset(preset, &panes, area, main_size(self, preset)).unwrap();
                         let w = self.windows.get_mut(&wid).unwrap();
-                        w.layout_cycle = layout::PRESETS.iter().position(|p| *p == short).unwrap_or(0);
+                        w.layout_cycle = layout::PRESETS.iter().position(|p| *p == preset);
                         n
+                    } else {
+                        layout::parse_layout_string(&name, &panes, area).map_err(|e| format!("can't set layout: {e}"))?
                     }
-                    None => layout::parse_layout_string(&short, &panes, area).map_err(|e| format!("can't set layout: {e}"))?,
+                } else {
+                    w.layout.clone()
                 };
                 let w = self.windows.get_mut(&wid).unwrap();
+                w.old_layout = Some(old_layout);
                 w.layout = node;
                 w.zoomed = false;
                 self.apply_layout(wid);
@@ -1575,7 +1625,7 @@ impl Server {
                 let tt = self.resolve_pane(ctx, t)?;
                 if o.has('a') {
                     let keep = tt.pane.unwrap();
-                    let others: Vec<PaneId> = self.windows[&tt.wid.unwrap()].layout.panes().into_iter().filter(|p| *p != keep).collect();
+                    let others: Vec<PaneId> = self.windows[&tt.wid.unwrap()].panes().into_iter().filter(|p| *p != keep).collect();
                     for p in others {
                         self.kill_pane(p);
                     }
@@ -1622,7 +1672,7 @@ impl Server {
                 }
                 if o.has('l') {
                     let w = &self.windows[&wid];
-                    let last = w.last_active.filter(|p| w.layout.panes().contains(p)).ok_or("no last pane")?;
+                    let last = w.last_active.filter(|p| w.panes().contains(p)).ok_or("no last pane")?;
                     self.select_pane(wid, last);
                     return Ok(Flow::Next);
                 }
@@ -1632,7 +1682,7 @@ impl Server {
                     }
                 }
                 // hooks run by select_window may have removed the pane
-                if self.windows.get(&wid).is_some_and(|w| w.layout.panes().contains(&pane)) {
+                if self.windows.get(&wid).is_some_and(|w| w.panes().contains(&pane)) {
                     self.select_pane(wid, pane);
                 }
                 Ok(Flow::Next)
@@ -1641,7 +1691,7 @@ impl Server {
                 let wt = self.resolve_window(ctx, t)?;
                 let wid = wt.wid.unwrap();
                 let w = &self.windows[&wid];
-                let last = w.last_active.filter(|p| w.layout.panes().contains(p)).ok_or("no last pane")?;
+                let last = w.last_active.filter(|p| w.panes().contains(p)).ok_or("no last pane")?;
                 if o.has('d') || o.has('e') {
                     let v = if o.has('d') { "on" } else { "off" };
                     self.panes.get_mut(&last).unwrap().options.set("@input-disabled", v.into());
@@ -1661,7 +1711,7 @@ impl Server {
                 let pane = tt.pane.unwrap();
                 if o.has('Z') {
                     let w = self.windows.get_mut(&wid).unwrap();
-                    if w.layout.panes().len() > 1 {
+                    if w.panes().len() > 1 {
                         if w.active != pane {
                             w.last_active = Some(w.active);
                             w.active = pane;
@@ -1718,7 +1768,7 @@ impl Server {
                 let dst = self.resolve_pane(ctx, t)?;
                 let (dwid, dpane) = (dst.wid.unwrap(), dst.pane.unwrap());
                 let (swid, spane) = if o.has('U') || o.has('D') {
-                    let panes = self.windows[&dwid].layout.panes();
+                    let panes = self.windows[&dwid].panes();
                     let i = panes.iter().position(|p| *p == dpane).ok_or("pane not in window")?;
                     let n = panes.len();
                     let other = if o.has('U') { panes[(i + n - 1) % n] } else { panes[(i + 1) % n] };
@@ -1738,6 +1788,8 @@ impl Server {
                 }
                 if swid == dwid {
                     let w = self.windows.get_mut(&dwid).unwrap();
+                    w.pane_order = w.panes();
+                    w.swap_pane_order(spane, dpane);
                     w.layout.swap(spane, dpane);
                     if !o.has('d') {
                         // tmux keeps the active pane position unless -d
@@ -1748,6 +1800,11 @@ impl Server {
                         }
                     }
                 } else {
+                    for wid in [swid, dwid] {
+                        let w = self.windows.get_mut(&wid).unwrap();
+                        w.pane_order = w.panes();
+                        w.swap_pane_order(spane, dpane);
+                    }
                     let pane_tmp: PaneId = PaneId::MAX - 1;
                     self.windows.get_mut(&swid).unwrap().layout.replace(spane, pane_tmp);
                     self.windows.get_mut(&dwid).unwrap().layout.replace(dpane, spane);
@@ -1787,7 +1844,7 @@ impl Server {
                     None => (ssid, None),
                 };
                 let name = o.get('n').map(String::from);
-                if self.windows[&swid].layout.panes().len() == 1 {
+                if self.windows[&swid].panes().len() == 1 {
                     // already alone: just move the window
                     if let Some(n) = name {
                         self.windows.get_mut(&swid).unwrap().name = n;
@@ -1798,7 +1855,7 @@ impl Server {
                 let l = std::mem::replace(&mut w.layout, Node::Leaf(PaneId::MAX));
                 w.layout = l.remove(pane).unwrap();
                 if w.active == pane {
-                    w.active = w.last_active.filter(|p| *p != pane).unwrap_or(w.layout.panes()[0]);
+                    w.active = w.last_active.filter(|p| *p != pane).unwrap_or(w.panes()[0]);
                 }
                 w.last_active = None;
                 w.zoomed = false;
@@ -1857,7 +1914,7 @@ impl Server {
                     Some(n) => {
                         sw.layout = n;
                         if sw.active == spane {
-                            sw.active = sw.layout.panes()[0];
+                            sw.active = sw.panes()[0];
                         }
                         sw.last_active = sw.last_active.filter(|p| *p != spane);
                         sw.zoomed = false;
@@ -1874,6 +1931,7 @@ impl Server {
                     }
                 }
                 let dw = self.windows.get_mut(&dwid).unwrap();
+                dw.insert_pane(dpane, spane, o.has('b'));
                 if o.has('f') {
                     let old = std::mem::replace(&mut dw.layout, Node::Leaf(PaneId::MAX));
                     dw.layout = if o.has('b') {
@@ -1913,7 +1971,7 @@ impl Server {
                 }
                 let fmt = if (o.has('a') || o.has('s')) && o.get('F').is_none() { "#{session_name}:#{window_index}.#{pane_index}: [#{pane_width}x#{pane_height}] [history #{history_size}/#{history_limit}] #{pane_id}#{?pane_active, (active),}" } else { fmt };
                 for (sid, idx, wid) in targets {
-                    for p in self.windows[&wid].layout.panes() {
+                    for p in self.windows[&wid].panes() {
                         let tt = Target { sid: Some(sid), idx: Some(idx), wid: Some(wid), pane: Some(p) };
                         if o.get('f').is_some_and(|f| !truthy(&self.expand(tt, ctx.client, f))) {
                             continue;
@@ -2023,7 +2081,9 @@ impl Server {
                     c.overlay = Some(Overlay::DisplayPanes { until: Instant::now() + Duration::from_millis(ms), template });
                     c.dirty = true;
                 }
-                Ok(Flow::Next)
+                let c = self.clients.get_mut(&cid).ok_or("no client")?;
+                c.overlay_epoch = c.overlay_epoch.wrapping_add(1);
+                if o.has('b') { Ok(Flow::Next) } else { Ok(Flow::WaitOverlay(cid, c.overlay_epoch)) }
             }
             // ---------------------------------------------------------------- modes
             "copy-mode" => {
@@ -2083,7 +2143,7 @@ impl Server {
             }
             "display-menu" => {
                 let cid = self.resolve_client(ctx, o.get('c'))?;
-                let tt = self.resolve_pane(ctx, t).unwrap_or_default();
+                let tt = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
                 let mut items = Vec::new();
                 let mut it = o.rest.iter();
                 while let Some(name) = it.next() {
@@ -2108,7 +2168,9 @@ impl Server {
                     c.overlay = Some(Overlay::Menu(menu));
                     c.dirty = true;
                 }
-                Ok(Flow::Next)
+                let c = self.clients.get_mut(&cid).ok_or("no client")?;
+                c.overlay_epoch = c.overlay_epoch.wrapping_add(1);
+                Ok(Flow::WaitOverlay(cid, c.overlay_epoch))
             }
             "display-popup" => {
                 let cid = self.resolve_client(ctx, o.get('c'))?;
@@ -2134,27 +2196,29 @@ impl Server {
                 }
                 let w = dim(o.get('w'), cw).clamp(3, cw);
                 let h = dim(o.get('h'), ch).clamp(3, ch);
-                let x = o.get('x').and_then(|v| v.parse().ok()).unwrap_or((cw - w) / 2).min(cw - w);
-                let y = o.get('y').and_then(|v| v.parse().ok()).unwrap_or((ch - h) / 2).min(ch - h);
+                let x = o.get('x').and_then(|v| v.parse().ok()).unwrap_or(((cw - 1) / 2).saturating_sub(w / 2)).min(cw - w);
+                let y = o.get('y').and_then(|v| v.parse().ok()).unwrap_or(((ch - 1) / 2).saturating_sub(h / 2)).min(ch - h);
                 let border = !o.has('B');
                 let (iw, ih) = if border { (w - 2, h - 2) } else { (w, h) };
-                let tt = self.resolve_pane(ctx, t).unwrap_or_default();
+                let tt = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
                 let cwd = o.get('d').map(|d| self.expand(tt, Some(cid), d)).or_else(|| tt.pane.and_then(|p| self.panes.get(&p)).map(|p| p.current_path.clone()));
                 let pane = self.spawn_pane(tt.sid, iw.max(1), ih.max(1), &o.rest, cwd.as_deref(), &env)?;
                 let title = o.get('T').map(|s| self.expand(tt, Some(cid), s)).unwrap_or_default();
                 if let Some(c) = self.clients.get_mut(&cid) {
                     if let Some(Overlay::Popup(old)) = c.overlay.take() {
                         let old = old.pane;
-                        c.overlay = Some(Overlay::Popup(Popup { pane, x, y, w, h, border, close_on_exit: o.has('E') || !o.rest.is_empty(), title }));
+                        c.overlay = Some(Overlay::Popup(Popup { pane, x, y, w, h, border, close_on_exit: o.has('E'), title }));
                         self.destroy_pane(old);
                     } else {
-                        c.overlay = Some(Overlay::Popup(Popup { pane, x, y, w, h, border, close_on_exit: o.has('E') || !o.rest.is_empty(), title }));
+                        c.overlay = Some(Overlay::Popup(Popup { pane, x, y, w, h, border, close_on_exit: o.has('E'), title }));
                     }
                 }
                 if let Some(c) = self.clients.get_mut(&cid) {
                     c.dirty = true;
                 }
-                Ok(Flow::Next)
+                let c = self.clients.get_mut(&cid).ok_or("no client")?;
+                c.overlay_epoch = c.overlay_epoch.wrapping_add(1);
+                Ok(Flow::WaitOverlay(cid, c.overlay_epoch))
             }
             // ---------------------------------------------------------------- prompts & messages
             "command-prompt" => {
@@ -2187,7 +2251,9 @@ impl Server {
             }
             "display-message" => {
                 let tt = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
-                let cid = o.get('c').map(|c| self.resolve_client(ctx, Some(c))).transpose()?.or(ctx.client);
+                let cid = o.get('c').map(|c| self.resolve_client(ctx, Some(c))).transpose()?
+                    .or_else(|| ctx.client.filter(|id| self.clients.get(id).is_some_and(|c| c.attached)))
+                    .or_else(|| self.resolve_client(ctx, None).ok()).or(ctx.client);
                 if o.has('a') {
                     let mut names: Vec<&str> = VAR_NAMES.to_vec();
                     names.sort();
@@ -2776,7 +2842,7 @@ impl Server {
             }
         }
         if let Some(c) = self.clients.get_mut(&cid) {
-            c.readonly = readonly;
+            c.readonly |= readonly || c.acl_readonly;
         }
         self.switch_client(cid, sid);
         Ok(Flow::Next)
@@ -3013,7 +3079,7 @@ impl Server {
         if let Some(wid) = self.window_of(pane) {
             if zoom {
                 let w = self.windows.get_mut(&wid).unwrap();
-                if w.layout.panes().len() > 1 && !w.zoomed {
+                if w.panes().len() > 1 && !w.zoomed {
                     w.active = pane;
                     w.zoomed = true;
                     self.apply_layout(wid);
@@ -3028,7 +3094,7 @@ impl Server {
         let input: Vec<char> = init.chars().collect();
         let cursor = input.len();
         if let Some(c) = self.clients.get_mut(&cid) {
-            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single });
+            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single, copy_incremental: None });
             c.dirty = true;
         }
     }
@@ -3038,7 +3104,7 @@ impl Server {
 const READ_ONLY_OK: &[&str] = &[
     "attach-session", "detach-client", "has-session", "list-sessions", "list-windows", "list-panes", "list-clients", "list-buffers", "list-keys",
     "list-commands", "display-message", "show-options", "show-window-options", "show-environment", "show-hooks", "show-messages", "show-buffer",
-    "capture-pane", "refresh-client", "switch-client", "choose-tree", "server-access",
+    "capture-pane", "refresh-client", "switch-client", "server-access",
 ];
 
 pub fn truthy(s: &str) -> bool {

@@ -12,6 +12,8 @@ mod modes;
 pub mod procinfo;
 mod render;
 mod vars;
+mod transport;
+mod output;
 
 use crate::cells::Line;
 use crate::copymode::CopyMode;
@@ -235,18 +237,46 @@ pub struct Window {
     pub id: WinId,
     pub name: String,
     pub layout: Node,
+    /// Pane indices follow the pane list, independently of layout geometry.
+    pub pane_order: Vec<PaneId>,
     pub active: PaneId,
     pub last_active: Option<PaneId>,
     pub zoomed: bool,
     pub options: Options,
     #[allow(dead_code)]
     pub alerts: u8,
-    pub layout_cycle: usize,
+    pub layout_cycle: Option<usize>,
+    pub old_layout: Option<String>,
     pub created: u64,
     pub activity: u64,
     /// Width/height the window is laid out at (follows the attached session size).
     pub sx: u16,
     pub sy: u16,
+}
+
+impl Window {
+    pub fn panes(&self) -> Vec<PaneId> {
+        let live = self.layout.panes();
+        let mut order: Vec<_> = self.pane_order.iter().copied().filter(|p| live.contains(p)).collect();
+        for p in live {
+            if !order.contains(&p) { order.push(p); }
+        }
+        order
+    }
+
+    fn insert_pane(&mut self, target: PaneId, new: PaneId, before: bool) {
+        let mut order = self.panes();
+        order.retain(|p| *p != new);
+        let idx = order.iter().position(|p| *p == target).unwrap_or(order.len());
+        order.insert((idx + usize::from(!before)).min(order.len()), new);
+        self.pane_order = order;
+    }
+
+    fn swap_pane_order(&mut self, a: PaneId, b: PaneId) {
+        for p in &mut self.pane_order {
+            if *p == a { *p = b; } else if *p == b { *p = a; }
+        }
+    }
 }
 
 pub struct Session {
@@ -305,6 +335,7 @@ pub struct Prompt {
     pub pane: Option<PaneId>,
     pub numeric: bool,
     pub single_key: bool,
+    pub copy_incremental: Option<(PaneId, bool)>,
 }
 
 pub enum Overlay {
@@ -342,6 +373,7 @@ pub struct Client {
     pub esc_deadline: Option<Instant>,
     pub prompt: Option<Prompt>,
     pub overlay: Option<Overlay>,
+    pub overlay_epoch: u64,
     pub message: Option<(String, Instant)>,
     pub prev: Option<RenderState>,
     pub dirty: bool,
@@ -365,6 +397,8 @@ pub struct Client {
     /// Frames queued for the writer thread, and since when the queue has been non-empty
     /// (ms since the epoch): how far behind the client is (control mode pause-after).
     pub pending: Arc<std::sync::atomic::AtomicUsize>,
+    pub queued_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    pub closed: Arc<std::sync::atomic::AtomicBool>,
     pub backlog_since: Arc<std::sync::atomic::AtomicU64>,
     pub ctl: control::Flags,
     /// Connecting user (uid / SID) and whether server-access lets it in / makes it read-only.
@@ -378,12 +412,29 @@ pub fn now_ms() -> u64 {
 }
 
 impl Client {
+    pub fn is_readonly(&self) -> bool {
+        self.readonly || self.acl_readonly
+    }
+
     pub fn send(&self, kind: u8, payload: &[u8]) {
         use std::sync::atomic::Ordering;
+        let len = payload.len().saturating_add(5);
+        if self.closed.load(Ordering::SeqCst) { return; }
+        #[allow(deprecated)]
+        let reserved = self.queued_bytes.fetch_update(Ordering::SeqCst, Ordering::SeqCst,
+            |n| n.checked_add(len).filter(|n| *n <= transport::MAX_OUTPUT_BACKLOG));
+        if reserved.is_err() {
+            self.closed.store(true, Ordering::SeqCst);
+            return;
+        }
         if self.pending.fetch_add(1, Ordering::SeqCst) == 0 {
             self.backlog_since.store(now_ms(), Ordering::SeqCst);
         }
-        let _ = self.tx.send(frame(kind, payload));
+        if self.tx.send(frame(kind, payload)).is_err() {
+            self.queued_bytes.fetch_sub(len, Ordering::SeqCst);
+            self.pending.fetch_sub(1, Ordering::SeqCst);
+            self.closed.store(true, Ordering::SeqCst);
+        }
     }
 
     /// How long output has been waiting to be written to this client.
@@ -436,12 +487,14 @@ pub struct Ctx {
     /// Default target pane.
     pub pane: Option<PaneId>,
     pub mouse: Option<input::MouseCtx>,
-    pub out: String,
+    pub out: output::Output,
     pub hook_depth: u8,
     /// True when run from a key binding (output goes to view mode).
     pub from_key: bool,
     /// Command number of a control-mode command (reply goes in a %begin/%end block).
     pub control_seq: Option<u64>,
+    /// The originating request's restriction, retained across hooks and parked queues.
+    pub readonly: bool,
 }
 
 pub struct Queue {
@@ -453,6 +506,7 @@ pub struct Queue {
 
 pub enum Flow {
     Next,
+    WaitOverlay(ClientId, u64),
     /// Run these commands next, before the rest of the queue (source-file, if-shell -F, run-shell -C).
     /// With `soft`, their errors are reported but don't stop the queue (like config files).
     Inject(Vec<Vec<String>>, bool),
@@ -469,7 +523,7 @@ pub struct Parked {
 }
 
 pub struct Server {
-    pub tx: Sender<Event>,
+    pub tx: mpsc::SyncSender<Event>,
     pub pty: Box<dyn PtySystem + Send>,
     pub sessions: BTreeMap<SessId, Session>,
     pub windows: HashMap<WinId, Window>,
@@ -488,6 +542,7 @@ pub struct Server {
     pub prompt_history: Vec<String>,
     pub jobs: HashMap<u32, Parked>,
     pub waits: HashMap<String, (bool, Vec<Queue>)>,
+    pub overlay_waits: Vec<(ClientId, u64, String, Queue)>,
     pub marked: Option<PaneId>,
     pub start_time: u64,
     pub host: String,
@@ -496,6 +551,8 @@ pub struct Server {
     pub last_tick: Instant,
     /// `#(command)` results: last output, when it last started, whether it is running.
     pub shell_cache: std::cell::RefCell<HashMap<String, (String, Instant, bool)>>,
+    /// Restriction of the current request, independent of format/command targets.
+    pub readonly_context: std::cell::Cell<bool>,
     /// Last synced window list of each session group.
     pub groups: HashMap<u32, BTreeMap<u32, WinId>>,
     /// The user running the server (always allowed).
@@ -512,48 +569,13 @@ pub fn run(config: Option<String>) -> io::Result<()> {
     if ipc::connect().is_ok() {
         return Ok(()); // another server already owns the endpoint
     }
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(64);
     let atx = tx.clone();
 
-    let mut env = BTreeMap::new();
-    for (k, v) in std::env::vars() {
-        if k != "PWSH_TMUX" && k != "PWSH_TMUX_PANE" {
-            env.insert(k, Some(v));
-        }
+    let mut srv = Server::new(tx);
+    if srv.owner.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "cannot determine server owner"));
     }
-    let mut srv = Server {
-        tx,
-        pty: native_pty_system(),
-        sessions: BTreeMap::new(),
-        windows: HashMap::new(),
-        panes: HashMap::new(),
-        clients: BTreeMap::new(),
-        next_id: 0,
-        opts_server: Options::defaults(Scope::Server),
-        opts_session: Options::defaults(Scope::Session),
-        opts_window: Options::defaults(Scope::Window),
-        env,
-        hooks: BTreeMap::new(),
-        buffers: Vec::new(),
-        buffer_seq: 0,
-        bindings: input::default_bindings(),
-        messages: VecDeque::new(),
-        prompt_history: Vec::new(),
-        jobs: HashMap::new(),
-        waits: HashMap::new(),
-        marked: None,
-        start_time: now_secs(),
-        host: procinfo::hostname(),
-        quit: false,
-        had_session: false,
-        last_tick: Instant::now(),
-        shell_cache: Default::default(),
-        groups: HashMap::new(),
-        owner: ipc::own_user_id(),
-        acl: Vec::new(),
-        pipe_acl: None,
-    };
-    srv.opts_session.set("default-shell", procinfo::default_shell());
     // config first: its server-access lines decide who may open the Windows pipe
     srv.load_config(config);
     let allowed: Vec<String> = srv.acl.iter().map(|a| a.0.clone()).collect();
@@ -616,6 +638,51 @@ pub fn run(config: Option<String>) -> io::Result<()> {
 }
 
 impl Server {
+    fn new(tx: mpsc::SyncSender<Event>) -> Self {
+        let mut env = BTreeMap::new();
+        for (k, v) in std::env::vars() {
+            if k != "PWSH_TMUX" && k != "PWSH_TMUX_PANE" {
+                env.insert(k, Some(v));
+            }
+        }
+        let mut srv = Self {
+            tx,
+            pty: native_pty_system(),
+            sessions: BTreeMap::new(),
+            windows: HashMap::new(),
+            panes: HashMap::new(),
+            clients: BTreeMap::new(),
+            next_id: 0,
+            opts_server: Options::defaults(Scope::Server),
+            opts_session: Options::defaults(Scope::Session),
+            opts_window: Options::defaults(Scope::Window),
+            env,
+            hooks: BTreeMap::new(),
+            buffers: Vec::new(),
+            buffer_seq: 0,
+            bindings: input::default_bindings(),
+            messages: VecDeque::new(),
+            prompt_history: Vec::new(),
+            jobs: HashMap::new(),
+            waits: HashMap::new(),
+            overlay_waits: Vec::new(),
+            marked: None,
+            start_time: now_secs(),
+            host: procinfo::hostname(),
+            quit: false,
+            had_session: false,
+            last_tick: Instant::now(),
+            shell_cache: Default::default(),
+            readonly_context: Default::default(),
+            groups: HashMap::new(),
+            owner: ipc::own_user_id(),
+            acl: Vec::new(),
+            pipe_acl: None,
+        };
+        srv.opts_session.set("default-shell", procinfo::default_shell());
+        srv
+    }
+
     pub fn id(&mut self) -> u32 {
         self.next_id += 1;
         self.next_id
@@ -697,7 +764,7 @@ impl Server {
     // ---- lookup helpers --------------------------------------------------------
 
     pub fn window_of(&self, pane: PaneId) -> Option<WinId> {
-        self.windows.values().find(|w| w.layout.panes().contains(&pane)).map(|w| w.id)
+        self.windows.values().find(|w| w.panes().contains(&pane)).map(|w| w.id)
     }
 
     /// Sessions (and index) a window is linked into.
@@ -783,6 +850,9 @@ impl Server {
     }
 
     fn accept(&mut self, stream: Stream) {
+        if self.clients.len() >= transport::MAX_CLIENTS || stream.set_nonblocking(true).is_err() {
+            return;
+        }
         let cid = self.id();
         let stream = Arc::new(stream);
         let recv = stream.clone();
@@ -791,34 +861,72 @@ impl Server {
         let backlog_since = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let writer_pending = pending.clone();
         let writer_since = backlog_since.clone();
+        let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writer_bytes = queued_bytes.clone();
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_closed = closed.clone();
+        let reader_closed = closed.clone();
         thread::spawn(move || {
             use std::sync::atomic::Ordering;
-            let mut send = &*stream;
-            for buf in rx {
-                if send.write_all(&buf).and_then(|_| send.flush()).is_err() {
+            loop {
+                if writer_closed.load(Ordering::SeqCst) { break; }
+                let buf = match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(buf) => buf,
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                };
+                let mut send = transport::Io { stream: &stream, closed: &writer_closed, deadline: Some(Instant::now() + transport::IO_TIMEOUT) };
+                if send.write_all(&buf).is_err() {
                     break;
                 }
+                writer_bytes.fetch_sub(buf.len(), Ordering::SeqCst);
                 // still behind: the backlog now starts at this write
                 if writer_pending.fetch_sub(1, Ordering::SeqCst) > 1 {
                     writer_since.store(now_ms(), Ordering::SeqCst);
                 }
             }
+            writer_closed.store(true, Ordering::SeqCst);
         });
         let etx = self.tx.clone();
+        let owner = self.owner.clone();
+        let allowed_users: Vec<String> = self.acl.iter().map(|a| a.0.clone()).collect();
         thread::spawn(move || {
             let mut first = true;
-            while let Ok((kind, payload)) = read_frame(&mut &*recv) {
+            let mut reader = transport::Io { stream: &recv, closed: &reader_closed, deadline: Some(Instant::now() + transport::IO_TIMEOUT) };
+            while let Ok((kind, payload)) = read_frame_checked(&mut reader, |kind, len| {
+                if len > transport::MAX_CLIENT_FRAME {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "client frame too large"));
+                }
                 if first {
-                    // who is connecting (Windows can only tell once data has been read)
+                    // Windows impersonation needs a pipe read. Reading just the
+                    // header lets us authenticate before allocating the payload.
                     first = false;
-                    if etx.send(Event::ClientUser(cid, ipc::peer_user_id(&recv))).is_err() {
-                        return;
+                    let user = ipc::peer_user_id(&recv);
+                    let allowed = user.as_ref().is_some_and(|id| !id.is_empty()
+                        && (id == &owner || ipc::is_superuser(id) || allowed_users.contains(id)));
+                    if !allowed {
+                        // No writer output exists before identification. Send the
+                        // refusal here so closing the cancelled connection cannot
+                        // discard an asynchronously queued error reply.
+                        let mut reject = transport::Io { stream: &recv, closed: &reader_closed,
+                            deadline: Some(Instant::now() + Duration::from_millis(100)) };
+                        let _ = write_frame(&mut reject, S_REPLY, &encode_reply(1, "access not allowed"));
+                        log(&format!("refused client from user {}", user.as_deref().unwrap_or("unknown")));
+                        return Err(io::ErrorKind::PermissionDenied.into());
+                    }
+                    etx.send(Event::ClientUser(cid, user)).map_err(|_| io::ErrorKind::BrokenPipe)?;
+                    if kind != C_IDENTIFY {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid identify frame"));
                     }
                 }
+                Ok(())
+            }) {
+                reader.deadline = None;
                 if etx.send(Event::ClientMsg(cid, kind, payload)).is_err() {
                     return;
                 }
             }
+            reader_closed.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = etx.send(Event::ClientGone(cid));
         });
         let now = now_secs();
@@ -838,6 +946,7 @@ impl Server {
                 esc_deadline: None,
                 prompt: None,
                 overlay: None,
+                overlay_epoch: 0,
                 message: None,
                 prev: None,
                 dirty: false,
@@ -855,6 +964,8 @@ impl Server {
                 seen: Default::default(),
                 features: Default::default(),
                 pending,
+                queued_bytes,
+                closed,
                 backlog_since,
                 ctl: Default::default(),
                 user: None,
@@ -866,12 +977,14 @@ impl Server {
 
     fn client_gone(&mut self, cid: ClientId) {
         let Some(c) = self.clients.remove(&cid) else { return };
+        c.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let readonly = c.is_readonly();
         if let Some(Overlay::Popup(p)) = c.overlay {
             self.destroy_pane(p.pane);
         }
         if c.attached {
             if let Some(sid) = c.session {
-                self.run_hook(Some(sid), "client-detached", Ctx::default());
+                self.run_hook(Some(sid), "client-detached", Ctx { readonly, ..Ctx::default() });
                 self.update_session_size(sid);
                 self.check_destroy_unattached(sid);
             }
@@ -883,7 +996,7 @@ impl Server {
         let Some(c) = self.clients.get_mut(&cid) else { return };
         let id = user.unwrap_or_default();
         let entry = self.acl.iter().find(|a| a.0 == id).cloned();
-        let allowed = id == self.owner || ipc::is_superuser(&id) || entry.is_some();
+        let allowed = !id.is_empty() && (id == self.owner || ipc::is_superuser(&id) || entry.is_some());
         c.user = Some(id.clone());
         if !allowed {
             c.denied = true;
@@ -891,10 +1004,8 @@ impl Server {
             log(&format!("refused client from user {id}"));
             return;
         }
-        if entry.is_some_and(|e| !e.1) {
-            c.acl_readonly = true;
-            c.readonly = true;
-        }
+        c.acl_readonly = entry.is_some_and(|e| !e.1);
+        c.readonly |= c.acl_readonly;
     }
 
     fn client_msg(&mut self, cid: ClientId, kind: u8, payload: Vec<u8>) {
@@ -974,7 +1085,9 @@ impl Server {
             return;
         }
         self.control_output(id, data);
+        let scroll_on_clear = options::is_on(&self.opt_pane(id, "scroll-on-clear"));
         let p = self.panes.get_mut(&id).unwrap();
+        p.parser.screen_mut().set_scroll_on_clear(scroll_on_clear);
         p.parser.process(data);
         p.last_output = Instant::now();
         if let Some(pipe) = &p.pipe {
@@ -1231,6 +1344,15 @@ impl Server {
                 c.dirty = true;
             }
         }
+        let waiting = std::mem::take(&mut self.overlay_waits);
+        for (cid, epoch, name, queue) in waiting {
+            if self.clients.get(&cid).is_none_or(|c| c.overlay.is_none() || c.overlay_epoch != epoch) {
+                self.after_command(&name, &queue.ctx);
+                self.run_queue(queue);
+            } else {
+                self.overlay_waits.push((cid, epoch, name, queue));
+            }
+        }
         // once a second: status refresh, automatic-rename, silence
         if self.last_tick.elapsed() >= Duration::from_secs(1) {
             self.last_tick = Instant::now();
@@ -1478,7 +1600,7 @@ impl Server {
         match layout.remove(id) {
             Some(n) => {
                 w.layout = n;
-                let panes = w.layout.panes();
+                let panes = w.panes();
                 w.last_active = w.last_active.filter(|p| panes.contains(p));
                 if w.active == id {
                     w.active = w.last_active.take().unwrap_or(panes[0]);
@@ -1498,7 +1620,7 @@ impl Server {
             self.unlink(sid, idx);
         }
         if let Some(w) = self.windows.remove(&wid) {
-            for p in w.layout.panes() {
+            for p in w.panes() {
                 self.destroy_pane(p);
             }
         }
@@ -1529,7 +1651,7 @@ impl Server {
         }
         if self.links_of(wid).is_empty() {
             if let Some(w) = self.windows.remove(&wid) {
-                for p in w.layout.panes() {
+                for p in w.panes() {
                     self.destroy_pane(p);
                 }
             }
@@ -1571,7 +1693,7 @@ impl Server {
             for wid in canonical.values() {
                 if !links.values().any(|w| w == wid) && self.windows.contains_key(wid) && self.links_of(*wid).is_empty() {
                     if let Some(w) = self.windows.remove(wid) {
-                        for p in w.layout.panes() {
+                        for p in w.panes() {
                             self.destroy_pane(p);
                         }
                     }
@@ -1611,7 +1733,7 @@ impl Server {
         for (_, wid) in &s.links {
             if self.links_of(*wid).is_empty() {
                 if let Some(w) = self.windows.remove(wid) {
-                    for p in w.layout.panes() {
+                    for p in w.panes() {
                         self.destroy_pane(p);
                     }
                 }
@@ -1668,6 +1790,7 @@ impl Server {
         if !was_attached {
             c.send(S_ATTACHED, b"");
         }
+        let writable = !self.client_is_readonly(Some(cid));
         let now = now_secs();
         // update-environment
         let names: Vec<String> = self.opt_array(Some(sid), "update-environment");
@@ -1675,7 +1798,7 @@ impl Server {
         if let Some(s) = self.sessions.get_mut(&sid) {
             s.last_attached = now;
             s.activity = now;
-            for n in &names {
+            for n in names.iter().filter(|_| writable) {
                 match env.iter().find(|(k, _)| k == n) {
                     Some((_, v)) => {
                         s.env.insert(n.clone(), Some(v.clone()));
@@ -1686,7 +1809,7 @@ impl Server {
                 }
             }
             let active = s.active;
-            s.alerts.remove(&active);
+            if writable { s.alerts.remove(&active); }
         }
         self.update_session_size(sid);
         if !was_attached {
@@ -1720,9 +1843,10 @@ impl Server {
         c.attached = false;
         c.session = None;
         c.send_exit(msg);
+        let readonly = c.is_readonly();
         if let Some(sid) = sid {
             self.update_session_size(sid);
-            self.run_hook(Some(sid), "client-detached", Ctx::default());
+            self.run_hook(Some(sid), "client-detached", Ctx { readonly, ..Ctx::default() });
             self.check_destroy_unattached(sid);
         }
     }
@@ -1759,8 +1883,8 @@ impl Server {
     /// Content rect of a pane (minus a pane-border-status line).
     pub fn content_rect(&self, wid: WinId, r: Rect) -> Rect {
         match self.opt_window(Some(wid), "pane-border-status").as_str() {
-            "top" if r.h > 1 => Rect { y: r.y + 1, h: r.h - 1, ..r },
-            "bottom" if r.h > 1 => Rect { h: r.h - 1, ..r },
+            "top" if r.y == 0 && r.h > 1 => Rect { y: r.y + 1, h: r.h - 1, ..r },
+            "bottom" if r.bottom() == self.windows[&wid].sy && r.h > 1 => Rect { h: r.h - 1, ..r },
             _ => r,
         }
     }
@@ -1786,7 +1910,7 @@ impl Server {
         let clients: Vec<(u64, (u16, u16))> = self
             .clients
             .values()
-            .filter(|c| c.attached && c.session == Some(sid))
+            .filter(|c| c.attached && c.session == Some(sid) && !c.is_readonly())
             .filter_map(|c| if c.control > 0 { c.control_size.filter(|_| !c.ctl.ignore_size).map(|s| (c.activity, s)) } else { Some((c.activity, c.size)) })
             .collect();
         let latest = clients.iter().max_by_key(|c| c.0).map(|c| c.1);
@@ -1824,7 +1948,7 @@ impl Server {
     // ---- hooks & queue ---------------------------------------------------------------------
 
     pub fn run_hook(&mut self, sid: Option<SessId>, name: &str, ctx: Ctx) {
-        if ctx.hook_depth > 4 {
+        if ctx.hook_depth > 4 || ctx.readonly || self.readonly_context.get() || self.client_is_readonly(ctx.client) {
             return;
         }
         let cmds = sid
@@ -1843,8 +1967,21 @@ impl Server {
                 Err(e) => log(&format!("hook {name}: {e}")),
             }
         }
-        let ctx = Ctx { reply: None, out: String::new(), hook_depth: ctx.hook_depth + 1, ..ctx };
+        let ctx = Ctx { reply: None, out: Default::default(), hook_depth: ctx.hook_depth + 1, ..ctx };
         self.run_queue(Queue { cmds: list, ctx , soft: 0 });
+    }
+
+    fn after_command(&mut self, name: &str, ctx: &Ctx) {
+        self.sync_groups();
+        if ctx.hook_depth == 0 {
+            if let Some(full) = cmds::canonical(name) {
+                let sid = ctx.pane.and_then(|p| self.session_of_pane(p)).map(|(s,_)|s)
+                    .or_else(|| ctx.client.and_then(|c| self.client_session(c)));
+                self.run_hook(sid, &format!("after-{full}"), Ctx {
+                    client: ctx.client, pane: ctx.pane, readonly: ctx.readonly, ..Ctx::default()
+                });
+            }
+        }
     }
 
     pub fn run_queue(&mut self, mut q: Queue) {
@@ -1866,16 +2003,11 @@ impl Server {
                     q.ctx.out.push_str(&e);
                     q.ctx.out.push('\n');
                 }
-                Ok(Flow::Next) => {
-                    self.sync_groups();
-                    if q.ctx.hook_depth == 0 {
-                        if let Some(full) = cmds::canonical(&name) {
-                            let sid = q.ctx.pane.and_then(|p| self.session_of_pane(p)).map(|(s, _)| s).or_else(|| q.ctx.client.and_then(|c| self.client_session(c)));
-                            let ctx = Ctx { client: q.ctx.client, pane: q.ctx.pane, ..Ctx::default() };
-                            self.run_hook(sid, &format!("after-{full}"), ctx);
-                        }
-                    }
+                Ok(Flow::WaitOverlay(cid, epoch)) => {
+                    self.overlay_waits.push((cid, epoch, name, q));
+                    return;
                 }
+                Ok(Flow::Next) => self.after_command(&name, &q.ctx),
                 Err(e) if e.starts_with('\0') => {
                     // async commands: park the rest of the queue
                     let parts: Vec<String> = e.split('\0').map(String::from).collect();
@@ -1884,7 +2016,7 @@ impl Server {
                         "job-if" => {
                             let kind = JobKind::IfShell { then: get(3), otherwise: Some(get(4)).filter(|s| !s.is_empty()) };
                             if get(5) == "b" {
-                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: String::new(), ..q.ctx.clone() }, soft: 0 };
+                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: Default::default(), ..q.ctx.clone() }, soft: 0 };
                                 self.spawn_job(&get(2), None, kind, sub);
                                 continue;
                             }
@@ -1897,7 +2029,7 @@ impl Server {
                             let cwd = Some(get(3)).filter(|s| !s.is_empty());
                             let kind = JobKind::RunShell { pane, background };
                             if background {
-                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: String::new(), ..q.ctx.clone() }, soft: 0 };
+                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: Default::default(), ..q.ctx.clone() }, soft: 0 };
                                 self.spawn_job(&get(2), cwd, kind, sub);
                                 continue;
                             }
@@ -1923,8 +2055,9 @@ impl Server {
         self.finish_queue(q, None);
     }
 
-    pub fn finish_queue(&mut self, q: Queue, err: Option<String>) {
+    pub fn finish_queue(&mut self, q: Queue, mut err: Option<String>) {
         let ctx = q.ctx;
+        if ctx.out.overflowed() { err = Some("command output limit exceeded".into()); }
         if let (Some(seq), Some(cid)) = (ctx.control_seq, ctx.client) {
             self.control_block(cid, seq, &ctx.out, err.as_deref());
             // a one-shot `pwsh-tmux -C command` that didn't attach ends here
@@ -1939,7 +2072,9 @@ impl Server {
             let Some(c) = self.clients.get(&rc) else { return };
             if c.attached {
                 if !ctx.out.is_empty() {
-                    if let Some(p) = ctx.client.and_then(|c| self.client_active_pane(c)) {
+                    if ctx.readonly || c.is_readonly() {
+                        self.set_message(rc, &ctx.out);
+                    } else if let Some(p) = ctx.client.and_then(|c| self.client_active_pane(c)) {
                         self.view_output(p, &ctx.out);
                     }
                 }
@@ -1949,7 +2084,7 @@ impl Server {
                 return;
             }
             match err {
-                Some(e) => c.send(S_REPLY, &encode_reply(1, &(ctx.out + &e))),
+                Some(e) => c.send(S_REPLY, &encode_reply(1, &format!("{}{e}", &*ctx.out))),
                 None => c.send(S_REPLY, &encode_reply(0, &ctx.out)),
             }
             return;
@@ -1963,7 +2098,9 @@ impl Server {
             if let Some(e) = err {
                 self.set_message(cid, &e);
             } else if !ctx.out.is_empty() {
-                if let Some(p) = self.client_active_pane(cid) {
+                if ctx.readonly || self.client_is_readonly(Some(cid)) {
+                    self.set_message(cid, &ctx.out);
+                } else if let Some(p) = self.client_active_pane(cid) {
                     self.view_output(p, &ctx.out);
                 }
             }
@@ -1995,3 +2132,6 @@ impl Server {
         id
     }
 }
+
+#[cfg(test)]
+mod security_tests;

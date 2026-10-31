@@ -4,6 +4,8 @@
 use super::vars::Target;
 use super::*;
 
+const MAX_SUBS_BYTES: usize = 1 << 20;
+
 /// What a control client was last told about.
 #[derive(Default, Clone, PartialEq)]
 pub struct Seen {
@@ -192,7 +194,10 @@ impl Server {
                 None if name == "pause-after" => c.ctl.pause_after = None,
                 None if name == "no-output" => c.ctl.no_output = on,
                 None if name == "wait-exit" => c.ctl.wait_exit = on,
-                None if name == "read-only" => c.readonly = on,
+                None if name == "read-only" => {
+                    if !on && c.is_readonly() { return Err("client is read-only".into()); }
+                    c.readonly = on || c.acl_readonly;
+                }
                 None if name == "ignore-size" => c.ctl.ignore_size = on,
                 None if matches!(name, "active-pane" | "no-detach-on-destroy") => {}
                 _ => return Err(format!("unknown flag: {name}")),
@@ -214,6 +219,17 @@ impl Server {
         let c = self.clients.get_mut(&cid).ok_or("no client")?;
         match (parts.next(), parts.next()) {
             (Some(what), Some(fmt)) => {
+                if name.len() > 256 || fmt.len() > 65536 || what.len() > 256 {
+                    return Err("subscription too large".into());
+                }
+                if c.ctl.subs.len() >= 128 && !c.ctl.subs.contains_key(&name) {
+                    return Err("too many subscriptions".into());
+                }
+                let total: usize = c.ctl.subs.iter().map(|(n, (w, f, _))| n.len() + w.len() + f.len()).sum();
+                let previous = c.ctl.subs.get(&name).map_or(0, |(w, f, _)| name.len() + w.len() + f.len());
+                if total.saturating_sub(previous).saturating_add(name.len() + what.len() + fmt.len()) > MAX_SUBS_BYTES {
+                    return Err("subscription memory limit exceeded".into());
+                }
                 c.ctl.subs.insert(name, (what.to_string(), fmt.to_string(), HashMap::new()));
             }
             _ => {
@@ -226,12 +242,14 @@ impl Server {
     /// Sends %subscription-changed for subscriptions whose value changed.
     pub fn control_subscriptions(&mut self) {
         let ids: Vec<ClientId> = self.clients.values().filter(|c| c.control > 0 && c.attached && !c.ctl.subs.is_empty()).map(|c| c.id).collect();
-        for cid in ids {
+        'clients: for cid in ids {
             let Some(sid) = self.client_session(cid) else { continue };
             let subs: Vec<(String, String, String)> = self.clients[&cid].ctl.subs.iter().map(|(n, (w, f, _))| (n.clone(), w.clone(), f.clone())).collect();
             let s = &self.sessions[&sid];
-            let mut out = String::new();
+            let mut out = output::Output::default();
             let mut updates = Vec::new();
+            let mut cached_bytes: usize = self.clients[&cid].ctl.subs.values()
+                .flat_map(|(_, _, values)| values.iter()).map(|(key, value)| key.len() + value.len()).sum();
             for (name, what, fmt) in subs {
                 // (key, target, line prefix)
                 let mut targets: Vec<(String, Target, String)> = Vec::new();
@@ -247,7 +265,7 @@ impl Server {
                     }
                 } else if what == "%*" || what.starts_with('%') {
                     for (idx, wid) in &s.links {
-                        for p in self.windows[wid].layout.panes() {
+                        for p in self.windows[wid].panes() {
                             if what == "%*" || what == format!("%{p}") {
                                 let t = Target { pane: Some(p), ..win_target(*idx, *wid) };
                                 targets.push((format!("%{p}"), t, format!("${sid} @{wid} {idx} %{p}")));
@@ -259,7 +277,17 @@ impl Server {
                     let value = self.expand(t, Some(cid), &fmt);
                     let last = self.clients[&cid].ctl.subs.get(&name).and_then(|x| x.2.get(&key));
                     if last != Some(&value) {
+                        let previous = last.map_or(0, |v| key.len() + v.len());
+                        cached_bytes = cached_bytes.saturating_sub(previous).saturating_add(key.len() + value.len());
+                        if cached_bytes > MAX_SUBS_BYTES {
+                            self.clients[&cid].closed.store(true, std::sync::atomic::Ordering::SeqCst);
+                            continue 'clients;
+                        }
                         out.push_str(&format!("%subscription-changed {name} {prefix} : {value}\n"));
+                        if out.overflowed() {
+                            self.clients[&cid].closed.store(true, std::sync::atomic::Ordering::SeqCst);
+                            continue 'clients;
+                        }
                         updates.push((name.clone(), key, value));
                     }
                 }
@@ -286,7 +314,7 @@ impl Server {
             let w = &self.windows[wid];
             seen.windows.insert(*wid, (w.name.clone(), w.layout.to_layout_string(self.window_area(*wid))));
             seen.active_pane.insert(*wid, w.active);
-            for p in w.layout.panes() {
+            for p in w.panes() {
                 seen.pane_modes.insert(p, self.panes.get(&p).is_some_and(|x| x.mode.is_some()));
             }
         }

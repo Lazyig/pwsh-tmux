@@ -8,6 +8,23 @@ use crate::format::{self, Span};
 use std::fmt::Write as _;
 use unicode_width::UnicodeWidthChar;
 
+// ConPTY counts decomposed accents as extra columns. Compose when Windows can do
+// so, and retain the original text if the platform cannot normalize it.
+fn terminal_text(text: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(windows)]
+    if text.chars().any(|c| c.width() == Some(0)) {
+        use windows_sys::Win32::Globalization::{NormalizeString, NormalizationC};
+        let source: Vec<u16> = text.encode_utf16().collect();
+        let needed = unsafe { NormalizeString(NormalizationC, source.as_ptr(), source.len() as i32, std::ptr::null_mut(), 0) };
+        if needed > 0 {
+            let mut dest = vec![0u16; needed as usize];
+            let written = unsafe { NormalizeString(NormalizationC, source.as_ptr(), source.len() as i32, dest.as_mut_ptr(), needed) };
+            if written > 0 { return String::from_utf16_lossy(&dest[..written as usize]).into(); }
+        }
+    }
+    text.into()
+}
+
 pub struct Frame {
     pub w: u16,
     pub h: u16,
@@ -40,9 +57,15 @@ impl Frame {
     }
     /// Writes `text` from (x, y) up to column `limit`; returns the next column.
     pub fn text(&mut self, mut x: u16, y: u16, text: &str, style: Style, limit: u16) -> u16 {
+        let start = x;
         for ch in text.chars() {
             let cw = ch.width().unwrap_or(0) as u16;
             if cw == 0 {
+                if x > start && y < self.h {
+                    let mut previous = x - 1;
+                    if self.get(previous, y).is_some_and(|c| c.text.is_empty()) && previous > start { previous -= 1; }
+                    if previous < self.w { self.cells[y as usize * self.w as usize + previous as usize].text.push(ch); }
+                }
                 continue;
             }
             if x + cw > limit.min(self.w) {
@@ -91,7 +114,14 @@ pub fn draw_box(f: &mut Frame, x: u16, y: u16, w: u16, h: u16, style: Style, tit
     f.set(x, y + h - 1, Cell { text: "└".into(), style });
     f.set(x + w - 1, y + h - 1, Cell { text: "┘".into(), style });
     if !title.is_empty() && w > 4 {
-        f.text(x + 2, y, &format!(" {title} "), style, x + w - 2);
+        let spans = format::spans(title, style);
+        let cells = spans_cells(&spans, w.saturating_sub(4) as usize, style);
+        let start = match spans.first().map(|s| s.align) {
+            Some(format::Align::Centre) => x + (w.saturating_sub(cells.len() as u16)) / 2,
+            Some(format::Align::Right) => x + w - 2 - cells.len() as u16,
+            _ => x + 2,
+        };
+        f.put_cells(start, y, &cells);
     }
 }
 
@@ -207,7 +237,9 @@ impl Server {
         let left_len = self.opt_session_num(Some(sid), "status-left-length").max(0) as usize;
         let right_len = self.opt_session_num(Some(sid), "status-right-length").max(0) as usize;
         let lcells = spans_cells(&format::spans(&left, left_style), left_len.min(width), base);
-        let rcells = spans_cells(&format::spans(&right, right_style), right_len.min(width.saturating_sub(lcells.len())), base);
+        let mut rcells = spans_cells(&format::spans(&right, right_style), right_len, base);
+        let available = width.saturating_sub(lcells.len());
+        if rcells.len() > available { rcells.drain(..rcells.len() - available); }
 
         // window list
         let sep = self.opt_window(None, "window-status-separator");
@@ -246,7 +278,8 @@ impl Server {
         let (wstart, wlen) = if wcells.len() <= avail {
             (0, wcells.len())
         } else {
-            let start = if cur_range.1 > avail { cur_range.1 - avail } else { 0 };
+            let centre = cur_range.0 + (cur_range.1 - cur_range.0) / 2;
+            let start = centre.saturating_sub(avail / 2).min(wcells.len().saturating_sub(avail));
             (start, avail)
         };
         let mut wslice: Vec<Cell> = wcells[wstart..wstart + wlen].to_vec();
@@ -311,7 +344,7 @@ impl Server {
         let active_rect = rects.iter().find(|(p, _)| *p == win.active).map(|(_, r)| *r);
         let area_h = ch.saturating_sub(nstatus);
         let border_status = self.opt_window(Some(wid), "pane-border-status");
-        let active_border = format::parse_style(&self.opt_window(Some(wid), "pane-active-border-style"), Style::default()).unwrap_or_default();
+        let active_border = format::parse_style(&self.expand_for_pane(win.active, &self.opt_window(Some(wid), "pane-active-border-style")), Style::default()).unwrap_or_default();
         let inactive_border = format::parse_style(&self.opt_window(Some(wid), "pane-border-style"), Style::default()).unwrap_or_default();
         let lines_kind = self.opt_window(Some(wid), "pane-border-lines");
         let bset = BORDER_SETS.iter().find(|(n, _)| *n == lines_kind).map(|(_, s)| *s).unwrap_or(BORDER_SETS[0].1);
@@ -325,8 +358,9 @@ impl Server {
             let wstyle = if is_active && wstyle == Style::default() { format::parse_style(&self.opt_pane(*id, "window-style"), Style::default()).unwrap_or_default() } else { wstyle };
             let mode_lines: Option<(Vec<Line>, Option<(u16, u16)>)> = match &p.mode {
                 Some(PaneMode::Copy(cm)) => {
-                    let (lines, cur) = cm.render();
-                    Some((lines, Some(cur)))
+                    let style = format::parse_style(&self.expand_for_pane(*id, &self.opt_window(Some(wid), "mode-style")), Style::default()).unwrap_or_default();
+                    let (lines, cur) = cm.render_with_style(style);
+                    Some((lines, Some((cur.1, cur.0))))
                 }
                 Some(PaneMode::Tree(t)) => Some((t.render(self, cr.w, cr.h), None)),
                 Some(PaneMode::Clock) => Some((Vec::new(), None)),
@@ -360,8 +394,8 @@ impl Server {
             if matches!(p.mode, Some(PaneMode::Clock)) {
                 let colour = format::parse_color(&self.opt_window(Some(wid), "clock-mode-colour")).unwrap_or(Color::Idx(4));
                 let text = clock_text(self.opt_window(Some(wid), "clock-mode-style") != "12");
-                let rr = Rect { y: oy + cr.y, ..cr };
-                if !big_text(&mut f, rr, &text, colour) {
+                let rr = Rect { y: oy + cr.y, h: cr.h.saturating_sub(1), ..cr };
+                if cr.h < 6 || !big_text(&mut f, rr, &text, colour) {
                     f.text(cr.x, oy + cr.y + cr.h / 2, &text, Style { fg: colour, ..Style::default() }, cr.x + cr.w);
                 }
             }
@@ -386,17 +420,6 @@ impl Server {
                         }
                     }
                 }
-            }
-            // pane border status line
-            if border_status != "off" && cr != *r {
-                let by = if border_status == "top" { r.y } else { r.bottom() - 1 };
-                let bstyle = if is_active { active_border } else { inactive_border };
-                for x in r.x..r.right() {
-                    f.set(x, oy + by, Cell { text: bset[0].into(), style: bstyle });
-                }
-                let text = self.expand_for_pane(*id, &self.opt_window(Some(wid), "pane-border-format"));
-                let cells = spans_cells(&format::spans(&text, bstyle), r.w.saturating_sub(2) as usize, bstyle);
-                f.put_cells(r.x + 1, oy + by, &cells);
             }
         }
 
@@ -427,12 +450,58 @@ impl Server {
                     (true, _, false, false) | (_, true, false, false) => bset[1],
                     _ => bset[0],
                 };
-                let near = active_rect.is_some_and(|a| x + 1 >= a.x && x <= a.right() && y + 1 >= a.y && y <= a.bottom()) && rects.len() > 1;
-                f.set(x, oy + y, Cell { text: ch.into(), style: if near { active_border } else { inactive_border } });
+                let mut near = active_rect.is_some_and(|a| x + 1 >= a.x && x <= a.right() && y + 1 >= a.y && y <= a.bottom()) && rects.len() > 1;
+                if near && rects.len() == 2 {
+                    if let Some(a) = active_rect {
+                        if rects[0].1.y == rects[1].1.y {
+                            near = if a.x == 0 { y <= a.h / 2 } else { y > a.h / 2 };
+                        } else if border_status == "off" {
+                            near = if a.y == 0 { x <= a.w / 2 } else { x > a.w / 2 };
+                        }
+                    }
+                }
+                let text = if lines_kind == "number" {
+                    // The pane below or to the right owns a shared border.
+                    let panes = win.panes();
+                    let active = panes.iter().position(|p| *p == win.active).unwrap_or(0);
+                    (0..panes.len()).map(|i| (active+i)%panes.len()).find(|i| {
+                        rects.iter().find(|(p,_)| *p==panes[*i]).is_some_and(|(_,a)|
+                            (x == a.right() && y >= a.y && y <= a.bottom()) ||
+                            (x + 1 == a.x && y >= a.y && y <= a.bottom()) ||
+                            (y == a.bottom() && x >= a.x && x <= a.right()) ||
+                            (y + 1 == a.y && x >= a.x && x <= a.right()))
+                    }).map(|i| char::from(b'0' + (i%10) as u8).to_string()).unwrap_or_else(|| "*".into())
+                } else { ch.into() };
+                f.set(x, oy + y, Cell { text, style: if near { active_border } else { inactive_border } });
+            }
+        }
+        // Internal separators double as pane titles; only the outer row
+        // consumes pane space.
+        if border_status != "off" {
+            for (id, r) in &rects {
+                let cr = self.content_rect(wid, *r);
+                let by = if border_status == "top" { cr.y.saturating_sub(1) } else { cr.bottom() };
+                let st = if *id == win.active { active_border } else { inactive_border };
+                for x in r.x..r.right() {
+                    if x >= r.x + 2 || !at(x as i32, by as i32) { f.set(x, oy + by, Cell { text: bset[0].into(), style: st }); }
+                }
+                let text = self.expand_for_pane(*id, &self.opt_window(Some(wid), "pane-border-format"));
+                let cells = spans_cells(&format::spans(&text, st), r.w.saturating_sub(2) as usize, st);
+                f.put_cells(r.x + 2, oy + by, &cells);
+            }
+        }
+        if border_status != "off" {
+            let by = if border_status == "top" { 0 } else { area_h.saturating_sub(1) };
+            for sep in &seps {
+                if sep.vertical && (if by == 0 { sep.y == 0 } else { sep.y + sep.len == area_h }) {
+                    if let Some(cell) = f.get(sep.x, oy + by).cloned() {
+                        f.set(sep.x, oy + by, Cell { text: (if by == 0 { bset[7] } else { bset[8] }).into(), ..cell });
+                    }
+                }
             }
         }
         // marked pane: reverse its borders
-        if let Some(m) = self.marked.filter(|m| win.layout.panes().contains(m)) {
+        if let Some(m) = self.marked.filter(|m| win.panes().contains(m)) {
             if let Some((_, r)) = rects.iter().find(|(p, _)| *p == m) {
                 for y in r.y.saturating_sub(1)..=r.bottom().min(area_h.saturating_sub(1)) {
                     for x in r.x.saturating_sub(1)..=r.right().min(cw - 1) {
@@ -458,6 +527,7 @@ impl Server {
         if let Some(ov) = &c.overlay {
             match ov {
                 Overlay::DisplayPanes { .. } => {
+                    cursor = None;
                     let colour = format::parse_color(&self.opt_session(Some(sid), "display-panes-colour")).unwrap_or(Color::Idx(4));
                     let acolour = format::parse_color(&self.opt_session(Some(sid), "display-panes-active-colour")).unwrap_or(Color::Idx(1));
                     let base = self.opt_window_num(Some(wid), "pane-base-index").max(0) as usize;
@@ -475,7 +545,10 @@ impl Server {
                 Overlay::Menu(m) => {
                     let st = format::parse_style(&self.opt_window(Some(wid), "popup-style"), Style::default()).unwrap_or_default();
                     let bst = format::parse_style(&self.opt_window(Some(wid), "popup-border-style"), Style::default()).unwrap_or_default();
-                    m.draw(&mut f, st, bst);
+                    let st = format::parse_style(&self.opt_window(Some(wid), "menu-style"), st).unwrap_or(st);
+                    let bst = format::parse_style(&self.opt_window(Some(wid), "menu-border-style"), bst).unwrap_or(bst);
+                    let selected = format::parse_style(&self.opt_window(Some(wid), "menu-selected-style"), Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() }).unwrap_or(Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() });
+                    m.draw(&mut f, st, bst, selected);
                     cursor = None;
                 }
                 Overlay::Popup(pp) => {
@@ -545,7 +618,7 @@ impl Server {
             for x in 0..cw {
                 f.set(x, my, Cell { text: " ".into(), style: st });
             }
-            let label = pr.label.clone() + if matches!(pr.kind, PromptKind::Confirm) || pr.label.ends_with(' ') || pr.label.is_empty() { "" } else { " " };
+            let label = pr.label.clone() + if matches!(pr.kind, PromptKind::Confirm) || pr.label == ":" || pr.label.ends_with(' ') || pr.label.is_empty() { "" } else { " " };
             let lx = f.text(0, my, &label, st, cw);
             let input: String = pr.input.iter().collect();
             let before: String = pr.input[..pr.cursor].iter().collect();
@@ -570,6 +643,7 @@ impl Server {
             }
             cursor = Some(((lx + bw - skip).min(cw - 1), my));
         } else if let Some((msg, _)) = &c.message {
+            cursor = None;
             let st = format::parse_style(&self.opt_session(Some(sid), "message-style"), Style::default()).unwrap_or_default();
             for x in 0..cw {
                 f.set(x, my, Cell { text: " ".into(), style: st });
@@ -577,6 +651,8 @@ impl Server {
             f.text(0, my, msg, st, cw);
         }
 
+        modes.app_cursor = true;
+        modes.bracketed_paste = c.features.has("bpaste");
         Some(RenderState { frame: f, cursor, modes })
     }
 
@@ -628,7 +704,7 @@ impl Server {
             changed = true;
             let _ = write!(out, "\x1b[{};1H", y + 1);
             let mut cur: Option<Style> = None;
-            for cell in row {
+            for (x, cell) in row.iter().enumerate() {
                 if cell.text.is_empty() {
                     continue;
                 }
@@ -636,7 +712,11 @@ impl Server {
                     push_sgr(&mut out, &fit_style(cell.style, &feats));
                     cur = Some(cell.style);
                 }
-                out.push_str(&cell.text);
+                out.push_str(&terminal_text(&cell.text));
+                if cfg!(windows) && cell.text.chars().any(|c| c.width() == Some(0)) {
+                    let width = cell.text.chars().filter_map(|c| c.width()).sum::<usize>();
+                    if x + width < next.frame.w as usize { let _ = write!(out, "\x1b[{};{}H", y + 1, x + width + 1); }
+                }
             }
         }
         let pm = prev.map(|p| p.modes);

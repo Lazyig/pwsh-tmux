@@ -28,6 +28,7 @@ pub struct TreeItem {
 
 pub struct Tree {
     pub kind: TreeKind,
+    pub owner: PaneId,
     pub template: String,
     pub items: Vec<TreeItem>,
     pub expanded: HashSet<String>,
@@ -49,6 +50,7 @@ fn line_from(text: &str, width: usize, style: Style) -> Line {
     for ch in text.chars() {
         let w = ch.width().unwrap_or(0);
         if w == 0 {
+            if let Some(cell) = cells.iter_mut().rev().find(|c: &&mut Cell| !c.text.is_empty()) { cell.text.push(ch); }
             continue;
         }
         if cells.len() + w > width {
@@ -82,7 +84,7 @@ impl Tree {
                 expanded.insert(format!("s{}", s.id));
             }
         }
-        let mut t = Tree { kind, template, items: Vec::new(), expanded, sel: 0, top: 0, filter, client: None, tagged: HashSet::new() };
+        let mut t = Tree { kind, owner: pane, template, items: Vec::new(), expanded, sel: 0, top: 0, filter, client: None, tagged: HashSet::new() };
         t.rebuild(srv);
         // select the current session / window
         let cur = srv.target_for_pane(pane);
@@ -126,18 +128,18 @@ impl Tree {
                         let w = &srv.windows[&wid];
                         let wkey = format!("s{}w{}", s.id, wid);
                         let flags = srv.window_flags(s.id, idx);
-                        let np = w.layout.panes().len();
+                        let np = w.panes().len();
                         items.push(TreeItem {
                             id: wkey.clone(),
                             depth: 1,
-                            label: format!("{idx}: {}{flags} ({np} panes) \"{}\"", w.name, srv.panes.get(&w.active).map(|p| p.title.as_str()).unwrap_or("")),
+                            label: format!("{idx}: {}{flags}{}", w.name, if np == 1 { format!(": \"{}\"", srv.panes.get(&w.active).map(|p| p.title.as_str()).unwrap_or("")) } else { String::new() }),
                             target: format!("${}:{idx}", s.id),
                             kill: format!("kill-window -t '@{wid}'"),
-                            expandable: np > 1,
+                            expandable: np > 0,
                             preview: Some(w.active),
                         });
-                        if np > 1 && self.expanded.contains(&wkey) {
-                            for (pi, p) in w.layout.panes().iter().enumerate() {
+                        if np > 0 && self.expanded.contains(&wkey) {
+                            for (pi, p) in w.panes().iter().enumerate() {
                                 let pp = srv.panes.get(p);
                                 items.push(TreeItem {
                                     id: format!("p{p}"),
@@ -155,11 +157,12 @@ impl Tree {
             }
             TreeKind::Buffers => {
                 for b in &srv.buffers {
-                    let sample: String = String::from_utf8_lossy(&b.data).chars().take(60).map(|c| if c.is_control() { ' ' } else { c }).collect();
+                    let sample: String = String::from_utf8_lossy(&b.data).chars().take(200).flat_map(|c| c.escape_default()).collect();
+                    let time = chrono::DateTime::from_timestamp(b.created as i64, 0).map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string()).unwrap_or_default();
                     items.push(TreeItem {
                         id: format!("b{}", b.name),
                         depth: 0,
-                        label: format!("{}: {} bytes: \"{}\"", b.name, b.data.len(), sample),
+                        label: format!("{}: {time}: {sample}", b.name),
                         target: b.name.clone(),
                         kill: format!("delete-buffer -b '{}'", b.name),
                         expandable: false,
@@ -313,62 +316,82 @@ impl Tree {
         TreeAction::None
     }
 
+    pub fn list_height(&self, h: usize) -> usize {
+        let mut height = (h / 3) * 2;
+        if height > self.items.len() { height = h / 2; }
+        if height < 10 || h.saturating_sub(height) < 2 { h } else { height }
+    }
+
     pub fn render(&self, srv: &Server, w: u16, h: u16) -> Vec<Line> {
-        let (w, h) = (w as usize, h as usize);
-        let preview = h >= 12 && self.items.get(self.sel).and_then(|i| i.preview).is_some();
-        let list_h = if preview { h / 2 } else { h };
-        let mut top = self.top;
-        if self.sel < top {
-            top = self.sel;
-        }
-        if self.sel >= top + list_h {
-            top = self.sel + 1 - list_h;
-        }
-        let mut out = Vec::with_capacity(h);
-        let sel_style = Style { attrs: INVERSE, ..Style::default() };
-        let tag_style = Style { attrs: BOLD, ..Style::default() };
+        use super::render::{Frame, draw_box};
+        let list_h = self.list_height(h as usize);
+        let mut f = Frame::new(w, h);
+        let top = self.top.min(self.sel).max((self.sel + 1).saturating_sub(list_h));
+        let pane = self.items.get(self.sel).and_then(|i| i.preview);
+        let wid = srv.target_for_pane(self.owner).wid;
+        let selected = crate::format::parse_style(&srv.opt_window(wid, "mode-style"), Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() }).unwrap_or_default();
         for row in 0..list_h {
             let i = top + row;
-            let Some(it) = self.items.get(i) else {
-                out.push(line_from("", w, Style::default()));
-                continue;
-            };
+            let Some(it) = self.items.get(i) else { continue };
             let quick = if i < 10 { format!("({i}) ") } else if i < 36 { format!("(M-{}) ", (b'a' + (i - 10) as u8) as char) } else { "     ".into() };
-            let arrow = if it.expandable { if self.expanded.contains(&it.id) { "- " } else { "+ " } } else { "  " };
-            let indent = "  ".repeat(it.depth as usize);
-            let tag = if self.tagged.contains(&it.id) { "*" } else { "" };
-            let text = format!("{quick}{indent}{arrow}{}{tag}", it.label);
-            let style = if i == self.sel { sel_style } else if self.tagged.contains(&it.id) { tag_style } else { Style::default() };
-            out.push(line_from(&text, w, style));
+            let flat = !matches!(self.kind, TreeKind::Windows | TreeKind::Sessions);
+            let arrow = if flat { "" } else if it.expandable { if self.expanded.contains(&it.id) { "- " } else { "+ " } } else { "  " };
+            let last = self.items.get(i + 1).is_none_or(|n| n.depth < it.depth) || !self.items[i+1..].iter().take_while(|n| n.depth >= it.depth).any(|n| n.depth == it.depth);
+            let indent = if it.depth == 0 { String::new() } else { format!("{}{}", "    ".repeat(it.depth.saturating_sub(1) as usize), if last { "└─> " } else { "├─> " }) };
+            let text = format!("{quick}{indent}{arrow}{}{}", it.label, if self.tagged.contains(&it.id) { "*" } else { "" });
+            let style = if i == self.sel { selected } else if self.tagged.contains(&it.id) { Style { attrs: BOLD, ..Style::default() } } else { Style::default() };
+            f.put_cells(0, row as u16, &line_from(&text, w as usize, style).cells);
         }
-        if preview {
-            let pane = self.items[self.sel].preview.unwrap();
-            let border = Style { fg: Color::Idx(2), ..Style::default() };
-            let title = format!(" {} ", self.items[self.sel].target);
-            let mut bar = String::from("─");
-            bar.push_str(&title);
-            while bar.chars().count() < w {
-                bar.push('─');
-            }
-            out.push(line_from(&bar, w, border));
-            let ph = h - list_h - 1;
-            if let Some(p) = srv.panes.get(&pane) {
-                let scr = p.screen();
-                for r in 0..ph {
-                    let mut cells: Vec<Cell> = (0..w as u16).map(|c| scr.cell(r as u16, c).map(crate::cells::cell_from_vt).unwrap_or_default()).collect();
-                    if let Some(last) = cells.last_mut() {
-                        if last.text.chars().next().and_then(|c| c.width()) == Some(2) {
-                            *last = Cell::default();
+        let y = list_h as u16;
+        if h.saturating_sub(y) > 4 && w > 4 {
+            if let Some(it) = self.items.get(self.sel) {
+                draw_box(&mut f, 0, y, w, h-y, Style::default(), "");
+                let name = if self.kind == TreeKind::Buffers { it.target.clone() } else { it.target.rsplit(':').next().unwrap_or(&it.target).to_string() };
+                f.text(1, y, &format!(" {name} (sort: {}) ", if self.kind == TreeKind::Buffers { "time" } else { "index" }), Style::default(), w-1);
+                let (pw,ph) = (w-4,h-y-2);
+                if self.kind == TreeKind::Buffers {
+                    if let Some(b) = srv.buffers.iter().find(|b| b.name == it.target) {
+                        for (row,line) in String::from_utf8_lossy(&b.data).lines().take(ph as usize).enumerate() { f.text(2, y+1+row as u16, line, Style::default(), w-2); }
+                    }
+                } else if let Some(p) = pane.and_then(|p| srv.panes.get(&p)) {
+                    let window = &srv.windows[&srv.target_for_pane(p.id).wid.unwrap()];
+                    let panes = window.panes();
+                    let visible = panes.len().min((pw / 24).max(1) as usize);
+                    let current = panes.iter().position(|id| *id == p.id).unwrap_or(0);
+                    let start = current.saturating_sub(visible-1).min(panes.len()-visible);
+                    let each = pw / visible as u16;
+                    for (i,id) in panes.iter().enumerate().skip(start).take(visible) {
+                        let pp = &srv.panes[id];
+                        let x = 2 + (i-start) as u16 * each;
+                        let width = if i == start+visible-1 { pw - (i-start) as u16 * each } else { each-1 };
+                        let scr = pp.screen();
+                        let (cy,cx) = scr.cursor_position();
+                        let px = if scr.hide_cursor() { 0 } else { cx.saturating_sub(width/3).min(pp.size.0.saturating_sub(width)) };
+                        let py = if scr.hide_cursor() { 0 } else { cy.saturating_sub(ph/3).min(pp.size.1.saturating_sub(ph)) };
+                        for yy in 0..ph { for xx in 0..width {
+                            if let Some(cell) = scr.cell(py+yy,px+xx) {
+                                let mut cell = crate::cells::cell_from_vt(cell);
+                                if !scr.hide_cursor() && (px+xx,py+yy)==(cx,cy) { cell.style.attrs |= INVERSE; }
+                                f.set(x+xx,y+1+yy,cell);
+                            }
+                        } }
+                        if i != start+visible-1 { for yy in 0..ph { f.text(x+width,y+1+yy,"│",Style::default(),w); } }
+                        let label = format!(" {i} ");
+                        let len = label.len() as u16;
+                        if len <= each && ph > 1 {
+                            let ox = (each-len+1)/2;
+                            let oy = (ph+1)/2;
+                            if ox>1 && ox+len<each-1 && ph>=3 { draw_box(&mut f,x+ox-1,y+oy,len+2,3,Style::default(),""); }
+                            let color = if *id==window.active { "display-panes-active-colour" } else { "display-panes-colour" };
+                            let sid = srv.session_of_pane(*id).map(|(sid,_)|sid);
+                            let style = Style { fg: crate::format::parse_color(&srv.opt_session(sid,color)).unwrap_or(Color::Default), ..Style::default() };
+                            f.text(x+ox,y+1+oy,&label,style,w-2);
                         }
                     }
-                    out.push(Line { cells, wrapped: false });
                 }
             }
         }
-        while out.len() < h {
-            out.push(line_from("", w, Style::default()));
-        }
-        out
+        f.cells.chunks(w as usize).map(|c| Line { cells:c.to_vec(),wrapped:false }).collect()
     }
 }
 
@@ -403,14 +426,14 @@ impl Menu {
         let inner = items
             .iter()
             .map(|i| crate::format::width(&i.name) + if i.key.is_empty() { 0 } else { crate::format::width(&i.key) + 3 })
-            .chain(std::iter::once(crate::format::width(&title) + 2))
+            .chain(std::iter::once(crate::format::spans(&title, Style::default()).iter().map(|s| crate::format::width(&s.text)).sum()))
             .max()
             .unwrap_or(10) as u16;
         let w = (inner + 4).min(cw);
         let h = (items.len() as u16 + 2).min(ch);
         let pos = |v: Option<&str>, total: u16, size: u16, mouse: Option<u16>| -> u16 {
             let p = match v {
-                Some("C") => total.saturating_sub(size) / 2,
+                Some("C") => ((total.saturating_sub(1)) / 2).saturating_sub(size / 2),
                 Some("R") => total.saturating_sub(size),
                 Some("M") => mouse.unwrap_or(0),
                 Some("P") | Some("W") | None => mouse.map(|m| m.saturating_sub(1)).unwrap_or(total.saturating_sub(size) / 2),
@@ -420,7 +443,7 @@ impl Menu {
             p.min(total.saturating_sub(size))
         };
         let mx = pos(x, cw, w, mouse.map(|m| m.0));
-        let my = pos(y, ch, h, mouse.map(|m| m.1));
+        let my = if y == Some("C") { ((ch.saturating_sub(1)) / 2).saturating_sub(h.div_ceil(2)) } else { pos(y, ch, h, mouse.map(|m| m.1)) };
         let sel = items.iter().position(|i| !i.cmd.is_empty());
         Menu { title, items, sel, x: mx, y: my, w, h, pane }
     }
@@ -477,7 +500,7 @@ impl Menu {
         MenuAction::None
     }
 
-    pub fn draw(&self, f: &mut super::render::Frame, style: Style, border: Style) {
+    pub fn draw(&self, f: &mut super::render::Frame, style: Style, border: Style, selected_style: Style) {
         let (x0, y0, w, h) = (self.x, self.y, self.w, self.h);
         super::render::draw_box(f, x0, y0, w, h, border, &self.title);
         for (i, it) in self.items.iter().enumerate() {
@@ -486,7 +509,7 @@ impl Menu {
                 break;
             }
             let selected = self.sel == Some(i);
-            let st = if selected { Style { attrs: style.attrs ^ INVERSE, ..style } } else { style };
+            let st = if selected { selected_style } else { style };
             for x in x0 + 1..x0 + w - 1 {
                 f.set(x, y, Cell { text: " ".into(), style: st });
             }
@@ -494,6 +517,8 @@ impl Menu {
                 for x in x0 + 1..x0 + w - 1 {
                     f.set(x, y, Cell { text: "─".into(), style: border });
                 }
+                f.set(x0, y, Cell { text: "├".into(), style: border });
+                f.set(x0 + w - 1, y, Cell { text: "┤".into(), style: border });
                 continue;
             }
             let dim = Style { attrs: style.attrs | crate::cells::DIM, ..st };

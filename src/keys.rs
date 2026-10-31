@@ -153,6 +153,7 @@ const ESC: u8 = 0x1b;
 const PASTE_END: &[u8] = b"\x1b[201~";
 /// A CSI longer than this without a final byte is treated as garbage.
 const MAX_CSI: usize = 64;
+const MAX_PASTE: usize = 4 << 20;
 
 /// Incremental parser: feed bytes, get complete inputs. A lone ESC (or an incomplete sequence)
 /// is held back; `flush_pending()` returns it as a key once the caller's escape-time expires.
@@ -160,6 +161,7 @@ pub struct Parser {
     buf: Vec<u8>,
     in_paste: bool,
     paste: Vec<u8>,
+    paste_overflow: bool,
 }
 
 impl Default for Parser {
@@ -174,6 +176,7 @@ impl Parser {
             buf: Vec::new(),
             in_paste: false,
             paste: Vec::new(),
+            paste_overflow: false,
         }
     }
 
@@ -207,9 +210,12 @@ impl Parser {
         loop {
             if self.in_paste {
                 if let Some(pos) = find(&self.buf, PASTE_END) {
-                    self.paste.extend_from_slice(&self.buf[..pos]);
+                    if self.paste.len().saturating_add(pos) > MAX_PASTE { self.paste_overflow = true; }
+                    if !self.paste_overflow { self.paste.extend_from_slice(&self.buf[..pos]); }
                     self.buf.drain(..pos + PASTE_END.len());
-                    out.push(Input::Paste(std::mem::take(&mut self.paste)));
+                    if !self.paste_overflow { out.push(Input::Paste(std::mem::take(&mut self.paste))); }
+                    self.paste.clear();
+                    self.paste_overflow = false;
                     self.in_paste = false;
                     continue;
                 }
@@ -219,7 +225,9 @@ impl Parser {
                     .find(|&k| k <= self.buf.len() && self.buf.ends_with(&PASTE_END[..k]))
                     .unwrap_or(0);
                 let take = self.buf.len() - keep;
-                self.paste.extend_from_slice(&self.buf[..take]);
+                if self.paste.len().saturating_add(take) > MAX_PASTE { self.paste_overflow = true; }
+                if !self.paste_overflow { self.paste.extend_from_slice(&self.buf[..take]); }
+                else { self.paste.clear(); }
                 self.buf.drain(..take);
                 break;
             }
@@ -1573,6 +1581,19 @@ mod tests {
             ]
         );
         assert_eq!(all(b"\x1b[200~\x1b[201~"), vec![Input::Paste(Vec::new())]);
+    }
+
+    #[test]
+    fn oversized_paste_is_discarded_until_end_without_becoming_keystrokes() {
+        let mut p = Parser::new();
+        assert!(p.feed(b"\x1b[200~").is_empty());
+        let chunk = vec![b'x'; 1 << 20];
+        for _ in 0..6 {
+            assert!(p.feed(&chunk).is_empty());
+            assert!(p.paste.len() <= MAX_PASTE);
+        }
+        assert_eq!(p.feed(b"echo forbidden\r\x1b[201~z"), vec![Input::Key(ch('z'), b"z".to_vec())]);
+        assert!(!p.in_paste());
     }
 
     #[test]

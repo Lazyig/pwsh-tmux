@@ -23,6 +23,10 @@ fn b(v: bool) -> String {
 }
 
 impl Server {
+    pub fn client_is_readonly(&self, client: Option<ClientId>) -> bool {
+        client.is_some_and(|id| self.clients.get(&id).is_none_or(|c| c.denied || c.is_readonly()))
+    }
+
     pub fn target_for_pane(&self, pane: PaneId) -> Target {
         let wid = self.window_of(pane);
         let (sid, idx) = match self.session_of_pane(pane) {
@@ -69,7 +73,7 @@ impl Server {
         if alerts & ALERT_SILENCE != 0 {
             f.push('~');
         }
-        if self.marked.is_some_and(|m| w.layout.panes().contains(&m)) {
+        if self.marked.is_some_and(|m| w.panes().contains(&m)) {
             f.push('M');
         }
         if w.zoomed {
@@ -80,10 +84,71 @@ impl Server {
 }
 
 impl Vars for VarCtx<'_> {
+    fn contexts(&self, kind: char, flags: &str) -> Vec<(Box<dyn Vars + '_>, bool)> {
+        let mut targets = Vec::new();
+        match kind {
+            'S' => {
+                let mut sessions: Vec<_> = self.srv.sessions.values().collect();
+                if flags.contains('n') { sessions.sort_by(|a, b| a.name.cmp(&b.name)); }
+                else if flags.contains('t') { sessions.sort_by_key(|s| (std::cmp::Reverse(s.activity), s.id)); }
+                for s in sessions {
+                    let wid = s.links.get(&s.active).copied();
+                    let pane = wid.and_then(|w| self.srv.windows.get(&w)).map(|w| w.active);
+                    targets.push((Target { sid: Some(s.id), idx: Some(s.active), wid, pane }, false));
+                }
+            }
+            'W' => {
+                if let Some(s) = self.t.sid.and_then(|s| self.srv.sessions.get(&s)) {
+                    for (&idx, &wid) in &s.links {
+                        let pane = self.srv.windows.get(&wid).map(|w| w.active);
+                        targets.push((Target { sid: Some(s.id), idx: Some(idx), wid: Some(wid), pane }, idx == s.active));
+                    }
+                }
+            }
+            'P' => {
+                if let Some(w) = self.t.wid.and_then(|w| self.srv.windows.get(&w)) {
+                    let mut panes = w.panes();
+                    panes.sort_unstable();
+                    for pane in panes {
+                        targets.push((Target { pane: Some(pane), ..self.t }, pane == w.active));
+                    }
+                }
+            }
+            _ => {}
+        }
+        if kind == 'W' && flags.contains('n') {
+            targets.sort_by_key(|(t, _)| self.srv.windows[&t.wid.unwrap()].name.clone());
+        } else if kind == 'W' && flags.contains('t') {
+            targets.sort_by_key(|(t, _)| std::cmp::Reverse(self.srv.windows[&t.wid.unwrap()].activity));
+        }
+        if flags.contains('r') { targets.reverse(); }
+        targets.into_iter().map(|(t, active)| {
+            let ctx: Box<dyn Vars + '_> = Box::new(VarCtx { srv: self.srv, t, client: self.client, extra: self.extra.clone() });
+            (ctx, active)
+        }).collect()
+    }
+
+    fn search(&self, pattern: &str, regex: bool, ignore_case: bool) -> usize {
+        let Some(p) = self.t.pane.and_then(|p| self.srv.panes.get(&p)) else { return 0 };
+        let screen = p.screen();
+        let (rows, cols) = screen.size();
+        let pattern = if regex { pattern.to_string() } else { format!("*{pattern}*") };
+        (0..rows.get()).find(|&row| {
+            let text = screen.contents_between(row, 0, row, cols.get());
+            if regex { format::regex_matches(&pattern, text.trim_end(), ignore_case) }
+            else { format::glob_match(&pattern, text.trim_end(), ignore_case) }
+        }).map_or(0, |row| row as usize + 1)
+    }
+
     /// Like tmux: run the command in the background, show its last output line until the
     /// next run, and re-run at most every status-interval seconds.
     fn shell(&self, command: &str) -> Option<String> {
         let srv = self.srv;
+        // Check the originating request as well as the format's target client.
+        // Do not expose cached output of privileged jobs to a restricted caller.
+        if srv.readonly_context.get() || srv.client_is_readonly(self.client) {
+            return None;
+        }
         let interval = Duration::from_secs(srv.opt_session_num(self.t.sid, "status-interval").max(1) as u64);
         let mut cache = srv.shell_cache.borrow_mut();
         let stale = cache.get(command).is_none_or(|e| !e.2 && e.1.elapsed() >= interval);
@@ -179,7 +244,7 @@ impl Vars for VarCtx<'_> {
             "window_active" => Some(b(sess.zip(t.idx).is_some_and(|(s, i)| s.active == i))),
             "window_last_flag" => Some(b(sess.zip(t.idx).is_some_and(|(s, i)| s.last.first() == Some(&i)))),
             "window_flags" | "window_raw_flags" => t.sid.zip(t.idx).map(|(s, i)| srv.window_flags(s, i)),
-            "window_panes" => win.map(|w| w.layout.panes().len().to_string()),
+            "window_panes" => win.map(|w| w.panes().len().to_string()),
             "window_zoomed_flag" => win.map(|w| b(w.zoomed)),
             "window_width" => win.map(|w| w.sx.to_string()),
             "window_height" => win.map(|w| w.sy.to_string()),
@@ -189,7 +254,7 @@ impl Vars for VarCtx<'_> {
             "window_activity_flag" => Some(b(sess.zip(t.idx).is_some_and(|(s, i)| s.alerts.get(&i).is_some_and(|a| a & ALERT_ACTIVITY != 0)))),
             "window_bell_flag" => Some(b(sess.zip(t.idx).is_some_and(|(s, i)| s.alerts.get(&i).is_some_and(|a| a & ALERT_BELL != 0)))),
             "window_silence_flag" => Some(b(sess.zip(t.idx).is_some_and(|(s, i)| s.alerts.get(&i).is_some_and(|a| a & ALERT_SILENCE != 0)))),
-            "window_marked_flag" => Some(b(win.is_some_and(|w| srv.marked.is_some_and(|m| w.layout.panes().contains(&m))))),
+            "window_marked_flag" => Some(b(win.is_some_and(|w| srv.marked.is_some_and(|m| w.panes().contains(&m))))),
             "window_start_flag" => Some(b(sess.zip(t.idx).is_some_and(|(s, i)| s.links.keys().next() == Some(&i)))),
             "window_end_flag" => Some(b(sess.zip(t.idx).is_some_and(|(s, i)| s.links.keys().next_back() == Some(&i)))),
             "window_linked" => win.map(|w| b(srv.links_of(w.id).len() > 1)),
@@ -200,7 +265,7 @@ impl Vars for VarCtx<'_> {
             // pane
             "pane_index" => win.zip(t.pane).and_then(|(w, p)| {
                 let base = srv.opt_window_num(Some(w.id), "pane-base-index").max(0) as usize;
-                w.layout.panes().iter().position(|x| *x == p).map(|i| (i + base).to_string())
+                w.panes().iter().position(|x| *x == p).map(|i| (i + base).to_string())
             }),
             "pane_id" => t.pane.map(|p| format!("%{p}")),
             "pane_title" => pane.map(|p| p.title.clone()),
@@ -258,7 +323,7 @@ impl Vars for VarCtx<'_> {
             }),
             "copy_cursor_x" | "copy_cursor_y" => pane.and_then(|p| match &p.mode {
                 Some(PaneMode::Copy(c)) => {
-                    let (x, y) = c.render().1;
+                    let (y, x) = c.render().1;
                     Some(if name == "copy_cursor_x" { x } else { y }.to_string())
                 }
                 _ => None,
@@ -282,7 +347,7 @@ impl Vars for VarCtx<'_> {
             "client_last_session" => client.and_then(|c| c.last_session).and_then(|s| srv.sessions.get(&s)).map(|s| s.name.clone()),
             "client_key_table" => client.map(|c| c.key_table.clone()),
             "client_prefix" => client.map(|c| b(c.key_table == "prefix")),
-            "client_readonly" => client.map(|c| b(c.readonly)),
+            "client_readonly" => client.map(|c| b(c.is_readonly())),
             "client_termname" | "client_termtype" => client.and_then(|c| c.ident.as_ref()).map(|i| i.term.clone()),
             "client_termfeatures" => client.map(|c| c.features.list()),
             "client_user" => client.and_then(|c| c.user.as_ref()).map(|u| ipc::user_name_for_id(u)),
@@ -298,18 +363,23 @@ impl Vars for VarCtx<'_> {
         }
         // Options are available as format variables too.
         if options::def(name).is_some() || name.starts_with('@') {
+            let value = |v: &str| {
+                if options::def(name).is_some_and(|d| matches!(d.kind, options::Kind::Flag)) {
+                    b(options::is_on(v))
+                } else { v.to_string() }
+            };
             if let Some(p) = t.pane {
                 if let Some(v) = srv.panes.get(&p).and_then(|p| p.options.get(name)) {
-                    return Some(v.to_string());
+                    return Some(value(v));
                 }
             }
             if let Some(v) = win.and_then(|w| w.options.get(name)) {
-                return Some(v.to_string());
+                return Some(value(v));
             }
             if let Some(v) = sess.and_then(|s| s.options.get(name)) {
-                return Some(v.to_string());
+                return Some(value(v));
             }
-            return srv.opts_window.get(name).or(srv.opts_session.get(name)).or(srv.opts_server.get(name)).map(String::from);
+            return srv.opts_window.get(name).or(srv.opts_session.get(name)).or(srv.opts_server.get(name)).map(value);
         }
         None
     }

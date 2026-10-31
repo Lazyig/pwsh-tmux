@@ -48,7 +48,7 @@ impl RawMode {
             if SetConsoleMode(hin, raw_in) == 0 {
                 return Err(io::Error::last_os_error());
             }
-            let raw_out = out_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT;
+            let raw_out = out_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT | DISABLE_NEWLINE_AUTO_RETURN;
             if SetConsoleMode(hout, raw_out) == 0 {
                 SetConsoleMode(hin, in_mode);
                 return Err(io::Error::last_os_error());

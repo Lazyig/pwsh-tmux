@@ -5,6 +5,10 @@
 # Codex cross-review reports (codex_review.py writes them here)
 /reviews
 
+# Python validation helpers
+__pycache__/
+*.py[cod]
+
 # Editors / OS
 .vscode/
 .idea/

@@ -12,6 +12,34 @@ fn start(ctx: &Ctx, name: &str) -> Term {
 }
 
 #[test]
+fn readonly_terminal_blocks_keys_paste_mouse_and_shared_resize() {
+    let ctx = Ctx::new("readonly-input");
+    ctx.ok(&["new-session", "-d", "-s", "ro", "-x", "100", "-y", "30"]);
+    ctx.wait_prompt("ro");
+    ctx.ok(&["split-window", "-h", "-t", "ro"]);
+    ctx.ok(&["set-option", "-g", "mouse", "on"]);
+    let before = ctx.fmt("ro", "#{pane_id}:#{window_width}x#{window_height}:#{session_windows}");
+    let mut t = Term::attach(&ctx, &["attach-session", "-r", "-t", "ro"], 60, 20);
+    t.wait_screen("readonly attach", |s| s.contains("[ro]"));
+    t.send(b"echo READONLY_TYPED\r");
+    t.send(b"\x1b[200~echo READONLY_PASTED\r\x1b[201~");
+    t.send(b"\x1b[777~");
+    t.prefix(b"c");
+    t.prefix(b"%");
+    t.mouse(0, 1, 1, false);
+    t.mouse(0, 1, 1, true);
+    // A writable input/output barrier ensures these checks run after the input.
+    ctx.ok(&["send-keys", "-t", "ro", "echo WRITABLE_BARRIER", "Enter"]);
+    wait_for("writable input barrier", || ctx.capture("ro").matches("WRITABLE_BARRIER").count() >= 2);
+    let capture = ctx.ok(&["capture-pane", "-p", "-t", "ro", "-S", "-"]);
+    assert!(!capture.contains("READONLY_TYPED") && !capture.contains("READONLY_PASTED"), "{capture}");
+    assert_eq!(ctx.fmt("ro", "#{pane_id}:#{window_width}x#{window_height}:#{session_windows}"), before);
+    assert_eq!(ctx.fmt("ro", "#{window_panes}"), "2");
+    t.prefix(b"d");
+    t.wait_exit();
+}
+
+#[test]
 fn prompt_rename_and_status() {
     let ctx = Ctx::new("prompt");
     let t = start(&ctx, "p");
@@ -49,6 +77,34 @@ fn prompt_rename_and_status() {
     let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
     ctx.ok(&["display-message", "-c", &client, "hello-msg"]);
     t.wait_screen("message", |s| s.contains("hello-msg"));
+}
+
+#[test]
+fn incremental_copy_search_updates_before_enter_and_can_cancel() {
+    let ctx = Ctx::new("isearch");
+    let t = start(&ctx, "s");
+    t.send(b"echo incremental-needle-321\r");
+    wait_for("search fixture", || ctx.capture("s").matches("incremental-needle-321").count() >= 2);
+    t.prefix(b"[");
+    wait_for("copy mode", || ctx.fmt("s", "#{pane_in_mode}") == "1");
+    let origin = ctx.fmt("s", "#{copy_cursor_x},#{copy_cursor_y}");
+    t.send(b"\x12");
+    t.send(b"incremental-needle");
+    wait_for("preview before enter", || ctx.fmt("s", "#{copy_cursor_x},#{copy_cursor_y}") != origin);
+    let preview = ctx.fmt("s", "#{copy_cursor_x},#{copy_cursor_y}");
+    t.send(b"\x07");
+    wait_for("cancel keeps preview cursor", || ctx.fmt("s", "#{copy_cursor_x},#{copy_cursor_y}") == preview);
+    ctx.ok(&["send-keys", "-X", "-t", "s", "history-bottom"]);
+    let bottom = ctx.fmt("s", "#{copy_cursor_x},#{copy_cursor_y}");
+    t.send(b"\x12");
+    t.send(b"incremental-needle");
+    wait_for("preview again", || ctx.fmt("s", "#{copy_cursor_x},#{copy_cursor_y}") != bottom);
+    let preview = ctx.fmt("s", "#{copy_cursor_x},#{copy_cursor_y}");
+    t.send(b"\r");
+    assert_eq!(ctx.fmt("s", "#{copy_cursor_x},#{copy_cursor_y}"), preview);
+    t.send(b"q");
+    wait_for("leave copy mode", || ctx.fmt("s", "#{pane_in_mode}") == "0");
+    t.prefix(b"d");
 }
 
 #[test]
@@ -164,9 +220,11 @@ fn mouse_menu_and_popup() {
     ctx.ok(&["resize-pane", "-Z", "-t", "m"]);
     // popup runs a command and closes when it exits
     let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
-    ctx.ok(&["display-popup", "-c", &client, "-w", "40", "-h", "10", "-T", "pop", "-E", "echo in-popup; sleep 2"]);
-    t.wait_screen("popup", |s| s.contains("in-popup") && s.contains(" pop "));
+    let mut popup = ctx.command().args(["display-popup", "-c", &client, "-w", "40", "-h", "10", "-T", "pop", "-E", "echo in-popup; sleep 2"]).spawn().unwrap();
+    t.wait_screen("popup", |s| s.contains("in-popup") && s.contains("pop"));
+    assert!(popup.try_wait().unwrap().is_none(), "popup CLI waits for close");
     t.wait_screen("popup closed", |s| !s.contains("in-popup"));
+    assert!(popup.wait().unwrap().success());
 }
 
 #[test]

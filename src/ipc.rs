@@ -95,7 +95,7 @@ pub fn connect() -> io::Result<Stream> {
     };
     let creds = s.peer_creds()?;
     #[cfg(unix)]
-    let same = creds.euid().is_none_or(|u| u == unsafe { libc::geteuid() });
+    let same = creds.euid().is_some_and(|u| u == unsafe { libc::geteuid() });
     #[cfg(windows)]
     let same = creds.pid().is_some_and(|p| win::same_user(p as u32));
     // -S names another user's shared server explicitly (server-access); otherwise refuse
@@ -152,7 +152,8 @@ fn listen(#[cfg_attr(unix, allow(unused_variables))] extra_users: &[String]) -> 
         use interprocess::os::windows::security_descriptor::SecurityDescriptor;
         let mut opts = ListenerOptions::new().name(pipe_name().to_ns_name::<GenericNamespaced>()?);
         // Only this user, SYSTEM and server-access users may open the pipe.
-        if let Some(sid) = win::own_sid_string() {
+        {
+            let sid = win::own_sid_string().ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "cannot determine pipe owner"))?;
             let others: String = extra_users.iter().filter(|s| s.starts_with("S-1-")).map(|s| format!("(A;;GA;;;{s})")).collect();
             let sddl = widestring::U16CString::from_str(format!("D:P(A;;GA;;;{sid})(A;;GA;;;SY){others}"))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;

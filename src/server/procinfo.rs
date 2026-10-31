@@ -188,15 +188,24 @@ pub mod win {
 
     pub fn deepest_descendant(root: u32) -> Option<String> {
         let procs = processes();
+        descendant_name(&procs, root)
+    }
+
+    fn descendant_name(procs: &[(u32, u32, String)], root: u32) -> Option<String> {
         let name_of = |pid: u32| procs.iter().find(|p| p.0 == pid).map(|p| p.2.clone());
         let mut best = (0usize, root);
         let mut stack = vec![(root, 0usize)];
+        // Parent IDs outlive their processes and may refer to a reused PID.
+        // A snapshot can therefore contain cycles, even though a live process
+        // tree cannot. Visit each PID once to bound both memory and traversal.
+        let mut visited = std::collections::HashSet::from([root]);
         while let Some((pid, depth)) = stack.pop() {
             for (child, _, name) in procs.iter().filter(|p| p.1 == pid && p.0 != pid) {
                 let lname = name.to_lowercase();
                 if lname == "conhost.exe" || lname == "openconsole.exe" {
                     continue;
                 }
+                if !visited.insert(*child) { continue; }
                 if depth + 1 >= best.0 {
                     best = (depth + 1, *child);
                 }
@@ -204,5 +213,23 @@ pub mod win {
             }
         }
         name_of(best.1)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::descendant_name;
+
+        #[test]
+        fn reused_parent_ids_cannot_cycle_descendant_traversal() {
+            let procs = vec![(1, 3, "shell.exe".into()), (2, 1, "child.exe".into()), (3, 2, "leaf.exe".into())];
+            assert_eq!(descendant_name(&procs, 1).as_deref(), Some("leaf.exe"));
+        }
+
+        #[test]
+        fn ignores_console_hosts_and_keeps_leaf_commands() {
+            let procs = vec![(1, 1, "shell.exe".into()), (2, 1, "conhost.exe".into()), (3, 1, "child.exe".into()), (4, 3, "tool.exe".into())];
+            assert_eq!(descendant_name(&procs, 1).as_deref(), Some("tool.exe"));
+            assert_eq!(descendant_name(&procs, 99), None);
+        }
     }
 }

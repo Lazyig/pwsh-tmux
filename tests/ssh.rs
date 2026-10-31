@@ -14,7 +14,7 @@ fn cfg() -> Option<(Vec<String>, String)> {
 }
 
 fn remote(args: &[String], cmdline: &str) -> (bool, String) {
-    let out = Command::new("ssh").args(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"]).args(args).arg(cmdline).output().unwrap();
+    let out = Command::new("ssh").args(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "LogLevel=ERROR"]).args(args).arg(cmdline).output().unwrap();
     (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr))
 }
 
@@ -34,7 +34,7 @@ fn over_ssh() {
 
     // interactive attach through ssh -tt
     let mut cb = CommandBuilder::new("ssh");
-    cb.args(["-tt", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"]);
+    cb.args(["-tt", "-o", "StrictHostKeyChecking=yes", "-o", "LogLevel=ERROR"]);
     cb.args(&args);
     cb.arg(format!("{bin} attach -t keep"));
     let mut t = Term::spawn(cb, 100, 30);

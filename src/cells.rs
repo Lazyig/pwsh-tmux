@@ -113,4 +113,56 @@ mod tests {
         assert_eq!(texts, vec!["line0", "line1", "line2", "line3", "line4", "line5", "line6", ""]);
         assert_eq!(p.screen().scrollback(), 0, "live screen untouched");
     }
+
+    #[test]
+    fn resize_reflows_history_and_preserves_styles_and_clusters() {
+        let nz = |n| NonZeroU16::new(n).unwrap();
+        let mut p = vt100::Parser::new(nz(4), nz(12), 100);
+        p.process("\x1b[31mabcdef한글é\x1b[0m\r\nnext".as_bytes());
+        p.set_size(nz(4), nz(5));
+        let small = snapshot(p.screen());
+        assert!(small.len() > 4);
+        let text: String = small.iter().flat_map(|r| r.cells.iter().map(|c| c.text.as_str())).collect();
+        assert!(text.contains("abcde"));
+        assert!(text.contains("한글"));
+        assert_eq!(small[0].cells[0].style.fg, Color::Idx(1));
+        p.set_size(nz(4), nz(12));
+        let large = snapshot(p.screen());
+        assert!(large.iter().any(|r| r.text() == "abcdef한글é"));
+        assert!(large.iter().any(|r| r.text() == "next"));
+    }
+
+    #[test]
+    fn resize_reflow_is_bounded_and_alternate_screen_stays_fixed() {
+        let nz = |n| NonZeroU16::new(n).unwrap();
+        let mut p = vt100::Parser::new(nz(3), nz(100), 5);
+        p.process("x".repeat(290).as_bytes());
+        p.set_size(nz(3), nz(1));
+        assert!(snapshot(p.screen()).len() <= 8);
+        p.set_size(nz(3), nz(10));
+        p.process(b"\x1b[?1049habcdefghi\x1b[2;3H");
+        p.set_size(nz(3), nz(5));
+        assert_eq!(p.screen().cursor_position(), (1, 2));
+        assert!(p.screen().contents().starts_with("abcde"));
+        assert!(!p.screen().contents().contains("fghi"));
+    }
+
+    #[test]
+    fn scroll_on_clear_preserves_used_rows_and_can_be_disabled() {
+        let nz = |n| NonZeroU16::new(n).unwrap();
+        let mut p = vt100::Parser::new(nz(4), nz(12), 10);
+        p.screen_mut().set_scroll_on_clear(true);
+        p.process(b"first\r\nsecond\x1b[2J\x1b[Hnew");
+        let rows = snapshot(p.screen());
+        assert_eq!(rows.len(), 6);
+        assert_eq!(rows[0].text(), "first");
+        assert_eq!(rows[1].text(), "second");
+        assert_eq!(rows[2].text(), "new");
+        p.screen_mut().set_scroll_on_clear(false);
+        p.process(b"\x1b[2J");
+        assert_eq!(snapshot(p.screen()).len(), 6);
+        p.screen_mut().set_scroll_on_clear(true);
+        p.process(b"\x1b[?1049halternate\x1b[2J\x1b[?1049l");
+        assert_eq!(snapshot(p.screen()).len(), 6, "alternate screen has no history");
+    }
 }

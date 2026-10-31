@@ -22,7 +22,8 @@ pub struct MouseCtx {
 
 const PANE_MENU: &str = "display-menu -T '#[align=centre]#{pane_index} (#{pane_id})' -t = -x M -y M \
 'Horizontal Split' h { split-window -h } 'Vertical Split' v { split-window -v } '' \
-'Swap Up' u { swap-pane -U } 'Swap Down' d { swap-pane -D } '' \
+'Swap Up' u { swap-pane -U } 'Swap Down' d { swap-pane -D } \
+'#{?pane_marked_set,Swap Marked,-Swap Marked}' s { swap-pane } '' \
 'Kill' X { kill-pane } 'Respawn' R { respawn-pane -k } \
 '#{?pane_marked,Unmark,Mark}' m { select-pane -m } '#{?window_zoomed_flag,Unzoom,Zoom}' z { resize-pane -Z }";
 
@@ -199,6 +200,9 @@ impl Server {
     }
 
     pub fn dispatch_input(&mut self, cid: ClientId, input: Input) {
+        if self.client_is_readonly(Some(cid)) && !matches!(&input, Input::Key(_, _)) {
+            return;
+        }
         match input {
             Input::Key(k, raw) => self.handle_key(cid, k, raw),
             Input::Mouse(m, _) => self.handle_mouse(cid, m),
@@ -212,7 +216,7 @@ impl Server {
                     c.dirty = true;
                     return;
                 }
-                if c.readonly {
+                if c.is_readonly() {
                     return;
                 }
                 if let Some(target) = self.input_target(cid) {
@@ -242,7 +246,7 @@ impl Server {
     }
 
     fn send_key_to_pane(&mut self, cid: ClientId, pane: PaneId, k: &Key, raw: Vec<u8>) {
-        if self.clients.get(&cid).is_some_and(|c| c.readonly) {
+        if self.client_is_readonly(Some(cid)) {
             return;
         }
         let Some(p) = self.panes.get(&pane) else { return };
@@ -270,7 +274,7 @@ impl Server {
         };
         let wid = self.window_of(pane);
         if wid.is_some_and(|w| self.opt_window_on(Some(w), "synchronize-panes")) {
-            let panes = self.windows[&wid.unwrap()].layout.panes();
+            let panes = self.windows[&wid.unwrap()].panes();
             for q in panes {
                 if let Some(pp) = self.panes.get(&q) {
                     if pp.mode.is_none() && pp.options.get("@input-disabled") != Some("on") {
@@ -286,6 +290,7 @@ impl Server {
     fn handle_key(&mut self, cid: ClientId, k: Key, raw: Vec<u8>) {
         let name = keys::key_name(&k);
         let Some(c) = self.clients.get(&cid) else { return };
+        if c.is_readonly() && (c.prompt.is_some() || c.overlay.is_some()) { return; }
         if c.prompt.is_some() {
             self.prompt_key(cid, &k, &name);
             return;
@@ -310,7 +315,7 @@ impl Server {
                         if let Some(sid) = self.client_session(cid) {
                             let wid = self.sessions[&sid].active_window();
                             let base = self.opt_window_num(Some(wid), "pane-base-index").max(0) as u32;
-                            let panes = self.windows[&wid].layout.panes();
+                            let panes = self.windows[&wid].panes();
                             if let Some(p) = d.checked_sub(base).and_then(|i| panes.get(i as usize)) {
                                 let cmd = fill_template(&template, &[format!("%{p}")]);
                                 self.run_string(cid, &cmd, Some(*p));
@@ -430,13 +435,14 @@ impl Server {
 
     /// A key for a pane that is in a mode (copy, tree, clock).
     pub fn mode_key(&mut self, pane: PaneId, cid: Option<ClientId>, name: &str) {
+        if self.client_is_readonly(cid) { return; }
         let Some(p) = self.panes.get_mut(&pane) else { return };
         match &mut p.mode {
             Some(PaneMode::Clock) => self.exit_mode(pane),
             Some(PaneMode::Tree(_)) => {
                 let h = p.size.1 as usize;
                 let Some(PaneMode::Tree(mut tree)) = p.mode.take() else { return };
-                let action = tree.key(name, if h >= 12 { h / 2 } else { h }, self);
+                let action = tree.key(name, tree.list_height(h), self);
                 let client = tree.client.or(cid);
                 match action {
                     TreeAction::None => {
@@ -551,6 +557,14 @@ impl Server {
                     // the pane is the prompt's context target (a %id in the template would read as %N)
                     let template = format!("send-keys -X {command} '%%'");
                     self.open_prompt(c, PromptKind::Command, vec![(label, String::new())], template, Some(pane), false, false);
+                    if command.ends_with("-incremental") {
+                        if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
+                            cm.begin_incremental_search();
+                        }
+                        if let Some(pr) = self.clients.get_mut(&c).and_then(|c| c.prompt.as_mut()) {
+                            pr.copy_incremental = Some((pane, command.starts_with("search-forward")));
+                        }
+                    }
                 }
             }
         }
@@ -566,6 +580,7 @@ impl Server {
         let c = self.clients.get_mut(&cid).unwrap();
         c.dirty = true;
         let pr = c.prompt.as_mut().unwrap();
+        let incremental = pr.copy_incremental;
         match pr.kind {
             PromptKind::Confirm => {
                 let yes = matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) || (name == "Enter" && false);
@@ -587,6 +602,12 @@ impl Server {
         match &k.code {
             KeyCode::Enter => {
                 let mut pr = c.prompt.take().unwrap();
+                if let Some((pane, _)) = incremental {
+                    if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
+                        cm.finish_incremental_search(false);
+                    }
+                    return;
+                }
                 let input: String = pr.input.iter().collect();
                 pr.answers.push(input.clone());
                 if !input.is_empty() && !pr.template.starts_with("send-keys -X ") {
@@ -715,6 +736,16 @@ impl Server {
             }
             _ => {}
         }
+        if let Some((pane, forward)) = incremental {
+            let text = self.clients.get(&cid).and_then(|c| c.prompt.as_ref()).map(|pr| pr.input.iter().collect::<String>());
+            if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
+                match text {
+                    Some(text) => cm.preview_search(&text, forward),
+                    None => cm.finish_incremental_search(false),
+                }
+            }
+            if let Some(wid) = self.window_of(pane) { self.mark_window_dirty(wid); }
+        }
     }
 
     // ---- mouse ------------------------------------------------------------------------
@@ -782,6 +813,7 @@ impl Server {
     }
 
     fn handle_mouse(&mut self, cid: ClientId, m: Mouse) {
+        if self.client_is_readonly(Some(cid)) { return; }
         // overlays first
         let Some(c) = self.clients.get_mut(&cid) else { return };
         if c.overlay.is_some() || c.prompt.is_some() {

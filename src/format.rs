@@ -15,6 +15,14 @@ pub trait Vars {
     fn shell(&self, _command: &str) -> Option<String> {
         None
     }
+    /// Contexts for S/W/P loops, paired with their active state.
+    fn contexts(&self, _kind: char, _flags: &str) -> Vec<(Box<dyn Vars + '_>, bool)> {
+        Vec::new()
+    }
+    /// First matching visible pane row (one-based), or zero.
+    fn search(&self, _pattern: &str, _regex: bool, _ignore_case: bool) -> usize {
+        0
+    }
 }
 
 impl Vars for HashMap<String, String> {
@@ -31,10 +39,12 @@ impl Vars for HashMap<&str, &str> {
 
 /// Recursion limit for nested expansion (`E:` of self-referencing values etc).
 const MAX_DEPTH: usize = 64;
+const MAX_FORMAT_BYTES: usize = 1 << 20;
+const MAX_FORMAT_WORK: usize = 1 << 20;
 
 /// Expand a format string.
 pub fn expand(template: &str, vars: &dyn Vars) -> String {
-    Expander { vars, now: Local::now() }.expand(template, 0)
+    Expander { vars, now: Local::now(), budget: &std::cell::Cell::new(MAX_FORMAT_WORK) }.expand(template, 0)
 }
 
 /// Like expand, but also applies strftime(3) `%` sequences (status-left/right, display-message).
@@ -46,7 +56,7 @@ pub fn expand_time(template: &str, vars: &dyn Vars) -> String {
 
 fn expand_time_at(template: &str, vars: &dyn Vars, now: DateTime<Local>) -> String {
     let t = strftime(template, &now);
-    Expander { vars, now }.expand(&t, 0)
+    Expander { vars, now, budget: &std::cell::Cell::new(MAX_FORMAT_WORK) }.expand(&t, 0)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -54,6 +64,7 @@ fn expand_time_at(template: &str, vars: &dyn Vars, now: DateTime<Local>) -> Stri
 // ---------------------------------------------------------------------------------------------
 
 struct Expander<'a> {
+    budget: &'a std::cell::Cell<usize>,
     vars: &'a dyn Vars,
     now: DateTime<Local>,
 }
@@ -124,7 +135,7 @@ struct Modifier {
 }
 
 const MODIFIERS2: [&str; 7] = ["||", "&&", "!=", "==", "<=", ">=", "!!"];
-const MODIFIERS1: &str = "labdEeTtmnpqswC=!<>";
+const MODIFIERS1: &str = "labdEeTtmnpqswCSWP=!<>";
 const COMPARE: [&str; 8] = ["==", "!=", "<", ">", "<=", ">=", "||", "&&"];
 
 /// Parse a modifier prefix such as `=10;b:` returning the modifiers and the remaining text.
@@ -202,9 +213,10 @@ impl Expander<'_> {
     }
 
     fn expand(&self, s: &str, depth: usize) -> String {
-        if depth > MAX_DEPTH {
+        if depth > MAX_DEPTH || s.len() > MAX_FORMAT_BYTES || s.len().saturating_add(1) > self.budget.get() {
             return String::new();
         }
+        self.budget.set(self.budget.get() - s.len() - 1);
         let b = s.as_bytes();
         let mut out = String::with_capacity(s.len());
         let mut i = 0;
@@ -219,12 +231,13 @@ impl Expander<'_> {
             match c {
                 b'{' => match skip(s, i, b"}") {
                     Some(end) => {
-                        out.push_str(&self.replace(&s[i + 2..end], depth + 1));
+                        let Some(value) = self.replace(&s[i + 2..end], depth + 1) else { return out };
+                        out.push_str(&value);
                         i = end + 1;
                     }
                     None => {
-                        out.push_str(&s[i..]);
-                        i = b.len();
+                        // Like tmux, stop at an unterminated format.
+                        return out;
                     }
                 },
                 b'(' => {
@@ -269,36 +282,52 @@ impl Expander<'_> {
                     }
                 }
             }
+            if out.len() > MAX_FORMAT_BYTES { return String::new(); }
             lit = i;
         }
+        if out.len().saturating_add(s.len() - lit) > MAX_FORMAT_BYTES { return String::new(); }
         out.push_str(&s[lit..]);
         out
     }
 
     /// Evaluate the contents of one `#{...}`.
-    fn replace(&self, content: &str, depth: usize) -> String {
+    fn replace(&self, content: &str, depth: usize) -> Option<String> {
         let (mods, copy) = parse_modifiers(content).unwrap_or((Vec::new(), content));
         let get = |n: &str| mods.iter().find(|m| m.name == n);
         let ex = |s: &str| self.expand(s, depth + 1);
 
         let mut value = if get("l").is_some() {
             copy.to_string()
-        } else if get("C").is_some() {
-            // TODO: pane content search is not supported.
-            "0".into()
+        } else if let Some(kind) = ['S', 'W', 'P'].into_iter().find(|c| get(&c.to_string()).is_some()) {
+            let (all, active) = if kind == 'S' { (copy, None) } else {
+                split2(copy).map_or((copy, None), |(a, b)| (a, Some(b)))
+            };
+            let flags = get(&kind.to_string()).and_then(|m| m.args.first()).map(|s| ex(s)).unwrap_or_default();
+            let mut out = String::new();
+            for (vars, is_active) in self.vars.contexts(kind, &flags) {
+                if self.budget.get() == 0 { break; }
+                let template = if is_active { active.unwrap_or(all) } else { all };
+                let value = Expander { vars: vars.as_ref(), now: self.now, budget: self.budget }.expand(template, depth + 1);
+                if out.len().saturating_add(value.len()) > MAX_FORMAT_BYTES { return None; }
+                out.push_str(&value);
+            }
+            out
+        } else if let Some(m) = get("C") {
+            let flags = m.args.first().map(String::as_str).unwrap_or("");
+            self.vars.search(&ex(copy), flags.contains('r'), flags.contains('i')).to_string()
         } else if let Some(m) = get("m") {
-            let Some((a, b)) = split2(copy) else { return String::new() };
+            let (a, b) = split2(copy)?;
             let flags = m.args.first().map(String::as_str).unwrap_or("");
             let icase = flags.contains('i');
             let (pat, text) = (ex(a), ex(b));
             let matched = if flags.contains('r') {
-                Regex::new(&pat).is_some_and(|re| re.find(&text.chars().collect::<Vec<_>>(), 0, icase).is_some())
+                regex_matches(&pat, &text, icase)
             } else {
                 glob_match(&pat, &text, icase)
             };
             bool_str(matched)
         } else if let Some(m) = mods.iter().find(|m| COMPARE.contains(&m.name)) {
-            let Some((a, b)) = split2(copy) else { return String::new() };
+            let (a, b) = split2(copy)?;
             let (a, b) = (ex(a), ex(b));
             bool_str(match m.name {
                 "==" => a == b,
@@ -315,10 +344,10 @@ impl Expander<'_> {
         } else if get("!").is_some() {
             bool_str(!truthy(&ex(copy)))
         } else if let Some(m) = get("e") {
-            let Some((a, b)) = split2(copy) else { return String::new() };
+            let (a, b) = split2(copy)?;
             match arith(&m.args, &ex(a), &ex(b)) {
                 Some(v) => v,
-                None => return String::new(),
+                None => return None,
             }
         } else if get("a").is_some() {
             ex(copy)
@@ -379,13 +408,9 @@ impl Expander<'_> {
         if get("T").is_some() {
             value = strftime(&ex(&value), &self.now);
         }
-        if let Some(m) = get("s")
-            && m.args.len() >= 2
-        {
+        for m in mods.iter().filter(|m| m.name == "s" && m.args.len() >= 2) {
             let flags = m.args.get(2).map(String::as_str).unwrap_or("");
-            if let Some(re) = Regex::new(&ex(&m.args[0])) {
-                value = re.replace_all(&value, &ex(&m.args[1]), flags.contains('i'));
-            }
+            value = regex_substitute(&ex(&m.args[0]), &ex(&m.args[1]), &value, flags.contains('i'));
         }
         if let Some(m) = get("=")
             && let Some(n) = m.args.first().and_then(|a| ex(a).trim().parse::<i64>().ok())
@@ -404,19 +429,21 @@ impl Expander<'_> {
             && let Some(n) = m.args.first().and_then(|a| ex(a).trim().parse::<i64>().ok())
         {
             let w = fmt_width(&value);
-            let target = n.unsigned_abs() as usize;
+            let target = usize::try_from(n.unsigned_abs()).ok()?;
+            if target > MAX_FORMAT_BYTES { return None; }
             if w < target {
                 let pad = " ".repeat(target - w);
                 value = if n > 0 { value + &pad } else { pad + &value };
             }
         }
         if get("n").is_some() {
-            value = value.chars().count().to_string();
+            value = value.len().to_string();
         }
         if get("w").is_some() {
             value = fmt_width(&value).to_string();
         }
-        value
+        if value.len() > MAX_FORMAT_BYTES { return None; }
+        Some(value)
     }
 
     /// `t:` modifier: format a unix timestamp. `t/p` = pretty (short), `t/f/<fmt>` = strftime.
@@ -444,6 +471,7 @@ fn arith(args: &[String], a: &str, b: &str) -> Option<String> {
     let op = args.first()?.as_str();
     let float = args.get(1).is_some_and(|f| f == "f");
     let prec: usize = if float { args.get(2).and_then(|p| p.parse().ok()).unwrap_or(2) } else { 0 };
+    if prec > 64 { return None; }
     let mut x: f64 = a.trim().parse().ok()?;
     let mut y: f64 = b.trim().parse().ok()?;
     if !float {
@@ -454,9 +482,9 @@ fn arith(args: &[String], a: &str, b: &str) -> Option<String> {
         "+" => x + y,
         "-" => x - y,
         "*" => x * y,
-        "/" | "%" if y == 0.0 => return None,
+        "/" | "%" | "m" if y == 0.0 => return None,
         "/" => x / y,
-        "%" => x % y,
+        "%" | "m" => x % y,
         "==" => (x == y) as i32 as f64,
         "!=" => (x != y) as i32 as f64,
         "<" => (x < y) as i32 as f64,
@@ -628,157 +656,99 @@ fn class_has(ranges: &[(char, char)], neg: bool, c: char, icase: bool) -> bool {
 }
 
 /// fnmatch(3)-style glob: `*`, `?`, `[...]`, `\` escapes.
-fn glob_match(pat: &str, text: &str, icase: bool) -> bool {
+pub fn glob_match(pat: &str, text: &str, icase: bool) -> bool {
+    if pat.len() > 16384 || text.len() > MAX_FORMAT_BYTES { return false; }
+    enum Token { Star, Any, Class(Ranges, bool), Literal(char) }
     let p: Vec<char> = pat.chars().collect();
     let t: Vec<char> = text.chars().collect();
-    fn go(p: &[char], t: &[char], icase: bool) -> bool {
-        let Some(&c) = p.first() else { return t.is_empty() };
-        match c {
-            '*' => (0..=t.len()).any(|k| go(&p[1..], &t[k..], icase)),
-            '?' => !t.is_empty() && go(&p[1..], &t[1..], icase),
-            '[' => match parse_class(p, 1) {
-                Some((r, neg, end)) => {
-                    !t.is_empty() && class_has(&r, neg, t[0], icase) && go(&p[end..], &t[1..], icase)
-                }
-                None => !t.is_empty() && t[0] == '[' && go(&p[1..], &t[1..], icase),
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < p.len() {
+        let token = match p[i] {
+            '*' => Token::Star,
+            '?' => Token::Any,
+            '[' => match parse_class(&p, i + 1) {
+                Some((r, neg, end)) => { i = end - 1; Token::Class(r, neg) }
+                None => Token::Literal('['),
             },
-            '\\' if p.len() > 1 => !t.is_empty() && ceq(p[1], t[0], icase) && go(&p[2..], &t[1..], icase),
-            _ => !t.is_empty() && ceq(c, t[0], icase) && go(&p[1..], &t[1..], icase),
-        }
+            '\\' if i + 1 < p.len() => { i += 1; Token::Literal(p[i]) }
+            c => Token::Literal(c),
+        };
+        tokens.push(token);
+        i += 1;
     }
-    go(&p, &t, icase)
+    let (mut pi, mut ti) = (0, 0);
+    let (mut star, mut retry) = (None, 0);
+    let mut work = MAX_FORMAT_WORK;
+    while ti < t.len() {
+        let cost = match tokens.get(pi) { Some(Token::Class(r, _)) => r.len().saturating_add(1), _ => 1 };
+        if work < cost { return false; }
+        work -= cost;
+        let matched = match tokens.get(pi) {
+            Some(Token::Star) => { star = Some(pi); retry = ti; pi += 1; continue; }
+            Some(Token::Any) => true,
+            Some(Token::Class(r, neg)) => class_has(r, *neg, t[ti], icase),
+            Some(Token::Literal(c)) => ceq(*c, t[ti], icase),
+            None => false,
+        };
+        if matched { pi += 1; ti += 1; }
+        else if let Some(s) = star { retry += 1; ti = retry; pi = s + 1; }
+        else { return false; }
+    }
+    while matches!(tokens.get(pi), Some(Token::Star)) { pi += 1; }
+    pi == tokens.len()
 }
 
-#[derive(Debug)]
-enum Atom {
-    Char(char),
-    Any,
-    Class(Vec<(char, char)>, bool),
-    Start,
-    End,
-}
-
-#[derive(Debug)]
-struct Piece {
-    atom: Atom,
-    min: usize,
-    max: usize,
-}
-
-/// Minimal POSIX-ish regex: literals, `.`, `[...]`, `^`, `$`, `*`, `+`, `?`, `\d \w \s`, `\x` escapes.
-struct Regex(Vec<Piece>);
-
-impl Regex {
-    fn new(pat: &str) -> Option<Regex> {
-        let p: Vec<char> = pat.chars().collect();
-        let mut pieces: Vec<Piece> = Vec::new();
-        let mut i = 0;
-        while i < p.len() {
-            let atom = match p[i] {
-                '.' => Atom::Any,
-                '^' if i == 0 => Atom::Start,
-                '$' if i == p.len() - 1 => Atom::End,
-                '[' => {
-                    let (r, neg, end) = parse_class(&p, i + 1)?;
-                    i = end - 1;
-                    Atom::Class(r, neg)
-                }
-                '\\' => {
-                    i += 1;
-                    match *p.get(i)? {
-                        'd' => Atom::Class(vec![('0', '9')], false),
-                        'D' => Atom::Class(vec![('0', '9')], true),
-                        'w' => Atom::Class(vec![('a', 'z'), ('A', 'Z'), ('0', '9'), ('_', '_')], false),
-                        'W' => Atom::Class(vec![('a', 'z'), ('A', 'Z'), ('0', '9'), ('_', '_')], true),
-                        's' => Atom::Class(vec![(' ', ' '), ('\t', '\r')], false),
-                        'S' => Atom::Class(vec![(' ', ' '), ('\t', '\r')], true),
-                        'n' => Atom::Char('\n'),
-                        't' => Atom::Char('\t'),
-                        c => Atom::Char(c),
-                    }
-                }
-                '*' | '+' | '?' => {
-                    // Quantifier on the previous atom.
-                    let last = pieces.last_mut().filter(|l| l.min == 1 && l.max == 1)?;
-                    if matches!(last.atom, Atom::Start | Atom::End) {
-                        return None;
-                    }
-                    match p[i] {
-                        '*' => (last.min, last.max) = (0, usize::MAX),
-                        '+' => last.max = usize::MAX,
-                        _ => last.min = 0,
-                    }
-                    i += 1;
-                    continue;
-                }
-                c => Atom::Char(c),
-            };
-            pieces.push(Piece { atom, min: 1, max: 1 });
-            i += 1;
-        }
-        Some(Regex(pieces))
-    }
-
-    fn atom_matches(atom: &Atom, c: char, icase: bool) -> bool {
-        match atom {
-            Atom::Char(a) => ceq(*a, c, icase),
-            Atom::Any => true,
-            Atom::Class(r, neg) => class_has(r, *neg, c, icase),
-            Atom::Start | Atom::End => false,
-        }
-    }
-
-    fn match_here(pieces: &[Piece], t: &[char], pos: usize, icase: bool) -> Option<usize> {
-        let Some(pc) = pieces.first() else { return Some(pos) };
-        match pc.atom {
-            Atom::Start => return if pos == 0 { Self::match_here(&pieces[1..], t, pos, icase) } else { None },
-            Atom::End => return if pos == t.len() { Some(pos) } else { None },
+/// tmux uses leftmost-longest matching and UTF-8 characters, including captures.
+pub(crate) fn compile_regex(pattern: &str, ignore_case: bool) -> Option<fancy_regex::Regex> {
+    // (?...) lookarounds/flags/named groups are not tmux's ERE syntax.
+    let mut chars = pattern.chars().peekable();
+    let mut class = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => { chars.next(); }
+            '[' => class = true,
+            ']' => class = false,
+            '(' if !class && chars.peek() == Some(&'?') => return None,
             _ => {}
         }
-        let mut n = 0;
-        while n < pc.max && pos + n < t.len() && Self::atom_matches(&pc.atom, t[pos + n], icase) {
-            n += 1;
-        }
-        loop {
-            if n < pc.min {
-                return None;
-            }
-            if let Some(e) = Self::match_here(&pieces[1..], t, pos + n, icase) {
-                return Some(e);
-            }
-            if n == 0 {
-                return None;
-            }
-            n -= 1;
-        }
     }
+    fancy_regex::RegexBuilder::new(pattern).case_insensitive(ignore_case)
+        .dot_matches_new_line(true).leftmost_longest(true).build().ok()
+}
 
-    fn find(&self, t: &[char], from: usize, icase: bool) -> Option<(usize, usize)> {
-        (from..=t.len()).find_map(|s| Self::match_here(&self.0, t, s, icase).map(|e| (s, e)))
-    }
+pub fn regex_matches(pattern: &str, text: &str, ignore_case: bool) -> bool {
+    compile_regex(pattern, ignore_case).is_some_and(|re| re.is_match(text).unwrap_or(false))
+}
 
-    fn replace_all(&self, text: &str, rep: &str, icase: bool) -> String {
-        let t: Vec<char> = text.chars().collect();
-        let mut out = String::new();
-        let mut pos = 0;
-        while pos <= t.len() {
-            let Some((s, e)) = self.find(&t, pos, icase) else { break };
-            out.extend(&t[pos..s]);
-            out.push_str(rep);
-            if e == s {
-                if s < t.len() {
-                    out.push(t[s]);
+fn regex_substitute(pattern: &str, replacement: &str, text: &str, ignore_case: bool) -> String {
+    let Some(re) = compile_regex(pattern, ignore_case) else { return text.to_string() };
+    let mut out = String::new();
+    let mut pos = 0;
+    for captures in re.captures_iter(text) {
+        let Ok(captures) = captures else { return text.to_string() };
+        let whole = captures.get(0).unwrap();
+        out.push_str(&text[pos..whole.start()]);
+        let mut chars = replacement.chars();
+        while let Some(c) = chars.next() {
+            if out.len() > MAX_FORMAT_BYTES { return String::new(); }
+            if c == '\\' {
+                match chars.next() {
+                    Some(d @ '0'..='9') => {
+                        if let Some(m) = captures.get(d as usize - '0' as usize) {
+                            out.push_str(m.as_str());
+                        }
+                    }
+                    Some(c) => out.push(c),
+                    None => out.push('\\'),
                 }
-                pos = s + 1;
-            } else {
-                pos = e;
-            }
+            } else { out.push(c); }
         }
-        if pos < t.len() {
-            out.extend(&t[pos..]);
-        }
-        out
+        pos = whole.end();
     }
+    if out.len().saturating_add(text.len() - pos) > MAX_FORMAT_BYTES { return String::new(); }
+    out.push_str(&text[pos..]);
+    out
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1153,8 +1123,8 @@ mod tests {
     }
 
     #[test]
-    fn unterminated_brace_is_literal() {
-        assert_eq!(x("a#{session_name", &[("session_name", "s")]), "a#{session_name");
+    fn unterminated_brace_stops_expansion() {
+        assert_eq!(x("a#{session_name", &[("session_name", "s")]), "a");
     }
 
     // ----- conditionals -----
@@ -1260,6 +1230,27 @@ mod tests {
     }
 
     #[test]
+    fn excessive_format_allocations_are_rejected() {
+        assert_eq!(x("#{p9223372036854775807:t}", &[("t", "x")]), "");
+        assert_eq!(x("#{p-9223372036854775808:t}", &[("t", "x")]), "");
+        assert_eq!(x("#{e|+|f|18446744073709551615:1,2}", &[]), "");
+        assert_eq!(regex_substitute("a", &"x".repeat(1024), &"a".repeat(2048), false), "");
+    }
+
+    #[test]
+    fn recursive_format_amplification_has_a_shared_work_limit() {
+        let v = [("x", "#{E:x}#{E:x}")];
+        assert!(x("#{E:x}", &v).len() <= MAX_FORMAT_BYTES);
+    }
+
+    #[test]
+    fn adversarial_globs_do_not_recurse_or_explode() {
+        let literal = "a".repeat(8000);
+        assert!(glob_match(&literal, &literal, false));
+        assert!(!glob_match(&("*a".repeat(1000) + "b"), &("a".repeat(2000) + "c"), false));
+    }
+
+    #[test]
     fn literal() {
         assert_eq!(x("#{l:#{session_name}}", &[("session_name", "s")]), "#{session_name}");
         assert_eq!(x("#{l:abc}", &[]), "abc");
@@ -1279,7 +1270,7 @@ mod tests {
     #[test]
     fn strftime_modifier() {
         let v = vars(&[("fmt", "%H:%M #{x}"), ("x", "y")]);
-        let e = Expander { vars: &v, now: fixed_time() };
+        let e = Expander { vars: &v, now: fixed_time(), budget: &std::cell::Cell::new(MAX_FORMAT_WORK) };
         assert_eq!(e.expand("#{T:fmt}", 0), "07:05 y");
         assert_eq!(e.expand("#{E:fmt}", 0), "%H:%M y");
     }
@@ -1325,6 +1316,21 @@ mod tests {
     }
 
     #[test]
+    fn regex_captures_longest_utf8_and_chaining() {
+        let v = [("text", "abc-123 abc-456"), ("unicode", "가나")];
+        assert_eq!(x(r"#{s/([a-z]+)-([0-9]+)/\2_\1/:text}", &v), "123_abc 456_abc");
+        assert_eq!(x("#{s/a/A/;s/b/B/:text}", &v), "ABc-123 ABc-456");
+        assert_eq!(x("#{s/(a|ab)/X/:#{l:ab}}", &[]), "X");
+        assert_eq!(x("#{s/a*/X/:#{l:ab}}", &[]), "XbX");
+        assert_eq!(x("#{s/./X/:unicode}", &v), "XX");
+        assert_eq!(x("#{n:unicode}", &v), "6");
+        assert_eq!(x("#{m/r:[[:digit:]]+,abc123}", &[]), "1");
+        assert_eq!(x("before#{m/r:bad}after", &[]), "before", "format syntax errors stop expansion");
+        assert!(!regex_matches("[", "text", false));
+        assert!(!regex_matches("(?=a)", "a", false));
+    }
+
+    #[test]
     fn match_glob() {
         let v = [("name", "vim-main")];
         assert_eq!(x("#{m:vim*,#{name}}", &v), "1");
@@ -1354,6 +1360,7 @@ mod tests {
         assert_eq!(x("#{e|*|:#{a},#{b}}", &v), "14");
         assert_eq!(x("#{e|/|:#{a},#{b}}", &v), "3");
         assert_eq!(x("#{e|%|:#{a},#{b}}", &v), "1");
+        assert_eq!(x("#{e|m|:#{a},#{b}}", &v), "1");
         assert_eq!(x("#{e|/|f|2:#{a},#{b}}", &v), "3.50");
         assert_eq!(x("#{e|*|f|4:5.5,3}", &v), "16.5000");
         assert_eq!(x("#{e|/|:1,0}", &v), "");
@@ -1366,7 +1373,7 @@ mod tests {
     #[test]
     fn length_width_ascii_quote() {
         let v = [("w", "漢字ab"), ("q", "it's a $x")];
-        assert_eq!(x("#{n:w}", &v), "4");
+        assert_eq!(x("#{n:w}", &v), "8");
         assert_eq!(x("#{w:w}", &v), "6");
         assert_eq!(x("#{a:98}", &v), "b");
         assert_eq!(x("#{a:#{e|+|:60,5}}", &v), "A");

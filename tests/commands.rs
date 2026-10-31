@@ -38,7 +38,7 @@ fn options_and_formats() {
     assert_eq!(ctx.fmt("o", "#S:#I.#P #{window_panes}"), "o:0.0 1");
     assert_eq!(ctx.fmt("o", "#{=2:#{l:abcdef}}"), "ab");
     assert_eq!(ctx.fmt("o", "#{e|+|:2,3}"), "5");
-    assert_eq!(ctx.fmt("o", "#{pane_width}x#{pane_height}"), "100x29");
+    assert_eq!(ctx.fmt("o", "#{pane_width}x#{pane_height}"), "100x30");
     assert!(ctx.ok(&["display-message", "-a", "-t", "o"]).contains("session_name=o"));
 }
 
@@ -101,6 +101,46 @@ fn copy_mode_commands() {
     assert_eq!(ctx.fmt("c", "#{pane_in_mode}"), "0");
     ctx.ok(&["clear-history", "-t", "c"]);
     assert_eq!(ctx.fmt("c", "#{history_size}"), "0");
+}
+
+#[test]
+fn compatible_layout_history_and_pane_indices() {
+    let ctx = Ctx::new("compat-layout");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "121", "-y", "41"]);
+    assert_eq!(ctx.fmt("s", "#{pane_height}"), "41");
+    ctx.ok(&["split-window", "-d", "-h", "-t", "s:0.0", "-l", "30"]);
+    ctx.ok(&["split-window", "-d", "-v", "-t", "s:0.1", "-l", "10"]);
+    let ids_before = ids(&ctx, "s");
+    let left = ctx.fmt("s:0.0", "#{pane_width}");
+    ctx.ok(&["select-layout", "-E", "-t", "s:0.1"]);
+    assert_eq!(ctx.fmt("s:0.0", "#{pane_width}"), left);
+    assert_eq!(ctx.fmt("s:0.1", "#{pane_height}"), "20");
+    assert_eq!(ctx.fmt("s:0.2", "#{pane_height}"), "20");
+    let spread = ctx.fmt("s", "#{window_layout}");
+    ctx.ok(&["select-layout", "-t", "s", "main-vertical-mirrored"]);
+    assert_eq!(ids(&ctx, "s"), ids_before, "layout geometry must not change pane indices");
+    assert_eq!(ctx.fmt("s:0.0", "#{pane_left} #{pane_width}"), "41 80");
+    ctx.ok(&["select-layout", "-o", "-t", "s"]);
+    assert_eq!(ctx.fmt("s", "#{window_layout}"), spread);
+    ctx.ok(&["select-layout", "-o", "-t", "s"]);
+    // Restoring a layout string assigns panes in list order, like tmux.
+    assert_eq!(ctx.fmt("s:0.2", "#{pane_left} #{pane_width}"), "41 80");
+    ctx.ok(&["select-layout", "-t", "s", "even-horiz"]);
+    ctx.fails(&["select-layout", "-t", "s", "even-"]);
+}
+
+#[test]
+fn format_loops_and_utf8_length() {
+    let ctx = Ctx::new("compat-format");
+    ctx.ok(&["new-session", "-d", "-s", "z"]);
+    ctx.ok(&["new-session", "-d", "-s", "a"]);
+    ctx.ok(&["split-window", "-d", "-t", "z:0.0"]);
+    assert_eq!(ctx.fmt("z", "#{S:#S;}"), "z;a;");
+    assert_eq!(ctx.fmt("z", "#{S/n:#S;}"), "a;z;");
+    assert_eq!(ctx.fmt("z", "#{P:#P,[#P]}"), "[0]1");
+    assert_eq!(ctx.fmt("z", "#{S:#{W:#{P:#S:#I.#P;}}}"), "z:0.0;z:0.1;a:0.0;");
+    ctx.ok(&["set", "-g", "@text", "가나"]);
+    assert_eq!(ctx.fmt("z", "#{n:@text} #{s/./X/:@text}"), "6 XX");
 }
 
 #[test]
@@ -177,7 +217,7 @@ fn windows_and_sessions() {
     ctx.ok(&["previous-window", "-t", "a"]);
     assert_eq!(ctx.fmt("a", "#{window_index}"), "1");
     ctx.ok(&["rename-window", "-t", "a:1", "uno"]);
-    assert_eq!(ctx.fmt("a:1", "#W #{automatic-rename}"), "uno off");
+    assert_eq!(ctx.fmt("a:1", "#W #{automatic-rename}"), "uno 0");
     ctx.ok(&["find-window", "-t", "a", "-N", "zero"]);
     assert_eq!(ctx.fmt("a", "#{window_name}"), "zero");
     // link into another session
@@ -305,9 +345,8 @@ fn split_window_options() {
     assert_eq!(ctx.fmt(&p, "#{pane_width}"), "30");
     let q = ctx.ok(&["split-window", "-v", "-b", "-l", "25%", "-t", &p, "-P", "-F", "#{pane_id}"]).trim().to_string();
     assert_eq!(ctx.fmt(&q, "#{pane_top} #{pane_height}"), "0 10");
-    ctx.ok(&["split-window", "-f", "-v", "-t", "s", "-d"]);
+    let full = ctx.ok(&["split-window", "-f", "-v", "-t", "s", "-d", "-P", "-F", "#{pane_id}"]).trim().to_string();
     assert_eq!(ctx.fmt("s", "#{window_panes}"), "4");
-    let full = ids(&ctx, "s").last().unwrap().clone();
     assert_eq!(ctx.fmt(&full, "#{pane_width}"), "101");
     // -c sets the directory
     let dir = std::env::temp_dir();
@@ -534,4 +573,68 @@ fn server_access_commands() {
     let me = if cfg!(windows) { std::env::var("USERNAME").unwrap() } else { std::env::var("USER").unwrap_or_else(|_| "root".into()) };
     assert!(ctx.fails(&["server-access", "-a", &me]).contains("owner"));
     ctx.fails(&["server-access", "-w", "no-such-user-pt-xyz"]);
+}
+
+#[test]
+fn readonly_control_client_cannot_execute_or_remove_restriction() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+    let ctx = Ctx::new("readonly");
+    ctx.ok(&["new-session", "-d", "-s", "ro"]);
+    ctx.ok(&["set-option", "-g", "update-environment[0]", "READONLY_ENV_PROOF"]);
+    ctx.ok(&["set-environment", "-t", "ro", "READONLY_ENV_PROOF", "original"]);
+    let mut child = ctx.command().args(["-C", "attach-session", "-r", "-t", "ro"])
+        .env("READONLY_ENV_PROOF", "forbidden")
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().unwrap();
+    let out = Arc::new(Mutex::new(String::new()));
+    let reader_out = out.clone();
+    let stdout = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            reader_out.lock().unwrap().push_str(&(line + "\n"));
+        }
+    });
+    let text = || out.lock().unwrap().clone();
+    let mut stdin = child.stdin.take().unwrap();
+    wait_for("readonly attach", || text().contains("%session-changed"));
+    for (i, line) in [
+        "refresh-client -f !read-only",
+        "switch-client -r",
+        "run-shell 'echo forbidden'",
+        "send-keys 'echo forbidden' Enter",
+        "capture-pane",
+        "detach-client -a",
+        "new-window",
+    ].iter().enumerate() {
+        writeln!(stdin, "{line}").unwrap();
+        stdin.flush().unwrap();
+        wait_for("readonly command rejected", || text().matches("client is read-only").count() == i + 1);
+    }
+    writeln!(stdin, "attach-session -t ro").unwrap();
+    writeln!(stdin, "display-message -p 'READONLY=#{{client_readonly}}'").unwrap();
+    stdin.flush().unwrap();
+    wait_for("readonly flag retained", || text().contains("READONLY=1"));
+    let oversized = vec!["display-message -p '#{p1048576:#{l:x}}'"; 16].join(" ; ");
+    writeln!(stdin, "{oversized}").unwrap();
+    stdin.flush().unwrap();
+    wait_for("combined reply rejected", || text().contains("command output limit exceeded"));
+    assert_eq!(ctx.ok(&["show-environment", "-t", "ro", "READONLY_ENV_PROOF"]).trim(), "READONLY_ENV_PROOF=original");
+    // A writable connection still works and the forbidden command made no window.
+    assert_eq!(ctx.fmt("ro", "#{session_windows}"), "1");
+    ctx.ok(&["new-window", "-d", "-t", "ro"]);
+    assert_eq!(ctx.fmt("ro", "#{session_windows}"), "2");
+    writeln!(stdin, "detach-client").unwrap();
+    stdin.flush().unwrap();
+    wait_for("readonly detach", || child.try_wait().unwrap().is_some());
+    let mut overflowing = ctx.command().args(["-C", "attach-session", "-r", "-t", "ro"])
+        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    wait_for("subscription client attach", || ctx.ok(&["list-clients"]).lines().count() == 1);
+    let mut feed = overflowing.stdin.take().unwrap();
+    writeln!(feed, "refresh-client -B 'first::#{{p1048576:#{{l:x}}}}'").unwrap();
+    writeln!(feed, "refresh-client -B 'second::#{{p1048576:#{{l:x}}}}'").unwrap();
+    feed.flush().unwrap();
+    wait_for("subscription cache overflow disconnect", || overflowing.try_wait().unwrap().is_some());
+    assert!(!overflowing.try_wait().unwrap().unwrap().success());
+    assert_eq!(ctx.fmt("ro", "#{session_windows}"), "2");
 }

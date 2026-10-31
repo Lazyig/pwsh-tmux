@@ -46,12 +46,18 @@ pub fn write_frame(w: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<(
 }
 
 pub fn read_frame(r: &mut impl Read) -> io::Result<(u8, Vec<u8>)> {
+    read_frame_checked(r, |_, _| Ok(()))
+}
+
+/// Validate a header (including peer authorization) before allocating its body.
+pub fn read_frame_checked(r: &mut impl Read, check: impl FnOnce(u8, usize) -> io::Result<()>) -> io::Result<(u8, Vec<u8>)> {
     let mut hdr = [0u8; 5];
     r.read_exact(&mut hdr)?;
     let len = u32::from_le_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
     if len > MAX_FRAME {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
     }
+    check(hdr[0], len)?;
     let mut payload = vec![0; len];
     r.read_exact(&mut payload)?;
     Ok((hdr[0], payload))
@@ -115,5 +121,13 @@ mod tests {
         let f = frame(S_OUTPUT, b"hello");
         let (k, p) = read_frame(&mut &f[..]).unwrap();
         assert_eq!((k, p.as_slice()), (S_OUTPUT, &b"hello"[..]));
+    }
+
+    #[test]
+    fn rejected_header_does_not_read_body() {
+        let mut bytes = &frame(C_IDENTIFY, b"private")[..];
+        let error = read_frame_checked(&mut bytes, |_, _| Err(io::ErrorKind::PermissionDenied.into())).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(bytes, b"private");
     }
 }
