@@ -3,6 +3,8 @@
 mod common;
 use common::*;
 use std::time::Duration;
+use std::io::Write;
+use std::process::Stdio;
 
 fn ids(ctx: &Ctx, t: &str) -> Vec<String> {
     ctx.ok(&["list-panes", "-t", t, "-F", "#{pane_id}"]).lines().map(String::from).collect()
@@ -73,6 +75,74 @@ fn buffers_and_paste() {
     ctx.fails(&["show-buffer", "-b", "cmd"]);
     ctx.ok(&["delete-buffer", "-b", "ld"]);
     ctx.fails(&["show-buffer", "-b", "ld"]);
+}
+
+#[test]
+fn binary_stdin_buffers_cannot_inject_commands() {
+    let ctx = Ctx::new("stdin-bytes");
+    ctx.ok(&["new-session", "-d", "-s", "buffer"]);
+    let mut data: Vec<u8> = (0..=255).collect();
+    data.extend_from_slice(b"\0;\0set-option\0-g\0@injected\0yes\\;");
+    let mut child = ctx.command().args(["load-buffer", "-", ";", "set-option", "-g", "@after-load", "done"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(&data).unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    assert!(ctx.ok(&["show-options", "-gqv", "@injected"]).is_empty());
+    assert_eq!(ctx.ok(&["show-options", "-gqv", "@after-load"]).trim(), "done");
+    let output = std::env::temp_dir().join(format!("{}-buffer.bin", ctx.socket));
+    ctx.ok(&["save-buffer", output.to_str().unwrap()]);
+    let saved = std::fs::read(&output).unwrap();
+    std::fs::remove_file(&output).unwrap();
+    assert_eq!(saved, data);
+}
+
+#[test]
+fn oversized_stdin_does_not_execute_any_queued_command() {
+    let ctx = Ctx::new("stdin-limit");
+    ctx.ok(&["new-session", "-d", "-s", "buffer"]);
+    ctx.ok(&["set-buffer", "original"]);
+    let mut child = ctx.command().args(["set-option", "-g", "@oversize-executed", "yes", ";", "load-buffer", "-"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    // Base64 fills the frame budget; the argument overhead must count too.
+    let _ = child.stdin.take().unwrap().write_all(&vec![b'x'; (1 << 20) / 4 * 3]);
+    let result = child.wait_with_output().unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("command frame too large"));
+    assert!(ctx.ok(&["show-options", "-gqv", "@oversize-executed"]).is_empty());
+    assert_eq!(ctx.ok(&["show-buffer"]), "original");
+}
+
+#[test]
+fn invalid_window_destinations_leave_sessions_unchanged() {
+    let ctx = Ctx::new("invalid-destination");
+    ctx.ok(&["new-session", "-d", "-s", "source"]);
+    ctx.ok(&["new-session", "-d", "-s", "destination"]);
+    let before = ctx.ok(&["list-windows", "-a", "-F", "#{session_name}:#{window_index}:#{window_id}"]);
+    for command in ["move-window", "link-window"] {
+        let error = ctx.fails(&[command, "-s", "source:0", "-t", "does-not-exist:5"]);
+        assert!(error.contains("can't find session"), "{error}");
+        ctx.ok(&["has-session", "-t", "source"]);
+        assert_eq!(ctx.ok(&["list-windows", "-a", "-F", "#{session_name}:#{window_index}:#{window_id}"]), before);
+    }
+    // A numeric window index without a session is still a valid target.
+    ctx.ok(&["link-window", "-s", "source:0", "-t", "5"]);
+    assert_eq!(ctx.fmt("destination:5", "#{window_id}"), ctx.fmt("source:0", "#{window_id}"));
+}
+
+#[test]
+fn relative_startup_config_uses_the_client_directory() {
+    let ctx = Ctx::new("relative-config");
+    let directory = std::env::temp_dir().join(format!("{} config directory", ctx.socket));
+    std::fs::create_dir(&directory).unwrap();
+    let config = directory.join("project settings.conf");
+    std::fs::write(&config, "set-option -g @review-config loaded\n").unwrap();
+    let result = ctx.command().current_dir(&directory).args(["-f", "project settings.conf", "new-session", "-d", "-s", "review", "-c", env!("CARGO_MANIFEST_DIR")]).output().unwrap();
+    let configured = if result.status.success() { ctx.ok(&["show-options", "-gqv", "@review-config"]) } else { String::new() };
+    std::fs::remove_file(&config).unwrap();
+    std::fs::remove_dir(&directory).unwrap();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    assert_eq!(configured.trim(), "loaded");
 }
 
 #[test]

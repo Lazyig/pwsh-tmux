@@ -27,6 +27,13 @@ Resource limits include 64 simultaneous connections, 1 MiB client frames, a
 64-event input queue, 8 MiB queued output per client, a 10-second identify deadline
 and a 10-second output-write deadline. Output overflow disconnects the client.
 Command replies have a 4 MiB aggregate limit, including multi-command requests.
+`load-buffer -` preserves binary stdin, including NUL and non-UTF-8 bytes, by
+encoding the data before it enters argument framing. Encoded data and arguments
+must fit in the 1 MiB command frame (roughly 768 KiB of raw stdin, less argument
+overhead). Larger buffers can be loaded from a file. Oversized stdin is rejected
+before sending a command; unsafe legacy inline-stdin requests are refused before
+command splitting. Upgrade clients and servers together; restart existing servers
+after upgrading the executable.
 Bracketed paste is capped at 4 MiB; oversized pastes are discarded completely
 through their end marker. Control subscriptions are limited to 128 per client,
 with formats of at most 64 KiB.
@@ -41,6 +48,11 @@ targets, shell-job cache access, hooks, actual control clients and attached
 terminals, invalid frame headers, stalled I/O, output overflow and adversarial
 formats. Run them with `cargo test --locked`. SSH tests require a verified
 `known_hosts` entry and explicit `PT_SSH` / `PT_SSH_BIN` settings.
+
+Version 0.1.1 fixes command injection through NUL bytes in `load-buffer -` data.
+Version 0.1.0 must not load untrusted stdin buffer data. Regression tests
+also cover unknown window destinations, popup process cleanup when an overlay is
+replaced, and startup configuration paths relative to the invoking client.
 
 Windows tests do not establish Linux or real cross-user coverage. Run
 `python3 tests/security_multiuser.py /absolute/path/to/pwsh-tmux` as Unix root to

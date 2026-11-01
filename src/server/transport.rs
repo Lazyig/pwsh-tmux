@@ -4,7 +4,7 @@ use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const MAX_CLIENTS: usize = 64;
-pub const MAX_CLIENT_FRAME: usize = 1 << 20;
+pub const MAX_CLIENT_FRAME: usize = crate::protocol::MAX_CLIENT_FRAME;
 pub const MAX_OUTPUT_BACKLOG: usize = 8 << 20;
 pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
 

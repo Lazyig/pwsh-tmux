@@ -1,4 +1,5 @@
 use super::vars::Target;
+use super::modes::Popup;
 use super::*;
 
 fn fixture() -> (Server, mpsc::Receiver<Event>) {
@@ -330,4 +331,56 @@ fn subscription_configuration_has_an_aggregate_memory_limit() {
     assert!(rejected);
     let stored: usize = srv.clients[&1].ctl.subs.iter().map(|(name, (what, fmt, _))| name.len() + what.len() + fmt.len()).sum();
     assert!(stored <= 1 << 20);
+}
+
+#[test]
+fn legacy_stdin_requests_are_rejected_before_command_splitting() {
+    let (mut srv, _) = fixture();
+    let (tx, output) = mpsc::channel();
+    let c = srv.clients.get_mut(&1).unwrap();
+    c.tx = tx;
+    c.readonly = false;
+    c.acl_readonly = false;
+    let args = vec!["load-buffer".into(), "\x01stdin:buffer\0;\0set-option\0-g\0@injected\0yes".into()];
+    srv.client_msg(1, C_COMMAND, encode_args(&args));
+    assert!(srv.buffers.is_empty());
+    assert!(!srv.opts_session.0.contains_key("@injected"));
+    let reply = output.try_recv().unwrap();
+    let (kind, payload) = read_frame(&mut &reply[..]).unwrap();
+    assert_eq!(kind, S_REPLY);
+    let (code, message) = decode_reply(&payload);
+    assert_eq!(code, 1);
+    assert!(message.contains("legacy stdin"));
+}
+
+#[test]
+fn replacing_popup_with_other_overlays_releases_its_pane() {
+    for args in [&["display-panes", "-b"][..], &["display-menu", "Item", "i", "display-message done"][..]] {
+        let (mut srv, _events) = fixture();
+        let c = srv.clients.get_mut(&1).unwrap();
+        c.readonly = false;
+        c.acl_readonly = false;
+        c.attached = true;
+        let pane = srv.spawn_pane(None, 20, 6, &[], None, &[]).unwrap();
+        srv.replace_overlay(1, Some(Overlay::Popup(Popup { pane, x: 0, y: 0, w: 22, h: 8, border: true, close_on_exit: false, title: String::new() }))).unwrap();
+        let epoch = srv.clients[&1].overlay_epoch;
+        let result = command(&mut srv, args);
+        let released = !srv.panes.contains_key(&pane);
+        let replaced = srv.clients[&1].overlay_epoch != epoch && !matches!(srv.clients[&1].overlay, Some(Overlay::Popup(_)));
+        srv.shutdown();
+        assert!(result.is_ok());
+        assert!(released && replaced, "{args:?} left an orphan popup pane");
+    }
+}
+
+#[test]
+fn close_popup_does_not_remove_an_unrelated_menu() {
+    let (mut srv, _) = fixture();
+    let c = srv.clients.get_mut(&1).unwrap();
+    c.readonly = false;
+    c.acl_readonly = false;
+    c.attached = true;
+    command(&mut srv, &["display-menu", "Item", "i", "display-message done"]).unwrap();
+    command(&mut srv, &["display-popup", "-C"]).unwrap();
+    assert!(matches!(srv.clients[&1].overlay, Some(Overlay::Menu(_))));
 }

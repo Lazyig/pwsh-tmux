@@ -34,6 +34,10 @@ runtime on Windows, remaps local build paths, and records source and file hashes
 It supports native x86_64 Windows MSVC and Linux GNU builds. `--offline` reuses an
 existing Cargo cache. See [`VALIDATION.md`](VALIDATION.md) for release checks.
 
+Version 0.1.1 fixes command injection in stdin buffer loading. Upgrade both the
+client and server, and restart existing servers after upgrading from 0.1.0.
+See [`SECURITY.md`](SECURITY.md) for the input limits and security model.
+
 ## Usage
 
 It works like tmux:

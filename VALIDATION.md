@@ -1,9 +1,10 @@
-# Release validation - 2026-10-31
+# Release validation - 2026-11-01
 
-The 0.1.0 release candidates were built from the current working tree using
+The 0.1.1 release candidates were built from the current working tree using
 Rust 1.99.1. After the final review, the validated Windows executable replaced
 the existing user PATH installation; the previous file was backed up in the
-workspace. No GitHub upload was performed.
+workspace. The source repository is published at
+[Lazyig/pwsh-tmux](https://github.com/Lazyig/pwsh-tmux).
 These results describe the tested platforms and behaviours, not a guarantee
 that every vulnerability or compatibility difference has been eliminated.
 
@@ -37,22 +38,29 @@ identity across platforms is not claimed.
 6. Running the optimized Windows package exposed PID reuse forming a cycle in
    a process snapshot. Descendant traversal now visits each PID once. Cycle,
    self-parent and console-host regression cases prevent unbounded traversal.
+7. The subsequent code review reproduced stdin-buffer command injection, silent
+   fallback from an unknown window destination, orphan popup processes after
+   overlay replacement, and startup config paths resolved from the server home.
+   Version 0.1.1 encodes binary stdin and rejects legacy requests before parsing,
+   fails unknown explicit destinations without changing session links, destroys
+   replaced popup panes, and resolves config paths before changing server cwd.
+   Regression tests and the original isolated reproduction probes cover all four.
 
 ## Results
 
 | Check | Result |
 |---|---|
-| Windows 11 native unit tests | 184 passed |
-| Windows 11 ConPTY/CLI integration against packaged `tmux.exe` | 30 passed |
-| Ubuntu 18.04, x86_64, WSL 1: native Linux unit tests | 182 passed |
-| Linux PTY/CLI integration against packaged `tmux` | 30 passed |
+| Windows 11 native unit tests | 191 passed |
+| Windows 11 ConPTY/CLI integration against packaged `tmux.exe` | 34 passed |
+| Ubuntu 18.04, x86_64, WSL 1: native Linux unit tests | 189 passed |
+| Linux PTY/CLI integration against packaged `tmux` | 34 passed |
 | Real UID boundaries: server owner, reader and unlisted user | 30 passed |
 | Windows SSH client to Linux package: host-key verification, detach, attach, split, Unicode input, reconnect | Passed |
 | Windows package versus tmux 3.6a | 62 matched, zero differences |
 | Linux package versus tmux 3.6a | 62 matched, zero differences |
 | RustSec / yanked / maintenance audit | 97 lockfile entries; zero vulnerabilities or warnings |
 | Clippy correctness and suspicious groups | Passed |
-| Source and Git-history secret scan | 64 public candidate files and 14 commits; zero secret findings |
+| Source and Git-history secret scan | 64 public candidate files; zero secret findings |
 | tmux 3.6a terminal UI, Linux Unicode and Windows ASCII | 52 cases each; 51 exact visible matches and one runtime-ID-only difference; state, copy, input modes and CLI wait all match |
 | Archive contents, checksums, source provenance and embedded build paths | Passed |
 | Windows PE imports | OS DLLs only; no external Visual C++ runtime |

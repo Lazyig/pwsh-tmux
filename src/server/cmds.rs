@@ -1282,7 +1282,15 @@ impl Server {
                 let (dsid, didx) = match t {
                     Some(tt) => {
                         let (s, w) = tt.split_once(':').unwrap_or((tt, ""));
-                        let sid = if s.is_empty() { self.current(ctx).sid.ok_or("no session")? } else { self.find_session(ctx, s).or_else(|_| self.current(ctx).sid.ok_or_else(|| "no session".to_string()))? };
+                        let sid = if s.is_empty() {
+                            self.current(ctx).sid.ok_or("no session")?
+                        } else {
+                            match self.find_session(ctx, s) {
+                                Ok(sid) => sid,
+                                Err(_) if !tt.contains(':') && tt.parse::<u32>().is_ok() => self.current(ctx).sid.ok_or("no session")?,
+                                Err(error) => return Err(error),
+                            }
+                        };
                         let idx = if w.is_empty() {
                             if tt.contains(':') || self.find_session(ctx, tt).is_ok() { None } else { tt.parse().ok() }
                         } else {
@@ -2077,13 +2085,8 @@ impl Server {
                 let sid = self.client_session(cid);
                 let ms = o.get('d').and_then(|v| v.parse().ok()).unwrap_or_else(|| self.opt_session_num(sid, "display-panes-time").max(1) as u64);
                 let template = o.rest.first().cloned().unwrap_or_else(|| "select-pane -t '%%'".into());
-                if let Some(c) = self.clients.get_mut(&cid) {
-                    c.overlay = Some(Overlay::DisplayPanes { until: Instant::now() + Duration::from_millis(ms), template });
-                    c.dirty = true;
-                }
-                let c = self.clients.get_mut(&cid).ok_or("no client")?;
-                c.overlay_epoch = c.overlay_epoch.wrapping_add(1);
-                if o.has('b') { Ok(Flow::Next) } else { Ok(Flow::WaitOverlay(cid, c.overlay_epoch)) }
+                let epoch = self.replace_overlay(cid, Some(Overlay::DisplayPanes { until: Instant::now() + Duration::from_millis(ms), template }))?;
+                if o.has('b') { Ok(Flow::Next) } else { Ok(Flow::WaitOverlay(cid, epoch)) }
             }
             // ---------------------------------------------------------------- modes
             "copy-mode" => {
@@ -2164,22 +2167,14 @@ impl Server {
                 let title = o.get('T').map(|s| self.expand(tt, Some(cid), s)).unwrap_or_default();
                 let (cw, ch) = self.clients[&cid].size;
                 let menu = Menu::new(title, items, o.get('x'), o.get('y'), cw, ch, ctx.mouse.as_ref().map(|m| (m.x, m.y)), tt.pane);
-                if let Some(c) = self.clients.get_mut(&cid) {
-                    c.overlay = Some(Overlay::Menu(menu));
-                    c.dirty = true;
-                }
-                let c = self.clients.get_mut(&cid).ok_or("no client")?;
-                c.overlay_epoch = c.overlay_epoch.wrapping_add(1);
-                Ok(Flow::WaitOverlay(cid, c.overlay_epoch))
+                let epoch = self.replace_overlay(cid, Some(Overlay::Menu(menu)))?;
+                Ok(Flow::WaitOverlay(cid, epoch))
             }
             "display-popup" => {
                 let cid = self.resolve_client(ctx, o.get('c'))?;
                 if o.has('C') {
-                    if let Some(c) = self.clients.get_mut(&cid) {
-                        if let Some(Overlay::Popup(p)) = c.overlay.take() {
-                            c.dirty = true;
-                            self.destroy_pane(p.pane);
-                        }
+                    if matches!(self.clients.get(&cid).and_then(|c| c.overlay.as_ref()), Some(Overlay::Popup(_))) {
+                        self.replace_overlay(cid, None)?;
                     }
                     return Ok(Flow::Next);
                 }
@@ -2204,21 +2199,8 @@ impl Server {
                 let cwd = o.get('d').map(|d| self.expand(tt, Some(cid), d)).or_else(|| tt.pane.and_then(|p| self.panes.get(&p)).map(|p| p.current_path.clone()));
                 let pane = self.spawn_pane(tt.sid, iw.max(1), ih.max(1), &o.rest, cwd.as_deref(), &env)?;
                 let title = o.get('T').map(|s| self.expand(tt, Some(cid), s)).unwrap_or_default();
-                if let Some(c) = self.clients.get_mut(&cid) {
-                    if let Some(Overlay::Popup(old)) = c.overlay.take() {
-                        let old = old.pane;
-                        c.overlay = Some(Overlay::Popup(Popup { pane, x, y, w, h, border, close_on_exit: o.has('E'), title }));
-                        self.destroy_pane(old);
-                    } else {
-                        c.overlay = Some(Overlay::Popup(Popup { pane, x, y, w, h, border, close_on_exit: o.has('E'), title }));
-                    }
-                }
-                if let Some(c) = self.clients.get_mut(&cid) {
-                    c.dirty = true;
-                }
-                let c = self.clients.get_mut(&cid).ok_or("no client")?;
-                c.overlay_epoch = c.overlay_epoch.wrapping_add(1);
-                Ok(Flow::WaitOverlay(cid, c.overlay_epoch))
+                let epoch = self.replace_overlay(cid, Some(Overlay::Popup(Popup { pane, x, y, w, h, border, close_on_exit: o.has('E'), title })))?;
+                Ok(Flow::WaitOverlay(cid, epoch))
             }
             // ---------------------------------------------------------------- prompts & messages
             "command-prompt" => {
@@ -2499,8 +2481,10 @@ impl Server {
             }
             "load-buffer" => {
                 let path = o.rest.first().ok_or("load-buffer needs a path")?;
-                let data = if let Some(inline) = path.strip_prefix("\x01stdin:") {
-                    inline.as_bytes().to_vec()
+                let data = if path.starts_with(STDIN_BUFFER_PREFIX) {
+                    decode_stdin_buffer(path)?
+                } else if path.starts_with("\x01stdin:") {
+                    return err("unsafe legacy stdin buffer encoding; update the client");
                 } else {
                     let p = self.resolve_path(ctx, path);
                     std::fs::read(&p).map_err(|e| format!("{p}: {e}"))?

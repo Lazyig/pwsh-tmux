@@ -22,6 +22,14 @@ pub struct Global {
 
 fn spawn_server(config: Option<&str>) -> std::io::Result<()> {
     use std::process::{Command, Stdio};
+    // Resolve before changing the server's cwd. Preserve source-file's ~/ form.
+    let config = config.map(|path| {
+        let path = if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+            crate::server::procinfo::home_dir().map(|home| std::path::PathBuf::from(home).join(rest)).unwrap_or_else(|| path.into())
+        } else { std::path::PathBuf::from(path) };
+        std::path::absolute(path).map(|path| path.to_string_lossy().into_owned())
+    }).transpose()?;
+    let config = config.as_deref();
     let exe = std::env::current_exe()?;
     let make = || {
         let mut c = Command::new(&exe);
@@ -139,21 +147,74 @@ fn is_tty() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
+fn prepare_stdin_buffers(args: &mut [String], input: &mut impl Read) -> std::io::Result<()> {
+    let mut start = 0;
+    for index in 0..args.len() {
+        let separate = args[index] == ";";
+        let suffixed = args[index].ends_with("\\;");
+        if !separate && !suffixed && index + 1 != args.len() { continue; }
+        let end = if separate { index } else { index + 1 };
+        if end > start + 1 && matches!(args[start].as_str(), "load-buffer" | "loadb") {
+            let last = end - 1;
+            let path = args[last].strip_suffix("\\;").unwrap_or(&args[last]);
+            if path == "-" {
+                let mut data = Vec::new();
+                input.take(MAX_STDIN_BUFFER as u64 + 1).read_to_end(&mut data)?;
+                if data.len() > MAX_STDIN_BUFFER { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "stdin buffer exceeds command frame limit")); }
+                let separator = if args[last].ends_with("\\;") { "\\;" } else { "" };
+                args[last] = encode_stdin_buffer(&data) + separator;
+            }
+        }
+        start = index + 1;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdin_data_stays_in_one_argument_in_compound_commands() {
+        let data = b"buffer\0;\0set-option\0-g\0@injected\0yes\xff\\;";
+        let mut argv = ["loadb", "-", ";", "display-message", "-p", "done"].map(String::from);
+        prepare_stdin_buffers(&mut argv, &mut &data[..]).unwrap();
+        let commands = crate::cmdparse::split_commands(&decode_args(&encode_args(&argv)));
+        assert_eq!(commands.len(), 2);
+        assert_eq!(decode_stdin_buffer(&commands[0][1]).unwrap(), data);
+        assert_eq!(commands[1], ["display-message", "-p", "done"]);
+    }
+
+    #[test]
+    fn stdin_loading_recognizes_command_boundaries_and_limits() {
+        let mut argv = ["run-shell", "load-buffer", "-"].map(String::from);
+        let mut input = std::io::Cursor::new(b"not consumed");
+        prepare_stdin_buffers(&mut argv, &mut input).unwrap();
+        assert_eq!(input.position(), 0);
+        let mut argv = ["load-buffer", "-\\;", "load-buffer", "-"].map(String::from);
+        prepare_stdin_buffers(&mut argv, &mut &b"data"[..]).unwrap();
+        let commands = crate::cmdparse::split_commands(&argv);
+        assert_eq!(decode_stdin_buffer(&commands[0][1]).unwrap(), b"data");
+        assert!(decode_stdin_buffer(&commands[1][1]).unwrap().is_empty());
+        let mut argv = ["load-buffer", "-"].map(String::from);
+        assert!(prepare_stdin_buffers(&mut argv, &mut std::io::repeat(b'x')).is_err());
+    }
+}
+
 pub fn main(mut args: Vec<String>, g: Global) -> i32 {
     if args.is_empty() {
         args.push("new-session".into());
     }
     let cmds = crate::cmdparse::split_commands(&args);
     let starts = cmds.iter().any(|c| matches!(c.first().map(String::as_str), Some("new-session" | "new" | "start-server" | "start")));
-    // load-buffer - reads the client's stdin
-    if let Some(pos) = args.iter().position(|a| a == "load-buffer" || a == "loadb") {
-        if args.get(pos + 1..).is_some_and(|r| r.last().map(String::as_str) == Some("-")) {
-            let mut data = String::new();
-            let _ = std::io::stdin().read_to_string(&mut data);
-            let last = args.len() - 1;
-            // NUL separates protocol arguments, so mark inline data with \x01
-            args[last] = format!("\x01stdin:{data}");
-        }
+    if let Err(error) = prepare_stdin_buffers(&mut args, &mut std::io::stdin().lock()) {
+        eprintln!("cannot load buffer from stdin: {error}");
+        return 1;
+    }
+    let command_payload = encode_args(&args);
+    if command_payload.len() > MAX_CLIENT_FRAME {
+        eprintln!("command frame too large (stdin data must fit after base64 encoding)");
+        return 1;
     }
     let stream = match connect(starts && !g.no_start, g.config.as_deref()) {
         Ok(s) => s,
@@ -186,7 +247,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
             write_frame(&mut &*stream, kind, payload).is_ok()
         }
     };
-    if !post(C_IDENTIFY, &encode_args(&ident)) || !post(C_COMMAND, &encode_args(&args)) {
+    if !post(C_IDENTIFY, &encode_args(&ident)) || !post(C_COMMAND, &command_payload) {
         eprintln!("lost server");
         return 1;
     }

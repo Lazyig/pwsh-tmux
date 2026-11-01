@@ -31,6 +31,50 @@ pub const S_SHELL: u8 = 15;
 pub const S_STDOUT: u8 = 16;
 
 const MAX_FRAME: usize = 64 << 20;
+pub const MAX_CLIENT_FRAME: usize = 1 << 20;
+pub const MAX_STDIN_BUFFER: usize = MAX_CLIENT_FRAME / 4 * 3;
+pub const STDIN_BUFFER_PREFIX: &str = "\x01stdin64:";
+
+/// Only ASCII base64 enters argv framing; buffer bytes never become arguments.
+pub fn encode_stdin_buffer(data: &[u8]) -> String {
+    let mut out = String::from(STDIN_BUFFER_PREFIX);
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for chunk in data.chunks(3) {
+        let value = (chunk[0] as u32) << 16 | (chunk.get(1).copied().unwrap_or(0) as u32) << 8 | chunk.get(2).copied().unwrap_or(0) as u32;
+        out.push(TABLE[(value >> 18) as usize] as char);
+        out.push(TABLE[((value >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { TABLE[((value >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[(value & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+pub fn decode_stdin_buffer(argument: &str) -> Result<Vec<u8>, String> {
+    let text = argument.strip_prefix(STDIN_BUFFER_PREFIX).ok_or("invalid stdin buffer encoding")?;
+    if text.len() > MAX_CLIENT_FRAME || text.len() % 4 != 0 { return Err("invalid stdin buffer encoding".into()); }
+    let digit = |b: u8| -> Result<u32, String> {
+        Ok(match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a' + 26) as u32,
+            b'0'..=b'9' => (b - b'0' + 52) as u32,
+            b'+' => 62, b'/' => 63,
+            _ => return Err("invalid stdin buffer encoding".into()),
+        })
+    };
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    for (index, chunk) in text.as_bytes().chunks_exact(4).enumerate() {
+        let (a, b) = (digit(chunk[0])?, digit(chunk[1])?);
+        let last = index + 1 == text.len() / 4;
+        let c = if chunk[2] == b'=' && last && chunk[3] == b'=' { 0 } else { digit(chunk[2])? };
+        let d = if chunk[3] == b'=' && last { 0 } else { digit(chunk[3])? };
+        if (chunk[2] == b'=' && b & 15 != 0) || (chunk[3] == b'=' && c & 3 != 0) { return Err("invalid stdin buffer encoding".into()); }
+        let value = a << 18 | b << 12 | c << 6 | d;
+        out.push((value >> 16) as u8);
+        if chunk[2] != b'=' { out.push((value >> 8) as u8); }
+        if chunk[3] != b'=' { out.push(value as u8); }
+    }
+    Ok(out)
+}
 
 pub fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(5 + payload.len());
@@ -114,6 +158,26 @@ mod tests {
         let a = vec!["send-keys".to_string(), String::new(), "한글 x".to_string()];
         assert_eq!(decode_args(&encode_args(&a)), a);
         assert!(decode_args(&encode_args(&[])).is_empty());
+    }
+
+    #[test]
+    fn stdin_buffers_preserve_bytes_without_changing_commands() {
+        for size in [0, 1, 2, 3, 255, 256, 257] {
+            let data: Vec<u8> = (0..size).map(|i| i as u8).collect();
+            let argv = vec!["load-buffer".into(), encode_stdin_buffer(&data)];
+            let decoded = decode_args(&encode_args(&argv));
+            assert_eq!(decoded, argv);
+            assert_eq!(crate::cmdparse::split_commands(&decoded).len(), 1);
+            assert_eq!(decode_stdin_buffer(&decoded[1]).unwrap(), data);
+        }
+    }
+
+    #[test]
+    fn stdin_buffers_reject_malformed_base64() {
+        for invalid in ["A", "====", "AA=A", "AA==AAAA", "AB==", "AAB=", "AA\n=", "____", "éé"] {
+            assert!(decode_stdin_buffer(&format!("{STDIN_BUFFER_PREFIX}{invalid}")).is_err(), "{invalid:?}");
+        }
+        assert!(decode_stdin_buffer("\x01stdin:legacy").is_err());
     }
 
     #[test]

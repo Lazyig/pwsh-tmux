@@ -975,6 +975,19 @@ impl Server {
         );
     }
 
+    /// Replacing an overlay also ends the PTY/process owned by an old popup.
+    pub fn replace_overlay(&mut self, cid: ClientId, overlay: Option<Overlay>) -> Result<u64, String> {
+        let (old, epoch) = {
+            let c = self.clients.get_mut(&cid).ok_or("no client")?;
+            let old = std::mem::replace(&mut c.overlay, overlay);
+            c.overlay_epoch = c.overlay_epoch.wrapping_add(1);
+            c.dirty = true;
+            (old, c.overlay_epoch)
+        };
+        if let Some(Overlay::Popup(popup)) = old { self.destroy_pane(popup.pane); }
+        Ok(epoch)
+    }
+
     fn client_gone(&mut self, cid: ClientId) {
         let Some(c) = self.clients.remove(&cid) else { return };
         c.closed.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1039,6 +1052,14 @@ impl Server {
             }
             C_COMMAND => {
                 let argv = decode_args(&payload);
+                // Older clients put unescaped stdin bytes into NUL-delimited
+                // argv. Reject the entire request before splitting commands.
+                if argv.iter().any(|arg| arg.starts_with("\x01stdin:")) {
+                    if let Some(c) = self.clients.get(&cid) {
+                        c.send(S_REPLY, &encode_reply(1, "unsafe legacy stdin buffer encoding; update the client"));
+                    }
+                    return;
+                }
                 let cmds = crate::cmdparse::split_commands(&argv);
                 let pane = self.clients.get(&cid).and_then(|c| c.ident.as_ref()).and_then(|i| i.ctx_pane).filter(|p| self.panes.contains_key(p));
                 // control clients get the reply to their command line in a %begin block too
