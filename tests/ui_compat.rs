@@ -44,10 +44,19 @@ struct App {
     broker: Option<Broker>,
 }
 
+/// The WSL (/mnt/<drive>/...) form of a Windows path, for the reference side.
+fn wsl_path(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    match s.as_bytes() {
+        [d, b':', rest @ ..] => format!("/mnt/{}{}", (*d as char).to_ascii_lowercase(), String::from_utf8_lossy(rest)),
+        _ => s,
+    }
+}
+
 struct Broker { child: Child, input: std::process::ChildStdin, output: BufReader<std::process::ChildStdout> }
 impl Broker {
     fn new() -> Self {
-        let mut child = Command::new("C:/Windows/System32/wsl.exe").args(["-d", "Ubuntu", "--exec", "python3", "/mnt/c/Source/pwsh-tmux/tests/ui_broker.py"])
+        let mut child = Command::new("C:/Windows/System32/wsl.exe").args(["-d", "Ubuntu", "--exec", "python3", &wsl_path(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/ui_broker.py"))])
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().unwrap();
         Self { input: child.stdin.take().unwrap(), output: BufReader::new(child.stdout.take().unwrap()), child }
     }
@@ -72,14 +81,14 @@ impl App {
         } else if cfg!(windows) {
             vec!["C:/Windows/System32/wsl.exe".into(), "-d".into(), "Ubuntu".into(), "--exec".into(),
                 "env".into(), "TERM=xterm-256color".into(), "LC_ALL=C.UTF-8".into(),
-                std::env::var("PT_UI_REFERENCE").unwrap_or_else(|_| "/mnt/c/Source/pwsh-tmux/target/tmux-reference/tmux".into())]
+                std::env::var("PT_UI_REFERENCE").unwrap_or_else(|_| wsl_path(&root.join("target/tmux-reference/tmux")))]
         } else {
             vec![std::env::var("PT_UI_REFERENCE").unwrap_or_else(|_| root.join("target/tmux-reference/tmux").to_string_lossy().into_owned())]
         };
         let mut fixture = if cfg!(windows) && is_candidate {
             format!("python {}", root.join("tests/ui_fixture.py").display())
         } else if cfg!(windows) {
-            "python3 /mnt/c/Source/pwsh-tmux/tests/ui_fixture.py".into()
+            format!("python3 {}", wsl_path(&root.join("tests/ui_fixture.py")))
         } else { format!("python3 {}", root.join("tests/ui_fixture.py").display()) };
         if let Ok(suffix) = std::env::var("PT_UI_FIXTURE_SUFFIX") { fixture.push(' '); fixture.push_str(&suffix); }
         Self {
