@@ -238,6 +238,7 @@ impl Grid {
         let new_history = out.len() - usize::from(size.rows());
         self.rows = out.drain(new_history..).collect();
         history.rows = out;
+        for row in &mut history.rows { row.compact(); }
         history.unbounded_len = old_scrolled.min(new_history);
         history.offset = 0;
         self.pos.row = cursor.0.saturating_sub(discarded + new_history).min(usize::from(size.rows()-1)) as u16;
@@ -814,6 +815,7 @@ impl Grid {
             scrollback.rows.extend(
                 between[num_reset..num_removed].iter_mut().map(|row| {
                     row.trim();
+                    row.compact();
                     core::mem::replace(row, new_row())
                 }),
             );

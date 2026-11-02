@@ -1521,10 +1521,10 @@ impl Server {
         let label = format!("{},{},{}", ipc::describe(), std::process::id(), sid.unwrap_or(0));
         cb.env("PWSH_TMUX", label);
         cb.env("PWSH_TMUX_PANE", format!("%{id}"));
-        if cfg!(unix) {
-            cb.env("TERM", self.opt_server("default-terminal"));
-            cb.env("COLORTERM", "truecolor");
-        }
+        // Describe the pane's virtual terminal, independently of the program
+        // that launched the server (which may have TERM=dumb on Windows).
+        cb.env("TERM", self.opt_server("default-terminal"));
+        cb.env("COLORTERM", "truecolor");
         cb.env("TERM_PROGRAM", "pwsh-tmux");
         cb.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
         for (k, v) in extra_env {

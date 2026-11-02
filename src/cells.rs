@@ -115,6 +115,27 @@ mod tests {
     }
 
     #[test]
+    fn history_compaction_preserves_styled_clusters_through_capture_and_reflow() {
+        let nz = |n| NonZeroU16::new(n).unwrap();
+        let mut p = vt100::Parser::new(nz(4), nz(80), 100);
+        let text = "ASCII 한글 e\u{301} ❤️ 👩\u{200d}💻";
+        for _ in 0..20 {
+            p.process(format!("\x1b[1;3;38;2;12;34;56m{text}\x1b[0m\r\n").as_bytes());
+        }
+        let before = snapshot(p.screen());
+        assert_eq!(before.len(), 21);
+        for row in &before[..20] {
+            assert_eq!(row.text(), text);
+            assert_eq!(row.cells[0].style.fg, Color::Rgb(12, 34, 56));
+            assert_eq!(row.cells[0].style.attrs & (BOLD | ITALIC), BOLD | ITALIC);
+        }
+        p.set_size(nz(4), nz(12));
+        p.set_size(nz(4), nz(80));
+        assert_eq!(snapshot(p.screen()), before);
+        assert_eq!(p.screen().scrollback(), 0, "history capture must not move the live view");
+    }
+
+    #[test]
     fn resize_reflows_history_and_preserves_styles_and_clusters() {
         let nz = |n| NonZeroU16::new(n).unwrap();
         let mut p = vt100::Parser::new(nz(4), nz(12), 100);

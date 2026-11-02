@@ -287,3 +287,29 @@ fn terminal_features_and_extended_keys() {
     assert!(t.raw_text().contains("\x1b[?2026h"), "synchronized output");
     assert!(t.raw_text().contains("\x1b[>4;2m"), "modifyOtherKeys requested");
 }
+
+#[test]
+fn progress_bar_preserves_dark_truecolor_background_on_blank_cells() {
+    let ctx = Ctx::new("progress-colors");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/ui_fixture.py");
+    let python = if cfg!(windows) { "python" } else { "python3" };
+    ctx.ok(&["new-session", "-d", "-s", "colors", python,
+        fixture.to_str().unwrap(), "--ascii", "--progress-colors"]);
+    let mut cb = portable_pty::CommandBuilder::new(binary());
+    cb.args(["attach-session", "-t", "colors"]);
+    cb.env("PWSH_TMUX_SOCKET", &ctx.socket);
+    cb.env_remove("PWSH_TMUX");
+    cb.env_remove("PWSH_TMUX_PANE");
+    cb.env_remove("COLORTERM");
+    cb.env("TERM", if cfg!(windows) { "dumb" } else { "xterm-direct" });
+    let t = Term::spawn(cb, 100, 30);
+    t.wait_screen("usage progress bar", |s| s.contains("2% used"));
+    let screen = t.screen.lock().unwrap();
+    let bar = screen.screen().cell(8, 10).unwrap();
+    assert_eq!(bar.contents(), " ");
+    assert_eq!(bar.bgcolor(), vt100::Color::Rgb(82, 82, 112));
+    let filled = screen.screen().cell(8, 0).unwrap();
+    assert_eq!(filled.fgcolor(), vt100::Color::Rgb(180, 180, 255));
+    assert_eq!(filled.bgcolor(), vt100::Color::Rgb(82, 82, 112));
+    assert!(ctx.ok(&["list-clients", "-F", "#{client_termfeatures}"]).contains("RGB"));
+}

@@ -80,6 +80,22 @@ Linux UID tests alone. No independent human security certification is claimed.
 
 ## Repeating the checks
 
+The subsequent compact-history optimization was checked separately against the
+source-tree release builds. Its measurements, workload limits and updated test
+counts are in [MEMORY_COMPARISON.md](MEMORY_COMPARISON.md). This does not change
+the provenance or results of the previously packaged 0.1.1 release above.
+`python tools/test_vt100.py` runs the bundled library's unit and doc tests;
+application `cargo test` does not run dependency unit tests.
+
+The color follow-up checks a truecolor usage bar whose unused area consists of
+colored spaces. A native Windows console no longer inherits `TERM=dumb` color
+capabilities from a launcher, and Windows panes now advertise the configured
+virtual terminal and truecolor support just like Unix panes. Explicit terminal
+names, Unix `TERM=dumb`, and application `NO_COLOR` preferences are preserved.
+
+Windows 193 / Linux 191 unit tests and 35 local integration tests per platform
+pass, including the new real-terminal dark-background progress-bar regression.
+
 ```text
 cargo test --locked
 cargo clippy --locked --all-targets -- -A clippy::style -A clippy::complexity -A clippy::perf -D clippy::correctness -D clippy::suspicious

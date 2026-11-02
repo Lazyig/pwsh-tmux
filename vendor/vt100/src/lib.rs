@@ -48,7 +48,6 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::type_complexity)]
 
-#[macro_use]
 extern crate alloc;
 
 mod attrs;
@@ -59,6 +58,7 @@ mod grid;
 mod parser;
 mod perform;
 mod row;
+mod row_cells;
 mod screen;
 mod term;
 

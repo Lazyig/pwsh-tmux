@@ -147,6 +147,12 @@ fn is_tty() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
+/// A native Windows console supports VT even when a launcher inherited TERM=dumb.
+/// Preserve explicit terminal names and non-console clients (including Unix).
+fn terminal_name(term: String, windows_console: bool) -> String {
+    if windows_console && term == "dumb" { String::new() } else { term }
+}
+
 fn prepare_stdin_buffers(args: &mut [String], input: &mut impl Read) -> std::io::Result<()> {
     let mut start = 0;
     for index in 0..args.len() {
@@ -173,6 +179,14 @@ fn prepare_stdin_buffers(args: &mut [String], input: &mut impl Read) -> std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_windows_console_does_not_inherit_dumb_color_capabilities() {
+        assert_eq!(terminal_name("dumb".into(), true), "");
+        assert_eq!(terminal_name("xterm-256color".into(), true), "xterm-256color");
+        assert_eq!(terminal_name("dumb".into(), false), "dumb");
+        assert_eq!(terminal_name(String::new(), true), "");
+    }
 
     #[test]
     fn stdin_data_stays_in_one_argument_in_compound_commands() {
@@ -230,7 +244,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
         rows.to_string(),
         if is_tty() { "1".into() } else { "0".into() },
         std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
-        std::env::var("TERM").unwrap_or_default(),
+        terminal_name(std::env::var("TERM").unwrap_or_default(), cfg!(windows) && is_tty()),
         std::process::id().to_string(),
         std::env::var("PWSH_TMUX_PANE").ok().filter(|_| std::env::var_os("PWSH_TMUX").is_some()).unwrap_or_default(),
         g.control.to_string(),

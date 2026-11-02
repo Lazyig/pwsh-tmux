@@ -1,16 +1,16 @@
 use crate::term::BufWrite as _;
-use alloc::{string::String, vec::Vec};
+use alloc::string::String;
 
 #[derive(Clone, Debug)]
 pub struct Row {
-    cells: Vec<crate::Cell>,
+    cells: crate::row_cells::RowCells,
     wrapped: bool,
 }
 
 impl Row {
     pub fn new(cols: u16) -> Self {
         Self {
-            cells: vec![crate::Cell::new(); usize::from(cols)],
+            cells: crate::row_cells::RowCells::new(cols),
             wrapped: false,
         }
     }
@@ -24,14 +24,14 @@ impl Row {
     }
 
     pub fn clear(&mut self, attrs: crate::attrs::Attrs) {
-        for cell in &mut self.cells {
+        for cell in self.cells.dense_mut() {
             cell.clear(attrs);
         }
         self.wrapped = false;
     }
 
     pub fn reset(&mut self) {
-        self.cells.fill(crate::Cell::new());
+        self.cells.dense_mut().fill(crate::Cell::new());
         self.wrapped = false;
     }
 
@@ -69,7 +69,7 @@ impl Row {
             is_wc
         });
 
-        let slice = &mut self.cells[usize::from(i)..];
+        let slice = &mut self.cells.dense_mut()[usize::from(i)..];
         slice.rotate_right(count);
         slice[..count].fill(crate::Cell::new());
         if is_wide_continuation {
@@ -94,7 +94,7 @@ impl Row {
         }
 
         let count = usize::from(range.end - range.start);
-        let slice = &mut self.cells[usize::from(range.start)..];
+        let slice = &mut self.cells.dense_mut()[usize::from(range.start)..];
         slice[..count].fill(crate::Cell::new());
         slice.rotate_left(count);
     }
@@ -113,13 +113,13 @@ impl Row {
     }
 
     pub fn truncate(&mut self, len: u16) {
-        self.cells.truncate(usize::from(len));
+        self.cells.dense_mut().truncate(usize::from(len));
         self.set_truncated();
     }
 
     fn set_truncated(&mut self) {
         self.wrapped = false;
-        if let Some(last_cell) = self.cells.last_mut() {
+        if let Some(last_cell) = self.cells.dense_mut().last_mut() {
             if last_cell.is_wide() {
                 last_cell.clear(*last_cell.attrs());
             }
@@ -128,7 +128,7 @@ impl Row {
 
     fn grow_unchecked(&mut self, len: u16, cell: crate::Cell) {
         debug_assert!(self.cells.len() < usize::from(len));
-        self.cells.resize(len.into(), cell);
+        self.cells.dense_mut().resize(len.into(), cell);
         self.wrapped = false;
     }
 
@@ -159,8 +159,17 @@ impl Row {
             .rev()
             .take_while(|c| **c == crate::cell::Cell::DEFAULT)
             .count();
-        self.cells.truncate(self.cells.len() - excess);
-        self.cells.shrink_to_fit();
+        if excess > 0 {
+            let len = self.cells.len() - excess;
+            self.cells.dense_mut().truncate(len);
+        }
+        if let crate::row_cells::RowCells::Dense(cells) = &mut self.cells {
+            cells.shrink_to_fit();
+        }
+    }
+
+    pub(crate) fn compact(&mut self) {
+        self.cells.compact();
     }
 
     pub fn wrap(&mut self, wrap: bool) {

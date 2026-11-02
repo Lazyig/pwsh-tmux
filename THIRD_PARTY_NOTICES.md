@@ -1,8 +1,9 @@
 # Third-party notices
 pwsh-tmux itself is MIT licensed (see `LICENSE`). It builds on the projects below; their notices are reproduced here as their licenses require, also for binary releases.
 
-The bundled `vendor/vt100` is vt100 0.18.1 with local normal-screen reflow and
-opt-in scroll-on-clear changes. See `vendor/vt100/PATCHES.md` and its MIT `LICENSE`.
+The bundled `vendor/vt100` is vt100 0.18.1 with local normal-screen reflow,
+opt-in scroll-on-clear and lossless compact history storage changes.
+See `vendor/vt100/PATCHES.md` and its MIT `LICENSE`.
 
 ## tmux
 

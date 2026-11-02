@@ -16,6 +16,19 @@ pub struct Cell {
 }
 const _: () = assert!(core::mem::size_of::<Cell>() == 32);
 
+// Immutable, default-style ASCII cells can be shared by all history rows.
+// Index zero denotes an empty cell, distinct from a cell containing a space.
+pub(crate) static ASCII_CELLS: [Cell; 128] = {
+    let mut cells = [const { Cell::new() }; 128];
+    let mut i = 1;
+    while i < cells.len() {
+        cells[i].contents[0] = i as u8;
+        cells[i].len = 1;
+        i += 1;
+    }
+    cells
+};
+
 impl PartialEq<Self> for Cell {
     fn eq(&self, other: &Self) -> bool {
         if self.len != other.len {
@@ -37,6 +50,19 @@ impl Cell {
             contents: [0; CONTENT_BYTES],
             len: 0,
             attrs: crate::attrs::Attrs::new(),
+        }
+    }
+
+    pub(crate) fn ascii_index(&self) -> Option<u8> {
+        if self.attrs != crate::attrs::Attrs::new() {
+            return None;
+        }
+        match self.len {
+            0 => Some(0),
+            1 if self.contents[0] > 0 && self.contents[0] < 128 => {
+                Some(self.contents[0])
+            }
+            _ => None,
         }
     }
 

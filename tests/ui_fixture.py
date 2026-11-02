@@ -29,6 +29,12 @@ def draw():
         'second needle beta',
         'selection target: alpha beta gamma',
     ]
+    if '--progress-colors' in sys.argv:
+        lines += [
+            'Current session',
+            '\x1b[48;2;82;82;112m\x1b[38;2;180;180;255m'
+            + '\u2588' + ' ' * 39 + '\x1b[0m 2% used',
+        ]
     text = '\x1b[0m\x1b[2J\x1b[H\x1b]2;pane-fixture\x07'
     for row, line in enumerate(lines):
         text += '\x1b[%d;1H%s' % (row + 1, line)
