@@ -3,6 +3,19 @@
 use std::io;
 
 pub fn size() -> (u16, u16) {
+    #[cfg(unix)]
+    {
+        // ioctl only: crossterm falls back to running `tput cols` and `tput lines`
+        // when there is no terminal, which cost two process spawns per command.
+        for fd in [1, 0, 2] {
+            let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+            if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+                return (ws.ws_col, ws.ws_row);
+            }
+        }
+        (80, 24)
+    }
+    #[cfg(windows)]
     match crossterm::terminal::size() {
         Ok((c, r)) if c > 0 && r > 0 => (c, r),
         _ => (80, 24),

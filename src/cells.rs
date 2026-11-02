@@ -44,7 +44,8 @@ pub struct Line {
 }
 
 impl Line {
-    /// Text of the row with trailing blanks removed.
+    /// Text of the row with trailing blanks removed ([`text_at`] is the fast path).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn text(&self) -> String {
         let s: String = self.cells.iter().map(|c| c.text.as_str()).collect();
         s.trim_end().to_string()
@@ -70,37 +71,53 @@ pub fn cell_from_vt(c: &vt100::Cell) -> Cell {
 
 /// Every row of a screen including its scrollback, oldest first.
 pub fn snapshot(screen: &vt100::Screen) -> Vec<Line> {
-    let mut s = screen.clone();
-    let (rows, cols) = s.size();
-    let (rows, cols) = (rows.get(), cols.get());
-    s.set_scrollback(usize::MAX);
-    let history = s.scrollback();
-    let mut out = Vec::with_capacity(history + rows as usize);
-    let mut offset = history;
-    loop {
-        s.set_scrollback(offset);
-        // With the view scrolled up by `offset`, row r is absolute line (history - offset + r).
-        let start = history - offset;
-        let take = if offset == 0 { rows as usize } else { offset.min(rows as usize) };
-        for r in 0..take as u16 {
-            if start + r as usize != out.len() {
-                continue;
-            }
-            let cells = (0..cols).map(|c| s.cell(r, c).map(cell_from_vt).unwrap_or_default()).collect();
-            out.push(Line { cells, wrapped: s.row_wrapped(r) });
-        }
-        if offset == 0 {
-            break;
-        }
-        offset = offset.saturating_sub(rows as usize);
+    (0..screen.history_rows_len()).map(|i| line_at(screen, i)).collect()
+}
+
+/// Row `index` of [`snapshot`] (oldest history row = 0) without building the others.
+pub fn line_at(screen: &vt100::Screen, index: usize) -> Line {
+    let cols = screen.size().1.get();
+    match screen.history_row(index) {
+        Some(row) => Line { cells: (0..cols).map(|c| row.cell(c).map(cell_from_vt).unwrap_or_default()).collect(), wrapped: row.wrapped() },
+        None => Line { cells: vec![Cell::default(); cols as usize], wrapped: false },
     }
-    out
+}
+
+/// Plain text of row `index` (trailing blanks removed, as [`Line::text`]) and whether it wraps.
+pub fn text_at(screen: &vt100::Screen, index: usize) -> (String, bool) {
+    let cols = screen.size().1.get();
+    let mut s = String::new();
+    let Some(row) = screen.history_row(index) else { return (s, false) };
+    row.write_plain(&mut s, cols);
+    let len = s.trim_end().len();
+    s.truncate(len);
+    (s, row.wrapped())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::num::NonZeroU16;
+
+    #[test]
+    fn row_access_matches_cell_snapshot() {
+        // text_at / line_at (no screen clone) must agree with the cell-by-cell view
+        let nz = |n| NonZeroU16::new(n).unwrap();
+        let mut p = vt100::Parser::new(nz(3), nz(10), 50);
+        p.process("a  b  \r\n\x1b[31m한글\x1b[0m x\r\n".as_bytes());
+        p.process(b"0123456789wrapped\r\nlast");
+        let lines = snapshot(p.screen());
+        assert_eq!(lines.len(), p.screen().history_rows_len());
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(line, &line_at(p.screen(), i));
+            assert_eq!(text_at(p.screen(), i), (line.text(), line.wrapped), "row {i}");
+        }
+        assert!(lines.iter().any(|l| l.wrapped), "a soft-wrapped row is covered");
+        // reading history must not move a scrolled view
+        p.screen_mut().set_scrollback(1);
+        let _ = snapshot(p.screen());
+        assert_eq!(p.screen().scrollback(), 1);
+    }
 
     #[test]
     fn snapshot_includes_history() {

@@ -675,6 +675,22 @@ impl Screen {
         self.grid().visible_cell(crate::grid::Pos { row, col })
     }
 
+    /// Number of rows of the active screen counting history: scrollback rows
+    /// followed by the visible screen. Index these with [`Screen::history_row`].
+    #[must_use]
+    pub fn history_rows_len(&self) -> usize {
+        self.grid().absolute_len()
+    }
+
+    /// Row `index` of the active screen counted from the oldest scrollback row
+    /// (0) to the bottom of the screen. Unlike [`Screen::cell`], this does not
+    /// depend on (or require changing) the scrollback view offset, so callers
+    /// can read history without cloning the screen.
+    #[must_use]
+    pub fn history_row(&self, index: usize) -> Option<crate::capture::RowContents<'_>> {
+        self.grid().absolute_row(index).map(crate::capture::RowContents)
+    }
+
     /// Returns whether the text in row `row` should wrap to the next line.
     #[must_use]
     pub fn row_wrapped(&self, row: u16) -> bool {

@@ -542,6 +542,8 @@ pub struct Server {
     pub prompt_history: Vec<String>,
     pub jobs: HashMap<u32, Parked>,
     pub waits: HashMap<String, (bool, Vec<Queue>)>,
+    /// wait-for channels signalled while nobody waited (the next wait returns at once).
+    pub waits_woken: std::collections::HashSet<String>,
     pub overlay_waits: Vec<(ClientId, u64, String, Queue)>,
     pub marked: Option<PaneId>,
     pub start_time: u64,
@@ -665,6 +667,7 @@ impl Server {
             prompt_history: Vec::new(),
             jobs: HashMap::new(),
             waits: HashMap::new(),
+            waits_woken: Default::default(),
             overlay_waits: Vec::new(),
             marked: None,
             start_time: now_secs(),

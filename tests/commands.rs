@@ -343,6 +343,16 @@ fn hooks_shell_and_wait() {
     assert!(waiter.try_wait().unwrap().is_none(), "wait-for returned early");
     ctx.ok(&["wait-for", "-S", "chan"]);
     wait_for("waiter exit", || waiter.try_wait().unwrap().is_some());
+    // a signal sent before anyone waits is kept for the next wait (tmux behaviour) ...
+    ctx.ok(&["wait-for", "-S", "early"]);
+    let mut late = ctx.command().args(["wait-for", "early"]).spawn().unwrap();
+    wait_for("late waiter returns at once", || late.try_wait().unwrap().is_some());
+    // ... but only once
+    let mut again = ctx.command().args(["wait-for", "early"]).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(again.try_wait().unwrap().is_none(), "a signal was consumed twice");
+    ctx.ok(&["wait-for", "-S", "early"]);
+    wait_for("second waiter exit", || again.try_wait().unwrap().is_some());
     // environment
     ctx.ok(&["set-environment", "-t", "h", "FOO_PT", "bar"]);
     assert!(ctx.ok(&["show-environment", "-t", "h", "FOO_PT"]).contains("FOO_PT=bar"));
@@ -381,6 +391,13 @@ fn keys_config_and_capture() {
     wait_for("repeat", || ctx.capture("k").contains("xxx"));
     ctx.ok(&["send-keys", "-t", "k", "C-u"]);
     let all = ctx.ok(&["capture-pane", "-p", "-t", "k", "-S", "-", "-E", "-"]);
+    // the plain-text fast path agrees with the cell-based -N output, minus trailing blanks
+    // (retried: the shell may still be redrawing between the two captures)
+    wait_for("plain capture == -N capture", || {
+        let plain = ctx.ok(&["capture-pane", "-p", "-t", "k", "-S", "-", "-E", "-"]);
+        let cells = ctx.ok(&["capture-pane", "-p", "-N", "-t", "k", "-S", "-", "-E", "-"]);
+        plain.lines().collect::<Vec<_>>() == cells.lines().map(str::trim_end).collect::<Vec<_>>()
+    });
     assert!(all.contains("literal-Enter"));
     let esc = ctx.ok(&["capture-pane", "-p", "-e", "-t", "k"]);
     assert!(!esc.is_empty());

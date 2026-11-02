@@ -19,6 +19,11 @@ Current screen rows remain dense; editing a compact row expands it on demand.
 Read-only cell access does not expand compact rows. Reflow compacts its history
 output as well. This does not lower the history limit or change cell capacity.
 
+Local addition: `Screen::history_rows_len` / `Screen::history_row` (backed by
+`Grid::absolute_len` / `Grid::absolute_row`) and `RowContents::cell`, `wrapped`
+and `write_plain` read any history row by absolute index without cloning the
+screen or moving its scrollback view. Used by capture-pane and copy mode.
+
 Project regression tests live in src/cells.rs. Run the bundled unit/doc tests
 with `python tools/test_vt100.py` from the project root. Review these changes
 when updating vt100.

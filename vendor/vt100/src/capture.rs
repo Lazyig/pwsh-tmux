@@ -54,6 +54,24 @@ impl BasicFormattedCaptureState {
 pub struct RowContents<'a>(pub(crate) &'a crate::row::Row);
 
 impl RowContents<'_> {
+    /// The cell at `col`, or `None` past the stored row width (history rows
+    /// may be narrower than the screen).
+    #[must_use]
+    pub fn cell(&self, col: u16) -> Option<&crate::Cell> {
+        self.0.get(col)
+    }
+
+    /// Whether this row soft-wraps onto the next one.
+    #[must_use]
+    pub fn wrapped(&self) -> bool {
+        self.0.wrapped()
+    }
+
+    /// Appends the row's text (columns `0..cols`, wide characters once) to `out`.
+    pub fn write_plain(&self, out: &mut alloc::string::String, cols: u16) {
+        self.0.write_contents(out, 0, cols, false);
+    }
+
     /// Writes the contents of the row to the provided buffer, in the same
     /// format as [`Screen::contents_formatted_basic`].
     ///

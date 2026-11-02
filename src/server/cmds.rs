@@ -1994,8 +1994,10 @@ impl Server {
             "capture-pane" => {
                 let tt = self.resolve_pane(ctx, t)?;
                 let p = self.panes.get(&tt.pane.unwrap()).ok_or("no pane")?;
-                let lines = p.snapshot();
-                let hist = p.screen().scrollback_len() as i64;
+                let screen = p.screen();
+                // only the requested rows are read; plain text skips per-cell conversion
+                let total = screen.history_rows_len() as i64;
+                let hist = screen.scrollback_len() as i64;
                 let rows = p.size.1 as i64;
                 let parse = |v: Option<&str>, default: i64| -> i64 {
                     match v {
@@ -2006,15 +2008,20 @@ impl Server {
                 };
                 let start = parse(o.get('S'), 0);
                 let end = parse(o.get('E'), rows - 1);
-                let to_abs = |v: i64| -> i64 { if v == i64::MIN { 0 } else { (hist + v).clamp(0, lines.len() as i64 - 1) } };
-                let (a, b) = (to_abs(start), if o.get('E') == Some("-") { lines.len() as i64 - 1 } else { to_abs(end) });
+                let to_abs = |v: i64| -> i64 { if v == i64::MIN { 0 } else { (hist + v).clamp(0, total - 1) } };
+                let (a, b) = (to_abs(start), if o.get('E') == Some("-") { total - 1 } else { to_abs(end) });
                 let mut out = String::new();
                 let mut i = a;
                 while i <= b {
-                    let line = &lines[i as usize];
-                    let text = if o.has('e') { render::line_with_escapes(line) } else if o.has('N') { line.cells.iter().map(|c| c.text.as_str()).collect() } else { line.text() };
+                    let (text, wrapped) = if o.has('e') || o.has('N') {
+                        let line = crate::cells::line_at(screen, i as usize);
+                        let text = if o.has('e') { render::line_with_escapes(&line) } else { line.cells.iter().map(|c| c.text.as_str()).collect() };
+                        (text, line.wrapped)
+                    } else {
+                        crate::cells::text_at(screen, i as usize)
+                    };
                     out.push_str(&text);
-                    if !(o.has('J') && line.wrapped) {
+                    if !(o.has('J') && wrapped) {
                         out.push('\n');
                     }
                     i += 1;
@@ -2649,10 +2656,20 @@ impl Server {
             "wait-for" => {
                 let ch = o.rest.first().ok_or("wait-for needs a channel")?.clone();
                 if o.has('S') {
-                    if let Some((_, waiters)) = self.waits.remove(&ch) {
-                        for q in waiters {
-                            self.run_queue(q);
+                    let locked = self.waits.get(&ch).is_some_and(|e| e.0);
+                    let waiters = self.waits.get_mut(&ch).map(|e| std::mem::take(&mut e.1)).unwrap_or_default();
+                    if !locked {
+                        self.waits.remove(&ch);
+                    }
+                    if waiters.is_empty() {
+                        // like tmux: a signal nobody is waiting for is kept for the next wait-for
+                        if !locked {
+                            self.waits_woken.insert(ch);
                         }
+                        return Ok(Flow::Next);
+                    }
+                    for q in waiters {
+                        self.run_queue(q);
                     }
                     return Ok(Flow::Next);
                 }
@@ -2676,6 +2693,9 @@ impl Server {
                         self.run_queue(q);
                     }
                     return Ok(Flow::Next);
+                }
+                if self.waits_woken.remove(&ch) {
+                    return Ok(Flow::Next); // already signalled
                 }
                 Err(format!("\0wait\0{ch}"))
             }

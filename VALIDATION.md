@@ -93,8 +93,10 @@ capabilities from a launcher, and Windows panes now advertise the configured
 virtual terminal and truecolor support just like Unix panes. Explicit terminal
 names, Unix `TERM=dumb`, and application `NO_COLOR` preferences are preserved.
 
-Windows 193 / Linux 191 unit tests and 35 local integration tests per platform
-pass, including the new real-terminal dark-background progress-bar regression.
+The later latency follow-up (ioctl terminal size on Unix, row-range
+`capture-pane`, `wait-for -S` before a waiter) brought Windows 194 / Linux 192
+unit tests and 36 local integration tests per platform, all passing, including
+the real-terminal dark-background progress-bar regression.
 
 ```text
 cargo test --locked
