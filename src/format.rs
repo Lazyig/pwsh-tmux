@@ -326,6 +326,20 @@ impl Expander<'_> {
                 glob_match(&pat, &text, icase)
             };
             bool_str(matched)
+        } else if let Some(m) = mods.iter().find(|m| m.name == "||" || m.name == "&&") {
+            // n-ary: #{||:a,b,c}
+            let mut parts = Vec::new();
+            let mut rest = copy;
+            while let Some((a, b)) = split2(rest) {
+                parts.push(a);
+                rest = b;
+            }
+            parts.push(rest);
+            if parts.len() < 2 {
+                return None;
+            }
+            let or = m.name == "||";
+            bool_str(if or { parts.iter().any(|p| truthy(&ex(p))) } else { parts.iter().all(|p| truthy(&ex(p))) })
         } else if let Some(m) = mods.iter().find(|m| COMPARE.contains(&m.name)) {
             let (a, b) = split2(copy)?;
             let (a, b) = (ex(a), ex(b));
@@ -916,12 +930,67 @@ pub fn parse_style(s: &str, base: Style) -> Result<Style, String> {
 // Spans and layout
 // ---------------------------------------------------------------------------------------------
 
+/// A mouse range set with `#[range=...]` (tmux style ranges), used to find what a click
+/// on a status line hit.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Range {
+    Left,
+    Right,
+    Window(u32),
+    Pane(u32),
+    Session(u32),
+    User(String),
+}
+
+impl Range {
+    /// Parses the value of `range=`: left, right, window|N, pane|%N, session|$N, user|X.
+    /// `Ok(None)` is tmux's STYLE_RANGE_NONE.
+    pub fn parse(v: &str) -> Result<Option<Range>, String> {
+        let (kind, arg) = match v.split_once('|') {
+            Some((k, a)) => (k, Some(a)),
+            None => (v, None),
+        };
+        let num = |a: Option<&str>, prefix: &str| -> Result<u32, String> {
+            let a = a.ok_or_else(|| format!("bad range: {v}"))?;
+            a.strip_prefix(prefix).unwrap_or(a).parse().map_err(|_| format!("bad range: {v}"))
+        };
+        Ok(Some(match kind.to_ascii_lowercase().as_str() {
+            "left" if arg.is_none() => Range::Left,
+            "right" if arg.is_none() => Range::Right,
+            "window" => Range::Window(num(arg, "@")?),
+            "pane" => Range::Pane(num(arg, "%")?),
+            "session" => Range::Session(num(arg, "$")?),
+            "user" => match arg {
+                Some(a) if a.len() <= 15 => Range::User(a.to_string()),
+                _ => return Err(format!("bad range: {v}")),
+            },
+            "none" if arg.is_none() => return Ok(None),
+            _ => return Err(format!("bad range: {v}")),
+        }))
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Range::Left => "left",
+            Range::Right => "right",
+            Range::Window(_) => "window",
+            Range::Pane(_) => "pane",
+            Range::Session(_) => "session",
+            Range::User(_) => "user",
+        }
+    }
+}
+
 /// A run of text with one style, as produced from embedded `#[...]` style directives.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Span {
     pub text: String,
     pub style: Style,
     pub align: Align,
+    /// Mouse range. As in tmux, a range only counts once a later `#[...]` ends it.
+    pub range: Option<Range>,
+    /// The last span of a range: tmux's range then covers one more cell.
+    pub range_end: bool,
 }
 
 /// Split already-expanded text into styled spans: `#[fg=red]a#[default]b`.
@@ -933,19 +1002,23 @@ pub fn spans(text: &str, base: Style) -> Vec<Span> {
     let mut default = base;
     let mut defaults: Vec<Style> = Vec::new();
     let mut align = Align::Left;
+    let mut range: Option<Range> = None;
+    let mut range_start = 0;
     let mut buf = String::new();
 
-    fn flush(out: &mut Vec<Span>, buf: &mut String, style: Style, align: Align) {
+    fn flush(out: &mut Vec<Span>, buf: &mut String, style: Style, align: Align, range: &Option<Range>) {
         if buf.is_empty() {
             return;
         }
         if let Some(last) = out.last_mut()
             && last.style == style
             && last.align == align
+            && last.range == *range
+            && !last.range_end
         {
             last.text.push_str(buf);
         } else {
-            out.push(Span { text: buf.clone(), style, align });
+            out.push(Span { text: buf.clone(), style, align, range: range.clone(), range_end: false });
         }
         buf.clear();
     }
@@ -959,18 +1032,37 @@ pub fn spans(text: &str, base: Style) -> Vec<Span> {
         } else if rest.starts_with("#[")
             && let Some(e) = rest.find(']')
         {
-            flush(&mut out, &mut buf, cur, align);
+            flush(&mut out, &mut buf, cur, align, &range);
+            let before = range.clone();
             for w in style_words(&rest[2..e]) {
-                match w.to_ascii_lowercase().as_str() {
+                let lower = w.to_ascii_lowercase();
+                match lower.as_str() {
                     "push-default" => {
                         defaults.push(default);
                         default = cur;
                     }
                     "pop-default" => default = defaults.pop().unwrap_or(base),
+                    "norange" => range = None,
+                    _ if lower.starts_with("range=") => {
+                        if let Ok(r) = Range::parse(&w[6..]) {
+                            range = r;
+                        }
+                    }
+                    "default" => {
+                        range = None;
+                        let _ = apply_word(w, &mut cur, &mut align, default);
+                    }
                     _ => {
                         let _ = apply_word(w, &mut cur, &mut align, default);
                     }
                 }
+            }
+            if range != before {
+                // the open range ends here (format_draw adds it to the list)
+                if before.is_some() && out.len() > range_start {
+                    out.last_mut().unwrap().range_end = true;
+                }
+                range_start = out.len();
             }
             i += e + 1;
         } else {
@@ -979,7 +1071,13 @@ pub fn spans(text: &str, base: Style) -> Vec<Span> {
             i += c.len_utf8();
         }
     }
-    flush(&mut out, &mut buf, cur, align);
+    flush(&mut out, &mut buf, cur, align, &range);
+    // a range still open at the end is dropped, as tmux does
+    if range.is_some() {
+        for sp in &mut out[range_start..] {
+            sp.range = None;
+        }
+    }
     out
 }
 
@@ -988,10 +1086,14 @@ pub fn width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
-/// Cells for a group of spans; wide characters occupy a lead cell plus an empty continuation.
-fn group_cells<'a>(spans: impl Iterator<Item = &'a Span>) -> Vec<Cell> {
+/// Cells for a group of spans (wide characters occupy a lead cell plus an empty
+/// continuation) and the mouse range of every cell.
+fn group_cells_ranged<'a>(spans: impl Iterator<Item = &'a Span>) -> (Vec<Cell>, Vec<Option<Range>>) {
     let mut cells: Vec<Cell> = Vec::new();
+    let mut tags: Vec<Option<Range>> = Vec::new();
+    let mut extend: Option<Range> = None;
     for sp in spans {
+        let tag = sp.range.clone();
         for c in sp.text.chars() {
             if c.is_control() {
                 continue;
@@ -1004,14 +1106,20 @@ fn group_cells<'a>(spans: impl Iterator<Item = &'a Span>) -> Vec<Cell> {
                 }
                 Some(w) => {
                     cells.push(Cell { text: c.to_string(), style: sp.style });
+                    // a range that ended just before covers this cell too
+                    tags.push(extend.take().or_else(|| tag.clone()));
                     for _ in 1..w {
                         cells.push(Cell { text: String::new(), style: sp.style });
+                        tags.push(tag.clone());
                     }
                 }
             }
         }
+        if sp.range_end {
+            extend = sp.range.clone();
+        }
     }
-    cells
+    (cells, tags)
 }
 
 /// Copy `cells[from..from+n]` to `out[at..]`, blanking wide characters cut at either edge.
@@ -1029,9 +1137,15 @@ fn put(out: &mut [Cell], at: usize, cells: &[Cell], from: usize, n: usize, fill:
 /// centre group halfway between them. When too wide, the centre shrinks first, then the right,
 /// then the left (as tmux does); wide characters are never split.
 pub fn layout_line(spans: &[Span], width: usize, fill: Style) -> Vec<Cell> {
+    layout_line_ranged(spans, width, fill).0
+}
+
+/// [`layout_line`] plus the mouse range (`#[range=...]`) under every cell.
+pub fn layout_line_ranged(spans: &[Span], width: usize, fill: Style) -> (Vec<Cell>, Vec<Option<Range>>) {
     let mut out = vec![Cell { text: " ".into(), style: fill }; width];
-    let group = |a: Align| group_cells(spans.iter().filter(move |s| s.align == a));
-    let (left, centre, right) = (group(Align::Left), group(Align::Centre), group(Align::Right));
+    let mut tags: Vec<Option<Range>> = vec![None; width];
+    let group = |a: Align| group_cells_ranged(spans.iter().filter(move |s| s.align == a));
+    let ((left, ltags), (centre, ctags), (right, rtags)) = (group(Align::Left), group(Align::Centre), group(Align::Right));
     let (mut lw, mut cw, mut rw) = (left.len(), centre.len(), right.len());
     while lw + cw + rw > width {
         if cw > 0 {
@@ -1044,16 +1158,19 @@ pub fn layout_line(spans: &[Span], width: usize, fill: Style) -> Vec<Cell> {
     }
     if lw > 0 {
         put(&mut out, 0, &left, 0, lw, fill);
+        tags[..lw].clone_from_slice(&ltags[..lw]);
     }
     if rw > 0 {
         put(&mut out, width - rw, &right, right.len() - rw, rw, fill);
+        tags[width - rw..].clone_from_slice(&rtags[right.len() - rw..]);
     }
     if cw > 0 {
         let at = lw + (width - rw - lw) / 2 - cw / 2;
         let from = centre.len() / 2 - cw / 2;
         put(&mut out, at, &centre, from, cw, fill);
+        tags[at..at + cw].clone_from_slice(&ctags[from..from + cw]);
     }
-    out
+    (out, tags)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1064,6 +1181,27 @@ pub fn layout_line(spans: &[Span], width: usize, fill: Style) -> Vec<Cell> {
 mod tests {
     use super::*;
     use crate::cells::{BLINK, BOLD, DIM, INVERSE, ITALIC, STRIKE, UNDERLINE};
+
+    #[test]
+    fn mouse_ranges_follow_tmux_format_draw() {
+        let base = Style::default();
+        let tags = |s: &str| layout_line_ranged(&spans(s, base), 8, base).1;
+        let w = |n| Some(Range::Window(n));
+        // a closed range covers one cell more; one still open at the end counts for nothing
+        assert_eq!(tags("#[range=window|3]ab#[norange]cd#[range=left]ef"), vec![w(3), w(3), w(3), None, None, None, None, None]);
+        // #[default] ends a range too; where ranges overlap the earlier one wins
+        assert_eq!(tags("#[range=window|1]a#[default]#[range=window|2]b#[norange]"), vec![w(1), w(1), None, None, None, None, None, None]);
+        assert_eq!(tags("#[range=window|1]a#[default]x#[range=window|2]b#[norange]y"), vec![w(1), w(1), w(2), w(2), None, None, None, None]);
+        // ranges keep to their alignment group
+        let right = tags("x#[align=right]#[range=right]RR#[norange]");
+        assert_eq!(right[6..], [Some(Range::Right), Some(Range::Right)]);
+        assert_eq!(right[..6], [None, None, None, None, None, None]);
+        assert_eq!(Range::parse("user|abc"), Ok(Some(Range::User("abc".into()))));
+        assert_eq!(Range::parse("pane|%7"), Ok(Some(Range::Pane(7))));
+        assert_eq!(Range::parse("session|$2"), Ok(Some(Range::Session(2))));
+        assert_eq!(Range::parse("none"), Ok(None));
+        assert!(Range::parse("window").is_err());
+    }
 
     fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
@@ -1208,6 +1346,10 @@ mod tests {
         assert_eq!(x("#{=-3:t}", &v), "hij");
         assert_eq!(x("#{=20:t}", &v), "abcdefghij");
         assert_eq!(x("#{=/3/...:t}", &v), "abc...");
+        assert_eq!(x("#{||:0,0,1}", &v), "1");
+        assert_eq!(x("#{||:0,,0}", &v), "0");
+        assert_eq!(x("#{&&:1,1,1}", &v), "1");
+        assert_eq!(x("#{&&:1,0,1}", &v), "0");
         assert_eq!(x("#{=/-3/...:t}", &v), "...hij");
         assert_eq!(x("#{=/20/...:t}", &v), "abcdefghij");
         // Display columns, never splitting a wide char.
@@ -1494,8 +1636,8 @@ mod tests {
         assert_eq!(
             sp,
             vec![
-                Span { text: "a".into(), style: st(Color::Idx(1), 0), align: Align::Left },
-                Span { text: "b".into(), style: base, align: Align::Left },
+                Span { text: "a".into(), style: st(Color::Idx(1), 0), align: Align::Left, range: None, range_end: false },
+                Span { text: "b".into(), style: base, align: Align::Left, range: None, range_end: false },
             ]
         );
         // Merging of identical styles, `##` → `#`, `##[` is literal.

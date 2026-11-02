@@ -50,6 +50,9 @@ impl JumpKind {
 type Pos = (usize, usize);
 type SearchOrigin = (Pos, usize, Option<(String, bool)>);
 
+/// tmux WHITESPACE.
+const WHITESPACE: &str = "\t ";
+
 /// tmux's default `word-separators` (tmux 3.0 - 3.2).
 pub const DEFAULT_WORD_SEPARATORS: &str = " -_@";
 
@@ -87,6 +90,10 @@ pub struct CopyMode {
     show_position: bool,
     search_marks: bool,
     exit_on_bottom: bool,
+    /// tmux's lastcx / lastsx: the column to return to and the length of the line it was on,
+    /// for vertical motion and scrolling (both start at 0).
+    tlastcx: usize,
+    tlastsx: usize,
 }
 
 impl CopyMode {
@@ -116,6 +123,8 @@ impl CopyMode {
             show_position: true,
             search_marks: false,
             exit_on_bottom: false,
+            tlastcx: 0,
+            tlastsx: 0,
         };
         cm.pad();
         cm.top = cm.hsize();
@@ -129,6 +138,91 @@ impl CopyMode {
     /// `copy-mode -e`: leave copy mode once scrolled back to the bottom.
     pub fn set_exit_on_bottom(&mut self, on: bool) {
         self.exit_on_bottom = on;
+    }
+
+    /// `copy-mode -H`: hide the position indicator.
+    pub fn set_show_position(&mut self, on: bool) {
+        self.show_position = on;
+    }
+
+    /// Cursor position within the view: (row, column).
+    pub fn view_cursor(&self) -> (u16, u16) {
+        ((self.cy - self.top) as u16, self.cx as u16)
+    }
+
+    pub fn view_height(&self) -> usize {
+        self.height
+    }
+
+    /// Line `i` of the content (0 = oldest history line) and how many there are.
+    pub fn line(&self, i: usize) -> Option<&Line> {
+        self.lines.get(i)
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Absolute index of the first line in view.
+    pub fn view_top(&self) -> usize {
+        self.top
+    }
+
+    /// window_copy_start_drag for a character selection: select from this cell.
+    pub fn start_drag(&mut self, row: u16, col: u16) {
+        self.move_to_view(row, col);
+        self.line_mode = false;
+        self.anchor = Some((self.cy, self.cx));
+    }
+
+    /// The other end of a mouse selection moves here.
+    pub fn drag_to(&mut self, row: u16, col: u16) {
+        self.move_to_view(row, col);
+    }
+
+    /// `copy-mode -d`: a page down; true when that should leave copy mode (with -e).
+    pub fn page_down_exit(&mut self, exit: bool) -> bool {
+        self.page_down(self.height);
+        exit && self.scroll_offset() == 0
+    }
+
+    /// window_copy_cursor_up/down(scroll_only): scroll the view one line while the cursor
+    /// keeps its row on the screen, sticking to the end of lines as tmux does.
+    pub fn scroll_line(&mut self, up: bool) {
+        let row = self.cy - self.top;
+        let norect = self.anchor.is_none() || !self.rect;
+        self.sticky_begin(norect);
+        if up {
+            self.top = self.top.saturating_sub(1);
+        } else {
+            self.top = (self.top + 1).min(self.hsize());
+        }
+        self.cy = (self.top + row).min(self.lines.len() - 1);
+        self.sticky_end(norect);
+    }
+
+    /// Before a vertical move: remember the column unless the cursor is at the end of
+    /// its line, then return to the remembered column.
+    fn sticky_begin(&mut self, norect: bool) {
+        let ox = self.len(self.cy);
+        if norect && self.cx != ox {
+            self.tlastcx = self.cx;
+            self.tlastsx = ox;
+        }
+        if norect {
+            self.cx = self.tlastcx;
+        }
+    }
+
+    /// After a vertical move: a cursor that was at a line end stays at the line end.
+    fn sticky_end(&mut self, norect: bool) {
+        if norect {
+            let px = self.len(self.cy);
+            if (self.cx >= self.tlastsx && self.cx != px) || self.cx > px {
+                self.cx = px;
+            }
+        }
+        self.cx = self.snap(self.cy, self.cx);
     }
 
     /// Moves the cursor to a cell of the current view (mouse clicks and drags).
@@ -149,6 +243,12 @@ impl CopyMode {
 
     pub fn selection_active(&self) -> bool {
         self.anchor.is_some()
+    }
+
+    /// selection_start_* / selection_end_*: the anchor and the cursor as (x, y), y counted
+    /// from the oldest history line.
+    pub fn selection_ends(&self) -> Option<((usize, usize), (usize, usize))> {
+        self.anchor.map(|(ay, ax)| ((ax, ay), (self.cx, self.cy)))
     }
 
     pub fn begin_incremental_search(&mut self) {
@@ -459,8 +559,9 @@ impl CopyMode {
             self.search_marks = false;
         }
         let action = self.run_inner(command, args);
-        let downward = matches!(command, "scroll-down" | "page-down" | "halfpage-down" | "cursor-down" | "history-bottom" | "scroll-down-and-cancel" | "page-down-and-cancel");
-        if self.exit_on_bottom && downward && action == Action::None && self.scroll_offset() == 0 && self.anchor.is_none() {
+        // copy-mode -e: these leave copy mode at the bottom, selection or not
+        let downward = matches!(command, "scroll-down" | "page-down" | "halfpage-down");
+        if self.exit_on_bottom && downward && action == Action::None && self.scroll_offset() == 0 {
             return Action::Cancel;
         }
         action
@@ -517,8 +618,8 @@ impl CopyMode {
             "page-down" => (0..n).for_each(|_| self.page_down(self.height)),
             "halfpage-up" => (0..n).for_each(|_| self.page_up((self.height / 2).max(1))),
             "halfpage-down" => (0..n).for_each(|_| self.page_down((self.height / 2).max(1))),
-            "scroll-up" => (0..n).for_each(|_| self.scroll_view(-1)),
-            "scroll-down" => (0..n).for_each(|_| self.scroll_view(1)),
+            "scroll-up" => (0..n).for_each(|_| self.scroll_line(true)),
+            "scroll-down" => (0..n).for_each(|_| self.scroll_line(false)),
             "scroll-middle" => {
                 self.top = self.cy.saturating_sub(self.height / 2).min(self.hsize());
             }
@@ -536,10 +637,19 @@ impl CopyMode {
                 self.set_x(x);
             }
             "select-word" => {
-                let (start, end) = self.word_extent((self.cy, self.cx), &seps);
+                // window_copy_cmd_select_word: back to the start of the word, then to its end
+                let start = self.reader_previous_word((self.cy, self.cx), &seps, false, !self.vi);
+                let (py, px) = start;
+                let (mut ny, mut nx) = (py, px + 1);
+                if self.wrapped(ny) && nx > self.width - 1 && ny + 1 < self.lines.len() {
+                    nx = 0;
+                    ny += 1;
+                }
+                let single = px < self.len(py) && self.in_set((ny, nx), WHITESPACE);
                 self.line_mode = false;
                 self.anchor = Some(start);
-                let end = if self.vi { end } else { self.step_right(end).unwrap_or(end) };
+                let end = if single { self.step_right(start).unwrap_or(start) } else { self.reader_next_word_end(start, &seps) };
+                let end = if self.vi { self.step_left(end).filter(|p| *p >= start).unwrap_or(start) } else { end };
                 self.set_cursor(end.0, end.1);
             }
             "rectangle-toggle" => self.rect = !self.rect,
@@ -885,13 +995,21 @@ impl CopyMode {
         self.set_cursor(p.0, p.1);
     }
 
+    /// window_copy_cursor_up / window_copy_cursor_down, `dy` times.
     fn vertical(&mut self, dy: isize) {
         let last = self.lines.len() - 1;
-        let y = if dy < 0 { self.cy.saturating_sub(dy.unsigned_abs()) } else { (self.cy + dy as usize).min(last) };
-        let lastcx = self.lastcx;
-        self.cy = y;
-        self.cx = self.snap(y, lastcx.min(self.max_x(y)));
-        self.ensure_visible();
+        for _ in 0..dy.unsigned_abs() {
+            let norect = self.anchor.is_none() || !self.rect;
+            self.sticky_begin(norect);
+            if dy < 0 {
+                self.cy = self.cy.saturating_sub(1);
+            } else {
+                self.cy = (self.cy + 1).min(last);
+            }
+            self.ensure_visible();
+            self.sticky_end(norect);
+        }
+        self.lastcx = self.cx;
     }
 
     /// tmux window_copy_pageup1: scroll the view up `n` lines keeping the cursor row.
@@ -923,25 +1041,106 @@ impl CopyMode {
     }
 
     fn place_row(&mut self, row: usize) {
+        self.sticky_begin(true);
         let y = (self.top + row).min(self.lines.len() - 1);
         self.cy = y;
-        self.cx = self.snap(y, self.lastcx.min(self.max_x(y)));
+        self.sticky_end(self.anchor.is_none() || !self.rect);
     }
 
-    /// Scroll the view by one line (-1 = towards history) keeping the cursor on its text.
-    fn scroll_view(&mut self, d: isize) {
-        if d < 0 {
-            self.top = self.top.saturating_sub(1);
-            if self.cy >= self.top + self.height {
-                self.cy = self.top + self.height - 1;
-            }
-        } else {
-            self.top = (self.top + 1).min(self.hsize());
-            if self.cy < self.top {
-                self.cy = self.top;
+    // ----------------------------------------------------------------- tmux grid_reader
+
+    /// grid_in_set: whether the character at a position is in `set` (blank past the end).
+    fn in_set(&self, (y, x): Pos, set: &str) -> bool {
+        match self.cell(y, x) {
+            None => set.contains(' '),
+            Some(c) if c.is_continuation() => false,
+            Some(c) => {
+                let mut chars = c.text.chars();
+                matches!((chars.next(), chars.next()), (Some(ch), None) if set.contains(ch))
             }
         }
-        self.cx = self.snap(self.cy, self.lastcx.min(self.max_x(self.cy)));
+    }
+
+    /// grid_reader_cursor_previous_word.
+    fn reader_previous_word(&self, (mut y, mut x): Pos, seps: &str, already: bool, stop_at_eol: bool) -> Pos {
+        let word_is_letters;
+        if already || self.in_set((y, x), WHITESPACE) {
+            loop {
+                if x > 0 {
+                    x -= 1;
+                    if !self.in_set((y, x), WHITESPACE) {
+                        word_is_letters = !self.in_set((y, x), seps);
+                        break;
+                    }
+                } else {
+                    if y == 0 {
+                        return (y, x);
+                    }
+                    y -= 1;
+                    x = self.len(y);
+                    if stop_at_eol && x > 0 && self.in_set((y, x - 1), WHITESPACE) {
+                        word_is_letters = false;
+                        break;
+                    }
+                }
+            }
+        } else {
+            word_is_letters = !self.in_set((y, x), seps);
+        }
+        loop {
+            let old = (y, x);
+            if x == 0 {
+                if y == 0 || !self.wrapped(y - 1) {
+                    return old;
+                }
+                y -= 1;
+                x = self.width;
+            }
+            x = x.saturating_sub(1);
+            if self.in_set((y, x), WHITESPACE) || word_is_letters == self.in_set((y, x), seps) {
+                return old;
+            }
+        }
+    }
+
+    /// grid_reader_cursor_next_word_end (emacs): the position just after the word.
+    fn reader_next_word_end(&self, (mut y, mut x): Pos, seps: &str) -> Pos {
+        let last = self.lines.len() - 1;
+        let line_end = |y: usize| if self.wrapped(y) { self.width - 1 } else { self.len(y) };
+        let mut xx = line_end(y);
+        let wrap = |x: &mut usize, y: &mut usize, xx: &mut usize| -> bool {
+            while *x > *xx {
+                if *y == last {
+                    return false;
+                }
+                *x = 0;
+                *y += 1;
+                *xx = line_end(*y);
+            }
+            true
+        };
+        while wrap(&mut x, &mut y, &mut xx) {
+            if self.in_set((y, x), WHITESPACE) {
+                x += 1;
+            } else if self.in_set((y, x), seps) {
+                loop {
+                    x += 1;
+                    if !(wrap(&mut x, &mut y, &mut xx) && self.in_set((y, x), seps) && !self.in_set((y, x), WHITESPACE)) {
+                        break;
+                    }
+                }
+                return (y, x);
+            } else {
+                loop {
+                    x += 1;
+                    if !(wrap(&mut x, &mut y, &mut xx) && !(self.in_set((y, x), WHITESPACE) || self.in_set((y, x), seps))) {
+                        break;
+                    }
+                }
+                return (y, x);
+            }
+        }
+        (y, x)
     }
 
     // ----------------------------------------------------------------- word motions
@@ -1568,9 +1767,13 @@ mod tests {
         cm.key("b");
         assert_eq!(cm.cx, 5);
         // Moving onto a continuation column snaps to the lead.
-        let mut cm = CopyMode::new(lines(&["abc", "가나"]), W, 2, (0, 3), true);
+        let mut cm = CopyMode::new(lines(&["abcd", "가나"]), W, 2, (0, 3), true);
         cm.key("j");
         assert_eq!(pos(&cm), (1, 2));
+        // A cursor at the end of a line stays at line ends (tmux lastsx).
+        let mut cm = CopyMode::new(lines(&["abc", "가나다"]), W, 2, (0, 3), true);
+        cm.key("j");
+        assert_eq!(pos(&cm), (1, 6));
     }
 
     #[test]
@@ -1618,16 +1821,19 @@ mod tests {
     }
 
     #[test]
-    fn scroll_line_keeps_cursor_on_text() {
+    fn scroll_line_keeps_cursor_row() {
+        // tmux 3.6 scroll-up / scroll-down: the view moves, the cursor keeps its screen row
         let mut cm = numbered();
         cm.key("k");
+        let row = cm.cy - cm.top;
         cm.key("C-y");
         assert_eq!(cm.scroll_offset(), 1);
-        assert_eq!(cm.cy, 13);
+        assert_eq!((cm.cy - cm.top, cm.cy), (row, 12));
         cm.key("C-y");
-        assert_eq!(cm.cy, 12, "pushed up by the bottom edge");
+        assert_eq!((cm.cy - cm.top, cm.cy), (row, 11));
         cm.key("C-e");
         assert_eq!(cm.scroll_offset(), 1);
+        assert_eq!(cm.cy, 12);
         keys(&mut cm, &["g", "z"]);
         assert_eq!(cm.scroll_offset(), 10);
         keys(&mut cm, &["1", "2", "j", "z"]);
@@ -1956,14 +2162,36 @@ mod tests {
         assert!(top.ends_with(ind), "{top:?}");
         let start = W as usize - ind.len();
         assert!(view[0].cells[start..].iter().all(|c| c.style.bg == YELLOW && c.style.fg == BLACK));
-        // Cursor line 12 is row 12 - top(9) = 3.
-        assert_eq!(cur, (3, 3));
-        let inv: Vec<bool> = view[3].cells[..6].iter().map(|c| c.style.bg == YELLOW).collect();
+        // C-y kept the cursor on screen row 2: line 11 (top 9).
+        assert_eq!(cur, (2, 3));
+        let inv: Vec<bool> = view[2].cells[..6].iter().map(|c| c.style.bg == YELLOW).collect();
         assert_eq!(inv, vec![false, true, true, true, false, false]);
-        assert!(view[2].cells.iter().all(|c| c.style.bg != YELLOW));
+        assert!(view[1].cells.iter().all(|c| c.style.bg != YELLOW));
         cm.key("P");
         let (view, _) = cm.render();
         assert!(!view[0].cells.iter().any(|c| c.style.bg == YELLOW));
+    }
+
+    #[test]
+    fn select_word_like_tmux() {
+        let pick = |text: &str, x: u16, vi: bool| {
+            let mut cm = CopyMode::new(lines(&[text]), W, 1, (0, x), vi);
+            cm.set_word_separators("!\"#$%&'()*+,-./:;<=>?@[\\]^`{|}~");
+            cm.run("select-word", &[]);
+            match cm.run("copy-selection", &[]) {
+                Action::Copy { text, .. } => text,
+                other => panic!("{other:?}"),
+            }
+        };
+        for vi in [false, true] {
+            assert_eq!(pick("alpha beta gamma", 8, vi), "beta");
+            // on a space: the word before it
+            assert_eq!(pick("history 48 filler", 10, vi), "48");
+            // separators end words; a run of separators is a word
+            assert_eq!(pick("gamma-delta", 18 - 10, vi), "delta");
+            assert_eq!(pick("x=1 y=22", 2, vi), "1");
+            assert_eq!(pick("a -- b", 3, vi), "--");
+        }
     }
 
     #[test]

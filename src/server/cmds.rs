@@ -25,7 +25,7 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("customize-mode", "", "NZ", "Fft"),
     ("delete-buffer", "deleteb", "", "b"),
     ("detach-client", "detach", "aP", "Esct"),
-    ("display-menu", "menu", "O", "bcCHMstSTxy"),
+    ("display-menu", "menu", "MO", "bcCHstSTxy"),
     ("display-message", "display", "aINpv", "cdt"),
     ("display-panes", "displayp", "bN", "dt"),
     ("display-popup", "popup", "BCEk", "bcdeHhsStTwxy"),
@@ -375,7 +375,7 @@ impl Server {
             "{down-of}" => dir_of(Dir::Down),
             "{left-of}" => dir_of(Dir::Left),
             "{right-of}" => dir_of(Dir::Right),
-            "{mouse}" | "=" => ctx.mouse.as_ref().and_then(|m| m.pane),
+            "{mouse}" | "=" => ctx.mouse.as_ref().and_then(|m| self.mouse_pane(m)),
             "{marked}" | "~" => self.marked,
             _ => None,
         };
@@ -415,7 +415,7 @@ impl Server {
         }
         if t == "{mouse}" || t == "=" {
             let m = ctx.mouse.as_ref().ok_or("no mouse target")?;
-            let p = m.pane.ok_or("no mouse pane")?;
+            let p = self.mouse_pane(m).ok_or("no mouse target")?;
             return Ok(self.target_for_pane(p));
         }
         if t == "{marked}" || t == "~" {
@@ -725,7 +725,8 @@ impl Server {
                 Node::Split { horizontal, ratio: 1.0 - ratio_new, a: Box::new(old), b: Box::new(Node::Leaf(new)) }
             };
         } else {
-            win.layout.split_ex(target, new, horizontal, before, Some(new_size), r);
+            // no size: tmux's middle split, whose first cell gets the odd column
+            win.layout.split_ex(target, new, horizontal, before, size.map(|_| new_size), r);
         }
         win.zoomed = false;
         self.apply_layout(wid);
@@ -991,7 +992,7 @@ impl Server {
                 } else {
                     let tt = self.resolve_pane(ctx, t).or_else(|_| self.resolve_session(ctx, t).map(|s| Target { sid: Some(s), ..Target::default() }))?;
                     let sid = tt.sid.ok_or("no session")?;
-                    if t.is_some_and(|t| t.contains(':') || t.contains('.') || t.starts_with('%') || t.starts_with('@')) {
+                    if t.is_some_and(|t| t.contains(':') || t.contains('.') || t.starts_with('%') || t.starts_with('@') || t == "=" || t == "{mouse}") {
                         if let (Some(idx), Some(wid), Some(p)) = (tt.idx, tt.wid, tt.pane) {
                             self.select_window(sid, idx);
                             self.select_pane(wid, p);
@@ -2089,6 +2090,10 @@ impl Server {
             }
             "display-panes" => {
                 let cid = self.resolve_client(ctx, t)?;
+                // like tmux, nothing happens while another overlay is shown
+                if self.clients.get(&cid).is_some_and(|c| c.overlay.is_some()) {
+                    return Ok(Flow::Next);
+                }
                 let sid = self.client_session(cid);
                 let ms = o.get('d').and_then(|v| v.parse().ok()).unwrap_or_else(|| self.opt_session_num(sid, "display-panes-time").max(1) as u64);
                 let template = o.rest.first().cloned().unwrap_or_else(|| "select-pane -t '%%'".into());
@@ -2097,28 +2102,45 @@ impl Server {
             }
             // ---------------------------------------------------------------- modes
             "copy-mode" => {
-                let tt = match o.get('s') {
-                    Some(_) => self.resolve_pane(ctx, t)?,
-                    None if o.has('M') => ctx.mouse.as_ref().and_then(|m| m.pane).map(|p| self.target_for_pane(p)).ok_or("no mouse pane")?,
-                    None => self.resolve_pane(ctx, t)?,
-                };
-                let pane = tt.pane.unwrap();
+                let tt = self.resolve_pane(ctx, t)?;
+                let mut pane = tt.pane.unwrap();
                 if o.has('q') {
                     self.exit_mode(pane);
                     return Ok(Flow::Next);
                 }
-                self.enter_copy_mode(pane);
+                if o.has('M') {
+                    // the pane under the mouse, for a client attached to that session
+                    let Some(m) = ctx.mouse.clone() else { return Ok(Flow::Next) };
+                    let Some(p) = self.mouse_pane(&m) else { return Ok(Flow::Next) };
+                    if ctx.client.is_none() || ctx.client.and_then(|c| self.client_session(c)) != m.sid {
+                        return Ok(Flow::Next);
+                    }
+                    pane = p;
+                }
+                let already = matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(_)));
+                if !already {
+                    self.enter_copy_mode(pane);
+                    if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
+                        cm.set_exit_on_bottom(o.has('e'));
+                        if o.has('H') {
+                            cm.set_show_position(false);
+                        }
+                    }
+                    if o.has('M') {
+                        if let (Some(cid), Some(m)) = (ctx.client, ctx.mouse.clone()) {
+                            self.start_copy_drag(cid, &m);
+                        }
+                    }
+                }
                 if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
                     if o.has('u') {
                         cm.run("page-up", &[]);
                     }
-                    if o.has('e') {
-                        cm.set_exit_on_bottom(true);
-                    }
-                }
-                if o.has('M') {
-                    if let (Some(cid), Some(m)) = (ctx.client, ctx.mouse.clone()) {
-                        self.start_copy_drag(cid, pane, m);
+                    if o.has('d') {
+                        let exit = o.has('e');
+                        if cm.page_down_exit(exit) {
+                            self.exit_mode(pane);
+                        }
                     }
                 }
                 if let Some(w) = tt.wid {
@@ -2144,7 +2166,9 @@ impl Server {
                 };
                 let template = o.rest.first().cloned();
                 self.open_tree(tt.pane.unwrap(), kind, template, None, o.has('Z'));
-                if let Some(cid) = ctx.client {
+                // remember an attached client (a command-line client is gone by the time a
+                // choice is made)
+                if let Some(cid) = ctx.client.filter(|c| self.clients.get(c).is_some_and(|c| c.attached)) {
                     if let Some(PaneMode::Tree(tr)) = self.panes.get_mut(&tt.pane.unwrap()).and_then(|p| p.mode.as_mut()) {
                         tr.client = Some(cid);
                     }
@@ -2153,27 +2177,46 @@ impl Server {
             }
             "display-menu" => {
                 let cid = self.resolve_client(ctx, o.get('c'))?;
+                if self.clients.get(&cid).is_some_and(|c| c.overlay.is_some()) {
+                    return Ok(Flow::Next);
+                }
                 let tt = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
-                let mut items = Vec::new();
+                let start = match o.get('C') {
+                    Some("-") => None,
+                    Some(v) => Some(v.parse::<usize>().map_err(|_| format!("starting choice {v} invalid"))?),
+                    None => Some(0),
+                };
+                let mut items: Vec<MenuItem> = Vec::new();
                 let mut it = o.rest.iter();
                 while let Some(name) = it.next() {
                     if name.is_empty() {
-                        items.push(MenuItem { name: String::new(), key: String::new(), cmd: String::new() });
+                        // a line: never first or twice in a row (menu_add_item)
+                        if items.last().is_some_and(|l| !l.name.is_empty()) {
+                            items.push(MenuItem { name: String::new(), key: String::new(), cmd: String::new() });
+                        }
                         continue;
                     }
-                    let key = it.next().cloned().unwrap_or_default();
-                    let command = it.next().cloned().unwrap_or_default();
+                    let (Some(key), Some(command)) = (it.next(), it.next()) else { return err("not enough arguments") };
+                    // names and commands are expanded now, while the mouse event is known
                     let name = self.expand(tt, Some(cid), name);
-                    if name.starts_with('-') {
-                        // disabled item
-                        items.push(MenuItem { name: name[1..].to_string(), key: String::new(), cmd: String::new() });
+                    if name.is_empty() {
+                        continue;
+                    }
+                    if let Some(rest) = name.strip_prefix('-') {
+                        items.push(MenuItem { name: rest.to_string(), key: String::new(), cmd: String::new() });
                     } else {
-                        items.push(MenuItem { name, key, cmd: command });
+                        let key = keys::parse_key_name(key).map(|k| keys::key_name(&k)).unwrap_or_else(|| key.clone());
+                        items.push(MenuItem { name, key, cmd: self.expand(tt, Some(cid), command) });
                     }
                 }
+                if items.is_empty() {
+                    return Ok(Flow::Next);
+                }
                 let title = o.get('T').map(|s| self.expand(tt, Some(cid), s)).unwrap_or_default();
-                let (cw, ch) = self.clients[&cid].size;
-                let menu = Menu::new(title, items, o.get('x'), o.get('y'), cw, ch, ctx.mouse.as_ref().map(|m| (m.x, m.y)), tt.pane);
+                let (w, h) = Menu::box_size(&title, &items);
+                let Some((x, y)) = self.overlay_position(cid, tt, ctx.mouse.as_ref(), o.get('x'), o.get('y'), w, h) else { return Ok(Flow::Next) };
+                let nomouse = ctx.mouse.is_none() && !o.has('M');
+                let menu = Menu::at(title, items, x, y, tt.pane, nomouse, o.has('O'), start);
                 let epoch = self.replace_overlay(cid, Some(Overlay::Menu(menu)))?;
                 Ok(Flow::WaitOverlay(cid, epoch))
             }
@@ -2183,6 +2226,9 @@ impl Server {
                     if matches!(self.clients.get(&cid).and_then(|c| c.overlay.as_ref()), Some(Overlay::Popup(_))) {
                         self.replace_overlay(cid, None)?;
                     }
+                    return Ok(Flow::Next);
+                }
+                if self.clients.get(&cid).is_some_and(|c| c.overlay.is_some()) {
                     return Ok(Flow::Next);
                 }
                 let (cw, ch) = self.clients[&cid].size;
@@ -2363,15 +2409,26 @@ impl Server {
                     let name = o.rest.first().ok_or("send-keys -X needs a command")?.clone();
                     let rest: Vec<String> = o.rest[1..].iter().map(|a| if o.has('F') { self.expand(tt, ctx.client, a) } else { a.clone() }).collect();
                     let n: usize = o.get('N').and_then(|v| v.parse().ok()).unwrap_or(1);
+                    if let Some(m) = ctx.mouse.clone() {
+                        // from a mouse binding: the cursor goes to the mouse first, and
+                        // begin-selection starts a drag (window_copy_command)
+                        self.copy_move_mouse(&m);
+                        if name == "begin-selection" {
+                            if let Some(cid) = ctx.client {
+                                self.start_copy_drag(cid, &m);
+                            }
+                            return Ok(Flow::Next);
+                        }
+                    }
                     for _ in 0..n {
                         self.copy_mode_command(pane, ctx.client, &name, &rest);
                     }
                     return Ok(Flow::Next);
                 }
                 if o.has('M') {
-                    if let Some(m) = ctx.mouse.clone() {
-                        self.forward_mouse(pane, &m);
-                    }
+                    let m = ctx.mouse.clone().ok_or("no mouse target")?;
+                    let p = self.mouse_pane(&m).ok_or("no mouse target")?;
+                    self.window_pane_mouse(p, ctx.client, &m);
                     return Ok(Flow::Next);
                 }
                 if o.has('R') {
@@ -2643,10 +2700,12 @@ impl Server {
                     let cmds = cmdparse::parse(&self.expand(tt, ctx.client, c))?;
                     return Ok(Flow::Inject(cmds, false));
                 }
-                let command = o.rest.first().map(|c| self.expand(tt, ctx.client, c)).unwrap_or_default();
-                if let Some(d) = o.get('d').and_then(|v| v.parse::<f64>().ok()) {
-                    thread::sleep(Duration::from_millis((d * 1000.0) as u64).min(Duration::from_secs(5)));
+                if let Some(d) = o.get('d') {
+                    // like tmux, wait on a timer: the queue resumes without -d afterwards
+                    let secs = d.parse::<f64>().ok().filter(|s| s.is_finite() && *s >= 0.0).ok_or_else(|| format!("invalid delay time: {d}"))?;
+                    return Err(format!(" delay {}", (secs * 1000.0).min(u32::MAX as f64) as u64));
                 }
+                let command = o.rest.first().map(|c| self.expand(tt, ctx.client, c)).unwrap_or_default();
                 if command.is_empty() {
                     return Ok(Flow::Next);
                 }

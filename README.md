@@ -89,8 +89,10 @@ PowerShell prompt hook described below.
 - **Interactive**: command prompt (history, completion), confirm-before, choose-tree /
   choose-client / customize-mode, display-menu, display-popup, display-panes, clock-mode,
   messages, `pane-border-status`.
-- **Mouse** (`set -g mouse on`): select panes and windows, drag borders, wheel into copy mode,
-  drag selection, double/triple click, right-click menus.
+- **Mouse** (`set -g mouse on`): tmux 3.6a events (`SecondClick`, `DoubleClick`, `MouseDragEnd`,
+  status-line ranges, ...), default bindings and menus; select panes and windows, drag borders,
+  wheel into copy mode, drag selection with edge scrolling, double/triple click, middle-click
+  paste. See [COMPATIBILITY.md](COMPATIBILITY.md#mouse-set--g-mouse-on).
 - **Scripting**: hooks (`set-hook`, `after-*`, `client-attached`, `pane-exited`, ...),
   `run-shell`, `if-shell`, `wait-for`, `set-environment`, `update-environment`, alerts.
 - **Terminal features** (`terminal-features`, `-T`): per-client RGB / 256 / 16-colour output,

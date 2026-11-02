@@ -90,7 +90,8 @@ impl Frame {
 pub struct Modes {
     pub app_cursor: bool,
     pub bracketed_paste: bool,
-    pub mouse: bool,
+    /// Mouse reporting asked of the terminal: 0 off, 1000, 1002 or 1003.
+    pub mouse: u16,
     pub focus: bool,
     pub cursor_style: u8,
     /// modifyOtherKeys level requested from the outer terminal (extended-keys).
@@ -225,7 +226,9 @@ impl Server {
         base
     }
 
-    fn status_line(&self, cid: ClientId, sid: SessId, width: u16) -> Vec<Cell> {
+    /// The default status line and the mouse range of each cell (status-left is `left`,
+    /// each window entry `window|N` and status-right `right`, as in tmux's status-format).
+    fn status_line(&self, cid: ClientId, sid: SessId, width: u16) -> (Vec<Cell>, Vec<Option<format::Range>>) {
         let s = &self.sessions[&sid];
         let width = width as usize;
         let base = self.status_style(sid);
@@ -244,6 +247,7 @@ impl Server {
         // window list
         let sep = self.opt_window(None, "window-status-separator");
         let mut wcells: Vec<Cell> = Vec::new();
+        let mut wtags: Vec<Option<format::Range>> = Vec::new();
         let mut cur_range = (0, 0);
         let n = s.links.len();
         for (k, (idx, wid)) in s.links.iter().enumerate() {
@@ -266,11 +270,18 @@ impl Server {
             let text = self.expand_time(t, Some(cid), &fmt);
             let start = wcells.len();
             wcells.extend(spans_cells(&format::spans(&text, st), usize::MAX, st));
+            wtags.resize(wcells.len(), Some(format::Range::Window(*idx)));
             if is_cur {
                 cur_range = (start, wcells.len());
             }
             if k + 1 < n {
+                let sep_start = wcells.len();
                 wcells.extend(spans_cells(&format::spans(&sep, base), usize::MAX, base));
+                wtags.resize(wcells.len(), None);
+                // tmux's window range (closed by #[norange]) covers one cell more
+                if let Some(t) = wtags.get_mut(sep_start) {
+                    *t = Some(format::Range::Window(*idx));
+                }
             }
         }
         let avail = width.saturating_sub(lcells.len() + rcells.len());
@@ -299,6 +310,7 @@ impl Server {
             }
         }
         let mut line = vec![Cell { text: " ".into(), style: base }; width];
+        let mut tags: Vec<Option<format::Range>> = vec![None; width];
         let justify = self.opt_session(Some(sid), "status-justify");
         let wpos = match justify.as_str() {
             "centre" => lcells.len() + (avail - wslice.len()) / 2,
@@ -308,15 +320,18 @@ impl Server {
         };
         for (i, c) in lcells.into_iter().enumerate() {
             line[i] = c;
+            tags[i] = Some(format::Range::Left);
         }
         for (i, c) in wslice.into_iter().enumerate() {
             if wpos + i < width {
                 line[wpos + i] = c;
+                tags[wpos + i] = wtags[wstart + i].clone();
             }
         }
         let rstart = width - rcells.len();
         for (i, c) in rcells.into_iter().enumerate() {
             line[rstart + i] = c;
+            tags[rstart + i] = Some(format::Range::Right);
         }
         // a wide char cut by a region boundary
         for i in 0..width {
@@ -324,7 +339,7 @@ impl Server {
                 line[i].text = " ".into();
             }
         }
-        line
+        (line, tags)
     }
 
     fn compose(&self, cid: ClientId) -> Option<RenderState> {
@@ -340,7 +355,8 @@ impl Server {
         let oy = if top { nstatus } else { 0 };
         let (rects, seps) = self.rects(wid);
         let mut cursor = None;
-        let mut modes = Modes { mouse: self.opt_session_on(Some(sid), "mouse"), focus: options::is_on(&self.opt_server("focus-events")), ..Modes::default() };
+        let mut status_ranges = Vec::new();
+        let mut modes = Modes { mouse: self.outer_mouse_mode(cid), focus: options::is_on(&self.opt_server("focus-events")), ..Modes::default() };
         let active_rect = rects.iter().find(|(p, _)| *p == win.active).map(|(_, r)| *r);
         let area_h = ch.saturating_sub(nstatus);
         let border_status = self.opt_window(Some(wid), "pane-border-status");
@@ -598,17 +614,18 @@ impl Server {
             for i in 0..nstatus {
                 let y = sy0 + i;
                 let custom = &formats[i as usize];
-                let line = if !custom.is_empty() {
+                let (line, tags) = if !custom.is_empty() {
                     let base = self.status_style(sid);
                     let cur = Target { sid: Some(sid), idx: Some(s.active), wid: Some(wid), pane: Some(win.active) };
                     let text = self.expand_time(cur, Some(cid), custom);
-                    format::layout_line(&format::spans(&text, base), cw as usize, base)
+                    format::layout_line_ranged(&format::spans(&text, base), cw as usize, base)
                 } else if i == 0 {
                     self.status_line(cid, sid, cw)
                 } else {
-                    vec![Cell { text: " ".into(), style: self.status_style(sid) }; cw as usize]
+                    (vec![Cell { text: " ".into(), style: self.status_style(sid) }; cw as usize], vec![None; cw as usize])
                 };
                 f.put_cells(0, y, &line);
+                status_ranges.push(tags);
             }
         }
         // message / prompt replace the first status line (or the last row without a status line)
@@ -653,7 +670,7 @@ impl Server {
 
         modes.app_cursor = true;
         modes.bracketed_paste = c.features.has("bpaste");
-        Some(RenderState { frame: f, cursor, modes })
+        Some(RenderState { frame: f, cursor, modes, status_ranges })
     }
 
     pub fn render(&mut self, cid: ClientId) {
@@ -678,7 +695,9 @@ impl Server {
             title_update = None;
         }
         let mut next = next;
-        next.modes.mouse &= feats.has("mouse");
+        if !feats.has("mouse") {
+            next.modes.mouse = 0;
+        }
         next.modes.focus &= feats.has("focus");
         next.modes.extkeys = if feats.has("extkeys") {
             match ext_keys.as_str() {
@@ -690,6 +709,7 @@ impl Server {
             0
         };
         c.dirty = false;
+        c.status_ranges = next.status_ranges.clone();
         let prev = c.prev.as_ref().filter(|p| p.frame.w == next.frame.w && p.frame.h == next.frame.h);
         let mut out = String::new();
         if prev.is_none() {
@@ -737,7 +757,12 @@ impl Server {
             let m = next.modes;
             out.push_str(if m.app_cursor { "\x1b[?1h" } else { "\x1b[?1l" });
             out.push_str(if m.bracketed_paste { "\x1b[?2004h" } else { "\x1b[?2004l" });
-            out.push_str(if m.mouse { "\x1b[?1000h\x1b[?1002h\x1b[?1006h" } else { "\x1b[?1006l\x1b[?1002l\x1b[?1000l" });
+            out.push_str(match m.mouse {
+                0 => "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l",
+                1000 => "\x1b[?1003l\x1b[?1002l\x1b[?1000h\x1b[?1006h",
+                1002 => "\x1b[?1003l\x1b[?1000h\x1b[?1002h\x1b[?1006h",
+                _ => "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h",
+            });
             out.push_str(if m.focus { "\x1b[?1004h" } else { "\x1b[?1004l" });
             if feats.has("cstyle") {
                 let _ = write!(out, "\x1b[{} q", m.cursor_style);

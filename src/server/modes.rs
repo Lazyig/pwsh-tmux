@@ -412,6 +412,10 @@ pub struct Menu {
     pub w: u16,
     pub h: u16,
     pub pane: Option<PaneId>,
+    /// Opened from the keyboard: the mouse does not choose items (MENU_NOMOUSE).
+    pub nomouse: bool,
+    /// -O: releasing the button does not close the menu (MENU_STAYOPEN).
+    pub stayopen: bool,
 }
 
 pub enum MenuAction {
@@ -421,7 +425,54 @@ pub enum MenuAction {
 }
 
 impl Menu {
+    /// Width and height of the box for these items (tmux menu->width + 4, count + 2).
+    pub fn box_size(title: &str, items: &[MenuItem]) -> (u16, u16) {
+        let inner = items
+            .iter()
+            .map(|i| crate::format::width(&i.name) + if i.key.is_empty() { 0 } else { crate::format::width(&i.key) + 3 })
+            .chain(std::iter::once(crate::format::spans(title, Style::default()).iter().map(|s| crate::format::width(&s.text)).sum()))
+            .max()
+            .unwrap_or(0) as u16;
+        (inner + 4, items.len() as u16 + 2)
+    }
+
+    /// A menu at a position from [`Server::overlay_position`]; `start` is the first
+    /// selected item for keyboard menus (tmux -C), None for no selection.
     #[allow(clippy::too_many_arguments)]
+    pub fn at(title: String, items: Vec<MenuItem>, x: u16, y: u16, pane: Option<PaneId>, nomouse: bool, stayopen: bool, start: Option<usize>) -> Menu {
+        let (w, h) = Menu::box_size(&title, &items);
+        let enabled = |i: usize| items.get(i).is_some_and(|it| !it.cmd.is_empty());
+        let sel = if !nomouse {
+            None
+        } else {
+            start.and_then(|s| {
+                let n = items.len();
+                if n == 0 {
+                    return None;
+                }
+                if s >= n {
+                    (0..n).rev().find(|&i| enabled(i))
+                } else {
+                    (0..n).map(|k| (s + k) % n).find(|&i| enabled(i))
+                }
+            })
+        };
+        Menu { title, items, sel, x, y, w, h, pane, nomouse, stayopen }
+    }
+
+    /// Run the selected item (tmux menu_key_cb "chosen").
+    pub fn choose(&self) -> MenuAction {
+        match self.sel.and_then(|i| self.items.get(i)) {
+            None => MenuAction::Cancel,
+            Some(it) if it.cmd.is_empty() => {
+                if self.stayopen { MenuAction::None } else { MenuAction::Cancel }
+            }
+            Some(it) => MenuAction::Run(it.cmd.clone()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub fn new(title: String, items: Vec<MenuItem>, x: Option<&str>, y: Option<&str>, cw: u16, ch: u16, mouse: Option<(u16, u16)>, pane: Option<PaneId>) -> Menu {
         let inner = items
             .iter()
@@ -445,7 +496,7 @@ impl Menu {
         let mx = pos(x, cw, w, mouse.map(|m| m.0));
         let my = if y == Some("C") { ((ch.saturating_sub(1)) / 2).saturating_sub(h.div_ceil(2)) } else { pos(y, ch, h, mouse.map(|m| m.1)) };
         let sel = items.iter().position(|i| !i.cmd.is_empty());
-        Menu { title, items, sel, x: mx, y: my, w, h, pane }
+        Menu { title, items, sel, x: mx, y: my, w, h, pane, nomouse: true, stayopen: false }
     }
 
     fn step(&mut self, dir: isize) {
@@ -474,30 +525,12 @@ impl Menu {
                 self.step(1);
                 MenuAction::None
             }
-            "Enter" | "Space" => match self.sel {
-                Some(i) => MenuAction::Run(self.items[i].cmd.clone()),
-                None => MenuAction::Cancel,
-            },
+            "Enter" | "Space" => self.choose(),
             k => match self.items.iter().find(|i| !i.cmd.is_empty() && i.key == k) {
                 Some(i) => MenuAction::Run(i.cmd.clone()),
                 None => MenuAction::None,
             },
         }
-    }
-
-    /// Mouse click in client coordinates.
-    pub fn click(&mut self, x: u16, y: u16, release: bool) -> MenuAction {
-        if x < self.x || x >= self.x + self.w || y < self.y || y >= self.y + self.h {
-            return if release { MenuAction::None } else { MenuAction::Cancel };
-        }
-        let row = y.saturating_sub(self.y + 1) as usize;
-        if y > self.y && row < self.items.len() && !self.items[row].cmd.is_empty() {
-            self.sel = Some(row);
-            if release {
-                return MenuAction::Run(self.items[row].cmd.clone());
-            }
-        }
-        MenuAction::None
     }
 
     pub fn draw(&self, f: &mut super::render::Frame, style: Style, border: Style, selected_style: Style) {

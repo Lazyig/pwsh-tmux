@@ -39,6 +39,46 @@ The reference implementations used for inspection are
 [format.c](https://github.com/tmux/tmux/blob/3.6a/format.c), and
 [window-copy.c](https://github.com/tmux/tmux/blob/3.6a/window-copy.c).
 
+## Mouse (`set -g mouse on`)
+
+[`tests/mouse_compat.py`](tests/mouse_compat.py) attaches a client to private servers of
+both programs inside a pseudo terminal, writes the same SGR mouse reports and compares
+the key events that fired (through logging bindings), the active pane and window, pane
+geometry, copy-mode state and selection, paste buffers, menu results and the bytes an
+application in the pane received. It runs on Linux or WSL:
+
+```sh
+python3 tests/mouse_compat.py --reference /path/to/tmux-3.6a --candidate target/debug/pwsh-tmux
+```
+
+The first run against tmux 3.6a matched 2 of 62 scenarios. After the changes below, all
+**80 scenarios** match. They cover clicks, second/double/triple clicks and their timing,
+drags and drag ends on panes, borders and status lines, modifiers, status-line ranges,
+the default root and copy-mode bindings, menus, choose-tree and clock mode, mouse
+applications, the alternate screen and `mouse off`.
+
+| Area | Previous behaviour | Corrected behaviour |
+|---|---|---|
+| Click events | A second press fired `DoubleClick` at once, only at the same cell | `SecondClick` fires at once, `DoubleClick` only after 300 ms without a third press, `TripleClick` on the third (tmux click timer) |
+| Drag events | Drags repeated `MouseDrag` and ended with `MouseUp` | The first drag is named after where the button went down, the release fires `MouseDragEnd` where it happened, and drags followed by `resize-pane -M` or a selection send no keys |
+| Status line areas | Every status click was `Status` | `StatusLeft`, `StatusRight`, `Status` (window, pane, session or user range) and `StatusDefault`, from the ranges drawn, including `#[range=...]` in `status-format` with tmux's closing rules |
+| Key tables | Copy-mode mouse handling was built in | Mouse keys use the pane's mode table, then root; unbound keys go to the pane (or are dropped after a mode table), and the prefix table returns to root |
+| Default bindings | A subset of tmux 3.5 bindings | The tmux 3.6a root, copy-mode and copy-mode-vi mouse bindings and menus, including word/line items, middle-click paste, the session menu and `alternate_on` |
+| Copy mode | A click moved the cursor and cleared the selection; scrolling kept the cursor on its text; `select-word` used its own rules | Only the bound commands act; `send-keys -X` from the mouse moves to the mouse first and `begin-selection` starts a drag that scrolls at the edges; scrolling keeps the cursor row with tmux's end-of-line rule; `select-word` follows tmux's word reader |
+| Menus | Positions and mouse handling differed; empty items were shown | tmux placement (`-x/-y` C, R, P, M, W, S and formats), releasing the button chooses or closes, `-O`, keyboard menus ignore the mouse, empty and doubled lines are dropped, items are expanded when the menu opens |
+| Formats | No `mouse_*` positions or words | `mouse_x`, `mouse_y`, `mouse_word`, `mouse_line`, `mouse_pane`, `mouse_status_line`, `mouse_status_range`, `selection_start_*`/`selection_end_*`; `#{||:...}` and `#{&&:...}` take any number of arguments |
+| Applications | Drags were reported at the press position; nothing reached the pane with `mouse off` | Events are reported where they happen, the delayed `DoubleClick` is not sent, and with `mouse off` the terminal reports what the active pane asked for |
+| `run-shell -d` | Blocked the whole server while waiting | The command queue resumes from a timer |
+
+Fixed on the way: `split-window -b` without a size gave the new pane the smaller half,
+`switch-client -t =` ignored the window, a tree opened from the command line chose
+through a client that was no longer connected, `display-menu`/`display-panes`/`display-popup`
+replaced an overlay already shown (tmux leaves it), and `pane_left`/`pane_top` ignored
+`pane-border-status` and zoom.
+
+Not implemented: tmux 3.6's `pane-scrollbars` (so the `Scrollbar*` areas and `copy-mode -S`
+never occur) and hyperlink tracking (`mouse_hyperlink` is always empty).
+
 ## Differences retained for a reason
 
 - PowerShell is the default shell: this is the project's stated purpose.

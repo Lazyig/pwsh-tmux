@@ -3,36 +3,29 @@
 use super::modes::{MenuAction, TreeAction};
 use super::*;
 use crate::copymode::Action;
-use crate::keys::{Input, Key, KeyCode, Mouse, MouseKind};
-use crate::layout::Dir;
+use crate::keys::{Input, Key, KeyCode};
 
-#[derive(Clone, Debug, Default)]
-pub struct MouseCtx {
-    pub x: u16,
-    pub y: u16,
-    pub sid: Option<SessId>,
-    pub idx: Option<u32>,
-    pub wid: Option<WinId>,
-    pub pane: Option<PaneId>,
-    pub event: Option<Mouse>,
-    /// Pane-relative position.
-    pub px: u16,
-    pub py: u16,
-}
+pub use super::mouse::MouseCtx;
 
-const PANE_MENU: &str = "display-menu -T '#[align=centre]#{pane_index} (#{pane_id})' -t = -x M -y M \
-'Horizontal Split' h { split-window -h } 'Vertical Split' v { split-window -v } '' \
-'Swap Up' u { swap-pane -U } 'Swap Down' d { swap-pane -D } \
-'#{?pane_marked_set,Swap Marked,-Swap Marked}' s { swap-pane } '' \
-'Kill' X { kill-pane } 'Respawn' R { respawn-pane -k } \
-'#{?pane_marked,Unmark,Mark}' m { select-pane -m } '#{?window_zoomed_flag,Unzoom,Zoom}' z { resize-pane -Z }";
+// The default mouse menus of tmux 3.6a (key-bindings.c).
+const PANE_MENU: &str = r##"display-menu -T "#[align=centre]#{pane_index} (#{pane_id})" -t = -x M -y M "#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Top,}" < { send-keys -X history-top } "#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Bottom,}" > { send-keys -X history-bottom } '' "#{?mouse_word,Search For #[underscore]#{=/9/...:mouse_word},}" C-r { if-shell -F "#{?#{m/r:(copy|view)-mode,#{pane_mode}},0,1}" "copy-mode -t=" ; send-keys -X -t = search-backward -- "#{q:mouse_word}" } "#{?mouse_word,Type #[underscore]#{=/9/...:mouse_word},}" C-y { copy-mode -q ; send-keys -l "#{q:mouse_word}" } "#{?mouse_word,Copy #[underscore]#{=/9/...:mouse_word},}" c { copy-mode -q ; set-buffer "#{q:mouse_word}" } "#{?mouse_line,Copy Line,}" l { copy-mode -q ; set-buffer "#{q:mouse_line}" } '' "#{?mouse_hyperlink,Type #[underscore]#{=/9/...:mouse_hyperlink},}" C-h { copy-mode -q ; send-keys -l "#{q:mouse_hyperlink}" } "#{?mouse_hyperlink,Copy #[underscore]#{=/9/...:mouse_hyperlink},}" h { copy-mode -q ; set-buffer "#{q:mouse_hyperlink}" } '' "Horizontal Split" h { split-window -h } "Vertical Split" v { split-window -v } '' "#{?#{>:#{window_panes},1},,-}Swap Up" u { swap-pane -U } "#{?#{>:#{window_panes},1},,-}Swap Down" d { swap-pane -D } "#{?pane_marked_set,,-}Swap Marked" s { swap-pane } '' Kill X { kill-pane } Respawn R { respawn-pane -k } "#{?pane_marked,Unmark,Mark}" m { select-pane -m } "#{?#{>:#{window_panes},1},,-}#{?window_zoomed_flag,Unzoom,Zoom}" z { resize-pane -Z }"##;
 
-const WINDOW_MENU: &str = "display-menu -T '#[align=centre]#{window_index}:#{window_name}' -t = -x W -y W \
-'Swap Left' l { swap-window -t :-1 } 'Swap Right' r { swap-window -t :+1 } '' \
-'Kill' X { kill-window } 'Respawn' R { respawn-window -k } \
-'Rename' n { command-prompt -I '#W' { rename-window -- '%%' } } '' 'New After' w { new-window -a } 'New At End' W { new-window }";
+const WINDOW_MENU: &str = r##"display-menu -T "#[align=centre]#{window_index}:#{window_name}" -t = -x W -y W "#{?#{>:#{session_windows},1},,-}Swap Left" l { swap-window -t :-1 } "#{?#{>:#{session_windows},1},,-}Swap Right" r { swap-window -t :+1 } "#{?pane_marked_set,,-}Swap Marked" s { swap-window } '' Kill X { kill-window } Respawn R { respawn-window -k } "#{?pane_marked,Unmark,Mark}" m { select-pane -m } Rename n { command-prompt -F -I "#W" { rename-window -t "#{window_id}" "%%" } } '' "New After" w { new-window -a } "New At End" W { new-window }"##;
+
+const SESSION_MENU: &str = r##"display-menu -T "#[align=centre]#{session_name}" -t = -x M -y W Next n { switch-client -n } Previous p { switch-client -p } '' Renumber N { move-window -r } Rename n { command-prompt -I "#S" { rename-session "%%" } } '' "New Session" s { new-session } "New Window" w { new-window }"##;
 
 const IN_MODE: &str = "#{||:#{pane_in_mode},#{mouse_any_flag}}";
+
+/// Mouse bindings of the copy-mode and copy-mode-vi tables.
+const COPY_MODE_MOUSE: &[(&str, &str)] = &[
+    ("MouseDown1Pane", "select-pane"),
+    ("MouseDrag1Pane", "select-pane ; send-keys -X begin-selection"),
+    ("MouseDragEnd1Pane", "send-keys -X copy-pipe-and-cancel"),
+    ("WheelUpPane", "select-pane ; send-keys -X -N 5 scroll-up"),
+    ("WheelDownPane", "select-pane ; send-keys -X -N 5 scroll-down"),
+    ("DoubleClick1Pane", "select-pane ; send-keys -X select-word ; run-shell -d 0.3 ; send-keys -X copy-pipe-and-cancel"),
+    ("TripleClick1Pane", "select-pane ; send-keys -X select-line ; run-shell -d 0.3 ; send-keys -X copy-pipe-and-cancel"),
+];
 
 pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
     let mut t: BTreeMap<String, BTreeMap<String, Binding>> = BTreeMap::new();
@@ -60,9 +53,9 @@ pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
         ("/", "command-prompt -k -p key { list-keys -1N '%%' }", false, "Describe key binding"),
         (":", "command-prompt", false, "Prompt for a command"),
         (";", "last-pane", false, "Move to the previously active pane"),
-        ("<", WINDOW_MENU, false, "Display window menu"),
+        ("<", &WINDOW_MENU.replacen(" -t = -x W -y W", " -x W -y W", 1), false, "Display window menu"),
         ("=", "choose-buffer -Z", false, "Choose a paste buffer from a list"),
-        (">", PANE_MENU, false, "Display pane menu"),
+        (">", &PANE_MENU.replacen(" -t = -x M -y M", " -x P -y P", 1), false, "Display pane menu"),
         ("?", "list-keys -N", false, "List key bindings"),
         ("C", "customize-mode -Z", false, "Customize options"),
         ("D", "choose-client -Z", false, "Choose and detach a client from a list"),
@@ -122,16 +115,24 @@ pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
     }
     let root: Vec<(&str, String)> = vec![
         ("MouseDown1Pane", "select-pane -t = ; send-keys -M".into()),
-        ("MouseDown1Status", "select-window -t =".into()),
+        ("MouseDown1Status", "switch-client -t =".into()),
+        ("MouseDown1ScrollbarUp", "copy-mode -u".into()),
+        ("MouseDown1ScrollbarDown", "copy-mode -d".into()),
+        ("MouseDrag1ScrollbarSlider", "copy-mode -S".into()),
+        ("MouseDown2Pane", format!("select-pane -t = ; if-shell -F '{IN_MODE}' {{ send-keys -M }} {{ paste-buffer -p }}")),
         ("MouseDown3Pane", format!("if-shell -F -t = '#{{||:#{{mouse_any_flag}},#{{&&:#{{pane_in_mode}},#{{?#{{m/r:(copy|view)-mode,#{{pane_mode}}}},0,1}}}}}}' {{ select-pane -t = ; send-keys -M }} {{ {PANE_MENU} }}")),
+        ("M-MouseDown3Pane", PANE_MENU.to_string()),
         ("MouseDown3Status", WINDOW_MENU.to_string()),
+        ("M-MouseDown3Status", WINDOW_MENU.to_string()),
+        ("MouseDown3StatusLeft", SESSION_MENU.to_string()),
+        ("M-MouseDown3StatusLeft", SESSION_MENU.to_string()),
         ("MouseDrag1Pane", format!("if-shell -F '{IN_MODE}' {{ send-keys -M }} {{ copy-mode -M }}")),
         ("MouseDrag1Border", "resize-pane -M".into()),
-        ("WheelUpPane", format!("if-shell -F '{IN_MODE}' {{ send-keys -M }} {{ copy-mode -e }}")),
+        ("WheelUpPane", "if-shell -F '#{||:#{alternate_on},#{pane_in_mode},#{mouse_any_flag}}' { send-keys -M } { copy-mode -e }".into()),
         ("WheelUpStatus", "previous-window".into()),
         ("WheelDownStatus", "next-window".into()),
-        ("DoubleClick1Pane", format!("select-pane -t = ; if-shell -F '{IN_MODE}' {{ send-keys -M }} {{ copy-mode -H ; send-keys -X select-word ; send-keys -X copy-selection-and-cancel }}")),
-        ("TripleClick1Pane", format!("select-pane -t = ; if-shell -F '{IN_MODE}' {{ send-keys -M }} {{ copy-mode -H ; send-keys -X select-line ; send-keys -X copy-selection-and-cancel }}")),
+        ("DoubleClick1Pane", format!("select-pane -t = ; if-shell -F '{IN_MODE}' {{ send-keys -M }} {{ copy-mode -H ; send-keys -X select-word ; run-shell -d 0.3 ; send-keys -X copy-pipe-and-cancel }}")),
+        ("TripleClick1Pane", format!("select-pane -t = ; if-shell -F '{IN_MODE}' {{ send-keys -M }} {{ copy-mode -H ; send-keys -X select-line ; run-shell -d 0.3 ; send-keys -X copy-pipe-and-cancel }}")),
     ];
     for (k, c) in &root {
         add("root", k, c, false, "");
@@ -139,6 +140,9 @@ pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
     for (table, vi) in [("copy-mode", false), ("copy-mode-vi", true)] {
         for (k, c) in CopyMode::default_bindings(vi) {
             t.entry(table.to_string()).or_default().insert(k.to_string(), Binding { cmd: format!("send-keys -X {c}"), repeat: false, note: "default".into() });
+        }
+        for (k, c) in COPY_MODE_MOUSE {
+            t.entry(table.to_string()).or_default().insert(k.to_string(), Binding { cmd: c.to_string(), repeat: false, note: String::new() });
         }
     }
     t
@@ -409,7 +413,7 @@ impl Server {
         }
     }
 
-    fn menu_action(&mut self, cid: ClientId, action: MenuAction) {
+    pub(crate) fn menu_action(&mut self, cid: ClientId, action: MenuAction) {
         match action {
             MenuAction::None => {
                 if let Some(c) = self.clients.get_mut(&cid) {
@@ -443,7 +447,8 @@ impl Server {
                 let h = p.size.1 as usize;
                 let Some(PaneMode::Tree(mut tree)) = p.mode.take() else { return };
                 let action = tree.key(name, tree.list_height(h), self);
-                let client = tree.client.or(cid);
+                // the client that opened the tree, if it is still attached
+                let client = tree.client.filter(|c| self.clients.get(c).is_some_and(|c| c.attached)).or(cid);
                 match action {
                     TreeAction::None => {
                         self.panes.get_mut(&pane).unwrap().mode = Some(PaneMode::Tree(tree));
@@ -508,6 +513,16 @@ impl Server {
     }
 
     pub fn copy_mode_command(&mut self, pane: PaneId, cid: Option<ClientId>, name: &str, args: &[String]) {
+        // copy-pipe without a command uses copy-command
+        let piped = name.starts_with("copy-pipe");
+        let pipe = if !piped {
+            None
+        } else if !args.is_empty() {
+            Some(args[0].clone())
+        } else {
+            Some(self.opt_server("copy-command")).filter(|c| !c.is_empty())
+        };
+        let run_args: Vec<String> = if piped && !args.is_empty() { args[1..].to_vec() } else { args.to_vec() };
         let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) else {
             if let Some(PaneMode::Tree(_)) = self.panes.get(&pane).and_then(|p| p.mode.as_ref()) {
                 // tree mode understands a few -X commands
@@ -523,8 +538,6 @@ impl Server {
             }
             return;
         };
-        let pipe = (name.starts_with("copy-pipe") && !args.is_empty()).then(|| args[0].clone());
-        let run_args: Vec<String> = if pipe.is_some() { args[1..].to_vec() } else { args.to_vec() };
         let action = cm.run(name, &run_args);
         self.copy_action(pane, cid, action, pipe);
     }
@@ -748,307 +761,6 @@ impl Server {
         }
     }
 
-    // ---- mouse ------------------------------------------------------------------------
-
-    fn mouse_ctx(&self, cid: ClientId, m: &Mouse) -> (MouseCtx, &'static str) {
-        let mut ctx = MouseCtx { x: m.x, y: m.y, event: Some(*m), ..MouseCtx::default() };
-        let Some(sid) = self.client_session(cid) else { return (ctx, "Pane") };
-        let s = &self.sessions[&sid];
-        ctx.sid = Some(sid);
-        let (_, ch) = self.clients[&cid].size;
-        let nstatus = self.status_lines(Some(sid)).min(ch.saturating_sub(1));
-        let top = self.opt_session(Some(sid), "status-position") == "top";
-        let status_y0 = if top { 0 } else { ch - nstatus };
-        if nstatus > 0 && m.y >= status_y0 && m.y < status_y0 + nstatus {
-            // which window is under the mouse in the status line
-            let idx = self.status_window_at(cid, sid, m.x);
-            ctx.idx = idx.or(Some(s.active));
-            ctx.wid = ctx.idx.and_then(|i| s.links.get(&i).copied());
-            let area = if idx.is_some() { "Status" } else if m.x < 10 { "StatusLeft" } else { "StatusRight" };
-            return (ctx, if area == "StatusLeft" || area == "StatusRight" { "Status" } else { area });
-        }
-        let oy = if top { nstatus } else { 0 };
-        let wid = s.active_window();
-        ctx.idx = Some(s.active);
-        ctx.wid = Some(wid);
-        let y = m.y.saturating_sub(oy);
-        let (rects, seps) = self.rects(wid);
-        for (id, r) in &rects {
-            if m.x >= r.x && m.x < r.right() && y >= r.y && y < r.bottom() {
-                ctx.pane = Some(*id);
-                let cr = self.content_rect(wid, *r);
-                ctx.px = m.x - cr.x;
-                ctx.py = y.saturating_sub(cr.y);
-                return (ctx, "Pane");
-            }
-        }
-        for sep in &seps {
-            let hit = if sep.vertical { m.x == sep.x && y >= sep.y && y < sep.y + sep.len } else { y == sep.y && m.x >= sep.x && m.x < sep.x + sep.len };
-            if hit {
-                return (ctx, "Border");
-            }
-        }
-        (ctx, "Pane")
-    }
-
-    /// Window index whose status entry covers column x (recomputed from the formats).
-    fn status_window_at(&self, cid: ClientId, sid: SessId, x: u16) -> Option<u32> {
-        let s = &self.sessions[&sid];
-        let base = Default::default();
-        let left = self.expand_time(self.current(&Ctx { client: Some(cid), ..Ctx::default() }), Some(cid), &self.opt_session(Some(sid), "status-left"));
-        let left_len = self.opt_session_num(Some(sid), "status-left-length").max(0) as usize;
-        let mut pos = crate::format::spans(&left, base).iter().map(|s| crate::format::width(&s.text)).sum::<usize>().min(left_len);
-        let sep = crate::format::width(&self.opt_window(None, "window-status-separator"));
-        for (idx, wid) in &s.links {
-            let fmt = self.opt_window(Some(*wid), if *idx == s.active { "window-status-current-format" } else { "window-status-format" });
-            let t = super::vars::Target { sid: Some(sid), idx: Some(*idx), wid: Some(*wid), pane: Some(self.windows[wid].active) };
-            let text = self.expand_time(t, Some(cid), &fmt);
-            let w: usize = crate::format::spans(&text, base).iter().map(|s| crate::format::width(&s.text)).sum();
-            if (x as usize) >= pos && (x as usize) < pos + w {
-                return Some(*idx);
-            }
-            pos += w + sep;
-        }
-        None
-    }
-
-    fn handle_mouse(&mut self, cid: ClientId, m: Mouse) {
-        if self.client_is_readonly(Some(cid)) { return; }
-        // overlays first
-        let Some(c) = self.clients.get_mut(&cid) else { return };
-        if c.overlay.is_some() || c.prompt.is_some() {
-            c.mouse_down = None;
-        }
-        if let Some(Overlay::Menu(menu)) = &mut c.overlay {
-            let action = match m.kind {
-                MouseKind::Down => menu.click(m.x, m.y, false),
-                MouseKind::Up => menu.click(m.x, m.y, true),
-                MouseKind::Drag | MouseKind::Move => {
-                    let _ = menu.click(m.x, m.y, false);
-                    MenuAction::None
-                }
-                _ => MenuAction::None,
-            };
-            self.menu_action(cid, action);
-            return;
-        }
-        if let Some(Overlay::Popup(p)) = &c.overlay {
-            let (ix, iy, iw, ih) = p.inner();
-            let pane = p.pane;
-            if m.x >= ix && m.x < ix + iw && m.y >= iy && m.y < iy + ih {
-                let rel = Mouse { x: m.x - ix, y: m.y - iy, ..m };
-                if let Some(pp) = self.panes.get(&pane) {
-                    let mode = pp.screen().mouse_protocol_mode();
-                    let sgr = pp.screen().mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr;
-                    if let Some(b) = keys::encode_mouse(&rel, mode, sgr) {
-                        pp.send(b);
-                    }
-                }
-            }
-            return;
-        }
-        if c.prompt.is_some() {
-            return;
-        }
-        if matches!(c.overlay, Some(Overlay::DisplayPanes { .. })) {
-            c.overlay = None;
-            c.dirty = true;
-        }
-        let Some(sid) = self.client_session(cid) else { return };
-        if !self.opt_session_on(Some(sid), "mouse") {
-            return;
-        }
-        // drags in progress
-        if let Some(drag) = self.clients.get(&cid).and_then(|c| c.drag.as_ref()) {
-            match drag.kind {
-                DragKind::Border { pane, vertical, last } => {
-                    if m.kind == MouseKind::Drag {
-                        if let Some(wid) = self.window_of(pane) {
-                            let area = self.window_area(wid);
-                            let (delta, dir_pos, dir_neg) = if vertical { (m.x as i32 - last.0 as i32, Dir::Right, Dir::Left) } else { (m.y as i32 - last.1 as i32, Dir::Down, Dir::Up) };
-                            if delta != 0 {
-                                let w = self.windows.get_mut(&wid).unwrap();
-                                w.layout.resize(pane, if delta > 0 { dir_pos } else { dir_neg }, delta.unsigned_abs() as u16, area);
-                                self.apply_layout(wid);
-                                self.mark_window_dirty(wid);
-                            }
-                        }
-                        if let Some(Drag { kind: DragKind::Border { last, .. } }) = &mut self.clients.get_mut(&cid).unwrap().drag {
-                            *last = (m.x, m.y);
-                        }
-                        return;
-                    }
-                    if m.kind == MouseKind::Up {
-                        self.clients.get_mut(&cid).unwrap().drag = None;
-                        return;
-                    }
-                }
-                DragKind::Copy { pane } => {
-                    let (ctx, _) = self.mouse_ctx(cid, &m);
-                    if m.kind == MouseKind::Drag {
-                        if ctx.pane == Some(pane) {
-                            if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
-                                cm.move_to_view(ctx.py, ctx.px);
-                            }
-                            if let Some(wid) = self.window_of(pane) {
-                                self.mark_window_dirty(wid);
-                            }
-                        }
-                        return;
-                    }
-                    if m.kind == MouseKind::Up {
-                        self.clients.get_mut(&cid).unwrap().drag = None;
-                        let name = keys::drag_end_key_name(&m, "Pane");
-                        let vi = self.opt_window(self.window_of(pane), "mode-keys") == "vi";
-                        let table = if vi { "copy-mode-vi" } else { "copy-mode" };
-                        match self.bindings.get(table).and_then(|t| t.get(&name)).map(|b| b.cmd.clone()) {
-                            Some(cmd) => self.run_string(cid, &cmd, Some(pane)),
-                            None => self.copy_mode_command(pane, Some(cid), "copy-selection-and-cancel", &[]),
-                        }
-                        return;
-                    }
-                }
-            }
-        }
-        let (mut ctx, mut area) = self.mouse_ctx(cid, &m);
-        match m.kind {
-            MouseKind::Down => self.clients.get_mut(&cid).unwrap().mouse_down = Some((ctx.clone(), area)),
-            MouseKind::Up => self.clients.get_mut(&cid).unwrap().mouse_down = None,
-            MouseKind::Drag => {
-                // tmux names drags after where the button went down (MouseDrag1Border ...)
-                if let Some((down, a)) = self.clients[&cid].mouse_down.clone() {
-                    area = a;
-                    ctx = MouseCtx { event: Some(m), x: down.x, y: down.y, ..down };
-                }
-            }
-            _ => {}
-        }
-        // double / triple click
-        let mut name = keys::mouse_key_name(&m, area);
-        if m.kind == MouseKind::Down {
-            let now = Instant::now();
-            let c = self.clients.get_mut(&cid).unwrap();
-            let count = match c.last_click {
-                Some((t, x, y, n)) if now.duration_since(t) < Duration::from_millis(300) && x == m.x && y == m.y => n + 1,
-                _ => 1,
-            };
-            c.last_click = Some((now, m.x, m.y, if count >= 3 { 0 } else { count }));
-            if count >= 2 {
-                name = keys::click_key_name(count.min(3), &m, area);
-            }
-        }
-        let pane = ctx.pane;
-        if let Some(p) = pane {
-            ctx.pane = Some(p);
-        }
-        // copy-mode tables have their own mouse bindings
-        let mode_table = pane.and_then(|p| self.panes.get(&p)).and_then(|p| match &p.mode {
-            Some(PaneMode::Copy(_)) => Some(if self.opt_window(self.window_of(p.id), "mode-keys") == "vi" { "copy-mode-vi" } else { "copy-mode" }),
-            _ => None,
-        });
-        let binding = mode_table
-            .and_then(|t| self.bindings.get(t).and_then(|t| t.get(&name)).filter(|b| b.note != "default").map(|b| b.cmd.clone()))
-            .or_else(|| self.bindings.get("root").and_then(|t| t.get(&name)).map(|b| b.cmd.clone()));
-        match binding {
-            Some(cmd) => match crate::cmdparse::parse(&cmd) {
-                Ok(cmds) => {
-                    let qctx = Ctx { client: Some(cid), pane: pane.or_else(|| self.client_active_pane(cid)), mouse: Some(ctx), from_key: true, ..Ctx::default() };
-                    self.run_queue(Queue { cmds: cmds.into(), ctx: qctx , soft: 0 });
-                    // the drag that started a border resize / selection also moves it
-                    if m.kind == MouseKind::Drag && self.clients.get(&cid).is_some_and(|c| c.drag.is_some()) {
-                        self.handle_mouse(cid, m);
-                    }
-                }
-                Err(e) => self.set_message(cid, &e),
-            },
-            None => {
-                if let Some(p) = pane {
-                    self.forward_mouse(p, &ctx);
-                }
-            }
-        }
-    }
-
-    /// `send-keys -M`: deliver the mouse event to the pane (application or copy mode).
-    pub fn forward_mouse(&mut self, pane: PaneId, ctx: &MouseCtx) {
-        let Some(m) = ctx.event else { return };
-        let Some(p) = self.panes.get_mut(&pane) else { return };
-        if let Some(PaneMode::Copy(cm)) = &mut p.mode {
-            let action = match m.kind {
-                MouseKind::WheelUp => (0..5).map(|_| cm.run("scroll-up", &[])).last(),
-                MouseKind::WheelDown => (0..5).map(|_| cm.run("scroll-down", &[])).find(|a| *a == Action::Cancel),
-                MouseKind::Down if m.button == 1 => {
-                    cm.run("clear-selection", &[]);
-                    cm.move_to_view(ctx.py, ctx.px);
-                    None
-                }
-                MouseKind::Drag if m.button == 1 => {
-                    if !cm.selection_active() {
-                        cm.run("begin-selection", &[]);
-                    }
-                    cm.move_to_view(ctx.py, ctx.px);
-                    None
-                }
-                _ => None,
-            };
-            if let Some(a) = action {
-                self.copy_action(pane, None, a, None);
-            }
-            if let Some(wid) = self.window_of(pane) {
-                self.mark_window_dirty(wid);
-            }
-            return;
-        }
-        if let Some(PaneMode::Tree(_)) = &p.mode {
-            match m.kind {
-                MouseKind::WheelUp => self.mode_key(pane, None, "Up"),
-                MouseKind::WheelDown => self.mode_key(pane, None, "Down"),
-                _ => {}
-            }
-            return;
-        }
-        let mode = p.screen().mouse_protocol_mode();
-        if mode == vt100::MouseProtocolMode::None {
-            return;
-        }
-        let sgr = p.screen().mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr;
-        let rel = Mouse { x: ctx.px, y: ctx.py, ..m };
-        if let Some(b) = keys::encode_mouse(&rel, mode, sgr) {
-            p.send(b);
-        }
-    }
-
-    pub fn start_border_drag(&mut self, cid: ClientId, mouse: Option<MouseCtx>) {
-        let Some(mc) = mouse else { return };
-        let Some(wid) = mc.wid.filter(|w| self.windows.contains_key(w)) else { return };
-        let Some((_, ch)) = self.clients.get(&cid).map(|c| c.size) else { return };
-        let sid = self.client_session(cid);
-        let top = self.opt_session(sid, "status-position") == "top";
-        let oy = if top { self.status_lines(sid).min(ch.saturating_sub(1)) } else { 0 };
-        let y = mc.y.saturating_sub(oy);
-        let (rects, _) = self.rects(wid);
-        // the pane left of / above the border under the mouse
-        let left = rects.iter().find(|(_, r)| r.right() == mc.x && y >= r.y && y < r.bottom());
-        let above = rects.iter().find(|(_, r)| r.bottom() == y && mc.x >= r.x && mc.x < r.right());
-        let (pane, vertical) = match (left, above) {
-            (Some((p, _)), _) => (*p, true),
-            (None, Some((p, _))) => (*p, false),
-            _ => return,
-        };
-        if let Some(c) = self.clients.get_mut(&cid) {
-            c.drag = Some(Drag { kind: DragKind::Border { pane, vertical, last: (mc.x, mc.y) } });
-        }
-    }
-
-    pub fn start_copy_drag(&mut self, cid: ClientId, pane: PaneId, m: MouseCtx) {
-        if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
-            cm.move_to_view(m.py, m.px);
-            cm.run("begin-selection", &[]);
-        }
-        if let Some(c) = self.clients.get_mut(&cid) {
-            c.drag = Some(Drag { kind: DragKind::Copy { pane } });
-        }
-    }
 }
 
 pub const COMMAND_NAMES: &[&str] = &[

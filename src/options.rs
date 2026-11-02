@@ -44,6 +44,7 @@ pub static DEFS: &[OptDef] = &[
     // server
     d("backspace", Server, Key, "C-?"),
     d("buffer-limit", Server, Num, "50"),
+    d("copy-command", Server, Str, ""),
     d("default-terminal", Server, Str, "xterm-256color"),
     d("escape-time", Server, Num, "10"),
     d("exit-empty", Server, Flag, "on"),

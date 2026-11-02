@@ -36,8 +36,10 @@ fn fixture() -> (Server, mpsc::Receiver<Event>) {
             drag: None,
             title: String::new(),
             suspended: false,
-            last_click: None,
-            mouse_down: None,
+            click: Default::default(),
+            mouse_last: (0, 0, 0),
+            mouse_drag_flag: 0,
+            status_ranges: Vec::new(),
             control: 0,
             control_size: None,
             control_seq: 0,
@@ -355,22 +357,33 @@ fn legacy_stdin_requests_are_rejected_before_command_splitting() {
 
 #[test]
 fn replacing_popup_with_other_overlays_releases_its_pane() {
-    for args in [&["display-panes", "-b"][..], &["display-menu", "Item", "i", "display-message done"][..]] {
-        let (mut srv, _events) = fixture();
+    let popup = |srv: &mut Server| {
         let c = srv.clients.get_mut(&1).unwrap();
         c.readonly = false;
         c.acl_readonly = false;
         c.attached = true;
         let pane = srv.spawn_pane(None, 20, 6, &[], None, &[]).unwrap();
         srv.replace_overlay(1, Some(Overlay::Popup(Popup { pane, x: 0, y: 0, w: 22, h: 8, border: true, close_on_exit: false, title: String::new() }))).unwrap();
+        pane
+    };
+    // like tmux, other overlays are not shown over a popup: it and its pane stay
+    for args in [&["display-panes", "-b"][..], &["display-menu", "Item", "i", "display-message done"][..]] {
+        let (mut srv, _events) = fixture();
+        let pane = popup(&mut srv);
         let epoch = srv.clients[&1].overlay_epoch;
         let result = command(&mut srv, args);
-        let released = !srv.panes.contains_key(&pane);
-        let replaced = srv.clients[&1].overlay_epoch != epoch && !matches!(srv.clients[&1].overlay, Some(Overlay::Popup(_)));
+        let kept = srv.panes.contains_key(&pane) && srv.clients[&1].overlay_epoch == epoch && matches!(srv.clients[&1].overlay, Some(Overlay::Popup(_)));
         srv.shutdown();
         assert!(result.is_ok());
-        assert!(released && replaced, "{args:?} left an orphan popup pane");
+        assert!(kept, "{args:?} replaced the popup");
     }
+    // replacing the overlay directly releases the popup's pane
+    let (mut srv, _events) = fixture();
+    let pane = popup(&mut srv);
+    srv.replace_overlay(1, Some(Overlay::DisplayPanes { until: Instant::now(), template: String::new() })).unwrap();
+    let released = !srv.panes.contains_key(&pane);
+    srv.shutdown();
+    assert!(released, "replaced popup left an orphan pane");
 }
 
 #[test]

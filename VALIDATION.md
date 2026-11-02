@@ -98,6 +98,12 @@ The later latency follow-up (ioctl terminal size on Unix, row-range
 unit tests and 36 local integration tests per platform, all passing, including
 the real-terminal dark-background progress-bar regression.
 
+The mouse follow-up compared `set -g mouse on` behaviour with tmux 3.6a using
+`tests/mouse_compat.py` (80 of 80 scenarios match; see COMPATIBILITY.md). Afterwards
+Windows 198 / Linux 196 unit tests and 36 local integration tests per platform pass,
+and the Windows ASCII UI comparison still has 51 exact matches of 52, the remaining
+case differing only in runtime pane IDs.
+
 ```text
 cargo test --locked
 cargo clippy --locked --all-targets -- -A clippy::style -A clippy::complexity -A clippy::perf -D clippy::correctness -D clippy::suspicious

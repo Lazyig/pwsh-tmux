@@ -9,6 +9,7 @@ mod control;
 pub mod features;
 mod input;
 mod modes;
+mod mouse;
 pub mod procinfo;
 mod render;
 mod vars;
@@ -348,15 +349,30 @@ pub struct RenderState {
     pub frame: render::Frame,
     pub cursor: Option<(u16, u16)>,
     pub modes: render::Modes,
+    /// Mouse range of every cell of each status line (tmux status entry ranges).
+    pub status_ranges: Vec<Vec<Option<crate::format::Range>>>,
 }
 
+/// What a mouse drag in progress updates (tmux's mouse_drag_update callback).
 pub struct Drag {
     pub kind: DragKind,
 }
 
 pub enum DragKind {
-    Border { pane: PaneId, vertical: bool, last: (u16, u16) },
+    /// resize-pane -M: borders next to where the drag started follow the mouse.
+    Border,
+    /// A copy-mode selection (copy-mode -M, begin-selection from the mouse).
     Copy { pane: PaneId },
+}
+
+/// Multi-click detection, as tmux's CLIENT_DOUBLECLICK / CLIENT_TRIPLECLICK and click timer.
+#[derive(Clone, Default)]
+pub struct ClickState {
+    /// 0: none, 1: waiting for a second click, 2: waiting for a third click.
+    pub waiting: u8,
+    pub button: u8,
+    pub event: Option<keys::Mouse>,
+    pub deadline: Option<Instant>,
 }
 
 pub struct Client {
@@ -383,9 +399,13 @@ pub struct Client {
     pub drag: Option<Drag>,
     pub title: String,
     pub suspended: bool,
-    pub last_click: Option<(Instant, u16, u16, u8)>,
-    /// Where the last button press landed (drag events are named after it).
-    pub mouse_down: Option<(input::MouseCtx, &'static str)>,
+    pub click: ClickState,
+    /// Position and button of the previous mouse event (tmux's lx, ly, lb).
+    pub mouse_last: (u16, u16, u8),
+    /// Button + 1 of the drag in progress, 0 when not dragging (tmux's mouse_drag_flag).
+    pub mouse_drag_flag: u8,
+    /// Mouse ranges of the status lines as last drawn.
+    pub status_ranges: Vec<Vec<Option<crate::format::Range>>>,
     /// Control mode: 0 = normal client, 1 = -C, 2 = -CC.
     pub control: u8,
     /// Size set with refresh-client -C (control clients don't size windows otherwise).
@@ -545,6 +565,12 @@ pub struct Server {
     /// wait-for channels signalled while nobody waited (the next wait returns at once).
     pub waits_woken: std::collections::HashSet<String>,
     pub overlay_waits: Vec<(ClientId, u64, String, Queue)>,
+    /// Copy-mode panes scrolling while a selection drag rests at an edge.
+    pub copy_drag_timers: HashMap<PaneId, Instant>,
+    /// Queues paused by `run-shell -d`.
+    pub delayed: Vec<(Instant, Queue)>,
+    /// Mouse event of the command being run, for the mouse_* formats.
+    pub cur_mouse: Option<input::MouseCtx>,
     pub marked: Option<PaneId>,
     pub start_time: u64,
     pub host: String,
@@ -669,6 +695,9 @@ impl Server {
             waits: HashMap::new(),
             waits_woken: Default::default(),
             overlay_waits: Vec::new(),
+            copy_drag_timers: HashMap::new(),
+            delayed: Vec::new(),
+            cur_mouse: None,
             marked: None,
             start_time: now_secs(),
             host: procinfo::hostname(),
@@ -959,8 +988,10 @@ impl Server {
                 drag: None,
                 title: String::new(),
                 suspended: false,
-                last_click: None,
-                mouse_down: None,
+                click: ClickState::default(),
+                mouse_last: (0, 0, 0),
+                mouse_drag_flag: 0,
+                status_ranges: Vec::new(),
                 control: 0,
                 control_size: None,
                 control_seq: 0,
@@ -1328,8 +1359,11 @@ impl Server {
     pub fn next_timeout(&self) -> Duration {
         let mut t = Duration::from_millis(1000);
         let now = Instant::now();
+        for d in self.copy_drag_timers.values().chain(self.delayed.iter().map(|(d, _)| d)) {
+            t = t.min(d.saturating_duration_since(now));
+        }
         for c in self.clients.values() {
-            for d in [c.esc_deadline, c.repeat_until, c.message.as_ref().map(|m| m.1)].into_iter().flatten() {
+            for d in [c.esc_deadline, c.repeat_until, c.message.as_ref().map(|m| m.1), c.click.deadline].into_iter().flatten() {
                 t = t.min(d.saturating_duration_since(now));
             }
             if let Some(Overlay::DisplayPanes { until, .. }) = &c.overlay {
@@ -1351,6 +1385,9 @@ impl Server {
                     self.dispatch_input(cid, i);
                 }
             }
+            if self.clients.get(&cid).is_some_and(|c| c.click.deadline.is_some_and(|d| d <= now)) {
+                self.mouse_click_timer(cid);
+            }
             let Some(c) = self.clients.get_mut(&cid) else { continue };
             if c.repeat_until.is_some_and(|d| d <= now) {
                 c.repeat_until = None;
@@ -1366,6 +1403,16 @@ impl Server {
             if matches!(&c.overlay, Some(Overlay::DisplayPanes { until, .. }) if *until <= now) {
                 c.overlay = None;
                 c.dirty = true;
+            }
+        }
+        if !self.copy_drag_timers.is_empty() {
+            self.copy_drag_timers_due(now);
+        }
+        if self.delayed.iter().any(|(d, _)| *d <= now) {
+            let (due, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.delayed).into_iter().partition(|(d, _)| *d <= now);
+            self.delayed = rest;
+            for (_, q) in due {
+                self.run_queue(q);
             }
         }
         let waiting = std::mem::take(&mut self.overlay_waits);
@@ -2013,7 +2060,11 @@ impl Server {
             let name = cmd.first().cloned().unwrap_or_default();
             let soft = q.soft > 0;
             q.soft = q.soft.saturating_sub(1);
-            match self.exec(cmd, &mut q.ctx) {
+            let delay_cmd = (name == "run-shell").then(|| cmd.clone());
+            let saved_mouse = std::mem::replace(&mut self.cur_mouse, q.ctx.mouse.clone());
+            let result = self.exec(cmd, &mut q.ctx);
+            self.cur_mouse = saved_mouse;
+            match result {
                 Ok(Flow::Inject(cmds, soft_errors)) => {
                     let n = cmds.len();
                     for c in cmds.into_iter().rev() {
@@ -2062,6 +2113,15 @@ impl Server {
                         }
                         "wait" => {
                             self.waits.entry(get(2)).or_insert((false, Vec::new())).1.push(q);
+                            return;
+                        }
+                        "delay" => {
+                            // run-shell -d: the rest of the queue (and the command) runs later
+                            let ms: u64 = get(2).parse().unwrap_or(0);
+                            if let Some(c) = delay_cmd.as_ref().map(|c| strip_delay(c)) {
+                                q.cmds.push_front(c);
+                            }
+                            self.delayed.push((Instant::now() + Duration::from_millis(ms), q));
                             return;
                         }
                         _ => {
@@ -2159,3 +2219,43 @@ impl Server {
 
 #[cfg(test)]
 mod security_tests;
+
+/// A `run-shell` command without its `-d` delay (applied by parking the queue).
+fn strip_delay(cmd: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(cmd.len());
+    let mut it = cmd.iter();
+    if let Some(name) = it.next() {
+        out.push(name.clone());
+    }
+    let mut options = true;
+    while let Some(a) = it.next() {
+        if options && a == "--" {
+            options = false;
+            out.push(a.clone());
+            continue;
+        }
+        if options && a.len() > 1 && a.starts_with('-') {
+            let flags = &a[1..];
+            if let Some(i) = flags.find('d') {
+                // flags before d are kept; the value is the rest of this word or the next one
+                let before = &flags[..i];
+                if !before.is_empty() {
+                    out.push(format!("-{before}"));
+                }
+                if flags.len() == i + 1 {
+                    it.next();
+                }
+                continue;
+            }
+            let takes_value = flags.ends_with(['c', 't']);
+            out.push(a.clone());
+            if takes_value && let Some(v) = it.next() {
+                out.push(v.clone());
+            }
+            continue;
+        }
+        options = false;
+        out.push(a.clone());
+    }
+    out
+}

@@ -58,7 +58,7 @@ impl Mods {
         1 + self.shift as u32 + 2 * self.meta as u32 + 4 * self.ctrl as u32
     }
 
-    fn prefix(&self) -> String {
+    pub fn prefix(&self) -> String {
         let mut s = String::new();
         if self.ctrl {
             s.push_str("C-");

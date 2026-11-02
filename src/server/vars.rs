@@ -297,14 +297,22 @@ impl Vars for VarCtx<'_> {
             "pane_created" => pane.map(|p| p.created.to_string()),
             "pane_left" | "pane_top" | "pane_right" | "pane_bottom" | "pane_at_left" | "pane_at_right" | "pane_at_top" | "pane_at_bottom" => {
                 let (w, p) = (win?, t.pane?);
-                let (rects, _) = srv.rects(w.id);
-                let r = rects.iter().find(|(id, _)| *id == p)?.1;
                 let area = srv.window_area(w.id);
+                // a pane hidden by zoom keeps its place in the unzoomed layout
+                let r = if w.zoomed && p != w.active {
+                    let (mut panes, mut seps) = (Vec::new(), Vec::new());
+                    w.layout.layout(area, &mut panes, &mut seps);
+                    panes.into_iter().find(|(id, _)| *id == p)?.1
+                } else {
+                    srv.rects(w.id).0.into_iter().find(|(id, _)| *id == p)?.1
+                };
+                // position of the pane's content (below a pane-border-status line)
+                let c = srv.content_rect(w.id, r);
                 Some(match name {
-                    "pane_left" => r.x.to_string(),
-                    "pane_top" => r.y.to_string(),
-                    "pane_right" => (r.right().saturating_sub(1)).to_string(),
-                    "pane_bottom" => (r.bottom().saturating_sub(1)).to_string(),
+                    "pane_left" => c.x.to_string(),
+                    "pane_top" => c.y.to_string(),
+                    "pane_right" => (c.right().saturating_sub(1)).to_string(),
+                    "pane_bottom" => (c.bottom().saturating_sub(1)).to_string(),
                     "pane_at_left" => b(r.x == 0),
                     "pane_at_top" => b(r.y == 0),
                     "pane_at_right" => b(r.right() >= area.w),
@@ -328,7 +336,25 @@ impl Vars for VarCtx<'_> {
                 }
                 _ => None,
             }),
-            "selection_present" => pane.map(|p| b(matches!(&p.mode, Some(PaneMode::Copy(c)) if c.selection_active()))),
+            "selection_start_x" | "selection_start_y" | "selection_end_x" | "selection_end_y" => pane.and_then(|p| match &p.mode {
+                Some(PaneMode::Copy(c)) => c.selection_ends().map(|(s, e)| {
+                    match name {
+                        "selection_start_x" => s.0,
+                        "selection_start_y" => s.1,
+                        "selection_end_x" => e.0,
+                        _ => e.1,
+                    }
+                    .to_string()
+                }),
+                _ => None,
+            }),
+            "selection_present" => pane.and_then(|p| match &p.mode {
+                Some(PaneMode::Copy(c)) => Some(b(c.selection_active())),
+                _ => None,
+            }),
+            "mouse_x" | "mouse_y" | "mouse_word" | "mouse_line" | "mouse_hyperlink" | "mouse_status_line" | "mouse_status_range" | "mouse_pane" => {
+                self.srv.mouse_var(name, self.client)
+            }
             "mouse_any_flag" => pane.map(|p| b(p.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None)),
             "mouse_standard_flag" => pane.map(|p| b(matches!(p.screen().mouse_protocol_mode(), vt100::MouseProtocolMode::PressRelease | vt100::MouseProtocolMode::Press))),
             "mouse_button_flag" => pane.map(|p| b(p.screen().mouse_protocol_mode() == vt100::MouseProtocolMode::ButtonMotion)),
