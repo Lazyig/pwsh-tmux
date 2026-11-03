@@ -193,6 +193,11 @@ fn overlay_style(cell: &mut Style, over: Style) {
     }
 }
 
+/// A blank that EL (erase to end of line, default background) reproduces exactly.
+fn erasable(c: &Cell) -> bool {
+    c.text == " " && c.style.bg == Color::Default && c.style.attrs & (UNDERLINE | INVERSE | STRIKE) == 0
+}
+
 fn spans_cells(spans: &[Span], max: usize, fill: Style) -> Vec<Cell> {
     let total: usize = spans.iter().map(|s| format::width(&s.text)).sum();
     let left_aligned: Vec<Span> = spans.iter().map(|s| Span { align: format::Align::Left, ..s.clone() }).collect();
@@ -724,7 +729,12 @@ impl Server {
             changed = true;
             let _ = write!(out, "\x1b[{};1H", y + 1);
             let mut cur: Option<Style> = None;
-            for (x, cell) in row.iter().enumerate() {
+            // Like tmux, blank default-background cells at the end of the row are erased
+            // with EL instead of being written as spaces. Terminals that keep text per line
+            // (the IntelliJ terminal's editor) then don't get full-width lines, which an
+            // IME's composed-text inlay at the cursor would push into a soft wrap.
+            let end = row.iter().rposition(|c| !erasable(c)).map_or(0, |i| i + 1);
+            for (x, cell) in row.iter().enumerate().take(end) {
                 if cell.text.is_empty() {
                     continue;
                 }
@@ -737,6 +747,13 @@ impl Server {
                     let width = cell.text.chars().filter_map(|c| c.width()).sum::<usize>();
                     if x + width < next.frame.w as usize { let _ = write!(out, "\x1b[{};{}H", y + 1, x + width + 1); }
                 }
+            }
+            if end < row.len() {
+                // EL erases with the current background: make sure it is the default
+                if cur != Some(Style::default()) {
+                    out.push_str("\x1b[0m");
+                }
+                out.push_str("\x1b[K");
             }
         }
         let pm = prev.map(|p| p.modes);

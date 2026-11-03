@@ -306,7 +306,8 @@ fn progress_bar_preserves_dark_truecolor_background_on_blank_cells() {
     t.wait_screen("usage progress bar", |s| s.contains("2% used"));
     let screen = t.screen.lock().unwrap();
     let bar = screen.screen().cell(8, 10).unwrap();
-    assert_eq!(bar.contents(), " ");
+    // a blank (written, or erased with the background colour by ConPTY)
+    assert!(matches!(bar.contents(), "" | " "), "{:?}", bar.contents());
     assert_eq!(bar.bgcolor(), vt100::Color::Rgb(82, 82, 112));
     let filled = screen.screen().cell(8, 0).unwrap();
     assert_eq!(filled.fgcolor(), vt100::Color::Rgb(180, 180, 255));
