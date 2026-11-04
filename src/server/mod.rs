@@ -65,6 +65,9 @@ pub enum Event {
     FormatShell(String, String),
     /// Who is on the other end of a connection (uid / SID), known after its first frame.
     ClientUser(ClientId, Option<String>),
+    /// Foreground programs looked up off the main thread:
+    /// (pane, shell pid it was looked up for, command, working directory).
+    PaneInfo(Vec<(PaneId, Option<u32>, Option<String>, Option<String>)>),
 }
 
 /// Answers terminal queries and collects title / bell / cwd reports from a pane.
@@ -567,6 +570,8 @@ pub struct Server {
     pub overlay_waits: Vec<(ClientId, u64, String, Queue)>,
     /// Copy-mode panes scrolling while a selection drag rests at an edge.
     pub copy_drag_timers: HashMap<PaneId, Instant>,
+    /// A lookup of what the panes run is in progress (at most one at a time).
+    pub pane_info_busy: bool,
     /// Queues paused by `run-shell -d`.
     pub delayed: Vec<(Instant, Queue)>,
     /// Mouse event of the command being run, for the mouse_* formats.
@@ -696,6 +701,7 @@ impl Server {
             waits_woken: Default::default(),
             overlay_waits: Vec::new(),
             copy_drag_timers: HashMap::new(),
+            pane_info_busy: false,
             delayed: Vec::new(),
             cur_mouse: None,
             marked: None,
@@ -871,6 +877,7 @@ impl Server {
             }
             Event::Job(id, status, output) => self.job_done(id, status, output),
             Event::ClientUser(cid, user) => self.client_user(cid, user),
+            Event::PaneInfo(info) => self.pane_info(info),
             Event::FormatShell(command, output) => {
                 if let Some(e) = self.shell_cache.borrow_mut().get_mut(&command) {
                     e.0 = output;
@@ -1433,38 +1440,14 @@ impl Server {
 
     fn tick_second(&mut self) {
         self.control_subscriptions();
-        let ids: Vec<PaneId> = self.panes.keys().copied().collect();
-        for id in ids {
-            let Some(p) = self.panes.get(&id) else { continue };
-            if p.dead.is_some() {
-                continue;
-            }
-            let (pid, pg) = (p.pid, p.fg_pgrp());
-            let cmd = procinfo::current_command(pid, pg);
-            let path = procinfo::current_path(pid, pg);
-            let p = self.panes.get_mut(&id).unwrap();
-            if let Some(c) = cmd {
-                p.current_cmd = c;
-            }
-            if let Some(path) = path {
-                p.current_path = path;
-            }
-        }
-        // automatic-rename
+        self.request_pane_info();
+        self.automatic_rename();
         let wids: Vec<WinId> = self.windows.keys().copied().collect();
         for wid in wids {
-            // alert hooks run below may have removed windows
-            let Some(active) = self.windows.get(&wid).map(|w| w.active) else { continue };
-            if !self.opt_window_on(Some(wid), "automatic-rename") {
+            // silence (alert hooks run below may have removed windows)
+            if !self.windows.contains_key(&wid) {
                 continue;
             }
-            let fmt = self.opt_window(Some(wid), "automatic-rename-format");
-            let name = self.expand_for_pane(active, &fmt);
-            if !name.is_empty() && self.windows.get(&wid).is_some_and(|w| w.name != name) {
-                self.windows.get_mut(&wid).unwrap().name = name;
-                self.mark_window_dirty(wid);
-            }
-            // silence
             let secs = self.opt_window_num(Some(wid), "monitor-silence");
             if secs > 0 {
                 let Some(w) = self.windows.get(&wid) else { continue };
@@ -1492,6 +1475,64 @@ impl Server {
         let clock: Vec<WinId> = self.panes.values().filter(|p| matches!(p.mode, Some(PaneMode::Clock))).filter_map(|p| self.window_of(p.id)).collect();
         for w in clock {
             self.mark_window_dirty(w);
+        }
+    }
+
+    /// Look up what every live pane runs on a helper thread: on Windows that takes a
+    /// snapshot of all processes, which can take long enough to stall input if done
+    /// here. A lookup still running is not started again.
+    fn request_pane_info(&mut self) {
+        if self.pane_info_busy {
+            return;
+        }
+        let req: Vec<(PaneId, Option<u32>, Option<i32>)> =
+            self.panes.values().filter(|p| p.dead.is_none()).map(|p| (p.id, p.pid, p.fg_pgrp())).collect();
+        if req.is_empty() {
+            return;
+        }
+        let tx = self.tx.clone();
+        let spawned = thread::Builder::new().name("pane-info".into()).spawn(move || {
+            let keys: Vec<(Option<u32>, Option<i32>)> = req.iter().map(|r| (r.1, r.2)).collect();
+            // always answer, so a failed lookup does not stop later ones
+            let found = std::panic::catch_unwind(|| procinfo::pane_programs(&keys)).unwrap_or_default();
+            let mut found = found.into_iter();
+            let info = req.into_iter().map(|(id, pid, _)| {
+                let (cmd, path) = found.next().unwrap_or((None, None));
+                (id, pid, cmd, path)
+            });
+            let _ = tx.send(Event::PaneInfo(info.collect()));
+        });
+        self.pane_info_busy = spawned.is_ok();
+    }
+
+    fn pane_info(&mut self, info: Vec<(PaneId, Option<u32>, Option<String>, Option<String>)>) {
+        self.pane_info_busy = false;
+        for (id, pid, cmd, path) in info {
+            // the pane may have gone or been respawned since the lookup started
+            let Some(p) = self.panes.get_mut(&id).filter(|p| p.pid == pid && p.dead.is_none()) else { continue };
+            if let Some(c) = cmd {
+                p.current_cmd = c;
+            }
+            if let Some(path) = path {
+                p.current_path = path;
+            }
+        }
+        self.automatic_rename();
+    }
+
+    fn automatic_rename(&mut self) {
+        let wids: Vec<WinId> = self.windows.keys().copied().collect();
+        for wid in wids {
+            let Some(active) = self.windows.get(&wid).map(|w| w.active) else { continue };
+            if !self.opt_window_on(Some(wid), "automatic-rename") {
+                continue;
+            }
+            let fmt = self.opt_window(Some(wid), "automatic-rename-format");
+            let name = self.expand_for_pane(active, &fmt);
+            if !name.is_empty() && self.windows.get(&wid).is_some_and(|w| w.name != name) {
+                self.windows.get_mut(&wid).unwrap().name = name;
+                self.mark_window_dirty(wid);
+            }
         }
     }
 

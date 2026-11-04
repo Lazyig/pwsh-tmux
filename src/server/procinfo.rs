@@ -114,32 +114,33 @@ pub fn program_name(argv0: &str) -> String {
         .unwrap_or_else(|| argv0.to_string())
 }
 
-/// Name of the foreground program in a pane: on Unix the pty's foreground process group,
-/// on Windows the deepest descendant of the pane's shell.
-pub fn current_command(pid: Option<u32>, fg_pgrp: Option<i32>) -> Option<String> {
+/// What each pane runs, for (shell pid, pty foreground process group) pairs: the
+/// foreground program's name and, where it can be read, its working directory.
+///
+/// On Unix that is the pty's foreground process group. On Windows it is the deepest
+/// descendant of the pane's shell, found in one process snapshot shared by all panes.
+/// This can be slow on a busy system, so the server calls it off its main thread.
+pub fn pane_programs(panes: &[(Option<u32>, Option<i32>)]) -> Vec<(Option<String>, Option<String>)> {
     #[cfg(unix)]
     {
-        let p = fg_pgrp.map(|p| p as u32).or(pid)?;
-        let comm = std::fs::read_to_string(format!("/proc/{p}/comm")).ok()?;
-        Some(comm.trim().to_string())
+        panes
+            .iter()
+            .map(|&(pid, fg_pgrp)| {
+                let Some(p) = fg_pgrp.map(|p| p as u32).or(pid) else { return (None, None) };
+                let comm = std::fs::read_to_string(format!("/proc/{p}/comm")).ok().map(|c| c.trim().to_string());
+                let cwd = std::fs::read_link(format!("/proc/{p}/cwd")).ok().map(|p| p.to_string_lossy().into_owned());
+                (comm, cwd)
+            })
+            .collect()
     }
     #[cfg(windows)]
     {
-        let _ = fg_pgrp;
-        win::deepest_descendant(pid?).map(|n| program_name(&n))
-    }
-}
-
-pub fn current_path(pid: Option<u32>, fg_pgrp: Option<i32>) -> Option<String> {
-    #[cfg(unix)]
-    {
-        let p = fg_pgrp.map(|p| p as u32).or(pid)?;
-        std::fs::read_link(format!("/proc/{p}/cwd")).ok().map(|p| p.to_string_lossy().into_owned())
-    }
-    #[cfg(windows)]
-    {
-        let _ = (pid, fg_pgrp);
-        None
+        if panes.iter().all(|(pid, _)| pid.is_none()) {
+            return vec![(None, None); panes.len()];
+        }
+        let table = win::ProcessTable::snapshot();
+        // the working directory comes from the shell's OSC 7 reports instead
+        panes.iter().map(|&(pid, _)| (pid.and_then(|p| table.deepest_descendant(p)).map(|n| program_name(&n)), None)).collect()
     }
 }
 
@@ -186,50 +187,97 @@ pub mod win {
         }
     }
 
-    pub fn deepest_descendant(root: u32) -> Option<String> {
-        let procs = processes();
-        descendant_name(&procs, root)
+    /// One process snapshot, indexed by parent, for looking up many panes at once.
+    pub struct ProcessTable {
+        names: std::collections::HashMap<u32, String>,
+        /// Children of each pid in snapshot order (a process naming itself as its
+        /// parent is left out).
+        children: std::collections::HashMap<u32, Vec<u32>>,
     }
 
-    fn descendant_name(procs: &[(u32, u32, String)], root: u32) -> Option<String> {
-        let name_of = |pid: u32| procs.iter().find(|p| p.0 == pid).map(|p| p.2.clone());
-        let mut best = (0usize, root);
-        let mut stack = vec![(root, 0usize)];
-        // Parent IDs outlive their processes and may refer to a reused PID.
-        // A snapshot can therefore contain cycles, even though a live process
-        // tree cannot. Visit each PID once to bound both memory and traversal.
-        let mut visited = std::collections::HashSet::from([root]);
-        while let Some((pid, depth)) = stack.pop() {
-            for (child, _, name) in procs.iter().filter(|p| p.1 == pid && p.0 != pid) {
-                let lname = name.to_lowercase();
-                if lname == "conhost.exe" || lname == "openconsole.exe" {
-                    continue;
-                }
-                if !visited.insert(*child) { continue; }
-                if depth + 1 >= best.0 {
-                    best = (depth + 1, *child);
-                }
-                stack.push((*child, depth + 1));
-            }
+    impl ProcessTable {
+        pub fn snapshot() -> ProcessTable {
+            ProcessTable::from_list(processes())
         }
-        name_of(best.1)
+
+        pub fn from_list(procs: Vec<(u32, u32, String)>) -> ProcessTable {
+            let mut names = std::collections::HashMap::with_capacity(procs.len());
+            let mut children: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+            for (pid, parent, name) in procs {
+                if pid != parent {
+                    children.entry(parent).or_default().push(pid);
+                }
+                // a pid listed twice keeps its first name, as a linear search would
+                names.entry(pid).or_insert(name);
+            }
+            ProcessTable { names, children }
+        }
+
+        /// Executable name of the deepest descendant of `root` (the latest found among
+        /// equally deep ones), ignoring console hosts; `root` itself when it has none.
+        pub fn deepest_descendant(&self, root: u32) -> Option<String> {
+            let mut best = (0usize, root);
+            let mut stack = vec![(root, 0usize)];
+            // Parent IDs outlive their processes and may refer to a reused PID.
+            // A snapshot can therefore contain cycles, even though a live process
+            // tree cannot. Visit each PID once to bound both memory and traversal.
+            let mut visited = std::collections::HashSet::from([root]);
+            while let Some((pid, depth)) = stack.pop() {
+                for &child in self.children.get(&pid).map(Vec::as_slice).unwrap_or_default() {
+                    let name = self.names.get(&child).map(String::as_str).unwrap_or_default();
+                    if name.eq_ignore_ascii_case("conhost.exe") || name.eq_ignore_ascii_case("openconsole.exe") {
+                        continue;
+                    }
+                    if !visited.insert(child) {
+                        continue;
+                    }
+                    if depth + 1 >= best.0 {
+                        best = (depth + 1, child);
+                    }
+                    stack.push((child, depth + 1));
+                }
+            }
+            self.names.get(&best.1).cloned()
+        }
     }
 
     #[cfg(test)]
     mod tests {
-        use super::descendant_name;
+        use super::ProcessTable;
+
+        fn deepest(procs: Vec<(u32, u32, String)>, root: u32) -> Option<String> {
+            ProcessTable::from_list(procs).deepest_descendant(root)
+        }
 
         #[test]
         fn reused_parent_ids_cannot_cycle_descendant_traversal() {
             let procs = vec![(1, 3, "shell.exe".into()), (2, 1, "child.exe".into()), (3, 2, "leaf.exe".into())];
-            assert_eq!(descendant_name(&procs, 1).as_deref(), Some("leaf.exe"));
+            assert_eq!(deepest(procs, 1).as_deref(), Some("leaf.exe"));
         }
 
         #[test]
         fn ignores_console_hosts_and_keeps_leaf_commands() {
             let procs = vec![(1, 1, "shell.exe".into()), (2, 1, "conhost.exe".into()), (3, 1, "child.exe".into()), (4, 3, "tool.exe".into())];
-            assert_eq!(descendant_name(&procs, 1).as_deref(), Some("tool.exe"));
-            assert_eq!(descendant_name(&procs, 99), None);
+            assert_eq!(deepest(procs.clone(), 1).as_deref(), Some("tool.exe"));
+            assert_eq!(deepest(procs, 99), None);
+        }
+
+        #[test]
+        fn one_table_answers_many_panes() {
+            let procs = vec![
+                (10, 1, "pwsh.exe".into()),
+                (11, 10, "OpenConsole.exe".into()),
+                (12, 10, "vim.exe".into()),
+                (20, 1, "pwsh.exe".into()),
+                (21, 20, "node.exe".into()),
+                (22, 21, "esbuild.exe".into()),
+                (23, 20, "git.exe".into()),
+                (30, 1, "pwsh.exe".into()),
+            ];
+            let t = ProcessTable::from_list(procs);
+            assert_eq!(t.deepest_descendant(10).as_deref(), Some("vim.exe"));
+            assert_eq!(t.deepest_descendant(20).as_deref(), Some("esbuild.exe"));
+            assert_eq!(t.deepest_descendant(30).as_deref(), Some("pwsh.exe"));
         }
     }
 }
