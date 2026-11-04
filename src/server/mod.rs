@@ -65,9 +65,19 @@ pub enum Event {
     FormatShell(String, String),
     /// Who is on the other end of a connection (uid / SID), known after its first frame.
     ClientUser(ClientId, Option<String>),
-    /// Foreground programs looked up off the main thread:
-    /// (pane, shell pid it was looked up for, command, working directory).
-    PaneInfo(Vec<(PaneId, Option<u32>, Option<String>, Option<String>)>),
+    /// Foreground programs looked up off the main thread.
+    PaneInfo(Vec<PaneInfo>),
+}
+
+/// What a pane was running when looked up, and which pane state the lookup was for.
+pub struct PaneInfo {
+    pub id: PaneId,
+    pub generation: u32,
+    pub pid: Option<u32>,
+    /// The pane's cwd_seq at the request: a cwd reported by the pane since then is newer.
+    pub cwd_seq: u64,
+    pub cmd: Option<String>,
+    pub path: Option<String>,
 }
 
 /// Answers terminal queries and collects title / bell / cwd reports from a pane.
@@ -87,10 +97,12 @@ fn decode_file_url(url: &str) -> Option<String> {
     let mut bytes = Vec::new();
     let b = path.as_bytes();
     let mut i = 0;
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
     while i < b.len() {
+        // decode %XX from the bytes: slicing the str here could split a character
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&path[i + 1..i + 3], 16) {
-                bytes.push(v);
+            if let (Some(hi), Some(lo)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                bytes.push(hi << 4 | lo);
                 i += 3;
                 continue;
             }
@@ -162,6 +174,8 @@ pub struct Pane {
     pub created: u64,
     pub current_cmd: String,
     pub current_path: String,
+    /// Counts working-directory reports from the pane (OSC 7).
+    pub cwd_seq: u64,
     /// The conhost.exe hosting this pane's pseudoconsole (Windows).
     #[cfg_attr(not(windows), allow(dead_code))]
     pub host_pid: Option<u32>,
@@ -1163,6 +1177,7 @@ impl Server {
         let title = cb.title.take();
         if let Some(cwd) = cb.cwd.take() {
             p.current_path = cwd;
+            p.cwd_seq += 1;
         }
         p.send(replies);
         if let Some(t) = title {
@@ -1485,35 +1500,40 @@ impl Server {
         if self.pane_info_busy {
             return;
         }
-        let req: Vec<(PaneId, Option<u32>, Option<i32>)> =
-            self.panes.values().filter(|p| p.dead.is_none()).map(|p| (p.id, p.pid, p.fg_pgrp())).collect();
+        let mut keys = Vec::new();
+        let mut req = Vec::new();
+        for p in self.panes.values().filter(|p| p.dead.is_none()) {
+            keys.push((p.pid, p.fg_pgrp()));
+            req.push(PaneInfo { id: p.id, generation: p.generation, pid: p.pid, cwd_seq: p.cwd_seq, cmd: None, path: None });
+        }
         if req.is_empty() {
             return;
         }
         let tx = self.tx.clone();
         let spawned = thread::Builder::new().name("pane-info".into()).spawn(move || {
-            let keys: Vec<(Option<u32>, Option<i32>)> = req.iter().map(|r| (r.1, r.2)).collect();
             // always answer, so a failed lookup does not stop later ones
             let found = std::panic::catch_unwind(|| procinfo::pane_programs(&keys)).unwrap_or_default();
-            let mut found = found.into_iter();
-            let info = req.into_iter().map(|(id, pid, _)| {
-                let (cmd, path) = found.next().unwrap_or((None, None));
-                (id, pid, cmd, path)
-            });
-            let _ = tx.send(Event::PaneInfo(info.collect()));
+            for (r, (cmd, path)) in req.iter_mut().zip(found) {
+                r.cmd = cmd;
+                r.path = path;
+            }
+            let _ = tx.send(Event::PaneInfo(req));
         });
         self.pane_info_busy = spawned.is_ok();
     }
 
-    fn pane_info(&mut self, info: Vec<(PaneId, Option<u32>, Option<String>, Option<String>)>) {
+    fn pane_info(&mut self, info: Vec<PaneInfo>) {
         self.pane_info_busy = false;
-        for (id, pid, cmd, path) in info {
+        for r in info {
             // the pane may have gone or been respawned since the lookup started
-            let Some(p) = self.panes.get_mut(&id).filter(|p| p.pid == pid && p.dead.is_none()) else { continue };
-            if let Some(c) = cmd {
+            let Some(p) = self.panes.get_mut(&r.id).filter(|p| p.generation == r.generation && p.pid == r.pid && p.dead.is_none()) else {
+                continue;
+            };
+            if let Some(c) = r.cmd {
                 p.current_cmd = c;
             }
-            if let Some(path) = path {
+            // a directory the pane reported meanwhile is newer than this lookup
+            if let Some(path) = r.path.filter(|_| p.cwd_seq == r.cwd_seq) {
                 p.current_path = path;
             }
         }
@@ -1682,6 +1702,7 @@ impl Server {
                 created: now,
                 current_cmd: prog,
                 current_path: dir,
+                cwd_seq: 0,
                 host_pid,
             },
         );

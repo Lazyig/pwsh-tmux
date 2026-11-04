@@ -397,3 +397,10 @@ fn close_popup_does_not_remove_an_unrelated_menu() {
     command(&mut srv, &["display-popup", "-C"]).unwrap();
     assert!(matches!(srv.clients[&1].overlay, Some(Overlay::Menu(_))));
 }
+
+#[test]
+fn osc7_with_a_multibyte_character_after_percent_does_not_panic() {
+    assert_eq!(super::decode_file_url("file://localhost/C:/%한"), Some("C:\\%한".into()));
+    assert_eq!(super::decode_file_url("file://h/tmp/%e2%82%acx%zz%4"), Some("/tmp/€x%zz%4".into()));
+    assert_eq!(super::decode_file_url("file://h/a%20b"), Some("/a b".into()));
+}
