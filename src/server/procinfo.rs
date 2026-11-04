@@ -61,9 +61,10 @@ fn is_cmd(shell: &str) -> bool {
 
 /// Wraps the user's prompt so PowerShell reports its location with OSC 7; that is how
 /// #{pane_current_path} works on Windows, where another process's cwd can't be read.
+/// `%` and `;` are percent-encoded: the URL is decoded, and `;` would end the OSC field.
 const PWSH_HOOK: &str = "$global:__pwsh_tmux_prompt = $function:prompt; \
 function global:prompt { $l = $executionContext.SessionState.Path.CurrentLocation; \
-if ($l.Provider.Name -eq 'FileSystem') { [Console]::Write([char]27 + ']7;file://localhost/' + ($l.ProviderPath -replace '\\\\','/') + [char]7) }; \
+if ($l.Provider.Name -eq 'FileSystem') { [Console]::Write([char]27 + ']7;file://localhost/' + ($l.ProviderPath -replace '%','%25' -replace ';','%3B' -replace '\\\\','/') + [char]7) }; \
 & $global:__pwsh_tmux_prompt }";
 
 /// argv for an interactive shell.

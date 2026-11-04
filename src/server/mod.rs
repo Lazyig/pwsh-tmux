@@ -93,7 +93,8 @@ pub struct PaneCb {
 
 fn decode_file_url(url: &str) -> Option<String> {
     let rest = url.strip_prefix("file://")?;
-    let path = &rest[rest.find('/')?..];
+    let slash = rest.find('/')?;
+    let (host, path) = (&rest[..slash], &rest[slash..]);
     let mut bytes = Vec::new();
     let b = path.as_bytes();
     let mut i = 0;
@@ -114,6 +115,14 @@ fn decode_file_url(url: &str) -> Option<String> {
     // file://host/C:/dir on Windows
     if p.len() >= 3 && p.as_bytes()[0] == b'/' && p.as_bytes()[2] == b':' {
         return Some(p[1..].replace('/', "\\"));
+    }
+    // A UNC share as the PowerShell hook sends it: file://localhost//server/share. A
+    // file://server/... URL is left alone: from an ssh session in a pane it names a
+    // directory on that host, not a share.
+    if cfg!(windows) && (host.is_empty() || host.eq_ignore_ascii_case("localhost")) {
+        if let Some(unc) = p.strip_prefix("//").map(|u| u.trim_start_matches('/')).filter(|u| !u.is_empty()) {
+            return Some(format!("\\\\{}", unc.replace('/', "\\")));
+        }
     }
     Some(p)
 }

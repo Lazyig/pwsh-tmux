@@ -404,3 +404,13 @@ fn osc7_with_a_multibyte_character_after_percent_does_not_panic() {
     assert_eq!(super::decode_file_url("file://h/tmp/%e2%82%acx%zz%4"), Some("/tmp/€x%zz%4".into()));
     assert_eq!(super::decode_file_url("file://h/a%20b"), Some("/a b".into()));
 }
+
+#[test]
+#[cfg(windows)]
+fn osc7_unc_paths_keep_their_server() {
+    // the PowerShell hook's forms, with the % and ; it encodes
+    assert_eq!(super::decode_file_url("file://localhost///server/share/a%3Bb"), Some(r"\\server\share\a;b".into()));
+    assert_eq!(super::decode_file_url("file://localhost/C:/a%2520b"), Some(r"C:\a%20b".into()));
+    // a remote shell's directory is not turned into a share
+    assert_eq!(super::decode_file_url("file://remote/home/me"), Some("/home/me".into()));
+}
