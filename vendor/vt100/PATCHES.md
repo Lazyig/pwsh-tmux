@@ -27,3 +27,14 @@ screen or moving its scrollback view. Used by capture-pane and copy mode.
 Project regression tests live in src/cells.rs. Run the bundled unit/doc tests
 with `python tools/test_vt100.py` from the project root. Review these changes
 when updating vt100.
+
+Local addition: mode and state tracking for tmux format variables. `Screen`
+records IRM (CSI 4 h/l), DECAWM (?7, on by default), cursor blinking (?12 and
+DECSCUSR, as tmux), very visible cursor (CSI 34 h/l), focus reporting (?1004),
+the 1005/1006 mouse encodings as separate flags, synchronized output (?2026) and
+theme updates (?2031); only the reporting changes, not how output is drawn. It
+also keeps the cursor saved by DECSET 1049 (`alternate_saved_cursor`), tab stops
+set with HTS (ESC H) and cleared with TBC (CSI g), which HT now follows (reset to
+every 8 columns when the width changes), and exposes `origin_mode` and
+`scroll_region`. `Grid` counts rows added to and dropped from history and history
+clears/rewraps (`history_counters`); RIS keeps those counts.

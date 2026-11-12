@@ -12,6 +12,8 @@ pub struct Grid {
     origin_mode: bool,
     saved_origin_mode: bool,
     scrollback: Option<ScrollbackState>,
+    /// Rows added to history, rows dropped from it, and clears/rewraps.
+    history_counters: (u64, u64, u64),
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +53,7 @@ impl Grid {
             origin_mode: false,
             saved_origin_mode: false,
             scrollback,
+            history_counters: (0, 0, 0),
         }
     }
 
@@ -159,7 +162,7 @@ impl Grid {
             self.saved_pos.row += pos_diff;
         }
 
-        if reflow { self.reflow(size); }
+        if reflow { self.reflow(size); self.history_counters.2 += 1; }
         self.pos.col = self.pos.col.min(size.cols() - 1);
         self.saved_pos.col = self.saved_pos.col.min(size.cols() - 1);
         self.scroll_bottom = size.rows() - 1;
@@ -245,6 +248,22 @@ impl Grid {
         self.pos.col = cursor.1;
         self.saved_pos.row = saved.0.saturating_sub(discarded + new_history).min(usize::from(size.rows()-1)) as u16;
         self.saved_pos.col = saved.1;
+    }
+
+    pub fn history_counters(&self) -> (u64, u64, u64) {
+        self.history_counters
+    }
+
+    pub fn set_history_counters(&mut self, counters: (u64, u64, u64)) {
+        self.history_counters = counters;
+    }
+
+    pub fn origin_mode(&self) -> bool {
+        self.origin_mode
+    }
+
+    pub fn scroll_region(&self) -> (u16, u16) {
+        (self.scroll_top, self.scroll_bottom)
     }
 
     pub fn pos(&self) -> Pos {
@@ -705,6 +724,7 @@ impl Grid {
             }
             scrollback.unbounded_len = 0;
             scrollback.offset = 0;
+            self.history_counters.2 += 1;
         }
     }
 
@@ -818,6 +838,8 @@ impl Grid {
             for row in scrollback.rows.drain(0..scrollback_overflow) {
                 on_row(&row);
             }
+            self.history_counters.0 += num_pushed as u64;
+            self.history_counters.1 += scrollback_overflow as u64;
 
             // Number of rows that will simply be reset rather than pushed to
             // the scrollback.

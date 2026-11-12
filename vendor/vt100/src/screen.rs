@@ -1,5 +1,5 @@
 use crate::term::BufWrite as _;
-use alloc::{string::String, string::ToString as _};
+use alloc::{string::String, string::ToString as _, vec::Vec};
 use unicode_width::UnicodeWidthChar as _;
 
 const MODE_APPLICATION_KEYPAD: u8 = 0b0000_0001;
@@ -7,6 +7,19 @@ const MODE_APPLICATION_CURSOR: u8 = 0b0000_0010;
 const MODE_HIDE_CURSOR: u8 = 0b0000_0100;
 const MODE_ALTERNATE_SCREEN: u8 = 0b0000_1000;
 const MODE_BRACKETED_PASTE: u8 = 0b0001_0000;
+
+// Modes kept only so they can be reported (tmux's pane_private_modes and the
+// *_flag format variables); the parser does not change behaviour for them.
+const XMODE_INSERT: u16 = 1 << 0;
+const XMODE_WRAP: u16 = 1 << 1;
+const XMODE_CURSOR_BLINKING: u16 = 1 << 2;
+const XMODE_CURSOR_BLINKING_SET: u16 = 1 << 3;
+const XMODE_CURSOR_VERY_VISIBLE: u16 = 1 << 4;
+const XMODE_FOCUS: u16 = 1 << 5;
+const XMODE_MOUSE_UTF8: u16 = 1 << 6;
+const XMODE_MOUSE_SGR: u16 = 1 << 7;
+const XMODE_SYNC: u16 = 1 << 8;
+const XMODE_THEME_UPDATES: u16 = 1 << 9;
 
 /// The xterm mouse handling mode currently in use.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
@@ -87,12 +100,19 @@ pub struct Screen {
     saved_attrs: crate::attrs::Attrs,
 
     modes: u8,
+    xmodes: u16,
     mouse_protocol_mode: MouseProtocolMode,
     mouse_protocol_encoding: MouseProtocolEncoding,
     cursor_style: CursorStyle,
 
     last_char: Option<char>,
     scroll_on_clear: bool,
+
+    /// Cursor saved by entering the alternate screen with DECSET 1049 (tmux's
+    /// saved_cx/saved_cy), as (row, col).
+    alternate_saved: Option<(u16, u16)>,
+    /// Tab stops when changed by HTS/TBC; None means one every 8 columns.
+    tabs: Option<Vec<bool>>,
 }
 
 impl Screen {
@@ -118,12 +138,16 @@ impl Screen {
             saved_attrs: crate::attrs::Attrs::default(),
 
             modes: 0,
+            xmodes: XMODE_WRAP,
             mouse_protocol_mode: MouseProtocolMode::default(),
             mouse_protocol_encoding: MouseProtocolEncoding::default(),
             cursor_style: CursorStyle::default(),
 
             last_char: None,
             scroll_on_clear: false,
+
+            alternate_saved: None,
+            tabs: None,
         }
     }
 
@@ -142,9 +166,17 @@ impl Screen {
         rows: core::num::NonZeroU16,
         cols: core::num::NonZeroU16,
     ) {
+        self.reset_tabs_for(cols.get());
         self.grid.set_size(crate::grid::Size { rows, cols }, |_| {});
         self.alternate_grid
             .set_size(crate::grid::Size { rows, cols }, |_| {});
+    }
+
+    // tmux resets the tab stops when the width changes
+    fn reset_tabs_for(&mut self, cols: u16) {
+        if cols != self.grid.size().cols() {
+            self.tabs = None;
+        }
     }
 
     /// Returns the current size of the terminal.
@@ -747,6 +779,92 @@ impl Screen {
         self.cursor_style
     }
 
+    /// Insert mode (IRM, `CSI 4 h`) as set by the application.
+    #[must_use]
+    pub fn insert_mode(&self) -> bool {
+        self.xmode(XMODE_INSERT)
+    }
+
+    /// Origin mode (DECOM, `CSI ? 6 h`).
+    #[must_use]
+    pub fn origin_mode(&self) -> bool {
+        self.grid().origin_mode()
+    }
+
+    /// Autowrap mode (DECAWM, `CSI ? 7 h`), on by default.
+    #[must_use]
+    pub fn wrap_mode(&self) -> bool {
+        self.xmode(XMODE_WRAP)
+    }
+
+    /// Whether the cursor blinks (`CSI ? 12 h` or a blinking DECSCUSR style),
+    /// and whether that was set with `CSI ? 12 h/l` rather than DECSCUSR.
+    #[must_use]
+    pub fn cursor_blinking(&self) -> (bool, bool) {
+        (self.xmode(XMODE_CURSOR_BLINKING), self.xmode(XMODE_CURSOR_BLINKING_SET))
+    }
+
+    /// Very visible cursor (`CSI 34 l`).
+    #[must_use]
+    pub fn cursor_very_visible(&self) -> bool {
+        self.xmode(XMODE_CURSOR_VERY_VISIBLE)
+    }
+
+    /// Focus reporting (`CSI ? 1004 h`).
+    #[must_use]
+    pub fn focus_events(&self) -> bool {
+        self.xmode(XMODE_FOCUS)
+    }
+
+    /// The mouse encodings asked for, as (UTF-8 1005, SGR 1006).
+    #[must_use]
+    pub fn mouse_encodings(&self) -> (bool, bool) {
+        (self.xmode(XMODE_MOUSE_UTF8), self.xmode(XMODE_MOUSE_SGR))
+    }
+
+    /// Synchronized output (`CSI ? 2026 h`) in progress.
+    #[must_use]
+    pub fn synchronized_output(&self) -> bool {
+        self.xmode(XMODE_SYNC)
+    }
+
+    /// Theme change notifications (`CSI ? 2031 h`).
+    #[must_use]
+    pub fn theme_updates(&self) -> bool {
+        self.xmode(XMODE_THEME_UPDATES)
+    }
+
+    /// Cursor position saved on entering the alternate screen with DECSET
+    /// 1049, as (row, col); None before that has happened.
+    #[must_use]
+    pub fn alternate_saved_cursor(&self) -> Option<(u16, u16)> {
+        self.alternate_saved
+    }
+
+    /// The scroll region of the active screen as (top, bottom) rows.
+    #[must_use]
+    pub fn scroll_region(&self) -> (u16, u16) {
+        self.grid().scroll_region()
+    }
+
+    /// Columns with a tab stop.
+    #[must_use]
+    pub fn tab_stops(&self) -> Vec<u16> {
+        let cols = self.grid.size().cols();
+        match &self.tabs {
+            Some(t) => (0..cols).filter(|&i| t.get(usize::from(i)).copied().unwrap_or(false)).collect(),
+            None => (8..cols).step_by(8).collect(),
+        }
+    }
+
+    /// History counters of the normal screen: (rows added to history, rows
+    /// dropped from it, times it was cleared or rewrapped), like tmux's
+    /// history_added, history_collected and history_generation.
+    #[must_use]
+    pub fn history_counters(&self) -> (u64, u64, u64) {
+        self.grid.history_counters()
+    }
+
     /// Returns the currently active foreground color.
     #[must_use]
     pub fn fgcolor(&self) -> crate::Color {
@@ -864,6 +982,23 @@ impl Screen {
 
     fn set_cursor_style(&mut self, style: CursorStyle) {
         self.cursor_style = style;
+    }
+
+    fn set_xmode(&mut self, mode: u16, on: bool) {
+        if on {
+            self.xmodes |= mode;
+        } else {
+            self.xmodes &= !mode;
+        }
+    }
+
+    fn xmode(&self, mode: u16) -> bool {
+        self.xmodes & mode != 0
+    }
+
+    fn tabs_mut(&mut self) -> &mut Vec<bool> {
+        let cols = usize::from(self.grid.size().cols());
+        self.tabs.get_or_insert_with(|| (0..cols).map(|i| i > 0 && i % 8 == 0).collect())
     }
 
     // determine the width of the character we're about to draw, and whether
@@ -1072,6 +1207,7 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
         rows: core::num::NonZeroU16,
         cols: core::num::NonZeroU16,
     ) {
+        self.screen.reset_tabs_for(cols.get());
         let callbacks = &mut self.callbacks;
         self.screen
             .grid
@@ -1178,7 +1314,58 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
     }
 
     pub fn tab(&mut self) {
-        self.screen.grid_mut().col_tab();
+        let Some(tabs) = &self.screen.tabs else {
+            self.screen.grid_mut().col_tab();
+            return;
+        };
+        let col = self.screen.grid().pos().col;
+        let last = self.screen.grid().size().cols() - 1;
+        let next = (col + 1..last).find(|&i| tabs.get(usize::from(i)).copied().unwrap_or(false)).unwrap_or(last);
+        self.screen.grid_mut().col_set(next.max(col));
+    }
+
+    // ESC H
+    pub fn hts(&mut self) {
+        let col = usize::from(self.screen.grid().pos().col);
+        if let Some(t) = self.screen.tabs_mut().get_mut(col) {
+            *t = true;
+        }
+    }
+
+    // CSI g
+    pub fn tbc(&mut self, mode: u16) {
+        match mode {
+            0 => {
+                let col = usize::from(self.screen.grid().pos().col);
+                if let Some(t) = self.screen.tabs_mut().get_mut(col) {
+                    *t = false;
+                }
+            }
+            3 => self.screen.tabs_mut().iter_mut().for_each(|t| *t = false),
+            _ => {}
+        }
+    }
+
+    // CSI h
+    pub fn sm(&mut self, params: &vte::Params, mut unhandled: impl FnMut(&mut Self)) {
+        for param in params {
+            match param {
+                [4] => self.screen.set_xmode(XMODE_INSERT, true),
+                [34] => self.screen.set_xmode(XMODE_CURSOR_VERY_VISIBLE, false),
+                _ => unhandled(self),
+            }
+        }
+    }
+
+    // CSI l
+    pub fn rm(&mut self, params: &vte::Params, mut unhandled: impl FnMut(&mut Self)) {
+        for param in params {
+            match param {
+                [4] => self.screen.set_xmode(XMODE_INSERT, false),
+                [34] => self.screen.set_xmode(XMODE_CURSOR_VERY_VISIBLE, true),
+                _ => unhandled(self),
+            }
+        }
     }
 
     pub fn lf(&mut self) {
@@ -1228,11 +1415,13 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
     // ESC c
     pub fn ris(&mut self) {
         let scroll_on_clear = self.screen.scroll_on_clear;
+        let counters = self.screen.grid.history_counters();
         self.screen = Screen::new(
             self.screen.grid.size(),
             self.screen.grid.scrollback_capacity(),
         );
         self.screen.scroll_on_clear = scroll_on_clear;
+        self.screen.grid.set_history_counters(counters);
     }
 
     // csi codes
@@ -1251,7 +1440,13 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
             4 => self.screen.set_cursor_style(CursorStyle::SteadyUnderline),
             5 => self.screen.set_cursor_style(CursorStyle::BlinkVerticalBar),
             6 => self.screen.set_cursor_style(CursorStyle::SteadyVerticalBar),
-            _ => unhandled(self),
+            _ => return unhandled(self),
+        }
+        // like tmux: odd styles blink, even ones do not, and 0 goes back to
+        // the default blinking state
+        match cursor_style {
+            0 => self.screen.set_xmode(XMODE_CURSOR_BLINKING_SET, false),
+            n => self.screen.set_xmode(XMODE_CURSOR_BLINKING, n % 2 == 1),
         }
     }
 
@@ -1411,7 +1606,9 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
             match param {
                 [1] => screen.set_mode(MODE_APPLICATION_CURSOR),
                 [6] => screen.grid_mut().set_origin_mode(true),
+                [7] => screen.set_xmode(XMODE_WRAP, true),
                 [9] => screen.set_mouse_mode(MouseProtocolMode::Press),
+                [12] => screen.set_xmode(XMODE_CURSOR_BLINKING | XMODE_CURSOR_BLINKING_SET, true),
                 [25] => screen.clear_mode(MODE_HIDE_CURSOR),
                 [47] => screen.enter_alternate_grid(),
                 [1000] => {
@@ -1421,18 +1618,27 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                     screen.set_mouse_mode(MouseProtocolMode::ButtonMotion);
                 }
                 [1003] => screen.set_mouse_mode(MouseProtocolMode::AnyMotion),
+                [1004] => screen.set_xmode(XMODE_FOCUS, true),
                 [1005] => {
+                    screen.set_xmode(XMODE_MOUSE_UTF8, true);
                     screen.set_mouse_encoding(MouseProtocolEncoding::Utf8);
                 }
                 [1006] => {
+                    screen.set_xmode(XMODE_MOUSE_SGR, true);
                     screen.set_mouse_encoding(MouseProtocolEncoding::Sgr);
                 }
                 [1049] => {
+                    if !screen.mode(MODE_ALTERNATE_SCREEN) {
+                        let pos = screen.grid().pos();
+                        screen.alternate_saved = Some((pos.row, pos.col));
+                    }
                     self.decsc();
                     self.screen.alternate_grid.clear();
                     self.screen.enter_alternate_grid();
                 }
                 [2004] => screen.set_mode(MODE_BRACKETED_PASTE),
+                [2026] => screen.set_xmode(XMODE_SYNC, true),
+                [2031] => screen.set_xmode(XMODE_THEME_UPDATES, true),
                 _ => unhandled(self),
             }
         }
@@ -1449,7 +1655,12 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
             match param {
                 [1] => screen.clear_mode(MODE_APPLICATION_CURSOR),
                 [6] => screen.grid_mut().set_origin_mode(false),
+                [7] => screen.set_xmode(XMODE_WRAP, false),
                 [9] => screen.clear_mouse_mode(MouseProtocolMode::Press),
+                [12] => {
+                    screen.set_xmode(XMODE_CURSOR_BLINKING, false);
+                    screen.set_xmode(XMODE_CURSOR_BLINKING_SET, true);
+                }
                 [25] => screen.set_mode(MODE_HIDE_CURSOR),
                 [47] => {
                     screen.exit_alternate_grid();
@@ -1463,10 +1674,13 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                 [1003] => {
                     screen.clear_mouse_mode(MouseProtocolMode::AnyMotion);
                 }
+                [1004] => screen.set_xmode(XMODE_FOCUS, false),
                 [1005] => {
+                    screen.set_xmode(XMODE_MOUSE_UTF8, false);
                     screen.clear_mouse_encoding(MouseProtocolEncoding::Utf8);
                 }
                 [1006] => {
+                    screen.set_xmode(XMODE_MOUSE_SGR, false);
                     screen.clear_mouse_encoding(MouseProtocolEncoding::Sgr);
                 }
                 [1049] => {
@@ -1474,6 +1688,8 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                     self.decrc();
                 }
                 [2004] => screen.clear_mode(MODE_BRACKETED_PASTE),
+                [2026] => screen.set_xmode(XMODE_SYNC, false),
+                [2031] => screen.set_xmode(XMODE_THEME_UPDATES, false),
                 _ => unhandled(self),
             }
         }
