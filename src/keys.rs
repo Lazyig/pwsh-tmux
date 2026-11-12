@@ -93,6 +93,7 @@ pub enum KeyCode {
     Insert,
     Delete,
     F(u8),
+    User(u16),
     /// Keypad key: '0'-'9', '/', '*', '-', '+', '.', ',', '=' and '\r' for KPEnter.
     KP(char),
 }
@@ -162,6 +163,7 @@ pub struct Parser {
     in_paste: bool,
     paste: Vec<u8>,
     paste_overflow: bool,
+    user_keys: Vec<(u16, Vec<u8>)>,
 }
 
 impl Default for Parser {
@@ -177,7 +179,26 @@ impl Parser {
             in_paste: false,
             paste: Vec::new(),
             paste_overflow: false,
+            user_keys: Vec::new(),
         }
+    }
+
+    pub fn set_user_keys(&mut self, keys: Vec<(u16, Vec<u8>)>) {
+        self.user_keys = keys.into_iter().filter(|(_, v)| !v.is_empty()).collect();
+    }
+
+    /// Recover from an unterminated paste after the server's five second limit.
+    pub fn expire_paste(&mut self) -> Vec<Input> {
+        if !self.in_paste { return Vec::new(); }
+        self.in_paste = false;
+        self.paste.extend(std::mem::take(&mut self.buf));
+        let data = std::mem::take(&mut self.paste);
+        let overflow = std::mem::replace(&mut self.paste_overflow, false);
+        if overflow { Vec::new() } else { vec![Input::Paste(data)] }
+    }
+
+    pub fn partial_paste_end(&self) -> bool {
+        self.in_paste && !self.buf.is_empty() && PASTE_END.starts_with(&self.buf)
     }
 
     pub fn feed(&mut self, data: &[u8]) -> Vec<Input> {
@@ -199,10 +220,15 @@ impl Parser {
     /// Resolve held-back bytes: a lone ESC becomes Escape, `ESC [` becomes M-[, partial UTF-8
     /// becomes Unknown, and so on. Does nothing while inside a bracketed paste.
     pub fn flush_pending(&mut self) -> Vec<Input> {
-        if self.in_paste {
-            return Vec::new();
-        }
+        if self.in_paste { return Vec::new(); }
         self.run(true)
+    }
+
+    /// Resolve a partial end marker only after the extended (500ms) escape timer.
+    pub fn expire_partial_paste_end(&mut self) {
+        if !self.partial_paste_end() { return; }
+        if self.paste.len().saturating_add(self.buf.len()) <= MAX_PASTE { self.paste.append(&mut self.buf); }
+        else { self.paste.clear(); self.buf.clear(); self.paste_overflow = true; }
     }
 
     fn run(&mut self, force: bool) -> Vec<Input> {
@@ -234,6 +260,12 @@ impl Parser {
             if self.buf.is_empty() {
                 break;
             }
+            if let Some((n, seq)) = self.user_keys.iter().find(|(_, v)| self.buf.starts_with(v)) {
+                let (n, len) = (*n, seq.len());
+                out.push(Input::Key(Key::plain(KeyCode::User(n)), self.buf.drain(..len).collect()));
+                continue;
+            }
+            if !force && self.user_keys.iter().any(|(_, v)| v.starts_with(&self.buf)) { break; }
             match parse_one(&self.buf, force) {
                 Res::Incomplete => break,
                 Res::Done(tok, n) => {
@@ -350,6 +382,15 @@ fn parse_esc(buf: &[u8], force: bool) -> Res {
             Csi::Incomplete if !force => Res::Incomplete,
             Csi::Incomplete | Csi::Invalid => meta_fallback(buf),
         },
+        b']' => {
+            let end = buf.iter().position(|b| *b == 7).map(|n| n + 1)
+                .or_else(|| find(buf, b"\x1b\\").map(|n| n + 2));
+            match end {
+                Some(n) => Res::Done(unknown_tok(&buf[..n]), n),
+                None if !force && buf.len() < MAX_PASTE => Res::Incomplete,
+                _ => Res::Done(unknown_tok(buf), buf.len()),
+            }
+        }
         b'O' => parse_ss3(buf, force),
         ESC => {
             if buf.len() == 2 {
@@ -807,6 +848,9 @@ pub fn parse_key_name(s: &str) -> Option<Key> {
 }
 
 fn lookup_name(name: &str) -> Option<KeyCode> {
+    if let Some(n) = name.strip_prefix("User").and_then(|s| s.parse::<u16>().ok()).filter(|n| *n < 1000) {
+        return Some(KeyCode::User(n));
+    }
     if let Some((_, c)) = NAMES.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
         return Some(c.clone());
     }
@@ -846,6 +890,7 @@ pub fn key_name(k: &Key) -> String {
         KeyCode::PageDown => s.push_str("NPage"),
         KeyCode::Insert => s.push_str("IC"),
         KeyCode::Delete => s.push_str("DC"),
+        KeyCode::User(n) => { let _ = write!(s, "User{n}"); }
         KeyCode::F(n) => {
             let _ = write!(s, "F{n}");
         }
@@ -956,7 +1001,7 @@ pub fn encode_key_mode(k: &Key, app_cursor: bool, app_keypad: bool) -> Vec<u8> {
             const NUMS: [u32; 8] = [15, 17, 18, 19, 20, 21, 23, 24];
             return tilde(NUMS[(f - 5) as usize]);
         }
-        KeyCode::F(_) => return Vec::new(),
+        KeyCode::F(_) | KeyCode::User(_) => return Vec::new(),
         KeyCode::BTab => b"\x1b[Z".to_vec(),
         KeyCode::Enter => b"\r".to_vec(),
         KeyCode::Tab => b"\t".to_vec(),
@@ -2199,6 +2244,48 @@ mod tests {
                 let bytes = encode_key(&key, app);
                 assert_eq!(key1(&bytes), key, "{n} app={app} {bytes:?}");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod compatibility_input_tests {
+    use super::*;
+
+    #[test]
+    fn user_keys_are_incremental_and_can_be_reconfigured() {
+        let mut parser = Parser::new();
+        parser.set_user_keys(vec![(7, b"\x1b[77~".to_vec())]);
+        assert!(parser.feed(b"\x1b[7").is_empty());
+        assert!(parser.has_pending());
+        assert_eq!(parser.feed(b"7~"), vec![Input::Key(Key::plain(KeyCode::User(7)), b"\x1b[77~".to_vec())]);
+        assert_eq!(parse_key_name("User7"), Some(Key::plain(KeyCode::User(7))));
+        assert_eq!(key_name(&Key::plain(KeyCode::User(7))), "User7");
+        assert!(parse_key_name("User1000").is_none());
+        parser.set_user_keys(vec![]);
+        assert!(matches!(&parser.feed(b"\x1b[77~")[0], Input::Unknown(_)));
+    }
+
+    #[test]
+    fn unterminated_paste_can_expire_and_partial_end_can_wait() {
+        let mut parser = Parser::new();
+        parser.feed(b"\x1b[200~abc\x1b[20");
+        assert!(parser.partial_paste_end());
+        assert!(parser.flush_pending().is_empty());
+        assert_eq!(parser.feed(b"1~"), vec![Input::Paste(b"abc".to_vec())]);
+        parser.feed(b"\x1b[200~unfinished");
+        assert_eq!(parser.expire_paste(), vec![Input::Paste(b"unfinished".to_vec())]);
+        assert!(!parser.in_paste());
+        assert!(matches!(&parser.feed(b"x")[0], Input::Key(_, _)));
+    }
+
+    #[test]
+    fn clipboard_reply_stays_one_input_across_chunks() {
+        let reply = b"\x1b]52;c;YWJj\x1b\\";
+        for at in 1..reply.len() {
+            let mut parser = Parser::new();
+            assert!(parser.feed(&reply[..at]).is_empty());
+            assert_eq!(parser.feed(&reply[at..]), vec![Input::Unknown(reply.to_vec())]);
         }
     }
 }
