@@ -651,12 +651,13 @@ impl Server {
             _ if ctrl('c') || ctrl('g') => {
                 c.prompt = None;
             }
+            KeyCode::BSpace | KeyCode::Char('h') if pr.bspace_exit && pr.input.is_empty() && (k.code == KeyCode::BSpace || ctrl('h')) => {
+                c.prompt = None;
+            }
             KeyCode::BSpace => {
                 if pr.cursor > 0 {
                     pr.cursor -= 1;
                     pr.input.remove(pr.cursor);
-                } else if pr.input.is_empty() {
-                    c.prompt = None;
                 }
             }
             _ if ctrl('h') => {

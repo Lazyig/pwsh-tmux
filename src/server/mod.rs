@@ -363,6 +363,8 @@ pub struct Prompt {
     pub numeric: bool,
     pub single_key: bool,
     pub copy_incremental: Option<(PaneId, bool)>,
+    /// command-prompt -e: backspace on an empty prompt closes it.
+    pub bspace_exit: bool,
 }
 
 pub enum Overlay {
@@ -978,7 +980,8 @@ impl Server {
                     first = false;
                     let user = ipc::peer_user_id(&recv);
                     let allowed = user.as_ref().is_some_and(|id| !id.is_empty()
-                        && (id == &owner || ipc::is_superuser(id) || allowed_users.contains(id)));
+                        && (id == &owner || ipc::is_superuser(id) || allowed_users.contains(id)
+                            || ipc::group_id_of_user(id).is_some_and(|g| allowed_users.contains(&g))));
                     if !allowed {
                         // No writer output exists before identification. Send the
                         // refusal here so closing the cancelled connection cannot
@@ -1085,7 +1088,9 @@ impl Server {
     fn client_user(&mut self, cid: ClientId, user: Option<String>) {
         let Some(c) = self.clients.get_mut(&cid) else { return };
         let id = user.unwrap_or_default();
-        let entry = self.acl.iter().find(|a| a.0 == id).cloned();
+        // a user entry takes precedence over the user's group entry (server-access -g)
+        let group = ipc::group_id_of_user(&id);
+        let entry = self.acl.iter().find(|a| a.0 == id).or_else(|| self.acl.iter().find(|a| Some(&a.0) == group.as_ref())).cloned();
         let allowed = !id.is_empty() && (id == self.owner || ipc::is_superuser(&id) || entry.is_some());
         c.user = Some(id.clone());
         if !allowed {

@@ -197,6 +197,23 @@ impl Server {
         }
     }
 
+    /// A whole target of `@`, `{current}` or `{active}` (tmux 3.7): the current window and
+    /// active pane of the client running the command, which must be attached.
+    fn client_current(&self, ctx: &Ctx, t: &str) -> Option<Result<Target, String>> {
+        if !matches!(t, "@" | "{current}" | "{active}") {
+            return None;
+        }
+        let sid = ctx.client.and_then(|c| self.clients.get(&c)).filter(|c| c.attached).and_then(|c| c.session).filter(|s| self.sessions.contains_key(s));
+        Some(match sid {
+            Some(sid) => {
+                let s = &self.sessions[&sid];
+                let wid = s.active_window();
+                Ok(Target { sid: Some(sid), idx: Some(s.active), wid: Some(wid), pane: Some(self.windows[&wid].active) })
+            }
+            None => err("no current client"),
+        })
+    }
+
     fn find_session(&self, ctx: &Ctx, name: &str) -> Result<SessId, String> {
         if name.is_empty() {
             return self.current(ctx).sid.ok_or_else(|| "no current session".to_string());
@@ -241,6 +258,9 @@ impl Server {
         match t {
             None => self.current(ctx).sid.ok_or_else(|| "no current session".to_string()),
             Some(t) => {
+                if let Some(c) = self.client_current(ctx, t) {
+                    return c.map(|c| c.sid.unwrap());
+                }
                 let s = t.split(':').next().unwrap_or("");
                 self.find_session(ctx, s)
             }
@@ -316,6 +336,9 @@ impl Server {
             let c = self.current(ctx);
             return if c.wid.is_some() { Ok(c) } else { err("no current window") };
         };
+        if let Some(c) = self.client_current(ctx, t) {
+            return c;
+        }
         let mk = |sid: SessId, idx: u32| -> Target {
             let wid = self.sessions[&sid].links[&idx];
             Target { sid: Some(sid), idx: Some(idx), wid: Some(wid), pane: Some(self.windows[&wid].active) }
@@ -426,6 +449,9 @@ impl Server {
             let c = self.current(ctx);
             return if c.pane.is_some() { Ok(c) } else { err("no current pane") };
         };
+        if let Some(c) = self.client_current(ctx, t) {
+            return c;
+        }
         if let Some(id) = t.strip_prefix('%').and_then(|i| i.parse::<PaneId>().ok()) {
             if self.panes.contains_key(&id) && self.window_of(id).is_some() {
                 return Ok(self.target_for_pane(id));
@@ -1057,18 +1083,19 @@ impl Server {
                     c.dirty = true;
                     return Ok(Flow::Next);
                 }
+                // -r toggles read-only and also reverses the -n/-p order; -F is accepted and
+                // unused, as in tmux
                 if o.has('r') {
                     let c = self.clients.get_mut(&cid).unwrap();
                     if c.is_readonly() { return err("client is read-only"); }
                     c.readonly = !c.readonly;
-                    return Ok(Flow::Next);
+                    if t.is_none() && !o.has('n') && !o.has('p') && !o.has('l') {
+                        return Ok(Flow::Next);
+                    }
                 }
+                let crit = sort::Criteria::from_args(o.get('O'), o.has('r'))?;
                 let cur = self.client_session(cid);
-                let sorted: Vec<SessId> = {
-                    let mut v: Vec<&Session> = self.sessions.values().collect();
-                    v.sort_by(|a, b| a.name.cmp(&b.name));
-                    v.iter().map(|s| s.id).collect()
-                };
+                let sorted = self.sorted_sessions(crit);
                 if sorted.is_empty() { return err("no sessions"); }
                 let pos = cur.and_then(|c| sorted.iter().position(|s| *s == c)).unwrap_or(0);
                 let sid = if o.has('l') {
@@ -1337,7 +1364,7 @@ impl Server {
                 let cwd = o.get('c').map(|c| self.expand(self.current(ctx), ctx.client, c)).or_else(|| Some(s.cwd.clone()));
                 let pane = self.spawn_pane(Some(sid), sx, sy, &command, cwd.as_deref(), &env)?;
                 let name = o.get('n').map(|n| self.expand(self.current(ctx), ctx.client, n));
-                let named = if command[0] == EMPTY_PANE { &[][..] } else { &command[..] };
+                let named = if command.first().is_some_and(|c| c == EMPTY_PANE) { &[][..] } else { &command[..] };
                 let wname = name.clone().unwrap_or_else(|| self.window_name_for(named, Some(sid)));
                 let wid = self.new_window_obj(wname, pane, sx, sy);
                 if name.is_some() {
@@ -1806,6 +1833,14 @@ impl Server {
                     self.panes.get_mut(&pane).unwrap().options.set("@input-disabled", v.into());
                     return Ok(Flow::Next);
                 }
+                if let Some(style) = o.get('P') {
+                    // deprecated -P: the pane's window-style and window-active-style
+                    let v = options::validate("window-style", Some(style), None).map_err(|_| format!("bad style: {style}"))?;
+                    let p = self.panes.get_mut(&pane).unwrap();
+                    p.options.set("window-style", v.clone());
+                    p.options.set("window-active-style", v);
+                    self.mark_window_dirty(wid);
+                }
                 if o.has('g') {
                     ctx.out.push_str(&self.opt_pane(pane, "window-style"));
                     ctx.out.push('\n');
@@ -2053,10 +2088,16 @@ impl Server {
                 if total < 3 {
                     return err("target pane too small");
                 }
-                let size = match o.get('l') {
-                    Some(l) if l.ends_with('%') => l.trim_end_matches('%').parse::<u32>().ok().map(|p| (total as u32 * p / 100) as u16),
-                    Some(l) => l.parse().ok(),
-                    None => None,
+                let size = match (o.get('l'), o.get('p')) {
+                    (Some(l), _) if l.ends_with('%') => l.trim_end_matches('%').parse::<u32>().ok().map(|p| (total as u32 * p / 100) as u16),
+                    (Some(l), _) => l.parse().ok(),
+                    // -p: a percentage of the target (tmux's older form of -l N%)
+                    (None, Some(p)) => {
+                        let v = self.expand(dst, ctx.client, p);
+                        let pct = v.parse::<u32>().ok().filter(|v| *v <= 100).ok_or_else(|| format!("size or position invalid tiled geometry {v}"))?;
+                        Some((total as u32 * pct / 100) as u16)
+                    }
+                    (None, None) => None,
                 };
                 // detach from source window
                 let sw = self.windows.get_mut(&swid).unwrap();
@@ -2448,17 +2489,24 @@ impl Server {
                 let cid = self.resolve_client(ctx, t)?;
                 let tt = self.current(&Ctx { client: Some(cid), ..ctx.clone() });
                 let template = o.rest.first().cloned().unwrap_or_else(|| "%1".into());
+                // -l: one prompt and input taken literally, not split at commas
+                let split = |v: &str| -> Vec<String> { if o.has('l') { vec![v.to_string()] } else { v.split(',').map(String::from).collect() } };
                 let labels: Vec<String> = match o.get('p') {
-                    Some(p) => p.split(',').map(|s| self.expand(tt, Some(cid), s)).collect(),
+                    Some(p) => split(p).iter().map(|s| self.expand(tt, Some(cid), s)).collect(),
                     None => vec![if o.rest.is_empty() { ":".into() } else { format!("({})", template.split_whitespace().next().unwrap_or("")) }],
                 };
                 let inits: Vec<String> = match o.get('I') {
-                    Some(i) => i.split(',').map(|s| self.expand(tt, Some(cid), s)).collect(),
+                    Some(i) => split(i).iter().map(|s| self.expand(tt, Some(cid), s)).collect(),
                     None => Vec::new(),
                 };
                 let prompts: Vec<(String, String)> = labels.into_iter().enumerate().map(|(i, l)| (l, inits.get(i).cloned().unwrap_or_default())).collect();
                 let kind = if o.has('k') { PromptKind::Key } else { PromptKind::Command };
                 self.open_prompt(cid, kind, prompts, template, ctx.pane, o.has('N'), o.has('1'));
+                // -e: backspace on empty input closes the prompt; -C (keep updating panes) is
+                // how prompts behave here anyway
+                if let Some(pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
+                    pr.bspace_exit = o.has('e') && !o.has('1') && !o.has('N') && !o.has('i') && !o.has('k');
+                }
                 Ok(Flow::Next)
             }
             "confirm-before" => {
@@ -3094,30 +3142,87 @@ impl Server {
                     let alias = if a.is_empty() { String::new() } else { format!(" ({a})") };
                     let flags = if b.is_empty() { String::new() } else { format!(" [-{b}]") };
                     let vals: String = v.chars().map(|c| format!(" [-{c} arg]")).collect();
-                    ctx.out.push_str(&format!("{n}{alias}{flags}{vals}\n"));
+                    match o.get('F') {
+                        Some(f) => {
+                            let vars = HashMap::from([
+                                ("command_list_name".to_string(), n.to_string()),
+                                ("command_list_alias".to_string(), a.to_string()),
+                                ("command_list_usage".to_string(), format!("{flags}{vals}").trim_start().to_string()),
+                            ]);
+                            let line = self.expand_extra(self.current(ctx), ctx.client, f, vars);
+                            if !line.is_empty() {
+                                ctx.out.push_str(&line);
+                                ctx.out.push('\n');
+                            }
+                        }
+                        None => ctx.out.push_str(&format!("{n}{alias}{flags}{vals}\n")),
+                    }
                 }
                 Ok(Flow::Next)
             }
             "clear-prompt" => Ok(Flow::Next),
             "server-access" => {
                 if o.has('l') {
+                    // user entries are U, group entries G; R read-only, W writable
                     for (id, write) in &self.acl {
-                        ctx.out.push_str(&format!("{} ({})\n", ipc::user_name_for_id(id), if *write { "W" } else { "R" }));
+                        let kind = if id.starts_with("g:") { 'G' } else { 'U' };
+                        ctx.out.push_str(&format!("{} ({kind},{})\n", ipc::user_name_for_id(id), if *write { "W" } else { "R" }));
                     }
                     return Ok(Flow::Next);
                 }
                 if ctx.client.and_then(|c| self.clients.get(&c)).is_some_and(|c| c.user.as_ref().is_some_and(|u| *u != self.owner && !ipc::is_superuser(u))) {
                     return err("only the server owner can change access");
                 }
-                let name = o.rest.first().ok_or("server-access needs a user")?;
-                let id = ipc::user_id_for_name(name).ok_or_else(|| format!("unknown user: {name}"))?;
-                if id == self.owner {
-                    return err("the server owner always has access");
+                let arg = o.rest.first().ok_or("missing user or group argument")?;
+                let name = self.expand(self.current(ctx), ctx.client, arg);
+                let group = o.has('g');
+                let kind = if group { "group" } else { "user" };
+                let id = if group {
+                    if cfg!(windows) {
+                        return err("groups are not supported on Windows");
+                    }
+                    ipc::group_id_for_name(&name)
+                } else {
+                    ipc::user_id_for_name(&name)
+                };
+                let id = id.ok_or_else(|| format!("unknown {kind}: {name}"))?;
+                if !group && (id == self.owner || ipc::is_superuser(&id)) {
+                    return err(format!("{name} owns the server, can't change access"));
                 }
-                let clients_of = |s: &Server| -> Vec<ClientId> { s.clients.values().filter(|c| c.user.as_deref() == Some(id.as_str())).map(|c| c.id).collect() };
+                if o.has('a') && o.has('d') {
+                    return err("-a and -d cannot be used together");
+                }
+                if o.has('r') && o.has('w') {
+                    return err("-r and -w cannot be used together");
+                }
+                // the clients an entry applies to: its user, or members of its group without a
+                // user entry of their own
+                let clients_of = |s: &Server| -> Vec<ClientId> {
+                    s.clients
+                        .values()
+                        .filter(|c| {
+                            c.user.as_deref().is_some_and(|u| {
+                                if group { ipc::group_id_of_user(u).as_deref() == Some(id.as_str()) && !s.acl.iter().any(|a| a.0 == u) } else { u == id }
+                            })
+                        })
+                        .map(|c| c.id)
+                        .collect()
+                };
                 if o.has('d') {
+                    if !self.acl.iter().any(|a| a.0 == id) {
+                        return err(format!("{kind} {name} not found"));
+                    }
                     self.acl.retain(|a| a.0 != id);
                     for cid in clients_of(self) {
+                        // still allowed by the user's group entry?
+                        let other = self.clients.get(&cid).and_then(|c| c.user.clone()).and_then(|u| ipc::group_id_of_user(&u)).and_then(|g| self.acl.iter().find(|a| a.0 == g).cloned());
+                        if let Some((_, write)) = other {
+                            if let Some(c) = self.clients.get_mut(&cid) {
+                                c.acl_readonly = !write;
+                                c.readonly = !write;
+                            }
+                            continue;
+                        }
                         if self.clients.get(&cid).is_some_and(|c| c.attached) {
                             self.detach_client(cid, "[access not allowed]");
                         }
@@ -3130,23 +3235,28 @@ impl Server {
                     }
                     return Ok(Flow::Next);
                 }
-                let write = !o.has('r');
                 if o.has('a') {
                     if self.acl.iter().any(|a| a.0 == id) {
-                        return err(format!("user {name} is already added"));
+                        return err(format!("{kind} {name} is already added"));
                     }
-                    self.acl.push((id.clone(), write));
-                    ipc::set_shared(true);
-                    if cfg!(windows) && self.pipe_acl.as_ref().is_some_and(|p| !p.contains(&id)) {
-                        ctx.out.push_str("note: the named pipe's ACL is set when the server starts; put this in the config file or restart the server for it to take effect\n");
-                    }
-                } else if o.has('r') || o.has('w') {
-                    let e = self.acl.iter_mut().find(|a| a.0 == id).ok_or_else(|| format!("user {name} not found"))?;
-                    e.1 = o.has('w');
-                } else {
-                    return err("server-access needs -a, -d, -l, -r or -w");
                 }
-                let write = self.acl.iter().find(|a| a.0 == id).map_or(write, |a| a.1);
+                if o.has('a') || o.has('r') || o.has('w') {
+                    // -r and -w add the entry if it is missing (tmux 3.8)
+                    if !self.acl.iter().any(|a| a.0 == id) {
+                        self.acl.push((id.clone(), !o.has('r')));
+                        ipc::set_shared(true);
+                        if cfg!(windows) && self.pipe_acl.as_ref().is_some_and(|p| !p.contains(&id)) {
+                            ctx.out.push_str("note: the named pipe's ACL is set when the server starts; put this in the config file or restart the server for it to take effect\n");
+                        }
+                    }
+                } else {
+                    return Ok(Flow::Next);
+                }
+                if o.has('r') || o.has('w') {
+                    let e = self.acl.iter_mut().find(|a| a.0 == id).unwrap();
+                    e.1 = o.has('w');
+                }
+                let write = self.acl.iter().find(|a| a.0 == id).is_none_or(|a| a.1);
                 for cid in clients_of(self) {
                     if let Some(c) = self.clients.get_mut(&cid) {
                         c.acl_readonly = !write;
@@ -3512,7 +3622,7 @@ impl Server {
         let input: Vec<char> = init.chars().collect();
         let cursor = input.len();
         if let Some(c) = self.clients.get_mut(&cid) {
-            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single, copy_incremental: None });
+            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false });
             c.dirty = true;
         }
     }
