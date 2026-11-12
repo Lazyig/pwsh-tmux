@@ -224,8 +224,23 @@ impl Server {
         }
     }
 
-    fn status_style(&self, sid: SessId) -> Style {
-        let mut base = format::parse_style(&self.opt_session(Some(sid), "status-style"), Style::default()).unwrap_or_default();
+    /// A style option for a target and client. As options_string_to_style, a style containing
+    /// `#{` is expanded as a format first, so colours in styles can be formats (3.8).
+    fn style_option(&self, value: &str, base: Style, t: Target, cid: Option<ClientId>) -> Option<Style> {
+        let ctx = vars::VarCtx { srv: self, t, client: cid, extra: HashMap::new() };
+        format::parse_style_with(value, base, Some(&ctx)).ok().map(|p| p.style)
+    }
+
+    /// The target of a session's current pane, which status and message styles are expanded for.
+    fn session_target(&self, sid: SessId) -> Target {
+        let s = &self.sessions[&sid];
+        let wid = s.active_window();
+        Target { sid: Some(sid), idx: Some(s.active), wid: Some(wid), pane: self.windows.get(&wid).map(|w| w.active) }
+    }
+
+    fn status_style(&self, sid: SessId, cid: ClientId) -> Style {
+        let cur = self.session_target(sid);
+        let mut base = self.style_option(&self.opt_session(Some(sid), "status-style"), Style::default(), cur, Some(cid)).unwrap_or_default();
         if let Some(c) = format::parse_color(&self.opt_session(Some(sid), "status-fg")).filter(|c| *c != Color::Default) {
             base.fg = c;
         }
@@ -240,10 +255,10 @@ impl Server {
     fn status_line(&self, cid: ClientId, sid: SessId, width: u16) -> (Vec<Cell>, Vec<Option<format::Range>>) {
         let s = &self.sessions[&sid];
         let width = width as usize;
-        let base = self.status_style(sid);
+        let base = self.status_style(sid, cid);
         let cur = Target { sid: Some(sid), idx: Some(s.active), wid: Some(s.active_window()), pane: Some(self.windows[&s.active_window()].active) };
-        let left_style = format::parse_style(&self.opt_session(Some(sid), "status-left-style"), base).unwrap_or(base);
-        let right_style = format::parse_style(&self.opt_session(Some(sid), "status-right-style"), base).unwrap_or(base);
+        let left_style = self.style_option(&self.opt_session(Some(sid), "status-left-style"), base, cur, Some(cid)).unwrap_or(base);
+        let right_style = self.style_option(&self.opt_session(Some(sid), "status-right-style"), base, cur, Some(cid)).unwrap_or(base);
         let left = self.expand_status_time(cur, cid, &self.opt_session(Some(sid), "status-left"));
         let right = self.expand_status_time(cur, cid, &self.opt_session(Some(sid), "status-right"));
         let left_len = self.opt_session_num(Some(sid), "status-left-length").max(0) as usize;
@@ -264,17 +279,18 @@ impl Server {
             let t = Target { sid: Some(sid), idx: Some(*idx), wid: Some(wid), pane: Some(self.windows[&wid].active) };
             let is_cur = *idx == s.active;
             let fmt = self.opt_window(Some(wid), if is_cur { "window-status-current-format" } else { "window-status-format" });
-            let mut st = format::parse_style(&self.opt_window(Some(wid), "window-status-style"), base).unwrap_or(base);
+            let wst = |name: &str, base: Style| self.style_option(&self.opt_window(Some(wid), name), base, t, Some(cid)).unwrap_or(base);
+            let mut st = wst("window-status-style", base);
             if is_cur {
-                st = format::parse_style(&self.opt_window(Some(wid), "window-status-current-style"), st).unwrap_or(st);
+                st = wst("window-status-current-style", st);
             } else if s.last.first() == Some(idx) {
-                st = format::parse_style(&self.opt_window(Some(wid), "window-status-last-style"), st).unwrap_or(st);
+                st = wst("window-status-last-style", st);
             }
             let alerts = s.alerts.get(idx).copied().unwrap_or(0);
             if alerts & ALERT_BELL != 0 {
-                st = format::parse_style(&self.opt_window(Some(wid), "window-status-bell-style"), st).unwrap_or(st);
+                st = wst("window-status-bell-style", st);
             } else if alerts & (ALERT_ACTIVITY | ALERT_SILENCE) != 0 {
-                st = format::parse_style(&self.opt_window(Some(wid), "window-status-activity-style"), st).unwrap_or(st);
+                st = wst("window-status-activity-style", st);
             }
             let text = self.expand_status_time(t, cid, &fmt);
             let start = wcells.len();
@@ -369,8 +385,9 @@ impl Server {
         let active_rect = rects.iter().find(|(p, _)| *p == win.active).map(|(_, r)| *r);
         let area_h = ch.saturating_sub(nstatus);
         let border_status = self.opt_window(Some(wid), "pane-border-status");
-        let active_border = format::parse_style(&self.expand_for_pane(win.active, &self.opt_window(Some(wid), "pane-active-border-style")), Style::default()).unwrap_or_default();
-        let inactive_border = format::parse_style(&self.opt_window(Some(wid), "pane-border-style"), Style::default()).unwrap_or_default();
+        let active_target = self.target_for_pane(win.active);
+        let active_border = self.style_option(&self.opt_window(Some(wid), "pane-active-border-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
+        let inactive_border = self.style_option(&self.opt_window(Some(wid), "pane-border-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
         let lines_kind = self.opt_window(Some(wid), "pane-border-lines");
         let bset = BORDER_SETS.iter().find(|(n, _)| *n == lines_kind).map(|(_, s)| *s).unwrap_or(BORDER_SETS[0].1);
 
@@ -379,11 +396,13 @@ impl Server {
             let Some(p) = self.panes.get(id) else { continue };
             let cr = self.content_rect(wid, *r);
             let is_active = *id == win.active;
-            let wstyle = format::parse_style(&self.opt_pane(*id, if is_active { "window-active-style" } else { "window-style" }), Style::default()).unwrap_or_default();
-            let wstyle = if is_active && wstyle == Style::default() { format::parse_style(&self.opt_pane(*id, "window-style"), Style::default()).unwrap_or_default() } else { wstyle };
+            let pane_target = self.target_for_pane(*id);
+            let pst = |name: &str| self.style_option(&self.opt_pane(*id, name), Style::default(), pane_target, Some(cid)).unwrap_or_default();
+            let wstyle = pst(if is_active { "window-active-style" } else { "window-style" });
+            let wstyle = if is_active && wstyle == Style::default() { pst("window-style") } else { wstyle };
             let mode_lines: Option<(Vec<Line>, Option<(u16, u16)>)> = match &p.mode {
                 Some(PaneMode::Copy(cm)) => {
-                    let style = format::parse_style(&self.expand_for_pane(*id, &self.opt_window(Some(wid), "mode-style")), Style::default()).unwrap_or_default();
+                    let style = self.style_option(&self.opt_window(Some(wid), "mode-style"), Style::default(), pane_target, Some(cid)).unwrap_or_default();
                     let (lines, cur) = cm.render_with_style(style);
                     Some((lines, Some((cur.1, cur.0))))
                 }
@@ -568,17 +587,18 @@ impl Server {
                     }
                 }
                 Overlay::Menu(m) => {
-                    let st = format::parse_style(&self.opt_window(Some(wid), "popup-style"), Style::default()).unwrap_or_default();
-                    let bst = format::parse_style(&self.opt_window(Some(wid), "popup-border-style"), Style::default()).unwrap_or_default();
-                    let st = format::parse_style(&self.opt_window(Some(wid), "menu-style"), st).unwrap_or(st);
-                    let bst = format::parse_style(&self.opt_window(Some(wid), "menu-border-style"), bst).unwrap_or(bst);
-                    let selected = format::parse_style(&self.opt_window(Some(wid), "menu-selected-style"), Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() }).unwrap_or(Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() });
+                    let ost = |name: &str, base: Style| self.style_option(&self.opt_window(Some(wid), name), base, active_target, Some(cid)).unwrap_or(base);
+                    let st = ost("popup-style", Style::default());
+                    let bst = ost("popup-border-style", Style::default());
+                    let st = ost("menu-style", st);
+                    let bst = ost("menu-border-style", bst);
+                    let selected = ost("menu-selected-style", Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() });
                     m.draw(&mut f, st, bst, selected);
                     cursor = None;
                 }
                 Overlay::Popup(pp) => {
-                    let st = format::parse_style(&self.opt_window(Some(wid), "popup-style"), Style::default()).unwrap_or_default();
-                    let bst = format::parse_style(&self.opt_window(Some(wid), "popup-border-style"), Style::default()).unwrap_or_default();
+                    let st = self.style_option(&self.opt_window(Some(wid), "popup-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
+                    let bst = self.style_option(&self.opt_window(Some(wid), "popup-border-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
                     for y in pp.y..pp.y + pp.h {
                         for x in pp.x..pp.x + pp.w {
                             f.set(x, y, Cell { text: " ".into(), style: st });
@@ -624,14 +644,14 @@ impl Server {
                 let y = sy0 + i;
                 let custom = &formats[i as usize];
                 let (line, tags) = if !custom.is_empty() {
-                    let base = self.status_style(sid);
+                    let base = self.status_style(sid, cid);
                     let cur = Target { sid: Some(sid), idx: Some(s.active), wid: Some(wid), pane: Some(win.active) };
                     let text = self.expand_status_time(cur, cid, custom);
                     format::layout_line_ranged(&format::spans(&text, base), cw as usize, base)
                 } else if i == 0 {
                     self.status_line(cid, sid, cw)
                 } else {
-                    (vec![Cell { text: " ".into(), style: self.status_style(sid) }; cw as usize], vec![None; cw as usize])
+                    (vec![Cell { text: " ".into(), style: self.status_style(sid, cid) }; cw as usize], vec![None; cw as usize])
                 };
                 f.put_cells(0, y, &line);
                 status_ranges.push(tags);
@@ -640,7 +660,7 @@ impl Server {
         // message / prompt replace the first status line (or the last row without a status line)
         let my = if nstatus > 0 { if top { 0 } else { ch - nstatus } } else { ch - 1 };
         if let Some(pr) = &c.prompt {
-            let st = format::parse_style(&self.opt_session(Some(sid), "message-style"), Style::default()).unwrap_or_default();
+            let st = self.style_option(&self.opt_session(Some(sid), "message-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
             for x in 0..cw {
                 f.set(x, my, Cell { text: " ".into(), style: st });
             }
@@ -670,7 +690,7 @@ impl Server {
             cursor = Some(((lx + bw - skip).min(cw - 1), my));
         } else if let Some((msg, _)) = &c.message {
             cursor = None;
-            let st = format::parse_style(&self.opt_session(Some(sid), "message-style"), Style::default()).unwrap_or_default();
+            let st = self.style_option(&self.opt_session(Some(sid), "message-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
             for x in 0..cw {
                 f.set(x, my, Cell { text: " ".into(), style: st });
             }
