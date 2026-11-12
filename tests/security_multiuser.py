@@ -159,7 +159,7 @@ class Audit:
         for n in range(16):
             if n:
                 batch.append(';')
-            batch += ['display-message', '-p', '#{p1048576:#{l:x}}']
+            batch += ['display-message', '-p', '#{p10000:#{l:x}}' * 100]
         self.check('combined reply amplification refused', 'output limit exceeded' in self.run(reader, *batch, expected=False))
         cache_fmt = '#(printf OWNER_CACHE_PROOF)'
         self.run(owner, 'display-message', '-p', cache_fmt)

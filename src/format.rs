@@ -23,6 +23,31 @@ pub trait Vars {
     fn search(&self, _pattern: &str, _regex: bool, _ignore_case: bool) -> usize {
         0
     }
+    /// Rows for the O (options, `option_*`) and V (environment, `environ_*`) loops, in order.
+    fn entries(&self, _kind: char, _flags: &str) -> Vec<HashMap<String, String>> {
+        Vec::new()
+    }
+    /// Contexts for the L loop: one per attached client, sorted as `flags` asks (i, n, t, r).
+    fn client_contexts(&self, _flags: &str) -> Vec<Box<dyn Vars + '_>> {
+        Vec::new()
+    }
+    /// The I modifier: `kind` is 'c' (terminfo capability), 'f' (terminal feature) or 'e'
+    /// (client environment). None when there is no attached client terminal.
+    fn client_info(&self, _kind: char, _name: &str) -> Option<String> {
+        None
+    }
+    /// Called when a status format shows an animation (A) of more than one frame, so the
+    /// client's status line is redrawn after one animation period.
+    fn schedule_animation(&self) {}
+    /// Window user options (`@name`, value) of this context, for prev_/next_ in W loops.
+    fn user_options(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    /// The client's resolved colour for a theme name (themeblack ... thememagenta).
+    /// None if unknown: styles then use the default theme and colour escapes the terminal colour.
+    fn theme_color(&self, _name: &str) -> Option<Color> {
+        None
+    }
 }
 
 impl Vars for HashMap<String, String> {
@@ -44,7 +69,7 @@ const MAX_FORMAT_WORK: usize = 1 << 20;
 
 /// Expand a format string.
 pub fn expand(template: &str, vars: &dyn Vars) -> String {
-    Expander { vars, now: Local::now(), budget: &std::cell::Cell::new(MAX_FORMAT_WORK) }.expand(template, 0)
+    Expander::top(vars, Local::now(), None, &std::cell::Cell::new(MAX_FORMAT_WORK)).expand(template, 0)
 }
 
 /// Like expand, but also applies strftime(3) `%` sequences (status-left/right, display-message).
@@ -54,9 +79,18 @@ pub fn expand_time(template: &str, vars: &dyn Vars) -> String {
     expand_time_at(template, vars, Local::now())
 }
 
+/// expand_time for status line formats (tmux's FORMAT_STATUS): only these show the frames
+/// of an `A` animation; elsewhere it expands to nothing.
+pub fn expand_status_time(template: &str, vars: &dyn Vars) -> String {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let ms = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+    let budget = std::cell::Cell::new(MAX_FORMAT_WORK);
+    Expander { time: true, ..Expander::top(vars, Local::now(), Some(ms), &budget) }.expand(template, 0)
+}
+
 fn expand_time_at(template: &str, vars: &dyn Vars, now: DateTime<Local>) -> String {
-    let t = strftime(template, &now);
-    Expander { vars, now, budget: &std::cell::Cell::new(MAX_FORMAT_WORK) }.expand(&t, 0)
+    let budget = std::cell::Cell::new(MAX_FORMAT_WORK);
+    Expander { time: true, ..Expander::top(vars, now, None, &budget) }.expand(template, 0)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -67,7 +101,17 @@ struct Expander<'a> {
     budget: &'a std::cell::Cell<usize>,
     vars: &'a dyn Vars,
     now: DateTime<Local>,
+    /// Animation clock (ms) in status formats; None elsewhere and inside `#()` (NOCYCLE).
+    cycle: Option<u64>,
+    /// `#()` is not run (expanding a command or its output, tmux's NOJOBS).
+    nojobs: bool,
+    /// strftime(3) is applied to every format expanded (tmux's FORMAT_EXPAND_TIME), so
+    /// also to E: values and other nested formats.
+    time: bool,
 }
+
+/// Animation frame period in milliseconds (FORMAT_CYCLE_PERIOD).
+const CYCLE_PERIOD: u64 = 100;
 
 fn alias(c: u8) -> Option<&'static str> {
     Some(match c {
@@ -135,8 +179,7 @@ struct Modifier {
 }
 
 const MODIFIERS2: [&str; 7] = ["||", "&&", "!=", "==", "<=", ">=", "!!"];
-const MODIFIERS1: &str = "labdEeTtmnpqswCSWP=!<>";
-const COMPARE: [&str; 8] = ["==", "!=", "<", ">", "<=", ">=", "||", "&&"];
+const MODIFIERS1: &str = "labdEeTtmnpqswCSWP=!<>OVILNRAc";
 
 /// Parse a modifier prefix such as `=10;b:` returning the modifiers and the remaining text.
 /// Returns None when the text does not start with a valid modifier list ending in `:`.
@@ -160,7 +203,11 @@ fn parse_modifiers(s: &str) -> Option<(Vec<Modifier>, &str)> {
         let c = *b.get(i)?;
         if c == b';' || c == b':' {
             // none
-        } else if c.is_ascii_alphanumeric() || c == b'-' || c == b'.' {
+        } else if !"ImCLNPSOVst=pReqWcA".contains(name) {
+            // Only these take arguments.
+            return None;
+        } else if !c.is_ascii_punctuation() || c == b'-' {
+            // A single argument, unless the next character is punctuation to separate several.
             let e = skip(s, i, b";:")?;
             args.push(s[i..e].to_string());
             i = e;
@@ -193,6 +240,11 @@ fn parse_modifiers(s: &str) -> Option<(Vec<Modifier>, &str)> {
     }
 }
 
+/// strtonum(3): an integer with optional leading space and sign, nothing after it.
+fn strtonum(s: &str) -> Option<i64> {
+    s.trim_start().parse().ok()
+}
+
 fn truthy(s: &str) -> bool {
     !s.is_empty() && s != "0"
 }
@@ -201,7 +253,16 @@ fn bool_str(b: bool) -> String {
     if b { "1".into() } else { "0".into() }
 }
 
-impl Expander<'_> {
+impl<'a> Expander<'a> {
+    fn top(vars: &'a dyn Vars, now: DateTime<Local>, cycle: Option<u64>, budget: &'a std::cell::Cell<usize>) -> Self {
+        Expander { vars, now, budget, cycle, nojobs: false, time: false }
+    }
+
+    /// An expander for a nested context (loop row) sharing this one's budget and state.
+    fn with<'b>(&'b self, vars: &'b dyn Vars) -> Expander<'b> {
+        Expander { vars, now: self.now, budget: self.budget, cycle: self.cycle, nojobs: self.nojobs, time: self.time }
+    }
+
     fn lookup(&self, name: &str) -> Option<String> {
         if let Some(v) = self.vars.get(name) {
             return Some(v);
@@ -217,6 +278,13 @@ impl Expander<'_> {
             return String::new();
         }
         self.budget.set(self.budget.get() - s.len() - 1);
+        let timed;
+        let s = if self.time && s.contains('%') {
+            timed = strftime(s, &self.now);
+            timed.as_str()
+        } else {
+            s
+        };
         let b = s.as_bytes();
         let mut out = String::with_capacity(s.len());
         let mut i = 0;
@@ -256,9 +324,13 @@ impl Expander<'_> {
                         }
                         j += 1;
                     }
-                    if j < b.len() {
-                        let command = self.expand(&s[i + 2..j], depth + 1);
-                        out.push_str(self.vars.shell(&command).unwrap_or_default().trim_end_matches(['\r', '\n']));
+                    if j < b.len() && !self.nojobs {
+                        // As format_job_get, the command and then its output are expanded, with
+                        // no further jobs and no animation.
+                        let inner = Expander { cycle: None, nojobs: true, time: false, ..self.with(self.vars) };
+                        let command = inner.expand(&s[i + 2..j], depth + 1);
+                        let output = self.vars.shell(&command).unwrap_or_default();
+                        out.push_str(&inner.expand(output.trim_end_matches(['\r', '\n']), depth + 1));
                     }
                     i = (j + 1).min(b.len());
                 }
@@ -290,44 +362,70 @@ impl Expander<'_> {
         out
     }
 
-    /// Evaluate the contents of one `#{...}`.
+    /// Evaluate the contents of one `#{...}`, following format_replace: the first matching
+    /// kind (client information, animation, literal, character, colour, loops, name checks,
+    /// search, repeat, boolean operators, comparisons, conditionals, expressions, then a
+    /// variable) gives the value, which E/T, s, =, p, n and w then modify in that order.
     fn replace(&self, content: &str, depth: usize) -> Option<String> {
-        let (mods, copy) = parse_modifiers(content).unwrap_or((Vec::new(), content));
-        let get = |n: &str| mods.iter().find(|m| m.name == n);
-        let ex = |s: &str| self.expand(s, depth + 1);
-
-        let mut value = if get("l").is_some() {
-            copy.to_string()
-        } else if let Some(kind) = ['S', 'W', 'P'].into_iter().find(|c| get(&c.to_string()).is_some()) {
-            let (all, active) = if kind == 'S' { (copy, None) } else {
-                split2(copy).map_or((copy, None), |(a, b)| (a, Some(b)))
-            };
-            let flags = get(&kind.to_string()).and_then(|m| m.args.first()).map(|s| ex(s)).unwrap_or_default();
-            let mut out = String::new();
-            for (vars, is_active) in self.vars.contexts(kind, &flags) {
-                if self.budget.get() == 0 { break; }
-                let template = if is_active { active.unwrap_or(all) } else { all };
-                let value = Expander { vars: vars.as_ref(), now: self.now, budget: self.budget }.expand(template, depth + 1);
-                if out.len().saturating_add(value.len()) > MAX_FORMAT_BYTES { return None; }
-                out.push_str(&value);
+        let (mut mods, copy) = parse_modifiers(content).unwrap_or((Vec::new(), content));
+        // Arguments are unescaped and expanded once, when the modifiers are built.
+        for m in &mut mods {
+            for a in &mut m.args {
+                *a = self.expand(&unescape_format(a), depth + 1);
             }
-            out
+        }
+        let get = |n: &str| mods.iter().find(|m| m.name == n);
+        let flags = |n: &str| get(n).and_then(|m| m.args.first()).map(String::as_str).unwrap_or("");
+        let ex = |s: &str| self.expand(s, depth + 1);
+        // I/e wins over I/f over I/c, as the later checks in tmux overwrite the value.
+        let info = get("I").map(|_| flags("I")).and_then(|f| ['e', 'f', 'c'].into_iter().find(|k| f.contains(*k)));
+        let loop_kind = ['S', 'W', 'P', 'L', 'O', 'V'].into_iter().find(|c| get(&c.to_string()).is_some());
+        let name_kind = get("N").and_then(|m| match m.args.first() {
+            None => Some('W'),
+            Some(f) if f.contains('w') => Some('W'),
+            Some(f) if f.contains('s') => Some('S'),
+            _ => None,
+        });
+        let compare = mods.iter().find(|m| ["==", "!=", "<", ">", "<=", ">=", "m"].contains(&m.name));
+
+        let mut value = if let Some(kind) = info {
+            self.vars.client_info(kind, copy).unwrap_or_default()
+        } else if let Some(m) = get("A") {
+            let count = m.args.first().and_then(|s| strtonum(s)).filter(|n| (1..=100).contains(n)).unwrap_or(1) as u64;
+            self.cycle(copy, count)
+        } else if get("l").is_some() {
+            unescape_format(copy)
+        } else if get("a").is_some() {
+            strtonum(&ex(copy))
+                .filter(|n| (32..127).contains(n))
+                .and_then(|n| char::from_u32(n as u32))
+                .map(String::from)
+                .unwrap_or_default()
+        } else if get("c").is_some() {
+            colour_format(&ex(copy), flags("c"), self.vars)
+        } else if let Some(kind) = loop_kind {
+            self.expand_loop(kind, flags(&kind.to_string()), copy, depth)?
+        } else if let Some(kind) = name_kind {
+            let name = ex(copy);
+            let key = if kind == 'S' { "session_name" } else { "window_name" };
+            bool_str(self.vars.contexts(kind, "").iter().any(|(v, _)| v.get(key).as_deref() == Some(&name)))
         } else if let Some(m) = get("C") {
             let flags = m.args.first().map(String::as_str).unwrap_or("");
             self.vars.search(&ex(copy), flags.contains('r'), flags.contains('i')).to_string()
-        } else if let Some(m) = get("m") {
-            let (a, b) = split2(copy)?;
-            let flags = m.args.first().map(String::as_str).unwrap_or("");
-            let icase = flags.contains('i');
-            let (pat, text) = (ex(a), ex(b));
-            let matched = if flags.contains('r') {
-                regex_matches(&pat, &text, icase)
-            } else {
-                glob_match(&pat, &text, icase)
-            };
-            bool_str(matched)
+        } else if get("R").is_some() {
+            // Repeat: at most 10000 times and 65536 bytes.
+            let (text, count) = split2(copy)?;
+            let text = ex(text);
+            match strtonum(&ex(count)).filter(|n| (1..=10000).contains(n) && text.len().saturating_mul(*n as usize) <= 65536) {
+                Some(n) => text.repeat(n as usize),
+                None => String::new(),
+            }
+        } else if get("!").is_some() {
+            bool_str(!truthy(&ex(copy)))
+        } else if get("!!").is_some() {
+            bool_str(truthy(&ex(copy)))
         } else if let Some(m) = mods.iter().find(|m| m.name == "||" || m.name == "&&") {
-            // n-ary: #{||:a,b,c}
+            // n-ary, short-circuiting: #{||:a,b,c}
             let mut parts = Vec::new();
             let mut rest = copy;
             while let Some((a, b)) = split2(rest) {
@@ -335,43 +433,29 @@ impl Expander<'_> {
                 rest = b;
             }
             parts.push(rest);
-            if parts.len() < 2 {
-                return None;
-            }
             let or = m.name == "||";
             bool_str(if or { parts.iter().any(|p| truthy(&ex(p))) } else { parts.iter().all(|p| truthy(&ex(p))) })
-        } else if let Some(m) = mods.iter().find(|m| COMPARE.contains(&m.name)) {
+        } else if let Some(m) = compare {
             let (a, b) = split2(copy)?;
             let (a, b) = (ex(a), ex(b));
-            bool_str(match m.name {
-                "==" => a == b,
-                "!=" => a != b,
-                "<" => a < b,
-                ">" => a > b,
-                "<=" => a <= b,
-                ">=" => a >= b,
-                "||" => truthy(&a) || truthy(&b),
-                _ => truthy(&a) && truthy(&b),
-            })
-        } else if get("!!").is_some() {
-            bool_str(truthy(&ex(copy)))
-        } else if get("!").is_some() {
-            bool_str(!truthy(&ex(copy)))
-        } else if let Some(m) = get("e") {
-            let (a, b) = split2(copy)?;
-            match arith(&m.args, &ex(a), &ex(b)) {
-                Some(v) => v,
-                None => return None,
+            match m.name {
+                "==" => bool_str(a == b),
+                "!=" => bool_str(a != b),
+                "<" => bool_str(a < b),
+                ">" => bool_str(a > b),
+                "<=" => bool_str(a <= b),
+                ">=" => bool_str(a >= b),
+                _ => {
+                    let flags = m.args.first().map(String::as_str).unwrap_or("");
+                    if flags.contains('p') || flags.contains('z') {
+                        fuzzy_match(&a, &b, flags.contains('p'))
+                    } else if flags.contains('r') {
+                        bool_str(regex_matches(&a, &b, flags.contains('i')))
+                    } else {
+                        bool_str(glob_match(&a, &b, flags.contains('i')))
+                    }
+                }
             }
-        } else if get("a").is_some() {
-            ex(copy)
-                .trim()
-                .parse::<u32>()
-                .ok()
-                .filter(|n| (32..127).contains(n))
-                .and_then(char::from_u32)
-                .map(String::from)
-                .unwrap_or_default()
         } else if let Some(rest) = copy.strip_prefix('?') {
             let parts = split_commas(rest);
             let mut i = 0;
@@ -394,61 +478,75 @@ impl Expander<'_> {
                 chosen = Some(parts[parts.len() - 1]);
             }
             chosen.map(ex).unwrap_or_default()
+        } else if let Some(m) = get("e").filter(|m| (1..=3).contains(&m.args.len())) {
+            let (a, b) = split2(copy)?;
+            arith(&m.args, &ex(a), &ex(b)).unwrap_or_default()
         } else {
-            let mut v = match self.lookup(copy) {
-                Some(v) => v,
-                // Extension: allow `#{b:#{pane_current_path}}`-style nested formats.
-                None if copy.contains('#') => ex(copy),
-                None => String::new(),
+            let found = match self.lookup(copy) {
+                Some(v) => Some(v),
+                // As tmux, a name containing a format is expanded instead. Extension: the
+                // modifiers below apply to it too, as in #{b:#{pane_current_path}}.
+                None if copy.contains("#{") => Some(ex(copy)),
+                None => None,
             };
-            if let Some(m) = get("t") {
-                v = self.format_time(&v, &m.args);
+            // t, b, d and q only change a value that was found.
+            match found {
+                None => String::new(),
+                Some(mut v) => {
+                    if let Some(m) = get("t") {
+                        v = self.format_time(&v, &m.args);
+                    }
+                    if get("b").is_some() {
+                        v = basename(&v);
+                    }
+                    if get("d").is_some() {
+                        v = dirname(&v);
+                    }
+                    if let Some(m) = get("q") {
+                        let flags = m.args.first().map(String::as_str).unwrap_or("");
+                        v = if m.args.is_empty() {
+                            shell_quote(&v)
+                        } else if flags.contains('s') {
+                            format!("'{}'", v.replace('\'', "'\\''"))
+                        } else if flags.contains('e') || flags.contains('h') {
+                            // Escape # for styles.
+                            v.replace('#', "##")
+                        } else if flags.contains('a') {
+                            quote_argument(&v)
+                        } else {
+                            v
+                        };
+                    }
+                    v
+                }
             }
-            if get("b").is_some() {
-                v = basename(&v);
-            }
-            if get("d").is_some() {
-                v = dirname(&v);
-            }
-            if get("q").is_some() {
-                v = shell_quote(&v);
-            }
-            v
         };
 
         if get("E").is_some() {
             value = ex(&value);
-        }
-        if get("T").is_some() {
-            value = strftime(&ex(&value), &self.now);
+        } else if get("T").is_some() {
+            value = Expander { time: true, ..self.with(self.vars) }.expand(&value, depth + 1);
         }
         for m in mods.iter().filter(|m| m.name == "s" && m.args.len() >= 2) {
+            // tmux expands substitution arguments a second time.
             let flags = m.args.get(2).map(String::as_str).unwrap_or("");
             value = regex_substitute(&ex(&m.args[0]), &ex(&m.args[1]), &value, flags.contains('i'));
         }
-        if let Some(m) = get("=")
-            && let Some(n) = m.args.first().and_then(|a| ex(a).trim().parse::<i64>().ok())
-        {
-            let marker = m.args.get(1).map(|a| ex(a)).unwrap_or_default();
-            let limit = n.unsigned_abs() as usize;
-            if fmt_width(&value) > limit {
-                value = if n >= 0 {
-                    trim_left(&value, limit) + &marker
-                } else {
-                    marker + &trim_right(&value, limit)
-                };
+        // Widths outside -10000..10000 are ignored.
+        let width_arg = |n: &str| get(n).and_then(|m| m.args.first()).and_then(|a| strtonum(a)).filter(|n| n.unsigned_abs() <= 10000).unwrap_or(0);
+        let limit = width_arg("=");
+        if limit != 0 {
+            let marker = get("=").and_then(|m| m.args.get(1)).map(String::as_str).unwrap_or("");
+            let n = limit.unsigned_abs() as usize;
+            if fmt_width(&value) > n {
+                value = if limit > 0 { trim_left(&value, n) + marker } else { marker.to_string() + &trim_right(&value, n) };
             }
         }
-        if let Some(m) = get("p")
-            && let Some(n) = m.args.first().and_then(|a| ex(a).trim().parse::<i64>().ok())
-        {
-            let w = fmt_width(&value);
-            let target = usize::try_from(n.unsigned_abs()).ok()?;
-            if target > MAX_FORMAT_BYTES { return None; }
-            if w < target {
-                let pad = " ".repeat(target - w);
-                value = if n > 0 { value + &pad } else { pad + &value };
-            }
+        let pad = width_arg("p");
+        let w = fmt_width(&value);
+        if (pad.unsigned_abs() as usize) > w {
+            let fill = " ".repeat(pad.unsigned_abs() as usize - w);
+            value = if pad > 0 { value + &fill } else { fill + &value };
         }
         if get("n").is_some() {
             value = value.len().to_string();
@@ -460,17 +558,95 @@ impl Expander<'_> {
         Some(value)
     }
 
+    /// The A modifier (format_cycle): one of the comma-separated frames, changing every
+    /// `count` periods. Only in status formats and never inside `#()`; frames are not expanded.
+    fn cycle(&self, frames: &str, count: u64) -> String {
+        let Some(time) = self.cycle.filter(|_| !frames.is_empty()) else { return String::new() };
+        let frames: Vec<&str> = frames.split(',').collect();
+        if frames.len() > 1 {
+            self.vars.schedule_animation();
+        }
+        frames[(time / (count * CYCLE_PERIOD) % frames.len() as u64) as usize].to_string()
+    }
+
+    /// S, W, P, L, O and V loops: expand `fmt` once per item with loop_index and
+    /// loop_last_flag set. S, W and P take an alternative format for the current item
+    /// after a comma; W also sets the window_*_active and prev_/next_ neighbour variables.
+    fn expand_loop(&self, kind: char, flags: &str, fmt: &str, depth: usize) -> Option<String> {
+        let (all, active) = match kind {
+            'S' | 'W' | 'P' => split2(fmt).map_or((fmt, None), |(a, b)| (a, Some(b))),
+            _ => (fmt, None),
+        };
+        let owned: Vec<Box<dyn Vars + '_>>;
+        let rows: Vec<(&dyn Vars, bool, HashMap<String, String>)> = match kind {
+            'S' | 'W' | 'P' => {
+                let contexts = self.vars.contexts(kind, flags);
+                // The current session is that of the client the format is for.
+                let client_session = self.vars.get("client_session").filter(|s| !s.is_empty());
+                let actives: Vec<bool> = contexts.iter().map(|(v, active)| {
+                    if kind == 'S' { client_session.is_some() && v.get("session_name") == client_session } else { *active }
+                }).collect();
+                let mut rows = Vec::new();
+                for i in 0..contexts.len() {
+                    let mut extra = HashMap::new();
+                    if kind == 'W' {
+                        extra.insert("window_after_active".into(), bool_str(i > 0 && actives[i - 1]));
+                        extra.insert("window_before_active".into(), bool_str(actives.get(i + 1) == Some(&true)));
+                        for (prefix, n) in [("prev", i.checked_sub(1)), ("next", Some(i + 1))] {
+                            let Some((nctx, _)) = n.and_then(|n| contexts.get(n)) else { continue };
+                            extra.insert(format!("{prefix}_window_index"), nctx.get("window_index").unwrap_or_default());
+                            extra.insert(format!("{prefix}_window_active"), bool_str(actives[n.unwrap()]));
+                            for (key, value) in nctx.user_options() {
+                                extra.insert(format!("{prefix}_{key}"), value);
+                            }
+                        }
+                    }
+                    rows.push((i, actives[i], extra));
+                }
+                owned = contexts.into_iter().map(|(v, _)| v).collect();
+                rows.into_iter().map(|(i, active, extra)| (owned[i].as_ref(), active, extra)).collect()
+            }
+            'L' => {
+                owned = self.vars.client_contexts(flags);
+                owned.iter().map(|v| (v.as_ref(), false, HashMap::new())).collect()
+            }
+            _ => {
+                self.vars.entries(kind, flags).into_iter().map(|extra| (self.vars, false, extra)).collect()
+            }
+        };
+        let n = rows.len();
+        let mut out = String::new();
+        for (i, (base, is_active, mut extra)) in rows.into_iter().enumerate() {
+            if self.budget.get() == 0 { break; }
+            extra.insert("loop_index".into(), i.to_string());
+            extra.insert("loop_last_flag".into(), bool_str(i + 1 == n));
+            let ctx = Overlay { base, extra };
+            let template = if is_active { active.unwrap_or(all) } else { all };
+            let value = self.with(&ctx).expand(template, depth + 1);
+            if out.len().saturating_add(value.len()) > MAX_FORMAT_BYTES { return None; }
+            out.push_str(&value);
+        }
+        Some(out)
+    }
+
     /// `t:` modifier: format a unix timestamp. `t/p` = pretty (short), `t/f/<fmt>` = strftime.
     fn format_time(&self, v: &str, args: &[String]) -> String {
         let Ok(secs) = v.trim().parse::<i64>() else { return String::new() };
+        if secs <= 0 { return String::new(); }
         let Some(t) = Local.timestamp_opt(secs, 0).single() else { return String::new() };
-        match args.first().map(String::as_str) {
-            Some("f") => strftime(args.get(1).map(String::as_str).unwrap_or(""), &t),
-            Some("p") => {
+        let flags = args.first().map(String::as_str).unwrap_or("");
+        let age = self.now.timestamp() - secs;
+        if !flags.contains('p') && flags.contains('r') { return relative_time(age); }
+        if !flags.contains('p') && flags.contains('d') { return age.to_string(); }
+        match flags {
+            f if !f.contains('p') && f.contains('f') && args.len() >= 2 => strftime(args.get(1).map(String::as_str).unwrap_or(""), &t),
+            p if p.contains('p') => {
                 let age = self.now.signed_duration_since(t);
-                if age.num_seconds() >= 0 && age.num_hours() < 24 {
+                if age.num_hours() < 24 {
                     t.format("%H:%M").to_string()
-                } else if t.year() == self.now.year() {
+                } else if (t.year() == self.now.year() && t.month() == self.now.month()) || age.num_days() < 28 {
+                    t.format("%a%d").to_string()
+                } else if (t.year() == self.now.year() && t.month() < self.now.month()) || (t.year() == self.now.year() - 1 && t.month() > self.now.month()) {
                     t.format("%d%b").to_string()
                 } else {
                     t.format("%b%y").to_string()
@@ -481,11 +657,402 @@ impl Expander<'_> {
     }
 }
 
+/// format_unescape: drop the `#` of `#,` `##` `#{` `#}` `#:` outside nested formats.
+fn unescape_format(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    let mut depth = 0i32;
+    while let Some(c) = chars.next() {
+        if c == '#' && chars.peek() == Some(&'{') {
+            depth += 1;
+        }
+        if depth == 0 && c == '#' && chars.peek().is_some_and(|c| ",#{}:".contains(*c)) {
+            out.push(chars.next().unwrap());
+            continue;
+        }
+        if c == '}' {
+            depth -= 1;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A loop row: the row's variables over a context, which provides everything else.
+struct Overlay<'a> {
+    base: &'a dyn Vars,
+    extra: HashMap<String, String>,
+}
+
+impl Vars for Overlay<'_> {
+    fn get(&self, name: &str) -> Option<String> {
+        self.extra.get(name).cloned().or_else(|| self.base.get(name))
+    }
+    fn shell(&self, command: &str) -> Option<String> {
+        self.base.shell(command)
+    }
+    fn contexts(&self, kind: char, flags: &str) -> Vec<(Box<dyn Vars + '_>, bool)> {
+        self.base.contexts(kind, flags)
+    }
+    fn search(&self, pattern: &str, regex: bool, ignore_case: bool) -> usize {
+        self.base.search(pattern, regex, ignore_case)
+    }
+    fn entries(&self, kind: char, flags: &str) -> Vec<HashMap<String, String>> {
+        self.base.entries(kind, flags)
+    }
+    fn client_contexts(&self, flags: &str) -> Vec<Box<dyn Vars + '_>> {
+        self.base.client_contexts(flags)
+    }
+    fn client_info(&self, kind: char, name: &str) -> Option<String> {
+        self.base.client_info(kind, name)
+    }
+    fn schedule_animation(&self) {
+        self.base.schedule_animation()
+    }
+    fn user_options(&self) -> Vec<(String, String)> {
+        self.base.user_options()
+    }
+    fn theme_color(&self, name: &str) -> Option<Color> {
+        self.base.theme_color(name)
+    }
+}
+
+/// q/a: quote as a command argument, as args_escape does (vis(3) C-style escapes; double
+/// quotes if there is a space or one of #';${}%, single quotes for a double quote).
+fn quote_argument(value: &str) -> String {
+    if value.is_empty() {
+        return "''".into();
+    }
+    let quote = if value.contains([' ', '#', '\'', ';', '$', '{', '}', '%']) {
+        Some('"')
+    } else if value.contains('"') {
+        Some('\'')
+    } else {
+        None
+    };
+    if value.len() == 1 && value != " " && (quote.is_some() || value == "~") {
+        return format!("\\{value}");
+    }
+    let mut escaped = String::new();
+    let chars: Vec<char> = value.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        match c {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\x07' => escaped.push_str("\\a"),
+            '\x08' => escaped.push_str("\\b"),
+            '\x0b' => escaped.push_str("\\v"),
+            '\x0c' => escaped.push_str("\\f"),
+            '\\' => escaped.push_str("\\\\"),
+            c if c.is_ascii_control() => escaped.push_str(&format!("\\{:03o}", c as u32)),
+            '"' if quote == Some('"') => escaped.push_str("\\\""),
+            // In double quotes only a $ that would start a variable is escaped.
+            '$' if quote == Some('"') && chars.get(i + 1).is_some_and(|n| n.is_ascii_alphabetic() || *n == '_' || *n == '{') => escaped.push_str("\\$"),
+            _ => escaped.push(c),
+        }
+    }
+    if escaped.starts_with('~') && quote != Some('\'') {
+        escaped.insert(0, '\\');
+    }
+    match quote {
+        Some(q) => format!("{q}{escaped}{q}"),
+        None => escaped,
+    }
+}
+
+/// t/r: the age of a time as "1d2h", "3h4m", "5m6s" or "7s"; nothing for a future time.
+fn relative_time(age: i64) -> String {
+    if age < 0 {
+        return String::new();
+    }
+    let (d, h, m, s) = (age / 86400, age % 86400 / 3600, age % 3600 / 60, age % 60);
+    let (a, unit, b, next) = if d != 0 {
+        (d, "d", h, "h")
+    } else if h != 0 {
+        (h, "h", m, "m")
+    } else if m != 0 {
+        (m, "m", s, "s")
+    } else {
+        (s, "s", 0, "")
+    };
+    if b == 0 { format!("{a}{unit}") } else { format!("{a}{unit}{b}{next}") }
+}
+
+/// RGB of a 256-colour palette entry (colour_256toRGB).
+fn palette_rgb(n: u8) -> (u8, u8, u8) {
+    const BASIC: [u32; 16] = [
+        0x000000, 0x800000, 0x008000, 0x808000, 0x000080, 0x800080, 0x008080, 0xc0c0c0,
+        0x808080, 0xff0000, 0x00ff00, 0xffff00, 0x0000ff, 0xff00ff, 0x00ffff, 0xffffff,
+    ];
+    if n < 16 {
+        let c = BASIC[n as usize];
+        return ((c >> 16) as u8, (c >> 8) as u8, c as u8);
+    }
+    if n >= 232 {
+        let c = 8 + (n - 232) * 10;
+        return (c, c, c);
+    }
+    let n = n - 16;
+    let component = |v| if v == 0 { 0 } else { 55 + v * 40 };
+    (component(n / 36), component(n / 6 % 6), component(n % 6))
+}
+
+/// Dim a colour by a percentage (colour_dim), for styles with dim=. Default colours are
+/// left alone.
+#[allow(dead_code)] // for the renderer of window-style dim=
+pub fn dim_color(color: Color, dim: u8) -> Color {
+    let (r, g, b) = match color {
+        _ if dim == 0 => return color,
+        Color::Default => return color,
+        Color::Idx(n) => palette_rgb(n),
+        Color::Rgb(r, g, b) => (r, g, b),
+    };
+    let scale = |v: u8| (v as u32 * (100 - dim.min(100) as u32) / 100) as u8;
+    Color::Rgb(scale(r), scale(g), scale(b))
+}
+
+/// The c modifier: a colour as hex RGB (c), or as an SGR escape for the foreground (c/f)
+/// or background (c/b). Theme colours have no RGB value; as escapes they use the client's
+/// theme or else the terminal colour.
+fn colour_format(s: &str, flags: &str, vars: &dyn Vars) -> String {
+    let (fg, bg) = (flags.contains('f'), flags.contains('b'));
+    let lower = s.to_ascii_lowercase();
+    let theme = THEMES.iter().position(|t| t.0 == lower);
+    if !fg && !bg {
+        let rgb = match theme.map_or_else(|| parse_color(s), |_| None) {
+            Some(Color::Rgb(r, g, b)) => (r, g, b),
+            Some(Color::Idx(n)) => palette_rgb(n),
+            _ => return String::new(),
+        };
+        return format!("{:02x}{:02x}{:02x}", rgb.0, rgb.1, rgb.2);
+    }
+    if lower == "none" {
+        return "\x1b[0m".into();
+    }
+    let base = if bg { 40 } else { 30 };
+    let (color, is256) = match theme {
+        Some(i) => match vars.theme_color(&lower) {
+            Some(c) => (c, true),
+            None => (Color::Idx(THEMES[i].3), false),
+        },
+        None => match parse_color(s) {
+            Some(c) => (c, lower.starts_with("colo")),
+            None => return String::new(),
+        },
+    };
+    match color {
+        Color::Default => format!("\x1b[{}m", base + 9),
+        Color::Rgb(r, g, b) => format!("\x1b[{};2;{r};{g};{b}m", base + 8),
+        Color::Idx(n) if is256 => format!("\x1b[{};5;{n}m", base + 8),
+        Color::Idx(n) if n < 8 => format!("\x1b[{}m", base + n as u32),
+        Color::Idx(n) => format!("\x1b[{}m", base + 60 + n as u32 - 8),
+    }
+}
+
+/// One visible character of fuzzy-matched text: the character, its alignment group
+/// (left, centre, right, absolute-centre), column offset within the group and width.
+struct FuzzyChar {
+    c: char,
+    align: usize,
+    offset: usize,
+    width: usize,
+}
+
+/// fuzzy_scan: the visible characters of text, skipping `#[...]` styles but following
+/// their align= to place characters as format_draw would.
+fn fuzzy_scan(text: &str) -> (Vec<FuzzyChar>, [usize; 4]) {
+    let mut cs = Vec::new();
+    let mut widths = [0usize; 4];
+    let mut align = Align::Left;
+    let add = |cs: &mut Vec<FuzzyChar>, c: char, align: Align, widths: &mut [usize; 4]| {
+        let a = match align { Align::Left => 0, Align::Centre => 1, Align::Right => 2, Align::AbsoluteCentre => 3 };
+        let width = UnicodeWidthChar::width(c).unwrap_or(0);
+        cs.push(FuzzyChar { c, align: a, offset: widths[a], width });
+        widths[a] += width;
+    };
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'#' {
+            let n = b[i..].iter().take_while(|&&c| c == b'#').count();
+            if b.get(i + n) != Some(&b'[') {
+                // ## is #: half the run, rounded up.
+                for _ in 0..n.div_ceil(2) { add(&mut cs, '#', align, &mut widths); }
+                i += n;
+                continue;
+            }
+            for _ in 0..n / 2 { add(&mut cs, '#', align, &mut widths); }
+            if n % 2 == 0 {
+                add(&mut cs, '[', align, &mut widths);
+                i += n + 1;
+                continue;
+            }
+            let Some(end) = skip(text, i + n + 1, b"]") else { break };
+            // As format_draw, an invalid style changes nothing.
+            let (mut st, mut a) = (Style::default(), align);
+            if style_words(&text[i + n + 1..end]).all(|w| apply_word(w, &mut st, &mut a, Style::default(), None).is_ok()) {
+                align = a;
+            }
+            i = end + 1;
+            continue;
+        }
+        let c = text[i..].chars().next().unwrap();
+        i += c.len_utf8();
+        if !c.is_ascii_control() {
+            add(&mut cs, c, align, &mut widths);
+        }
+    }
+    (cs, widths)
+}
+
+/// The m/z and m/p modifiers (format_match_fuzzy and fuzzy.c): fzf-style matching where
+/// `|` separates alternative groups and spaces separate terms that must all match. A term
+/// is a fuzzy subsequence unless it starts with ' (substring), ^ (prefix) or ends with $
+/// (suffix); a leading ! inverts it (as a substring). Case is ignored unless the pattern
+/// has an upper case letter. m/z gives 1 or 0; m/p gives the matched display columns of
+/// the best group, laid out as the status line would draw the text.
+fn fuzzy_match(pattern: &str, text: &str, positions: bool) -> String {
+    const EXACT: i64 = 1000;
+    const PREFIX: i64 = 200;
+    const SUFFIX: i64 = 100;
+    const START: i64 = 12;
+    const BOUNDARY: i64 = 8;
+    const CONSECUTIVE: i64 = 6;
+    const LEADING_MAX: usize = 10;
+    let width = fmt_width(text).max(1);
+    // An empty query matches everything, with nothing highlighted.
+    if pattern.chars().all(|c| c == ' ' || c == '|') {
+        return if positions { String::new() } else { "1".into() };
+    }
+    let fold = !pattern.chars().any(|c| c.is_ascii_uppercase());
+    let (cs, widths) = fuzzy_scan(text);
+    let n = cs.len();
+    let equal = |a: char, b: char| a == b || (fold && a.is_ascii() && b.is_ascii() && a.eq_ignore_ascii_case(&b));
+    let boundary = |i: usize| " -_/.:".contains(cs[i].c);
+    let leading = |i: usize| i.min(LEADING_MAX) as i64;
+
+    let exact = |tok: &[char], prefix: bool, suffix: bool| -> Option<(i64, usize)> {
+        if tok.is_empty() || tok.len() > n || (prefix && suffix && tok.len() != n) {
+            return None;
+        }
+        let range = if prefix { 0..1 } else if suffix { n - tok.len()..n - tok.len() + 1 } else { 0..n - tok.len() + 1 };
+        let mut best: Option<(i64, usize)> = None;
+        for i in range {
+            if !tok.iter().enumerate().all(|(j, t)| equal(*t, cs[i + j].c)) {
+                continue;
+            }
+            let mut score = EXACT + tok.len() as i64 * CONSECUTIVE;
+            if prefix { score += PREFIX; }
+            if suffix { score += SUFFIX; }
+            if i == 0 { score += START; } else if boundary(i - 1) { score += BOUNDARY; }
+            score -= leading(i);
+            if !prefix && !suffix { score -= (n - i - tok.len()) as i64; }
+            if best.is_none_or(|(s, _)| score > s) { best = Some((score, i)); }
+        }
+        best
+    };
+    let fuzzy = |tok: &[char]| -> Option<(i64, Vec<usize>)> {
+        if tok.is_empty() || n == 0 {
+            return None;
+        }
+        // The first subsequence from the start, then compacted backwards.
+        let mut pos = Vec::with_capacity(tok.len());
+        let mut ci = 0;
+        for t in tok {
+            while ci < n && !equal(*t, cs[ci].c) { ci += 1; }
+            if ci == n { return None; }
+            pos.push(ci);
+            ci += 1;
+        }
+        let mut ci = pos[tok.len() - 1];
+        for pi in (0..tok.len()).rev() {
+            while !equal(tok[pi], cs[ci].c) { ci -= 1; }
+            pos[pi] = ci;
+            if pi != 0 { ci -= 1; }
+        }
+        let mut score = if pos[0] == 0 { START } else { (if boundary(pos[0] - 1) { BOUNDARY } else { 0 }) - leading(pos[0]) };
+        for w in pos.windows(2) {
+            if w[1] == w[0] + 1 { score += CONSECUTIVE; } else if boundary(w[1] - 1) { score += BOUNDARY; }
+        }
+        score -= (pos[tok.len() - 1] - pos[0] + 1 - tok.len()) as i64;
+        Some((score, pos))
+    };
+
+    let mut best: Option<(i64, Vec<usize>)> = None;
+    for group in pattern.split('|') {
+        let terms: Vec<&str> = group.split(' ').filter(|t| !t.is_empty()).collect();
+        if terms.is_empty() {
+            continue;
+        }
+        let mut score = 0;
+        let mut matched = Vec::new();
+        let ok = terms.iter().all(|term| {
+            let inverse = term.starts_with('!');
+            let t = if inverse { &term[1..] } else { term };
+            let (quoted, prefix) = (t.starts_with('\''), t.starts_with('^'));
+            let t = if quoted || prefix { &t[1..] } else { t };
+            let suffix = t.ends_with('$') && !t.is_empty();
+            let t = if suffix { &t[..t.len() - 1] } else { t };
+            if t.is_empty() {
+                return false;
+            }
+            let tok: Vec<char> = t.chars().collect();
+            let found = if inverse || quoted || prefix || suffix {
+                exact(&tok, prefix, suffix).map(|(s, i)| (s, (i..i + tok.len()).collect()))
+            } else {
+                fuzzy(&tok)
+            };
+            match found {
+                _ if inverse => found.is_none(),
+                Some((s, pos)) => {
+                    score += s;
+                    matched.extend(pos);
+                    true
+                }
+                None => false,
+            }
+        });
+        if ok && best.as_ref().is_none_or(|(s, _)| score > *s) {
+            best = Some((score, matched));
+        }
+    }
+    let Some((_, matched)) = best else { return if positions { String::new() } else { "0".into() } };
+    if !positions {
+        return "1".into();
+    }
+    // Columns as format_draw_none lays out the alignment groups.
+    let (mut wl, mut wc, mut wr) = (widths[0], widths[1], widths[2]);
+    while wl + wc + wr > width {
+        if wc > 0 { wc -= 1; } else if wr > 0 { wr -= 1; } else { wl -= 1; }
+    }
+    let wa = widths[3].min(width);
+    let start = [0, wl + (width - wr - wl) / 2 - wc / 2, width - wr, (width - wa) / 2];
+    let src = [0, widths[1] / 2 - wc / 2, widths[2] - wr, 0];
+    let vis = [wl, wc, wr, wa];
+    let mut columns = vec![false; width];
+    for i in matched {
+        let fc = &cs[i];
+        let a = fc.align;
+        if fc.offset < src[a] || fc.offset >= src[a] + vis[a] {
+            continue;
+        }
+        let column = start[a] + fc.offset - src[a];
+        for c in column..(column + fc.width).min(width) {
+            columns[c] = true;
+        }
+    }
+    columns.iter().enumerate().filter(|(_, on)| **on).map(|(i, _)| i.to_string()).collect::<Vec<_>>().join(",")
+}
+
 fn arith(args: &[String], a: &str, b: &str) -> Option<String> {
     let op = args.first()?.as_str();
-    let float = args.get(1).is_some_and(|f| f == "f");
-    let prec: usize = if float { args.get(2).and_then(|p| p.parse().ok()).unwrap_or(2) } else { 0 };
-    if prec > 64 { return None; }
+    let float = args.get(1).is_some_and(|f| f.contains('f'));
+    let prec = match args.get(2) {
+        // A negative precision is the printf default.
+        Some(p) => match strtonum(p).filter(|n| (-100..=100).contains(n))? { n if n < 0 => 6, n => n as usize },
+        None => if float { 2 } else { 0 },
+    };
     let mut x: f64 = a.trim().parse().ok()?;
     let mut y: f64 = b.trim().parse().ok()?;
     if !float {
@@ -496,18 +1063,26 @@ fn arith(args: &[String], a: &str, b: &str) -> Option<String> {
         "+" => x + y,
         "-" => x - y,
         "*" => x * y,
-        "/" | "%" | "m" if y == 0.0 => return None,
         "/" => x / y,
         "%" | "m" => x % y,
-        "==" => (x == y) as i32 as f64,
-        "!=" => (x != y) as i32 as f64,
+        "==" => ((x - y).abs() < 1e-9) as i32 as f64,
+        "!=" => ((x - y).abs() > 1e-9) as i32 as f64,
         "<" => (x < y) as i32 as f64,
         ">" => (x > y) as i32 as f64,
         "<=" => (x <= y) as i32 as f64,
         ">=" => (x >= y) as i32 as f64,
         _ => return None,
     };
-    let r = if float { r } else { r.trunc() };
+    if float {
+        // As printf, without precision for inf and nan.
+        return Some(match r {
+            _ if r.is_finite() => format!("{r:.prec$}"),
+            _ if r.is_nan() => (if r.is_sign_negative() { "-nan" } else { "nan" }).into(),
+            _ => (if r > 0.0 { "inf" } else { "-inf" }).into(),
+        });
+    }
+    // An integer result out of range (such as division by zero) is converted as x86 does.
+    let r = if r.is_finite() && r.abs() < 9.2e18 { r.trunc() } else { i64::MIN as f64 };
     Some(format!("{r:.prec$}"))
 }
 
@@ -540,7 +1115,7 @@ fn dirname(p: &str) -> String {
 fn shell_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if "|&;<>()$`\\\"' *?[#=%".contains(c) {
+        if "|&;<>(){}$`\\\"'*?[# =%\n\t".contains(c) {
             out.push('\\');
         }
         out.push(c);
@@ -820,13 +1395,80 @@ pub enum Align {
     Left,
     Centre,
     Right,
+    AbsoluteCentre,
 }
 
+/// Theme colour names (colour.c): name, dark and light theme defaults (the 256-colour
+/// values of the dark-theme-* and light-theme-* options) and the terminal colour used
+/// when there is no theme.
+const THEMES: [(&str, &str, &str, u8); 10] = [
+    ("themeblack", "gray5", "gray10", 0),
+    ("themewhite", "gray90", "gray95", 7),
+    ("themelightgrey", "gray70", "gray80", 7),
+    ("themedarkgrey", "gray15", "gray45", 0),
+    ("themegreen", "yellowgreen", "seagreen", 2),
+    ("themeyellow", "darkgoldenrod", "darkgoldenrod", 3),
+    ("themered", "indianred", "indianred4", 1),
+    ("themeblue", "skyblue3", "steelblue", 4),
+    ("themecyan", "cadetblue", "darkcyan", 6),
+    ("thememagenta", "mediumpurple", "purple4", 5),
+];
+
+/// Which colours theme names resolve to when there is no client theme to ask.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Theme {
+    Dark,
+    Light,
+    /// The terminal's own colours (theme option "terminal").
+    Terminal,
+}
+
+static DEFAULT_THEME: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Set the theme used for theme colour names in styles parsed without a client (default dark).
+#[allow(dead_code)] // for the theme option
+pub fn set_default_theme(theme: Theme) {
+    DEFAULT_THEME.store(theme as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn default_theme() -> Theme {
+    match DEFAULT_THEME.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Theme::Light,
+        2 => Theme::Terminal,
+        _ => Theme::Dark,
+    }
+}
+
+/// The colour of a theme name (themeblack, themewhite, themelightgrey, themedarkgrey,
+/// themegreen, themeyellow, themered, themeblue, themecyan, thememagenta) in a theme.
+pub fn theme_color(name: &str, theme: Theme) -> Option<Color> {
+    let (_, dark, light, terminal) = THEMES.iter().find(|t| name.eq_ignore_ascii_case(t.0))?;
+    match theme {
+        Theme::Dark => parse_color(dark),
+        Theme::Light => parse_color(light),
+        Theme::Terminal => Some(Color::Idx(*terminal)),
+    }
+}
+
+/// parse_color, resolving theme names through the client of a format context if any.
+pub fn parse_color_with(s: &str, vars: Option<&dyn Vars>) -> Option<Color> {
+    let name = s.trim();
+    if THEMES.iter().any(|t| name.eq_ignore_ascii_case(t.0)) {
+        return vars.and_then(|v| v.theme_color(&name.to_ascii_lowercase())).or_else(|| theme_color(name, default_theme()));
+    }
+    parse_color(s)
+}
+
+/// colour_fromstring: names, brightNAME, 0-7 and 90-97, colourN, #rrggbb, theme names,
+/// grayN/greyN (0-100) and the X11 colour names.
 pub fn parse_color(s: &str) -> Option<Color> {
     let s = s.trim().to_ascii_lowercase();
     const NAMES: [&str; 8] = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
     if s == "default" || s == "terminal" {
         return Some(Color::Default);
+    }
+    if THEMES.iter().any(|t| t.0 == s) {
+        return theme_color(&s, default_theme());
     }
     if let Some(i) = NAMES.iter().position(|n| *n == s) {
         return Some(Color::Idx(i as u8));
@@ -841,11 +1483,24 @@ pub fn parse_color(s: &str) -> Option<Color> {
         let v = u32::from_str_radix(hex, 16).ok()?;
         return Some(Color::Rgb((v >> 16) as u8, (v >> 8) as u8, v as u8));
     }
-    let num = s.strip_prefix("colour").or_else(|| s.strip_prefix("color")).unwrap_or(&s);
-    if !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) {
+    if let Some(num) = s.strip_prefix("colour").or_else(|| s.strip_prefix("color")) {
         return num.parse::<u8>().ok().map(Color::Idx);
     }
-    None
+    match s.as_str() {
+        "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" => return s.parse().ok().map(Color::Idx),
+        "90" | "91" | "92" | "93" | "94" | "95" | "96" | "97" => return s.parse::<u8>().ok().map(|n| Color::Idx(n - 82)),
+        _ => {}
+    }
+    if let Some(n) = s.strip_prefix("gray").or_else(|| s.strip_prefix("grey")) {
+        let c = if n.is_empty() {
+            0xbe
+        } else {
+            let n: u8 = n.parse().ok().filter(|n| *n <= 100)?;
+            (2.55 * n as f64).round() as u8
+        };
+        return Some(Color::Rgb(c, c, c));
+    }
+    X11_COLOURS.iter().find(|(name, _)| name.eq_ignore_ascii_case(&s)).map(|(_, c)| Color::Rgb((c >> 16) as u8, (c >> 8) as u8, *c as u8))
 }
 
 const ATTRS: [(&str, u8); 15] = [
@@ -867,29 +1522,52 @@ const ATTRS: [(&str, u8); 15] = [
     ("acs", 0),
 ];
 
-/// Apply one style word. Returns Err for unknown words or bad values.
-fn apply_word(word: &str, st: &mut Style, align: &mut Align, base: Style) -> Result<(), String> {
+/// Apply one style word. Returns Err for unknown words or bad values. Theme colours are
+/// resolved through `vars` when given.
+fn apply_word(word: &str, st: &mut Style, align: &mut Align, base: Style, vars: Option<&dyn Vars>) -> Result<(), String> {
     let w = word.trim().to_ascii_lowercase();
     if w.is_empty() {
         return Ok(());
     }
     if let Some((key, val)) = w.split_once('=') {
-        let color = || parse_color(val).ok_or_else(|| format!("bad colour: {val}"));
+        let color = || parse_color_with(val, vars).ok_or_else(|| format!("bad colour: {val}"));
         match key {
-            "fg" => st.fg = color()?,
-            "bg" => st.bg = color()?,
+            // fg=default and bg=default are the base colours.
+            "fg" => st.fg = if val == "default" { base.fg } else { color()? },
+            "bg" => st.bg = if val == "default" { base.bg } else { color()? },
             "us" | "fill" => {
                 color()?;
             }
             "align" => {
                 *align = match val {
                     "left" => Align::Left,
-                    "centre" | "center" | "absolute-centre" | "absolute-center" => Align::Centre,
+                    "centre" | "center" => Align::Centre,
+                    "absolute-centre" | "absolute-center" => Align::AbsoluteCentre,
                     "right" => Align::Right,
                     _ => return Err(format!("bad align: {val}")),
                 }
             }
-            "list" | "range" | "width" | "pad" => {}
+            "dim" => {
+                parse_dim(val)?;
+            }
+            // Kept by spans and parse_style_with; Style has no room for it.
+            "link" => {}
+            "list" => {
+                if !["on", "focus", "left-marker", "right-marker"].contains(&val) {
+                    return Err(format!("bad list: {val}"));
+                }
+            }
+            "range" => {
+                Range::parse(val)?;
+            }
+            "width" | "pad" => {
+                // width=N or width=N% (at most 100%).
+                let pct = if key == "width" { val.strip_suffix('%').filter(|v| !v.is_empty()) } else { None };
+                let n: u32 = pct.unwrap_or(val).parse().map_err(|_| format!("bad {key}: {val}"))?;
+                if pct.is_some() && n > 100 {
+                    return Err(format!("bad width: {val}"));
+                }
+            }
             _ => return Err(format!("unknown style: {word}")),
         }
         return Ok(());
@@ -897,7 +1575,8 @@ fn apply_word(word: &str, st: &mut Style, align: &mut Align, base: Style) -> Res
     match w.as_str() {
         "default" => *st = base,
         "none" => st.attrs = 0,
-        "push-default" | "pop-default" | "nolist" | "norange" | "noalign" => {}
+        "push-default" | "pop-default" | "set-default" | "nolist" | "norange" | "nolink" | "ignore" | "noignore" | "noattr" => {}
+        "noalign" => *align = Align::Left,
         _ => {
             if let Some(&(_, bit)) = ATTRS.iter().find(|(n, _)| *n == w) {
                 st.attrs |= bit;
@@ -911,19 +1590,52 @@ fn apply_word(word: &str, st: &mut Style, align: &mut Align, base: Style) -> Res
     Ok(())
 }
 
+/// dim=N or dim=N%, 0 to 100.
+fn parse_dim(val: &str) -> Result<u8, String> {
+    val.strip_suffix('%').unwrap_or(val).parse::<u8>().ok().filter(|n| *n <= 100).ok_or_else(|| format!("bad dim: {val}"))
+}
+
 fn style_words(s: &str) -> impl Iterator<Item = &str> {
-    s.split([',', ' ', '\t']).filter(|w| !w.is_empty())
+    s.split([',', ' ', '\t', '\n']).filter(|w| !w.is_empty())
 }
 
 /// Parse a style string like "fg=red,bg=colour235,bold,noitalics" applying it on top of `base`.
 /// `default` resets to `base`. `align=`, `fill=`, `list=` etc are validated but have no effect.
 pub fn parse_style(s: &str, base: Style) -> Result<Style, String> {
-    let mut st = base;
+    parse_style_with(s, base, None).map(|p| p.style)
+}
+
+/// A parsed style with the parts Style cannot hold.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParsedStyle {
+    pub style: Style,
+    /// dim= percentage (tmux dims pane colours by it for window-style and window-active-style;
+    /// see dim_color).
+    pub dim: u8,
+    /// link= hyperlink URI.
+    pub link: Option<String>,
+}
+
+/// Parse a style with a format context, as tmux does for style options: a style containing
+/// `#{` is expanded as a format first (so colours can be formats), and theme colour names
+/// resolve through the context's client.
+pub fn parse_style_with(s: &str, base: Style, vars: Option<&dyn Vars>) -> Result<ParsedStyle, String> {
+    let expanded = vars.filter(|_| s.contains("#{")).map(|v| expand(s, v));
+    let s = expanded.as_deref().unwrap_or(s);
+    let mut result = ParsedStyle { style: base, dim: 0, link: None };
     let mut align = Align::Left;
-    for w in style_words(s) {
-        apply_word(w, &mut st, &mut align, base)?;
+    for word in style_words(s) {
+        apply_word(word, &mut result.style, &mut align, base, vars)?;
+        let (key, value) = word.split_once('=').unwrap_or((word, ""));
+        if key.eq_ignore_ascii_case("link") && word.contains('=') {
+            result.link = Some(value.to_string()).filter(|v| !v.is_empty());
+        } else if word.eq_ignore_ascii_case("nolink") || word.eq_ignore_ascii_case("default") {
+            result.link = None;
+        } else if key.eq_ignore_ascii_case("dim") && word.contains('=') {
+            result.dim = parse_dim(value)?;
+        }
     }
-    Ok(st)
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -961,7 +1673,7 @@ impl Range {
             "pane" => Range::Pane(num(arg, "%")?),
             "session" => Range::Session(num(arg, "$")?),
             "user" => match arg {
-                Some(a) if a.len() <= 15 => Range::User(a.to_string()),
+                Some(a) if !a.is_empty() => Range::User(a.to_string()),
                 _ => return Err(format!("bad range: {v}")),
             },
             "none" if arg.is_none() => return Ok(None),
@@ -985,6 +1697,8 @@ impl Range {
 #[derive(Clone, PartialEq, Debug)]
 pub struct Span {
     pub text: String,
+    /// URI from link=, retained for renderers which support OSC 8.
+    pub link: Option<String>,
     pub style: Style,
     pub align: Align,
     /// Mouse range. As in tmux, a range only counts once a later `#[...]` ends it.
@@ -999,6 +1713,7 @@ pub struct Span {
 pub fn spans(text: &str, base: Style) -> Vec<Span> {
     let mut out: Vec<Span> = Vec::new();
     let mut cur = base;
+    let mut link = None;
     let mut default = base;
     let mut defaults: Vec<Style> = Vec::new();
     let mut align = Align::Left;
@@ -1006,19 +1721,20 @@ pub fn spans(text: &str, base: Style) -> Vec<Span> {
     let mut range_start = 0;
     let mut buf = String::new();
 
-    fn flush(out: &mut Vec<Span>, buf: &mut String, style: Style, align: Align, range: &Option<Range>) {
+    fn flush(out: &mut Vec<Span>, buf: &mut String, style: Style, align: Align, range: &Option<Range>, link: &Option<String>) {
         if buf.is_empty() {
             return;
         }
         if let Some(last) = out.last_mut()
             && last.style == style
+            && last.link == *link
             && last.align == align
             && last.range == *range
             && !last.range_end
         {
             last.text.push_str(buf);
         } else {
-            out.push(Span { text: buf.clone(), style, align, range: range.clone(), range_end: false });
+            out.push(Span { text: buf.clone(), link: link.clone(), style, align, range: range.clone(), range_end: false });
         }
         buf.clear();
     }
@@ -1032,11 +1748,20 @@ pub fn spans(text: &str, base: Style) -> Vec<Span> {
         } else if rest.starts_with("#[")
             && let Some(e) = rest.find(']')
         {
-            flush(&mut out, &mut buf, cur, align, &range);
+            flush(&mut out, &mut buf, cur, align, &range, &link);
             let before = range.clone();
+            let saved = cur;
             for w in style_words(&rest[2..e]) {
                 let lower = w.to_ascii_lowercase();
                 match lower.as_str() {
+                    // link= continues until nolink, default or an empty link=.
+                    "nolink" => link = None,
+                    _ if lower.starts_with("link=") => link = Some(w[5..].to_string()).filter(|l| !l.is_empty()),
+                    // The style before this directive becomes the default.
+                    "set-default" => {
+                        defaults.clear();
+                        default = saved;
+                    }
                     "push-default" => {
                         defaults.push(default);
                         default = cur;
@@ -1049,11 +1774,12 @@ pub fn spans(text: &str, base: Style) -> Vec<Span> {
                         }
                     }
                     "default" => {
+                        link = None;
                         range = None;
-                        let _ = apply_word(w, &mut cur, &mut align, default);
+                        let _ = apply_word(w, &mut cur, &mut align, default, None);
                     }
                     _ => {
-                        let _ = apply_word(w, &mut cur, &mut align, default);
+                        let _ = apply_word(w, &mut cur, &mut align, default, None);
                     }
                 }
             }
@@ -1071,7 +1797,7 @@ pub fn spans(text: &str, base: Style) -> Vec<Span> {
             i += c.len_utf8();
         }
     }
-    flush(&mut out, &mut buf, cur, align, &range);
+    flush(&mut out, &mut buf, cur, align, &range, &link);
     // a range still open at the end is dropped, as tmux does
     if range.is_some() {
         for sp in &mut out[range_start..] {
@@ -1169,6 +1895,13 @@ pub fn layout_line_ranged(spans: &[Span], width: usize, fill: Style) -> (Vec<Cel
         let from = centre.len() / 2 - cw / 2;
         put(&mut out, at, &centre, from, cw, fill);
         tags[at..at + cw].clone_from_slice(&ctags[from..from + cw]);
+    }
+    let (absolute, atags) = group(Align::AbsoluteCentre);
+    let aw = absolute.len().min(width);
+    if aw > 0 {
+        let at = (width - aw) / 2;
+        put(&mut out, at, &absolute, 0, aw, fill);
+        tags[at..at + aw].clone_from_slice(&atags[..aw]);
     }
     (out, tags)
 }
@@ -1373,8 +2106,8 @@ mod tests {
 
     #[test]
     fn excessive_format_allocations_are_rejected() {
-        assert_eq!(x("#{p9223372036854775807:t}", &[("t", "x")]), "");
-        assert_eq!(x("#{p-9223372036854775808:t}", &[("t", "x")]), "");
+        assert_eq!(x("#{p9223372036854775807:t}", &[("t", "x")]), "x");
+        assert_eq!(x("#{p-9223372036854775808:t}", &[("t", "x")]), "x");
         assert_eq!(x("#{e|+|f|18446744073709551615:1,2}", &[]), "");
         assert_eq!(regex_substitute("a", &"x".repeat(1024), &"a".repeat(2048), false), "");
     }
@@ -1412,7 +2145,8 @@ mod tests {
     #[test]
     fn strftime_modifier() {
         let v = vars(&[("fmt", "%H:%M #{x}"), ("x", "y")]);
-        let e = Expander { vars: &v, now: fixed_time(), budget: &std::cell::Cell::new(MAX_FORMAT_WORK) };
+        let budget = std::cell::Cell::new(MAX_FORMAT_WORK);
+        let e = Expander::top(&v, fixed_time(), None, &budget);
         assert_eq!(e.expand("#{T:fmt}", 0), "07:05 y");
         assert_eq!(e.expand("#{E:fmt}", 0), "%H:%M y");
     }
@@ -1505,7 +2239,9 @@ mod tests {
         assert_eq!(x("#{e|m|:#{a},#{b}}", &v), "1");
         assert_eq!(x("#{e|/|f|2:#{a},#{b}}", &v), "3.50");
         assert_eq!(x("#{e|*|f|4:5.5,3}", &v), "16.5000");
-        assert_eq!(x("#{e|/|:1,0}", &v), "");
+        // Division by zero as tmux 3.8 on x86.
+        assert_eq!(x("#{e|/|:1,0}|#{e|/|f:1,0}|#{e|/|f:-1,0}", &v), "-9223372036854775808|inf|-inf");
+        assert!(x("#{e|%|f:1,0}", &v).ends_with("nan"));
         assert_eq!(x("#{e|+|:x,1}", &v), "");
         assert_eq!(x("#{e|<|:1,2}", &v), "1");
         assert_eq!(x("#{e|==|:2,2}", &v), "1");
@@ -1596,7 +2332,7 @@ mod tests {
         assert_eq!(parse_color("#ff80"), None);
         assert_eq!(parse_color("default"), Some(Color::Default));
         assert_eq!(parse_color("terminal"), Some(Color::Default));
-        assert_eq!(parse_color("12"), Some(Color::Idx(12)));
+        assert_eq!(parse_color("12"), None);
         assert_eq!(parse_color("mauve"), None);
         assert_eq!(parse_color(""), None);
     }
@@ -1613,7 +2349,7 @@ mod tests {
         assert_eq!(parse_style("none", s).unwrap().attrs, 0);
         assert_eq!(parse_style("none", s).unwrap().fg, s.fg);
         assert_eq!(parse_style("fg=red,default", base).unwrap(), base);
-        assert_eq!(parse_style("fg=default", base).unwrap().fg, Color::Default);
+        assert_eq!(parse_style("fg=default", base).unwrap().fg, base.fg);
         assert_eq!(parse_style("", base).unwrap(), base);
         assert_eq!(parse_style("bright,hidden,double-underscore", base).unwrap().attrs, BOLD | UNDERLINE);
         assert_eq!(parse_style("align=right,fill=blue,list=on,FG=Blue", base).unwrap().fg, Color::Idx(4));
@@ -1621,6 +2357,243 @@ mod tests {
         assert!(parse_style("sparkly", base).is_err());
         assert!(parse_style("align=diagonal", base).is_err());
         assert!(parse_style("frobnicate=1", base).is_err());
+    }
+
+    // Expected values below were checked against tmux 3.8 (display -p).
+
+    #[test]
+    fn modifier_arguments_and_limits() {
+        assert_eq!(x("#{R:ab,3}|#{R:ab,0}|#{R:x,10001}", &[]), "ababab||");
+        assert_eq!(x("#{R:#{l:x},#{e|+:1,2}}", &[]), "xxx");
+        assert_eq!(x("#{R:x,65537}|#{R:ab,32769}", &[]), "|");
+        assert_eq!(x("#{e|/|f|5:1,3}|#{e|+||3:1,2}|#{e|+|f|101:1,2}|#{e|+|f|-1:1,2}", &[]), "0.33333|3.000||3.000000");
+        assert_eq!(x("#{e|/|f|100:1,2}", &[]), format!("0.5{}", "0".repeat(99)));
+        assert_eq!(x("#{e|==|f:1,1.0000000001}|#{e|!=|f:1,1.0000000001}", &[]), "1.00|0.00");
+        assert_eq!(x("#{e:v}|#{e|+|f|2|x:1,2}", &[("v", "x")]), "x|");
+        assert_eq!(x("#{||:1}|#{&&:1}|#{||:}|#{&&:}", &[]), "1|1|0|0");
+        assert_eq!(x("#{=0:v}|#{=10001:v}|#{p10001;n:v}|#{p-5:v}|#{p5:v}|", &[("v", "abc")]), "abc|abc|3|  abc|abc  |");
+        assert_eq!(x("#{=-2;p5:v}x|#{p-5;=2:v}x", &[("v", "abcdefghij")]), "ij   x|   abx");
+        assert_eq!(x("#{=/3/...:v}|#{=/-3/...:v}|#{=3:v}|#{=/3/...:s}", &[("v", "abcdefghij"), ("s", "abc")]), "abc...|...hij|abc|abc");
+        assert_eq!(x("#{l:a#,b#:#}##}", &[]), "a,b:}#");
+        // Arguments are expanded once; s/ expands its pattern and replacement again.
+        assert_eq!(x("#{=/#{n}/:v}|#{s|a|#{l:X}|:v}|#{=#{n}:v}", &[("n", "2"), ("v", "abca")]), "ab|XbcX|=2:v");
+        // A single argument may start with any non-punctuation character.
+        assert_eq!(parse_modifiers("p 3:v").unwrap().0[0].args, vec![" 3".to_string()]);
+        assert!(parse_modifiers("literal:value").is_none());
+        assert!(parse_modifiers("b/arg:value").is_none());
+    }
+
+    #[test]
+    fn modifier_precedence_follows_format_replace() {
+        assert_eq!(x("#{a:65}|#{a:31}|#{l;c:red}", &[]), "A||red");
+        assert_eq!(x("#{!;==:a,a}|#{!!:0}|#{!:}", &[]), "0|0|1");
+        assert_eq!(x("#{b:p}|#{d:p}|#{b;d:p}", &[("p", "/a/b/c/")]), "c|/a/b|.");
+        assert_eq!(x("#{b:#S}|#{b:x}|#{w:#[fg=red]ab}|#{=1:#[fg=red]ab}", &[("S", "s")]), "||0|");
+        assert_eq!(x("#{session_name&}|#{?,a,b}|#{?z,a,b}|#{?unset,a,b,c}", &[("z", "0")]), "|b|b|");
+        // I without c, e or f is an ordinary variable.
+        assert_eq!(x("#{I/x:v}|#{I:v}", &[("v", "val")]), "val|val");
+    }
+
+    #[test]
+    fn quoting_variants_and_time_expansion_order() {
+        let v = [("v", "a'b #[red]"), ("hash", "#[fg=red]"), ("fmt", "%H #{hour}"), ("hour", "%H")];
+        assert_eq!(x("#{q/s:v}|#{q/e:v}|#{q/a:v}|#{q:v}", &v), "'a'\\''b #[red]'|a'b ##[red]|\"a'b #[red]\"|a\\'b\\ \\#\\[red]");
+        assert_eq!(x("#{q/e:hash}|#{q/h:hash}", &v), "##[fg=red]|##[fg=red]");
+        assert_eq!(x("#{q/a:d}", &[("d", "say \"hi\" $HOME `x` ${y} $")]), "\"say \\\"hi\\\" \\$HOME `x` \\${y} $\"");
+        assert_eq!(x("#{q/a:t}|#{q/a:s}|#{q/a:o}|#{q/a:h}|#{q/a:e}", &[("t", "tab\there"), ("s", "it\"s"), ("o", ";"), ("h", "~x"), ("e", "")]),
+            "tab\\there|'it\"s'|\\;|\\~x|''");
+        assert_eq!(x("#{q:nl}", &[("nl", "a{b}\n")]), "a\\{b\\}\\\n");
+        let v = vars(&v);
+        let budget = std::cell::Cell::new(MAX_FORMAT_WORK);
+        let e = Expander::top(&v, fixed_time(), None, &budget);
+        assert_eq!(e.expand("#{T:fmt}", 0), "07 %H");
+        // Status and display formats apply strftime to nested formats too, as E: values.
+        let v = vars(&[("fmt", "%H:%M"), ("pct", "%%")]);
+        assert_eq!(expand_time_at("#{E:fmt}|#{fmt}|%%|#{E:pct}|#(x %H)", &v, fixed_time()), "07:05|%H:%M|%|%|");
+    }
+
+    #[test]
+    fn relative_and_difference_time() {
+        let now = fixed_time();
+        let values = HashMap::from([("past".to_string(), (now.timestamp() - 90061).to_string()),
+            ("future".into(), (now.timestamp() + 30).to_string()), ("zero".into(), "0".into()),
+            ("recent".into(), (now.timestamp() - 86400 * 2).to_string()), ("month".into(), (now.timestamp() - 86400 * 40).to_string()),
+            ("old".into(), (now.timestamp() - 86400 * 400).to_string())]);
+        let budget = std::cell::Cell::new(MAX_FORMAT_WORK);
+        let e = Expander::top(&values, now, None, &budget);
+        assert_eq!(e.expand("#{t/d:past}|#{t/d:future}|#{t/r:past}|#{t/r:future}|#{t:zero}", 0), "90061|-30|1d1h||");
+        // p wins over r, d and f.
+        assert_eq!(e.expand("#{t/p:recent}|#{t/pr:recent}|#{t/p:future}|#{t/p:month}|#{t/p:old}", 0), "Wed07|Wed07|07:05|30Aug|Sep25");
+        assert_eq!(relative_time(3661), "1h1m");
+        assert_eq!(relative_time(3600), "1h");
+        assert_eq!(relative_time(61), "1m1s");
+        assert_eq!(relative_time(0), "0s");
+    }
+
+    struct LoopVars;
+    impl Vars for LoopVars {
+        fn get(&self, name: &str) -> Option<String> {
+            (name == "client_session").then(|| "two".into())
+        }
+        fn contexts(&self, kind: char, _: &str) -> Vec<(Box<dyn Vars + '_>, bool)> {
+            if kind == 'W' {
+                vec![(Box::new(UserVars(vars(&[("window_index", "2"), ("window_name", "one")]))), true),
+                    (Box::new(UserVars(vars(&[("window_index", "4"), ("window_name", "two"), ("@c", "red")]))), false)]
+            } else if kind == 'S' {
+                vec![(Box::new(vars(&[("session_name", "one")])), false), (Box::new(vars(&[("session_name", "two")])), false)]
+            } else {
+                Vec::new()
+            }
+        }
+        fn entries(&self, kind: char, flags: &str) -> Vec<HashMap<String, String>> {
+            match kind {
+                'O' if flags == "gw" => vec![vars(&[("option_name", "@x"), ("option_value", "yes"), ("option_is_user", "1")])],
+                'V' => vec![vars(&[("environ_name", "X"), ("environ_value", "42"), ("environ_hidden", "0"), ("environ_removed", "0")])],
+                _ => Vec::new(),
+            }
+        }
+        fn client_contexts(&self, _: &str) -> Vec<Box<dyn Vars + '_>> {
+            vec![Box::new(vars(&[("client_name", "c1")])), Box::new(vars(&[("client_name", "c2")]))]
+        }
+        fn client_info(&self, kind: char, name: &str) -> Option<String> {
+            Some(if kind == 'e' { (if name == "HOME" { "/home/me" } else { "" }).into() } else { bool_str(name == "RGB") })
+        }
+        fn shell(&self, command: &str) -> Option<String> {
+            Some(format!("ran {command} #{{l:x}} #(y)"))
+        }
+    }
+
+    /// Vars whose @ variables are window user options.
+    struct UserVars(HashMap<String, String>);
+    impl Vars for UserVars {
+        fn get(&self, name: &str) -> Option<String> {
+            self.0.get(name).cloned()
+        }
+        fn user_options(&self) -> Vec<(String, String)> {
+            self.0.iter().filter(|(k, _)| k.starts_with('@')).map(|(k, v)| (k.clone(), v.clone())).collect()
+        }
+    }
+
+    #[test]
+    fn option_environment_client_loops_and_information() {
+        assert_eq!(expand("#{O/gw:#{loop_index}:#{option_name}=#{option_value}/#{option_is_user}/#{loop_last_flag}}", &LoopVars), "0:@x=yes/1/1");
+        assert_eq!(expand("#{V:#{environ_name}=#{environ_value}:#{environ_hidden}:#{environ_removed}}", &LoopVars), "X=42:0:0");
+        assert_eq!(expand("#{L:#{client_name}:#{loop_index}:#{loop_last_flag};}", &LoopVars), "c1:0:0;c2:1:1;");
+        assert_eq!(expand("#{I/f:RGB}|#{I/c:missing}|#{I/e:HOME}|#{I/fe:HOME}", &LoopVars), "1|0|/home/me|/home/me");
+        assert_eq!(x("#{O:x}|#{V:x}|#{L:x}|#{I/f:RGB}", &[]), "|||");
+        assert_eq!(expand("#{N:one}|#{N/w:missing}|#{N/s:two}|#{N/x:two}", &LoopVars), "1|0|1|");
+        // The current session is the client's.
+        assert_eq!(expand("#{S:#{session_name},*#{session_name}} ", &LoopVars), "one*two ");
+    }
+
+    #[test]
+    fn window_loop_neighbours_and_indices() {
+        assert_eq!(expand("#{W:#{loop_index}/#{loop_last_flag}/#{prev_window_index}/#{next_window_index}/#{window_after_active}/#{window_before_active}/#{next_window_active}/#{next_@c};}", &LoopVars),
+            "0/0//4/0/0/0/red;1/1/2//1/0//;");
+    }
+
+    #[test]
+    fn jobs_expand_their_output_without_jobs_or_animation() {
+        assert_eq!(expand("#(echo #{A:a,b})", &LoopVars), "ran echo  x ");
+        let budget = std::cell::Cell::new(MAX_FORMAT_WORK);
+        assert_eq!(Expander::top(&LoopVars, fixed_time(), Some(0), &budget).expand("#(#{A:a,b})", 0), "ran  x ");
+    }
+
+    #[test]
+    fn animation_status_only_count_and_raw_frames() {
+        let at = |ms, f: &str| Expander::top(&LoopVars, fixed_time(), Some(ms), &std::cell::Cell::new(MAX_FORMAT_WORK)).expand(f, 0);
+        assert_eq!(x("#{A:first,second}", &[]), "");
+        assert_eq!(at(500, "#{A:first,second,third}"), "third");
+        assert_eq!(at(500, "#{A2:first,second,third}"), "third");
+        assert_eq!(at(500, "#{A3:first,second,third}"), "second");
+        assert_eq!(at(500, "#{A0:first,second,third}|#{A101:a,b}"), "third|b");
+        assert_eq!(at(500, "#{A:#{l:raw}}|#{A:}"), "#{l:raw}|");
+        assert_eq!(at(0, "#{W:#{A:a,b}}"), "aa");
+        assert_eq!(expand_status_time("#{A:frame}", &vars(&[])), "frame");
+    }
+
+    #[test]
+    fn fuzzy_terms_positions_and_smart_case() {
+        assert_eq!(x("#{m/z:fb,foo bar}|#{m/p:fb,foo bar}|#{m/z:FB,foo bar}", &[]), "1|0,4|0");
+        assert_eq!(x("#{m/z:fb !baz,foo bar}|#{m/z:fb !bar,foo bar}", &[]), "1|0");
+        assert_eq!(x("#{m/z:^foo bar$,foo bar}|#{m/z:'ob,foo bar}|#{m/z:missing | ^foo,foo bar}", &[]), "1|0|1");
+        assert_eq!(x("#{m/p:ab,a--ab}|#{m/z:,}|#{m/p:,}", &[]), "3,4|1|");
+        assert_eq!(x("#{m/p:ab,abc#[align=right]def}|#{m/p:ef,abc#[align=right]def}", &[]), "0,1|4,5");
+        assert_eq!(x("#{m/p:c,ab#[align=centre]cd}|#{m/p:x,ab#[align=absolute-centre]x}", &[]), "2|1");
+        assert_eq!(x("#{m/p:a#,b,x a#,b y}", &[]), "2,3,4");
+        assert_eq!(x("#{m/p:漢b,#[fg=red]漢ab}|#{m/p:#[,a##[b}", &[]), "0,1,3|1,2");
+        assert_eq!(x("#{m/z:'foo$ !^bar,foo}|#{m/z:!^foo,foo}|#{m/z:^,foo}|#{m/z:fo |,foo}", &[]), "1|0|0|1");
+    }
+
+    #[test]
+    fn colour_modifiers_and_names() {
+        assert_eq!(x("#{c:red}|#{c:colour196}|#{c:#0102ff}|#{c:default}|#{c:themegreen}", &[]), "800000|ff0000|0102ff||");
+        assert_eq!(x("#{c:brightred}|#{c:gray50}|#{c:8}|#{c:12}|#{c:97}|#{c:grey}", &[]), "ff0000|7f7f7f|||ffffff|bebebe");
+        assert_eq!(x("#{c/f:red}|#{c/b:brightblue}|#{c/f:colour9}|#{c/b:#010203}", &[]), "\x1b[31m|\x1b[104m|\x1b[38;5;9m|\x1b[48;2;1;2;3m");
+        assert_eq!(x("#{c/f:none}|#{c/b:default}|#{c:bad}|#{c/f:themegreen}", &[]), "\x1b[0m|\x1b[49m||\x1b[32m");
+        assert_eq!(parse_color("90"), Some(Color::Idx(8)));
+        assert_eq!(parse_color("8"), None);
+        assert_eq!(parse_color("12"), None);
+        assert_eq!(parse_color("gray50"), Some(Color::Rgb(127, 127, 127)));
+        assert_eq!(parse_color("AliceBlue"), Some(Color::Rgb(240, 248, 255)));
+        assert_eq!(parse_color("grey101"), None);
+        for (name, ..) in THEMES {
+            assert!(parse_color(name).is_some());
+            assert!(theme_color(name, Theme::Light).is_some());
+        }
+        assert_eq!(parse_color("ThemeGreen"), parse_color("yellowgreen"));
+        assert_eq!(theme_color("themegreen", Theme::Light), parse_color("seagreen"));
+        assert_eq!(theme_color("themegreen", Theme::Terminal), Some(Color::Idx(2)));
+    }
+
+    /// A client whose theme resolves themered to bright red.
+    struct ThemeVars(HashMap<String, String>);
+    impl Vars for ThemeVars {
+        fn get(&self, name: &str) -> Option<String> {
+            self.0.get(name).cloned()
+        }
+        fn theme_color(&self, name: &str) -> Option<Color> {
+            (name == "themered").then_some(Color::Idx(9))
+        }
+    }
+
+    #[test]
+    fn dim_links_and_styles_with_format_context() {
+        let base = Style::default();
+        let parsed = parse_style_with("fg=#804020,dim=50%,link=https://Example.test", base, None).unwrap();
+        assert_eq!((parsed.dim, parsed.link.as_deref()), (50, Some("https://Example.test")));
+        assert_eq!(parsed.style.fg, Color::Rgb(128, 64, 32));
+        assert_eq!(dim_color(Color::Rgb(128, 64, 32), 50), Color::Rgb(64, 32, 16));
+        assert_eq!(dim_color(Color::Idx(1), 100), Color::Rgb(0, 0, 0));
+        assert_eq!(dim_color(Color::Default, 50), Color::Default);
+        for s in ["dim=101", "dim=-1", "dim=xx", "dim=50%%", "dim=", "width=101%", "width=%"] {
+            assert!(parse_style(s, base).is_err(), "{s}");
+        }
+        assert!(parse_style("width=50%,pad=2,dim=0,ignore,noignore,set-default,noattr", base).is_ok());
+        assert_eq!(parse_style_with("link=x,nolink", base, None).unwrap().link, None);
+        assert_eq!(parse_style_with("link=x,link=", base, None).unwrap().link, None);
+        assert_eq!(parse_style_with("link=x,default", base, None).unwrap().link, None);
+        // Styles with #{ are expanded as formats when there is a context.
+        let v = ThemeVars(vars(&[("colour", "themered"), ("on", "1"), ("D", "%1")]));
+        assert_eq!(parse_style_with("fg=#{?on,#{colour},red}", base, Some(&v)).unwrap().style.fg, Color::Idx(9));
+        assert_eq!(parse_style_with("bg=themered", base, Some(&v)).unwrap().style.bg, Color::Idx(9));
+        assert_eq!(parse_style_with("bg=themegreen", base, Some(&v)).unwrap().style.bg, parse_color("yellowgreen").unwrap());
+        assert_eq!(parse_style_with("fg=#D0D0D0", base, Some(&v)).unwrap().style.fg, Color::Rgb(0xd0, 0xd0, 0xd0));
+        assert!(parse_style("fg=#{x}", base).is_err());
+        // Links are kept on spans; dim= does not change status line colours.
+        let spans = spans("#[fg=#804020,dim=50,link=https://Example.test]a#[nolink]b#[link=u]c#[default]d", base);
+        assert_eq!(spans.iter().map(|s| s.link.as_deref()).collect::<Vec<_>>(), [Some("https://Example.test"), None, Some("u"), None]);
+        assert_eq!(spans[0].style.fg, Color::Rgb(128, 64, 32));
+    }
+
+    #[test]
+    fn set_default_and_absolute_centre() {
+        let base = Style::default();
+        let sp = spans("#[fg=red]#[set-default,bold]a#[default]b", base);
+        assert_eq!(sp[1].style, st(Color::Idx(1), 0));
+        let (cells, _) = layout_line_ranged(&spans("ab#[align=absolute-centre]X", base), 9, base);
+        assert_eq!(cells.iter().map(|c| c.text.as_str()).collect::<String>(), "ab  X    ");
+        assert_eq!(parse_style("noalign", base), Ok(base));
     }
 
     // ----- spans -----
@@ -1636,8 +2609,8 @@ mod tests {
         assert_eq!(
             sp,
             vec![
-                Span { text: "a".into(), style: st(Color::Idx(1), 0), align: Align::Left, range: None, range_end: false },
-                Span { text: "b".into(), style: base, align: Align::Left, range: None, range_end: false },
+                Span { text: "a".into(), link: None, style: st(Color::Idx(1), 0), align: Align::Left, range: None, range_end: false },
+                Span { text: "b".into(), link: None, style: base, align: Align::Left, range: None, range_end: false },
             ]
         );
         // Merging of identical styles, `##` → `#`, `##[` is literal.
@@ -1750,3 +2723,585 @@ mod tests {
         assert_eq!(cells[11].style.fg, Color::Idx(1));
     }
 }
+
+// X11 colour data from tmux 3.8 colour.c (Nicholas Marriott, ISC licensed).
+const X11_COLOURS: &[(&str, u32)] = &[
+    ("AliceBlue", 0xf0f8ff),
+    ("AntiqueWhite", 0xfaebd7),
+    ("AntiqueWhite1", 0xffefdb),
+    ("AntiqueWhite2", 0xeedfcc),
+    ("AntiqueWhite3", 0xcdc0b0),
+    ("AntiqueWhite4", 0x8b8378),
+    ("BlanchedAlmond", 0xffebcd),
+    ("BlueViolet", 0x8a2be2),
+    ("CadetBlue", 0x5f9ea0),
+    ("CadetBlue1", 0x98f5ff),
+    ("CadetBlue2", 0x8ee5ee),
+    ("CadetBlue3", 0x7ac5cd),
+    ("CadetBlue4", 0x53868b),
+    ("CornflowerBlue", 0x6495ed),
+    ("DarkBlue", 0x00008b),
+    ("DarkCyan", 0x008b8b),
+    ("DarkGoldenrod", 0xb8860b),
+    ("DarkGoldenrod1", 0xffb90f),
+    ("DarkGoldenrod2", 0xeead0e),
+    ("DarkGoldenrod3", 0xcd950c),
+    ("DarkGoldenrod4", 0x8b6508),
+    ("DarkGray", 0xa9a9a9),
+    ("DarkGreen", 0x006400),
+    ("DarkGrey", 0xa9a9a9),
+    ("DarkKhaki", 0xbdb76b),
+    ("DarkMagenta", 0x8b008b),
+    ("DarkOliveGreen", 0x556b2f),
+    ("DarkOliveGreen1", 0xcaff70),
+    ("DarkOliveGreen2", 0xbcee68),
+    ("DarkOliveGreen3", 0xa2cd5a),
+    ("DarkOliveGreen4", 0x6e8b3d),
+    ("DarkOrange", 0xff8c00),
+    ("DarkOrange1", 0xff7f00),
+    ("DarkOrange2", 0xee7600),
+    ("DarkOrange3", 0xcd6600),
+    ("DarkOrange4", 0x8b4500),
+    ("DarkOrchid", 0x9932cc),
+    ("DarkOrchid1", 0xbf3eff),
+    ("DarkOrchid2", 0xb23aee),
+    ("DarkOrchid3", 0x9a32cd),
+    ("DarkOrchid4", 0x68228b),
+    ("DarkRed", 0x8b0000),
+    ("DarkSalmon", 0xe9967a),
+    ("DarkSeaGreen", 0x8fbc8f),
+    ("DarkSeaGreen1", 0xc1ffc1),
+    ("DarkSeaGreen2", 0xb4eeb4),
+    ("DarkSeaGreen3", 0x9bcd9b),
+    ("DarkSeaGreen4", 0x698b69),
+    ("DarkSlateBlue", 0x483d8b),
+    ("DarkSlateGray", 0x2f4f4f),
+    ("DarkSlateGray1", 0x97ffff),
+    ("DarkSlateGray2", 0x8deeee),
+    ("DarkSlateGray3", 0x79cdcd),
+    ("DarkSlateGray4", 0x528b8b),
+    ("DarkSlateGrey", 0x2f4f4f),
+    ("DarkTurquoise", 0x00ced1),
+    ("DarkViolet", 0x9400d3),
+    ("DeepPink", 0xff1493),
+    ("DeepPink1", 0xff1493),
+    ("DeepPink2", 0xee1289),
+    ("DeepPink3", 0xcd1076),
+    ("DeepPink4", 0x8b0a50),
+    ("DeepSkyBlue", 0x00bfff),
+    ("DeepSkyBlue1", 0x00bfff),
+    ("DeepSkyBlue2", 0x00b2ee),
+    ("DeepSkyBlue3", 0x009acd),
+    ("DeepSkyBlue4", 0x00688b),
+    ("DimGray", 0x696969),
+    ("DimGrey", 0x696969),
+    ("DodgerBlue", 0x1e90ff),
+    ("DodgerBlue1", 0x1e90ff),
+    ("DodgerBlue2", 0x1c86ee),
+    ("DodgerBlue3", 0x1874cd),
+    ("DodgerBlue4", 0x104e8b),
+    ("FloralWhite", 0xfffaf0),
+    ("ForestGreen", 0x228b22),
+    ("GhostWhite", 0xf8f8ff),
+    ("GreenYellow", 0xadff2f),
+    ("HotPink", 0xff69b4),
+    ("HotPink1", 0xff6eb4),
+    ("HotPink2", 0xee6aa7),
+    ("HotPink3", 0xcd6090),
+    ("HotPink4", 0x8b3a62),
+    ("IndianRed", 0xcd5c5c),
+    ("IndianRed1", 0xff6a6a),
+    ("IndianRed2", 0xee6363),
+    ("IndianRed3", 0xcd5555),
+    ("IndianRed4", 0x8b3a3a),
+    ("LavenderBlush", 0xfff0f5),
+    ("LavenderBlush1", 0xfff0f5),
+    ("LavenderBlush2", 0xeee0e5),
+    ("LavenderBlush3", 0xcdc1c5),
+    ("LavenderBlush4", 0x8b8386),
+    ("LawnGreen", 0x7cfc00),
+    ("LemonChiffon", 0xfffacd),
+    ("LemonChiffon1", 0xfffacd),
+    ("LemonChiffon2", 0xeee9bf),
+    ("LemonChiffon3", 0xcdc9a5),
+    ("LemonChiffon4", 0x8b8970),
+    ("LightBlue", 0xadd8e6),
+    ("LightBlue1", 0xbfefff),
+    ("LightBlue2", 0xb2dfee),
+    ("LightBlue3", 0x9ac0cd),
+    ("LightBlue4", 0x68838b),
+    ("LightCoral", 0xf08080),
+    ("LightCyan", 0xe0ffff),
+    ("LightCyan1", 0xe0ffff),
+    ("LightCyan2", 0xd1eeee),
+    ("LightCyan3", 0xb4cdcd),
+    ("LightCyan4", 0x7a8b8b),
+    ("LightGoldenrod", 0xeedd82),
+    ("LightGoldenrod1", 0xffec8b),
+    ("LightGoldenrod2", 0xeedc82),
+    ("LightGoldenrod3", 0xcdbe70),
+    ("LightGoldenrod4", 0x8b814c),
+    ("LightGoldenrodYellow", 0xfafad2),
+    ("LightGray", 0xd3d3d3),
+    ("LightGreen", 0x90ee90),
+    ("LightGrey", 0xd3d3d3),
+    ("LightPink", 0xffb6c1),
+    ("LightPink1", 0xffaeb9),
+    ("LightPink2", 0xeea2ad),
+    ("LightPink3", 0xcd8c95),
+    ("LightPink4", 0x8b5f65),
+    ("LightSalmon", 0xffa07a),
+    ("LightSalmon1", 0xffa07a),
+    ("LightSalmon2", 0xee9572),
+    ("LightSalmon3", 0xcd8162),
+    ("LightSalmon4", 0x8b5742),
+    ("LightSeaGreen", 0x20b2aa),
+    ("LightSkyBlue", 0x87cefa),
+    ("LightSkyBlue1", 0xb0e2ff),
+    ("LightSkyBlue2", 0xa4d3ee),
+    ("LightSkyBlue3", 0x8db6cd),
+    ("LightSkyBlue4", 0x607b8b),
+    ("LightSlateBlue", 0x8470ff),
+    ("LightSlateGray", 0x778899),
+    ("LightSlateGrey", 0x778899),
+    ("LightSteelBlue", 0xb0c4de),
+    ("LightSteelBlue1", 0xcae1ff),
+    ("LightSteelBlue2", 0xbcd2ee),
+    ("LightSteelBlue3", 0xa2b5cd),
+    ("LightSteelBlue4", 0x6e7b8b),
+    ("LightYellow", 0xffffe0),
+    ("LightYellow1", 0xffffe0),
+    ("LightYellow2", 0xeeeed1),
+    ("LightYellow3", 0xcdcdb4),
+    ("LightYellow4", 0x8b8b7a),
+    ("LimeGreen", 0x32cd32),
+    ("MediumAquamarine", 0x66cdaa),
+    ("MediumBlue", 0x0000cd),
+    ("MediumOrchid", 0xba55d3),
+    ("MediumOrchid1", 0xe066ff),
+    ("MediumOrchid2", 0xd15fee),
+    ("MediumOrchid3", 0xb452cd),
+    ("MediumOrchid4", 0x7a378b),
+    ("MediumPurple", 0x9370db),
+    ("MediumPurple1", 0xab82ff),
+    ("MediumPurple2", 0x9f79ee),
+    ("MediumPurple3", 0x8968cd),
+    ("MediumPurple4", 0x5d478b),
+    ("MediumSeaGreen", 0x3cb371),
+    ("MediumSlateBlue", 0x7b68ee),
+    ("MediumSpringGreen", 0x00fa9a),
+    ("MediumTurquoise", 0x48d1cc),
+    ("MediumVioletRed", 0xc71585),
+    ("MidnightBlue", 0x191970),
+    ("MintCream", 0xf5fffa),
+    ("MistyRose", 0xffe4e1),
+    ("MistyRose1", 0xffe4e1),
+    ("MistyRose2", 0xeed5d2),
+    ("MistyRose3", 0xcdb7b5),
+    ("MistyRose4", 0x8b7d7b),
+    ("NavajoWhite", 0xffdead),
+    ("NavajoWhite1", 0xffdead),
+    ("NavajoWhite2", 0xeecfa1),
+    ("NavajoWhite3", 0xcdb38b),
+    ("NavajoWhite4", 0x8b795e),
+    ("NavyBlue", 0x000080),
+    ("OldLace", 0xfdf5e6),
+    ("OliveDrab", 0x6b8e23),
+    ("OliveDrab1", 0xc0ff3e),
+    ("OliveDrab2", 0xb3ee3a),
+    ("OliveDrab3", 0x9acd32),
+    ("OliveDrab4", 0x698b22),
+    ("OrangeRed", 0xff4500),
+    ("OrangeRed1", 0xff4500),
+    ("OrangeRed2", 0xee4000),
+    ("OrangeRed3", 0xcd3700),
+    ("OrangeRed4", 0x8b2500),
+    ("PaleGoldenrod", 0xeee8aa),
+    ("PaleGreen", 0x98fb98),
+    ("PaleGreen1", 0x9aff9a),
+    ("PaleGreen2", 0x90ee90),
+    ("PaleGreen3", 0x7ccd7c),
+    ("PaleGreen4", 0x548b54),
+    ("PaleTurquoise", 0xafeeee),
+    ("PaleTurquoise1", 0xbbffff),
+    ("PaleTurquoise2", 0xaeeeee),
+    ("PaleTurquoise3", 0x96cdcd),
+    ("PaleTurquoise4", 0x668b8b),
+    ("PaleVioletRed", 0xdb7093),
+    ("PaleVioletRed1", 0xff82ab),
+    ("PaleVioletRed2", 0xee799f),
+    ("PaleVioletRed3", 0xcd6889),
+    ("PaleVioletRed4", 0x8b475d),
+    ("PapayaWhip", 0xffefd5),
+    ("PeachPuff", 0xffdab9),
+    ("PeachPuff1", 0xffdab9),
+    ("PeachPuff2", 0xeecbad),
+    ("PeachPuff3", 0xcdaf95),
+    ("PeachPuff4", 0x8b7765),
+    ("PowderBlue", 0xb0e0e6),
+    ("RebeccaPurple", 0x663399),
+    ("RosyBrown", 0xbc8f8f),
+    ("RosyBrown1", 0xffc1c1),
+    ("RosyBrown2", 0xeeb4b4),
+    ("RosyBrown3", 0xcd9b9b),
+    ("RosyBrown4", 0x8b6969),
+    ("RoyalBlue", 0x4169e1),
+    ("RoyalBlue1", 0x4876ff),
+    ("RoyalBlue2", 0x436eee),
+    ("RoyalBlue3", 0x3a5fcd),
+    ("RoyalBlue4", 0x27408b),
+    ("SaddleBrown", 0x8b4513),
+    ("SandyBrown", 0xf4a460),
+    ("SeaGreen", 0x2e8b57),
+    ("SeaGreen1", 0x54ff9f),
+    ("SeaGreen2", 0x4eee94),
+    ("SeaGreen3", 0x43cd80),
+    ("SeaGreen4", 0x2e8b57),
+    ("SkyBlue", 0x87ceeb),
+    ("SkyBlue1", 0x87ceff),
+    ("SkyBlue2", 0x7ec0ee),
+    ("SkyBlue3", 0x6ca6cd),
+    ("SkyBlue4", 0x4a708b),
+    ("SlateBlue", 0x6a5acd),
+    ("SlateBlue1", 0x836fff),
+    ("SlateBlue2", 0x7a67ee),
+    ("SlateBlue3", 0x6959cd),
+    ("SlateBlue4", 0x473c8b),
+    ("SlateGray", 0x708090),
+    ("SlateGray1", 0xc6e2ff),
+    ("SlateGray2", 0xb9d3ee),
+    ("SlateGray3", 0x9fb6cd),
+    ("SlateGray4", 0x6c7b8b),
+    ("SlateGrey", 0x708090),
+    ("SpringGreen", 0x00ff7f),
+    ("SpringGreen1", 0x00ff7f),
+    ("SpringGreen2", 0x00ee76),
+    ("SpringGreen3", 0x00cd66),
+    ("SpringGreen4", 0x008b45),
+    ("SteelBlue", 0x4682b4),
+    ("SteelBlue1", 0x63b8ff),
+    ("SteelBlue2", 0x5cacee),
+    ("SteelBlue3", 0x4f94cd),
+    ("SteelBlue4", 0x36648b),
+    ("VioletRed", 0xd02090),
+    ("VioletRed1", 0xff3e96),
+    ("VioletRed2", 0xee3a8c),
+    ("VioletRed3", 0xcd3278),
+    ("VioletRed4", 0x8b2252),
+    ("WebGray", 0x808080),
+    ("WebGreen", 0x008000),
+    ("WebGrey", 0x808080),
+    ("WebMaroon", 0x800000),
+    ("WebPurple", 0x800080),
+    ("WhiteSmoke", 0xf5f5f5),
+    ("X11Gray", 0xbebebe),
+    ("X11Green", 0x00ff00),
+    ("X11Grey", 0xbebebe),
+    ("X11Maroon", 0xb03060),
+    ("X11Purple", 0xa020f0),
+    ("YellowGreen", 0x9acd32),
+    ("alice blue", 0xf0f8ff),
+    ("antique white", 0xfaebd7),
+    ("aqua", 0x00ffff),
+    ("aquamarine", 0x7fffd4),
+    ("aquamarine1", 0x7fffd4),
+    ("aquamarine2", 0x76eec6),
+    ("aquamarine3", 0x66cdaa),
+    ("aquamarine4", 0x458b74),
+    ("azure", 0xf0ffff),
+    ("azure1", 0xf0ffff),
+    ("azure2", 0xe0eeee),
+    ("azure3", 0xc1cdcd),
+    ("azure4", 0x838b8b),
+    ("beige", 0xf5f5dc),
+    ("bisque", 0xffe4c4),
+    ("bisque1", 0xffe4c4),
+    ("bisque2", 0xeed5b7),
+    ("bisque3", 0xcdb79e),
+    ("bisque4", 0x8b7d6b),
+    ("black", 0x000000),
+    ("blanched almond", 0xffebcd),
+    ("blue violet", 0x8a2be2),
+    ("blue", 0x0000ff),
+    ("blue1", 0x0000ff),
+    ("blue2", 0x0000ee),
+    ("blue3", 0x0000cd),
+    ("blue4", 0x00008b),
+    ("brown", 0xa52a2a),
+    ("brown1", 0xff4040),
+    ("brown2", 0xee3b3b),
+    ("brown3", 0xcd3333),
+    ("brown4", 0x8b2323),
+    ("burlywood", 0xdeb887),
+    ("burlywood1", 0xffd39b),
+    ("burlywood2", 0xeec591),
+    ("burlywood3", 0xcdaa7d),
+    ("burlywood4", 0x8b7355),
+    ("cadet blue", 0x5f9ea0),
+    ("chartreuse", 0x7fff00),
+    ("chartreuse1", 0x7fff00),
+    ("chartreuse2", 0x76ee00),
+    ("chartreuse3", 0x66cd00),
+    ("chartreuse4", 0x458b00),
+    ("chocolate", 0xd2691e),
+    ("chocolate1", 0xff7f24),
+    ("chocolate2", 0xee7621),
+    ("chocolate3", 0xcd661d),
+    ("chocolate4", 0x8b4513),
+    ("coral", 0xff7f50),
+    ("coral1", 0xff7256),
+    ("coral2", 0xee6a50),
+    ("coral3", 0xcd5b45),
+    ("coral4", 0x8b3e2f),
+    ("cornflower blue", 0x6495ed),
+    ("cornsilk", 0xfff8dc),
+    ("cornsilk1", 0xfff8dc),
+    ("cornsilk2", 0xeee8cd),
+    ("cornsilk3", 0xcdc8b1),
+    ("cornsilk4", 0x8b8878),
+    ("crimson", 0xdc143c),
+    ("cyan", 0x00ffff),
+    ("cyan1", 0x00ffff),
+    ("cyan2", 0x00eeee),
+    ("cyan3", 0x00cdcd),
+    ("cyan4", 0x008b8b),
+    ("dark blue", 0x00008b),
+    ("dark cyan", 0x008b8b),
+    ("dark goldenrod", 0xb8860b),
+    ("dark gray", 0xa9a9a9),
+    ("dark green", 0x006400),
+    ("dark grey", 0xa9a9a9),
+    ("dark khaki", 0xbdb76b),
+    ("dark magenta", 0x8b008b),
+    ("dark olive green", 0x556b2f),
+    ("dark orange", 0xff8c00),
+    ("dark orchid", 0x9932cc),
+    ("dark red", 0x8b0000),
+    ("dark salmon", 0xe9967a),
+    ("dark sea green", 0x8fbc8f),
+    ("dark slate blue", 0x483d8b),
+    ("dark slate gray", 0x2f4f4f),
+    ("dark slate grey", 0x2f4f4f),
+    ("dark turquoise", 0x00ced1),
+    ("dark violet", 0x9400d3),
+    ("deep pink", 0xff1493),
+    ("deep sky blue", 0x00bfff),
+    ("dim gray", 0x696969),
+    ("dim grey", 0x696969),
+    ("dodger blue", 0x1e90ff),
+    ("firebrick", 0xb22222),
+    ("firebrick1", 0xff3030),
+    ("firebrick2", 0xee2c2c),
+    ("firebrick3", 0xcd2626),
+    ("firebrick4", 0x8b1a1a),
+    ("floral white", 0xfffaf0),
+    ("forest green", 0x228b22),
+    ("fuchsia", 0xff00ff),
+    ("gainsboro", 0xdcdcdc),
+    ("ghost white", 0xf8f8ff),
+    ("gold", 0xffd700),
+    ("gold1", 0xffd700),
+    ("gold2", 0xeec900),
+    ("gold3", 0xcdad00),
+    ("gold4", 0x8b7500),
+    ("goldenrod", 0xdaa520),
+    ("goldenrod1", 0xffc125),
+    ("goldenrod2", 0xeeb422),
+    ("goldenrod3", 0xcd9b1d),
+    ("goldenrod4", 0x8b6914),
+    ("green yellow", 0xadff2f),
+    ("green", 0x00ff00),
+    ("green1", 0x00ff00),
+    ("green2", 0x00ee00),
+    ("green3", 0x00cd00),
+    ("green4", 0x008b00),
+    ("honeydew", 0xf0fff0),
+    ("honeydew1", 0xf0fff0),
+    ("honeydew2", 0xe0eee0),
+    ("honeydew3", 0xc1cdc1),
+    ("honeydew4", 0x838b83),
+    ("hot pink", 0xff69b4),
+    ("indian red", 0xcd5c5c),
+    ("indigo", 0x4b0082),
+    ("ivory", 0xfffff0),
+    ("ivory1", 0xfffff0),
+    ("ivory2", 0xeeeee0),
+    ("ivory3", 0xcdcdc1),
+    ("ivory4", 0x8b8b83),
+    ("khaki", 0xf0e68c),
+    ("khaki1", 0xfff68f),
+    ("khaki2", 0xeee685),
+    ("khaki3", 0xcdc673),
+    ("khaki4", 0x8b864e),
+    ("lavender blush", 0xfff0f5),
+    ("lavender", 0xe6e6fa),
+    ("lawn green", 0x7cfc00),
+    ("lemon chiffon", 0xfffacd),
+    ("light blue", 0xadd8e6),
+    ("light coral", 0xf08080),
+    ("light cyan", 0xe0ffff),
+    ("light goldenrod yellow", 0xfafad2),
+    ("light goldenrod", 0xeedd82),
+    ("light gray", 0xd3d3d3),
+    ("light green", 0x90ee90),
+    ("light grey", 0xd3d3d3),
+    ("light pink", 0xffb6c1),
+    ("light salmon", 0xffa07a),
+    ("light sea green", 0x20b2aa),
+    ("light sky blue", 0x87cefa),
+    ("light slate blue", 0x8470ff),
+    ("light slate gray", 0x778899),
+    ("light slate grey", 0x778899),
+    ("light steel blue", 0xb0c4de),
+    ("light yellow", 0xffffe0),
+    ("lime green", 0x32cd32),
+    ("lime", 0x00ff00),
+    ("linen", 0xfaf0e6),
+    ("magenta", 0xff00ff),
+    ("magenta1", 0xff00ff),
+    ("magenta2", 0xee00ee),
+    ("magenta3", 0xcd00cd),
+    ("magenta4", 0x8b008b),
+    ("maroon", 0xb03060),
+    ("maroon1", 0xff34b3),
+    ("maroon2", 0xee30a7),
+    ("maroon3", 0xcd2990),
+    ("maroon4", 0x8b1c62),
+    ("medium aquamarine", 0x66cdaa),
+    ("medium blue", 0x0000cd),
+    ("medium orchid", 0xba55d3),
+    ("medium purple", 0x9370db),
+    ("medium sea green", 0x3cb371),
+    ("medium slate blue", 0x7b68ee),
+    ("medium spring green", 0x00fa9a),
+    ("medium turquoise", 0x48d1cc),
+    ("medium violet red", 0xc71585),
+    ("midnight blue", 0x191970),
+    ("mint cream", 0xf5fffa),
+    ("misty rose", 0xffe4e1),
+    ("moccasin", 0xffe4b5),
+    ("navajo white", 0xffdead),
+    ("navy blue", 0x000080),
+    ("navy", 0x000080),
+    ("old lace", 0xfdf5e6),
+    ("olive drab", 0x6b8e23),
+    ("olive", 0x808000),
+    ("orange red", 0xff4500),
+    ("orange", 0xffa500),
+    ("orange1", 0xffa500),
+    ("orange2", 0xee9a00),
+    ("orange3", 0xcd8500),
+    ("orange4", 0x8b5a00),
+    ("orchid", 0xda70d6),
+    ("orchid1", 0xff83fa),
+    ("orchid2", 0xee7ae9),
+    ("orchid3", 0xcd69c9),
+    ("orchid4", 0x8b4789),
+    ("pale goldenrod", 0xeee8aa),
+    ("pale green", 0x98fb98),
+    ("pale turquoise", 0xafeeee),
+    ("pale violet red", 0xdb7093),
+    ("papaya whip", 0xffefd5),
+    ("peach puff", 0xffdab9),
+    ("peru", 0xcd853f),
+    ("pink", 0xffc0cb),
+    ("pink1", 0xffb5c5),
+    ("pink2", 0xeea9b8),
+    ("pink3", 0xcd919e),
+    ("pink4", 0x8b636c),
+    ("plum", 0xdda0dd),
+    ("plum1", 0xffbbff),
+    ("plum2", 0xeeaeee),
+    ("plum3", 0xcd96cd),
+    ("plum4", 0x8b668b),
+    ("powder blue", 0xb0e0e6),
+    ("purple", 0xa020f0),
+    ("purple1", 0x9b30ff),
+    ("purple2", 0x912cee),
+    ("purple3", 0x7d26cd),
+    ("purple4", 0x551a8b),
+    ("rebecca purple", 0x663399),
+    ("red", 0xff0000),
+    ("red1", 0xff0000),
+    ("red2", 0xee0000),
+    ("red3", 0xcd0000),
+    ("red4", 0x8b0000),
+    ("rosy brown", 0xbc8f8f),
+    ("royal blue", 0x4169e1),
+    ("saddle brown", 0x8b4513),
+    ("salmon", 0xfa8072),
+    ("salmon1", 0xff8c69),
+    ("salmon2", 0xee8262),
+    ("salmon3", 0xcd7054),
+    ("salmon4", 0x8b4c39),
+    ("sandy brown", 0xf4a460),
+    ("sea green", 0x2e8b57),
+    ("seashell", 0xfff5ee),
+    ("seashell1", 0xfff5ee),
+    ("seashell2", 0xeee5de),
+    ("seashell3", 0xcdc5bf),
+    ("seashell4", 0x8b8682),
+    ("sienna", 0xa0522d),
+    ("sienna1", 0xff8247),
+    ("sienna2", 0xee7942),
+    ("sienna3", 0xcd6839),
+    ("sienna4", 0x8b4726),
+    ("silver", 0xc0c0c0),
+    ("sky blue", 0x87ceeb),
+    ("slate blue", 0x6a5acd),
+    ("slate gray", 0x708090),
+    ("slate grey", 0x708090),
+    ("snow", 0xfffafa),
+    ("snow1", 0xfffafa),
+    ("snow2", 0xeee9e9),
+    ("snow3", 0xcdc9c9),
+    ("snow4", 0x8b8989),
+    ("spring green", 0x00ff7f),
+    ("steel blue", 0x4682b4),
+    ("tan", 0xd2b48c),
+    ("tan1", 0xffa54f),
+    ("tan2", 0xee9a49),
+    ("tan3", 0xcd853f),
+    ("tan4", 0x8b5a2b),
+    ("teal", 0x008080),
+    ("thistle", 0xd8bfd8),
+    ("thistle1", 0xffe1ff),
+    ("thistle2", 0xeed2ee),
+    ("thistle3", 0xcdb5cd),
+    ("thistle4", 0x8b7b8b),
+    ("tomato", 0xff6347),
+    ("tomato1", 0xff6347),
+    ("tomato2", 0xee5c42),
+    ("tomato3", 0xcd4f39),
+    ("tomato4", 0x8b3626),
+    ("turquoise", 0x40e0d0),
+    ("turquoise1", 0x00f5ff),
+    ("turquoise2", 0x00e5ee),
+    ("turquoise3", 0x00c5cd),
+    ("turquoise4", 0x00868b),
+    ("violet red", 0xd02090),
+    ("violet", 0xee82ee),
+    ("web gray", 0x808080),
+    ("web green", 0x008000),
+    ("web grey", 0x808080),
+    ("web maroon", 0x800000),
+    ("web purple", 0x800080),
+    ("wheat", 0xf5deb3),
+    ("wheat1", 0xffe7ba),
+    ("wheat2", 0xeed8ae),
+    ("wheat3", 0xcdba96),
+    ("wheat4", 0x8b7e66),
+    ("white smoke", 0xf5f5f5),
+    ("white", 0xffffff),
+    ("x11 gray", 0xbebebe),
+    ("x11 green", 0x00ff00),
+    ("x11 grey", 0xbebebe),
+    ("x11 maroon", 0xb03060),
+    ("x11 purple", 0xa020f0),
+    ("yellow green", 0x9acd32),
+    ("yellow", 0xffff00),
+    ("yellow1", 0xffff00),
+    ("yellow2", 0xeeee00),
+    ("yellow3", 0xcdcd00),
+    ("yellow4", 0x8b8b00),
+];

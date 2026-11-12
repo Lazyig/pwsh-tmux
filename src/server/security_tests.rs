@@ -314,8 +314,10 @@ fn repeated_readonly_formats_cannot_accumulate_unbounded_reply() {
     let (mut srv, _) = fixture();
     let mut ctx = Ctx { client: Some(1), reply: Some(1), ..Ctx::default() };
     let mut rejected = false;
+    // About 1MB per reply; tmux limits each padding to 10000 columns.
+    let fmt = "#{p10000:#{l:x}}".repeat(100);
     for _ in 0..16 {
-        let args = ["display-message", "-p", "#{p1048576:#{l:x}}"].map(String::from).to_vec();
+        let args = ["display-message", "-p", fmt.as_str()].map(String::from).to_vec();
         if srv.exec(args, &mut ctx).is_err() { rejected = true; break; }
     }
     assert!(rejected, "combined query replies exceeded the request budget");

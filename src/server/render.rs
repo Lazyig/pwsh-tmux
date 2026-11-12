@@ -118,7 +118,7 @@ pub fn draw_box(f: &mut Frame, x: u16, y: u16, w: u16, h: u16, style: Style, tit
         let spans = format::spans(title, style);
         let cells = spans_cells(&spans, w.saturating_sub(4) as usize, style);
         let start = match spans.first().map(|s| s.align) {
-            Some(format::Align::Centre) => x + (w.saturating_sub(cells.len() as u16)) / 2,
+            Some(format::Align::Centre | format::Align::AbsoluteCentre) => x + (w.saturating_sub(cells.len() as u16)) / 2,
             Some(format::Align::Right) => x + w - 2 - cells.len() as u16,
             _ => x + 2,
         };
