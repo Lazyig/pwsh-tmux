@@ -464,11 +464,9 @@ impl Tree {
                 Sort::Creation => a.created.cmp(&b.created),
                 _ => a.id.cmp(&b.id),
             };
-            r.then(a.name.cmp(&b.name))
+            let r = r.then(a.name.cmp(&b.name));
+            if self.reversed { r.reverse() } else { r }
         });
-        if self.reversed {
-            v.reverse();
-        }
         v
     }
 
@@ -497,11 +495,9 @@ impl Tree {
                     Sort::Activity => wc.map(|w| w.activity).cmp(&wa.map(|w| w.activity)),
                     _ => a.0.cmp(&c.0),
                 };
-                r.then(wa.map(|w| &w.name).cmp(&wc.map(|w| &w.name)))
+                let r = r.then(wa.map(|w| &w.name).cmp(&wc.map(|w| &w.name)));
+                if self.reversed { r.reverse() } else { r }
             });
-            if self.reversed {
-                wls.reverse();
-            }
             let mut empty = 0;
             for (idx, wid) in &wls {
                 if self.win_filter.as_ref().is_some_and(|f| !f.contains(wid)) || !self.build_window(srv, b, s, *idx, *wid, si, filter, after) {
@@ -524,15 +520,18 @@ impl Tree {
         b.nodes[wi].align = true;
         let base = srv.opt_window_num(Some(wid), "pane-base-index").max(0) as usize;
         let mut panes: Vec<(usize, PaneId)> = w.panes().into_iter().enumerate().map(|(i, p)| (i + base, p)).collect();
+        // sort_pane_cmp: ties go by title and -r reverses the comparison
         let order = self.sort().unwrap_or(Sort::Index);
-        if order == Sort::Name {
-            panes.sort_by(|a, c| srv.panes.get(&a.1).map(|p| &p.title).cmp(&srv.panes.get(&c.1).map(|p| &p.title)));
-        } else if order == Sort::Activity {
-            panes.sort_by(|a, c| srv.panes.get(&c.1).map(|p| p.last_output).cmp(&srv.panes.get(&a.1).map(|p| p.last_output)));
-        }
-        if self.reversed {
-            panes.reverse();
-        }
+        let title = |p: PaneId| srv.panes.get(&p).map(|p| p.title.clone()).unwrap_or_default();
+        panes.sort_by(|a, c| {
+            let r = match order {
+                Sort::Name => std::cmp::Ordering::Equal,
+                Sort::Activity => srv.panes.get(&a.1).map(|p| p.last_output).cmp(&srv.panes.get(&c.1).map(|p| p.last_output)),
+                _ => a.0.cmp(&c.0),
+            };
+            let r = r.then_with(|| title(a.1).cmp(&title(c.1)));
+            if self.reversed { r.reverse() } else { r }
+        });
         let mut found = 0;
         for (pi, p) in panes {
             let pt = Target { pane: Some(p), ..t };
@@ -556,15 +555,17 @@ impl Tree {
 
     fn build_buffers(&self, srv: &Server, b: &mut Builder, filter: Option<&str>) {
         let mut bufs: Vec<&Buffer> = srv.buffers.iter().collect();
-        match self.sort().unwrap_or(Sort::Creation) {
-            Sort::Name => bufs.sort_by(|a, c| a.name.cmp(&c.name)),
-            Sort::Size => bufs.sort_by(|a, c| c.data.len().cmp(&a.data.len()).then(a.name.cmp(&c.name))),
-            // the list is newest first already
-            _ => {}
-        }
-        if self.reversed {
-            bufs.reverse();
-        }
+        let order = self.sort().unwrap_or(Sort::Creation);
+        let pos = |b: &Buffer| srv.buffers.iter().position(|x| x.name == b.name).unwrap_or(0);
+        bufs.sort_by(|a, c| {
+            let r = match order {
+                Sort::Name => a.name.cmp(&c.name),
+                Sort::Size => c.data.len().cmp(&a.data.len()).then(a.name.cmp(&c.name)),
+                // the list is newest first already
+                _ => pos(a).cmp(&pos(c)),
+            };
+            if self.reversed { r.reverse() } else { r }
+        });
         let t = srv.target_for_pane(self.owner);
         for buf in bufs {
             let vars = crate::server::cmds::buffer_vars(buf);
@@ -1710,4 +1711,63 @@ fn draw_label(grid: &mut [Vec<Cell>], px: usize, py: usize, sx: usize, sy: usize
         }
     }
     put_cells(&mut grid[py + oy], px + ox, &cells);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn built(n: usize) -> Built {
+        let nodes: Vec<Node> = (0..n)
+            .map(|i| Node { tag: format!("t{i}"), name: i.to_string(), text: None, data: ItemData::Buffer(i.to_string()), parent: None, children: vec![], expanded: false, tagged: false, align: false, no_tag: false, draw_as_parent: false })
+            .collect();
+        let lines = (0..n).map(|i| TLine { item: i, depth: 0, last: i + 1 == n, flat: true, key: None }).collect();
+        Built { nodes, roots: (0..n).collect(), lines, no_matches: false }
+    }
+
+    #[test]
+    fn rebuilding_keeps_the_scroll_position() {
+        let mut t = Tree::new(TreeKind::Buffers, 0, Target::default());
+        let b = built(30);
+        // scrolled so line 12 is shown at the top with line 15 current
+        t.offset = 12;
+        t.cur_tag = Some("t15".into());
+        assert_eq!(t.resolve(&b, 10), (15, 12));
+        // the current item moved up after a rebuild: the offset stays while it is visible
+        let mut b2 = built(30);
+        b2.nodes.swap(15, 13);
+        b2.nodes[13].tag = "t15".into();
+        b2.nodes[15].tag = "t13".into();
+        assert_eq!(t.resolve(&b2, 10), (13, 12));
+        // the list shrank: no empty lines at the bottom
+        assert_eq!(t.resolve(&built(16), 10), (15, 6));
+        // the current item went away: its line, clamped to the list
+        t.cur_tag = Some("gone".into());
+        t.cur = 40;
+        assert_eq!(t.resolve(&built(20), 10).0, 19);
+    }
+
+    #[test]
+    fn list_height_follows_the_preview() {
+        let mut t = Tree::new(TreeKind::Tree, 0, Target::default());
+        assert_eq!(t.list_height(24, 9), 12);
+        assert_eq!(t.list_height(24, 40), 16);
+        assert_eq!(t.list_height(12, 40), 12);
+        t.preview = Preview::Big;
+        assert_eq!(t.list_height(24, 40), 6);
+        t.preview = Preview::Off;
+        assert_eq!(t.list_height(24, 40), 24);
+        let c = Tree::new(TreeKind::Options, 0, Target::default());
+        assert_eq!(c.list_height(30, 5), 18);
+    }
+
+    #[test]
+    fn sort_orders_cycle_per_mode() {
+        let t = Tree::new(TreeKind::Buffers, 0, Target::default());
+        assert_eq!(t.sort(), Some(Sort::Creation));
+        assert_eq!(Tree::new(TreeKind::Clients, 0, Target::default()).sort(), Some(Sort::Name));
+        assert_eq!(Tree::new(TreeKind::Options, 0, Target::default()).sort(), None);
+        assert_eq!(Sort::parse("Z"), Some(Sort::Z));
+        assert_eq!(strip_styles("#[fg=red]a##b#[default]c"), "a#bc");
+    }
 }
