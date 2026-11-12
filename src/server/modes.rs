@@ -383,8 +383,7 @@ impl Tree {
                             let oy = (ph+1)/2;
                             if ox>1 && ox+len<each-1 && ph>=3 { draw_box(&mut f,x+ox-1,y+oy,len+2,3,Style::default(),""); }
                             let color = if *id==window.active { "display-panes-active-colour" } else { "display-panes-colour" };
-                            let sid = srv.session_of_pane(*id).map(|(sid,_)|sid);
-                            let style = Style { fg: crate::format::parse_color(&srv.opt_session(sid,color)).unwrap_or(Color::Default), ..Style::default() };
+                            let style = Style { fg: crate::format::parse_color(&srv.opt_window(Some(window.id),color)).unwrap_or(Color::Default), ..Style::default() };
                             f.text(x+ox,y+1+oy,&label,style,w-2);
                         }
                     }

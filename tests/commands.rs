@@ -22,9 +22,9 @@ fn options_and_formats() {
     assert_eq!(ctx.ok(&["show-window-options", "-v", "-t", "o", "synchronize-panes"]).trim(), "on");
     // flag without value toggles
     ctx.ok(&["set", "-g", "mouse"]);
-    assert_eq!(ctx.ok(&["show", "-gv", "mouse"]).trim(), "on");
-    ctx.ok(&["set", "-u", "-g", "mouse"]);
     assert_eq!(ctx.ok(&["show", "-gv", "mouse"]).trim(), "off");
+    ctx.ok(&["set", "-u", "-g", "mouse"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "mouse"]).trim(), "on");
     ctx.fails(&["set", "-g", "no-such-option", "1"]);
     ctx.fails(&["set", "-g", "base-index", "abc"]);
     ctx.ok(&["set", "-ag", "status-left", "+X"]);
@@ -42,6 +42,148 @@ fn options_and_formats() {
     assert_eq!(ctx.fmt("o", "#{e|+|:2,3}"), "5");
     assert_eq!(ctx.fmt("o", "#{pane_width}x#{pane_height}"), "100x30");
     assert!(ctx.ok(&["display-message", "-a", "-t", "o"]).contains("session_name=o"));
+}
+
+#[test]
+fn tmux_38_options_scopes_arrays_and_choices() {
+    let ctx = Ctx::new("opts38");
+    ctx.ok(&["new-session", "-d", "-s", "o"]);
+    assert_eq!(ctx.ok(&["show", "-sv", "theme"]).trim(), "detect");
+    ctx.ok(&["set", "-s", "theme", "light"]);
+    assert_eq!(ctx.ok(&["show", "-sv", "theme"]).trim(), "light");
+    ctx.fails(&["set", "-s", "theme", "auto"]);
+    assert!(ctx.ok(&["show", "-gv", "status-format[1]"]).contains("#{P:"));
+    ctx.ok(&["set", "-gw", "pane-border-status", "top-floating"]);
+    ctx.ok(&["set", "-p", "-t", "o", "cursor-style", "bar"]);
+    assert_eq!(ctx.ok(&["show", "-pv", "-t", "o", "cursor-style"]).trim(), "bar");
+    assert_eq!(ctx.ok(&["show", "-gwv", "cursor-style"]).trim(), "default");
+    ctx.ok(&["set", "-g", "pane-scrollbars", "auto-hide"]);
+    assert_eq!(ctx.ok(&["show", "-gwv", "pane-scrollbars"]).trim(), "auto-hide");
+    ctx.ok(&["set", "-gw", "pane-colours[0010]", "red"]);
+    assert_eq!(ctx.ok(&["show", "-gwv", "pane-colours[10]"]).trim(), "red");
+    ctx.fails(&["set", "-gw", "pane-colours[2]", "bad-colour"]);
+    ctx.ok(&["set", "-s", "codepoint-widths[emoji]", "U+1F600=2"]);
+    assert_eq!(ctx.ok(&["show", "-sv", "codepoint-widths[emoji]"]).trim(), "U+1F600=2");
+    ctx.ok(&["set", "-s", "command-alias", "one=display-message hello,two=list-sessions"]);
+    assert_eq!(ctx.ok(&["show", "-sv", "command-alias[0]"]).trim(), "one=display-message hello");
+    ctx.ok(&["set", "-su", "command-alias[0]"]);
+    ctx.ok(&["set", "-sa", "command-alias", "three=list-windows"]);
+    assert_eq!(ctx.ok(&["show", "-sv", "command-alias[0]"]).trim(), "three=list-windows");
+    ctx.ok(&["set", "-sgu", "command-alias"]);
+    assert_eq!(ctx.ok(&["show", "-sv", "command-alias[0]"]).trim(), "split-pane=split-window");
+    ctx.fails(&["set", "-g", "mouse[0]", "on"]);
+    ctx.fails(&["show", "-s", "codepoint-widths[]"]);
+    // names: unique prefixes and old -color spellings, like options_match
+    ctx.ok(&["set", "-g", "display-panes-color", "red"]);
+    assert_eq!(ctx.ok(&["show", "-gw", "display-panes-col"]).trim(), "display-panes-colour red");
+    assert!(ctx.fails(&["set", "-g", "status-l", "x"]).contains("ambiguous option"));
+    // -a appends to this level only; styles get a comma
+    ctx.ok(&["set", "-at", "o", "status-left", "X"]);
+    assert_eq!(ctx.ok(&["show", "-t", "o", "status-left"]).trim(), "status-left X");
+    ctx.ok(&["set", "-ag", "status-style", "fg=red"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "status-style"]).trim(), "bg=themegreen,fg=themeblack,fg=red");
+    // an array set on a session does not copy the global elements
+    ctx.ok(&["set", "-t", "o", "status-format[1]", "X"]);
+    assert_eq!(ctx.ok(&["show", "-t", "o", "status-format"]).trim(), "status-format[1] X");
+    assert!(ctx.ok(&["show", "-A", "-t", "o"]).contains("mouse* on\n"));
+    // listings follow the tmux table order, user options first
+    ctx.ok(&["set", "-s", "@z", "1"]);
+    let all = ctx.ok(&["show", "-s"]);
+    assert!(all.starts_with("@z 1\nbackspace C-?\nbuffer-limit 50\nclear-on-attach on\ncommand-alias[0]"), "{all}");
+    assert!(all.find("\ntheme light").unwrap() < all.find("dark-theme-black").unwrap());
+    ctx.ok(&["set", "-s", "default-client-command", "new -A"]);
+    assert_eq!(ctx.ok(&["show", "-sv", "default-client-command"]).trim(), "new-session -A");
+    assert!(ctx.fails(&["set", "-g", "status-left"]).contains("empty value"));
+}
+
+#[test]
+fn tmux_38_option_levels_targets_and_hooks() {
+    let ctx = Ctx::new("opts38b");
+    ctx.ok(&["new-session", "-d", "-s", "o"]);
+    ctx.ok(&["split-window", "-d", "-t", "o"]);
+    // -U clears the target window's panes with -g too
+    ctx.ok(&["set", "-p", "-t", "o:0.0", "pane-border-style", "fg=red"]);
+    ctx.ok(&["set", "-p", "-t", "o:0.1", "pane-border-style", "fg=blue"]);
+    ctx.ok(&["set", "-w", "-t", "o", "pane-border-style", "fg=green"]);
+    ctx.ok(&["set", "-gU", "pane-border-style"]);
+    assert_eq!(ctx.ok(&["show", "-p", "-t", "o:0.0"]), "");
+    assert_eq!(ctx.ok(&["show", "-p", "-t", "o:0.1"]), "");
+    assert_eq!(ctx.ok(&["show", "-pA", "-t", "o:0.0", "pane-border-style"]).trim(), "pane-border-style* fg=green");
+    // an array made by element sets stays, empty, and hides the global one
+    ctx.ok(&["set", "-t", "o", "status-format[1]", "Y"]);
+    ctx.ok(&["set", "-u", "-t", "o", "status-format[1]"]);
+    assert_eq!(ctx.ok(&["show", "-t", "o"]).trim(), "status-format");
+    assert_eq!(ctx.ok(&["show", "-At", "o", "status-format"]).trim(), "status-format");
+    ctx.ok(&["set", "-w", "-t", "o", "pane-colours[3]", "red"]);
+    ctx.ok(&["set", "-wU", "-t", "o", "pane-colours[3]"]);
+    assert!(ctx.ok(&["show", "-w", "-t", "o"]).contains("\npane-colours\n"));
+    // a failing whole-array assignment keeps what was assigned before the error
+    ctx.ok(&["set", "-gw", "pane-colours", "red,blue"]);
+    assert_eq!(ctx.fails(&["set", "-gw", "pane-colours", "red,nope"]).trim(), "bad colour: nope");
+    assert_eq!(ctx.ok(&["show", "-gw", "pane-colours"]).trim(), "pane-colours[0] red");
+    // show-options takes a key on any option and prints the plain value
+    assert_eq!(ctx.ok(&["show", "-g", "mouse[0]"]).trim(), "mouse[0] on");
+    assert_eq!(ctx.ok(&["show", "-gv", "mouse[0]"]).trim(), "on");
+    ctx.ok(&["set", "-g", "@u", "x"]);
+    assert_eq!(ctx.ok(&["show", "-g", "@u[0]"]).trim(), "@u[0] x");
+    assert_eq!(ctx.fails(&["set", "-g", "mouse[0]", "on"]).trim(), "not an array: mouse[0]");
+    assert_eq!(ctx.fails(&["set", "-qg", "mouse[0]", "on"]).trim(), "not an array: mouse[0]");
+    // targets: "no such ..." errors, hidden by -q
+    assert_eq!(ctx.ok(&["set", "-qt", "nosuch", "status-left", "x"]), "");
+    assert_eq!(ctx.ok(&["show", "-qt", "nosuch"]), "");
+    assert_eq!(ctx.ok(&["set", "-wq", "-t", "o:9", "aggressive-resize", "on"]), "");
+    assert_eq!(ctx.fails(&["set", "-t", "nosuch", "status-left", "x"]).trim(), "no such session: nosuch");
+    assert_eq!(ctx.fails(&["show", "-w", "-t", "o:9"]).trim(), "no such window: o:9");
+    assert_eq!(ctx.fails(&["set", "-p", "-t", "%99", "pane-border-style", "fg=red"]).trim(), "no such pane: %99");
+    // values
+    assert_eq!(ctx.fails(&["set", "-g", "mouse", "true"]).trim(), "bad value: true");
+    assert_eq!(ctx.fails(&["set", "-gw", "pane-border-lines", "center"]).trim(), "unknown value: center");
+    ctx.ok(&["set", "-g", "base-index", " 5"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "base-index"]).trim(), "5");
+    ctx.ok(&["set", "-g", "status-left-style", "fg=red"]);
+    assert_eq!(ctx.fails(&["set", "-ag", "status-left-style", "align=center"]).trim(), "invalid style: fg=red,align=center");
+    assert_eq!(ctx.ok(&["show", "-gv", "status-left-style"]).trim(), "fg=red");
+    ctx.fails(&["set", "-g", "status-style", "range=user"]);
+    for (key, shown) in [("C-@", "C-@"), ("^?", "C-?"), ("M-S-a", "M-S-a"), ("MouseDown1Pane", "MouseDown1Pane"), ("0x41", "A")] {
+        ctx.ok(&["set", "-g", "prefix2", key]);
+        assert_eq!(ctx.ok(&["show", "-gv", "prefix2"]).trim(), shown);
+    }
+    // command options: aliases, unknown commands and flags, { } blocks, args_print order
+    for (value, shown) in [
+        ("info", "show-messages -JT"),
+        ("splitp -h", "split-window -h"),
+        ("if -F 1 { display a } { display b }", "if-shell -F 1 { display-message a } { display-message b }"),
+        ("lsk -Tprefix -1 -N -a", "list-keys -1Na -T prefix"),
+        ("display a ; display b", "display-message a ; display-message b"),
+    ] {
+        ctx.ok(&["set", "-s", "default-client-command", value]);
+        assert_eq!(ctx.ok(&["show", "-sv", "default-client-command"]).trim(), shown, "{value}");
+    }
+    assert_eq!(ctx.fails(&["set", "-s", "default-client-command", "nosuchcmd x"]).trim(), "unknown command: nosuchcmd");
+    assert_eq!(ctx.fails(&["set", "-s", "default-client-command", "new -Q"]).trim(), "command new-session: unknown flag -Q");
+    assert_eq!(ctx.fails(&["set", "-s", "default-client-command", "{ new }"]).trim(), "syntax error");
+    assert_eq!(ctx.fails(&["set", "-s", "default-client-command", "neww { x }"]).trim(), "unknown command: x");
+    assert_eq!(ctx.fails(&["set", "-s", "default-client-command", "neww { display a }"]).trim(), "command new-window: argument 1 must be \"string\"");
+    assert!(ctx.fails(&["set", "-s", "default-client-command", "li"]).starts_with("ambiguous command: li, could be: link-window, list-buffers"));
+    // hooks are options too
+    ctx.ok(&["set", "-g", "after-new-window", "display hi"]);
+    assert_eq!(ctx.ok(&["show", "-g", "after-new-window"]).trim(), "after-new-window[0] display-message hi");
+    ctx.ok(&["set", "-g", "after-new-window[3]", "info"]);
+    ctx.ok(&["set", "-gu", "after-new-window[0]"]);
+    assert_eq!(ctx.ok(&["show", "-g", "after-new-window"]).trim(), "after-new-window[3] show-messages -JT");
+    assert_eq!(ctx.ok(&["show", "-g", "after-split-window"]).trim(), "after-split-window");
+    ctx.ok(&["set", "-t", "o", "session-renamed", "display x"]);
+    assert_eq!(ctx.ok(&["show", "-t", "o", "session-renamed"]).trim(), "session-renamed[0] display-message x");
+    assert_eq!(ctx.ok(&["show", "-H", "-t", "o"]).trim(), "status-format\nsession-renamed[0] display-message x");
+    assert_eq!(ctx.ok(&["show", "-At", "o", "session-created"]).trim(), "session-created");
+    assert!(!ctx.ok(&["show", "-t", "o"]).contains("session-renamed"));
+    ctx.ok(&["set", "-g", "pane-exited", "display x"]);
+    assert_eq!(ctx.fails(&["show", "-gw", "pane-c"]).trim(), "ambiguous option: pane-c");
+    assert_eq!(ctx.fails(&["show", "-s", "com"]).trim(), "ambiguous option: com");
+    // the hook runs from the option
+    ctx.ok(&["set", "-g", "after-new-window", "set -g @ran yes"]);
+    ctx.ok(&["new-window", "-d", "-t", "o"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@ran"]).trim(), "yes");
 }
 
 #[test]

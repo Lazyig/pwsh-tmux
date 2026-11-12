@@ -572,8 +572,8 @@ impl Server {
             match ov {
                 Overlay::DisplayPanes { .. } => {
                     cursor = None;
-                    let colour = format::parse_color(&self.opt_session(Some(sid), "display-panes-colour")).unwrap_or(Color::Idx(4));
-                    let acolour = format::parse_color(&self.opt_session(Some(sid), "display-panes-active-colour")).unwrap_or(Color::Idx(1));
+                    let colour = format::parse_color(&self.opt_window(Some(wid), "display-panes-colour")).unwrap_or(Color::Idx(4));
+                    let acolour = format::parse_color(&self.opt_window(Some(wid), "display-panes-active-colour")).unwrap_or(Color::Idx(1));
                     let base = self.opt_window_num(Some(wid), "pane-base-index").max(0) as usize;
                     for (i, (id, r)) in rects.iter().enumerate() {
                         let col = if *id == win.active { acolour } else { colour };
@@ -643,7 +643,8 @@ impl Server {
             for i in 0..nstatus {
                 let y = sy0 + i;
                 let custom = &formats[i as usize];
-                let (line, tags) = if !custom.is_empty() {
+                // The built-in first line has a dedicated renderer for list clipping.
+                let (line, tags) = if !custom.is_empty() && !(i == 0 && custom == options::STATUS_FORMATS[0]) {
                     let base = self.status_style(sid, cid);
                     let cur = Target { sid: Some(sid), idx: Some(s.active), wid: Some(wid), pane: Some(win.active) };
                     let text = self.expand_status_time(cur, cid, custom);
