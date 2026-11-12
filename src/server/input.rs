@@ -7,12 +7,13 @@ use crate::keys::{Input, Key, KeyCode};
 
 pub use super::mouse::MouseCtx;
 
-// The default mouse menus of tmux 3.6a (key-bindings.c).
-const PANE_MENU: &str = r##"display-menu -T "#[align=centre]#{pane_index} (#{pane_id})" -t = -x M -y M "#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Top,}" < { send-keys -X history-top } "#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Bottom,}" > { send-keys -X history-bottom } '' "#{?mouse_word,Search For #[underscore]#{=/9/...:mouse_word},}" C-r { if-shell -F "#{?#{m/r:(copy|view)-mode,#{pane_mode}},0,1}" "copy-mode -t=" ; send-keys -X -t = search-backward -- "#{q:mouse_word}" } "#{?mouse_word,Type #[underscore]#{=/9/...:mouse_word},}" C-y { copy-mode -q ; send-keys -l "#{q:mouse_word}" } "#{?mouse_word,Copy #[underscore]#{=/9/...:mouse_word},}" c { copy-mode -q ; set-buffer "#{q:mouse_word}" } "#{?mouse_line,Copy Line,}" l { copy-mode -q ; set-buffer "#{q:mouse_line}" } '' "#{?mouse_hyperlink,Type #[underscore]#{=/9/...:mouse_hyperlink},}" C-h { copy-mode -q ; send-keys -l "#{q:mouse_hyperlink}" } "#{?mouse_hyperlink,Copy #[underscore]#{=/9/...:mouse_hyperlink},}" h { copy-mode -q ; set-buffer "#{q:mouse_hyperlink}" } '' "Horizontal Split" h { split-window -h } "Vertical Split" v { split-window -v } '' "#{?#{>:#{window_panes},1},,-}Swap Up" u { swap-pane -U } "#{?#{>:#{window_panes},1},,-}Swap Down" d { swap-pane -D } "#{?pane_marked_set,,-}Swap Marked" s { swap-pane } '' Kill X { kill-pane } Respawn R { respawn-pane -k } "#{?pane_marked,Unmark,Mark}" m { select-pane -m } "#{?#{>:#{window_panes},1},,-}#{?window_zoomed_flag,Unzoom,Zoom}" z { resize-pane -Z }"##;
+// The default mouse menus of tmux 3.8 (key-bindings.c): the session menu (built by run-shell
+// -C so it can list sessions) gained Detach in 3.7 and the pane menu Paste.
+const PANE_MENU: &str = r##"display-menu -T "#[align=centre]#{pane_index} (#{pane_id})" -t = -x M -y M "#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Top,}" < { send-keys -X history-top } "#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Bottom,}" > { send-keys -X history-bottom } '' "#{?#{==:#{pane_mode},copy-mode},#{?copy_line_numbers,Hide Line Numbers,Show Line Numbers},}" L { send-keys -X line-numbers-toggle } "#{?#{==:#{pane_mode},copy-mode},#{?refresh_active,Refresh Off,Refresh On},}" r { send-keys -X refresh-toggle } '' "#{?#{&&:#{buffer_size},#{!:#{pane_in_mode}}},Paste #[underscore]#{=/9/...:buffer_sample},}" p { paste-buffer } '' "#{?mouse_word,Search For #[underscore]#{=/9/...:mouse_word},}" C-r { if-shell -F "#{?#{m/r:(copy|view)-mode,#{pane_mode}},0,1}" "copy-mode -t=" ; send-keys -X -t = search-backward -- "#{q:mouse_word}" } "#{?mouse_word,Type #[underscore]#{=/9/...:mouse_word},}" C-y { copy-mode -q ; send-keys -l "#{q:mouse_word}" } "#{?mouse_word,Copy #[underscore]#{=/9/...:mouse_word},}" c { copy-mode -q ; set-buffer "#{q:mouse_word}" } "#{?mouse_line,Copy Line,}" l { copy-mode -q ; set-buffer "#{q:mouse_line}" } '' "#{?mouse_hyperlink,Type #[underscore]#{=/9/...:mouse_hyperlink},}" C-h { copy-mode -q ; send-keys -l "#{q:mouse_hyperlink}" } "#{?mouse_hyperlink,Copy #[underscore]#{=/9/...:mouse_hyperlink},}" h { copy-mode -q ; set-buffer "#{q:mouse_hyperlink}" } '' "#{?#{#{pane_floating_flag}},Move,}" '' { display-menu -T "#[align=centre]Move" -x L -y L Centre c { move-pane -P centre } '' "Top Left" 1 { move-pane -P top-left } "Top Right" 2 { move-pane -P top-right } "Bottom Left" 3 { move-pane -P bottom-left } "Bottom Right" 4 { move-pane -P bottom-right } '' Top t { move-pane -P top-centre } Bottom b { move-pane -P bottom-centre } Left l { move-pane -P centre-left } Right r { move-pane -P centre-right } } "#{?#{#{pane_floating_flag}},Move & Resize,}" '' { display-menu -T "#[align=centre]Move & Resize" -x L -y L Fill 0 { resize-pane -x "100%" -y "100%" ; move-pane -P top-left } '' "Top Left" 1 { resize-pane -x "50%" -y "50%" ; move-pane -P top-left } "Top Right" 2 { resize-pane -x "50%" -y "50%" ; move-pane -P top-right } "Bottom Left" 3 { resize-pane -x "50%" -y "50%" ; move-pane -P bottom-left } "Bottom Right" 4 { resize-pane -x "50%" -y "50%" ; move-pane -P bottom-right } '' Top t { resize-pane -x "100%" -y "50%" ; move-pane -P top-centre } Bottom b { resize-pane -x "100%" -y "50%" ; move-pane -P bottom-centre } Left l { resize-pane -x "50%" -y "100%" ; move-pane -P centre-left } Right r { resize-pane -x "50%" -y "100%" ; move-pane -P centre-right } } "#{?#{#{pane_floating_flag}},Tile,}" t { join-pane } "#{?#{!:#{pane_floating_flag}},Float,}" f { break-pane -W } "#{?#{!:#{pane_floating_flag}},Horizontal Split,}" h { split-window -h } "#{?#{!:#{pane_floating_flag}},Vertical Split,}" v { split-window -v } '' "#{?#{&&:#{!:#{pane_floating_flag}},#{>:#{window_panes},1}},Swap Up,}" u { swap-pane -U } "#{?#{&&:#{!:#{pane_floating_flag}},#{>:#{window_panes},1}},Swap Down,}" d { swap-pane -D } "#{?pane_marked_set,,-}Swap Marked" s { swap-pane } '' Kill X { kill-pane } Respawn R { respawn-pane -k } "#{?pane_marked,Unmark,Mark}" m { select-pane -m } "#{?#{>:#{window_panes},1},,-}#{?window_zoomed_flag,Unzoom,Zoom}" z { resize-pane -Z }"##;
 
 const WINDOW_MENU: &str = r##"display-menu -T "#[align=centre]#{window_index}:#{window_name}" -t = -x W -y W "#{?#{>:#{session_windows},1},,-}Swap Left" l { swap-window -t :-1 } "#{?#{>:#{session_windows},1},,-}Swap Right" r { swap-window -t :+1 } "#{?pane_marked_set,,-}Swap Marked" s { swap-window } '' Kill X { kill-window } Respawn R { respawn-window -k } "#{?pane_marked,Unmark,Mark}" m { select-pane -m } Rename n { command-prompt -F -I "#W" { rename-window -t "#{window_id}" "%%" } } '' "New After" w { new-window -a } "New At End" W { new-window }"##;
 
-const SESSION_MENU: &str = r##"display-menu -T "#[align=centre]#{session_name}" -t = -x M -y W Next n { switch-client -n } Previous p { switch-client -p } '' Renumber N { move-window -r } Rename n { command-prompt -I "#S" { rename-session "%%" } } '' "New Session" s { new-session } "New Window" w { new-window }"##;
+const SESSION_MENU: &str = r##"run-shell -C "display-menu -t= -xM -yW -T '#[align=centre]#{session_name}'  #{S/t:#{?#{&&:#{<:#{loop_index},6},#{!:#{session_active}}},'Switch To #[underscore]#{session_name}' '' {switch-client -t=#{session_id}#} ,}} '' 'Renumber' 'N' {move-window -r} 'Rename' 'r' {command-prompt -I '#S' {rename-session -- '%%'}} 'Detach' 'd' {detach-client} '' 'New Session' 's' {new-session} 'New Window' 'w' {new-window}""##;
 
 const IN_MODE: &str = "#{||:#{pane_in_mode},#{mouse_any_flag}}";
 
@@ -78,6 +79,8 @@ pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
         ("s", "choose-tree -Zs", false, "Choose a session from a list"),
         ("t", "clock-mode", false, "Show a clock"),
         ("w", "choose-tree -Zw", false, "Choose a window from a list"),
+        ("Tab", "new-pane -E -X 0 -Y 0 -x \"75%\" -y \"30%\" ; move-pane -P bottom-centre ; switch-mode -kw", false, "Switch to a window"),
+        ("BTab", "new-pane -E -X 0 -Y 0 -x \"75%\" -y \"30%\" ; move-pane -P bottom-centre ; switch-mode -ks", false, "Switch to a session"),
         ("x", "confirm-before -p \"kill-pane #P? (y/n)\" kill-pane", false, "Kill the active pane"),
         ("z", "resize-pane -Z", false, "Zoom the active pane"),
         ("{", "swap-pane -U", false, "Swap the active pane with the pane above"),
@@ -299,7 +302,13 @@ impl Server {
             self.prompt_key(cid, &k, &name);
             return;
         }
-        // overlays
+        // overlays; a menu belongs to its window, so other clients on the window use it too
+        let menu_owner = self.window_menu_owner(cid);
+        let (cid, c) = match menu_owner {
+            Some(_) if c.is_readonly() => return,
+            Some(o) => (o, &self.clients[&o]),
+            None => (cid, c),
+        };
         match &c.overlay {
             Some(Overlay::Menu(_)) => {
                 let action = match &mut self.clients.get_mut(&cid).unwrap().overlay {
@@ -393,7 +402,35 @@ impl Server {
         }
     }
 
+    /// The client whose menu is shown over this client's window when this client has no
+    /// overlay of its own (tmux 3.8 keeps the menu in the window).
+    pub fn window_menu_owner(&self, cid: ClientId) -> Option<ClientId> {
+        let c = self.clients.get(&cid)?;
+        if c.overlay.is_some() {
+            return None;
+        }
+        let wid = self.sessions.get(&c.session?)?.active_window();
+        self.clients.values().find(|o| o.id != cid && o.attached && matches!(&o.overlay, Some(Overlay::Menu(m)) if self.menu_window(m, o.id) == Some(wid))).map(|o| o.id)
+    }
+
+    /// The window a menu belongs to: its pane's, else the opening client's current window.
+    pub fn menu_window(&self, m: &super::modes::Menu, owner: ClientId) -> Option<WinId> {
+        m.pane.and_then(|p| self.window_of(p)).or_else(|| self.client_session(owner).and_then(|s| self.sessions.get(&s)).map(|s| s.active_window()))
+    }
+
+    /// Redraw every client showing the window of a client's menu.
+    pub fn menu_changed(&mut self, owner: ClientId) {
+        let wid = match self.clients.get(&owner).and_then(|c| c.overlay.as_ref()) {
+            Some(Overlay::Menu(m)) => self.menu_window(m, owner),
+            _ => self.client_session(owner).and_then(|s| self.sessions.get(&s)).map(|s| s.active_window()),
+        };
+        if let Some(w) = wid {
+            self.mark_window_dirty(w);
+        }
+    }
+
     pub(crate) fn menu_action(&mut self, cid: ClientId, action: MenuAction) {
+        self.menu_changed(cid);
         match action {
             MenuAction::None => {
                 if let Some(c) = self.clients.get_mut(&cid) {

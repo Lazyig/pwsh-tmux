@@ -560,6 +560,8 @@ pub struct Prompt {
     pub bspace_exit: bool,
     /// confirm-before: the key that confirms (-c) and whether Enter does too (-y).
     pub confirm: (char, bool),
+    /// command-prompt -P: drawn on the last line of `pane` rather than the status line.
+    pub in_pane: bool,
 }
 
 pub enum Overlay {

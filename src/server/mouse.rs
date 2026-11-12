@@ -113,6 +113,8 @@ impl Server {
 
     /// Menus get the raw events (tmux menu_key_cb); true when the event was used.
     fn mouse_overlay(&mut self, cid: ClientId, m: &Mouse) -> bool {
+        // a menu belongs to its window: other clients on the window use it too (3.8)
+        let cid = self.window_menu_owner(cid).unwrap_or(cid);
         let Some(c) = self.clients.get_mut(&cid) else { return true };
         match &mut c.overlay {
             Some(Overlay::Menu(menu)) => {

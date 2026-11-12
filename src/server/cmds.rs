@@ -2642,6 +2642,7 @@ impl Server {
                 let nomouse = ctx.mouse.is_none() && !o.has('M');
                 let menu = Menu::at(title, items, x, y, tt.pane, nomouse, o.has('O'), start);
                 let epoch = self.replace_overlay(cid, Some(Overlay::Menu(menu)))?;
+                self.menu_changed(cid);
                 Ok(Flow::WaitOverlay(cid, epoch))
             }
             "display-popup" => {
@@ -2698,11 +2699,23 @@ impl Server {
                 };
                 let prompts: Vec<(String, String)> = labels.into_iter().enumerate().map(|(i, l)| (l, inits.get(i).cloned().unwrap_or_default())).collect();
                 let kind = if o.has('k') { PromptKind::Key } else { PromptKind::Command };
-                self.open_prompt(cid, kind, prompts, template, ctx.pane, o.has('N'), o.has('1'));
+                // -P: the prompt belongs to the pane and is drawn over its last line; a pane
+                // has one prompt at a time
+                let in_pane = if o.has('P') {
+                    let Some(pane) = tt.pane else { return Ok(Flow::Next) };
+                    if self.clients.values().any(|c| c.prompt.as_ref().is_some_and(|p| p.in_pane && p.pane == Some(pane))) {
+                        return Ok(Flow::Next);
+                    }
+                    Some(pane)
+                } else {
+                    None
+                };
+                self.open_prompt(cid, kind, prompts, template, in_pane.or(ctx.pane), o.has('N'), o.has('1'));
                 // -e: backspace on empty input closes the prompt; -C (keep updating panes) is
                 // how prompts behave here anyway
                 if let Some(pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
                     pr.bspace_exit = o.has('e') && !o.has('1') && !o.has('N') && !o.has('i') && !o.has('k');
+                    pr.in_pane = in_pane.is_some();
                 }
                 Ok(Flow::Next)
             }
@@ -4016,7 +4029,7 @@ impl Server {
         let input: Vec<char> = init.chars().collect();
         let cursor = input.len();
         if let Some(c) = self.clients.get_mut(&cid) {
-            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false, confirm: ('y', false) });
+            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false, confirm: ('y', false), in_pane: false });
             c.dirty = true;
         }
     }

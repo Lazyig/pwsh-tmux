@@ -574,7 +574,8 @@ impl Server {
         }
 
         // overlays
-        if let Some(ov) = &c.overlay {
+        let shared = self.window_menu_owner(cid).and_then(|o| self.clients[&o].overlay.as_ref());
+        if let Some(ov) = c.overlay.as_ref().or(shared) {
             match ov {
                 Overlay::Menu(m) => {
                     let ost = |name: &str, base: Style| self.style_option(&self.opt_window(Some(wid), name), base, active_target, Some(cid)).unwrap_or(base);
@@ -652,11 +653,17 @@ impl Server {
         let my = if nstatus > 0 { if top { 0 } else { ch - nstatus } } else { ch - 1 };
         if let Some(pr) = &c.prompt {
             let st = self.style_option(&self.opt_session(Some(sid), "message-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
-            for x in 0..cw {
+            // command-prompt -P: the last line of the pane (the first with the status at the top)
+            let area = pr.pane.filter(|_| pr.in_pane).and_then(|p| rects.iter().find(|(id, _)| *id == p)).map(|(_, r)| self.content_rect(wid, *r));
+            let (px, my, cw) = match area {
+                Some(r) if r.w > 0 && r.h > 0 => (r.x, oy + if top { r.y } else { r.y + r.h - 1 }, r.x + r.w),
+                _ => (0, my, cw),
+            };
+            for x in px..cw {
                 f.set(x, my, Cell { text: " ".into(), style: st });
             }
             let label = pr.label.clone() + if matches!(pr.kind, PromptKind::Confirm) || pr.label == ":" || pr.label.ends_with(' ') || pr.label.is_empty() { "" } else { " " };
-            let lx = f.text(0, my, &label, st, cw);
+            let lx = f.text(px, my, &label, st, cw);
             let input: String = pr.input.iter().collect();
             let before: String = pr.input[..pr.cursor].iter().collect();
             let bw = format::width(&before) as u16;
