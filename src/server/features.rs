@@ -56,7 +56,12 @@ pub fn fnmatch(pat: &str, s: &str) -> bool {
 
 /// `term`: the client's TERM (empty for a Windows console client), `colorterm`: its COLORTERM,
 /// `table`: terminal-features entries ("pattern:feature:feature"), `extra`: the `-T` list.
+#[cfg(test)]
 pub fn compute(term: &str, colorterm: &str, table: &[String], extra: &str) -> Features {
+    compute_named(term, "", colorterm, table, extra)
+}
+
+pub fn compute_named(term: &str, program: &str, colorterm: &str, table: &[String], extra: &str) -> Features {
     let mut f = Features::default();
     if term.is_empty() {
         // Windows console / Windows Terminal: a modern VT implementation
@@ -76,7 +81,7 @@ pub fn compute(term: &str, colorterm: &str, table: &[String], extra: &str) -> Fe
     if matches!(colorterm, "truecolor" | "24bit") {
         f.add("RGB");
     }
-    if term.contains("wezterm") || term.contains("WezTerm") || term.contains("ghostty") {
+    if term.to_ascii_lowercase().contains("wezterm") || term.contains("ghostty") || matches!(program.to_ascii_lowercase().as_str(), "wezterm" | "ghostty") {
         f.add("RGB,clipboard,cstyle,ccolour,extkeys,focus,margins,usstyle,hyperlinks,utf8");
     }
     for entry in table {
@@ -233,8 +238,7 @@ pub fn cursor_style(s: &str) -> u8 {
 
 pub fn cursor_sequence(caps: &std::collections::BTreeMap<String, String>, style: u8) -> String {
     if style == 0 { if let Some(se) = caps.get("Se") { return se.clone(); } }
-    caps.get("Ss").map(|s| s.replace("%p1%d", &style.to_string()).replace("%d", &style.to_string()))
-        .unwrap_or_else(|| format!("\x1b[{style} q"))
+    string_capability(caps, "Ss", "\x1b[%p1%d q", &[&style.to_string()])
 }
 
 /// tmux ignores malformed width entries, including reversed or invalid ranges.
@@ -280,9 +284,5 @@ fn terminfo_capabilities(term: &str) -> std::collections::BTreeMap<String, Strin
 
 /// Expand the parameter forms used by VT cursor and selection capabilities.
 pub fn string_capability(caps: &std::collections::BTreeMap<String, String>, name: &str, fallback: &str, params: &[&str]) -> String {
-    let mut sequence = caps.get(name).map(String::as_str).unwrap_or(fallback).to_string();
-    for (index, value) in params.iter().enumerate() {
-        sequence = sequence.replace(&format!("%p{}%s", index + 1), value).replace(&format!("%p{}%d", index + 1), value);
-    }
-    sequence
+    super::termcap::expand(caps.get(name).map(String::as_str).unwrap_or(fallback), params).unwrap_or_default()
 }

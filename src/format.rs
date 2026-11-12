@@ -4,7 +4,7 @@
 use crate::cells::{self, Cell, Style};
 use chrono::{DateTime, Datelike, Local, TimeZone};
 use std::collections::HashMap;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use crate::width::{char_width, str_width};
 use vt100::Color;
 
 pub trait Vars {
@@ -931,7 +931,7 @@ fn fuzzy_scan(text: &str) -> (Vec<FuzzyChar>, [usize; 4]) {
     let mut align = Align::Left;
     let add = |cs: &mut Vec<FuzzyChar>, c: char, align: Align, widths: &mut [usize; 4]| {
         let a = match align { Align::Left => 0, Align::Centre => 1, Align::Right => 2, Align::AbsoluteCentre => 3 };
-        let width = UnicodeWidthChar::width(c).unwrap_or(0);
+        let width = char_width(c).unwrap_or(0);
         cs.push(FuzzyChar { c, align: a, offset: widths[a], width });
         widths[a] += width;
     };
@@ -1270,7 +1270,7 @@ fn units(s: &str) -> Vec<Unit<'_>> {
         } else {
             let c = rest.chars().next().unwrap();
             let n = c.len_utf8();
-            out.push(Unit::Text(&rest[..n], c.width().unwrap_or(0)));
+            out.push(Unit::Text(&rest[..n], char_width(c).unwrap_or(0)));
             i += n;
         }
     }
@@ -1283,7 +1283,7 @@ fn fmt_width(s: &str) -> usize {
 
 /// utf8_cstrwidth: the width of every printable character, styles and `##` included.
 fn cstr_width(s: &str) -> usize {
-    s.chars().map(|c| if c.is_ascii() { usize::from(c > '\x1f' && c != '\x7f') } else { c.width().unwrap_or(0) }).sum()
+    s.chars().map(|c| char_width(c).unwrap_or(0)).sum()
 }
 
 fn trim_left(s: &str, limit: usize) -> String {
@@ -2000,7 +2000,7 @@ pub fn spans(text: &str, base: Style) -> Vec<Span> {
 
 /// Terminal display width of a string.
 pub fn width(s: &str) -> usize {
-    UnicodeWidthStr::width(s)
+    str_width(s)
 }
 
 /// Cells for a group of spans (wide characters occupy a lead cell plus an empty
@@ -2015,7 +2015,7 @@ fn group_cells_ranged<'a>(spans: impl Iterator<Item = &'a Span>) -> (Vec<Cell>, 
             if c.is_control() {
                 continue;
             }
-            match c.width() {
+            match char_width(c) {
                 Some(0) | None => {
                     if let Some(last) = cells.iter_mut().rev().find(|c| !c.is_continuation()) {
                         last.text.push(c);

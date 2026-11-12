@@ -6,13 +6,13 @@ use super::*;
 use crate::cells::{Cell, Color, Line, Style, BLINK, BOLD, DIM, INVERSE, ITALIC, STRIKE, UNDERLINE};
 use crate::format::{self, Span};
 use std::fmt::Write as _;
-use unicode_width::UnicodeWidthChar;
+use crate::width::char_width;
 
 // ConPTY counts decomposed accents as extra columns. Compose when Windows can do
 // so, and retain the original text if the platform cannot normalize it.
 fn terminal_text(text: &str) -> std::borrow::Cow<'_, str> {
     #[cfg(windows)]
-    if text.chars().any(|c| c.width() == Some(0)) {
+    if text.chars().any(|c| char_width(c) == Some(0)) {
         use windows_sys::Win32::Globalization::{NormalizeString, NormalizationC};
         let source: Vec<u16> = text.encode_utf16().collect();
         let needed = unsafe { NormalizeString(NormalizationC, source.as_ptr(), source.len() as i32, std::ptr::null_mut(), 0) };
@@ -42,7 +42,7 @@ impl Frame {
             if self.cells[i].text.is_empty() && x > 0 {
                 self.cells[i - 1] = Cell { text: " ".into(), style: self.cells[i - 1].style };
             }
-            if !cell.text.is_empty() && x + 1 < self.w && self.cells[i + 1].text.is_empty() && self.cells[i].text.chars().next().and_then(|c| c.width()) == Some(2) {
+            if !cell.text.is_empty() && x + 1 < self.w && self.cells[i + 1].text.is_empty() && self.cells[i].text.chars().next().and_then(|c| char_width(c)) == Some(2) {
                 self.cells[i + 1] = Cell { text: " ".into(), style: self.cells[i + 1].style };
             }
             self.cells[i] = cell;
@@ -59,7 +59,7 @@ impl Frame {
     pub fn text(&mut self, mut x: u16, y: u16, text: &str, style: Style, limit: u16) -> u16 {
         let start = x;
         for ch in text.chars() {
-            let cw = ch.width().unwrap_or(0) as u16;
+            let cw = char_width(ch).unwrap_or(0) as u16;
             if cw == 0 {
                 if x > start && y < self.h {
                     let mut previous = x - 1;
@@ -94,6 +94,8 @@ pub struct Modes {
     pub mouse: u16,
     pub focus: bool,
     pub cursor_style: u8,
+    pub cursor_colour: Option<vt100::Color>,
+    pub appesc: bool,
     /// modifyOtherKeys level requested from the outer terminal (extended-keys).
     pub extkeys: u8,
 }
@@ -360,14 +362,15 @@ impl Server {
         }
         // a wide char cut by a region boundary
         for i in 0..width {
-            if line[i].text.is_empty() && (i == 0 || line[i - 1].text.chars().next().and_then(|c| c.width()) != Some(2)) {
+            if line[i].text.is_empty() && (i == 0 || line[i - 1].text.chars().next().and_then(|c| char_width(c)) != Some(2)) {
                 line[i].text = " ".into();
             }
         }
         (line, tags)
     }
 
-    fn compose(&self, cid: ClientId) -> Option<RenderState> {
+    pub(super) fn compose(&self, cid: ClientId) -> Option<RenderState> {
+        let _widths = self.width_context();
         let c = self.clients.get(&cid)?;
         let sid = c.session?;
         let s = self.sessions.get(&sid)?;
@@ -456,6 +459,9 @@ impl Server {
                         modes.app_cursor = scr.application_cursor();
                         modes.bracketed_paste = scr.bracketed_paste();
                         modes.cursor_style = scr.cursor_style() as u8;
+                        if modes.cursor_style == 0 { modes.cursor_style = features::cursor_style(&self.opt_pane(*id, "cursor-style")); }
+                        let colour = p.parser.callbacks().osc.cursor_colour.clone().unwrap_or_else(|| self.opt_pane(*id, "cursor-colour"));
+                        modes.cursor_colour = format::parse_color(&self.expand(pane_target, Some(cid), &colour)).filter(|c| *c != vt100::Color::Default);
                         if !scr.hide_cursor() {
                             let (cy, cx) = scr.cursor_position();
                             if cx < cr.w && cy < cr.h {
@@ -675,7 +681,7 @@ impl Server {
             let mut x = lx;
             let mut col = 0u16;
             for ch in input.chars() {
-                let w = ch.width().unwrap_or(0) as u16;
+                let w = char_width(ch).unwrap_or(0) as u16;
                 if col >= skip {
                     if x + w > cw {
                         break;
@@ -698,12 +704,21 @@ impl Server {
             f.text(0, my, msg, st, cw);
         }
 
+        if let Some(pr) = &c.prompt {
+            let command = pr.command_mode;
+            let prefix = if command { "prompt-command-cursor" } else { "prompt-cursor" };
+            modes.cursor_style = features::cursor_style(&self.opt_session(Some(sid), &format!("{prefix}-style")));
+            modes.cursor_colour = format::parse_color(&self.expand(active_target, Some(cid), &self.opt_session(Some(sid), &format!("{prefix}-colour")))).filter(|c| *c != vt100::Color::Default);
+        }
+        modes.appesc = c.features.has("appesc");
+        if self.opt_session_on(Some(sid), "mouse") && self.opt_session_on(Some(sid), "focus-follows-mouse") { modes.mouse = 1003; }
         modes.app_cursor = true;
         modes.bracketed_paste = c.features.has("bpaste");
         Some(RenderState { frame: f, cursor, modes, status_ranges })
     }
 
     pub fn render(&mut self, cid: ClientId) {
+        let _widths = self.width_context();
         let Some(next) = self.compose(cid) else { return };
         // window title
         let mut title_update = None;
@@ -767,9 +782,10 @@ impl Server {
                     push_sgr(&mut out, &fit_style(cell.style, &feats));
                     cur = Some(cell.style);
                 }
-                out.push_str(&terminal_text(&cell.text));
-                if cfg!(windows) && cell.text.chars().any(|c| c.width() == Some(0)) {
-                    let width = cell.text.chars().filter_map(|c| c.width()).sum::<usize>();
+                if feats.has("utf8") { out.push_str(&terminal_text(&cell.text)); }
+                else { for ch in cell.text.chars() { if ch.is_ascii() { out.push(ch); } else if char_width(ch).unwrap_or(0) > 0 { out.push('_'); if char_width(ch) == Some(2) { out.push('_'); } } } }
+                if cfg!(windows) && cell.text.chars().any(|c| char_width(c) == Some(0)) {
+                    let width = cell.text.chars().filter_map(|c| char_width(c)).sum::<usize>();
                     if x + width < next.frame.w as usize { let _ = write!(out, "\x1b[{};{}H", y + 1, x + width + 1); }
                 }
             }
@@ -798,17 +814,27 @@ impl Server {
         if modes_changed {
             let m = next.modes;
             out.push_str(if m.app_cursor { "\x1b[?1h" } else { "\x1b[?1l" });
-            out.push_str(if m.bracketed_paste { "\x1b[?2004h" } else { "\x1b[?2004l" });
+            out.push_str(&features::string_capability(&c.term_caps, if m.bracketed_paste { "Enbp" } else { "Dsbp" }, if m.bracketed_paste { "\x1b[?2004h" } else { "\x1b[?2004l" }, &[]));
             out.push_str(match m.mouse {
                 0 => "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l",
                 1000 => "\x1b[?1003l\x1b[?1002l\x1b[?1000h\x1b[?1006h",
                 1002 => "\x1b[?1003l\x1b[?1000h\x1b[?1002h\x1b[?1006h",
                 _ => "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h",
             });
-            out.push_str(if m.focus { "\x1b[?1004h" } else { "\x1b[?1004l" });
+            out.push_str(&features::string_capability(&c.term_caps, if m.focus { "Enfcs" } else { "Dsfcs" }, if m.focus { "\x1b[?1004h" } else { "\x1b[?1004l" }, &[]));
             if feats.has("cstyle") {
-                let _ = write!(out, "\x1b[{} q", m.cursor_style);
+                out.push_str(&features::cursor_sequence(&c.term_caps, m.cursor_style));
             }
+            if feats.has("ccolour") && pm.and_then(|p| p.cursor_colour) != m.cursor_colour {
+                match m.cursor_colour {
+                    Some(colour) => {
+                        let (r, g, b) = match colour { vt100::Color::Rgb(r, g, b) => (r, g, b), vt100::Color::Idx(i) => features::idx_to_rgb(i), _ => unreachable!() };
+                        out.push_str(&features::string_capability(&c.term_caps, "Cs", "\x1b]12;%p1%s\x07", &[&format!("#{r:02x}{g:02x}{b:02x}")]));
+                    }
+                    _ => out.push_str(&features::string_capability(&c.term_caps, "Cr", "\x1b]112\x07", &[])),
+                }
+            }
+            if pm.is_none_or(|p| p.appesc != m.appesc) && (m.appesc || pm.is_some_and(|p| p.appesc)) { out.push_str(&features::string_capability(&c.term_caps, if m.appesc { "Enesc" } else { "Dsesc" }, if m.appesc { "\x1b[?7727h" } else { "\x1b[?7727l" }, &[])); }
             if pm.map_or(0, |p| p.extkeys) != m.extkeys {
                 // modifyOtherKeys: have the terminal report keys like C-Enter distinctly
                 out.push_str(match m.extkeys {

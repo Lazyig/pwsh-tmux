@@ -14,6 +14,7 @@ mod opts;
 mod protocol;
 mod server;
 mod term;
+mod width;
 
 const USAGE: &str = "\
 usage: pwsh-tmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]

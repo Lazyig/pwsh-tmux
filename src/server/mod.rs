@@ -7,6 +7,7 @@
 mod cmds;
 mod control;
 pub mod features;
+mod termcap;
 mod input;
 mod modes;
 mod mouse;
@@ -89,6 +90,8 @@ pub struct PaneCb {
     pub cwd: Option<String>,
     /// modifyOtherKeys level the application asked for (CSI > 4 ; n m).
     pub ext_keys: u8,
+    pub clipboard_queries: Vec<(Vec<u8>, bool)>,
+    pub passthrough: Vec<Vec<u8>>,
     /// State reported for formats (pane_path, cursor_colour, pane_pb_*, pane_command_*).
     pub osc: OscState,
 }
@@ -258,6 +261,19 @@ fn decode_file_url(url: &str) -> Option<String> {
 }
 
 impl vt100::Callbacks for PaneCb {
+    fn clipboard_query(&mut self, _: &mut vt100::Screen, ty: &[u8], bel: bool) {
+        self.clipboard_queries.push((ty.to_vec(), bel));
+    }
+    fn dcs(&mut self, _: &mut vt100::Screen, payload: &[u8]) {
+        if let Some(payload) = payload.strip_prefix(b"tmux;") {
+            let mut data = Vec::new(); let mut i = 0;
+            while i < payload.len() {
+                data.push(payload[i]);
+                i += if payload[i] == 0x1b && payload.get(i + 1) == Some(&0x1b) { 2 } else { 1 };
+            }
+            self.passthrough.push(data);
+        }
+    }
     fn audible_bell(&mut self, _: &mut vt100::Screen) {
         self.bell = true;
     }
@@ -512,6 +528,7 @@ pub struct Prompt {
     pub cursor: usize,
     pub template: String,
     pub history_pos: Option<usize>,
+    pub command_mode: bool,
     pub pane: Option<PaneId>,
     pub numeric: bool,
     pub single_key: bool,
@@ -569,6 +586,8 @@ pub struct Client {
     pub key_table: String,
     pub repeat_until: Option<Instant>,
     pub keyp: keys::Parser,
+    pub input_state: input::InputState,
+    pub term_caps: BTreeMap<String, String>,
     pub esc_deadline: Option<Instant>,
     pub prompt: Option<Prompt>,
     pub overlay: Option<Overlay>,
@@ -819,6 +838,7 @@ pub fn run(config: Option<String>) -> io::Result<()> {
     }
     // config first: its server-access lines decide who may open the Windows pipe
     srv.load_config(config);
+    srv.load_prompt_history();
     let allowed: Vec<String> = srv.acl.iter().map(|a| a.0.clone()).collect();
     let Some(listener) = ipc::listen_exclusive(&allowed)? else {
         return Ok(()); // another server won the race
@@ -1198,6 +1218,8 @@ impl Server {
                 key_table: "root".into(),
                 repeat_until: None,
                 keyp: keys::Parser::new(),
+                input_state: Default::default(),
+                term_caps: Default::default(),
                 esc_deadline: None,
                 prompt: None,
                 overlay: None,
@@ -1302,8 +1324,13 @@ impl Server {
                 let control = get(7).parse().unwrap_or(0);
                 let colorterm = ident.env.iter().find(|(k, _)| k == "COLORTERM").map(|(_, v)| v.as_str()).unwrap_or("");
                 let table: Vec<String> = self.opts_server.0.iter().filter(|(k, _)| k.starts_with("terminal-features[")).map(|(_, v)| v.clone()).collect();
-                let features = features::compute(&ident.term, colorterm, &table, &get(8));
+                let program = ident.env.iter().find(|(k, _)| k == "TERM_PROGRAM").map(|(_, v)| v.as_str()).unwrap_or("");
+                let mut features = features::compute_named(&ident.term, program, colorterm, &table, &get(8));
+                let table = self.opts_server.array_items("terminal-overrides").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
+                let caps = features::overrides(&ident.term, &table, &mut features);
                 if let Some(c) = self.clients.get_mut(&cid) {
+                    c.input_state.terminal_extra = get(8);
+                    c.term_caps = caps;
                     c.control = control;
                     c.features = features;
                     c.size = (ident.cols.max(1), ident.rows.max(1));
@@ -1320,7 +1347,12 @@ impl Server {
                     }
                     return;
                 }
-                let cmds = crate::cmdparse::split_commands(&argv);
+                let cmds = if argv.is_empty() {
+                    match crate::cmdparse::parse(&self.opt_server("default-client-command")) {
+                        Ok(cmds) => cmds,
+                        Err(e) => { if let Some(c) = self.clients.get(&cid) { c.send(S_REPLY, &encode_reply(1, &e)); } return; }
+                    }
+                } else { crate::cmdparse::split_commands(&argv) };
                 let pane = self.clients.get(&cid).and_then(|c| c.ident.as_ref()).and_then(|i| i.ctx_pane).filter(|p| self.panes.contains_key(p));
                 // control clients get the reply to their command line in a %begin block too
                 let control_seq = self.clients.get_mut(&cid).filter(|c| c.control > 0).map(|c| {
@@ -1331,6 +1363,7 @@ impl Server {
                 self.run_queue(Queue { cmds: cmds.into_iter().filter(|c| !c.is_empty()).collect(), ctx , soft: 0 });
             }
             C_INPUT => {
+                if let Some(sid) = self.client_session(cid) { if let Some(s) = self.sessions.get_mut(&sid) { s.activity = now_secs(); } }
                 if let Some(c) = self.clients.get_mut(&cid) {
                     c.activity = now_secs();
                 }
@@ -1351,8 +1384,10 @@ impl Server {
                 self.control_line(cid, &line);
             }
             C_RESUMED => {
+                if let Some(sid) = self.client_session(cid) { if let Some(s) = self.sessions.get_mut(&sid) { s.activity = now_secs(); } }
                 if let Some(c) = self.clients.get_mut(&cid) {
                     c.suspended = false;
+                    c.activity = now_secs();
                     c.prev = None;
                     c.dirty = true;
                 }
@@ -1367,7 +1402,14 @@ impl Server {
         }
         self.control_output(id, data);
         let scroll_on_clear = options::is_on(&self.opt_pane(id, "scroll-on-clear"));
+        let alternate = options::is_on(&self.opt_pane(id, "alternate-screen"));
+        let widths = features::codepoint_widths(&self.opts_server.array_items("codepoint-widths").into_iter().map(|(_, v)| v).collect::<Vec<_>>());
+        let variation_wide = options::is_on(&self.opt_server("variation-selector-always-wide"));
+        let input_limit = self.opt_server_num("input-buffer-size") as usize;
         let p = self.panes.get_mut(&id).unwrap();
+        p.parser.set_input_buffer_size(input_limit);
+        p.parser.screen_mut().set_alternate_screen_allowed(alternate);
+        p.parser.screen_mut().set_codepoint_widths(widths, variation_wide);
         p.parser.screen_mut().set_scroll_on_clear(scroll_on_clear);
         p.parser.process(data);
         p.last_output = Instant::now();
@@ -1390,13 +1432,16 @@ impl Server {
         let replies = std::mem::take(&mut cb.replies);
         let bell = std::mem::take(&mut cb.bell);
         let title = cb.title.take();
+        let queries = std::mem::take(&mut cb.clipboard_queries);
+        let passthrough = std::mem::take(&mut cb.passthrough);
         if let Some(cwd) = cb.cwd.take() {
             p.current_path = cwd;
             p.cwd_seq += 1;
         }
         p.send(replies);
-        if let Some(t) = title {
-            p.title = t.clone();
+        self.pane_input_requests(id, queries, passthrough);
+        if let Some(t) = title.filter(|_| options::is_on(&self.opt_pane(id, "allow-set-title"))) {
+            self.panes.get_mut(&id).unwrap().title = t.clone();
             if options::is_on(&self.opt_pane(id, "allow-rename")) {
                 if let Some(wid) = self.window_of(id) {
                     if let Some(w) = self.windows.get_mut(&wid) {
@@ -1494,7 +1539,7 @@ impl Server {
             return;
         }
         let remain = self.opt_pane(id, "remain-on-exit");
-        let keep = remain == "on" || (remain == "failed" && status.unwrap_or(0) != 0);
+        let keep = matches!(remain.as_str(), "on" | "key") || (matches!(remain.as_str(), "failed" | "failed-key") && status.unwrap_or(0) != 0);
         if keep {
             let fmt = self.opt_pane(id, "remain-on-exit-format");
             if let Some(p) = self.panes.get_mut(&id) {
@@ -1614,12 +1659,14 @@ impl Server {
     }
 
     fn timers(&mut self) {
+        self.input_timers();
         let now = Instant::now();
         let cids: Vec<ClientId> = self.clients.keys().copied().collect();
         for cid in cids {
             let Some(c) = self.clients.get_mut(&cid) else { continue };
             if c.esc_deadline.is_some_and(|d| d <= now) {
                 c.esc_deadline = None;
+                c.keyp.expire_partial_paste_end();
                 let pending = c.keyp.flush_pending();
                 for i in pending {
                     self.dispatch_input(cid, i);
@@ -2148,6 +2195,7 @@ impl Server {
     }
 
     pub fn attach_client(&mut self, cid: ClientId, sid: SessId) {
+        let clear = options::is_on(&self.opt_server("clear-on-attach"));
         let Some(c) = self.clients.get_mut(&cid) else { return };
         let was_attached = c.attached;
         if c.session != Some(sid) {
@@ -2159,7 +2207,7 @@ impl Server {
         c.dirty = true;
         c.key_table = "root".into();
         if !was_attached {
-            c.send(S_ATTACHED, b"");
+            c.send(S_ATTACHED, if clear { b"" } else { b"no-clear" });
         }
         let writable = !self.client_is_readonly(Some(cid));
         let now = now_secs();
@@ -2357,7 +2405,7 @@ impl Server {
 
     pub fn run_queue(&mut self, mut q: Queue) {
         while let Some(cmd) = q.cmds.pop_front() {
-            let name = cmd.first().cloned().unwrap_or_default();
+            let name = cmd.first().map(|s| s.strip_prefix("\0alias:").unwrap_or(s).to_string()).unwrap_or_default();
             let soft = q.soft > 0;
             q.soft = q.soft.saturating_sub(1);
             if name == FILE_PUSH {
@@ -2572,3 +2620,6 @@ fn strip_delay(cmd: &[String]) -> Vec<String> {
     }
     out
 }
+
+#[cfg(test)]
+mod input_tests;

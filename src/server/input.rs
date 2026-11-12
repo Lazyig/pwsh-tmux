@@ -7,6 +7,19 @@ use crate::keys::{Input, Key, KeyCode};
 
 pub use super::mouse::MouseCtx;
 
+/// Per-client key timing. Monotonic time avoids wall clock changes during a paste.
+#[derive(Default)]
+pub struct InputState {
+    prefix_at: Option<Instant>,
+    last_key: String,
+    key_at: Option<Instant>,
+    assume_paste: bool,
+    guess_at: Option<Instant>,
+    pub(super) terminal_extra: String,
+    paste_at: Option<Instant>,
+    clipboard: Vec<(PaneId, Instant, bool)>,
+}
+
 // The default mouse menus of tmux 3.6a (key-bindings.c).
 const PANE_MENU: &str = r##"display-menu -T "#[align=centre]#{pane_index} (#{pane_id})" -t = -x M -y M "#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Top,}" < { send-keys -X history-top } "#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Bottom,}" > { send-keys -X history-bottom } '' "#{?mouse_word,Search For #[underscore]#{=/9/...:mouse_word},}" C-r { if-shell -F "#{?#{m/r:(copy|view)-mode,#{pane_mode}},0,1}" "copy-mode -t=" ; send-keys -X -t = search-backward -- "#{q:mouse_word}" } "#{?mouse_word,Type #[underscore]#{=/9/...:mouse_word},}" C-y { copy-mode -q ; send-keys -l "#{q:mouse_word}" } "#{?mouse_word,Copy #[underscore]#{=/9/...:mouse_word},}" c { copy-mode -q ; set-buffer "#{q:mouse_word}" } "#{?mouse_line,Copy Line,}" l { copy-mode -q ; set-buffer "#{q:mouse_line}" } '' "#{?mouse_hyperlink,Type #[underscore]#{=/9/...:mouse_hyperlink},}" C-h { copy-mode -q ; send-keys -l "#{q:mouse_hyperlink}" } "#{?mouse_hyperlink,Copy #[underscore]#{=/9/...:mouse_hyperlink},}" h { copy-mode -q ; set-buffer "#{q:mouse_hyperlink}" } '' "Horizontal Split" h { split-window -h } "Vertical Split" v { split-window -v } '' "#{?#{>:#{window_panes},1},,-}Swap Up" u { swap-pane -U } "#{?#{>:#{window_panes},1},,-}Swap Down" d { swap-pane -D } "#{?pane_marked_set,,-}Swap Marked" s { swap-pane } '' Kill X { kill-pane } Respawn R { respawn-pane -k } "#{?pane_marked,Unmark,Mark}" m { select-pane -m } "#{?#{>:#{window_panes},1},,-}#{?window_zoomed_flag,Unzoom,Zoom}" z { resize-pane -Z }"##;
 
@@ -189,12 +202,161 @@ pub fn fill_template(template: &str, answers: &[String]) -> String {
 }
 
 impl Server {
-    pub fn handle_input(&mut self, cid: ClientId, data: &[u8]) {
+    pub(crate) fn width_context(&self) -> crate::width::Guard {
+        let entries = self.opts_server.array_items("codepoint-widths").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
+        crate::width::enter(features::codepoint_widths(&entries), options::is_on(&self.opt_server("variation-selector-always-wide")))
+    }
+
+    pub(crate) fn input_timers(&mut self) {
+        let now = Instant::now();
+        for c in self.clients.values_mut() {
+            if c.input_state.guess_at.is_some_and(|t| now.duration_since(t) >= Duration::from_secs(5)) {
+                c.input_state.assume_paste = false; c.input_state.guess_at = None;
+            }
+            c.input_state.clipboard.retain(|(_, t, _)| now.duration_since(*t) < Duration::from_secs(5));
+        }
+        let expired: Vec<_> = self.clients.iter().filter(|(_, c)| c.input_state.paste_at.is_some_and(|t| now.duration_since(t) >= Duration::from_secs(5))).map(|(id, _)| *id).collect();
+        for cid in expired {
+            let c = self.clients.get_mut(&cid).unwrap();
+            c.input_state.paste_at = None;
+            c.input_state.assume_paste = false;
+            let inputs = c.keyp.expire_paste();
+            for input in inputs { self.dispatch_input(cid, input); }
+        }
+        let expired: Vec<_> = self.sessions.values().filter_map(|s| {
+            let seconds = self.opt_session_num(Some(s.id), "lock-after-time");
+            (seconds > 0 && now_secs().saturating_sub(s.activity) >= seconds as u64).then_some(s.id)
+        }).collect();
+        for sid in expired {
+            let ids: Vec<_> = self.clients.values().filter(|c| c.session == Some(sid)).map(|c| c.id).collect();
+            for id in ids { self.lock_input_client(id); }
+        }
+    }
+
+    pub(crate) fn lock_input_client(&mut self, cid: ClientId) {
+        let Some(c) = self.clients.get(&cid) else { return };
+        if !c.attached || c.suspended || c.control != 0 { return; }
+        let command = self.opt_session(c.session, "lock-command");
+        if command.is_empty() { return; }
+        let c = self.clients.get_mut(&cid).unwrap();
+        c.suspended = true;
+        c.activity = now_secs();
+        c.send(S_SHELL, command.as_bytes());
+    }
+
+    fn history_path(&self) -> Option<std::path::PathBuf> {
+        let path = self.opt_server("history-file");
+        if path.is_empty() { None } else if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+            procinfo::home_dir().map(|home| std::path::PathBuf::from(home).join(rest))
+        } else { Some(path.into()) }
+    }
+
+    pub(crate) fn load_prompt_history(&mut self) {
+        if let Some(path) = self.history_path() {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                self.prompt_history = text.lines().map(String::from).collect();
+                let limit = self.opt_server_num("prompt-history-limit").max(0) as usize;
+                let remove = self.prompt_history.len().saturating_sub(limit);
+                self.prompt_history.drain(..remove);
+            }
+        }
+    }
+
+    pub(crate) fn save_prompt_history(&self) {
+        if let Some(path) = self.history_path() {
+            let text = self.prompt_history.iter().map(|s| format!("{s}\n")).collect::<String>();
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+            if let Ok(mut file) = options.open(path) { let _ = file.write_all(text.as_bytes()); }
+        }
+    }
+
+    pub(crate) fn pane_input_requests(&mut self, pane: PaneId, queries: Vec<(Vec<u8>, bool)>, passthrough: Vec<Vec<u8>>) {
+        if self.opt_server("set-clipboard") == "on" {
+            for (selector, bel) in queries {
+                match self.opt_server("get-clipboard").as_str() {
+                    "buffer" => {
+                        if let Some(buffer) = self.buffers.first() {
+                            let reply = format!("\x1b]52;{};{}{}", String::from_utf8_lossy(&selector), super::cmds::base64(&buffer.data), if bel { "\x07" } else { "\x1b\\" });
+                            if let Some(p) = self.panes.get(&pane) { p.send(reply.into_bytes()); }
+                        }
+                    }
+                    "request" | "both" => {
+                        let cid = self.clients.values().find(|c| c.attached && c.control == 0 && c.features.has("clipboard") && c.session.is_some_and(|s| self.sessions[&s].links.values().any(|w| self.windows[w].panes().contains(&pane)))).map(|c| c.id);
+                        if let Some(cid) = cid {
+                            let c = self.clients.get_mut(&cid).unwrap();
+                            if c.input_state.clipboard.len() < 64 {
+                                c.input_state.clipboard.push((pane, Instant::now(), bel));
+                                c.send(S_OUTPUT, features::string_capability(&c.term_caps, "Ms", "\x1b]52;%p1%s;%p2%s\x07", &[&String::from_utf8_lossy(&selector), "?"]).as_bytes());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let allow = self.opt_pane(pane, "allow-passthrough");
+        if allow != "off" {
+            for c in self.clients.values().filter(|c| c.attached && !c.suspended && c.control == 0) {
+                let linked = c.session.is_some_and(|s| self.sessions[&s].links.values().any(|w| self.windows[w].panes().contains(&pane)));
+                let visible = c.session.is_some_and(|s| { let w = &self.windows[&self.sessions[&s].active_window()]; w.panes().contains(&pane) && (!w.zoomed || w.active == pane) });
+                if linked && (allow == "all" || visible) { for data in &passthrough { c.send(S_OUTPUT, data); } }
+            }
+        }
+    }
+
+    fn clipboard_reply(&mut self, cid: ClientId, raw: &[u8]) {
+        let Some(body) = raw.strip_prefix(b"\x1b]52;").and_then(|s| s.strip_suffix(b"\x07").or_else(|| s.strip_suffix(b"\x1b\\"))) else { return };
+        let Some(at) = body.iter().position(|b| *b == b';') else { return };
+        let selector = &body[..at];
+        if !selector.iter().all(|b| b"cpqs01234567".contains(b)) { return; }
+        let Ok(encoded) = std::str::from_utf8(&body[at + 1..]) else { return };
+        let Ok(data) = decode_stdin_buffer(&format!("{STDIN_BUFFER_PREFIX}{encoded}")) else { return };
         let Some(c) = self.clients.get_mut(&cid) else { return };
+        let requests = std::mem::take(&mut c.input_state.clipboard);
+        if requests.is_empty() { return; }
+        let setting = self.opt_server("get-clipboard");
+        if !matches!(setting.as_str(), "request" | "both") { return; }
+        for (pane, at, bel) in requests {
+            if at.elapsed() <= Duration::from_secs(5) {
+                if let Some(p) = self.panes.get(&pane) {
+                    let mut reply = b"\x1b]52;".to_vec(); reply.extend(body);
+                    reply.extend(if bel { &b"\x07"[..] } else { &b"\x1b\\"[..] });
+                    p.send(reply);
+                }
+            }
+        }
+        if setting == "both" { self.add_buffer(None, data, false); }
+    }
+
+    pub(crate) fn refresh_terminal_features(&mut self) {
+        let table = self.opts_server.array_items("terminal-features").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
+        let overrides = self.opts_server.array_items("terminal-overrides").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
+        for c in self.clients.values_mut() {
+            let Some(ident) = &c.ident else { continue };
+            let colorterm = ident.env.iter().find(|(k, _)| k == "COLORTERM").map(|(_, v)| v.as_str()).unwrap_or("");
+            let program = ident.env.iter().find(|(k, _)| k == "TERM_PROGRAM").map(|(_, v)| v.as_str()).unwrap_or("");
+            c.features = features::compute_named(&ident.term, program, colorterm, &table, &c.input_state.terminal_extra);
+            c.term_caps = features::overrides(&ident.term, &overrides, &mut c.features);
+            c.prev = None; c.dirty = true;
+        }
+    }
+
+    pub fn handle_input(&mut self, cid: ClientId, data: &[u8]) {
+        let user_keys = self.opts_server.array_items("user-keys").into_iter()
+            .filter_map(|(n, s)| n.strip_prefix("user-keys[").and_then(|s| s.strip_suffix(']')).and_then(|s| s.parse::<u16>().ok()).filter(|n| *n < 1000).map(|n| (n, s.into_bytes()))).collect();
+        let Some(c) = self.clients.get_mut(&cid) else { return };
+        if c.suspended { return; }
+        c.keyp.set_user_keys(user_keys);
         let inputs = c.keyp.feed(data);
-        c.esc_deadline = if c.keyp.has_pending() {
-            let ms = self.opts_server.get("escape-time").and_then(|v| v.parse().ok()).unwrap_or(10u64);
-            Some(Instant::now() + Duration::from_millis(ms))
+        if c.keyp.in_paste() && c.input_state.paste_at.is_none() { c.input_state.paste_at = Some(Instant::now()); }
+        if !c.keyp.in_paste() { c.input_state.paste_at = None; }
+        c.esc_deadline = if c.keyp.has_pending() || c.keyp.partial_paste_end() {
+            let mut ms = self.opts_server.get("escape-time").and_then(|v| v.parse().ok()).unwrap_or(10u64).max(1);
+            if c.keyp.partial_paste_end() || !c.input_state.clipboard.is_empty() { ms = ms.max(500); }
+            if c.keyp.partial_paste_end() { Some(Instant::now() + Duration::from_millis(ms)) }
+            else { c.esc_deadline.or_else(|| Some(Instant::now() + Duration::from_millis(ms))) }
         } else {
             None
         };
@@ -209,7 +371,21 @@ impl Server {
         }
         match input {
             Input::Key(k, raw) => self.handle_key(cid, k, raw),
-            Input::Mouse(m, _) => self.handle_mouse(cid, m),
+            Input::Mouse(m, _) => {
+                if m.kind == keys::MouseKind::Move && self.clients.get(&cid).is_some_and(|c| c.prompt.is_none() && c.overlay.is_none()) {
+                    if let Some(sid) = self.client_session(cid).filter(|s| self.opt_session_on(Some(*s), "focus-follows-mouse")) {
+                        let wid = self.sessions[&sid].active_window();
+                        let top = self.opt_session(Some(sid), "status-position") == "top";
+                        let offset = if top { self.status_lines(Some(sid)) } else { 0 };
+                        if let Some(y) = m.y.checked_sub(offset) {
+                            if let Some((pane, _)) = self.rects(wid).0.iter().find(|(_, r)| {
+                                let r = self.content_rect(wid, *r); m.x >= r.x && m.x < r.right() && y >= r.y && y < r.bottom()
+                            }).copied() { self.select_pane(wid, pane); }
+                        }
+                    }
+                }
+                self.handle_mouse(cid, m)
+            },
             Input::Paste(data) => {
                 let Some(c) = self.clients.get_mut(&cid) else { return };
                 if let Some(pr) = &mut c.prompt {
@@ -228,6 +404,7 @@ impl Server {
                 }
             }
             Input::Unknown(raw) => {
+                if raw.starts_with(b"\x1b]52;") { self.clipboard_reply(cid, &raw); return; }
                 // focus reports are only forwarded when the pane asked for them
                 if raw == b"\x1b[I" || raw == b"\x1b[O" {
                     return;
@@ -253,29 +430,8 @@ impl Server {
         if self.client_is_readonly(Some(cid)) {
             return;
         }
-        let Some(p) = self.panes.get(&pane) else { return };
-        if p.options.get("@input-disabled") == Some("on") {
-            return;
-        }
-        let app = p.screen().application_cursor();
-        // extended-keys: on = only for applications that asked (CSI > 4 ; n m), always = everyone
-        let requested = p.parser.callbacks().ext_keys;
-        let csi_u = self.opt_server("extended-keys-format") == "csi-u";
-        let extended = match self.opt_server("extended-keys").as_str() {
-            "always" => keys::encode_extended(k, requested >= 2, csi_u),
-            "on" if requested > 0 => keys::encode_extended(k, requested >= 2, csi_u),
-            _ => None,
-        };
-        let bytes = if let Some(e) = extended {
-            e
-        } else if matches!(k.code, KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End) && k.mods.is_empty() {
-            keys::encode_key(k, app)
-        } else if raw.starts_with(b"\x1b[") && (raw.ends_with(b"u") || raw.starts_with(b"\x1b[27;")) {
-            // the outer terminal sent an extended key but this pane didn't ask for them
-            keys::encode_key(k, app)
-        } else {
-            raw
-        };
+        if self.panes.get(&pane).is_none_or(|p| p.options.get("@input-disabled") == Some("on")) { return; }
+        let bytes = self.encode_pane_key(pane, k, raw);
         let wid = self.window_of(pane);
         if wid.is_some_and(|w| self.opt_window_on(Some(w), "synchronize-panes")) {
             let panes = self.windows[&wid.unwrap()].panes();
@@ -286,8 +442,47 @@ impl Server {
                     }
                 }
             }
-        } else {
+        } else if let Some(p) = self.panes.get(&pane) {
             p.send(bytes);
+        }
+    }
+
+    pub(crate) fn encode_pane_key(&self, pane: PaneId, k: &Key, raw: Vec<u8>) -> Vec<u8> {
+        let Some(p) = self.panes.get(&pane) else { return Vec::new() };
+        let app = p.screen().application_cursor();
+        let mut mapped = k.clone();
+        let mut remapped = false;
+        if k.code == KeyCode::BSpace {
+            if let Some(mut backspace) = keys::parse_key_name(&self.opt_server("backspace")) {
+                backspace.mods.ctrl |= k.mods.ctrl;
+                backspace.mods.meta |= k.mods.meta;
+                backspace.mods.shift |= k.mods.shift;
+                mapped = backspace;
+                remapped = true;
+            }
+        }
+        let k = &mapped;
+        // extended-keys: on = only for applications that asked (CSI > 4 ; n m), always = everyone
+        let requested = p.parser.callbacks().ext_keys;
+        let csi_u = self.opt_server("extended-keys-format") == "csi-u";
+        let extended = match self.opt_server("extended-keys").as_str() {
+            "always" => keys::encode_extended(k, requested >= 2, csi_u),
+            "on" if requested > 0 => keys::encode_extended(k, requested >= 2, csi_u),
+            _ => None,
+        };
+        if let Some(e) = extended {
+            e
+        } else if let KeyCode::User(n) = k.code {
+            self.opts_server.get(&format!("user-keys[{n}]")).unwrap_or("").as_bytes().to_vec()
+        } else if remapped || matches!(k.code, KeyCode::KP(_)) {
+            keys::encode_key_mode(k, app, p.screen().application_keypad())
+        } else if matches!(k.code, KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End) && k.mods.is_empty() {
+            keys::encode_key(k, app)
+        } else if raw.starts_with(b"\x1b[") && (raw.ends_with(b"u") || raw.starts_with(b"\x1b[27;")) {
+            // the outer terminal sent an extended key but this pane didn't ask for them
+            keys::encode_key(k, app)
+        } else {
+            raw
         }
     }
 
@@ -296,7 +491,8 @@ impl Server {
         let Some(c) = self.clients.get(&cid) else { return };
         if c.is_readonly() && (c.prompt.is_some() || c.overlay.is_some()) { return; }
         if c.prompt.is_some() {
-            self.prompt_key(cid, &k, &name);
+            let prompt_key = match k.code { KeyCode::KP('\r') => Key::plain(KeyCode::Enter), KeyCode::KP(ch) => Key::plain(KeyCode::Char(ch)), _ => k.clone() };
+            self.prompt_key(cid, &prompt_key, &name);
             return;
         }
         // overlays
@@ -345,8 +541,33 @@ impl Server {
             None => {}
         }
         let Some(sid) = self.client_session(cid) else { return };
+        if let Some(pane) = self.input_target(cid) {
+            if self.panes.get(&pane).is_some_and(|p| p.dead.is_some()) && matches!(self.opt_pane(pane, "remain-on-exit").as_str(), "key" | "failed-key") {
+                if !self.client_is_readonly(Some(cid)) { self.kill_pane(pane); }
+                return;
+            }
+        }
+        let now = Instant::now();
+        let threshold = self.opt_session_num(Some(sid), "assume-paste-time").max(0) as u64;
+        let c = self.clients.get_mut(&cid).unwrap();
+        let quick = threshold > 0 && !c.features.has("bpaste") && c.input_state.key_at.is_some_and(|t| now.duration_since(t) < Duration::from_millis(threshold));
+        let paste = quick && c.input_state.assume_paste;
+        if quick && !c.input_state.assume_paste { c.input_state.guess_at = Some(now); }
+        c.input_state.assume_paste = quick;
+        c.input_state.key_at = Some(now);
+        if paste {
+            if let Some(pane) = self.input_target(cid) { self.send_key_to_pane(cid, pane, &k, raw); }
+            return;
+        }
         let mut table = self.clients[&cid].key_table.clone();
         let repeating = self.clients[&cid].repeat_until.is_some_and(|d| d > Instant::now());
+        let prefix_ms = self.opt_server_num("prefix-timeout").max(0) as u64;
+        let repeat_binding = self.bindings.get(&table).and_then(|t| t.get(&name)).is_some_and(|b| b.repeat);
+        if table == "prefix" && prefix_ms > 0 && !(repeating && repeat_binding)
+            && self.clients[&cid].input_state.prefix_at.is_some_and(|t| now.duration_since(t) > Duration::from_millis(prefix_ms)) {
+            table = "root".into();
+            let c = self.clients.get_mut(&cid).unwrap(); c.key_table = table.clone(); c.repeat_until = None;
+        }
         if table == "root" {
             let prefix = self.opt_session(Some(sid), "prefix");
             let prefix2 = self.opt_session(Some(sid), "prefix2");
@@ -356,6 +577,7 @@ impl Server {
                 if !self.bindings.get("root").is_some_and(|t| t.contains_key(&name)) {
                     let c = self.clients.get_mut(&cid).unwrap();
                     c.key_table = "prefix".into();
+                    c.input_state.prefix_at = Some(now);
                     c.repeat_until = None;
                     c.dirty = true;
                     return;
@@ -367,9 +589,13 @@ impl Server {
             let found = self.bindings.get(&table).and_then(|t| t.get(&name)).map(|b| (b.cmd.clone(), b.repeat));
             match found {
                 Some((cmd, repeat)) => {
-                    let ms = self.opt_session_num(Some(sid), "repeat-time").max(0) as u64;
+                    let mut ms = self.opt_session_num(Some(sid), "repeat-time").max(0) as u64;
+                    let initial = self.opt_session_num(Some(sid), "initial-repeat-time").max(0) as u64;
+                    if ms > 0 && initial > 0 && (!repeating || self.clients[&cid].input_state.last_key != name) { ms = initial; }
                     let c = self.clients.get_mut(&cid).unwrap();
-                    if repeat && table != "root" {
+                    c.input_state.last_key = name.clone();
+                    c.input_state.prefix_at = Some(now);
+                    if repeat && ms > 0 && table != "root" {
                         c.repeat_until = Some(Instant::now() + Duration::from_millis(ms));
                         c.key_table = table.clone();
                     } else {
@@ -590,6 +816,7 @@ impl Server {
 
     fn prompt_key(&mut self, cid: ClientId, k: &Key, name: &str) {
         let hist_len = self.prompt_history.len();
+        let vi = self.opt_session(self.client_session(cid), "status-keys") == "vi";
         let c = self.clients.get_mut(&cid).unwrap();
         c.dirty = true;
         let pr = c.prompt.as_mut().unwrap();
@@ -612,6 +839,31 @@ impl Server {
             }
             PromptKind::Command => {}
         }
+        let translated;
+        let k = if vi {
+            if k.code == KeyCode::Escape {
+                if !pr.command_mode { pr.command_mode = true; pr.cursor = pr.cursor.saturating_sub(1); }
+                return;
+            }
+            if pr.command_mode {
+                let code = match k.code {
+                    KeyCode::Char('i') => { pr.command_mode = false; return; }
+                    KeyCode::Char('a') => { pr.command_mode = false; pr.cursor = (pr.cursor + 1).min(pr.input.len()); return; }
+                    KeyCode::Char('A') => { pr.command_mode = false; pr.cursor = pr.input.len(); return; }
+                    KeyCode::Char('I') => { pr.command_mode = false; pr.cursor = 0; return; }
+                    KeyCode::Char('h') | KeyCode::BSpace => KeyCode::Left,
+                    KeyCode::Char('l') => KeyCode::Right,
+                    KeyCode::Char('0') => KeyCode::Home,
+                    KeyCode::Char('$') => KeyCode::End,
+                    KeyCode::Char('x') => KeyCode::Delete,
+                    KeyCode::Char('k') => KeyCode::Up,
+                    KeyCode::Char('j') => KeyCode::Down,
+                    KeyCode::Char(_) if k.mods.is_empty() => return,
+                    _ => k.code.clone(),
+                };
+                translated = Key::new(code, k.mods); &translated
+            } else { k }
+        } else { k };
         let ctrl = |ch: char| k.mods.ctrl && k.code == KeyCode::Char(ch);
         match &k.code {
             KeyCode::Enter => {
@@ -632,6 +884,7 @@ impl Server {
                         self.prompt_history.remove(0);
                     }
                 }
+                self.save_prompt_history();
                 if pr.answers.len() < pr.prompts.len() {
                     let (label, init) = pr.prompts[pr.answers.len()].clone();
                     pr.label = label;

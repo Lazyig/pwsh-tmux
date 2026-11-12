@@ -1445,12 +1445,18 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
     // ESC c
     pub fn ris(&mut self) {
         let scroll_on_clear = self.screen.scroll_on_clear;
+        let allow_alternate = self.screen.allow_alternate;
+        let widths = core::mem::take(&mut self.screen.widths);
+        let variation_wide = self.screen.variation_wide;
         let counters = self.screen.grid.history_counters();
         self.screen = Screen::new(
             self.screen.grid.size(),
             self.screen.grid.scrollback_capacity(),
         );
         self.screen.scroll_on_clear = scroll_on_clear;
+        self.screen.allow_alternate = allow_alternate;
+        self.screen.widths = widths;
+        self.screen.variation_wide = variation_wide;
         self.screen.grid.set_history_counters(counters);
     }
 

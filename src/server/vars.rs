@@ -106,14 +106,17 @@ impl Server {
     }
 
     pub fn expand(&self, t: Target, client: Option<ClientId>, fmt: &str) -> String {
+        let _widths = self.width_context();
         format::expand(fmt, &VarCtx { srv: self, t, client, extra: HashMap::new() })
     }
 
     pub fn expand_time(&self, t: Target, client: Option<ClientId>, fmt: &str) -> String {
+        let _widths = self.width_context();
         format::expand_time(fmt, &VarCtx { srv: self, t, client, extra: HashMap::new() })
     }
 
     pub fn expand_extra(&self, t: Target, client: Option<ClientId>, fmt: &str, extra: HashMap<String, String>) -> String {
+        let _widths = self.width_context();
         format::expand(fmt, &VarCtx { srv: self, t, client, extra })
     }
 

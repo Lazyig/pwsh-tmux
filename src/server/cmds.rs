@@ -1030,7 +1030,7 @@ impl Server {
         if clip != "off" {
             if let Some(c) = cid.and_then(|c| self.clients.get(&c)).filter(|c| c.control == 0 && c.features.has("clipboard")) {
                 let enc = base64(text.as_bytes());
-                c.send(S_OUTPUT, format!("\x1b]52;c;{enc}\x07").as_bytes());
+                c.send(S_OUTPUT, features::string_capability(&c.term_caps, "Ms", "\x1b]52;%p1%s;%p2%s\x07", &["c", &enc]).as_bytes());
             }
         }
         self.add_buffer(None, text.into_bytes(), false);
@@ -1058,7 +1058,16 @@ impl Server {
     pub fn exec(&mut self, argv: Vec<String>, ctx: &mut Ctx) -> Result<Flow, String> {
         ctx.readonly |= self.readonly_context.get() || self.client_is_readonly(ctx.client) || self.client_is_readonly(ctx.reply);
         let previous = self.readonly_context.replace(ctx.readonly);
-        let result = self.exec_inner(argv, ctx);
+        // Resolve each alias once; arguments belong to its last command (cmd-parse.y).
+        let result = if argv.first().is_some_and(|s| s.starts_with("\0alias:")) {
+            let mut argv = argv;
+            argv[0] = argv[0].trim_start_matches("\0alias:").to_string();
+            self.exec_inner(argv, ctx)
+        } else if argv.first().is_some_and(|name| self.command_aliases().iter().any(|a| a.split_once('=').is_some_and(|(n, _)| n == name))) {
+            print_parsed_command(argv.into_iter().map(|s| (s, false)).collect(), &self.command_aliases(), true)
+                .and_then(|cmds| cmdparse::parse(&cmds.join(" ; ")))
+                .map(|mut cmds| { for cmd in &mut cmds { if let Some(name) = cmd.first_mut() { *name = format!("\0alias:{name}"); } } Flow::Inject(cmds, false) })
+        } else { self.exec_inner(argv, ctx) };
         self.readonly_context.set(previous);
         if ctx.out.overflowed() { err("command output limit exceeded") } else { result }
     }
@@ -1353,10 +1362,6 @@ impl Server {
                 Ok(Flow::Next)
             }
             "lock-server" | "lock-session" | "lock-client" => {
-                let cmdline = self.opt_session(None, "lock-command");
-                if cmdline.is_empty() {
-                    return err("lock-command is not set");
-                }
                 let cids: Vec<ClientId> = match cmd {
                     "lock-client" => vec![self.resolve_client(ctx, t)?],
                     "lock-session" => {
@@ -1365,12 +1370,7 @@ impl Server {
                     }
                     _ => self.clients.values().filter(|c| c.attached).map(|c| c.id).collect(),
                 };
-                for c in cids {
-                    if let Some(cl) = self.clients.get_mut(&c) {
-                        cl.suspended = true;
-                        cl.send(S_SHELL, cmdline.as_bytes());
-                    }
-                }
+                for c in cids { self.lock_input_client(c); }
                 Ok(Flow::Next)
             }
             "suspend-client" => {
@@ -2705,6 +2705,7 @@ impl Server {
             }
             "clear-prompt-history" => {
                 self.prompt_history.clear();
+                self.save_prompt_history();
                 Ok(Flow::Next)
             }
             "show-prompt-history" => {
@@ -2858,7 +2859,7 @@ impl Server {
                     let name = self.opt_session(tt.sid, if o.has('2') { "prefix2" } else { "prefix" });
                     if let Some(k) = keys::parse_key_name(&name) {
                         let app = self.panes.get(&pane).is_some_and(|p| p.screen().application_cursor());
-                        self.panes[&pane].send(keys::encode_key(&k, app));
+                        self.panes[&pane].send(self.encode_pane_key(pane, &k, keys::encode_key(&k, app)));
                     }
                     return Ok(Flow::Next);
                 }
@@ -2910,7 +2911,7 @@ impl Server {
                         continue;
                     }
                     match keys::parse_key_name(&k) {
-                        Some(key) if k.chars().count() > 1 || k == " " => data.extend(keys::encode_key(&key, app)),
+                        Some(key) if k.chars().count() > 1 || k == " " => data.extend(self.encode_pane_key(pane, &key, keys::encode_key(&key, app))),
                         _ => data.extend(k.as_bytes()),
                     }
                 }
@@ -3696,6 +3697,7 @@ impl Server {
             store.set(&name, v);
         }
         // side effects
+        if name.starts_with("terminal-features") || name.starts_with("terminal-overrides") { self.refresh_terminal_features(); }
         match name.as_str() {
             "status" | "status-position" | "pane-border-status" | "window-size" => {
                 let sids: Vec<SessId> = self.sessions.keys().copied().collect();
@@ -3915,7 +3917,7 @@ impl Server {
         let input: Vec<char> = init.chars().collect();
         let cursor = input.len();
         if let Some(c) = self.clients.get_mut(&cid) {
-            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false, confirm: ('y', false) });
+            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, command_mode: false, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false, confirm: ('y', false) });
             c.dirty = true;
         }
     }
