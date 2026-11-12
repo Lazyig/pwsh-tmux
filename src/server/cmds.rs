@@ -110,15 +110,109 @@ pub fn canonical(name: &str) -> Option<&'static str> {
     if m.len() == 1 { Some(m[0].0) } else { None }
 }
 
-/// Store a command option the way tmux prints its parsed list: full command
-/// names, escaped arguments, commands joined by " ; ". Unknown names (aliases)
-/// are kept as written.
-fn canonical_command_list(v: &str) -> Result<String, String> {
-    let cmds = cmdparse::parse(v)?;
-    Ok(cmds.iter().filter(|c| !c.is_empty()).map(|c| {
-        let name = canonical(&c[0]).map_or_else(|| options::escape_arg(&c[0]), String::from);
-        std::iter::once(name).chain(c[1..].iter().map(|a| options::escape_arg(a))).collect::<Vec<_>>().join(" ")
-    }).collect::<Vec<_>>().join(" ; "))
+/// Store a command option (default-client-command, hooks) the way tmux parses
+/// it with cmd_parse_from_string and prints it with cmd_list_print: command-alias
+/// entries expanded, unknown commands and flags rejected, flags sorted as
+/// args_print does, { } blocks kept as command lists, commands joined by " ; ".
+fn command_list_string(v: &str, aliases: &[String]) -> Result<String, String> {
+    // errors of a string parse have no file:line prefix
+    let cmds = cmdparse::parse_blocks(v).map_err(|e| match e.split_once(": ") {
+        Some((l, rest)) if l.starts_with("line ") => rest.to_string(),
+        _ => e,
+    })?;
+    let mut out = Vec::new();
+    for c in cmds {
+        out.extend(print_parsed_command(c, aliases, true)?);
+    }
+    Ok(out.join(" ; "))
+}
+
+/// Whether positional argument `idx` of a command may be a { } block
+/// (ARGS_PARSE_COMMANDS_OR_STRING in the command's args_parse callback).
+fn takes_commands(cmd: &str, idx: usize, flags: &[char]) -> bool {
+    match cmd {
+        "if-shell" => idx == 1 || idx == 2,
+        "set-option" | "set-window-option" | "set-hook" => idx == 1,
+        "run-shell" => flags.contains(&'C'),
+        "bind-key" | "confirm-before" | "command-prompt" | "display-menu" | "choose-tree" | "choose-client"
+        | "choose-buffer" | "customize-mode" | "switch-mode" | "display-panes" => true,
+        _ => false,
+    }
+}
+
+fn print_parsed_command(words: Vec<(String, bool)>, aliases: &[String], expand: bool) -> Result<Vec<String>, String> {
+    let Some((name, brace)) = words.first().cloned() else { return Ok(vec![]) };
+    if brace { return err("syntax error"); }
+    // cmd_parse_expand_alias: the alias's last command takes the arguments
+    if expand && let Some(alias) = aliases.iter().find_map(|a| a.split_once('=').filter(|(n, _)| *n == name).map(|(_, v)| v)) {
+        let mut cmds = cmdparse::parse_blocks(alias)?;
+        let Some(last) = cmds.last_mut() else { return Ok(vec![]) };
+        last.extend(words.into_iter().skip(1));
+        let mut out = Vec::new();
+        for c in cmds {
+            out.extend(print_parsed_command(c, aliases, false)?);
+        }
+        return Ok(out);
+    }
+    // blocks are built before the command itself
+    let mut args = Vec::new();
+    for (a, brace) in words.into_iter().skip(1) {
+        let a = if brace {
+            let mut inner = Vec::new();
+            for c in cmdparse::parse_blocks(&a)? {
+                inner.extend(print_parsed_command(c, aliases, expand)?);
+            }
+            format!("{{ {} }}", inner.join(" ; "))
+        } else { a };
+        args.push((a, brace));
+    }
+    let full = canonical(&name).ok_or_else(|| {
+        let m: Vec<&str> = COMMANDS.iter().map(|c| c.0).filter(|c| c.starts_with(name.as_str())).collect();
+        if m.len() > 1 { format!("ambiguous command: {name}, could be: {}", m.join(", ")) } else { format!("unknown command: {name}") }
+    })?;
+    let spec = COMMANDS.iter().find(|c| c.0 == full).unwrap();
+    let fail = |e: String| format!("command {full}: {e}");
+    let (mut bare, mut valued) = (Vec::new(), Vec::new());
+    let mut i = 0;
+    while let Some((a, brace)) = args.get(i) {
+        if *brace || !a.starts_with('-') || a.len() < 2 { break; }
+        i += 1;
+        if a == "--" { break; }
+        let chars: Vec<char> = a[1..].chars().collect();
+        for (j, &c) in chars.iter().enumerate() {
+            if spec.2.contains(c) {
+                bare.push(c);
+            } else if spec.3.contains(c) {
+                let inline: String = chars[j + 1..].iter().collect();
+                let v = if !inline.is_empty() { inline } else {
+                    let v = match args.get(i) {
+                        Some((v, false)) => v.clone(),
+                        Some((_, true)) => return Err(fail(format!("-{c} argument must be a string"))),
+                        None => return Err(fail(format!("-{c} expects an argument"))),
+                    };
+                    i += 1;
+                    v
+                };
+                valued.push((c, v));
+                break;
+            } else {
+                return Err(fail(format!("unknown flag -{c}")));
+            }
+        }
+    }
+    // args_print: bare flags together, then flags with values, both by flag
+    bare.sort_unstable();
+    valued.sort_by_key(|(c, _)| *c);
+    let mut out = vec![full.to_string()];
+    if !bare.is_empty() { out.push(format!("-{}", bare.iter().collect::<String>())); }
+    out.extend(valued.into_iter().map(|(c, v)| format!("-{c} {}", options::escape_arg(&v))));
+    for (k, (a, brace)) in args[i..].iter().enumerate() {
+        if *brace && !takes_commands(full, k, &bare) {
+            return Err(fail(format!("argument {} must be \"string\"", k + 1)));
+        }
+        out.push(if *brace { a.clone() } else { options::escape_arg(a) });
+    }
+    Ok(vec![out.join(" ")])
 }
 
 fn err<T>(s: impl Into<String>) -> Result<T, String> {
@@ -2646,7 +2740,7 @@ impl Server {
             "show-hooks" => {
                 let map = if o.has('g') { self.hooks.clone() } else { self.resolve_session(ctx, t).ok().map(|s| self.sessions[&s].hooks.clone()).unwrap_or_default() };
                 for (k, v) in map {
-                    for (i, c) in v.iter().enumerate() {
+                    for (i, c) in v.iter().enumerate().filter(|(_, c)| !c.is_empty()) {
                         ctx.out.push_str(&format!("{k}[{i}] {c}\n"));
                     }
                 }
@@ -2968,39 +3062,134 @@ impl Server {
         }
     }
 
+    /// The level an option lives at, like options_scope_from_name: a target that
+    /// does not resolve reports "no such <level>: <target>" (cmd_find runs with
+    /// CMD_FIND_CANFAIL, so its own error is not shown).
     fn option_target(&self, scope: Scope, global: bool, ctx: &Ctx, t: Option<&str>) -> Result<Target, String> {
+        let cause = |what: &str| t.map_or_else(|| format!("no current {what}"), |t| format!("no such {what}: {t}"));
         Ok(match scope {
-            Scope::Session if !global => Target { sid: Some(self.resolve_session(ctx, t)?), ..Target::default() },
-            Scope::Window if !global => self.resolve_window(ctx, t)?,
-            Scope::Pane => self.resolve_pane(ctx, t)?,
+            Scope::Session if !global => Target { sid: Some(self.resolve_session(ctx, t).map_err(|_| cause("session"))?), ..Target::default() },
+            Scope::Window if !global => self.resolve_window(ctx, t).map_err(|_| cause("window"))?,
+            Scope::Pane => self.resolve_pane(ctx, t).map_err(|_| cause("pane"))?,
             _ => Target::default(),
         })
     }
 
-    /// Resolve the option argument (format-expanded, like tmux); None means -q swallowed an error.
-    fn option_name(&self, o: &Opts, ctx: &Ctx, arg: &str) -> Result<Option<String>, String> {
+    /// Resolve the option argument (format-expanded, like tmux) to (name, argument);
+    /// None means -q swallowed an error.
+    fn option_name(&self, o: &Opts, ctx: &Ctx, arg: &str) -> Result<Option<(String, String)>, String> {
         let arg = if arg.contains('#') { self.expand(self.current(ctx), ctx.client, arg) } else { arg.to_string() };
         match options::canonical_name(&arg) {
-            Ok(n) => Ok(Some(n)),
-            Err(e) if o.has('q') && !e.starts_with("not an array") => Ok(None),
+            Ok(n) => Ok(Some((n, arg))),
+            Err(_) if o.has('q') => Ok(None),
             Err(e) => err(e),
         }
     }
 
+    fn command_aliases(&self) -> Vec<String> {
+        self.opts_server.array_items("command-alias").into_iter().map(|(_, v)| v).collect()
+    }
+
+    /// The hook map a hook option lives in: the server's with -g, otherwise the
+    /// target session's (pwsh-tmux keeps window and pane hooks per session).
+    fn hook_level(&self, o: &Opts, ctx: &Ctx) -> Result<Option<SessId>, String> {
+        if o.has('g') { return Ok(None); }
+        let t = o.get('t');
+        self.resolve_session(ctx, t).map(Some)
+            .map_err(|_| t.map_or_else(|| "no current session".to_string(), |t| format!("no such session: {t}")))
+    }
+
+    /// A hook's commands at a level: the global level holds every hook (an empty
+    /// array by default), a session only those set on it.
+    fn hook_values(&self, sid: Option<SessId>, base: &str) -> Option<&[String]> {
+        match sid {
+            None => Some(self.hooks.get(base).map_or(&[][..], |v| v.as_slice())),
+            Some(s) => self.sessions.get(&s)?.hooks.get(base).map(|v| v.as_slice()),
+        }
+    }
+
+    /// set-option on a hook: an array of command lists. Unset elements are kept as
+    /// "" so the other keys stay put (string keys are not supported).
+    fn set_hook_option(&mut self, o: &Opts, ctx: &Ctx, name: &str, arg: &str, value: Option<String>) -> Result<(), String> {
+        let sid = match self.hook_level(o, ctx) {
+            Ok(s) => s,
+            Err(_) if o.has('q') => return Ok(()),
+            Err(e) => return err(e),
+        };
+        let (base, key) = match name.split_once('[') {
+            Some((b, k)) => {
+                let k = k.trim_end_matches(']');
+                (b, Some(k.parse::<usize>().map_err(|_| format!("bad array key: {k}"))?))
+            }
+            None => (name, None),
+        };
+        let already = self.hook_values(sid, base).is_some_and(|v| key.is_none_or(|i| v.get(i).is_some_and(|c| !c.is_empty())));
+        if o.has('o') && !o.has('u') && already {
+            return if o.has('q') { Ok(()) } else { err(format!("already set: {arg}")) };
+        }
+        let cmd = match &value {
+            _ if o.has('u') || o.has('U') => None,
+            None => return err("empty value"),
+            Some(v) => Some(command_list_string(v, &self.command_aliases())),
+        };
+        let map = match sid {
+            None => &mut self.hooks,
+            Some(s) => &mut self.sessions.get_mut(&s).ok_or("no such session")?.hooks,
+        };
+        let Some(cmd) = cmd else {
+            match key {
+                None => { map.remove(base); }
+                Some(i) => {
+                    if let Some(v) = map.get_mut(base) && i < v.len() {
+                        v[i].clear();
+                        while v.last().is_some_and(String::is_empty) { v.pop(); }
+                    }
+                }
+            }
+            return Ok(());
+        };
+        // the level gets the (empty) array even when the command does not parse
+        let v = map.entry(base.to_string()).or_default();
+        let cmd = cmd?;
+        let i = match key {
+            None => {
+                if !o.has('a') { v.clear(); }
+                // options_array_assign adds nothing for an empty value, else uses the first free key
+                if value.as_deref().unwrap_or("").is_empty() { return Ok(()); }
+                v.iter().position(String::is_empty).unwrap_or(v.len())
+            }
+            Some(i) => i,
+        };
+        if v.len() <= i { v.resize(i + 1, String::new()); }
+        v[i] = cmd;
+        Ok(())
+    }
+
     fn cmd_set_option(&mut self, window_cmd: bool, o: &Opts, ctx: &Ctx) -> Result<(), String> {
-        let Some(name) = self.option_name(o, ctx, o.rest.first().ok_or("missing argument")?)? else { return Ok(()) };
+        let Some((name, arg)) = self.option_name(o, ctx, o.rest.first().ok_or("missing argument")?)? else { return Ok(()) };
         let value = o.rest.get(1).map(|v| if o.has('F') { self.expand(self.current(ctx), ctx.client, v) } else { v.clone() });
+        if options::hook_scope(&name).is_some() {
+            return self.set_hook_option(o, ctx, &name, &arg, value);
+        }
         let scope = Self::option_scope(window_cmd, o, Some(&name));
         // -g has no meaning for server options and is ignored with -p
         let global = scope == Scope::Server || (o.has('g') && scope != Scope::Pane);
-        let tt = self.option_target(scope, global, ctx, o.get('t'))?;
+        let tt = match self.option_target(scope, global, ctx, o.get('t')) {
+            Ok(t) => t,
+            Err(_) if o.has('q') => return Ok(()),
+            Err(e) => return err(e),
+        };
+        // keys need an array; -q does not hide this
+        if name.contains('[') && !options::is_array(&name) {
+            return err(format!("not an array: {arg}"));
+        }
         let def = options::def(&name);
         let (present, current) = match self.store(scope, global, tt) {
             Some(s) => (s.has(&name), s.get(&name).map(String::from)),
             None => (false, None),
         };
         if o.has('o') && !o.has('u') && present {
-            return if o.has('q') { Ok(()) } else { err(format!("already set: {name}")) };
+            return if o.has('q') { Ok(()) } else { err(format!("already set: {arg}")) };
         }
         // toggles start from the effective (possibly inherited) value
         let effective = current.clone().or_else(|| match scope {
@@ -3009,12 +3198,15 @@ impl Server {
             Scope::Window => Some(self.opt_window(tt.wid, &name)),
             Scope::Pane => tt.pane.map(|p| self.opt_pane(p, &name)),
         });
-        if o.has('U') && scope == Scope::Window && !global {
-            let pids = tt.wid.and_then(|w| self.windows.get(&w)).map(|w| w.panes()).unwrap_or_default();
+        // -U also clears the panes of the target window, with or without -g
+        if o.has('U') && scope == Scope::Window {
+            let wid = if global { self.resolve_window(ctx, o.get('t')).ok().and_then(|t| t.wid) } else { tt.wid };
+            let pids = wid.and_then(|w| self.windows.get(&w)).map(|w| w.panes()).unwrap_or_default();
             for p in pids {
                 if let Some(p) = self.panes.get_mut(&p) { p.options.unset(&name); }
             }
         }
+        let aliases = self.command_aliases();
         let store = self.store_mut(scope, global, tt).ok_or("no such target")?;
         if o.has('u') || o.has('U') {
             // global levels go back to the table default, others inherit again
@@ -3022,16 +3214,23 @@ impl Server {
         } else if def.is_some_and(|d| d.kind == options::Kind::Array) && !name.contains('[') {
             store.assign_array(&name, value.as_deref().ok_or("empty value")?, o.has('a'))?;
         } else {
-            let mut v = options::validate(&name, value.as_deref(), effective.as_deref())?;
-            // -a appends to this level's own string value (options_set_string)
+            if let Some((base, _)) = name.split_once('[') {
+                // options_empty: the level holds the array before the element is checked
+                store.touch_array(base);
+            }
+            // -a appends to this level's own string value (options_set_string) and
+            // checks the result
             let string = def.is_none_or(|d| matches!(d.kind, options::Kind::Str | options::Kind::Style | options::Kind::ColourFormat)
                 || (d.kind == options::Kind::Array && d.name != "pane-colours"));
-            if o.has('a') && string && let Some(old) = &current {
-                let sep = if name.contains('[') { "" } else { def.map_or("", |d| d.append_separator()) };
-                v = options::validate(&name, Some(&format!("{old}{sep}{v}")), None)?;
-            }
+            let mut v = match (&current, &value) {
+                (Some(old), Some(new)) if o.has('a') && string => {
+                    let sep = if name.contains('[') { "" } else { def.map_or("", |d| d.append_separator()) };
+                    options::validate(&name, Some(&format!("{old}{sep}{new}")), None)?
+                }
+                _ => options::validate(&name, value.as_deref(), effective.as_deref())?,
+            };
             if def.is_some_and(|d| d.kind == options::Kind::Command) {
-                v = canonical_command_list(&v)?;
+                v = command_list_string(&v, &aliases)?;
             }
             store.set(&name, v);
         }
@@ -3081,13 +3280,61 @@ impl Server {
     }
 
     fn cmd_show_options(&mut self, window_cmd: bool, o: &Opts, ctx: &mut Ctx) -> Result<(), String> {
-        let name = match o.rest.first() {
+        let named = match o.rest.first() {
             Some(arg) => match self.option_name(o, ctx, arg)? { Some(n) => Some(n), None => return Ok(()) },
             None => None,
         };
-        let scope = Self::option_scope(window_cmd, o, name.as_deref());
+        let name = named.as_ref().map(|n| n.0.as_str());
+        let hook = name.is_some_and(|n| options::hook_scope(n).is_some());
+        let scope = Self::option_scope(window_cmd, o, name.filter(|_| !hook));
         let global = scope == Scope::Server || (o.has('g') && scope != Scope::Pane);
-        let tt = self.option_target(scope, global, ctx, o.get('t'))?;
+        let print = |out: &mut String, key: &str, value: Option<&str>, parent: bool| {
+            let star = if parent { "*" } else { "" };
+            match value {
+                Some(v) if o.has('v') => out.push_str(&format!("{v}\n")),
+                Some(v) => out.push_str(&format!("{key}{star} {}\n", options::print_value(key, v))),
+                None if o.has('v') => {}
+                None => out.push_str(&format!("{key}{star}\n")),
+            }
+        };
+        // hooks live in the hook maps: the session's (if not -g), then the global one
+        let hook_sid = match self.hook_level(o, ctx) {
+            Ok(s) => s,
+            Err(_) if o.has('q') && hook => return Ok(()),
+            Err(e) if hook => return err(e),
+            Err(_) => None,
+        };
+        let show_hook = |out: &mut String, name: &str, named: bool| {
+            let (base, key) = match name.split_once('[') {
+                Some((b, k)) => (b, Some(k.trim_end_matches(']'))),
+                None => (name, None),
+            };
+            let (values, parent) = match self.hook_values(hook_sid, base) {
+                Some(v) => (v, false),
+                None if o.has('A') => (self.hook_values(None, base).unwrap_or_default(), true),
+                None => return,
+            };
+            match key {
+                Some(k) => print(out, name, Some(k.parse::<usize>().ok().and_then(|i| values.get(i)).map_or("", String::as_str)), parent),
+                None if values.iter().all(String::is_empty) => print(out, base, None, parent && !named),
+                None => {
+                    for (i, v) in values.iter().enumerate().filter(|(_, v)| !v.is_empty()) {
+                        print(out, &format!("{base}[{i}]"), Some(v), parent);
+                    }
+                }
+            }
+        };
+        if let Some((n, _)) = named.as_ref().filter(|_| hook) {
+            let mut out = String::new();
+            show_hook(&mut out, n, true);
+            ctx.out.push_str(&out);
+            return Ok(());
+        }
+        let tt = match self.option_target(scope, global, ctx, o.get('t')) {
+            Ok(t) => t,
+            Err(_) if o.has('q') => return Ok(()),
+            Err(e) => return err(e),
+        };
         let Some(store) = self.store(scope, global, tt) else { return err("no such target") };
         // -A walks the parent levels: pane -> window -> global window, session -> global session
         let parents: Vec<&Options> = match scope {
@@ -3103,21 +3350,14 @@ impl Server {
             if !o.has('A') { return None; }
             parents.iter().find(|p| p.has(base)).map(|p| (*p, true))
         };
-        let print = |out: &mut String, key: &str, value: Option<&str>, parent: bool| {
-            let star = if parent { "*" } else { "" };
-            match value {
-                Some(v) if o.has('v') => out.push_str(&format!("{v}\n")),
-                Some(v) => out.push_str(&format!("{key}{star} {}\n", options::print_value(key, v))),
-                None if o.has('v') => {}
-                None => out.push_str(&format!("{key}{star}\n")),
-            }
-        };
-        // print one option like cmd_show_options_print: arrays show each element
+        // print one option like cmd_show_options_print: arrays show each element,
+        // a key on a non-array shows the plain value under that key
         let show = |out: &mut String, lvl: &Options, name: &str, parent: bool, named: bool| {
             let base = name.split('[').next().unwrap_or(name);
             if name.contains('[') {
-                print(out, name, Some(lvl.get(name).unwrap_or("")), parent);
-            } else if options::def(base).is_some_and(|d| d.kind == options::Kind::Array) {
+                let v = if options::is_array(name) { lvl.get(name) } else { lvl.get(base) };
+                print(out, name, Some(v.unwrap_or("")), parent);
+            } else if options::is_array(base) {
                 let items = lvl.array_items(base);
                 if items.is_empty() {
                     print(out, base, None, parent && !named);
@@ -3130,12 +3370,12 @@ impl Server {
             }
         };
         let mut out = String::new();
-        match &name {
-            Some(n) => {
+        match &named {
+            Some((n, arg)) => {
                 let base = n.split('[').next().unwrap_or(n);
                 match find(base) {
                     Some((lvl, parent)) => show(&mut out, lvl, n, parent, true),
-                    None if base.starts_with('@') && !o.has('q') => return err(format!("invalid option: {n}")),
+                    None if base.starts_with('@') && !o.has('q') => return err(format!("invalid option: {arg}")),
                     None => {}
                 }
             }
@@ -3144,10 +3384,16 @@ impl Server {
                 for (k, v) in store.0.iter().filter(|(k, _)| k.starts_with('@')) {
                     print(&mut out, k, Some(v), false);
                 }
-                let wanted = |d: &&options::OptDef| d.scope == scope || (d.scope == Scope::Pane && scope == Scope::Window);
-                for d in options::DEFS.iter().filter(wanted) {
+                let wanted = |s: Scope| s == scope || (s == Scope::Pane && scope == Scope::Window);
+                for d in options::DEFS.iter().filter(|d| wanted(d.scope)) {
                     if let Some((lvl, parent)) = find(d.name) {
                         show(&mut out, lvl, d.name, parent, false);
+                    }
+                }
+                // hooks come last in the table and only show with -H
+                if o.has('H') && scope != Scope::Server {
+                    for (h, _) in options::HOOKS.iter().filter(|h| wanted(h.1)) {
+                        show_hook(&mut out, h, false);
                     }
                 }
             }

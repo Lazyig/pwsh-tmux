@@ -33,8 +33,31 @@ pub fn parse_with_env(input: &str, cond: &dyn Fn(&str) -> bool, env: &dyn Fn(&st
         line: 1,
         env,
         assigned: std::collections::HashMap::new(),
+        braces: Vec::new(),
     };
     lx.run(cond)
+}
+
+/// Like [`parse`], but each argument also says whether it was a `{ ... }`
+/// block (its text is then the block's body), as tmux keeps command blocks
+/// apart from strings.
+pub fn parse_blocks(input: &str) -> Result<Vec<Vec<(String, bool)>>, String> {
+    let normalized = input.replace("\r\n", "\n");
+    let env = |name: &str| std::env::var(name).ok();
+    let mut lx = Lexer {
+        s: normalized.chars().collect(),
+        pos: 0,
+        line: 1,
+        env: &env,
+        assigned: std::collections::HashMap::new(),
+        braces: Vec::new(),
+    };
+    let cmds = lx.run(&|c: &str| !c.is_empty() && c != "0")?;
+    let mut out: Vec<Vec<(String, bool)>> = cmds.into_iter().map(|c| c.into_iter().map(|w| (w, false)).collect()).collect();
+    for (c, w) in lx.braces {
+        out[c][w].1 = true;
+    }
+    Ok(out)
 }
 
 /// Split an already-tokenized argv (e.g. from the OS command line, or a bind-key's
@@ -158,6 +181,8 @@ struct Lexer<'a> {
     env: &'a dyn Fn(&str) -> Option<String>,
     /// Assignments made earlier in this parse; they shadow `env`.
     assigned: std::collections::HashMap<String, String>,
+    /// (command, argument) positions of `{ ... }` blocks.
+    braces: Vec<(usize, usize)>,
 }
 
 fn is_blank(c: Option<char>) -> bool {
@@ -202,7 +227,7 @@ impl Lexer<'_> {
 
     fn run(&mut self, cond: &dyn Fn(&str) -> bool) -> Result<Vec<Vec<String>>, String> {
         let mut cmds: Vec<Vec<String>> = Vec::new();
-        let mut cur: Vec<(String, bool)> = Vec::new();
+        let mut cur: Vec<(String, bool, bool)> = Vec::new();
         let mut stack: Vec<Frame> = Vec::new();
         let mut line_start = true;
 
@@ -212,7 +237,7 @@ impl Lexer<'_> {
             let active = stack.last().is_none_or(|f| f.active);
             match c {
                 '\n' => {
-                    finish(&mut cmds, &mut cur, active, &mut self.assigned);
+                    finish(&mut cmds, &mut cur, active, &mut self.assigned, &mut self.braces);
                     self.pos += 1;
                     self.line += 1;
                     line_start = true;
@@ -228,27 +253,27 @@ impl Lexer<'_> {
                 }
                 '{' if is_blank(self.peek_at(1)) => {
                     let body = self.read_brace()?;
-                    cur.push((body, false));
+                    cur.push((body, false, true));
                     // `};` ends the command even without a following blank.
                     if self.peek() == Some(';') {
                         self.pos += 1;
-                        finish(&mut cmds, &mut cur, active, &mut self.assigned);
+                        finish(&mut cmds, &mut cur, active, &mut self.assigned, &mut self.braces);
                     }
                 }
                 _ => {
                     let w = self.read_word()?;
                     if w.present {
-                        cur.push((w.text, w.assign));
+                        cur.push((w.text, w.assign, false));
                     }
                     if w.ends_cmd {
-                        finish(&mut cmds, &mut cur, active, &mut self.assigned);
+                        finish(&mut cmds, &mut cur, active, &mut self.assigned, &mut self.braces);
                     }
                 }
             }
             line_start = false;
         }
         let active = stack.last().is_none_or(|f| f.active);
-        finish(&mut cmds, &mut cur, active, &mut self.assigned);
+        finish(&mut cmds, &mut cur, active, &mut self.assigned, &mut self.braces);
         if !stack.is_empty() {
             return Err(self.err(self.line, "missing %endif"));
         }
@@ -664,7 +689,7 @@ impl Lexer<'_> {
 
 /// Finish the current command: push it (if active and non-empty), mapping a
 /// lone `NAME=value` to `set-environment -g NAME value`.
-fn finish(cmds: &mut Vec<Vec<String>>, cur: &mut Vec<(String, bool)>, active: bool, assigned: &mut std::collections::HashMap<String, String>) {
+fn finish(cmds: &mut Vec<Vec<String>>, cur: &mut Vec<(String, bool, bool)>, active: bool, assigned: &mut std::collections::HashMap<String, String>, braces: &mut Vec<(usize, usize)>) {
     let words = std::mem::take(cur);
     if !active || words.is_empty() {
         return;
@@ -680,7 +705,8 @@ fn finish(cmds: &mut Vec<Vec<String>>, cur: &mut Vec<(String, bool)>, active: bo
         ]);
         return;
     }
-    cmds.push(words.into_iter().map(|(w, _)| w).collect());
+    braces.extend(words.iter().enumerate().filter(|(_, w)| w.2).map(|(i, _)| (cmds.len(), i)));
+    cmds.push(words.into_iter().map(|(w, _, _)| w).collect());
 }
 
 #[cfg(test)]
@@ -693,6 +719,15 @@ mod tests {
 
     fn p(s: &str) -> Vec<Vec<String>> {
         parse(s).unwrap_or_else(|e| panic!("parse failed for {s:?}: {e}"))
+    }
+
+    #[test]
+    fn blocks_are_marked() {
+        let c = parse_blocks("A=1\nif -F 1 { display a } 'b'; bind x {\n  neww\n}").unwrap();
+        assert_eq!(c.len(), 3);
+        assert_eq!(c[1][3], ("display a".to_string(), true));
+        assert_eq!(c[1][4], ("b".to_string(), false));
+        assert!(c[2][2].1 && !c[2][1].1 && !c[0].iter().any(|w| w.1));
     }
 
     #[test]

@@ -239,6 +239,55 @@ pub static DEFS: &[OptDef] = &[
     d("xterm-keys", Window, Flag, "on"),
 ];
 
+// tmux 3.8 hooks are array options of commands (OPTIONS_TABLE_IS_HOOK) at the
+// end of the option table: they share the set-option/show-options namespace and
+// prefix matching. pwsh-tmux keeps their commands in the server and session hook
+// maps. Pane means window + pane.
+pub static HOOKS: &[(&str, Scope)] = &[
+    ("after-bind-key", Session), ("after-capture-pane", Session), ("after-copy-mode", Session),
+    ("after-display-message", Session), ("after-display-panes", Session), ("after-kill-pane", Session),
+    ("after-list-buffers", Session), ("after-list-clients", Session), ("after-list-keys", Session),
+    ("after-list-panes", Session), ("after-list-sessions", Session), ("after-list-windows", Session),
+    ("after-load-buffer", Session), ("after-lock-server", Session), ("after-new-session", Session),
+    ("after-new-window", Session), ("after-paste-buffer", Session), ("after-pipe-pane", Session),
+    ("after-refresh-client", Session), ("after-rename-session", Session), ("after-rename-window", Session),
+    ("after-resize-pane", Session), ("after-resize-window", Session), ("after-save-buffer", Session),
+    ("after-select-layout", Session), ("after-select-pane", Session), ("after-select-window", Session),
+    ("after-send-keys", Session), ("after-set-buffer", Session), ("after-set-environment", Session),
+    ("after-set-hook", Session), ("after-set-option", Session), ("after-show-environment", Session),
+    ("after-show-messages", Session), ("after-show-options", Session), ("after-split-window", Session),
+    ("after-swap-window", Session), ("after-unbind-key", Session),
+    ("alert-activity", Session), ("alert-bell", Session), ("alert-silence", Session),
+    ("client-active", Session), ("client-attached", Session), ("client-created", Session),
+    ("client-closed", Session), ("client-detached", Session), ("client-focus-in", Session),
+    ("client-focus-out", Session), ("client-resized", Session), ("client-session-changed", Session),
+    ("client-light-theme", Session), ("client-dark-theme", Session), ("command-error", Session),
+    ("marked-pane-changed", Session),
+    ("pane-activity", Pane), ("pane-bell", Pane), ("pane-command-finished", Pane),
+    ("pane-command-started", Pane), ("pane-created", Pane), ("pane-died", Pane), ("pane-exited", Pane),
+    ("pane-focus-in", Pane), ("pane-focus-out", Pane), ("pane-mode-changed", Pane),
+    ("pane-mode-entered", Pane), ("pane-mode-exited", Pane), ("pane-moved", Pane),
+    ("pane-prompt-closed", Pane), ("pane-prompt-opened", Pane), ("pane-resized", Pane),
+    ("pane-set-clipboard", Pane), ("pane-shell-prompt", Pane), ("pane-title-changed", Pane),
+    ("session-closed", Session), ("session-created", Session), ("session-added-to-group", Session),
+    ("session-renamed", Session), ("session-removed-from-group", Session), ("session-window-changed", Session),
+    ("window-created", Window), ("window-closed", Window), ("window-layout-changed", Window),
+    ("window-linked", Session), ("window-pane-changed", Window), ("window-renamed", Window),
+    ("window-resized", Window), ("window-unzoomed", Window), ("window-zoomed", Window),
+    ("window-unlinked", Session),
+];
+
+/// The table scope of a hook name (with or without an array key).
+pub fn hook_scope(name: &str) -> Option<Scope> {
+    let base = name.split('[').next().unwrap_or(name);
+    HOOKS.iter().find(|h| h.0 == base).map(|h| h.1)
+}
+
+/// Whether an option name (with or without key) is an array: table arrays and hooks.
+pub fn is_array(name: &str) -> bool {
+    !name.starts_with('@') && (def(name).is_some_and(|d| d.kind == Array) || hook_scope(name).is_some())
+}
+
 impl OptDef {
     pub fn number_range(&self) -> (i64, i64) {
         match self.name {
@@ -294,8 +343,10 @@ const OTHER_NAMES: &[(&str, &str)] = &[
 
 /// Resolve an option argument like tmux's options_match: the array key is
 /// canonicalised (numeric keys lose leading zeros), old -color names are mapped
-/// and a unique prefix selects an option. A malformed key reports "ambiguous
-/// option" as tmux does. Array keys on non-array options are rejected.
+/// and a unique prefix selects an option or hook, scanning the table in order
+/// (an exact name ends the scan). A malformed key reports "ambiguous option" as
+/// tmux does. Keys on non-array options are left for the caller: set-option
+/// rejects them, show-options prints the plain value under the key.
 pub fn canonical_name(arg: &str) -> Result<String, String> {
     let ambiguous = || format!("ambiguous option: {arg}");
     if arg.is_empty() { return Err(ambiguous()); }
@@ -311,23 +362,23 @@ pub fn canonical_name(arg: &str) -> Result<String, String> {
     };
     let name = if base.starts_with('@') { base } else {
         let base = OTHER_NAMES.iter().find(|(from, _)| *from == base).map_or(base, |(_, to)| to);
-        match DEFS.iter().find(|d| d.name == base) {
-            Some(d) => d.name,
-            None => {
-                let mut m = DEFS.iter().filter(|d| d.name.starts_with(base));
-                match (m.next(), m.next()) {
-                    (Some(d), None) => d.name,
-                    (Some(_), Some(_)) => return Err(ambiguous()),
-                    _ => return Err(format!("invalid option: {arg}")),
-                }
+        let mut found = None;
+        for n in DEFS.iter().map(|d| d.name).chain(HOOKS.iter().map(|h| h.0)) {
+            if n == base {
+                found = Some(n);
+                break;
+            }
+            if n.starts_with(base) {
+                if found.is_some() { return Err(ambiguous()); }
+                found = Some(n);
             }
         }
+        found.ok_or_else(|| format!("invalid option: {arg}"))?
     };
-    match key {
-        None => Ok(name.into()),
-        Some(_) if !def(name).is_some_and(|d| d.kind == Array) => Err(format!("not an array: {arg}")),
-        Some(k) => Ok(format!("{name}[{k}]")),
-    }
+    Ok(match key {
+        None => name.into(),
+        Some(k) => format!("{name}[{k}]"),
+    })
 }
 
 pub fn def(name: &str) -> Option<&'static OptDef> {
@@ -354,7 +405,7 @@ pub fn compare_names(a: &str, b: &str) -> std::cmp::Ordering {
 /// How show-options prints a value: string options go through args_escape;
 /// numbers, flags, choices, keys, colours and commands print raw.
 pub fn print_value(name: &str, value: &str) -> String {
-    if def(name).is_some_and(|d| matches!(d.kind, Num | Flag | Choice(_) | Key | Colour | Command) || d.name == "pane-colours") {
+    if hook_scope(name).is_some() || def(name).is_some_and(|d| matches!(d.kind, Num | Flag | Choice(_) | Key | Colour | Command) || d.name == "pane-colours") {
         return value.into();
     }
     escape_arg(value)
@@ -419,7 +470,27 @@ impl Options {
         self.0.get(name).map(String::as_str)
     }
     pub fn set(&mut self, name: &str, value: String) {
+        // Setting an element creates the array at this level (options_empty), so
+        // it stays, empty, once its last element is unset.
+        if let Some((base, _)) = name.split_once('[') && def(base).is_some_and(|d| d.kind == Array) && !self.0.contains_key(base) {
+            self.0.insert(base.to_string(), String::new());
+        }
         self.0.insert(name.to_string(), value);
+    }
+
+    /// Make this level hold the array `base` (possibly empty), like options_empty.
+    pub fn touch_array(&mut self, base: &str) {
+        if !self.has(base) { self.0.insert(base.to_string(), String::new()); }
+    }
+
+    /// The value this level holds, like options_get_only: an element of an array
+    /// this level holds is "" when unset, so the parent array is not consulted.
+    pub fn lookup(&self, name: &str) -> Option<&str> {
+        if let Some(v) = self.get(name) { return Some(v); }
+        match name.split_once('[') {
+            Some((base, _)) if self.has(base) => Some(""),
+            _ => None,
+        }
     }
     /// Whether this level holds the option itself (an array counts when it has
     /// any element or was assigned, even empty), like options_get_only.
@@ -462,15 +533,16 @@ impl Options {
         }
     }
 
+    /// set-option on a whole array: options_array_clear (unless appending), then
+    /// options_array_assign, which stops at the first bad element and keeps the
+    /// elements set before it.
     pub fn assign_array(&mut self, name: &str, value: &str, append: bool) -> Result<(), String> {
         let d = def(name).ok_or_else(|| format!("invalid option: {name}"))?;
-        let parts: Vec<_> = value.split(|c| d.array_separator().contains(c)).filter(|v| !v.is_empty()).collect();
-        // Validate before changing the store, so a bad palette leaves the array intact.
-        let parts: Vec<_> = parts.into_iter().map(|v| validate_array_value(d, v)).collect::<Result<_, _>>()?;
         if !append { self.unset(name); }
         self.set(name, String::new());
         let mut i = 0u32;
-        for value in parts {
+        for part in value.split(|c| d.array_separator().contains(c)).filter(|v| !v.is_empty()) {
+            let value = validate_array_value(d, part)?;
             while self.get(&format!("{name}[{i}]")).is_some() { i += 1; }
             self.set(&format!("{name}[{i}]"), value);
         }
@@ -502,17 +574,15 @@ pub fn validate(name: &str, value: Option<&str>, current: Option<&str>) -> Resul
     match def.kind {
         Flag => match value {
             None | Some("") => Ok(if current.is_some_and(is_on) { "off" } else { "on" }.into()),
-            Some(v) if ["on", "1", "yes", "true"].iter().any(|x| v.eq_ignore_ascii_case(x)) => Ok("on".into()),
-            Some(v) if ["off", "0", "no", "false"].iter().any(|x| v.eq_ignore_ascii_case(x)) => Ok("off".into()),
+            // options_from_string_flag: 1/0 exactly, on/yes and off/no in any case
+            Some(v) if v == "1" || ["on", "yes"].iter().any(|x| v.eq_ignore_ascii_case(x)) => Ok("on".into()),
+            Some(v) if v == "0" || ["off", "no"].iter().any(|x| v.eq_ignore_ascii_case(x)) => Ok("off".into()),
             Some(v) => Err(format!("bad value: {v}")),
         },
         Num => {
             let v = need()?;
-            let n = v.parse::<i64>().map_err(|_| format!("value is invalid: {v}"))?;
             let (min, max) = def.number_range();
-            if n < min { return Err(format!("value is too small: {v}")); }
-            if n > max { return Err(format!("value is too large: {v}")); }
-            Ok(n.to_string())
+            strtonum(v, min, max).map(|n| n.to_string()).map_err(|e| format!("value is {e}: {v}"))
         }
         Choice(choices) => {
             let v = match value {
@@ -523,8 +593,8 @@ pub fn validate(name: &str, value: Option<&str>, current: Option<&str>) -> Resul
                     choices[if i < 2 { 1 - i } else { i }]
                 }
             };
-            // pwsh-tmux also accepts the US spelling of centre
-            let v = if v == "center" { "centre" } else { v };
+            // pwsh-tmux also accepts the US spelling for status-justify
+            let v = if v == "center" && def.name == "status-justify" { "centre" } else { v };
             if choices.contains(&v) { Ok(v.to_string()) } else { Err(format!("unknown value: {v}")) }
         }
         Array => {
@@ -544,15 +614,10 @@ pub fn validate(name: &str, value: Option<&str>, current: Option<&str>) -> Resul
         }
         Key => {
             let v = need()?;
-            if v.eq_ignore_ascii_case("none") { return Ok("None".into()); }
-            crate::keys::parse_key_name(v).map(|k| crate::keys::key_name(&k))
-                .ok_or_else(|| format!("bad key: {v}"))
+            key_option_value(v).ok_or_else(|| format!("bad key: {v}"))
         }
-        Command => {
-            let v = need()?;
-            crate::cmdparse::parse(v)?;
-            Ok(v.into())
-        }
+        // parsed and printed by the server (aliases come from command-alias)
+        Command => Ok(need()?.into()),
         Str => {
             let v = need()?;
             // options-table.c pattern "[0-9]*x[0-9]*" (fnmatch)
@@ -719,38 +784,204 @@ fn normalize_colour(v: &str) -> Result<String, String> {
     Err(format!("bad colour: {v}"))
 }
 
-fn validate_style(v: &str) -> Result<(), String> {
-    // tmux defers validation of style strings containing formats until expansion.
-    if v.contains("#{") { return Ok(()); }
-    let mut words = Vec::new();
-    for word in v.split([',', ' ', '\n']).filter(|w| !w.is_empty()) {
-        let lower = word.to_ascii_lowercase();
-        if let Some((key, value)) = lower.split_once('=') {
-            match key {
-                "fg" | "bg" | "us" | "fill" => {
-                    if !valid_colour(value) { return Err(format!("invalid style: {v}")); }
-                    words.push(format!("{key}=default"));
-                    continue;
-                }
-                "width" | "pad" | "dim" => {
-                    let percent = value.ends_with('%');
-                    let raw = value.strip_suffix('%').unwrap_or(value);
-                    let max = if key == "dim" || (key == "width" && percent) { 100 } else { u32::MAX };
-                    if (percent && key == "pad") || !raw.parse::<u32>().is_ok_and(|n| n <= max) {
-                        return Err(format!("invalid style: {v}"));
-                    }
-                    continue;
-                }
-                "link" => continue,
-                "list" if !["on", "focus", "left-marker", "right-marker"].contains(&value) => return Err(format!("invalid style: {v}")),
-                _ => {}
-            }
-        }
-        if ["noattr", "ignore", "noignore", "set-default", "nolink"].contains(&lower.as_str()) { continue; }
-        words.push(lower);
+/// OpenBSD strtonum: strtoll (leading blanks and a sign are allowed), the whole
+/// string must be used; the error is "invalid", "too small" or "too large".
+pub fn strtonum(s: &str, min: i64, max: i64) -> Result<i64, &'static str> {
+    let t = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
+    if min > max || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("invalid");
     }
-    crate::format::parse_style(&words.join(","), crate::cells::Style::default())
-        .map(|_| ()).map_err(|_| format!("invalid style: {v}"))
+    match t.parse::<i64>() {
+        Ok(n) if n < min => Err("too small"),
+        Ok(n) if n > max => Err("too large"),
+        Ok(n) => Ok(n),
+        // strtoll clamps with ERANGE
+        Err(_) if t.starts_with('-') => Err("too small"),
+        Err(_) => Err("too large"),
+    }
+}
+
+// key_string_table names other than mouse keys, in table order (the first name
+// of a key is the one printed).
+const KEY_NAMES: &[&str] = &[
+    "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+    "IC", "Insert", "DC", "Delete", "Home", "End", "NPage", "PageDown", "PgDn", "PPage", "PageUp", "PgUp",
+    "BTab", "Space", "BSpace",
+    "Up", "Down", "Left", "Right",
+    "KP/", "KP*", "KP-", "KP7", "KP8", "KP9", "KP+", "KP4", "KP5", "KP6", "KP1", "KP2", "KP3", "KPEnter", "KP0", "KP.",
+];
+// C0 controls by code (Tab, Enter and Escape keep their names).
+const C0_NAMES: [&str; 32] = [
+    "[NUL]", "[SOH]", "[STX]", "[ETX]", "[EOT]", "[ENQ]", "[ASC]", "[BEL]", "[BS]", "Tab", "[LF]", "[VT]",
+    "[FF]", "Enter", "[SO]", "[SI]", "[DLE]", "[DC1]", "[DC2]", "[DC3]", "[DC4]", "[NAK]", "[SYN]", "[ETB]",
+    "[CAN]", "[EM]", "[SUB]", "Escape", "[FS]", "[GS]", "[RS]", "[US]",
+];
+const MOUSE_KINDS: &[&str] = &["MouseDown", "MouseUp", "MouseDrag", "MouseDragEnd", "SecondClick", "DoubleClick", "TripleClick"];
+const MOUSE_PLACES: &[&str] = &[
+    "Pane", "Status", "StatusLeft", "StatusRight", "StatusDefault", "ScrollbarUp", "ScrollbarSlider",
+    "ScrollbarDown", "Empty", "Border", "Control0", "Control1", "Control2", "Control3", "Control4",
+    "Control5", "Control6", "Control7", "Control8", "Control9",
+];
+
+/// Canonical name of a key_string_table entry (case-insensitive lookup).
+fn key_table_name(s: &str) -> Option<String> {
+    let lower = s.to_ascii_lowercase();
+    let alias = |a: &str, to: &'static str| (lower == a).then_some(to);
+    if let Some(n) = alias("insert", "IC").or_else(|| alias("delete", "DC")).or_else(|| alias("pagedown", "NPage"))
+        .or_else(|| alias("pgdn", "NPage")).or_else(|| alias("pageup", "PPage")).or_else(|| alias("pgup", "PPage")) {
+        return Some(n.into());
+    }
+    if let Some(n) = KEY_NAMES.iter().chain(C0_NAMES.iter()).find(|n| n.eq_ignore_ascii_case(s)) {
+        return Some((*n).into());
+    }
+    for kind in MOUSE_KINDS.iter().chain(["WheelUp", "WheelDown"].iter()) {
+        let Some(rest) = lower.strip_prefix(&kind.to_ascii_lowercase()) else { continue };
+        let (button, place) = if kind.starts_with("Wheel") { ("", rest) } else {
+            let n = rest.bytes().take_while(u8::is_ascii_digit).count();
+            (&rest[..n], &rest[n..])
+        };
+        if !kind.starts_with("Wheel") && !matches!(button, "1" | "2" | "3" | "6" | "7" | "8" | "9" | "10" | "11") { continue; }
+        if let Some(p) = MOUSE_PLACES.iter().find(|p| p.eq_ignore_ascii_case(place)) {
+            return Some(format!("{kind}{button}{p}"));
+        }
+    }
+    // sscanf("User%u") with at most KEYC_NUSER
+    let n = s.get(..4).filter(|p| *p == "User").map(|_| &s[4..])?;
+    let n = n.trim_start();
+    let digits = n.bytes().take_while(u8::is_ascii_digit).count();
+    n[..digits].parse::<u32>().ok().filter(|n| *n <= 1000).map(|n| format!("User{n}"))
+}
+
+/// A key option value as tmux stores and shows it: key_string_lookup_string
+/// followed by key_string_lookup_key. None for an unknown key.
+pub fn key_option_value(s: &str) -> Option<String> {
+    if s.eq_ignore_ascii_case("none") { return Some("None".into()); }
+    if s.eq_ignore_ascii_case("any") { return Some("Any".into()); }
+    // A key below 128 as tmux prints it.
+    let ascii = |b: u32| match b {
+        0..=31 => C0_NAMES[b as usize].to_string(),
+        32 => "Space".into(),
+        127 => "C-?".into(),
+        _ => char::from_u32(b).map(String::from).unwrap_or_default(),
+    };
+    if let Some(hex) = s.strip_prefix("0x") {
+        let hex = hex.trim_start();
+        let hex = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(hex);
+        let n = hex.bytes().take_while(u8::is_ascii_hexdigit).count();
+        let u = u32::from_str_radix(&hex[..n], 16).ok()?;
+        // from 32 up the character itself is the key (printed as is)
+        return if u < 32 { Some(ascii(u)) } else { char::from_u32(u).map(String::from) };
+    }
+    let mut mods = (false, false, false);
+    let mut rest = s;
+    if let Some(r) = s.strip_prefix('^') && !r.is_empty() {
+        let mut cs = r.chars();
+        if let (Some(c), None) = (cs.next(), cs.next()) {
+            let c = c.to_ascii_lowercase();
+            return Some(format!("C-{}", if (c as u32) < 128 { ascii(c as u32) } else { c.to_string() }));
+        }
+        mods.0 = true;
+        rest = r;
+    }
+    while rest.len() >= 2 && rest.as_bytes()[1] == b'-' {
+        match rest.as_bytes()[0] {
+            b'C' | b'c' => mods.0 = true,
+            b'M' | b'm' => mods.1 = true,
+            b'S' | b's' => mods.2 = true,
+            _ => return None,
+        }
+        rest = &rest[2..];
+    }
+    let mut chars = rest.chars();
+    let key = match (chars.next(), chars.next()) {
+        (None, _) => return None,
+        (Some(c), None) if (c as u32) < 32 => return None,
+        (Some(c), None) if (c as u32) < 128 => ascii(c as u32),
+        // a single UTF-8 character
+        (Some(c), None) => c.to_string(),
+        (Some(c), Some(_)) if !c.is_ascii() => return None,
+        _ => key_table_name(rest)?,
+    };
+    let prefix = format!("{}{}{}", if mods.0 { "C-" } else { "" }, if mods.1 { "M-" } else { "" }, if mods.2 { "S-" } else { "" });
+    Some(prefix + &key)
+}
+
+/// attributes_fromstring: attribute names separated by " ,|".
+fn valid_attributes(s: &str) -> bool {
+    const ATTRS: &[&str] = &[
+        "acs", "bright", "bold", "dim", "underscore", "blink", "reverse", "hidden", "italics", "strikethrough",
+        "double-underscore", "curly-underscore", "dotted-underscore", "dashed-underscore", "overline",
+    ];
+    let delim = |c: char| " ,|".contains(c);
+    if s.is_empty() || s.starts_with(delim) || s.ends_with(delim) { return false; }
+    if s.eq_ignore_ascii_case("default") || s.eq_ignore_ascii_case("none") { return true; }
+    s.split(delim).filter(|a| !a.is_empty()).all(|a| ATTRS.iter().any(|n| n.eq_ignore_ascii_case(a)))
+}
+
+/// One word of a style, checked like style_parse.
+fn valid_style_word(tok: &str) -> bool {
+    let lower = tok.to_ascii_lowercase();
+    let end = tok.len();
+    let num = |s: &str, max: i64| strtonum(s, 0, max).is_ok();
+    if matches!(lower.as_str(), "default" | "ignore" | "noignore" | "push-default" | "pop-default" | "set-default" | "nolist" | "norange" | "noalign" | "none") {
+        return true;
+    }
+    if let Some(v) = lower.strip_prefix("list=") {
+        return matches!(v, "on" | "focus" | "left-marker" | "right-marker");
+    }
+    if end > 6 && lower.starts_with("range=") {
+        let (kind, arg) = match tok[6..].split_once('|') {
+            Some((_, "")) => return false,
+            Some((k, a)) => (k.to_ascii_lowercase(), Some(a)),
+            None => (lower[6..].to_string(), None),
+        };
+        let numbered = |prefix: char| arg.and_then(|a| a.strip_prefix(prefix)).is_some_and(|n| !n.is_empty() && num(n, u32::MAX as i64));
+        return match kind.as_str() {
+            "left" | "right" => arg.is_none(),
+            "control" => arg.is_some_and(|a| num(a, 9)),
+            "pane" => numbered('%'),
+            "window" => arg.is_some_and(|a| num(a, u32::MAX as i64)),
+            "session" => numbered('$'),
+            "user" => arg.is_some(),
+            // other range types are ignored
+            _ => true,
+        };
+    }
+    if end > 6 && lower.starts_with("align=") {
+        return matches!(&lower[6..], "left" | "centre" | "right" | "absolute-centre");
+    }
+    if end > 5 && lower.starts_with("fill=") { return valid_colour(&tok[5..]); }
+    if end > 4 && lower.starts_with("dim=") {
+        return num(tok[4..].strip_suffix('%').unwrap_or(&tok[4..]), 100);
+    }
+    if end > 3 && lower.as_bytes()[1..3] == *b"g=" {
+        return matches!(lower.as_bytes()[0], b'f' | b'b') && valid_colour(&tok[3..]);
+    }
+    if end > 3 && lower.starts_with("us=") { return valid_colour(&tok[3..]); }
+    if end > 2 && lower.starts_with("no") {
+        return matches!(&tok[2..], "link" | "attr") || valid_attributes(&tok[2..]);
+    }
+    if end > 6 && lower.starts_with("width=") {
+        return match tok[6..].strip_suffix('%') {
+            Some(n) if end > 7 => num(n, 100),
+            _ => num(&tok[6..], u32::MAX as i64),
+        };
+    }
+    if end > 4 && lower.starts_with("pad=") { return num(&tok[4..], u32::MAX as i64); }
+    if lower.starts_with("link=") { return true; }
+    valid_attributes(tok)
+}
+
+/// Checks a style option like options_from_string_check: styles with formats
+/// are only parsed once expanded.
+fn validate_style(v: &str) -> Result<(), String> {
+    if v.contains("#{") { return Ok(()); }
+    if v.split([' ', ',', '\n']).filter(|w| !w.is_empty()).all(|w| w.len() < 256 && valid_style_word(w)) {
+        Ok(())
+    } else {
+        Err(format!("invalid style: {v}"))
+    }
 }
 
 #[cfg(test)]
@@ -834,7 +1065,7 @@ mod tests {
         assert!(validate("cursor-colour", Some("nonsense"), None).is_err());
         assert!(validate("pane-scrollbars-style", Some("width=oops"), None).is_err());
         assert!(validate("prefix", Some("bad-key"), None).is_err());
-        assert!(validate("default-client-command", Some("'unterminated"), None).is_err());
+        assert_eq!(validate("default-client-command", None, None).unwrap_err(), "empty value");
         assert_eq!(validate("cursor-colour", Some("#{@cursor}"), None).unwrap(), "#{@cursor}");
         assert_eq!(validate("pane-colours[10]", Some("IndianRed4"), None).unwrap(), "#8b3a3a");
         assert!(validate("pane-colours[0]", Some("colour256"), None).is_err());
@@ -844,9 +1075,12 @@ mod tests {
     fn tmux_38_arrays() {
         assert_eq!(canonical_name("pane-colours[0010]").unwrap(), "pane-colours[10]");
         assert_eq!(canonical_name("codepoint-widths[emoji]").unwrap(), "codepoint-widths[emoji]");
-        for name in ["mouse[0]", "pane-colours[]", "pane-colours[4294967296]", "pane-colours[1]tail", "pane-colours[1"] {
+        for name in ["pane-colours[]", "pane-colours[4294967296]", "pane-colours[1]tail", "pane-colours[1"] {
             assert!(canonical_name(name).is_err(), "{name}");
         }
+        // keys on scalar options are accepted here (show-options prints the value)
+        assert_eq!(canonical_name("mouse[0]").unwrap(), "mouse[0]");
+        assert!(is_array("pane-colours[1]") && is_array("after-new-window") && !is_array("mouse[0]") && !is_array("@x"));
         let mut o = Options::defaults(Server);
         o.assign_array("command-alias", "one=display-message a,two=display-message b", false).unwrap();
         assert_eq!(o.get("command-alias[0]"), Some("one=display-message a"));
@@ -863,8 +1097,76 @@ mod tests {
         let mut window = Options::defaults(Window);
         window.assign_array("pane-colours", "red blue,colour42", false).unwrap();
         assert_eq!(window.get("pane-colours[2]"), Some("colour42"));
-        assert!(window.assign_array("pane-colours", "bad-colour", false).is_err());
-        assert_eq!(window.get("pane-colours[0]"), Some("red"));
+        // like options_array_assign, elements before a bad one stay
+        assert_eq!(window.assign_array("pane-colours", "green,bad-colour,blue", false).unwrap_err(), "bad colour: bad-colour");
+        assert_eq!(window.array_items("pane-colours"), vec![("pane-colours[0]".to_string(), "green".to_string())]);
+    }
+
+    #[test]
+    fn tmux_38_empty_arrays() {
+        // an element set at a level creates the array there; it stays (empty)
+        // when the element goes and hides the parent's elements
+        let mut o = Options::default();
+        o.set("status-format[1]", "Y".into());
+        o.unset("status-format[1]");
+        assert!(o.has("status-format"));
+        assert!(o.array_items("status-format").is_empty());
+        assert_eq!(o.lookup("status-format[0]"), Some(""));
+        assert_eq!(o.lookup("status-left"), None);
+        o.unset("status-format");
+        assert!(!o.has("status-format"));
+        o.touch_array("pane-colours");
+        assert!(o.has("pane-colours"));
+    }
+
+    #[test]
+    fn tmux_38_value_parsing() {
+        // options_from_string_flag takes 1/0/on/off/yes/no only
+        for v in ["true", "false", "TRUE", "2"] {
+            assert_eq!(validate("mouse", Some(v), None).unwrap_err(), format!("bad value: {v}"));
+        }
+        assert_eq!(validate("mouse", Some("YES"), None).unwrap(), "on");
+        // strtonum skips leading blanks and takes a sign
+        assert_eq!(validate("base-index", Some(" 5"), None).unwrap(), "5");
+        assert_eq!(validate("base-index", Some("+6"), None).unwrap(), "6");
+        assert_eq!(validate("base-index", Some("7 "), None).unwrap_err(), "value is invalid: 7 ");
+        assert_eq!(validate("base-index", Some("-1"), None).unwrap_err(), "value is too small: -1");
+        assert_eq!(validate("base-index", Some("99999999999999999999"), None).unwrap_err(), "value is too large: 99999999999999999999");
+        // only status-justify takes the US spelling; errors show the value given
+        assert_eq!(validate("pane-border-lines", Some("center"), None).unwrap_err(), "unknown value: center");
+        assert_eq!(validate("status-justify", Some("center"), None).unwrap(), "centre");
+    }
+
+    #[test]
+    fn tmux_38_style_checks() {
+        for v in ["align=center", "range=user|", "range=user", "range=control|x", "range=control|10", "range=window|x",
+            "range=pane|x", "range=pane|%", "range=session|x", "range=left|x", "align=", "list=", "xg=red", "NOLINK",
+            "pad=-1", "width=101%", "dim=%", "bold|", "fg=nope"] {
+            assert_eq!(validate("status-style", Some(v), None).unwrap_err(), format!("invalid style: {v}"), "{v}");
+        }
+        for v in ["align=centre", "align=absolute-centre", "range=foo", "range=pane|%3", "range=session|$1", "range=window|2",
+            "range=control|9", "range=user|x", "range=right", "bold|italics", "nobold", "nolink", "dim=50%", "width=50%",
+            "Fg=Red", "fg=red bg=blue", "acs,none", "link=", "#{?x,align=center,}"] {
+            assert!(validate("status-style", Some(v), None).is_ok(), "{v}");
+        }
+    }
+
+    #[test]
+    fn tmux_38_key_options() {
+        // key_string_lookup_string then key_string_lookup_key
+        for (input, shown) in [
+            ("C-@", "C-@"), ("C-?", "C-?"), ("^?", "C-?"), ("^[", "C-["), ("M-S-a", "M-S-a"), ("MouseDown1Pane", "MouseDown1Pane"),
+            ("WheelUpStatus", "WheelUpStatus"), ("Any", "Any"), ("0x41", "A"), ("C-B", "C-B"), ("0x5", "[ENQ]"), ("0xe9", "é"),
+            ("M-F1", "M-F1"), ("pgup", "PPage"), ("User3", "User3"), ("Space", "Space"), ("^a", "C-a"), ("C-Space", "C-Space"),
+            ("M-C-x", "C-M-x"), ("Insert", "IC"), ("mousedown1pane", "MouseDown1Pane"), ("[nul]", "[NUL]"), ("none", "None"),
+            ("C-b", "C-b"),
+        ] {
+            assert_eq!(key_option_value(input).as_deref(), Some(shown), "{input}");
+        }
+        for bad in ["X-a", "C-", "User1001", "b-", "Bogus", "\x01"] {
+            assert_eq!(key_option_value(bad), None, "{bad}");
+        }
+        assert_eq!(validate("prefix2", Some("Bogus"), None).unwrap_err(), "bad key: Bogus");
     }
 
 
@@ -874,7 +1176,14 @@ mod tests {
         assert_eq!(canonical_name("display-panes-color").unwrap(), "display-panes-colour");
         assert_eq!(canonical_name("pane-colors[3]").unwrap(), "pane-colours[3]");
         assert_eq!(canonical_name("status").unwrap(), "status");
-        assert_eq!(canonical_name("@user[x]").unwrap_err(), "not an array: @user[x]");
+        assert_eq!(canonical_name("@user[x]").unwrap(), "@user[x]");
+        // hooks are in the table too, after the options
+        assert_eq!(canonical_name("pane-c").unwrap_err(), "ambiguous option: pane-c");
+        assert_eq!(canonical_name("com").unwrap_err(), "ambiguous option: com");
+        assert_eq!(canonical_name("after-new-w").unwrap(), "after-new-window");
+        assert_eq!(canonical_name("pane-colours").unwrap(), "pane-colours");
+        assert_eq!(hook_scope("pane-exited[2]"), Some(Pane));
+        assert_eq!(HOOKS.len(), 89);
         assert_eq!(canonical_name("status-l").unwrap_err(), "ambiguous option: status-l");
         assert_eq!(canonical_name("codepoint-widths[").unwrap_err(), "ambiguous option: codepoint-widths[");
         assert_eq!(canonical_name("no-such").unwrap_err(), "invalid option: no-such");

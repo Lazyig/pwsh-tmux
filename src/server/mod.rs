@@ -803,7 +803,7 @@ impl Server {
     }
     pub fn opt_session(&self, sid: Option<SessId>, name: &str) -> String {
         sid.and_then(|s| self.sessions.get(&s))
-            .and_then(|s| s.options.get(name))
+            .and_then(|s| s.options.lookup(name))
             .or_else(|| self.opts_session.get(name))
             .unwrap_or("")
             .to_string()
@@ -816,7 +816,7 @@ impl Server {
     }
     pub fn opt_window(&self, wid: Option<WinId>, name: &str) -> String {
         wid.and_then(|w| self.windows.get(&w))
-            .and_then(|w| w.options.get(name))
+            .and_then(|w| w.options.lookup(name))
             .or_else(|| self.opts_window.get(name))
             .unwrap_or("")
             .to_string()
@@ -828,7 +828,7 @@ impl Server {
         options::is_on(&self.opt_window(wid, name))
     }
     pub fn opt_pane(&self, pid: PaneId, name: &str) -> String {
-        if let Some(v) = self.panes.get(&pid).and_then(|p| p.options.get(name)) {
+        if let Some(v) = self.panes.get(&pid).and_then(|p| p.options.lookup(name)) {
             return v.to_string();
         }
         self.opt_window(self.window_of(pid), name)
@@ -1975,7 +1975,7 @@ impl Server {
 
     pub fn opt_array(&self, sid: Option<SessId>, name: &str) -> Vec<String> {
         let prefix = format!("{name}[");
-        let src = sid.and_then(|s| self.sessions.get(&s)).map(|s| &s.options).filter(|o| o.0.keys().any(|k| k.starts_with(&prefix))).unwrap_or(&self.opts_session);
+        let src = sid.and_then(|s| self.sessions.get(&s)).map(|s| &s.options).filter(|o| o.has(name)).unwrap_or(&self.opts_session);
         src.0.iter().filter(|(k, _)| k.starts_with(&prefix)).flat_map(|(_, v)| v.split_whitespace().map(String::from).collect::<Vec<_>>()).collect()
     }
 
