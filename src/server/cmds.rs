@@ -146,6 +146,22 @@ fn command_list_string(v: &str, aliases: &[String]) -> Result<String, String> {
     Ok(out.join(" ; "))
 }
 
+/// A stored command string (a key binding or hook) printed as cmd_list_print does:
+/// full command names, flags sorted, arguments escaped, { } blocks kept; commands are
+/// separated by ` \; ` when `escaped` (list-keys), else ` ; `. Strings that do not
+/// parse are shown as they are.
+pub fn print_command_string(v: &str, aliases: &[String], escaped: bool) -> String {
+    let Ok(cmds) = cmdparse::parse_blocks(v) else { return v.to_string() };
+    let mut out = Vec::new();
+    for c in cmds {
+        match print_parsed_command(c, aliases, true) {
+            Ok(c) => out.extend(c),
+            Err(_) => return v.to_string(),
+        }
+    }
+    out.join(if escaped { " \\; " } else { " ; " })
+}
+
 /// Whether positional argument `idx` of a command may be a { } block
 /// (ARGS_PARSE_COMMANDS_OR_STRING in the command's args_parse callback).
 fn takes_commands(cmd: &str, idx: usize, flags: &[char]) -> bool {
@@ -1744,7 +1760,7 @@ impl Server {
                 let generation = p.generation + 1;
                 let size = p.size;
                 let cwd = o.get('c').map(String::from).unwrap_or_else(|| p.start_path.clone());
-                let cmdv = if o.rest.is_empty() && !p.start_cmd.is_empty() && !o.has('E') { vec![p.start_cmd.clone()] } else { requested };
+                let cmdv = if o.rest.is_empty() && !p.track.argv.is_empty() && !o.has('E') { p.track.argv.clone() } else { requested };
                 self.spawn_into(pane, generation, tt.sid, size.0, size.1, &cmdv, Some(&cwd), &env)?;
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
@@ -2657,13 +2673,32 @@ impl Server {
                 let tt = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
                 let cid = o.get('c').map(|c| self.resolve_client(ctx, Some(c))).transpose()?
                     .or_else(|| ctx.client.filter(|id| self.clients.get(id).is_some_and(|c| c.attached)))
-                    .or_else(|| self.resolve_client(ctx, None).ok()).or(ctx.client);
+                    .or_else(|| self.resolve_client(ctx, None).ok());
+                // the formats use -c (or the current client) if it shows the target session,
+                // else the best client of that session, or of any if it has none attached
+                let fc = match tt.sid {
+                    Some(s) if cid.and_then(|c| self.clients.get(&c)).is_some_and(|c| c.session == Some(s)) => cid,
+                    Some(s) => {
+                        let attached = |c: &&Client| c.attached && c.session.is_some_and(|x| self.sessions.contains_key(&x));
+                        let on_s = self.clients.values().filter(attached).any(|c| c.session == Some(s));
+                        self.clients.values().filter(attached).filter(|c| !on_s || c.session == Some(s)).max_by_key(|c| (c.activity, c.id)).map(|c| c.id)
+                    }
+                    None => None,
+                };
+                // cmdq_merge_formats adds the command's name
+                let extra = HashMap::from([("command".to_string(), "display-message".to_string())]);
                 if o.has('a') && !o.has('j') {
                     let mut names: Vec<&str> = VAR_NAMES.to_vec();
                     names.sort();
-                    let vc = super::vars::VarCtx { srv: self, t: tt, client: cid, extra: HashMap::new() };
+                    let vc = super::vars::VarCtx { srv: self, t: tt, client: fc, extra: HashMap::new() };
+                    // format_each: the table (variables without a value are left out),
+                    // then the added entries
                     for n in names {
-                        let v = crate::format::Vars::get(&vc, n).unwrap_or_default();
+                        if let Some(v) = crate::format::Vars::get(&vc, n) {
+                            ctx.out.push_str(&format!("{n}={v}\n"));
+                        }
+                    }
+                    for (n, v) in &extra {
                         ctx.out.push_str(&format!("{n}={v}\n"));
                     }
                     return Ok(Flow::Next);
@@ -2678,7 +2713,9 @@ impl Server {
                 };
                 // -l: literal, -j: JSON printed back in tmux's form; -C (keep updating the
                 // pane) and -N (ignore keys) are how messages behave here anyway
-                let msg = if o.has('l') { fmt.to_string() } else { self.expand_time(tt, cid, fmt) };
+                let msg = if o.has('l') { fmt.to_string() } else {
+                    crate::format::expand_time(fmt, &super::vars::VarCtx { srv: self, t: tt, client: fc, extra })
+                };
                 let msg = if o.has('j') { json::normalize(&msg)? } else { msg };
                 let attached_client = cid.filter(|c| self.clients.get(c).is_some_and(|c| c.attached));
                 if o.has('p') || attached_client.is_none() {
@@ -2723,7 +2760,11 @@ impl Server {
                 let key = args.remove(0);
                 let kname = keys::parse_key_name(&key).map(|k| keys::key_name(&k)).unwrap_or(key.clone());
                 let table = if o.has('n') { "root".to_string() } else { o.get('T').unwrap_or("prefix").to_string() };
-                let command = if args.len() == 1 { args[0].clone() } else { args.iter().map(|a| if a == ";" { "\\;".into() } else { cmdparse::quote(a) }).collect::<Vec<_>>().join(" ") };
+                // separate arguments: ";" separates commands and "{" "}" delimit blocks, as
+                // cmd_parse_from_arguments treats them
+                let command = if args.len() == 1 { args[0].clone() } else {
+                    args.iter().map(|a| match a.as_str() { ";" => "\\;".into(), "{" | "}" => a.clone(), _ => cmdparse::quote(a) }).collect::<Vec<_>>().join(" ")
+                };
                 if command.is_empty() {
                     return err("bind-key needs a command");
                 }
@@ -2808,6 +2849,7 @@ impl Server {
                 let key_width = l.iter().map(|(_, k, _)| crate::format::width(k)).max().unwrap_or(0);
                 let table_width = l.iter().map(|(t, _, _)| crate::format::width(t)).max().unwrap_or(0);
                 let pad = |s: &str, w: usize| format!("{s}{}", " ".repeat(w.saturating_sub(crate::format::width(s))));
+                let aliases = self.command_aliases();
                 let mut lines = Vec::new();
                 for (table, key, b) in &l {
                     let line = match o.get('F') {
@@ -2822,14 +2864,14 @@ impl Server {
                                 ("key_prefix".to_string(), prefix.clone()),
                                 ("key_table".to_string(), table.to_string()),
                                 ("key_string".to_string(), key.to_string()),
-                                ("key_command".to_string(), b.cmd.clone()),
+                                ("key_command".to_string(), print_command_string(&b.cmd, &aliases, true)),
                             ]);
                             self.expand_extra(self.current(ctx), ctx.client, f, vars)
                         }
-                        None if notes_only => format!("{prefix} {} {}", pad(key, key_width), if b.note.is_empty() { &b.cmd } else { &b.note }),
+                        None if notes_only => format!("{prefix} {} {}", pad(key, key_width), if b.note.is_empty() { print_command_string(&b.cmd, &aliases, true) } else { b.note.clone() }),
                         None => {
                             let r = if !has_repeat { "" } else if b.repeat { "-r" } else { "  " };
-                            format!("bind-key {r} -T {} {} {}", pad(table, table_width), pad(&vis::args_escape(key), key_width), b.cmd)
+                            format!("bind-key {r} -T {} {} {}", pad(table, table_width), pad(&vis::args_escape(key), key_width), print_command_string(&b.cmd, &aliases, true))
                         }
                     };
                     if !line.is_empty() {
@@ -3107,20 +3149,23 @@ impl Server {
             "show-hooks" => {
                 let map = if o.has('g') { self.hooks.clone() } else { self.resolve_session(ctx, t).ok().map(|s| self.sessions[&s].hooks.clone()).unwrap_or_default() };
                 let ft = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
+                let aliases = self.command_aliases();
                 for (k, v) in map {
                     if o.rest.first().is_some_and(|n| n.split('[').next() != Some(k.as_str())) {
                         continue;
                     }
-                    for (i, c) in v.iter().enumerate().filter(|(_, c)| !c.is_empty()) {
+                    // hook[N] shows only that element
+                    let only: Option<usize> = o.rest.first().and_then(|n| n.split_once('[')).and_then(|(_, i)| i.trim_end_matches(']').parse().ok());
+                    for (i, c) in v.iter().enumerate().filter(|(i, c)| !c.is_empty() && only.is_none_or(|o| o == *i)) {
                         match o.get('F') {
                             Some(f) => {
                                 let vars = HashMap::from([
                                     ("option_name".to_string(), k.clone()),
-                                    ("option_value".to_string(), c.clone()),
+                                    ("option_value".to_string(), print_command_string(c, &aliases, false)),
                                     ("option_value_only".to_string(), "0".to_string()),
                                     ("option_is_parent".to_string(), "0".to_string()),
                                     ("option_is_array".to_string(), "1".to_string()),
-                                    ("option_is_string".to_string(), "1".to_string()),
+                                    ("option_is_string".to_string(), "0".to_string()),
                                     ("option_is_hook".to_string(), "1".to_string()),
                                     ("option_is_user".to_string(), (k.starts_with('@') as u8).to_string()),
                                     ("option_has_value".to_string(), "1".to_string()),
@@ -3131,7 +3176,7 @@ impl Server {
                                 ctx.out.push_str(&line);
                                 ctx.out.push('\n');
                             }
-                            None => ctx.out.push_str(&format!("{k}[{i}] {c}\n")),
+                            None => ctx.out.push_str(&format!("{k}[{i}] {}\n", print_command_string(c, &aliases, false))),
                         }
                     }
                 }
@@ -3761,7 +3806,10 @@ impl Server {
                 let def = options::def(base);
                 let is_hook = options::hook_scope(base).is_some();
                 let is_array = is_hook || def.is_some_and(|d| d.kind == options::Kind::Array);
-                let is_string = is_hook || def.is_none_or(|d| matches!(d.kind, options::Kind::Str | options::Kind::Style | options::Kind::Array));
+                // OPTIONS_IS_STRING: user options and string-typed ones (styles and string
+                // arrays), not commands (hooks), colours or numbers
+                let is_string = !is_hook && def.is_none_or(|d| matches!(d.kind, options::Kind::Str | options::Kind::Style)
+                    || (d.kind == options::Kind::Array && d.name != "pane-colours"));
                 let b = |v: bool| if v { "1".to_string() } else { "0".to_string() };
                 let vars = HashMap::from([
                     ("option_name".to_string(), base.to_string()),
@@ -3804,6 +3852,9 @@ impl Server {
                 None if o.has('A') => (self.hook_values(None, base).unwrap_or_default(), true),
                 None => return,
             };
+            // set-hook keeps the command as given; it is shown as tmux prints it
+            let aliases = self.command_aliases();
+            let values: Vec<String> = values.iter().map(|v| if v.is_empty() { String::new() } else { print_command_string(v, &aliases, false) }).collect();
             match key {
                 Some(k) => print(out, name, Some(k.parse::<usize>().ok().and_then(|i| values.get(i)).map_or("", String::as_str)), parent),
                 None if values.iter().all(String::is_empty) => print(out, base, None, parent && !named),
@@ -3949,8 +4000,20 @@ pub fn base64(data: &[u8]) -> String {
     out
 }
 
+/// paste_make_sample: the first 200 bytes vis-encoded, cut at 200 bytes with "..." when
+/// the buffer or its encoding is longer.
+pub fn buffer_sample(data: &[u8]) -> String {
+    const WIDTH: usize = 200;
+    let mut v = vis::strvis(&data[..data.len().min(WIDTH)], vis::OCTAL | vis::CSTYLE | vis::TAB | vis::NL);
+    if data.len() > WIDTH || v.len() > WIDTH {
+        v.truncate(WIDTH);
+        v.extend_from_slice(b"...");
+    }
+    String::from_utf8_lossy(&v).into_owned()
+}
+
 pub fn buffer_vars(b: &Buffer) -> HashMap<String, String> {
-    let sample: String = String::from_utf8_lossy(&b.data).chars().take(50).map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let sample = buffer_sample(&b.data);
     HashMap::from([
         ("buffer_name".to_string(), b.name.clone()),
         ("buffer_size".to_string(), b.data.len().to_string()),

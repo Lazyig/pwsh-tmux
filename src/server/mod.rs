@@ -305,7 +305,6 @@ pub struct Pane {
     pub killer: Option<Box<dyn ChildKiller + Send + Sync>>,
     pub size: (u16, u16),
     pub pid: Option<u32>,
-    pub start_cmd: String,
     pub start_path: String,
     pub title: String,
     pub dead: Option<(Option<i32>, u64)>,
@@ -1834,7 +1833,6 @@ impl Server {
             [one] => procinfo::via_shell(&shell, one),
             many => many.to_vec(),
         };
-        let start_cmd = cmd.join(" ");
         // tmux keeps the command given, else default-command; respawn without one keeps the old
         let start_argv = match cmd {
             [] if default_cmd.is_empty() => self.panes.get(&id).map(|p| p.track.argv.clone()).unwrap_or_default(),
@@ -1928,7 +1926,6 @@ impl Server {
                 killer,
                 size: (cols, rows),
                 pid,
-                start_cmd,
                 start_path: dir.clone(),
                 title,
                 dead: None,

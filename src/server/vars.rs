@@ -303,7 +303,8 @@ impl Vars for VarCtx<'_> {
             "session_grouped" => sess.map(|s| b(s.group.is_some())),
             "session_group" | "session_group_size" | "session_group_list" | "session_group_attached" => {
                 let s = sess?;
-                let Some(g) = s.group else { return Some(if name == "session_group_size" || name == "session_group_attached" { "0".into() } else { String::new() }) };
+                // no value outside a group
+                let g = s.group?;
                 let members: Vec<&Session> = srv.sessions.values().filter(|x| x.group == Some(g)).collect();
                 Some(match name {
                     // tmux names a group after its first session
@@ -391,7 +392,8 @@ impl Vars for VarCtx<'_> {
             }),
             // no floating panes yet, so never a modal one
             "window_modal_pane" => None,
-            "window_offset_x" | "window_offset_y" => Some("0".into()),
+            // only set while the client shows part of a larger window, which never happens here
+            "window_offset_x" | "window_offset_y" => None,
             "window_format" => Some(b(win.is_some())),
             // pane
             "pane_index" => win.zip(t.pane).and_then(|(w, p)| {
@@ -402,7 +404,8 @@ impl Vars for VarCtx<'_> {
             "pane_title" => pane.map(|p| p.title.clone()),
             "pane_current_path" => pane.map(|p| p.current_path.clone()),
             "pane_current_command" => pane.map(|p| p.current_cmd.clone()),
-            "pane_start_command" => pane.map(|p| p.start_cmd.clone()),
+            // cmd_stringify_argv: each argument escaped as args_print does
+            "pane_start_command" => pane.map(|p| p.track.argv.iter().map(|a| options::escape_arg(a)).collect::<Vec<_>>().join(" ")),
             "pane_start_path" => pane.map(|p| p.start_path.clone()),
             "pane_pid" => pane.and_then(|p| p.pid).map(|p| p.to_string()),
             // the pty's device on Unix; a ConPTY has no name
@@ -419,13 +422,14 @@ impl Vars for VarCtx<'_> {
             "pane_dead" => pane.map(|p| b(p.dead.is_some())),
             "pane_dead_status" => pane.and_then(|p| p.dead).and_then(|d| d.0).map(|s| s.to_string()),
             "pane_dead_time" => pane.and_then(|p| p.dead).map(|d| d.1.to_string()),
-            "pane_dead_signal" => Some(String::new()),
+            // the exit signal is not tracked, and only a signalled pane has one
+            "pane_dead_signal" => None,
             "pane_in_mode" => pane.map(|p| b(p.mode.is_some())),
-            "pane_mode" => pane.map(|p| match &p.mode {
-                Some(PaneMode::Copy(_)) => "copy-mode".into(),
-                Some(PaneMode::Clock) => "clock-mode".into(),
-                Some(PaneMode::Tree(_)) => "tree-mode".into(),
-                None => String::new(),
+            "pane_mode" => pane.and_then(|p| match &p.mode {
+                Some(PaneMode::Copy(_)) => Some("copy-mode".into()),
+                Some(PaneMode::Clock) => Some("clock-mode".into()),
+                Some(PaneMode::Tree(_)) => Some("tree-mode".into()),
+                None => None,
             }),
             "pane_synchronized" => t.pane.map(|p| b(options::is_on(&srv.opt_pane(p, "synchronize-panes")))),
             "pane_format" => Some(b(pane.is_some())),
