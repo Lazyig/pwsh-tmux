@@ -23,6 +23,15 @@ fn err<T>(s: impl Into<String>) -> Result<T, String> {
     Err(s.into())
 }
 
+/// The window row of a mouse row (below a top status line, or clamped above a bottom one).
+fn drag_row(m: &super::input::MouseCtx, v: u16) -> i32 {
+    (match m.statusat {
+        Some(0) if v >= m.statuslines => v - m.statuslines,
+        Some(at) if at > 0 && v >= at => at - 1,
+        _ => v,
+    }) as i32
+}
+
 /// tmux strtonum.
 fn strtonum(v: &str, lo: i64, hi: i64) -> Result<i64, String> {
     let n: i64 = v.trim().parse().map_err(|_| "invalid".to_string())?;
@@ -725,6 +734,12 @@ impl Server {
             ctx.out.push('\n');
         }
         ctx.pane = Some(new);
+        // -M: the new pane follows the drag that created it
+        if o.has('M') && floating {
+            if let (Some(cid), Some(m)) = (ctx.client, ctx.mouse.clone()) {
+                self.start_float_drag(cid, &m, new, false, true);
+            }
+        }
         if o.has('W') {
             // continued by finish_pane_waits when the command exits
             return Err(format!("\0pane-wait\0{new}"));
@@ -949,6 +964,105 @@ impl Server {
         self.mark_window_dirty(wid);
         self.run_hook(t.sid, "window-layout-changed", Ctx::default());
         Ok(Flow::Next)
+    }
+
+    /// Start dragging a floating pane from a mouse binding: resize-pane -M (`moving` false),
+    /// move-pane -M, or new-pane -M (`new`, sized from where the drag started).
+    pub fn start_float_drag(&mut self, cid: ClientId, m: &super::input::MouseCtx, pane: PaneId, moving: bool, new: bool) {
+        let Some(wid) = self.window_of(pane) else { return };
+        if !self.windows[&wid].is_floating(pane) || self.client_session(cid) != m.sid {
+            return;
+        }
+        let (lx, ly) = (m.lx as i32, drag_row(m, m.ly));
+        let kind = if new { DragKind::NewFloat { pane, x: lx, y: ly } } else { DragKind::Float { pane, moving } };
+        if !new {
+            self.set_active_pane(wid, pane);
+        }
+        if let Some(c) = self.clients.get_mut(&cid) {
+            c.drag = Some(Drag { kind });
+        }
+        self.float_drag_update(cid, m);
+    }
+
+    /// One mouse event of a floating pane drag (tmux cmd_resize_pane_mouse_resize_move_floating,
+    /// cmd_join_pane_mouse_move and cmd_split_window_mouse_resize).
+    pub fn float_drag_update(&mut self, cid: ClientId, m: &super::input::MouseCtx) {
+        let kind = match self.clients.get(&cid).and_then(|c| c.drag.as_ref()).map(|d| &d.kind) {
+            Some(DragKind::Float { pane, moving }) => (*pane, *moving, None),
+            Some(DragKind::NewFloat { pane, x, y }) => (*pane, false, Some((*x, *y))),
+            _ => return,
+        };
+        let (pane, moving, start) = kind;
+        let Some(wid) = self.window_of(pane).filter(|w| self.windows[w].is_floating(pane)) else {
+            if let Some(c) = self.clients.get_mut(&cid) {
+                c.drag = None;
+            }
+            return;
+        };
+        let (x, y, lx, ly) = (m.x as i32, drag_row(m, m.y), m.lx as i32, drag_row(m, m.ly));
+        let border = self.pane_lines(wid, pane) != "none";
+        let w = self.windows.get_mut(&wid).unwrap();
+        let Some(g) = w.layout.geom_mut(pane) else { return };
+        let old = *g;
+        let min = PANE_MIN as i32;
+        if let Some((dx, dy)) = start {
+            let b = i32::from(border);
+            let (mut sx, mut xoff) = if x >= dx { (x - dx + 1, dx + b) } else { (dx - x + 1, x + b) };
+            let (mut sy, mut yoff) = if y >= dy { (y - dy + 1, dy + b) } else { (dy - y + 1, y + b) };
+            if x < dx {
+                xoff = dx - sx + 1 + b;
+            }
+            if y < dy {
+                yoff = dy - sy + 1 + b;
+            }
+            if border {
+                sx = if sx <= 2 { min } else { sx - 2 };
+                sy = if sy <= 2 { min } else { sy - 2 };
+            }
+            *g = FGeom { x: xoff, y: yoff, w: sx.max(min) as u16, h: sy.max(min) as u16 };
+        } else if moving {
+            g.x += x - lx;
+            g.y += y - ly;
+        } else {
+            let (left, right, top, bottom) = (g.x - 1, g.x + g.w as i32, g.y - 1, g.y + g.h as i32);
+            let (gw, gh) = (g.w as i32, g.h as i32);
+            let at_left = lx == left || lx == left + 1;
+            let at_right = lx == right + 1 || lx == right;
+            if at_left && ly == top {
+                *g = FGeom { x: x + 1, y: y + 1, w: (gw + lx - x).max(min) as u16, h: (gh + ly - y).max(min) as u16 };
+            } else if at_right && ly == top {
+                *g = FGeom { y: y + 1, w: (x - g.x).max(min) as u16, h: (gh + ly - y).max(min) as u16, ..*g };
+            } else if at_left && ly == bottom {
+                if y - g.y < min {
+                    return;
+                }
+                *g = FGeom { x: x + 1, w: (gw + lx - x).max(min) as u16, h: (y - g.y) as u16, ..*g };
+            } else if at_right && ly == bottom {
+                *g = FGeom { w: (x - g.x).max(min) as u16, h: (y - g.y).max(min) as u16, ..*g };
+            } else if lx == right {
+                if x - g.x < min {
+                    return;
+                }
+                g.w = (x - g.x) as u16;
+            } else if lx == left {
+                if gw + lx - x < min {
+                    return;
+                }
+                *g = FGeom { x: x + 1, w: (gw + lx - x) as u16, ..*g };
+            } else if ly == bottom {
+                if y - g.y < min {
+                    return;
+                }
+                g.h = (y - g.y) as u16;
+            } else if ly == top {
+                // the top border moves the pane
+                *g = FGeom { x: g.x + x - lx, y: y + 1, ..*g };
+            }
+        }
+        if *g != old {
+            self.apply_layout(wid);
+            self.mark_window_dirty(wid);
+        }
     }
 
     /// select-layout with a layout string (tmux `layout_parse`).

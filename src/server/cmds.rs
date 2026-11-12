@@ -2002,7 +2002,14 @@ impl Server {
                 }
                 if o.has('M') {
                     if let Some(cid) = ctx.client {
-                        self.start_border_drag(cid, ctx.mouse.clone());
+                        // a floating pane under the mouse is resized (or moved by its top border)
+                        match ctx.mouse.clone() {
+                            Some(m) if self.mouse_pane(&m).is_some_and(|p| self.windows.get(&wid).is_some_and(|w| w.is_floating(p))) => {
+                                let p = self.mouse_pane(&m).unwrap();
+                                self.start_float_drag(cid, &m, p, false, false);
+                            }
+                            m => self.start_border_drag(cid, m),
+                        }
                     }
                     return Ok(Flow::Next);
                 }
@@ -2199,7 +2206,12 @@ impl Server {
                 let (dwid, dpane) = (dst.wid.unwrap(), dst.pane.unwrap());
                 if cmd == "move-pane" {
                     if o.has('M') {
-                        // dragging a floating pane needs the mouse event of a binding
+                        // drag the floating pane under the mouse (from a mouse binding)
+                        if let (Some(cid), Some(m)) = (ctx.client, ctx.mouse.clone()) {
+                            if let Some(p) = self.mouse_pane(&m) {
+                                self.start_float_drag(cid, &m, p, true, false);
+                            }
+                        }
                         return Ok(Flow::Next);
                     }
                     if ['P', 'z', 'X', 'Y', 'U', 'D', 'L', 'R'].into_iter().any(|c| o.has(c)) {

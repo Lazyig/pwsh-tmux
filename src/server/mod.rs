@@ -597,6 +597,11 @@ pub enum DragKind {
     Border,
     /// A copy-mode selection (copy-mode -M, begin-selection from the mouse).
     Copy { pane: PaneId },
+    /// A floating pane: resize-pane -M resizes it by a border or corner (moves it by the top
+    /// border), move-pane -M (`moving`) moves it.
+    Float { pane: PaneId, moving: bool },
+    /// new-pane -M: the new floating pane spans from where the drag started to the mouse.
+    NewFloat { pane: PaneId, x: i32, y: i32 },
 }
 
 /// Multi-click detection, as tmux's CLIENT_DOUBLECLICK / CLIENT_TRIPLECLICK and click timer.

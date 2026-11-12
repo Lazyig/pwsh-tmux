@@ -418,3 +418,28 @@ fn floating_and_modal_panes_on_screen() {
     t.mouse(0, 15, 8, true);
     wait_for("click selects the floating pane", || ctx.fmt("fu", "#{pane_id}") == f);
 }
+
+#[test]
+fn floating_panes_follow_mouse_drags() {
+    let ctx = Ctx::new("float-drag");
+    let t = start(&ctx, "fd");
+    ctx.ok(&["set", "-g", "mouse", "on"]);
+    ctx.ok(&["bind", "-n", "M-MouseDrag1Pane", "move-pane", "-M"]);
+    let f = ctx.ok(&["new-pane", "-P", "-F", "#{pane_id}", "-t", "fd", "-x", "30", "-y", "8", "-X", "10", "-Y", "5", "cat"]).trim().to_string();
+    t.wait_screen("floating pane", |s| s.contains('┌'));
+    // dragging the right border (column 39) resizes it (MouseDrag1Border runs resize-pane -M)
+    t.mouse(0, 39, 8, false);
+    t.mouse(32, 43, 8, false);
+    t.mouse(0, 43, 8, true);
+    wait_for("resized by the border", || ctx.fmt(&f, "#{pane_width}x#{pane_height} #{pane_x},#{pane_y}") == "32x6 11,6");
+    // the top border moves it
+    t.mouse(0, 20, 5, false);
+    t.mouse(32, 22, 7, false);
+    t.mouse(0, 22, 7, true);
+    wait_for("moved by the top border", || ctx.fmt(&f, "#{pane_x},#{pane_y}") == "13,8");
+    // M-drag inside moves it too (move-pane -M)
+    t.mouse(8, 20, 12, false);
+    t.mouse(40, 21, 11, false);
+    t.mouse(8, 21, 11, true);
+    wait_for("moved by move-pane -M", || ctx.fmt(&f, "#{pane_x},#{pane_y}") == "14,7");
+}

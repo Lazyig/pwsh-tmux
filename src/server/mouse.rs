@@ -502,12 +502,15 @@ impl Server {
     }
 
     fn mouse_drag_update(&mut self, cid: ClientId, m: &MouseCtx) {
-        match self.clients.get(&cid).and_then(|c| c.drag.as_ref()).map(|d| match d.kind {
-            DragKind::Border => None,
-            DragKind::Copy { pane } => Some(pane),
-        }) {
-            Some(None) => self.border_drag_update(cid, m),
-            Some(Some(_)) => self.copy_drag_update(m),
+        let kind = self.clients.get(&cid).and_then(|c| c.drag.as_ref()).map(|d| match d.kind {
+            DragKind::Border => 0,
+            DragKind::Copy { .. } => 1,
+            DragKind::Float { .. } | DragKind::NewFloat { .. } => 2,
+        });
+        match kind {
+            Some(0) => self.border_drag_update(cid, m),
+            Some(1) => self.copy_drag_update(m),
+            Some(_) => self.float_drag_update(cid, m),
             None => {}
         }
     }
