@@ -155,6 +155,13 @@ fn customize_mode_groups_changed_only_and_keys() {
     t.wait_screen("set prompt", |s| s.contains("(@mine) value-1"));
     t.send(b"\x15value-2\r");
     wait_for("set", || ctx.ok(&["show", "-gv", "@mine"]).trim() == "value-2");
+    // e edits the value with the editor option's program, in a popup
+    #[cfg(unix)]
+    {
+        ctx.ok(&["set", "-s", "editor", "sed -i s/value-2/value-3/"]);
+        t.send(b"e");
+        wait_for("edited", || ctx.ok(&["show", "-gv", "@mine"]).trim() == "value-3");
+    }
     t.send(b"C");
     t.wait_screen("all again", |s| s.contains("Server Options"));
     t.send(b"q");

@@ -1465,9 +1465,27 @@ impl Tree {
                         }
                         return;
                     }
+                    // window_client_draw: the active pane (or with -h, when that is this mode's
+                    // pane, the last one), a line, then the client's status lines
                     let t = Tree::client_target(srv, cl);
-                    if let Some(p) = t.pane {
-                        preview_into(srv, p, grid, x, y, sx, sy.saturating_sub(1).max(1));
+                    let mut pane = t.pane;
+                    if self.hide_this_pane && pane == Some(self.owner) {
+                        pane = t.wid.and_then(|w| srv.windows.get(&w)).and_then(|w| w.last_active);
+                    }
+                    let lines = srv.status_lines(t.sid) as usize;
+                    let lines = if lines >= sy { 0 } else { lines };
+                    let top = srv.opt_session(t.sid, "status-position") == "top";
+                    let at = if top { lines } else { 0 };
+                    if let Some(p) = pane {
+                        preview_into(srv, p, grid, x, y + at, sx, sy.saturating_sub(2 + lines));
+                    }
+                    let hy = if at != 0 { y + 2 } else { (y + sy).saturating_sub(1 + lines) };
+                    let owner_t = srv.target_for_pane(self.owner);
+                    let gc = mode_style(srv, &srv.opt_window(owner_t.wid, "tree-mode-border-style"), Style::default(), owner_t);
+                    for xx in 0..sx {
+                        if let Some(c) = grid.get_mut(hy).and_then(|r| r.get_mut(x + xx)) {
+                            *c = Cell { text: "─".into(), style: gc };
+                        }
                     }
                 }
             }

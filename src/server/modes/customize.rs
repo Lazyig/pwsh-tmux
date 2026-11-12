@@ -478,8 +478,9 @@ pub fn key(tree: &mut Tree, name: &str, srv: &Server, b: &mut Built) -> ModeActi
                 Item::Option { scope, .. } => *scope,
                 _ => Scope::Server,
             };
-            if let Some(command) = set_command(srv, &it, scope, "\u{1}") {
-                return ModeAction::Edit { value, command: command.replace("'\u{1}'", "'%%'").replace('\u{1}', "%%") };
+            // a placeholder quote() leaves alone stands for the edited text
+            if let Some(command) = set_command(srv, &it, scope, "PwshTmuxEditedValue") {
+                return ModeAction::Edit { value, command: command.replace("PwshTmuxEditedValue", "'%%'") };
             }
         }
         "a" => {
