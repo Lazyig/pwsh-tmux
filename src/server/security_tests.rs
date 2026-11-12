@@ -209,10 +209,7 @@ fn overlay_queue_waits_for_close_and_rechecks_access() {
     client.readonly = false;
     client.acl_readonly = false;
     client.overlay_epoch = 7;
-    client.overlay = Some(Overlay::DisplayPanes {
-        until: Instant::now() + Duration::from_secs(30),
-        template: String::new(),
-    });
+    client.overlay = Some(Overlay::Menu(super::modes::Menu::at(String::new(), vec![super::modes::MenuItem { name: "Item".into(), key: "i".into(), cmd: "display-message done".into() }], 0, 0, None, true, false, Some(0))));
     let queue = Queue {
         cmds: VecDeque::from([vec!["set-option".into(), "-g".into(), "@overlay-result".into(), "written".into()]]),
         ctx: Ctx { client: Some(1), ..Ctx::default() }, soft: 0,
@@ -236,9 +233,7 @@ fn replacing_overlay_resumes_the_previous_queue() {
     client.readonly = false;
     client.acl_readonly = false;
     client.overlay_epoch = 8;
-    client.overlay = Some(Overlay::DisplayPanes {
-        until: Instant::now() + Duration::from_secs(30), template: String::new(),
-    });
+    client.overlay = Some(Overlay::Menu(super::modes::Menu::at(String::new(), vec![super::modes::MenuItem { name: "Item".into(), key: "i".into(), cmd: "display-message done".into() }], 0, 0, None, true, false, Some(0))));
     srv.overlay_waits.push((1, 7, "display-menu".into(), Queue {
         cmds: VecDeque::from([vec!["set-option".into(), "-g".into(), "@overlay-result".into(), "written".into()]]),
         ctx: Ctx { client: Some(1), ..Ctx::default() }, soft: 0,
@@ -366,11 +361,11 @@ fn replacing_popup_with_other_overlays_releases_its_pane() {
         c.acl_readonly = false;
         c.attached = true;
         let pane = srv.spawn_pane(None, 20, 6, &[], None, &[]).unwrap();
-        srv.replace_overlay(1, Some(Overlay::Popup(Popup { pane, x: 0, y: 0, w: 22, h: 8, border: true, close_on_exit: false, title: String::new() }))).unwrap();
+        srv.replace_overlay(1, Some(Overlay::Popup(Popup { pane, x: 0, y: 0, w: 22, h: 8, border: true, close_on_exit: false, title: String::new(), editor: None }))).unwrap();
         pane
     };
     // like tmux, other overlays are not shown over a popup: it and its pane stay
-    for args in [&["display-panes", "-b"][..], &["display-menu", "Item", "i", "display-message done"][..]] {
+    for args in [&["display-menu", "Item", "i", "display-message done"][..]] {
         let (mut srv, _events) = fixture();
         let pane = popup(&mut srv);
         let epoch = srv.clients[&1].overlay_epoch;
@@ -383,7 +378,7 @@ fn replacing_popup_with_other_overlays_releases_its_pane() {
     // replacing the overlay directly releases the popup's pane
     let (mut srv, _events) = fixture();
     let pane = popup(&mut srv);
-    srv.replace_overlay(1, Some(Overlay::DisplayPanes { until: Instant::now(), template: String::new() })).unwrap();
+    srv.replace_overlay(1, Some(Overlay::Menu(super::modes::Menu::at(String::new(), vec![super::modes::MenuItem { name: "Item".into(), key: "i".into(), cmd: "display-message done".into() }], 0, 0, None, true, false, Some(0))))).unwrap();
     let released = !srv.panes.contains_key(&pane);
     srv.shutdown();
     assert!(released, "replaced popup left an orphan pane");

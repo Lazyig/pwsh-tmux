@@ -406,7 +406,13 @@ impl Server {
                     let (lines, cur) = cm.render_with_style(style);
                     Some((lines, Some((cur.1, cur.0))))
                 }
-                Some(PaneMode::Tree(t)) => Some((t.render(self, cr.w, cr.h), None)),
+                Some(PaneMode::Tree(t)) => {
+                    Some(t.render(self, cr.w, cr.h))
+                }
+                Some(PaneMode::Switch(s)) => {
+                    Some(s.render(self, cr.w, cr.h))
+                }
+                Some(PaneMode::Panes(m)) => Some((m.render(self, cr.w, cr.h), None)),
                 Some(PaneMode::Clock) => Some((Vec::new(), None)),
                 None => None,
             };
@@ -570,22 +576,6 @@ impl Server {
         // overlays
         if let Some(ov) = &c.overlay {
             match ov {
-                Overlay::DisplayPanes { .. } => {
-                    cursor = None;
-                    let colour = format::parse_color(&self.opt_window(Some(wid), "display-panes-colour")).unwrap_or(Color::Idx(4));
-                    let acolour = format::parse_color(&self.opt_window(Some(wid), "display-panes-active-colour")).unwrap_or(Color::Idx(1));
-                    let base = self.opt_window_num(Some(wid), "pane-base-index").max(0) as usize;
-                    for (i, (id, r)) in rects.iter().enumerate() {
-                        let col = if *id == win.active { acolour } else { colour };
-                        let label = (i + base).to_string();
-                        let rr = Rect { y: oy + r.y, ..*r };
-                        if !big_text(&mut f, rr, &label, col) {
-                            f.text(r.x + r.w / 2, oy + r.y + r.h / 2, &label, Style { fg: col, ..Style::default() }, r.right());
-                        }
-                        let size = format!("{}x{}", r.w, r.h);
-                        f.text(r.right().saturating_sub(size.len() as u16), oy + r.y, &size, Style { fg: col, ..Style::default() }, r.right());
-                    }
-                }
                 Overlay::Menu(m) => {
                     let ost = |name: &str, base: Style| self.style_option(&self.opt_window(Some(wid), name), base, active_target, Some(cid)).unwrap_or(base);
                     let st = ost("popup-style", Style::default());

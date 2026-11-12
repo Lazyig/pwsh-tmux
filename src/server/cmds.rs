@@ -1,6 +1,6 @@
 //! Command table, target resolution and the implementation of every command.
 
-use super::modes::{Menu, MenuItem, Popup, Tree, TreeKind};
+use super::modes::{Collapse, Menu, MenuItem, Panes, Popup, Preview, Sort, Switch, Tree, TreeKind};
 use super::vars::Target;
 use super::*;
 use crate::cmdparse;
@@ -18,21 +18,21 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("bind-key", "bind", "nr", "TN"),
     ("break-pane", "breakp", "abdP", "FnstL"),
     ("capture-pane", "capturep", "aCeFHIJLMNpPqRT", "bESt"),
-    ("choose-buffer", "", "NrZy", "FfKOt"),
-    ("choose-client", "", "iNrZy", "FfKOt"),
-    ("choose-tree", "", "GNrswZy", "FfKOt"),
+    ("choose-buffer", "", "kNrZy", "FfKOt"),
+    ("choose-client", "", "hikNrZy", "FfKOt"),
+    ("choose-tree", "", "GhkNrswZy", "FfKOt"),
     ("clear-history", "clearhist", "H", "t"),
     ("clear-prompt-history", "clearphist", "", "T"),
     ("clock-mode", "", "", "t"),
-    ("command-prompt", "", "1bCeFkilN", "IpTt"),
+    ("command-prompt", "", "1bCeFkilNP", "IpTt"),
     ("confirm-before", "confirm", "by", "cpt"),
     ("copy-mode", "", "deHMqSu", "st"),
-    ("customize-mode", "", "NZy", "Fft"),
+    ("customize-mode", "", "kNZy", "Fft"),
     ("delete-buffer", "deleteb", "", "b"),
     ("detach-client", "detach", "aP", "Esct"),
     ("display-menu", "menu", "MO", "bcCHstSTxy"),
     ("display-message", "display", "aCIjlNpv", "cdFt"),
-    ("display-panes", "displayp", "bN", "dt"),
+    ("display-panes", "displayp", "kNZ", "dst"),
     ("display-popup", "popup", "BCEkN", "bcdeHhsStTwxy"),
     ("find-window", "findw", "CiNrTZ", "t"),
     ("has-session", "has", "", "t"),
@@ -101,6 +101,7 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("swap-pane", "swapp", "dDUZ", "st"),
     ("swap-window", "swapw", "d", "st"),
     ("switch-client", "switchc", "EFlnprZ", "cOtT"),
+    ("switch-mode", "", "kswZ", "Ft"),
     ("unbind-key", "unbind", "anq", "T"),
     ("unlink-window", "unlinkw", "k", "t"),
     ("wait-for", "wait", "LSU", ""),
@@ -981,7 +982,23 @@ impl Server {
                 }
             }
             p.track.unseen_changes = false;
-            p.mode = None;
+            let Some(mode) = p.mode.take() else {
+                return;
+            };
+            // window_pane_reset_mode: unzoom if the mode zoomed, kill the pane for -k
+            if mode.zoomed_window() {
+                if let Some(wid) = self.window_of(pane) {
+                    let w = self.windows.get_mut(&wid).unwrap();
+                    if w.zoomed {
+                        w.zoomed = false;
+                        self.apply_layout(wid);
+                    }
+                }
+            }
+            if mode.kill_on_exit() {
+                self.kill_pane(pane);
+                return;
+            }
         }
         if let Some(wid) = self.window_of(pane) {
             self.mark_window_dirty(wid);
@@ -1073,7 +1090,7 @@ impl Server {
             return Ok(Flow::Next);
         }
         let full = canonical(name).ok_or_else(|| format!("unknown command: {name}"))?;
-        if matches!(full, "display-menu" | "display-popup" | "display-panes") && self.overlay_waits.len() >= 64 {
+        if matches!(full, "display-menu" | "display-popup") && self.overlay_waits.len() >= 64 {
             return err("too many waiting overlays");
         }
         let spec = COMMANDS.iter().find(|c| c.0 == full).unwrap();
@@ -1704,7 +1721,9 @@ impl Server {
                     _ => {
                         let pane = self.current(ctx).pane.ok_or("no pane")?;
                         let filter: Vec<WinId> = hits.iter().map(|i| self.sessions[&sid].links[i]).collect();
-                        self.open_tree(pane, TreeKind::Windows, None, Some(filter), o.has('Z'));
+                        let mut tree = Tree::new(TreeKind::Tree, pane, self.target_for_pane(pane));
+                        tree.win_filter = Some(filter);
+                        self.open_tree(pane, tree, o.has('Z'), ctx);
                         Ok(Flow::Next)
                     }
                 }
@@ -2433,18 +2452,6 @@ impl Server {
                 });
                 Ok(Flow::Next)
             }
-            "display-panes" => {
-                let cid = self.resolve_client(ctx, t)?;
-                // like tmux, nothing happens while another overlay is shown
-                if self.clients.get(&cid).is_some_and(|c| c.overlay.is_some()) {
-                    return Ok(Flow::Next);
-                }
-                let sid = self.client_session(cid);
-                let ms = o.get('d').and_then(|v| v.parse().ok()).unwrap_or_else(|| self.opt_window_num(sid.and_then(|s| self.sessions.get(&s)).map(|s| s.active_window()), "display-panes-time").max(1) as u64);
-                let template = o.rest.first().cloned().unwrap_or_else(|| "select-pane -t '%%'".into());
-                let epoch = self.replace_overlay(cid, Some(Overlay::DisplayPanes { until: Instant::now() + Duration::from_millis(ms), template }))?;
-                if o.has('b') { Ok(Flow::Next) } else { Ok(Flow::WaitOverlay(cid, epoch)) }
-            }
             // ---------------------------------------------------------------- modes
             "copy-mode" => {
                 let tt = self.resolve_pane(ctx, t)?;
@@ -2502,22 +2509,94 @@ impl Server {
             }
             "choose-tree" | "choose-buffer" | "choose-client" | "customize-mode" => {
                 let tt = self.resolve_pane(ctx, t)?;
+                let pane = tt.pane.unwrap();
                 let kind = match cmd {
                     "choose-buffer" => TreeKind::Buffers,
                     "choose-client" => TreeKind::Clients,
                     "customize-mode" => TreeKind::Options,
-                    _ if o.has('s') => TreeKind::Sessions,
-                    _ => TreeKind::Windows,
+                    _ => TreeKind::Tree,
                 };
-                let template = o.rest.first().cloned();
-                self.open_tree(tt.pane.unwrap(), kind, template, None, o.has('Z'));
-                // remember an attached client (a command-line client is gone by the time a
-                // choice is made)
-                if let Some(cid) = ctx.client.filter(|c| self.clients.get(c).is_some_and(|c| c.attached)) {
-                    if let Some(PaneMode::Tree(tr)) = self.panes.get_mut(&tt.pane.unwrap()).and_then(|p| p.mode.as_mut()) {
-                        tr.client = Some(cid);
-                    }
+                let order = match o.get('O') {
+                    Some(v) => Some(Sort::parse(v).ok_or("invalid sort order")?),
+                    None => None,
+                };
+                // like tmux, there is nothing to choose from without buffers or clients
+                if (kind == TreeKind::Buffers && self.buffers.is_empty()) || (kind == TreeKind::Clients && !self.clients.values().any(|c| c.attached)) {
+                    return Ok(Flow::Next);
                 }
+                if self.panes.get(&pane).and_then(|p| p.mode.as_ref()).is_some_and(|m| matches!(m, PaneMode::Tree(t) if t.kind == kind)) {
+                    return Ok(Flow::Next);
+                }
+                let mut tree = Tree::new(kind, pane, tt);
+                if let Some(t) = o.rest.first() {
+                    tree.command = t.clone();
+                }
+                if let Some(f) = o.get('F') {
+                    tree.format = f.to_string();
+                }
+                tree.key_format = o.get('K').map(String::from);
+                tree.filter = o.get('f').map(String::from);
+                tree.order = order;
+                tree.reversed = o.has('r');
+                tree.preview = match o.count('N') {
+                    0 => Preview::Normal,
+                    1 => Preview::Off,
+                    _ => Preview::Big,
+                };
+                tree.collapse = if o.has('s') { Collapse::Sessions } else if o.has('w') { Collapse::Windows } else { Collapse::None };
+                tree.squash_groups = !o.has('G');
+                tree.hide_this_pane = o.has('h');
+                tree.info = o.has('i') && kind == TreeKind::Clients;
+                tree.accept = o.has('y');
+                tree.kill = o.has('k');
+                self.open_tree(pane, tree, o.has('Z'), ctx);
+                Ok(Flow::Next)
+            }
+            "switch-mode" => {
+                let tt = self.resolve_pane(ctx, t)?;
+                let pane = tt.pane.unwrap();
+                if matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Switch(_))) {
+                    return Ok(Flow::Next);
+                }
+                let mut sw = Switch::new(pane, o.has('w'), o.get('F').map(String::from), o.rest.first().cloned());
+                sw.kill = o.has('k');
+                sw.client = self.ctx_mode_client(ctx);
+                if o.has('Z') {
+                    sw.zoomed = Some(self.zoom_for_mode(pane));
+                }
+                sw.snapshot(self, self.panes.get(&pane).map_or(0, |p| p.size.0 as usize));
+                self.set_pane_mode(pane, PaneMode::Switch(Box::new(sw)));
+                Ok(Flow::Next)
+            }
+            "display-panes" => {
+                let tt = self.resolve_pane(ctx, t)?;
+                let pane = tt.pane.unwrap();
+                let source = match o.get('s') {
+                    Some(s) => self.resolve_window(ctx, Some(s))?,
+                    None => tt,
+                };
+                let delay = match o.get('d') {
+                    Some(d) => options::strtonum(d, 0, u32::MAX as i64).map_err(|e| format!("delay {e}"))? as u64,
+                    None => self.opt_window_num(tt.wid, "display-panes-time").max(0) as u64,
+                };
+                if matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Panes(_))) {
+                    return Ok(Flow::Next);
+                }
+                let mut m = Panes {
+                    owner: pane,
+                    session: source.sid,
+                    source: source.wid.ok_or("no window")?,
+                    template: o.rest.first().cloned().unwrap_or_else(|| super::modes::PANES_DEFAULT_TEMPLATE.into()),
+                    until: (delay != 0).then(|| Instant::now() + Duration::from_millis(delay)),
+                    ignore_keys: o.has('N'),
+                    zoomed: None,
+                    kill: o.has('k'),
+                    client: self.ctx_mode_client(ctx),
+                };
+                if !o.has('Z') {
+                    m.zoomed = Some(self.zoom_for_mode(pane));
+                }
+                self.set_pane_mode(pane, PaneMode::Panes(Box::new(m)));
                 Ok(Flow::Next)
             }
             "display-menu" => {
@@ -2597,7 +2676,7 @@ impl Server {
                 let cwd = o.get('d').map(|d| self.expand(tt, Some(cid), d)).or_else(|| tt.pane.and_then(|p| self.panes.get(&p)).map(|p| p.current_path.clone()));
                 let pane = self.spawn_pane(tt.sid, iw.max(1), ih.max(1), &o.rest, cwd.as_deref(), &env)?;
                 let title = o.get('T').map(|s| self.expand(tt, Some(cid), s)).unwrap_or_default();
-                let epoch = self.replace_overlay(cid, Some(Overlay::Popup(Popup { pane, x, y, w, h, border, close_on_exit: o.has('E'), title })))?;
+                let epoch = self.replace_overlay(cid, Some(Overlay::Popup(Popup { pane, x, y, w, h, border, close_on_exit: o.has('E'), title, editor: None })))?;
                 Ok(Flow::WaitOverlay(cid, epoch))
             }
             // ---------------------------------------------------------------- prompts & messages
@@ -3892,22 +3971,44 @@ impl Server {
         Ok(())
     }
 
-    pub fn open_tree(&mut self, pane: PaneId, kind: TreeKind, template: Option<String>, filter: Option<Vec<WinId>>, zoom: bool) {
-        let tree = Tree::new(kind, template, filter, self, pane);
+    /// The attached client a mode acts for (a command-line client is gone by the time a
+    /// choice is made).
+    fn ctx_mode_client(&self, ctx: &Ctx) -> Option<ClientId> {
+        ctx.client.filter(|c| self.clients.get(c).is_some_and(|c| c.attached))
+    }
+
+    /// mode_tree_zoom and friends: zoom the window to the pane; whether it was zoomed already.
+    pub fn zoom_for_mode(&mut self, pane: PaneId) -> bool {
+        let Some(wid) = self.window_of(pane) else { return true };
+        let w = self.windows.get_mut(&wid).unwrap();
+        if w.zoomed {
+            return true;
+        }
+        if w.panes().len() > 1 {
+            w.active = pane;
+            w.zoomed = true;
+            self.apply_layout(wid);
+        }
+        false
+    }
+
+    /// Put a pane into a mode (window_pane_set_mode), replacing any other.
+    pub fn set_pane_mode(&mut self, pane: PaneId, mode: PaneMode) {
         if let Some(p) = self.panes.get_mut(&pane) {
-            p.mode = Some(PaneMode::Tree(Box::new(tree)));
+            p.mode = Some(mode);
         }
         if let Some(wid) = self.window_of(pane) {
-            if zoom {
-                let w = self.windows.get_mut(&wid).unwrap();
-                if w.panes().len() > 1 && !w.zoomed {
-                    w.active = pane;
-                    w.zoomed = true;
-                    self.apply_layout(wid);
-                }
-            }
             self.mark_window_dirty(wid);
         }
+    }
+
+    pub fn open_tree(&mut self, pane: PaneId, mut tree: Tree, zoom: bool, ctx: &Ctx) {
+        tree.client = self.ctx_mode_client(ctx);
+        if zoom {
+            tree.zoomed = Some(self.zoom_for_mode(pane));
+        }
+        tree.start(self);
+        self.set_pane_mode(pane, PaneMode::Tree(Box::new(tree)));
     }
 
     pub fn open_prompt(&mut self, cid: ClientId, kind: PromptKind, prompts: Vec<(String, String)>, template: String, pane: Option<PaneId>, numeric: bool, single: bool) {

@@ -1,6 +1,6 @@
 //! Client input: key tables, prompts, overlays, pane modes and the mouse.
 
-use super::modes::{MenuAction, TreeAction};
+use super::modes::{MenuAction, ModeAction};
 use super::*;
 use crate::copymode::Action;
 use crate::keys::{Input, Key, KeyCode};
@@ -309,26 +309,6 @@ impl Server {
                 self.menu_action(cid, action);
                 return;
             }
-            Some(Overlay::DisplayPanes { template, .. }) => {
-                let template = template.clone();
-                let c = self.clients.get_mut(&cid).unwrap();
-                c.overlay = None;
-                c.dirty = true;
-                if let KeyCode::Char(ch) = k.code {
-                    if let Some(d) = ch.to_digit(10) {
-                        if let Some(sid) = self.client_session(cid) {
-                            let wid = self.sessions[&sid].active_window();
-                            let base = self.opt_window_num(Some(wid), "pane-base-index").max(0) as u32;
-                            let panes = self.windows[&wid].panes();
-                            if let Some(p) = d.checked_sub(base).and_then(|i| panes.get(i as usize)) {
-                                let cmd = fill_template(&template, &[format!("%{p}")]);
-                                self.run_string(cid, &cmd, Some(*p));
-                            }
-                        }
-                    }
-                }
-                return;
-            }
             Some(Overlay::Popup(p)) => {
                 let pane = p.pane;
                 if self.panes.get(&pane).is_some_and(|x| x.dead.is_some()) {
@@ -443,50 +423,19 @@ impl Server {
         let Some(p) = self.panes.get_mut(&pane) else { return };
         match &mut p.mode {
             Some(PaneMode::Clock) => self.exit_mode(pane),
-            Some(PaneMode::Tree(_)) => {
-                let h = p.size.1 as usize;
-                let Some(PaneMode::Tree(mut tree)) = p.mode.take() else { return };
-                let action = tree.key(name, tree.list_height(h), self);
-                // the client that opened the tree, if it is still attached
-                let client = tree.client.filter(|c| self.clients.get(c).is_some_and(|c| c.attached)).or(cid);
-                match action {
-                    TreeAction::None => {
-                        self.panes.get_mut(&pane).unwrap().mode = Some(PaneMode::Tree(tree));
-                    }
-                    TreeAction::Cancel => {}
-                    TreeAction::Run(cmd) => {
-                        let kill = name == "x" || name == "X";
-                        if kill {
-                            self.panes.get_mut(&pane).unwrap().mode = Some(PaneMode::Tree(tree));
-                        }
-                        if let Some(c) = client {
-                            self.run_string(c, &cmd, Some(pane));
-                        } else {
-                            let cmds = crate::cmdparse::parse(&cmd).unwrap_or_default();
-                            self.run_queue(Queue { cmds: cmds.into(), ctx: Ctx { pane: Some(pane), ..Ctx::default() } , soft: 0 });
-                        }
-                        if kill {
-                            if let Some(PaneMode::Tree(mut t)) = self.panes.get_mut(&pane).and_then(|p| p.mode.take()) {
-                                t.rebuild(self);
-                                if let Some(p) = self.panes.get_mut(&pane) {
-                                    p.mode = Some(PaneMode::Tree(t));
-                                }
-                            }
-                        }
-                    }
+            Some(PaneMode::Tree(_) | PaneMode::Switch(_) | PaneMode::Panes(_)) => {
+                let (w, h) = (p.size.0 as usize, p.size.1 as usize);
+                let Some(mut mode) = p.mode.take() else { return };
+                let action = match &mut mode {
+                    PaneMode::Tree(t) => t.key(name, self, w, h),
+                    PaneMode::Switch(s) => s.key(name, self, w, h),
+                    PaneMode::Panes(m) => m.key(name, self),
+                    _ => ModeAction::None,
+                };
+                if let Some(p) = self.panes.get_mut(&pane) {
+                    p.mode = Some(mode);
                 }
-                // unzoom if the tree zoomed the window
-                if self.panes.get(&pane).is_some_and(|p| p.mode.is_none()) {
-                    if let Some(wid) = self.window_of(pane) {
-                        if self.windows[&wid].zoomed {
-                            self.windows.get_mut(&wid).unwrap().zoomed = false;
-                            self.apply_layout(wid);
-                        }
-                    }
-                }
-                if let Some(wid) = self.window_of(pane) {
-                    self.mark_window_dirty(wid);
-                }
+                self.mode_action(pane, cid, action);
             }
             Some(PaneMode::Copy(_)) => {
                 let vi = self.opt_window(self.window_of(pane), "mode-keys") == "vi";
@@ -512,6 +461,107 @@ impl Server {
         }
     }
 
+    /// The client a mode's commands run for: the one that opened it while it is attached.
+    fn mode_client(&self, pane: PaneId, cid: Option<ClientId>) -> Option<ClientId> {
+        let opened = match self.panes.get(&pane).and_then(|p| p.mode.as_ref()) {
+            Some(PaneMode::Tree(t)) => t.client,
+            Some(PaneMode::Switch(s)) => s.client,
+            Some(PaneMode::Panes(m)) => m.client,
+            _ => None,
+        };
+        opened.filter(|c| self.clients.get(c).is_some_and(|c| c.attached)).or(cid)
+    }
+
+    fn run_mode_command(&mut self, client: Option<ClientId>, cmd: &str, pane: PaneId) {
+        let pane = self.panes.contains_key(&pane).then_some(pane);
+        match client {
+            Some(c) => self.run_string(c, cmd, pane),
+            None => match crate::cmdparse::parse(cmd) {
+                Ok(cmds) => self.run_queue(Queue { cmds: cmds.into(), ctx: Ctx { pane, ..Ctx::default() }, soft: 0 }),
+                Err(e) => log(&format!("mode command: {e}")),
+            },
+        }
+    }
+
+    /// Carry out what a mode asked for after a key or a click.
+    pub fn mode_action(&mut self, pane: PaneId, cid: Option<ClientId>, action: ModeAction) {
+        let client = self.mode_client(pane, cid);
+        match action {
+            ModeAction::None => {}
+            ModeAction::Exit => self.exit_mode(pane),
+            ModeAction::Run(cmd) => {
+                // choosing a pane in panes mode unzooms its window (window_panes_key)
+                if matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Panes(_))) {
+                    if let Some(wid) = self.window_of(pane) {
+                        if self.windows[&wid].zoomed {
+                            self.windows.get_mut(&wid).unwrap().zoomed = false;
+                            self.apply_layout(wid);
+                        }
+                    }
+                }
+                // like tmux, the mode is gone before the queued command runs
+                self.exit_mode(pane);
+                self.run_mode_command(client, &cmd, pane);
+            }
+            ModeAction::RunKeep(cmd) => self.run_mode_command(client, &cmd, pane),
+            ModeAction::Edit { value, command } => {
+                if let Some(c) = client {
+                    if let Err(e) = self.open_editor(c, &value, command) {
+                        self.set_message(c, &e);
+                    }
+                }
+            }
+        }
+        if let Some(wid) = self.window_of(pane) {
+            self.mark_window_dirty(wid);
+        }
+    }
+
+    /// spawn_editor: edit `value` in the editor option's program, in a popup over the client;
+    /// `command` runs with %% replaced by the text when the editor exits successfully.
+    pub fn open_editor(&mut self, cid: ClientId, value: &str, command: String) -> Result<(), String> {
+        if self.clients.get(&cid).is_some_and(|c| c.overlay.is_some()) {
+            return Err("an overlay is already open".into());
+        }
+        let path = std::env::temp_dir().join(format!("tmux.{}.{}", std::process::id(), now_ms()));
+        let text = if value.is_empty() { "\n".to_string() } else { value.to_string() };
+        std::fs::write(&path, text).map_err(|e| format!("editor: {e}"))?;
+        let editor = self.opt_server("editor");
+        // the editor option names the program (notepad.exe on Windows); the file is one argument
+        let quoted = if cfg!(windows) { format!("\"{}\"", path.display()) } else { crate::cmdparse::quote(&path.display().to_string()) };
+        let cmd = format!("{editor} {quoted}");
+        let (cw, ch) = self.clients[&cid].size;
+        let (w, h) = ((cw as u32 * 9 / 10) as u16, (ch.saturating_sub(self.status_lines(self.client_session(cid))) as u32 * 9 / 10) as u16);
+        let (w, h) = (w.max(3), h.max(3));
+        let (x, y) = (cw / 2 - w / 2, ch / 2 - h / 2);
+        let sid = self.client_session(cid);
+        let pane = match self.spawn_pane(sid, w - 2, h - 2, &[cmd], Some(&std::env::temp_dir().display().to_string()), &[]) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                return Err(e);
+            }
+        };
+        let editor = Some(Box::new(super::modes::PopupEditor { path, command }));
+        self.replace_overlay(cid, Some(Overlay::Popup(super::modes::Popup { pane, x, y, w, h, border: true, close_on_exit: true, title: String::new(), editor })))?;
+        Ok(())
+    }
+
+    /// The editor popup closed: run its command with the new text (spawn_editor_finish).
+    pub fn editor_done(&mut self, cid: ClientId, ed: super::modes::PopupEditor, status: Option<i32>) {
+        let text = std::fs::read_to_string(&ed.path).ok();
+        let _ = std::fs::remove_file(&ed.path);
+        let Some(mut text) = text.filter(|_| status.unwrap_or(0) == 0) else { return };
+        if text.ends_with('\n') {
+            text.pop();
+            if text.ends_with('\r') {
+                text.pop();
+            }
+        }
+        let cmd = fill_template(&ed.command, &[text]);
+        self.run_string(cid, &cmd, None);
+    }
+
     pub fn copy_mode_command(&mut self, pane: PaneId, cid: Option<ClientId>, name: &str, args: &[String]) {
         // copy-pipe without a command uses copy-command
         let piped = name.starts_with("copy-pipe");
@@ -524,12 +574,15 @@ impl Server {
         };
         let run_args: Vec<String> = if piped && !args.is_empty() { args[1..].to_vec() } else { args.to_vec() };
         let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) else {
-            if let Some(PaneMode::Tree(_)) = self.panes.get(&pane).and_then(|p| p.mode.as_ref()) {
-                // tree mode understands a few -X commands
+            if self.panes.get(&pane).and_then(|p| p.mode.as_ref()).is_some_and(|m| !matches!(m, PaneMode::Clock)) {
+                // the other modes understand a few -X commands
                 let key = match name {
                     "cursor-up" => "Up",
                     "cursor-down" => "Down",
-                    "cancel" => "q",
+                    "cancel" => {
+                        self.exit_mode(pane);
+                        return;
+                    }
                     _ => "",
                 };
                 if !key.is_empty() {
@@ -774,7 +827,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "rename-session", "rename-window", "resize-pane", "resize-window", "respawn-pane", "respawn-window", "rotate-window", "run-shell", "save-buffer", "select-layout",
     "select-pane", "select-window", "send-keys", "send-prefix", "set-buffer", "set-environment", "set-hook", "set-option", "set-window-option", "show-buffer",
     "show-environment", "show-hooks", "show-messages", "show-options", "show-window-options", "source-file", "split-window", "start-server", "suspend-client",
-    "swap-pane", "swap-window", "switch-client", "unbind-key", "unlink-window", "wait-for",
+    "swap-pane", "swap-window", "switch-client", "switch-mode", "unbind-key", "unlink-window", "wait-for",
 ];
 
 #[cfg(test)]

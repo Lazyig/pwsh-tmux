@@ -135,11 +135,6 @@ impl Server {
                 }
                 true
             }
-            Some(Overlay::DisplayPanes { .. }) => {
-                c.overlay = None;
-                c.dirty = true;
-                false
-            }
             None => false,
         }
     }
@@ -422,7 +417,7 @@ impl Server {
     pub fn window_pane_mouse(&mut self, pane: PaneId, cid: Option<ClientId>, m: &MouseCtx) {
         let Some(p) = self.panes.get(&pane) else { return };
         match &p.mode {
-            Some(PaneMode::Tree(_)) => self.tree_mouse(pane, cid, m),
+            Some(PaneMode::Tree(_) | PaneMode::Switch(_) | PaneMode::Panes(_)) => self.tree_mouse(pane, cid, m),
             Some(PaneMode::Clock) => self.exit_mode(pane),
             Some(_) => {}
             None => {
@@ -441,29 +436,25 @@ impl Server {
         }
     }
 
-    /// mode_tree_key for mouse keys: clicks pick a line, a double click chooses it.
+    /// Mouse keys for the tree, switch and panes modes (their window_mode key callbacks).
     fn tree_mouse(&mut self, pane: PaneId, cid: Option<ClientId>, m: &MouseCtx) {
-        let Some((_, y)) = self.mouse_at(pane, m, false) else { return };
-        let height = self.pane_rect(pane).map(|r| r.h as usize).unwrap_or(1);
-        let mut choose = false;
-        if let Some(PaneMode::Tree(tr)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
-            let list_h = tr.list_height(height);
-            if (y as usize) > list_h {
-                return;
-            }
-            let top = tr.top.min(tr.sel).max((tr.sel + 1).saturating_sub(list_h));
-            let row = top + y as usize;
-            if row < tr.items.len() && matches!(m.key.as_str(), "MouseDown1Pane" | "MouseDown3Pane" | "DoubleClick1Pane") {
-                tr.sel = row;
-                tr.top = top;
-                choose = m.key == "DoubleClick1Pane";
-            }
+        if self.client_is_readonly(cid) {
+            return;
         }
-        if choose {
-            self.mode_key(pane, cid, "Enter");
-        } else if let Some(w) = self.window_of(pane) {
-            self.mark_window_dirty(w);
+        let Some((x, y)) = self.mouse_at(pane, m, false) else { return };
+        let Some(p) = self.panes.get_mut(&pane) else { return };
+        let (w, h) = (p.size.0, p.size.1);
+        let Some(mut mode) = p.mode.take() else { return };
+        let action = match &mut mode {
+            PaneMode::Tree(t) => t.mouse(&m.key, x, y, self, w as usize, h as usize),
+            PaneMode::Switch(s) => s.mouse(&m.key, x, y, self, w as usize, h as usize),
+            PaneMode::Panes(pm) => pm.mouse(&m.key, x, y, self, w, h),
+            _ => super::modes::ModeAction::None,
+        };
+        if let Some(p) = self.panes.get_mut(&pane) {
+            p.mode = Some(mode);
         }
+        self.mode_action(pane, cid, action);
     }
 
     fn mouse_drag_update(&mut self, cid: ClientId, m: &MouseCtx) {

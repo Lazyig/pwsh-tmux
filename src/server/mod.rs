@@ -294,6 +294,46 @@ pub enum PaneMode {
     Copy(Box<CopyMode>),
     Clock,
     Tree(Box<modes::Tree>),
+    Switch(Box<modes::Switch>),
+    Panes(Box<modes::Panes>),
+}
+
+impl PaneMode {
+    /// The mode's name, as pane_mode shows it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            PaneMode::Copy(_) => "copy-mode",
+            PaneMode::Clock => "clock-mode",
+            PaneMode::Tree(t) => match t.kind {
+                modes::TreeKind::Tree => "tree-mode",
+                modes::TreeKind::Buffers => "buffer-mode",
+                modes::TreeKind::Clients => "client-mode",
+                modes::TreeKind::Options => "options-mode",
+            },
+            PaneMode::Switch(_) => "switch-mode",
+            PaneMode::Panes(_) => "panes-mode",
+        }
+    }
+
+    /// -k: the pane is killed when the mode exits.
+    pub fn kill_on_exit(&self) -> bool {
+        match self {
+            PaneMode::Tree(t) => t.kill,
+            PaneMode::Switch(s) => s.kill,
+            PaneMode::Panes(p) => p.kill,
+            _ => false,
+        }
+    }
+
+    /// Whether the mode zoomed the window itself (so leaving it unzooms).
+    pub fn zoomed_window(&self) -> bool {
+        match self {
+            PaneMode::Tree(t) => t.zoomed == Some(false),
+            PaneMode::Switch(s) => s.zoomed == Some(false),
+            PaneMode::Panes(p) => p.zoomed == Some(false),
+            _ => false,
+        }
+    }
 }
 
 pub struct Pane {
@@ -525,7 +565,6 @@ pub struct Prompt {
 pub enum Overlay {
     Menu(modes::Menu),
     Popup(modes::Popup),
-    DisplayPanes { until: Instant, template: String },
 }
 
 pub struct RenderState {
@@ -1485,11 +1524,17 @@ impl Server {
                 p.dead = Some((status, now_secs()));
             }
             if close {
+                let mut editor = None;
                 if let Some(c) = self.clients.get_mut(&cid) {
-                    c.overlay = None;
+                    if let Some(Overlay::Popup(p)) = c.overlay.take() {
+                        editor = p.editor;
+                    }
                     c.dirty = true;
                 }
                 self.destroy_pane(id);
+                if let Some(ed) = editor {
+                    self.editor_done(cid, *ed, status);
+                }
             }
             return;
         }
@@ -1603,8 +1648,13 @@ impl Server {
             for d in [c.esc_deadline, c.repeat_until, c.message.as_ref().map(|m| m.1), c.click.deadline].into_iter().flatten() {
                 t = t.min(d.saturating_duration_since(now));
             }
-            if let Some(Overlay::DisplayPanes { until, .. }) = &c.overlay {
-                t = t.min(until.saturating_duration_since(now));
+        }
+        // display-panes closes by itself
+        for p in self.panes.values() {
+            if let Some(PaneMode::Panes(m)) = &p.mode {
+                if let Some(until) = m.until {
+                    t = t.min(until.saturating_duration_since(now));
+                }
             }
         }
         for d in self.animation_deadlines.borrow().values() {
@@ -1640,10 +1690,10 @@ impl Server {
                 c.message = None;
                 c.dirty = true;
             }
-            if matches!(&c.overlay, Some(Overlay::DisplayPanes { until, .. }) if *until <= now) {
-                c.overlay = None;
-                c.dirty = true;
-            }
+        }
+        let expired: Vec<PaneId> = self.panes.values().filter(|p| matches!(&p.mode, Some(PaneMode::Panes(m)) if m.until.is_some_and(|u| u <= now))).map(|p| p.id).collect();
+        for p in expired {
+            self.exit_mode(p);
         }
         if !self.copy_drag_timers.is_empty() {
             self.copy_drag_timers_due(now);
