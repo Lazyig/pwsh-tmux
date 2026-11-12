@@ -187,7 +187,9 @@ impl Vars for VarCtx<'_> {
             "host" => Some(srv.host.clone()),
             "host_short" => Some(srv.host.split('.').next().unwrap_or("").to_string()),
             "pid" => Some(std::process::id().to_string()),
-            "version" => Some(env!("CARGO_PKG_VERSION").into()),
+            // the tmux release this aims to match, so configs' version checks work
+            "version" => Some(TMUX_VERSION.into()),
+            "current_file" => srv.cur_file.clone(),
             "socket_path" => Some(ipc::describe()),
             "start_time" => Some(srv.start_time.to_string()),
             "server_sessions" => Some(srv.sessions.len().to_string()),

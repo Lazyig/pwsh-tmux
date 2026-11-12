@@ -541,7 +541,16 @@ pub struct Ctx {
     pub control_seq: Option<u64>,
     /// The originating request's restriction, retained across hooks and parked queues.
     pub readonly: bool,
+    /// Files being sourced (innermost last), for #{current_file}.
+    pub files: Vec<String>,
 }
+
+/// Queue markers source-file puts around a file's commands (never typed: they start with NUL).
+pub const FILE_PUSH: &str = "\0file-push";
+pub const FILE_POP: &str = "\0file-pop";
+
+/// The tmux release whose behaviour this server matches (`#{version}`).
+pub const TMUX_VERSION: &str = "3.8";
 
 pub struct Queue {
     pub cmds: VecDeque<Vec<String>>,
@@ -599,6 +608,8 @@ pub struct Server {
     pub delayed: Vec<(Instant, Queue)>,
     /// Mouse event of the command being run, for the mouse_* formats.
     pub cur_mouse: Option<input::MouseCtx>,
+    /// The file the running command came from (#{current_file}).
+    pub cur_file: Option<String>,
     pub marked: Option<PaneId>,
     pub start_time: u64,
     pub host: String,
@@ -727,6 +738,7 @@ impl Server {
             pane_info_busy: false,
             delayed: Vec::new(),
             cur_mouse: None,
+            cur_file: None,
             marked: None,
             start_time: now_secs(),
             host: procinfo::hostname(),
@@ -2131,10 +2143,20 @@ impl Server {
             let name = cmd.first().cloned().unwrap_or_default();
             let soft = q.soft > 0;
             q.soft = q.soft.saturating_sub(1);
+            if name == FILE_PUSH {
+                q.ctx.files.push(cmd.get(1).cloned().unwrap_or_default());
+                continue;
+            }
+            if name == FILE_POP {
+                q.ctx.files.pop();
+                continue;
+            }
             let delay_cmd = (name == "run-shell").then(|| cmd.clone());
             let saved_mouse = std::mem::replace(&mut self.cur_mouse, q.ctx.mouse.clone());
+            let saved_file = std::mem::replace(&mut self.cur_file, q.ctx.files.last().cloned());
             let result = self.exec(cmd, &mut q.ctx);
             self.cur_mouse = saved_mouse;
+            self.cur_file = saved_file;
             match result {
                 Ok(Flow::Inject(cmds, soft_errors)) => {
                     let n = cmds.len();

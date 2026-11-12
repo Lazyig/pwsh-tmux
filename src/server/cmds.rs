@@ -2660,8 +2660,15 @@ impl Server {
                             }
                             Err(e) => return err(format!("{f}: {e}")),
                         };
-                        let cond = |c: &str| truthy(&self.expand(self.current(ctx), ctx.client, c));
-                        let cmds = cmdparse::parse_with(&text, &cond).map_err(|e| format!("{f}:{e}"))?;
+                        // #{current_file} is this file while its %if lines are evaluated
+                        let saved_file = self.cur_file.replace(f.clone());
+                        let parsed = {
+                            let cond = |c: &str| truthy(&self.expand(self.current(ctx), ctx.client, c));
+                            let env = |n: &str| self.env.get(n).cloned().flatten();
+                            cmdparse::parse_with_env(&text, &cond, &env)
+                        };
+                        self.cur_file = saved_file;
+                        let cmds = parsed.map_err(|e| format!("{f}:{e}"))?;
                         if o.has('n') {
                             continue;
                         }
@@ -2672,7 +2679,10 @@ impl Server {
                         }
                         // Run the file's commands next in this queue (so async ones like
                         // run-shell work); errors are reported without stopping, like tmux.
+                        // The markers around them set #{current_file} while they run.
+                        injected.push(vec![FILE_PUSH.to_string(), f.clone()]);
                         injected.extend(cmds);
+                        injected.push(vec![FILE_POP.to_string()]);
                     }
                 }
                 Ok(Flow::Inject(injected, true))
@@ -3215,7 +3225,7 @@ fn glob_files(path: &str) -> Vec<String> {
 }
 
 pub const VAR_NAMES: &[&str] = &[
-    "host", "host_short", "pid", "version", "socket_path", "start_time", "session_name", "session_id", "session_windows", "session_attached", "session_created", "session_activity",
+    "host", "host_short", "pid", "version", "current_file", "socket_path", "start_time", "session_name", "session_id", "session_windows", "session_attached", "session_created", "session_activity",
     "session_path", "session_alerts", "window_index", "window_name", "window_id", "window_active", "window_flags", "window_panes", "window_zoomed_flag", "window_layout",
     "window_width", "window_height", "pane_index", "pane_id", "pane_title", "pane_current_path", "pane_current_command", "pane_pid", "pane_width", "pane_height", "pane_active",
     "pane_dead", "pane_in_mode", "pane_mode", "pane_left", "pane_top", "pane_right", "pane_bottom", "cursor_x", "cursor_y", "history_size", "history_limit", "alternate_on",

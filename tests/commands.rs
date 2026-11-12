@@ -382,6 +382,24 @@ fn keys_config_and_capture() {
     assert!(ctx.ok(&["list-keys", "-T", "root", "F5"]).contains("set -g @f5 pressed"));
     ctx.fails(&["source-file", "/no/such/file.conf"]);
     ctx.ok(&["source-file", "-q", "/no/such/file.conf"]);
+    // #{current_file} and assignments used by the next lines, as theme plugins
+    // (catppuccin) rely on: source -F "#{d:current_file}/${MOD}/x.conf"
+    let dir = std::env::temp_dir().join(format!("pt-cf-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(
+        dir.join("main.conf"),
+        "%hidden MOD=\"sub\"\nset -g @mod \"${MOD}\"\nsource -F \"#{d:current_file}/${MOD}/inner.conf\"\nset -gF @after \"#{b:current_file}\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("sub").join("inner.conf"),
+        "set -gF @inner \"#{b:current_file}\"\n%if \"#{==:#{b:current_file},inner.conf}\"\nset -g @inner_if yes\n%endif\n",
+    )
+    .unwrap();
+    ctx.ok(&["source-file", &dir.join("main.conf").to_string_lossy()]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(ctx.fmt("k", "#{@mod} #{@inner} #{@inner_if} #{@after}"), "sub inner.conf yes main.conf");
+    assert_eq!(ctx.fmt("k", "[#{current_file}] #{version}"), "[] 3.8");
     // send-keys variants and capture-pane
     ctx.wait_prompt("k");
     ctx.ok(&["send-keys", "-t", "k", "-l", "echo literal-Enter"]);

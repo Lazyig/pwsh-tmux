@@ -17,11 +17,22 @@ pub fn parse(input: &str) -> Result<Vec<Vec<String>>, String> {
 /// Like [`parse`], but `%if` / `%elif` conditions are evaluated by `cond`
 /// (which receives the condition text, e.g. an unexpanded format).
 pub fn parse_with(input: &str, cond: &dyn Fn(&str) -> bool) -> Result<Vec<Vec<String>>, String> {
+    parse_with_env(input, cond, &|name: &str| std::env::var(name).ok())
+}
+
+/// Like [`parse_with`], but `$NAME` / `${NAME}` are looked up with `env` (the server's
+/// global environment) instead of the process environment. As in tmux, a `NAME=value`
+/// or `%hidden NAME=value` line takes effect for the rest of the parse at once, so a
+/// later `${NAME}` in the same file sees it (the `set-environment` commands are still
+/// returned so the server's environment ends up the same).
+pub fn parse_with_env(input: &str, cond: &dyn Fn(&str) -> bool, env: &dyn Fn(&str) -> Option<String>) -> Result<Vec<Vec<String>>, String> {
     let normalized = input.replace("\r\n", "\n");
     let mut lx = Lexer {
         s: normalized.chars().collect(),
         pos: 0,
         line: 1,
+        env,
+        assigned: std::collections::HashMap::new(),
     };
     lx.run(cond)
 }
@@ -139,17 +150,21 @@ struct Frame {
     seen_else: bool,
 }
 
-struct Lexer {
+struct Lexer<'a> {
     s: Vec<char>,
     pos: usize,
     line: usize,
+    /// Variable lookup for `$NAME` (the server's global environment).
+    env: &'a dyn Fn(&str) -> Option<String>,
+    /// Assignments made earlier in this parse; they shadow `env`.
+    assigned: std::collections::HashMap<String, String>,
 }
 
 fn is_blank(c: Option<char>) -> bool {
     matches!(c, None | Some(' ') | Some('\t') | Some('\n'))
 }
 
-impl Lexer {
+impl Lexer<'_> {
     fn peek(&self) -> Option<char> {
         self.s.get(self.pos).copied()
     }
@@ -197,7 +212,7 @@ impl Lexer {
             let active = stack.last().is_none_or(|f| f.active);
             match c {
                 '\n' => {
-                    finish(&mut cmds, &mut cur, active);
+                    finish(&mut cmds, &mut cur, active, &mut self.assigned);
                     self.pos += 1;
                     self.line += 1;
                     line_start = true;
@@ -217,7 +232,7 @@ impl Lexer {
                     // `};` ends the command even without a following blank.
                     if self.peek() == Some(';') {
                         self.pos += 1;
-                        finish(&mut cmds, &mut cur, active);
+                        finish(&mut cmds, &mut cur, active, &mut self.assigned);
                     }
                 }
                 _ => {
@@ -226,14 +241,14 @@ impl Lexer {
                         cur.push((w.text, w.assign));
                     }
                     if w.ends_cmd {
-                        finish(&mut cmds, &mut cur, active);
+                        finish(&mut cmds, &mut cur, active, &mut self.assigned);
                     }
                 }
             }
             line_start = false;
         }
         let active = stack.last().is_none_or(|f| f.active);
-        finish(&mut cmds, &mut cur, active);
+        finish(&mut cmds, &mut cur, active, &mut self.assigned);
         if !stack.is_empty() {
             return Err(self.err(self.line, "missing %endif"));
         }
@@ -327,6 +342,7 @@ impl Lexer {
                 }
                 if active {
                     let (n, v) = words[0].0.split_once('=').unwrap();
+                    self.assigned.insert(n.to_string(), v.to_string());
                     cmds.push(vec![
                         "set-environment".into(),
                         "-gh".into(),
@@ -426,6 +442,10 @@ impl Lexer {
         Ok(text.trim().to_string())
     }
 
+    fn lookup(&self, name: &str) -> String {
+        self.assigned.get(name).cloned().or_else(|| (self.env)(name)).unwrap_or_default()
+    }
+
     /// Expand `$NAME` / `${NAME}` at `$`. Pushes a literal `$` if not a variable.
     fn expand_var(&mut self, out: &mut String) {
         self.pos += 1; // '$'
@@ -436,7 +456,7 @@ impl Lexer {
             }
             if end < self.s.len() && self.s[end] == '}' && end > self.pos + 1 {
                 let name: String = self.s[self.pos + 1..end].iter().collect();
-                out.push_str(&std::env::var(&name).unwrap_or_default());
+                out.push_str(&self.lookup(&name));
                 self.pos = end + 1;
                 return;
             }
@@ -454,7 +474,7 @@ impl Lexer {
         if name.is_empty() {
             out.push('$');
         } else {
-            out.push_str(&std::env::var(&name).unwrap_or_default());
+            out.push_str(&self.lookup(&name));
         }
     }
 
@@ -644,13 +664,14 @@ impl Lexer {
 
 /// Finish the current command: push it (if active and non-empty), mapping a
 /// lone `NAME=value` to `set-environment -g NAME value`.
-fn finish(cmds: &mut Vec<Vec<String>>, cur: &mut Vec<(String, bool)>, active: bool) {
+fn finish(cmds: &mut Vec<Vec<String>>, cur: &mut Vec<(String, bool)>, active: bool, assigned: &mut std::collections::HashMap<String, String>) {
     let words = std::mem::take(cur);
     if !active || words.is_empty() {
         return;
     }
     if words.len() == 1 && words[0].1 {
         let (n, v) = words[0].0.split_once('=').unwrap();
+        assigned.insert(n.to_string(), v.to_string());
         cmds.push(vec![
             "set-environment".into(),
             "-g".into(),
@@ -756,6 +777,30 @@ mod tests {
             ])]
         );
         assert_eq!(p(r#"a "\$CMDPARSE_T1""#), vec![v(&["a", "$CMDPARSE_T1"])]);
+    }
+
+    #[test]
+    fn assignments_apply_during_the_parse() {
+        let env = |n: &str| (n == "OUTER").then(|| "from-server".to_string());
+        let pe = |s: &str| parse_with_env(s, &|c: &str| !c.is_empty() && c != "0", &env).unwrap();
+        // tmux: an assignment is visible to ${NAME} on the following lines at once
+        assert_eq!(
+            pe("%hidden MOD=\"session\"\nset -g \"@ctp_${MOD}_icon\" x\nA=1\nset @a $A ; B=2 ; set @b ${B}${OUTER}"),
+            vec![
+                v(&["set-environment", "-gh", "MOD", "session"]),
+                v(&["set", "-g", "@ctp_session_icon", "x"]),
+                v(&["set-environment", "-g", "A", "1"]),
+                v(&["set", "@a", "1"]),
+                v(&["set-environment", "-g", "B", "2"]),
+                v(&["set", "@b", "2from-server"]),
+            ]
+        );
+        // a later assignment replaces an earlier one; inactive branches assign nothing
+        assert_eq!(pe("A=1\nA=2\nset @a $A")[2], v(&["set", "@a", "2"]));
+        assert_eq!(pe("%if 0\n%hidden C=no\nD=no\n%endif\nset @c [$C$D]"), vec![v(&["set", "@c", "[]"])]);
+        // the lookup is the server's environment, not the process's
+        unsafe { std::env::set_var("CMDPARSE_PROC_ONLY", "proc") };
+        assert_eq!(pe("set @p [$CMDPARSE_PROC_ONLY]"), vec![v(&["set", "@p", "[]"])]);
     }
 
     #[test]
