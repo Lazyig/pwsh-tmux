@@ -45,6 +45,58 @@ fn options_and_formats() {
 }
 
 #[test]
+fn tmux_38_options_scopes_arrays_and_choices() {
+    let ctx = Ctx::new("opts38");
+    ctx.ok(&["new-session", "-d", "-s", "o"]);
+    assert_eq!(ctx.ok(&["show", "-sv", "theme"]).trim(), "detect");
+    ctx.ok(&["set", "-s", "theme", "light"]);
+    assert_eq!(ctx.ok(&["show", "-sv", "theme"]).trim(), "light");
+    ctx.fails(&["set", "-s", "theme", "auto"]);
+    assert!(ctx.ok(&["show", "-gv", "status-format[1]"]).contains("#{P:"));
+    ctx.ok(&["set", "-gw", "pane-border-status", "top-floating"]);
+    ctx.ok(&["set", "-p", "-t", "o", "cursor-style", "bar"]);
+    assert_eq!(ctx.ok(&["show", "-pv", "-t", "o", "cursor-style"]).trim(), "bar");
+    assert_eq!(ctx.ok(&["show", "-gwv", "cursor-style"]).trim(), "default");
+    ctx.ok(&["set", "-g", "pane-scrollbars", "auto-hide"]);
+    assert_eq!(ctx.ok(&["show", "-gwv", "pane-scrollbars"]).trim(), "auto-hide");
+    ctx.ok(&["set", "-gw", "pane-colours[0010]", "red"]);
+    assert_eq!(ctx.ok(&["show", "-gwv", "pane-colours[10]"]).trim(), "red");
+    ctx.fails(&["set", "-gw", "pane-colours[2]", "bad-colour"]);
+    ctx.ok(&["set", "-s", "codepoint-widths[emoji]", "U+1F600=2"]);
+    assert_eq!(ctx.ok(&["show", "-sv", "codepoint-widths[emoji]"]).trim(), "U+1F600=2");
+    ctx.ok(&["set", "-s", "command-alias", "one=display-message hello,two=list-sessions"]);
+    assert_eq!(ctx.ok(&["show", "-sv", "command-alias[0]"]).trim(), "one=display-message hello");
+    ctx.ok(&["set", "-su", "command-alias[0]"]);
+    ctx.ok(&["set", "-sa", "command-alias", "three=list-windows"]);
+    assert_eq!(ctx.ok(&["show", "-sv", "command-alias[0]"]).trim(), "three=list-windows");
+    ctx.ok(&["set", "-sgu", "command-alias"]);
+    assert_eq!(ctx.ok(&["show", "-sv", "command-alias[0]"]).trim(), "split-pane=split-window");
+    ctx.fails(&["set", "-g", "mouse[0]", "on"]);
+    ctx.fails(&["show", "-s", "codepoint-widths[]"]);
+    // names: unique prefixes and old -color spellings, like options_match
+    ctx.ok(&["set", "-g", "display-panes-color", "red"]);
+    assert_eq!(ctx.ok(&["show", "-gw", "display-panes-col"]).trim(), "display-panes-colour red");
+    assert!(ctx.fails(&["set", "-g", "status-l", "x"]).contains("ambiguous option"));
+    // -a appends to this level only; styles get a comma
+    ctx.ok(&["set", "-at", "o", "status-left", "X"]);
+    assert_eq!(ctx.ok(&["show", "-t", "o", "status-left"]).trim(), "status-left X");
+    ctx.ok(&["set", "-ag", "status-style", "fg=red"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "status-style"]).trim(), "bg=themegreen,fg=themeblack,fg=red");
+    // an array set on a session does not copy the global elements
+    ctx.ok(&["set", "-t", "o", "status-format[1]", "X"]);
+    assert_eq!(ctx.ok(&["show", "-t", "o", "status-format"]).trim(), "status-format[1] X");
+    assert!(ctx.ok(&["show", "-A", "-t", "o"]).contains("mouse* on\n"));
+    // listings follow the tmux table order, user options first
+    ctx.ok(&["set", "-s", "@z", "1"]);
+    let all = ctx.ok(&["show", "-s"]);
+    assert!(all.starts_with("@z 1\nbackspace C-?\nbuffer-limit 50\nclear-on-attach on\ncommand-alias[0]"), "{all}");
+    assert!(all.find("\ntheme light").unwrap() < all.find("dark-theme-black").unwrap());
+    ctx.ok(&["set", "-s", "default-client-command", "new -A"]);
+    assert_eq!(ctx.ok(&["show", "-sv", "default-client-command"]).trim(), "new-session -A");
+    assert!(ctx.fails(&["set", "-g", "status-left"]).contains("empty value"));
+}
+
+#[test]
 fn buffers_and_paste() {
     let ctx = Ctx::new("buf");
     ctx.ok(&["new-session", "-d", "-s", "b"]);

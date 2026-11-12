@@ -110,6 +110,17 @@ pub fn canonical(name: &str) -> Option<&'static str> {
     if m.len() == 1 { Some(m[0].0) } else { None }
 }
 
+/// Store a command option the way tmux prints its parsed list: full command
+/// names, escaped arguments, commands joined by " ; ". Unknown names (aliases)
+/// are kept as written.
+fn canonical_command_list(v: &str) -> Result<String, String> {
+    let cmds = cmdparse::parse(v)?;
+    Ok(cmds.iter().filter(|c| !c.is_empty()).map(|c| {
+        let name = canonical(&c[0]).map_or_else(|| options::escape_arg(&c[0]), String::from);
+        std::iter::once(name).chain(c[1..].iter().map(|a| options::escape_arg(a))).collect::<Vec<_>>().join(" ")
+    }).collect::<Vec<_>>().join(" ; "))
+}
+
 fn err<T>(s: impl Into<String>) -> Result<T, String> {
     Err(s.into())
 }
@@ -2943,92 +2954,86 @@ impl Server {
         std::path::Path::new(&base).join(p).to_string_lossy().into_owned()
     }
 
-    fn cmd_set_option(&mut self, window_cmd: bool, o: &Opts, ctx: &Ctx) -> Result<(), String> {
-        let name = o.rest.first().ok_or("set-option needs an option name")?.clone();
-        let value = o.rest.get(1).map(|v| if o.has('F') { self.expand(self.current(ctx), ctx.client, v) } else { v.clone() });
-        let scope = if o.has('s') {
-            Scope::Server
-        } else if o.has('p') {
-            Scope::Pane
-        } else if o.has('w') || window_cmd {
-            Scope::Window
-        } else {
-            match options::natural_scope(&name) {
-                Some(s) => s,
-                None if o.has('q') => return Ok(()),
-                None => return err(format!("invalid option: {name}")),
-            }
-        };
-        if !name.starts_with('@') {
-            let def = options::def(&name).ok_or_else(|| format!("invalid option: {name}"))?;
-            let ok = def.scope == scope || (def.scope == Scope::Pane && scope == Scope::Window) || (window_cmd && def.scope == Scope::Pane);
-            if !ok && !o.has('q') {
-                return err(format!("invalid option: {name}"));
-            }
+    /// Scope for an option name like options_scope_from_name: table options use
+    /// their own scope (-p selects the pane level of window+pane options); user
+    /// options and listings without a name follow -s/-p/-w.
+    fn option_scope(window_cmd: bool, o: &Opts, name: Option<&str>) -> Scope {
+        match name.filter(|n| !n.starts_with('@')).and_then(options::def) {
+            Some(d) if d.scope == Scope::Pane && o.has('p') => Scope::Pane,
+            Some(d) => options::natural_scope(d.name).unwrap_or(d.scope),
+            None if o.has('s') => Scope::Server,
+            None if o.has('p') => Scope::Pane,
+            None if o.has('w') || window_cmd => Scope::Window,
+            None => Scope::Session,
         }
-        let global = o.has('g');
-        let t = o.get('t');
-        // locate the option store
-        let tt = match scope {
-            Scope::Server => Target::default(),
-            Scope::Session => {
-                if global {
-                    Target::default()
-                } else {
-                    Target { sid: Some(self.resolve_session(ctx, t)?), ..Target::default() }
-                }
-            }
-            Scope::Window => {
-                if global {
-                    Target::default()
-                } else {
-                    self.resolve_window(ctx, t)?
-                }
-            }
+    }
+
+    fn option_target(&self, scope: Scope, global: bool, ctx: &Ctx, t: Option<&str>) -> Result<Target, String> {
+        Ok(match scope {
+            Scope::Session if !global => Target { sid: Some(self.resolve_session(ctx, t)?), ..Target::default() },
+            Scope::Window if !global => self.resolve_window(ctx, t)?,
             Scope::Pane => self.resolve_pane(ctx, t)?,
+            _ => Target::default(),
+        })
+    }
+
+    /// Resolve the option argument (format-expanded, like tmux); None means -q swallowed an error.
+    fn option_name(&self, o: &Opts, ctx: &Ctx, arg: &str) -> Result<Option<String>, String> {
+        let arg = if arg.contains('#') { self.expand(self.current(ctx), ctx.client, arg) } else { arg.to_string() };
+        match options::canonical_name(&arg) {
+            Ok(n) => Ok(Some(n)),
+            Err(e) if o.has('q') && !e.starts_with("not an array") => Ok(None),
+            Err(e) => err(e),
+        }
+    }
+
+    fn cmd_set_option(&mut self, window_cmd: bool, o: &Opts, ctx: &Ctx) -> Result<(), String> {
+        let Some(name) = self.option_name(o, ctx, o.rest.first().ok_or("missing argument")?)? else { return Ok(()) };
+        let value = o.rest.get(1).map(|v| if o.has('F') { self.expand(self.current(ctx), ctx.client, v) } else { v.clone() });
+        let scope = Self::option_scope(window_cmd, o, Some(&name));
+        // -g has no meaning for server options and is ignored with -p
+        let global = scope == Scope::Server || (o.has('g') && scope != Scope::Pane);
+        let tt = self.option_target(scope, global, ctx, o.get('t'))?;
+        let def = options::def(&name);
+        let (present, current) = match self.store(scope, global, tt) {
+            Some(s) => (s.has(&name), s.get(&name).map(String::from)),
+            None => (false, None),
         };
-        let current = {
-            let store = self.store(scope, global, tt);
-            store.and_then(|s| s.get(&name).map(String::from))
-        };
-        let inherited = match scope {
+        if o.has('o') && !o.has('u') && present {
+            return if o.has('q') { Ok(()) } else { err(format!("already set: {name}")) };
+        }
+        // toggles start from the effective (possibly inherited) value
+        let effective = current.clone().or_else(|| match scope {
             Scope::Server => self.opts_server.get(&name).map(String::from),
             Scope::Session => Some(self.opt_session(tt.sid, &name)),
-            Scope::Window | Scope::Pane => Some(self.opt_window(tt.wid, &name)),
-        };
-        if o.has('o') && current.is_some() {
-            return if o.has('q') { Ok(()) } else { err(format!("already set: {name}")) };
+            Scope::Window => Some(self.opt_window(tt.wid, &name)),
+            Scope::Pane => tt.pane.map(|p| self.opt_pane(p, &name)),
+        });
+        if o.has('U') && scope == Scope::Window && !global {
+            let pids = tt.wid.and_then(|w| self.windows.get(&w)).map(|w| w.panes()).unwrap_or_default();
+            for p in pids {
+                if let Some(p) = self.panes.get_mut(&p) { p.options.unset(&name); }
+            }
         }
         let store = self.store_mut(scope, global, tt).ok_or("no such target")?;
         if o.has('u') || o.has('U') {
-            if global {
-                // reset global to default
-                if let Some(d) = options::def(&name) {
-                    store.set(&name, d.default.to_string());
-                } else {
-                    store.unset(&name);
-                }
-            } else {
-                store.unset(&name);
-            }
+            // global levels go back to the table default, others inherit again
+            if global && def.is_some() { store.reset(&name); } else { store.unset(&name); }
+        } else if def.is_some_and(|d| d.kind == options::Kind::Array) && !name.contains('[') {
+            store.assign_array(&name, value.as_deref().ok_or("empty value")?, o.has('a'))?;
         } else {
-            let base_value = current.clone().or(inherited);
-            let mut v = options::validate(&name, value.as_deref(), base_value.as_deref())?;
-            if o.has('a') {
-                v = format!("{}{}", base_value.unwrap_or_default(), v);
+            let mut v = options::validate(&name, value.as_deref(), effective.as_deref())?;
+            // -a appends to this level's own string value (options_set_string)
+            let string = def.is_none_or(|d| matches!(d.kind, options::Kind::Str | options::Kind::Style | options::Kind::ColourFormat)
+                || (d.kind == options::Kind::Array && d.name != "pane-colours"));
+            if o.has('a') && string && let Some(old) = &current {
+                let sep = if name.contains('[') { "" } else { def.map_or("", |d| d.append_separator()) };
+                v = options::validate(&name, Some(&format!("{old}{sep}{v}")), None)?;
             }
-            // array options without an index append at the next free slot
-            if options::def(&name).is_some_and(|d| d.kind == options::Kind::Array) && !name.contains('[') {
-                if !o.has('a') {
-                    store.unset(&name);
-                }
-                let n = store.0.keys().filter(|k| k.starts_with(&format!("{name}["))).count();
-                for (i, part) in v.split(',').enumerate() {
-                    store.set(&format!("{name}[{}]", n + i), part.to_string());
-                }
-            } else {
-                store.set(&name, v);
+            if def.is_some_and(|d| d.kind == options::Kind::Command) {
+                v = canonical_command_list(&v)?;
             }
+            store.set(&name, v);
         }
         // side effects
         match name.as_str() {
@@ -3076,71 +3081,78 @@ impl Server {
     }
 
     fn cmd_show_options(&mut self, window_cmd: bool, o: &Opts, ctx: &mut Ctx) -> Result<(), String> {
-        let name = o.rest.first().cloned();
-        let scope = if o.has('s') {
-            Scope::Server
-        } else if o.has('p') {
-            Scope::Pane
-        } else if o.has('w') || window_cmd {
-            Scope::Window
-        } else if let Some(n) = &name {
-            options::natural_scope(n).unwrap_or(Scope::Session)
-        } else {
-            Scope::Session
+        let name = match o.rest.first() {
+            Some(arg) => match self.option_name(o, ctx, arg)? { Some(n) => Some(n), None => return Ok(()) },
+            None => None,
         };
-        let global = o.has('g');
-        let tt = match scope {
-            Scope::Session if !global => Target { sid: Some(self.resolve_session(ctx, o.get('t'))?), ..Target::default() },
-            Scope::Window if !global => self.resolve_window(ctx, o.get('t'))?,
-            Scope::Pane => self.resolve_pane(ctx, o.get('t'))?,
-            _ => Target::default(),
+        let scope = Self::option_scope(window_cmd, o, name.as_deref());
+        let global = scope == Scope::Server || (o.has('g') && scope != Scope::Pane);
+        let tt = self.option_target(scope, global, ctx, o.get('t'))?;
+        let Some(store) = self.store(scope, global, tt) else { return err("no such target") };
+        // -A walks the parent levels: pane -> window -> global window, session -> global session
+        let parents: Vec<&Options> = match scope {
+            _ if global => vec![],
+            Scope::Session => vec![&self.opts_session],
+            Scope::Window => vec![&self.opts_window],
+            Scope::Pane => tt.wid.and_then(|w| self.windows.get(&w)).map(|w| &w.options).into_iter().chain([&self.opts_window]).collect(),
+            Scope::Server => vec![],
         };
-        let mut entries: Vec<(String, String, bool)> = Vec::new();
-        if let Some(s) = self.store(scope, global, tt) {
-            for (k, v) in &s.0 {
-                entries.push((k.clone(), v.clone(), false));
+        // the level holding an option: this one, or with -A the nearest parent
+        let find = |base: &str| -> Option<(&Options, bool)> {
+            if store.has(base) { return Some((store, false)); }
+            if !o.has('A') { return None; }
+            parents.iter().find(|p| p.has(base)).map(|p| (*p, true))
+        };
+        let print = |out: &mut String, key: &str, value: Option<&str>, parent: bool| {
+            let star = if parent { "*" } else { "" };
+            match value {
+                Some(v) if o.has('v') => out.push_str(&format!("{v}\n")),
+                Some(v) => out.push_str(&format!("{key}{star} {}\n", options::print_value(key, v))),
+                None if o.has('v') => {}
+                None => out.push_str(&format!("{key}{star}\n")),
             }
-        }
-        if o.has('A') && !global {
-            let parent = match scope {
-                Scope::Session => Some(&self.opts_session),
-                Scope::Window | Scope::Pane => Some(&self.opts_window),
-                _ => None,
-            };
-            if let Some(p) = parent {
-                for (k, v) in &p.0 {
-                    if !entries.iter().any(|e| &e.0 == k) {
-                        entries.push((k.clone(), v.clone(), true));
+        };
+        // print one option like cmd_show_options_print: arrays show each element
+        let show = |out: &mut String, lvl: &Options, name: &str, parent: bool, named: bool| {
+            let base = name.split('[').next().unwrap_or(name);
+            if name.contains('[') {
+                print(out, name, Some(lvl.get(name).unwrap_or("")), parent);
+            } else if options::def(base).is_some_and(|d| d.kind == options::Kind::Array) {
+                let items = lvl.array_items(base);
+                if items.is_empty() {
+                    print(out, base, None, parent && !named);
+                }
+                for (k, v) in items {
+                    print(out, &k, Some(&v), parent);
+                }
+            } else if let Some(v) = lvl.get(name) {
+                print(out, name, Some(v), parent);
+            }
+        };
+        let mut out = String::new();
+        match &name {
+            Some(n) => {
+                let base = n.split('[').next().unwrap_or(n);
+                match find(base) {
+                    Some((lvl, parent)) => show(&mut out, lvl, n, parent, true),
+                    None if base.starts_with('@') && !o.has('q') => return err(format!("invalid option: {n}")),
+                    None => {}
+                }
+            }
+            None => {
+                // user options of this level first, then the table in tmux order
+                for (k, v) in store.0.iter().filter(|(k, _)| k.starts_with('@')) {
+                    print(&mut out, k, Some(v), false);
+                }
+                let wanted = |d: &&options::OptDef| d.scope == scope || (d.scope == Scope::Pane && scope == Scope::Window);
+                for d in options::DEFS.iter().filter(wanted) {
+                    if let Some((lvl, parent)) = find(d.name) {
+                        show(&mut out, lvl, d.name, parent, false);
                     }
                 }
             }
-            entries.sort();
         }
-        let mut found = false;
-        for (k, v, inherited) in entries {
-            if let Some(n) = &name {
-                if &k != n && !k.starts_with(&format!("{n}[")) {
-                    continue;
-                }
-            }
-            if o.has('H') && false {
-                continue;
-            }
-            found = true;
-            let star = if inherited { "*" } else { "" };
-            if o.has('v') {
-                ctx.out.push_str(&format!("{v}\n"));
-            } else {
-                ctx.out.push_str(&format!("{k}{star} {}\n", cmdparse::quote(&v)));
-            }
-        }
-        if !found {
-            if let Some(n) = &name {
-                if options::def(n).is_none() && !n.starts_with('@') && !o.has('q') {
-                    return err(format!("invalid option: {n}"));
-                }
-            }
-        }
+        ctx.out.push_str(&out);
         Ok(())
     }
 
