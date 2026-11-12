@@ -205,15 +205,11 @@ impl Server {
     /// and a zoomed window is unzoomed unless the pane is shown above the zoom.
     pub fn set_active_pane(&mut self, wid: WinId, pane: PaneId) -> bool {
         let Some(w) = self.windows.get(&wid) else { return false };
-        if w.modal.is_some_and(|m| m != pane) {
+        if w.modal.is_some_and(|m| m != pane) || pane == w.active {
             return false;
         }
         if w.is_floating(pane) {
             self.raise(wid, pane);
-        }
-        let w = &self.windows[&wid];
-        if pane == w.active {
-            return false;
         }
         let zoomed = self.zoomed_pane(wid);
         let keep_zoom = zoomed.is_some() && self.pane_visible(wid, pane);

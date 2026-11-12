@@ -678,7 +678,9 @@ impl Server {
                 sort::Order::Activity => point(a).cmp(&point(b)),
                 sort::Order::Creation => a.cmp(b),
                 sort::Order::Size => size(a).cmp(&size(b)),
-                sort::Order::Index | sort::Order::Z => index(a).cmp(&index(b)),
+                sort::Order::Index => index(a).cmp(&index(b)),
+                // floating panes front to back, then the tiled ones (tmux window_pane_zindex)
+                sort::Order::Z => self.pane_z(wid, *a).cmp(&self.pane_z(wid, *b)),
                 sort::Order::Name => title(a).cmp(title(b)),
                 _ => Ordering::Equal,
             }
