@@ -22,9 +22,9 @@ fn options_and_formats() {
     assert_eq!(ctx.ok(&["show-window-options", "-v", "-t", "o", "synchronize-panes"]).trim(), "on");
     // flag without value toggles
     ctx.ok(&["set", "-g", "mouse"]);
-    assert_eq!(ctx.ok(&["show", "-gv", "mouse"]).trim(), "on");
-    ctx.ok(&["set", "-u", "-g", "mouse"]);
     assert_eq!(ctx.ok(&["show", "-gv", "mouse"]).trim(), "off");
+    ctx.ok(&["set", "-u", "-g", "mouse"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "mouse"]).trim(), "on");
     ctx.fails(&["set", "-g", "no-such-option", "1"]);
     ctx.fails(&["set", "-g", "base-index", "abc"]);
     ctx.ok(&["set", "-ag", "status-left", "+X"]);

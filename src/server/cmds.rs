@@ -2095,7 +2095,7 @@ impl Server {
                     return Ok(Flow::Next);
                 }
                 let sid = self.client_session(cid);
-                let ms = o.get('d').and_then(|v| v.parse().ok()).unwrap_or_else(|| self.opt_session_num(sid, "display-panes-time").max(1) as u64);
+                let ms = o.get('d').and_then(|v| v.parse().ok()).unwrap_or_else(|| self.opt_window_num(sid.and_then(|s| self.sessions.get(&s)).map(|s| s.active_window()), "display-panes-time").max(1) as u64);
                 let template = o.rest.first().cloned().unwrap_or_else(|| "select-pane -t '%%'".into());
                 let epoch = self.replace_overlay(cid, Some(Overlay::DisplayPanes { until: Instant::now() + Duration::from_millis(ms), template }))?;
                 if o.has('b') { Ok(Flow::Next) } else { Ok(Flow::WaitOverlay(cid, epoch)) }
