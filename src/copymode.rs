@@ -245,6 +245,11 @@ impl CopyMode {
         self.anchor.is_some()
     }
 
+    /// The last search text (pane_search_string).
+    pub fn last_search(&self) -> Option<&str> {
+        self.search.as_ref().map(|s| s.0.as_str())
+    }
+
     /// selection_start_* / selection_end_*: the anchor and the cursor as (x, y), y counted
     /// from the oldest history line.
     pub fn selection_ends(&self) -> Option<((usize, usize), (usize, usize))> {

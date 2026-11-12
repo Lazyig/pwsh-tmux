@@ -53,6 +53,7 @@ fn fixture() -> (Server, mpsc::Receiver<Event>) {
             user: None,
             denied: false,
             acl_readonly: false,
+            io: Default::default(),
         },
     );
     srv.acl.push(("publication-review-readonly".into(), false));

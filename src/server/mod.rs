@@ -89,6 +89,136 @@ pub struct PaneCb {
     pub cwd: Option<String>,
     /// modifyOtherKeys level the application asked for (CSI > 4 ; n m).
     pub ext_keys: u8,
+    /// State reported for formats (pane_path, cursor_colour, pane_pb_*, pane_command_*).
+    pub osc: OscState,
+}
+
+/// What a pane's application reported through OSC sequences that tmux keeps.
+#[derive(Default, Clone)]
+pub struct OscState {
+    /// OSC 7 as sent (tmux's pane_path).
+    pub path: String,
+    /// OSC 12 cursor colour as tmux prints it; None after OSC 112.
+    pub cursor_colour: Option<String>,
+    /// OSC 9;4 progress bar: state (0 hidden .. 4 paused) and percent.
+    pub pb_state: u8,
+    pub pb_progress: u8,
+    /// OSC 133: last prompt (A/N), command start (C) and end (D) times, and exit status.
+    pub prompt_time: u64,
+    pub cmd_start: u64,
+    pub cmd_end: u64,
+    pub cmd_running: bool,
+    pub cmd_status: Option<i32>,
+}
+
+impl OscState {
+    fn osc(&mut self, params: &[&[u8]]) {
+        let Some((first, rest)) = params.split_first() else { return };
+        // tmux sees the text after "N;" with its separators
+        let arg = rest.iter().map(|p| String::from_utf8_lossy(p)).collect::<Vec<_>>().join(";");
+        match *first {
+            b"7" => self.path = arg.chars().filter(|c| !c.is_control()).collect(),
+            b"9" => self.progress(&arg),
+            b"12" if arg != "?" => {
+                if let Some(c) = parse_x11_colour(&arg) {
+                    self.cursor_colour = Some(c);
+                }
+            }
+            b"112" if arg.is_empty() => self.cursor_colour = None,
+            b"133" => self.osc133(&arg),
+            _ => {}
+        }
+    }
+
+    /// OSC 9;4;state[;progress], as tmux's input_osc_9.
+    fn progress(&mut self, arg: &str) {
+        let Some(rest) = arg.strip_prefix("4;") else { return };
+        let mut it = rest.splitn(2, ';');
+        let state = it.next().unwrap_or("");
+        let Some(state) = state.parse::<u8>().ok().filter(|s| *s <= 4 && state.len() == 1) else { return };
+        let progress = match it.next() {
+            None | Some("") => None,
+            Some(p) => match p.parse::<u8>() {
+                Ok(n) if n <= 100 && p.bytes().all(|b| b.is_ascii_digit()) => Some(n),
+                _ => return,
+            },
+        };
+        self.pb_state = state;
+        // indeterminate keeps the last percentage
+        if let Some(n) = progress.filter(|_| state != 3) {
+            self.pb_progress = n;
+        }
+    }
+
+    fn osc133(&mut self, arg: &str) {
+        let now = now_secs();
+        match arg.as_bytes().first() {
+            Some(b'A' | b'N') => self.prompt_time = now,
+            Some(b'C') => {
+                self.cmd_start = now;
+                self.cmd_end = 0;
+                self.cmd_running = true;
+                self.cmd_status = None;
+            }
+            Some(b'D') => {
+                self.cmd_end = now;
+                self.cmd_running = false;
+                self.cmd_status = Some(osc133_exit_status(arg));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The exit status in OSC 133 "D;status[;key=value...]": 0 when absent or a key=value, 255
+/// when not a number from 0 to 255 (tmux's input_osc_133_exit_status).
+fn osc133_exit_status(arg: &str) -> i32 {
+    let Some(rest) = arg.get(1..).and_then(|r| r.strip_prefix(';')) else { return 0 };
+    let field = rest.split(';').next().unwrap_or("");
+    if field.is_empty() || field.contains('=') {
+        return 0;
+    }
+    field.parse::<i32>().ok().filter(|n| (0..=255).contains(n)).unwrap_or(255)
+}
+
+/// An OSC colour (rgb:RR/GG/BB, #RRGGBB, R,G,B or a name) as tmux's colour_tostring prints it.
+pub fn parse_x11_colour(s: &str) -> Option<String> {
+    let hex = |v: &str| u16::from_str_radix(v, 16).ok().filter(|_| !v.is_empty() && v.len() <= 4);
+    let rgb = |r: u16, g: u16, b: u16| format!("#{:02x}{:02x}{:02x}", r, g, b);
+    if let Some(v) = s.strip_prefix("rgb:") {
+        let parts: Vec<&str> = v.split('/').collect();
+        if let [r, g, b] = parts[..] {
+            if r.len() == g.len() && g.len() == b.len() && (r.len() == 2 || r.len() == 4) {
+                let shift = if r.len() == 4 { 8 } else { 0 };
+                return Some(rgb(hex(r)? >> shift, hex(g)? >> shift, hex(b)? >> shift));
+            }
+        }
+        return None;
+    }
+    if let Some(v) = s.strip_prefix('#') {
+        let n = match v.len() { 6 => 2, 12 => 4, _ => return None };
+        let shift = if n == 4 { 8 } else { 0 };
+        let c = |i: usize| v.get(i * n..(i + 1) * n).and_then(hex).map(|x| x >> shift);
+        return Some(rgb(c(0)?, c(1)?, c(2)?));
+    }
+    let parts: Vec<&str> = s.split(',').collect();
+    if let [r, g, b] = parts[..] {
+        let n = |v: &str| v.trim().parse::<u16>().ok().filter(|n| *n < 256);
+        return Some(rgb(n(r)?, n(g)?, n(b)?));
+    }
+    crate::format::parse_color(s).map(colour_name)
+}
+
+/// tmux's colour_tostring.
+pub fn colour_name(c: vt100::Color) -> String {
+    const NAMES: [&str; 8] = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
+    match c {
+        vt100::Color::Default => "default".into(),
+        vt100::Color::Idx(i) if i < 8 => NAMES[i as usize].into(),
+        vt100::Color::Idx(i) if i < 16 => format!("bright{}", NAMES[i as usize - 8]),
+        vt100::Color::Idx(i) => format!("colour{i}"),
+        vt100::Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+    }
 }
 
 fn decode_file_url(url: &str) -> Option<String> {
@@ -135,6 +265,7 @@ impl vt100::Callbacks for PaneCb {
         self.title = Some(String::from_utf8_lossy(title).into_owned());
     }
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        self.osc.osc(params);
         match params {
             [b"7", url, ..] => self.cwd = decode_file_url(&String::from_utf8_lossy(url)),
             [b"9", b"9", path, ..] => self.cwd = Some(String::from_utf8_lossy(path).trim_matches('"').to_string()),
@@ -152,6 +283,8 @@ impl vt100::Callbacks for PaneCb {
             (None, 'c', 0) => self.replies.extend(b"\x1b[?1;2c"),
             (Some(b'>'), 'c', 0) => self.replies.extend(b"\x1b[>84;0;0c"),
             (Some(b'>'), 'm', 4) => self.ext_keys = params.get(1).and_then(|p| p.first()).copied().unwrap_or(0) as u8,
+            // CSI > 4 n turns modifyOtherKeys off again
+            (Some(b'>'), 'n', 4) => self.ext_keys = 0,
             _ => {}
         }
     }
@@ -188,6 +321,26 @@ pub struct Pane {
     /// The conhost.exe hosting this pane's pseudoconsole (Windows).
     #[cfg_attr(not(windows), allow(dead_code))]
     pub host_pid: Option<u32>,
+    pub track: PaneTrack,
+}
+
+/// Pane state tmux keeps for format variables.
+#[derive(Default)]
+pub struct PaneTrack {
+    /// The command as given (tmux's argv), for pane_start_command_list.
+    pub argv: Vec<String>,
+    /// When output last arrived (0 before any).
+    pub last_output_time: u64,
+    /// Counts output reads.
+    pub output_generation: u64,
+    /// Output arrived while the pane was in a mode.
+    pub unseen_changes: bool,
+    /// The pipe-pane command.
+    pub pipe_pid: Option<u32>,
+    /// The last copy-mode search (kept after copy mode exits).
+    pub search: String,
+    /// Since when synchronized output (DECSET 2026) has been on: tmux ends it after 1s.
+    pub sync_since: Option<Instant>,
 }
 
 impl Pane {
@@ -451,6 +604,14 @@ pub struct Client {
     pub user: Option<String>,
     pub denied: bool,
     pub acl_readonly: bool,
+    /// Bytes written to the client and dropped for it (client_written, client_discarded).
+    pub io: Arc<ClientIo>,
+}
+
+#[derive(Default)]
+pub struct ClientIo {
+    pub written: std::sync::atomic::AtomicU64,
+    pub discarded: std::sync::atomic::AtomicU64,
 }
 
 pub fn now_ms() -> u64 {
@@ -465,11 +626,15 @@ impl Client {
     pub fn send(&self, kind: u8, payload: &[u8]) {
         use std::sync::atomic::Ordering;
         let len = payload.len().saturating_add(5);
-        if self.closed.load(Ordering::SeqCst) { return; }
+        if self.closed.load(Ordering::SeqCst) {
+            self.io.discarded.fetch_add(len as u64, Ordering::Relaxed);
+            return;
+        }
         #[allow(deprecated)]
         let reserved = self.queued_bytes.fetch_update(Ordering::SeqCst, Ordering::SeqCst,
             |n| n.checked_add(len).filter(|n| *n <= transport::MAX_OUTPUT_BACKLOG));
         if reserved.is_err() {
+            self.io.discarded.fetch_add(len as u64, Ordering::Relaxed);
             self.closed.store(true, Ordering::SeqCst);
             return;
         }
@@ -628,6 +793,8 @@ pub struct Server {
     pub acl: Vec<(String, bool)>,
     /// Windows: users the named pipe's ACL was created for (None until listening).
     pub pipe_acl: Option<Vec<String>>,
+    /// Configuration files tried at startup (config_files).
+    pub cfg_files: Vec<String>,
 }
 
 pub fn run(config: Option<String>) -> io::Result<()> {
@@ -751,6 +918,7 @@ impl Server {
             owner: ipc::own_user_id(),
             acl: Vec::new(),
             pipe_acl: None,
+            cfg_files: Vec::new(),
         };
         srv.opts_session.set("default-shell", procinfo::default_shell());
         srv
@@ -774,6 +942,7 @@ impl Server {
                 files.push((format!("{x}/pwsh-tmux/pwsh-tmux.conf"), true));
             }
         }
+        self.cfg_files = files.iter().map(|f| f.0.clone()).collect();
         for (f, quiet) in files {
             let mut args = vec!["source-file".to_string()];
             if quiet {
@@ -940,6 +1109,8 @@ impl Server {
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writer_closed = closed.clone();
         let reader_closed = closed.clone();
+        let io = Arc::new(ClientIo::default());
+        let writer_io = io.clone();
         thread::spawn(move || {
             use std::sync::atomic::Ordering;
             loop {
@@ -954,6 +1125,7 @@ impl Server {
                     break;
                 }
                 writer_bytes.fetch_sub(buf.len(), Ordering::SeqCst);
+                writer_io.written.fetch_add(buf.len() as u64, Ordering::Relaxed);
                 // still behind: the backlog now starts at this write
                 if writer_pending.fetch_sub(1, Ordering::SeqCst) > 1 {
                     writer_since.store(now_ms(), Ordering::SeqCst);
@@ -1047,6 +1219,7 @@ impl Server {
                 user: None,
                 denied: false,
                 acl_readonly: false,
+                io,
             },
         );
     }
@@ -1187,9 +1360,19 @@ impl Server {
         p.parser.screen_mut().set_scroll_on_clear(scroll_on_clear);
         p.parser.process(data);
         p.last_output = Instant::now();
+        if !data.is_empty() {
+            p.track.last_output_time = now_secs();
+            p.track.output_generation += 1;
+            p.track.unseen_changes |= p.mode.is_some();
+        }
+        let sync = p.parser.screen().synchronized_output();
+        if sync != p.track.sync_since.is_some() {
+            p.track.sync_since = sync.then(Instant::now);
+        }
         if let Some(pipe) = &p.pipe {
             if pipe.send(data.to_vec()).is_err() {
                 p.pipe = None;
+                p.track.pipe_pid = None;
             }
         }
         let cb = p.parser.callbacks_mut();
@@ -1627,6 +1810,12 @@ impl Server {
             many => many.to_vec(),
         };
         let start_cmd = cmd.join(" ");
+        // tmux keeps the command given, else default-command; respawn without one keeps the old
+        let start_argv = match cmd {
+            [] if default_cmd.is_empty() => self.panes.get(&id).map(|p| p.track.argv.clone()).unwrap_or_default(),
+            [] => vec![default_cmd.clone()],
+            many => many.to_vec(),
+        };
         #[cfg(windows)]
         let hosts_before = procinfo::win::children_named(std::process::id(), "conhost.exe");
         let pair = self.pty.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).map_err(|e| format!("openpty: {e}"))?;
@@ -1725,6 +1914,7 @@ impl Server {
                 current_path: dir,
                 cwd_seq: 0,
                 host_pid,
+                track: PaneTrack { argv: start_argv, ..Default::default() },
             },
         );
         if let Some(old) = previous {
