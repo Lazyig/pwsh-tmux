@@ -1380,6 +1380,8 @@ impl Server {
         let scroll_on_clear = options::is_on(&self.opt_pane(id, "scroll-on-clear"));
         let p = self.panes.get_mut(&id).unwrap();
         p.parser.screen_mut().set_scroll_on_clear(scroll_on_clear);
+        // capture-pane -I: rows entering the history record when
+        p.parser.screen_mut().set_time(now_secs());
         p.parser.process(data);
         p.last_output = Instant::now();
         if !data.is_empty() {

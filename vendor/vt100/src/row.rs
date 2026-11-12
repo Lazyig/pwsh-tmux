@@ -5,6 +5,9 @@ use alloc::string::String;
 pub struct Row {
     cells: crate::row_cells::RowCells,
     wrapped: bool,
+    /// When the row entered the history (seconds since the epoch), 0 if it
+    /// has not or the time was not set (tmux's grid_line time).
+    time: u64,
 }
 
 impl Row {
@@ -12,7 +15,16 @@ impl Row {
         Self {
             cells: crate::row_cells::RowCells::new(cols),
             wrapped: false,
+            time: 0,
         }
+    }
+
+    pub fn time(&self) -> u64 {
+        self.time
+    }
+
+    pub fn set_time(&mut self, time: u64) {
+        self.time = time;
     }
 
     fn cols(&self) -> u16 {
@@ -33,6 +45,7 @@ impl Row {
     pub fn reset(&mut self) {
         self.cells.dense_mut().fill(crate::Cell::new());
         self.wrapped = false;
+        self.time = 0;
     }
 
     fn cells(&self) -> impl Iterator<Item = &crate::Cell> {

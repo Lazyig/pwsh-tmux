@@ -2414,8 +2414,9 @@ impl Server {
                             out.push_str(&format!("{} ", i - hist));
                         }
                         if o.has('I') {
-                            // when the line entered the history: not recorded here
-                            out.push_str("0 ");
+                            // when the line entered the history (0 for screen lines)
+                            let time = if mode_lines.is_some() || o.has('a') { 0 } else { screen.history_row_time(i as usize) };
+                            out.push_str(&format!("{time} "));
                         }
                         if o.has('F') {
                             out.push_str(if wrapped { "W " } else { "- " });

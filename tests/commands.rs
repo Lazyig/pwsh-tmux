@@ -1254,3 +1254,23 @@ fn message_log_jobs_and_prompt_history_types() {
     ctx.ok(&["clear-prompt-history", "-T", "command"]);
     assert!(ctx.fails(&["clear-prompt-history", "-T", "bogus"]).contains("invalid type: bogus"));
 }
+
+#[cfg(unix)]
+#[test]
+fn capture_pane_history_times() {
+    let ctx = Ctx::new("p1fix-capi");
+    let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    ctx.ok(&["new-session", "-d", "-s", "c", "-x", "40", "-y", "10", "seq 1 30; sleep 100"]);
+    wait_for("output", || ctx.capture("c").contains("30"));
+    let out = ctx.ok(&["capture-pane", "-p", "-I", "-L", "-S", "-", "-t", "c"]);
+    let rows: Vec<(i64, u64, String)> = out.lines().map(|l| {
+        let mut w = l.splitn(3, ' ');
+        (w.next().unwrap().parse().unwrap(), w.next().unwrap().parse().unwrap(), w.next().unwrap_or("").to_string())
+    }).collect();
+    // history lines carry the time they entered the history, screen lines 0
+    assert_eq!(rows[0].0, -21);
+    assert_eq!(rows[0].2, "1");
+    for (n, time, _) in &rows {
+        if *n < 0 { assert!(*time >= before && *time <= before + 60, "{out}"); } else { assert_eq!(*time, 0, "{out}"); }
+    }
+}

@@ -14,6 +14,9 @@ pub struct Grid {
     scrollback: Option<ScrollbackState>,
     /// Rows added to history, rows dropped from it, and clears/rewraps.
     history_counters: (u64, u64, u64),
+    /// The current time (seconds since the epoch, 0 = unknown) given to rows as
+    /// they enter the history.
+    now: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +57,7 @@ impl Grid {
             saved_origin_mode: false,
             scrollback,
             history_counters: (0, 0, 0),
+            now: 0,
         }
     }
 
@@ -203,6 +207,8 @@ impl Grid {
         for (index, mut old) in source.enumerate() {
             let wrapped = old.wrapped();
             if !wrapped { old.trim(); }
+            // rewrapped rows keep the time their line entered the history
+            if col == 0 { row.set_time(old.time()); }
             let mut x = 0u16;
             while let Some(cell) = old.get(x) {
                 if cell.is_wide_continuation() { x += 1; continue; }
@@ -252,6 +258,14 @@ impl Grid {
 
     pub fn history_counters(&self) -> (u64, u64, u64) {
         self.history_counters
+    }
+
+    pub fn now(&self) -> u64 {
+        self.now
+    }
+
+    pub fn set_now(&mut self, now: u64) {
+        self.now = now;
     }
 
     pub fn set_history_counters(&mut self, counters: (u64, u64, u64)) {
@@ -821,6 +835,7 @@ impl Grid {
         // Number of to-be-removed rows.
         let num_removed = count.min(num_between);
         let new_row = || crate::row::Row::new(self.size.cols());
+        let now = self.now;
 
         if let Some(scrollback) =
             self.scrollback.as_mut().filter(|_| scrollback_enabled)
@@ -854,6 +869,7 @@ impl Grid {
                 between[num_reset..num_removed].iter_mut().map(|row| {
                     row.trim();
                     row.compact();
+                    row.set_time(now);
                     core::mem::replace(row, new_row())
                 }),
             );
