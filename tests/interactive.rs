@@ -314,3 +314,45 @@ fn progress_bar_preserves_dark_truecolor_background_on_blank_cells() {
     assert_eq!(filled.bgcolor(), vt100::Color::Rgb(82, 82, 112));
     assert!(ctx.ok(&["list-clients", "-F", "#{client_termfeatures}"]).contains("RGB"));
 }
+
+#[test]
+fn current_target_sorted_switch_and_prompt_flags() {
+    let ctx = Ctx::new("cur-target");
+    ctx.ok(&["new-session", "-d", "-s", "c"]);
+    ctx.ok(&["new-session", "-d", "-s", "b"]);
+    let t = start(&ctx, "a");
+    // {current} / @ name the attached client's window
+    ctx.ok(&["bind-key", "-n", "F5", "set-option", "-t", "{current}", "@cur", "yes"]);
+    t.send(b"\x1b[15~");
+    wait_for("{current}", || ctx.ok(&["show-options", "-qv", "-t", "a", "@cur"]).trim() == "yes");
+    ctx.ok(&["bind-key", "-n", "F6", "rename-window", "-t", "@", "via-at"]);
+    t.send(b"\x1b[17~");
+    wait_for("@ target", || ctx.fmt("a", "#W") == "via-at");
+    // switch-client -n by name (the default) and by -O index (creation order: c, b, a)
+    ctx.ok(&["bind-key", "-n", "F7", "switch-client", "-n"]);
+    ctx.ok(&["bind-key", "-n", "F8", "switch-client", "-n", "-O", "index"]);
+    let session = || ctx.ok(&["list-clients", "-F", "#{session_name}"]).trim().to_string();
+    t.send(b"\x1b[18~");
+    wait_for("next by name", || session() == "b");
+    t.send(b"\x1b[19~");
+    wait_for("next by index", || session() == "a");
+    // command-prompt -l: one prompt and input, commas included
+    ctx.ok(&["bind-key", "-n", "F9", "command-prompt", "-l", "-p", "one,two", "-I", "x,y", "set -g @got '%1'"]);
+    t.send(b"\x1b[20~");
+    wait_for("literal prompt", || t.row(29).starts_with("one,two"));
+    t.send(b"\r");
+    wait_for("literal input", || ctx.ok(&["show-options", "-gqv", "@got"]).trim() == "x,y");
+    // backspace on an empty prompt closes it only with -e
+    ctx.ok(&["bind-key", "-n", "F10", "command-prompt", "-p", "plain", "set -g @plain '%1'"]);
+    t.send(b"\x1b[21~");
+    wait_for("plain prompt", || t.row(29).starts_with("plain"));
+    t.send(b"\x7f");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(t.row(29).starts_with("plain"), "{}", t.row(29));
+    t.send(b"\x1b");
+    ctx.ok(&["bind-key", "-n", "F11", "command-prompt", "-e", "-p", "exits", "set -g @exits '%1'"]);
+    t.send(b"\x1b[23~");
+    wait_for("-e prompt", || t.row(29).starts_with("exits"));
+    t.send(b"\x7f");
+    wait_for("-e closes", || !t.row(29).starts_with("exits"));
+}

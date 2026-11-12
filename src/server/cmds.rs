@@ -3202,7 +3202,12 @@ impl Server {
                         .values()
                         .filter(|c| {
                             c.user.as_deref().is_some_and(|u| {
-                                if group { ipc::group_id_of_user(u).as_deref() == Some(id.as_str()) && !s.acl.iter().any(|a| a.0 == u) } else { u == id }
+                                if group {
+                                    // the owner and root are never limited by a group entry
+                                    u != s.owner && !ipc::is_superuser(u) && ipc::group_id_of_user(u).as_deref() == Some(id.as_str()) && !s.acl.iter().any(|a| a.0 == u)
+                                } else {
+                                    u == id
+                                }
                             })
                         })
                         .map(|c| c.id)

@@ -1089,7 +1089,7 @@ impl Server {
         let Some(c) = self.clients.get_mut(&cid) else { return };
         let id = user.unwrap_or_default();
         // a user entry takes precedence over the user's group entry (server-access -g)
-        let group = ipc::group_id_of_user(&id);
+        let group = ipc::group_id_of_user(&id).filter(|_| id != self.owner && !ipc::is_superuser(&id));
         let entry = self.acl.iter().find(|a| a.0 == id).or_else(|| self.acl.iter().find(|a| Some(&a.0) == group.as_ref())).cloned();
         let allowed = !id.is_empty() && (id == self.owner || ipc::is_superuser(&id) || entry.is_some());
         c.user = Some(id.clone());
