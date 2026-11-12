@@ -403,7 +403,9 @@ fn layouts_swaps_and_moves() {
     // kill-pane -a keeps only the target
     ctx.ok(&["kill-pane", "-a", "-t", &first]);
     assert_eq!(ids(&ctx, "l"), vec![first.clone()]);
-    // select-pane -T sets the title, -m marks
+    // select-pane -T sets the title, -m marks (after the shell has started: a
+    // prompt that sets the title by OSC 2 would overwrite it)
+    ctx.wait_prompt(&first);
     ctx.ok(&["select-pane", "-t", &first, "-T", "my title"]);
     assert_eq!(ctx.fmt(&first, "#{pane_title}"), "my title");
     ctx.ok(&["select-pane", "-m", "-t", &first]);
