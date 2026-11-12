@@ -755,6 +755,13 @@ impl Server {
 
     pub fn exit_mode(&mut self, pane: PaneId) {
         if let Some(p) = self.panes.get_mut(&pane) {
+            // tmux keeps the pane's last search and clears unseen changes with the mode
+            if let Some(PaneMode::Copy(cm)) = &p.mode {
+                if let Some(s) = cm.last_search() {
+                    p.track.search = s.to_string();
+                }
+            }
+            p.track.unseen_changes = false;
             p.mode = None;
         }
         if let Some(wid) = self.window_of(pane) {
@@ -2047,6 +2054,7 @@ impl Server {
                 let had = self.panes.get(&pane).is_some_and(|p| p.pipe.is_some());
                 if let Some(p) = self.panes.get_mut(&pane) {
                     p.pipe = None;
+                    p.track.pipe_pid = None;
                 }
                 let Some(command) = o.rest.first() else { return Ok(Flow::Next) };
                 if o.has('o') && had {
@@ -2069,7 +2077,9 @@ impl Server {
                             }
                         }
                     });
-                    self.panes.get_mut(&pane).unwrap().pipe = Some(ptx);
+                    let p = self.panes.get_mut(&pane).unwrap();
+                    p.pipe = Some(ptx);
+                    p.track.pipe_pid = Some(child.id());
                 }
                 if o.has('I') {
                     let mut stdout = child.stdout.take().unwrap();
@@ -3225,11 +3235,36 @@ fn glob_files(path: &str) -> Vec<String> {
 }
 
 pub const VAR_NAMES: &[&str] = &[
-    "host", "host_short", "pid", "version", "current_file", "socket_path", "start_time", "session_name", "session_id", "session_windows", "session_attached", "session_created", "session_activity",
-    "session_path", "session_alerts", "window_index", "window_name", "window_id", "window_active", "window_flags", "window_panes", "window_zoomed_flag", "window_layout",
-    "window_width", "window_height", "pane_index", "pane_id", "pane_title", "pane_current_path", "pane_current_command", "pane_pid", "pane_width", "pane_height", "pane_active",
-    "pane_dead", "pane_in_mode", "pane_mode", "pane_left", "pane_top", "pane_right", "pane_bottom", "cursor_x", "cursor_y", "history_size", "history_limit", "alternate_on",
-    "client_name", "client_width", "client_height", "client_session", "client_key_table", "client_prefix", "client_termname",
+    // tmux 3.8's format_table, which display-message -a lists
+    "active_window_index", "alternate_on", "alternate_saved_x", "alternate_saved_y", "bracket_paste_flag", "buffer_created", "buffer_full",
+    "buffer_mode_format", "buffer_name", "buffer_sample", "buffer_size", "client_activity", "client_cell_height", "client_cell_width",
+    "client_colours", "client_control_mode", "client_created", "client_discarded", "client_flags", "client_height", "client_key_table",
+    "client_last_session", "client_mode_format", "client_name", "client_pid", "client_prefix", "client_readonly", "client_session",
+    "client_termfeatures", "client_termname", "client_termtype", "client_theme", "client_tty", "client_uid", "client_user", "client_utf8",
+    "client_width", "client_written", "config_files", "cursor_blinking", "cursor_character", "cursor_colour", "cursor_flag", "cursor_shape",
+    "cursor_very_visible", "cursor_x", "cursor_y", "history_added", "history_all_bytes", "history_bytes", "history_collected", "history_generation",
+    "history_limit", "history_size", "host", "host_short", "insert_flag", "keypad_cursor_flag", "keypad_flag", "last_window_index", "mouse_all_flag",
+    "mouse_any_flag", "mouse_button_flag", "mouse_hyperlink", "mouse_line", "mouse_pane", "mouse_sgr_flag", "mouse_standard_flag",
+    "mouse_status_line", "mouse_status_range", "mouse_utf8_flag", "mouse_word", "mouse_x", "mouse_y", "next_session_id", "origin_flag", "pane_active",
+    "pane_at_bottom", "pane_at_left", "pane_at_right", "pane_at_top", "pane_bg", "pane_bottom", "pane_command_duration", "pane_command_end_time",
+    "pane_command_running", "pane_command_start_time", "pane_command_status", "pane_current_command", "pane_current_path", "pane_dead",
+    "pane_dead_signal", "pane_dead_status", "pane_dead_time", "pane_fg", "pane_flags", "pane_floating_flag", "pane_format", "pane_height", "pane_id",
+    "pane_index", "pane_in_mode", "pane_input_off", "pane_key_mode", "pane_last", "pane_last_output_time", "pane_last_prompt_time", "pane_left",
+    "pane_marked", "pane_marked_set", "pane_modal_flag", "pane_mode", "pane_output_generation", "pane_path", "pane_pb_progress", "pane_pb_state",
+    "pane_pid", "pane_pipe", "pane_pipe_pid", "pane_private_modes", "pane_right", "pane_search_string", "pane_start_command",
+    "pane_start_command_list", "pane_start_path", "pane_synchronized", "pane_tabs", "pane_title", "pane_top", "pane_tty", "pane_unseen_changes",
+    "pane_unzoomed_height", "pane_unzoomed_width", "pane_width", "pane_x", "pane_y", "pane_z", "pane_zoomed_flag", "pid", "scroll_region_lower",
+    "scroll_region_upper", "server_sessions", "session_active", "session_activity", "session_activity_flag", "session_alert", "session_alerts",
+    "session_attached", "session_attached_list", "session_bell_flag", "session_created", "session_format", "session_group", "session_group_attached",
+    "session_group_attached_list", "session_grouped", "session_group_list", "session_group_many_attached", "session_group_size", "session_id",
+    "session_last_attached", "session_many_attached", "session_marked", "session_name", "session_path", "session_silence_flag", "session_stack",
+    "session_windows", "sixel_support", "socket_path", "start_time", "synchronized_output_flag", "tree_mode_format", "uid", "user", "version",
+    "window_active", "window_active_clients", "window_active_clients_list", "window_active_sessions", "window_active_sessions_list",
+    "window_activity", "window_activity_flag", "window_bell_flag", "window_bigger", "window_cell_height", "window_cell_width", "window_end_flag",
+    "window_flags", "window_format", "window_height", "window_id", "window_index", "window_last_flag", "window_layout", "window_linked",
+    "window_linked_sessions", "window_linked_sessions_list", "window_manual_height", "window_manual_width", "window_marked_flag", "window_modal_pane",
+    "window_name", "window_offset_x", "window_offset_y", "window_panes", "window_raw_flags", "window_silence_flag", "window_stack_index",
+    "window_start_flag", "window_visible_layout", "window_width", "window_zoomed_flag", "wrap_flag",
 ];
 
 #[cfg(test)]

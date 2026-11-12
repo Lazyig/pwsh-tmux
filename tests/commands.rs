@@ -743,3 +743,30 @@ fn readonly_control_client_cannot_execute_or_remove_restriction() {
     assert!(!overflowing.try_wait().unwrap().unwrap().success());
     assert_eq!(ctx.fmt("ro", "#{session_windows}"), "2");
 }
+
+#[test]
+fn tmux38_format_variables() {
+    let ctx = Ctx::new("vars38");
+    ctx.ok(&["new-session", "-d", "-s", "v", "-x", "80", "-y", "24"]);
+    ctx.ok(&["new-window", "-d", "-t", "v:4"]);
+    ctx.ok(&["split-window", "-h", "-t", "v:0"]);
+    // display -a lists tmux 3.8's variables
+    let all = ctx.ok(&["display-message", "-a", "-t", "v:0"]);
+    for name in ["active_window_index=0", "last_window_index=4", "session_stack=0", "pane_flags=*", "pane_z=1", "pane_floating_flag=0",
+        "pane_pb_state=hidden", "pane_key_mode=", "history_added=", "next_session_id=$", "tree_mode_format=", "window_raw_flags=*"] {
+        assert!(all.lines().any(|l| l.starts_with(name)), "{name} missing from display -a:\n{all}");
+    }
+    assert_eq!(ctx.fmt("v:0.0", "#{pane_flags}|#{pane_zoomed_flag}|#{pane_unzoomed_width}|#{pane_x}"), "-|0|40|0");
+    ctx.ok(&["resize-pane", "-Z", "-t", "v:0.1"]);
+    assert_eq!(ctx.fmt("v:0.1", "#{pane_flags}|#{pane_zoomed_flag}|#{pane_unzoomed_width}x#{pane_unzoomed_height}|#{window_raw_flags}"), "*Z|1|39x24|*Z");
+    assert_eq!(ctx.fmt("v:4", "#{window_stack_index} #{window_active_sessions} #{window_linked_sessions_list} [#{window_manual_width}] #{session_alert}"), "0 0 v [] ");
+    assert_eq!(ctx.fmt("v", "#{pane_pipe} #{pane_input_off} #{pane_unseen_changes} #{pane_modal_flag} [#{window_modal_pane}] #{sixel_support}"), "0 0 0 0 [] 0");
+    ctx.ok(&["select-pane", "-d", "-t", "v:0.1"]);
+    assert_eq!(ctx.fmt("v:0.1", "#{pane_input_off}"), "1");
+    // copy-mode search text stays after copy mode exits
+    ctx.ok(&["copy-mode", "-t", "v:0.1"]);
+    ctx.ok(&["send-keys", "-t", "v:0.1", "-X", "search-backward", "needle"]);
+    assert_eq!(ctx.fmt("v:0.1", "#{pane_search_string}"), "needle");
+    ctx.ok(&["send-keys", "-t", "v:0.1", "-X", "cancel"]);
+    assert_eq!(ctx.fmt("v:0.1", "#{pane_in_mode} #{pane_search_string}"), "0 needle");
+}
