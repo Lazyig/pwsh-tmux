@@ -1004,8 +1004,9 @@ fn show_options_and_hooks_formats() {
     assert_eq!(ctx.ok(&["showw", "-g", "-F", "#{option_name}:#{option_value}", "mode-keys"]), "mode-keys:emacs\n");
     assert_eq!(ctx.ok(&["show", "-gv", "-F", "V=#{option_value}#{option_value_only}", "status-left"]), "V=L R1\n");
     ctx.ok(&["set-hook", "-g", "session-renamed", "display hi"]);
-    assert_eq!(ctx.ok(&["show-hooks", "-g", "-F", "#{option_name}[#{option_array_key}] #{option_value} #{option_is_hook}", "session-renamed"]), "session-renamed[0] display hi 1\n");
-    assert_eq!(ctx.ok(&["show-hooks", "-g", "client-attached"]), "");
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "-F", "#{option_name}[#{option_array_key}] #{option_value} #{option_is_hook}", "session-renamed"]), "session-renamed[0] display-message hi 1\n");
+    // the global level always holds the table hooks (an empty array)
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "client-attached"]), "client-attached\n");
 }
 
 #[test]

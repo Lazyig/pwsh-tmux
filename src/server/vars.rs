@@ -243,6 +243,10 @@ impl Vars for VarCtx<'_> {
         if let Some(v) = self.extra.get(name) {
             return Some(v.clone());
         }
+        // a hook's commands see its formats (hook, hook_*)
+        if let Some(v) = self.srv.ev.cur_formats.as_ref().and_then(|f| f.get(name)) {
+            return Some(v.clone());
+        }
         let srv = self.srv;
         let t = self.t;
         let sess = t.sid.and_then(|s| srv.sessions.get(&s));

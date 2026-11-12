@@ -228,8 +228,9 @@ impl Server {
                 }
             }
             Input::Unknown(raw) => {
-                // focus reports are only forwarded when the pane asked for them
+                // focus reports reach panes through pane-focus-in/out (only those that asked)
                 if raw == b"\x1b[I" || raw == b"\x1b[O" {
+                    self.client_focus(cid, raw == b"\x1b[I");
                     return;
                 }
                 if let Some(t) = self.input_target(cid) {

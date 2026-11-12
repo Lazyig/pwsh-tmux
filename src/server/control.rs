@@ -1,22 +1,12 @@
 //! Control mode (`-C` / `-CC`): command replies in %begin/%end blocks, pane output as
-//! %output, and notifications derived by diffing what each control client has seen.
+//! %output, and notifications from events (control-notify.c), held back while a
+//! command's %begin/%end block is open.
 
+use super::events::{Payload, Val};
 use super::vars::Target;
 use super::*;
 
 const MAX_SUBS_BYTES: usize = 1 << 20;
-
-/// What a control client was last told about.
-#[derive(Default, Clone, PartialEq)]
-pub struct Seen {
-    pub session: Option<(SessId, String)>,
-    pub sessions: BTreeMap<SessId, String>,
-    /// window -> (name, layout) for windows in the client's session
-    pub windows: BTreeMap<WinId, (String, String)>,
-    pub active_window: Option<WinId>,
-    pub active_pane: BTreeMap<WinId, PaneId>,
-    pub pane_modes: BTreeMap<PaneId, bool>,
-}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PaneOutput {
@@ -85,16 +75,19 @@ impl Server {
         c.control_seq += 1;
         let seq = c.control_seq;
         let pane = self.client_active_pane(cid);
-        let ctx = Ctx { client: Some(cid), pane, control_seq: Some(seq), ..Ctx::default() };
+        let ctx = Ctx { client: Some(cid), pane, control_seq: Some(seq), control_line: true, ..Ctx::default() };
         match crate::cmdparse::parse(line) {
             Ok(cmds) => self.run_queue(Queue { cmds: cmds.into(), ctx, soft: 0 }),
-            Err(e) => self.control_block(cid, seq, "", Some(&e)),
+            Err(e) => self.control_block(cid, seq, true, "", Some(&e)),
         }
     }
 
-    pub fn control_block(&self, cid: ClientId, seq: u64, out: &str, err: Option<&str>) {
+    /// A command's reply; the flags are 1 for commands the client typed
+    /// (CMDQ_STATE_CONTROL), 0 for those from its command line.
+    pub fn control_block(&self, cid: ClientId, seq: u64, typed: bool, out: &str, err: Option<&str>) {
         let t = now_secs();
-        let mut s = format!("%begin {t} {seq} 1\n");
+        let flags = typed as u8;
+        let mut s = format!("%begin {t} {seq} {flags}\n");
         s.push_str(out);
         if !out.is_empty() && !out.ends_with('\n') {
             s.push('\n');
@@ -103,9 +96,9 @@ impl Server {
             Some(e) => {
                 s.push_str(e.trim_end());
                 s.push('\n');
-                s.push_str(&format!("%error {t} {seq} 1\n"));
+                s.push_str(&format!("%error {t} {seq} {flags}\n"));
             }
-            None => s.push_str(&format!("%end {t} {seq} 1\n")),
+            None => s.push_str(&format!("%end {t} {seq} {flags}\n")),
         }
         self.control_write(cid, &s);
     }
@@ -199,7 +192,7 @@ impl Server {
                     c.readonly = on || c.acl_readonly;
                 }
                 None if name == "ignore-size" => c.ctl.ignore_size = on,
-                None if matches!(name, "active-pane" | "no-detach-on-destroy") => {}
+                None if matches!(name, "active-pane" | "no-detach-on-destroy" | "new-layouts") => {}
                 _ => return Err(format!("unknown flag: {name}")),
             }
         }
@@ -304,88 +297,139 @@ impl Server {
         }
     }
 
-    fn seen_now(&self, cid: ClientId) -> Seen {
-        let mut seen = Seen { sessions: self.sessions.values().map(|s| (s.id, s.name.clone())).collect(), ..Seen::default() };
-        let Some(sid) = self.client_session(cid) else { return seen };
-        let s = &self.sessions[&sid];
-        seen.session = Some((sid, s.name.clone()));
-        seen.active_window = Some(s.active_window());
-        for wid in s.links.values() {
-            let w = &self.windows[wid];
-            seen.windows.insert(*wid, (w.name.clone(), w.layout.to_layout_string(self.window_area(*wid))));
-            seen.active_pane.insert(*wid, w.active);
-            for p in w.panes() {
-                seen.pane_modes.insert(p, self.panes.get(&p).is_some_and(|x| x.mode.is_some()));
-            }
-        }
-        seen
+    /// Control clients that get notifications (CONTROL_SHOULD_NOTIFY_CLIENT): not
+    /// those already exiting.
+    fn notify_clients(&self) -> Vec<(ClientId, Option<SessId>)> {
+        self.clients.values().filter(|c| c.control > 0 && c.attached && !c.ctl.exiting.get())
+            .map(|c| (c.id, c.session.filter(|s| self.sessions.contains_key(s)))).collect()
     }
 
-    /// Emits notifications for whatever changed since each control client was last told.
+    /// control_notify_write: notifications never go inside a %begin/%end block, so
+    /// they wait until the reply of the command that caused them is written.
+    fn control_notify_write(&mut self, cid: ClientId, line: &str) {
+        let q = self.ev.ctl_queue.entry(cid).or_default();
+        q.push_str(line);
+        q.push('\n');
+    }
+
+    /// The notifications control clients get for an event (control_build_events).
+    pub fn control_event(&mut self, name: &str, p: &Payload) {
+        let clients = self.notify_clients();
+        if clients.is_empty() {
+            return;
+        }
+        let window = match p.get("window") { Some(Val::Window(w, _)) => Some(*w), _ => None };
+        let in_session = |srv: &Self, sid: Option<SessId>, wid: WinId| {
+            sid.and_then(|s| srv.sessions.get(&s)).and_then(|s| s.links.iter().find(|(_, w)| **w == wid).map(|(i, _)| *i))
+        };
+        let mut lines: Vec<(ClientId, String)> = Vec::new();
+        match name {
+            "pane-mode-changed" => {
+                if let Some(v) = p.get("pane") {
+                    for (c, _) in &clients {
+                        lines.push((*c, format!("%pane-mode-changed {}", v.print())));
+                    }
+                }
+            }
+            "window-layout-changed" => {
+                // a window losing its last pane goes away soon: nothing to say
+                let Some(wid) = window.filter(|w| self.windows.contains_key(w)) else { return };
+                for (c, sid) in &clients {
+                    let Some(idx) = in_session(self, *sid, wid) else { continue };
+                    let t = Target { sid: *sid, idx: Some(idx), wid: Some(wid), pane: Some(self.windows[&wid].active) };
+                    let line = self.expand(t, Some(*c), "%layout-change #{window_id} #{window_layout} #{window_visible_layout} #{window_raw_flags}");
+                    lines.push((*c, line));
+                }
+            }
+            "window-pane-changed" => {
+                let Some(w) = window.and_then(|w| self.windows.get(&w)) else { return };
+                for (c, _) in &clients {
+                    lines.push((*c, format!("%window-pane-changed @{} %{}", w.id, w.active)));
+                }
+            }
+            "window-unlinked" | "window-linked" | "window-renamed" => {
+                let Some(wid) = window else { return };
+                let from = match p.get("session") { Some(Val::Session(s, _)) => Some(*s), _ => None };
+                for (c, sid) in &clients {
+                    let Some(sid) = sid else { continue };
+                    // window-unlinked fires as the link goes: still the client's window then
+                    let mine = in_session(self, Some(*sid), wid).is_some() || (name == "window-unlinked" && from == Some(*sid));
+                    let pre = if mine { "" } else { "unlinked-" };
+                    let line = match name {
+                        "window-unlinked" => format!("%{pre}window-close @{wid}"),
+                        "window-linked" => format!("%{pre}window-add @{wid}"),
+                        _ => match self.windows.get(&wid) {
+                            Some(w) => format!("%{pre}window-renamed @{wid} {}", w.name),
+                            None => continue,
+                        },
+                    };
+                    lines.push((*c, line));
+                }
+            }
+            "client-session-changed" => {
+                let Some(Val::Client(cc, ccname)) = p.get("client") else { return };
+                let Some(sid) = self.client_session(*cc) else { return };
+                let sname = self.sessions[&sid].name.clone();
+                for (c, csid) in &clients {
+                    if csid.is_none() {
+                        continue;
+                    }
+                    let line = if c == cc { format!("%session-changed ${sid} {sname}") } else { format!("%client-session-changed {ccname} ${sid} {sname}") };
+                    lines.push((*c, line));
+                }
+            }
+            "client-detached" => {
+                let Some(Val::Client(_, ccname)) = p.get("client") else { return };
+                for (c, _) in &clients {
+                    lines.push((*c, format!("%client-detached {ccname}")));
+                }
+            }
+            "session-renamed" => {
+                let Some(Val::Session(sid, _)) = p.get("session") else { return };
+                let Some(s) = self.sessions.get(sid) else { return };
+                for (c, _) in &clients {
+                    lines.push((*c, format!("%session-renamed ${sid} {}", s.name)));
+                }
+            }
+            "session-created" | "session-closed" => {
+                for (c, _) in &clients {
+                    lines.push((*c, "%sessions-changed".into()));
+                }
+            }
+            "session-window-changed" => {
+                let Some(Val::Session(sid, _)) = p.get("session") else { return };
+                let Some((_, wid)) = self.session_window(*sid) else { return };
+                for (c, _) in &clients {
+                    lines.push((*c, format!("%session-window-changed ${sid} @{wid}")));
+                }
+            }
+            "paste-buffer-changed" | "paste-buffer-deleted" => {
+                let Some(Val::Str(b)) = p.get("paste_buffer") else { return };
+                for (c, _) in &clients {
+                    lines.push((*c, format!("%{name} {b}")));
+                }
+            }
+            _ => {}
+        }
+        for (c, line) in lines {
+            self.control_notify_write(c, &line);
+        }
+    }
+
+    /// Writes the notifications held for a control client.
+    pub fn control_flush(&mut self, cid: ClientId) {
+        if let Some(text) = self.ev.ctl_queue.remove(&cid) {
+            if self.clients.get(&cid).is_some_and(|c| !c.ctl.exiting.get()) {
+                self.control_write(cid, &text);
+            }
+        }
+    }
+
+    /// Writes every held notification (no command block is open between commands).
     pub fn control_notify(&mut self) {
-        let ids: Vec<ClientId> = self.clients.values().filter(|c| c.control > 0 && c.attached).map(|c| c.id).collect();
+        let ids: Vec<ClientId> = self.ev.ctl_queue.keys().copied().collect();
         for cid in ids {
-            let now = self.seen_now(cid);
-            let before = self.clients[&cid].seen.clone();
-            if now == before {
-                continue;
-            }
-            let mut out = String::new();
-            if now.session != before.session {
-                if let Some((sid, name)) = &now.session {
-                    out.push_str(&format!("%session-changed ${sid} {name}\n"));
-                }
-            } else if let (Some((sid, a)), Some((_, b))) = (&now.session, &before.session) {
-                if a != b {
-                    out.push_str(&format!("%session-renamed ${sid} {a}\n"));
-                }
-            }
-            if now.sessions.keys().ne(before.sessions.keys()) {
-                out.push_str("%sessions-changed\n");
-            }
-            let same_session = now.session.as_ref().map(|s| s.0) == before.session.as_ref().map(|s| s.0);
-            if same_session {
-                for (wid, (name, layout)) in &now.windows {
-                    match before.windows.get(wid) {
-                        None => out.push_str(&format!("%window-add @{wid}\n")),
-                        Some((old_name, old_layout)) => {
-                            if old_name != name {
-                                out.push_str(&format!("%window-renamed @{wid} {name}\n"));
-                            }
-                            if old_layout != layout {
-                                let zoomed = self.windows.get(wid).is_some_and(|w| w.zoomed);
-                                out.push_str(&format!("%layout-change @{wid} {layout} {layout} {}\n", if zoomed { "*Z" } else { "*" }));
-                            }
-                        }
-                    }
-                }
-                for wid in before.windows.keys() {
-                    if !now.windows.contains_key(wid) {
-                        out.push_str(&format!("%window-close @{wid}\n"));
-                    }
-                }
-                if now.active_window != before.active_window {
-                    if let (Some((sid, _)), Some(w)) = (&now.session, now.active_window) {
-                        out.push_str(&format!("%session-window-changed ${sid} @{w}\n"));
-                    }
-                }
-                for (wid, p) in &now.active_pane {
-                    if before.active_pane.get(wid).is_some_and(|old| old != p) {
-                        out.push_str(&format!("%window-pane-changed @{wid} %{p}\n"));
-                    }
-                }
-                for (p, m) in &now.pane_modes {
-                    if before.pane_modes.get(p).is_some_and(|old| old != m) {
-                        out.push_str(&format!("%pane-mode-changed %{p}\n"));
-                    }
-                }
-            }
-            if let Some(c) = self.clients.get_mut(&cid) {
-                c.seen = now;
-            }
-            if !out.is_empty() {
-                self.control_write(cid, &out);
-            }
+            self.control_flush(cid);
         }
     }
 }

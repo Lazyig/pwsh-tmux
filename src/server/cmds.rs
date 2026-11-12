@@ -84,12 +84,12 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("server-access", "", "adglrw", ""),
     ("set-buffer", "setb", "aw", "bnt"),
     ("set-environment", "setenv", "Fhgru", "t"),
-    ("set-hook", "", "agpRuw", "t"),
+    ("set-hook", "", "agpERTuw", "Bt"),
     ("set-option", "set", "aFgopqsuUw", "t"),
     ("set-window-option", "setw", "aFgoqu", "t"),
     ("show-buffer", "showb", "", "b"),
     ("show-environment", "showenv", "hgs", "t"),
-    ("show-hooks", "", "gpw", "Ft"),
+    ("show-hooks", "", "Bgpw", "Ft"),
     ("show-messages", "showmsgs", "JT", "t"),
     ("show-options", "show", "AgHpqsvw", "Ft"),
     ("show-prompt-history", "showphist", "", "T"),
@@ -103,8 +103,13 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("switch-client", "switchc", "EFlnprZ", "cOtT"),
     ("unbind-key", "unbind", "anq", "T"),
     ("unlink-window", "unlinkw", "k", "t"),
-    ("wait-for", "wait", "LSU", ""),
+    ("wait-for", "wait", "ELSUlv", "Fw"),
 ];
+
+/// A command's flags without and with a value.
+pub fn command_flags(full: &str) -> (&'static str, &'static str) {
+    COMMANDS.iter().find(|c| c.0 == full).map_or(("", ""), |c| (c.2, c.3))
+}
 
 pub fn canonical(name: &str) -> Option<&'static str> {
     if let Some(c) = COMMANDS.iter().find(|c| c.0 == name || (!c.1.is_empty() && c.1 == name)) {
@@ -133,7 +138,7 @@ fn spawn_command(o: &Opts, input: bool) -> Result<Vec<String>, String> {
 /// it with cmd_parse_from_string and prints it with cmd_list_print: command-alias
 /// entries expanded, unknown commands and flags rejected, flags sorted as
 /// args_print does, { } blocks kept as command lists, commands joined by " ; ".
-fn command_list_string(v: &str, aliases: &[String]) -> Result<String, String> {
+pub(super) fn command_list_string(v: &str, aliases: &[String]) -> Result<String, String> {
     // errors of a string parse have no file:line prefix
     let cmds = cmdparse::parse_blocks(v).map_err(|e| match e.split_once(": ") {
         Some((l, rest)) if l.starts_with("line ") => rest.to_string(),
@@ -151,7 +156,8 @@ fn command_list_string(v: &str, aliases: &[String]) -> Result<String, String> {
 fn takes_commands(cmd: &str, idx: usize, flags: &[char]) -> bool {
     match cmd {
         "if-shell" => idx == 1 || idx == 2,
-        "set-option" | "set-window-option" | "set-hook" => idx == 1,
+        "set-option" | "set-window-option" => idx == 1,
+        "set-hook" => idx == 1 || flags.contains(&'B'),
         "run-shell" => flags.contains(&'C'),
         "bind-key" | "confirm-before" | "command-prompt" | "display-menu" | "choose-tree" | "choose-client"
         | "choose-buffer" | "customize-mode" | "switch-mode" | "display-panes" => true,
@@ -832,7 +838,6 @@ impl Server {
                 cwd: cwd.clone(),
                 options: Options::default(),
                 env: senv,
-                hooks: BTreeMap::new(),
                 created: now,
                 activity: now,
                 last_attached: 0,
@@ -858,7 +863,10 @@ impl Server {
         self.sessions.get_mut(&sid).unwrap().active = idx;
         self.link(sid, idx, wid, true);
         self.had_session = true;
-        self.run_hook(Some(sid), "session-created", Ctx { client: ctx.client, ..Ctx::default() });
+        let _ = ctx;
+        // its window's events come first (spawn_window), then session-created
+        self.detect_changes(None);
+        self.fire_session("session-created", sid);
         Ok(sid)
     }
 
@@ -876,7 +884,6 @@ impl Server {
         s.alerts.remove(&idx);
         s.activity = now_secs();
         self.mark_session_dirty(sid);
-        self.run_hook(Some(sid), "session-window-changed", Ctx::default());
     }
 
     pub fn select_pane(&mut self, wid: WinId, pane: PaneId) {
@@ -888,7 +895,6 @@ impl Server {
                 w.zoomed = false;
                 self.apply_layout(wid);
             }
-            self.run_hook(None, "window-pane-changed", Ctx { pane: Some(pane), ..Ctx::default() });
         }
         self.mark_window_dirty(wid);
     }
@@ -998,11 +1004,15 @@ impl Server {
                 } else {
                     b.data = data;
                 }
+                let n = b.name.clone();
+                self.buffer_event(&n, false);
                 return;
             }
         } else if append {
             if let Some(b) = self.buffers.first_mut() {
                 b.data.extend(data);
+                let n = b.name.clone();
+                self.buffer_event(&n, false);
                 return;
             }
         }
@@ -1012,13 +1022,15 @@ impl Server {
             self.buffer_seq += 1;
             n
         });
-        self.buffers.insert(0, Buffer { name, data, automatic, created: now_secs() });
         let limit = self.opt_server_num("buffer-limit").max(1) as usize;
-        while self.buffers.iter().filter(|b| b.automatic).count() > limit {
-            if let Some(pos) = self.buffers.iter().rposition(|b| b.automatic) {
-                self.buffers.remove(pos);
-            }
+        // paste_add frees the oldest automatic buffers first
+        while self.buffers.iter().filter(|b| b.automatic).count() >= limit && automatic {
+            let Some(pos) = self.buffers.iter().rposition(|b| b.automatic) else { break };
+            let old = self.buffers.remove(pos);
+            self.buffer_event(&old.name, true);
         }
+        self.buffers.insert(0, Buffer { name: name.clone(), data, automatic, created: now_secs() });
+        self.buffer_event(&name, false);
     }
 
     /// Copy from copy mode: store in a buffer and forward to the outer terminal clipboard (OSC 52).
@@ -1312,9 +1324,11 @@ impl Server {
                 if self.sessions.values().any(|s| s.id != sid && s.name == name) {
                     return err(format!("duplicate session: {name}"));
                 }
-                self.sessions.get_mut(&sid).unwrap().name = name;
+                let old = std::mem::replace(&mut self.sessions.get_mut(&sid).unwrap().name, name.clone());
                 self.mark_session_dirty(sid);
-                self.run_hook(Some(sid), "session-renamed", Ctx::default());
+                let mut p = self.payload_session(sid);
+                p.str("old_name", old).str("new_name", name);
+                self.fire("session-renamed", p);
                 Ok(Flow::Next)
             }
             "list-sessions" => {
@@ -1495,7 +1509,6 @@ impl Server {
                     ctx.out.push('\n');
                 }
                 ctx.pane = Some(pane);
-                self.run_hook(Some(sid), "window-linked", Ctx::default());
                 Ok(Flow::Next)
             }
             "kill-window" => {
@@ -1631,7 +1644,6 @@ impl Server {
                 w.name = name;
                 w.options.set("automatic-rename", "off".into());
                 self.mark_window_dirty(wt.wid.unwrap());
-                self.run_hook(wt.sid, "window-renamed", Ctx::default());
                 Ok(Flow::Next)
             }
             "select-window" | "next-window" | "previous-window" | "last-window" => {
@@ -1789,7 +1801,6 @@ impl Server {
                     w.zoomed = false;
                     self.apply_layout(wid);
                     self.mark_window_dirty(wid);
-                    self.run_hook(wt.sid, "window-layout-changed", Ctx::default());
                     return Ok(Flow::Next);
                 } else {
                     o.rest.first().cloned().or_else(|| {
@@ -1814,7 +1825,6 @@ impl Server {
                 w.zoomed = false;
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
-                self.run_hook(wt.sid, "window-layout-changed", Ctx::default());
                 Ok(Flow::Next)
             }
             "resize-window" => {
@@ -1930,13 +1940,21 @@ impl Server {
                 let wid = tt.wid.unwrap();
                 let pane = tt.pane.unwrap();
                 if o.has('m') || o.has('M') {
+                    let last = self.marked.filter(|p| self.panes.contains_key(p));
                     self.marked = if o.has('M') || self.marked == Some(pane) { None } else { Some(pane) };
                     self.mark_all_dirty();
+                    self.fire_marked_changed(pane, last);
                     return Ok(Flow::Next);
                 }
                 if let Some(title) = o.get('T') {
                     let title = self.expand(tt, ctx.client, title);
-                    self.panes.get_mut(&pane).unwrap().title = title;
+                    let p = self.panes.get_mut(&pane).unwrap();
+                    if p.title != title {
+                        p.title = title.clone();
+                        let mut ev = self.payload_pane(pane);
+                        ev.str("new_title", title);
+                        self.fire("pane-title-changed", ev);
+                    }
                     self.mark_window_dirty(wid);
                     return Ok(Flow::Next);
                 }
@@ -2060,7 +2078,6 @@ impl Server {
                 }
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
-                self.run_hook(tt.sid, "window-layout-changed", Ctx::default());
                 Ok(Flow::Next)
             }
             "swap-pane" => {
@@ -2940,8 +2957,10 @@ impl Server {
                         None => self.buffers.first_mut(),
                     }
                     .ok_or("no buffer")?;
-                    b.name = newname.to_string();
+                    let old = std::mem::replace(&mut b.name, newname.to_string());
                     b.automatic = false;
+                    self.buffer_event(&old, true);
+                    self.buffer_event(newname, false);
                     return Ok(Flow::Next);
                 }
                 let data = o.rest.first().ok_or("no data specified")?.clone();
@@ -2957,13 +2976,15 @@ impl Server {
                 match o.get('b') {
                     Some(n) => {
                         let pos = self.buffers.iter().position(|b| b.name == n).ok_or_else(|| format!("unknown buffer: {n}"))?;
-                        self.buffers.remove(pos);
+                        let old = self.buffers.remove(pos);
+                        self.buffer_event(&old.name, true);
                     }
                     None => {
                         if self.buffers.is_empty() {
                             return err("no buffer");
                         }
-                        self.buffers.remove(0);
+                        let old = self.buffers.remove(0);
+                        self.buffer_event(&old.name, true);
                     }
                 }
                 Ok(Flow::Next)
@@ -3047,7 +3068,8 @@ impl Server {
                 let data = if o.has('S') { data } else { vis::strvis(&data, vis::SAFE | vis::NOSLASH) };
                 self.paste(tt.pane.unwrap(), &data, o.has('p'), o.has('r'), o.get('s'));
                 if o.has('d') {
-                    self.buffers.remove(idx);
+                    let old = self.buffers.remove(idx);
+                    self.buffer_event(&old.name, true);
                 }
                 Ok(Flow::Next)
             }
@@ -3083,60 +3105,10 @@ impl Server {
                 Ok(Flow::Next)
             }
             "set-hook" => {
-                let name = o.rest.first().ok_or("set-hook needs a hook name")?.clone();
-                let base = name.split('[').next().unwrap().to_string();
-                if o.has('R') {
-                    let sid = self.current(ctx).sid;
-                    self.run_hook(sid, &base, ctx.clone());
-                    return Ok(Flow::Next);
-                }
-                let map = if o.has('g') || self.resolve_session(ctx, t).is_err() { &mut self.hooks } else { &mut self.sessions.get_mut(&self.resolve_session(ctx, t)?).unwrap().hooks };
-                if o.has('u') {
-                    map.remove(&base);
-                    return Ok(Flow::Next);
-                }
-                let command = o.rest.get(1).ok_or("set-hook needs a command")?.clone();
-                let e = map.entry(base).or_default();
-                if o.has('a') {
-                    e.push(command);
-                } else {
-                    *e = vec![command];
-                }
-                Ok(Flow::Next)
+                let aliases = self.command_aliases();
+                self.cmd_set_hook(&o, ctx, &aliases)
             }
-            "show-hooks" => {
-                let map = if o.has('g') { self.hooks.clone() } else { self.resolve_session(ctx, t).ok().map(|s| self.sessions[&s].hooks.clone()).unwrap_or_default() };
-                let ft = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
-                for (k, v) in map {
-                    if o.rest.first().is_some_and(|n| n.split('[').next() != Some(k.as_str())) {
-                        continue;
-                    }
-                    for (i, c) in v.iter().enumerate().filter(|(_, c)| !c.is_empty()) {
-                        match o.get('F') {
-                            Some(f) => {
-                                let vars = HashMap::from([
-                                    ("option_name".to_string(), k.clone()),
-                                    ("option_value".to_string(), c.clone()),
-                                    ("option_value_only".to_string(), "0".to_string()),
-                                    ("option_is_parent".to_string(), "0".to_string()),
-                                    ("option_is_array".to_string(), "1".to_string()),
-                                    ("option_is_string".to_string(), "1".to_string()),
-                                    ("option_is_hook".to_string(), "1".to_string()),
-                                    ("option_is_user".to_string(), (k.starts_with('@') as u8).to_string()),
-                                    ("option_has_value".to_string(), "1".to_string()),
-                                    ("option_has_array_key".to_string(), "1".to_string()),
-                                    ("option_array_key".to_string(), i.to_string()),
-                                ]);
-                                let line = self.expand_extra(ft, ctx.client, f, vars);
-                                ctx.out.push_str(&line);
-                                ctx.out.push('\n');
-                            }
-                            None => ctx.out.push_str(&format!("{k}[{i}] {c}\n")),
-                        }
-                    }
-                }
-                Ok(Flow::Next)
-            }
+            "show-hooks" => self.cmd_show_hooks(&o, ctx),
             // ---------------------------------------------------------------- scripting
             "source-file" => {
                 let mut injected = Vec::new();
@@ -3221,52 +3193,7 @@ impl Server {
                 let flags = format!("{}{}", if o.has('b') { "b" } else { "" }, if o.has('E') { "E" } else { "" });
                 Err(format!("\0job-run\0{command}\0{}\0{flags}\0{}", cwd.unwrap_or_default(), tt.pane.map(|p| p.to_string()).unwrap_or_default()))
             }
-            "wait-for" => {
-                let ch = o.rest.first().ok_or("wait-for needs a channel")?.clone();
-                if o.has('S') {
-                    let locked = self.waits.get(&ch).is_some_and(|e| e.0);
-                    let waiters = self.waits.get_mut(&ch).map(|e| std::mem::take(&mut e.1)).unwrap_or_default();
-                    if !locked {
-                        self.waits.remove(&ch);
-                    }
-                    if waiters.is_empty() {
-                        // like tmux: a signal nobody is waiting for is kept for the next wait-for
-                        if !locked {
-                            self.waits_woken.insert(ch);
-                        }
-                        return Ok(Flow::Next);
-                    }
-                    for q in waiters {
-                        self.run_queue(q);
-                    }
-                    return Ok(Flow::Next);
-                }
-                if o.has('L') {
-                    let e = self.waits.entry(ch.clone()).or_insert((false, Vec::new()));
-                    if !e.0 {
-                        e.0 = true;
-                        return Ok(Flow::Next);
-                    }
-                    return Err(format!("\0wait\0{ch}"));
-                }
-                if o.has('U') {
-                    let Some(e) = self.waits.get_mut(&ch) else { return err(format!("channel {ch} not locked")) };
-                    if !e.0 {
-                        return err(format!("channel {ch} not locked"));
-                    }
-                    if e.1.is_empty() {
-                        e.0 = false;
-                    } else {
-                        let q = e.1.remove(0);
-                        self.run_queue(q);
-                    }
-                    return Ok(Flow::Next);
-                }
-                if self.waits_woken.remove(&ch) {
-                    return Ok(Flow::Next); // already signalled
-                }
-                Err(format!("\0wait\0{ch}"))
-            }
+            "wait-for" => self.cmd_wait_for(&o, ctx),
             "list-commands" => {
                 for (n, a, b, v) in COMMANDS {
                     if o.rest.first().is_some_and(|x| x != n && x != a) {
@@ -3439,7 +3366,6 @@ impl Server {
             cwd: t.cwd.clone(),
             options: Options::default(),
             env: t.env.clone(),
-            hooks: BTreeMap::new(),
             created: now,
             activity: now,
             last_attached: 0,
@@ -3447,7 +3373,8 @@ impl Server {
             group: Some(gid),
         };
         self.sessions.insert(sid, session);
-        self.run_hook(Some(sid), "session-created", Ctx { client: ctx.client, ..Ctx::default() });
+        self.detect_changes(None);
+        self.fire_session("session-created", sid);
         if print {
             let s = self.expand(Target { sid: Some(sid), ..Target::default() }, None, fmt.unwrap_or("#{session_name}:"));
             ctx.out.push_str(&s);
@@ -3551,86 +3478,12 @@ impl Server {
         self.opts_server.array_items("command-alias").into_iter().map(|(_, v)| v).collect()
     }
 
-    /// The hook map a hook option lives in: the server's with -g, otherwise the
-    /// target session's (pwsh-tmux keeps window and pane hooks per session).
-    fn hook_level(&self, o: &Opts, ctx: &Ctx) -> Result<Option<SessId>, String> {
-        if o.has('g') { return Ok(None); }
-        let t = o.get('t');
-        self.resolve_session(ctx, t).map(Some)
-            .map_err(|_| t.map_or_else(|| "no current session".to_string(), |t| format!("no such session: {t}")))
-    }
-
-    /// A hook's commands at a level: the global level holds every hook (an empty
-    /// array by default), a session only those set on it.
-    fn hook_values(&self, sid: Option<SessId>, base: &str) -> Option<&[String]> {
-        match sid {
-            None => Some(self.hooks.get(base).map_or(&[][..], |v| v.as_slice())),
-            Some(s) => self.sessions.get(&s)?.hooks.get(base).map(|v| v.as_slice()),
-        }
-    }
-
-    /// set-option on a hook: an array of command lists. Unset elements are kept as
-    /// "" so the other keys stay put (string keys are not supported).
-    fn set_hook_option(&mut self, o: &Opts, ctx: &Ctx, name: &str, arg: &str, value: Option<String>) -> Result<(), String> {
-        let sid = match self.hook_level(o, ctx) {
-            Ok(s) => s,
-            Err(_) if o.has('q') => return Ok(()),
-            Err(e) => return err(e),
-        };
-        let (base, key) = match name.split_once('[') {
-            Some((b, k)) => {
-                let k = k.trim_end_matches(']');
-                (b, Some(k.parse::<usize>().map_err(|_| format!("bad array key: {k}"))?))
-            }
-            None => (name, None),
-        };
-        let already = self.hook_values(sid, base).is_some_and(|v| key.is_none_or(|i| v.get(i).is_some_and(|c| !c.is_empty())));
-        if o.has('o') && !o.has('u') && already {
-            return if o.has('q') { Ok(()) } else { err(format!("already set: {arg}")) };
-        }
-        let cmd = match &value {
-            _ if o.has('u') || o.has('U') => None,
-            None => return err("empty value"),
-            Some(v) => Some(command_list_string(v, &self.command_aliases())),
-        };
-        let map = match sid {
-            None => &mut self.hooks,
-            Some(s) => &mut self.sessions.get_mut(&s).ok_or("no such session")?.hooks,
-        };
-        let Some(cmd) = cmd else {
-            match key {
-                None => { map.remove(base); }
-                Some(i) => {
-                    if let Some(v) = map.get_mut(base) && i < v.len() {
-                        v[i].clear();
-                        while v.last().is_some_and(String::is_empty) { v.pop(); }
-                    }
-                }
-            }
-            return Ok(());
-        };
-        // the level gets the (empty) array even when the command does not parse
-        let v = map.entry(base.to_string()).or_default();
-        let cmd = cmd?;
-        let i = match key {
-            None => {
-                if !o.has('a') { v.clear(); }
-                // options_array_assign adds nothing for an empty value, else uses the first free key
-                if value.as_deref().unwrap_or("").is_empty() { return Ok(()); }
-                v.iter().position(String::is_empty).unwrap_or(v.len())
-            }
-            Some(i) => i,
-        };
-        if v.len() <= i { v.resize(i + 1, String::new()); }
-        v[i] = cmd;
-        Ok(())
-    }
-
     fn cmd_set_option(&mut self, window_cmd: bool, o: &Opts, ctx: &Ctx) -> Result<(), String> {
         let Some((name, arg)) = self.option_name(o, ctx, o.rest.first().ok_or("missing argument")?)? else { return Ok(()) };
         let value = o.rest.get(1).map(|v| if o.has('F') { self.expand(self.current(ctx), ctx.client, v) } else { v.clone() });
         if options::hook_scope(&name).is_some() {
-            return self.set_hook_option(o, ctx, &name, &arg, value);
+            let aliases = self.command_aliases();
+            return self.set_hook_option(o, ctx, &name, &arg, value, &aliases);
         }
         let scope = Self::option_scope(window_cmd, o, Some(&name));
         // -g has no meaning for server options and is ignored with -p
@@ -3710,7 +3563,6 @@ impl Server {
             "mode-keys" => {}
             _ => {}
         }
-        self.run_hook(None, "option-changed", Ctx::default());
         self.mark_all_dirty();
         for c in self.clients.values_mut() {
             c.prev = None;
@@ -3787,36 +3639,34 @@ impl Server {
                 None => out.push_str(&format!("{key}{star}\n")),
             }
         };
-        // hooks live in the hook maps: the session's (if not -g), then the global one
-        let hook_sid = match self.hook_level(o, ctx) {
-            Ok(s) => s,
-            Err(_) if o.has('q') && hook => return Ok(()),
-            Err(e) if hook => return err(e),
-            Err(_) => None,
-        };
-        let show_hook = |out: &mut String, name: &str, named: bool| {
-            let (base, key) = match name.split_once('[') {
-                Some((b, k)) => (b, Some(k.trim_end_matches(']'))),
-                None => (name, None),
-            };
-            let (values, parent) = match self.hook_values(hook_sid, base) {
-                Some(v) => (v, false),
-                None if o.has('A') => (self.hook_values(None, base).unwrap_or_default(), true),
-                None => return,
-            };
-            match key {
-                Some(k) => print(out, name, Some(k.parse::<usize>().ok().and_then(|i| values.get(i)).map_or("", String::as_str)), parent),
-                None if values.iter().all(String::is_empty) => print(out, base, None, parent && !named),
-                None => {
-                    for (i, v) in values.iter().enumerate().filter(|(_, v)| !v.is_empty()) {
-                        print(out, &format!("{base}[{i}]"), Some(v), parent);
-                    }
+        // hooks are array options of their level; -A falls back to the parent levels
+        let show_hook = |out: &mut String, level: events::Level, name: &str, named: bool| {
+            let base = name.split('[').next().unwrap_or(name);
+            let (lvl, parent) = if self.level_holds(level, base) {
+                (level, false)
+            } else if o.has('A') {
+                match self.hook_parents(level).into_iter().find(|l| self.level_holds(*l, base)) {
+                    Some(l) => (l, true),
+                    None => return,
                 }
+            } else {
+                return;
+            };
+            let mut lines = Vec::new();
+            self.hook_lines(lvl, name, &mut lines);
+            for (k, v, _) in lines {
+                let empty = v.is_none() && !name.contains('[');
+                print(out, &k, v.as_deref(), parent && !(named && empty));
             }
         };
         if let Some((n, _)) = named.as_ref().filter(|_| hook) {
+            let level = match self.hook_scope_level(o, ctx, n.split('[').next().unwrap_or(n)) {
+                Ok(l) => l,
+                Err(_) if o.has('q') => return Ok(()),
+                Err(e) => return err(e),
+            };
             let mut out = String::new();
-            show_hook(&mut out, n, true);
+            show_hook(&mut out, level, n, true);
             ctx.out.push_str(&out);
             return Ok(());
         }
@@ -3870,9 +3720,19 @@ impl Server {
                 }
             }
             None => {
-                // user options of this level first, then the table in tmux order
+                // user options of this level first (@ hooks only with -H), then the table in tmux order
+                let level = match (scope, global) {
+                    (Scope::Server, _) => None,
+                    (Scope::Session, true) => Some(events::Level::GlobalSession),
+                    (Scope::Session, false) => tt.sid.map(events::Level::Session),
+                    (_, true) => Some(events::Level::GlobalWindow),
+                    (Scope::Window, false) => tt.wid.map(events::Level::Window),
+                    (Scope::Pane, false) => tt.pane.map(events::Level::Pane),
+                };
                 for (k, v) in store.0.iter().filter(|(k, _)| k.starts_with('@')) {
-                    print(&mut out, k, Some(v), false);
+                    if o.has('H') || level.is_none_or(|l| !self.is_user_hook(l, k)) {
+                        print(&mut out, k, Some(v), false);
+                    }
                 }
                 let wanted = |s: Scope| s == scope || (s == Scope::Pane && scope == Scope::Window);
                 for d in options::DEFS.iter().filter(|d| wanted(d.scope)) {
@@ -3881,9 +3741,9 @@ impl Server {
                     }
                 }
                 // hooks come last in the table and only show with -H
-                if o.has('H') && scope != Scope::Server {
+                if let Some(level) = level.filter(|_| o.has('H')) {
                     for (h, _) in options::HOOKS.iter().filter(|h| wanted(h.1)) {
-                        show_hook(&mut out, h, false);
+                        show_hook(&mut out, level, h, false);
                     }
                 }
             }
