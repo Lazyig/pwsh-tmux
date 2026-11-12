@@ -99,21 +99,40 @@ pub struct Modes {
 }
 
 pub fn draw_box(f: &mut Frame, x: u16, y: u16, w: u16, h: u16, style: Style, title: &str) {
+    draw_box_lines(f, x, y, w, h, style, title, "single");
+}
+
+/// Box characters for menu-border-lines / popup-border-lines: horizontal, vertical,
+/// corners (tl, tr, bl, br) and the left and right ends of a menu separator.
+pub fn box_lines(lines: &str) -> [&'static str; 8] {
+    match lines {
+        "rounded" => ["─", "│", "╭", "╮", "╰", "╯", "├", "┤"],
+        "double" => ["═", "║", "╔", "╗", "╚", "╝", "╠", "╣"],
+        "heavy" => ["━", "┃", "┏", "┓", "┗", "┛", "┣", "┫"],
+        "simple" => ["-", "|", "+", "+", "+", "+", "+", "+"],
+        "padded" | "none" => [" "; 8],
+        _ => ["─", "│", "┌", "┐", "└", "┘", "├", "┤"],
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn draw_box_lines(f: &mut Frame, x: u16, y: u16, w: u16, h: u16, style: Style, title: &str, lines: &str) {
     if w < 2 || h < 2 {
         return;
     }
+    let [hz, vt, tl, tr, bl, br, _, _] = box_lines(lines);
     for i in x + 1..x + w - 1 {
-        f.set(i, y, Cell { text: "─".into(), style });
-        f.set(i, y + h - 1, Cell { text: "─".into(), style });
+        f.set(i, y, Cell { text: hz.into(), style });
+        f.set(i, y + h - 1, Cell { text: hz.into(), style });
     }
     for j in y + 1..y + h - 1 {
-        f.set(x, j, Cell { text: "│".into(), style });
-        f.set(x + w - 1, j, Cell { text: "│".into(), style });
+        f.set(x, j, Cell { text: vt.into(), style });
+        f.set(x + w - 1, j, Cell { text: vt.into(), style });
     }
-    f.set(x, y, Cell { text: "┌".into(), style });
-    f.set(x + w - 1, y, Cell { text: "┐".into(), style });
-    f.set(x, y + h - 1, Cell { text: "└".into(), style });
-    f.set(x + w - 1, y + h - 1, Cell { text: "┘".into(), style });
+    f.set(x, y, Cell { text: tl.into(), style });
+    f.set(x + w - 1, y, Cell { text: tr.into(), style });
+    f.set(x, y + h - 1, Cell { text: bl.into(), style });
+    f.set(x + w - 1, y + h - 1, Cell { text: br.into(), style });
     if !title.is_empty() && w > 4 {
         let spans = format::spans(title, style);
         let cells = spans_cells(&spans, w.saturating_sub(4) as usize, style);
@@ -593,19 +612,27 @@ impl Server {
                     let st = ost("menu-style", st);
                     let bst = ost("menu-border-style", bst);
                     let selected = ost("menu-selected-style", Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() });
-                    m.draw(&mut f, st, bst, selected);
+                    // display-menu -s -S -H -b
+                    let given = |v: &Option<String>, base: Style| v.as_deref().and_then(|v| self.style_option(v, base, active_target, Some(cid))).unwrap_or(base);
+                    let (st, bst, selected) = (given(&m.look.style, st), given(&m.look.border_style, bst), given(&m.look.selected_style, selected));
+                    let lines = m.look.lines.clone().unwrap_or_else(|| self.opt_window(Some(wid), "menu-border-lines"));
+                    m.draw(&mut f, st, bst, selected, &lines);
                     cursor = None;
                 }
                 Overlay::Popup(pp) => {
                     let st = self.style_option(&self.opt_window(Some(wid), "popup-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
                     let bst = self.style_option(&self.opt_window(Some(wid), "popup-border-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
+                    // display-popup -s -S -b
+                    let given = |v: &Option<String>, base: Style| v.as_deref().and_then(|v| self.style_option(v, base, active_target, Some(cid))).unwrap_or(base);
+                    let (st, bst) = (given(&pp.look.style, st), given(&pp.look.border_style, bst));
+                    let lines = pp.look.lines.clone().unwrap_or_else(|| self.opt_window(Some(wid), "popup-border-lines"));
                     for y in pp.y..pp.y + pp.h {
                         for x in pp.x..pp.x + pp.w {
                             f.set(x, y, Cell { text: " ".into(), style: st });
                         }
                     }
                     if pp.border {
-                        draw_box(&mut f, pp.x, pp.y, pp.w, pp.h, bst, &pp.title);
+                        draw_box_lines(&mut f, pp.x, pp.y, pp.w, pp.h, bst, &pp.title, &lines);
                     }
                     let (ix, iy, iw, ih) = pp.inner();
                     cursor = None;

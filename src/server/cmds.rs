@@ -1426,6 +1426,22 @@ impl Server {
             }
             "refresh-client" => {
                 let cid = self.resolve_client(ctx, t)?;
+                // -c/-L/-R/-U/-D pan a window larger than the client; windows are drawn from
+                // their top left here, so only the adjustment is checked
+                if ['c', 'L', 'R', 'U', 'D'].into_iter().any(|f| o.has(f)) {
+                    if let Some(a) = o.rest.first() {
+                        match a.parse::<i64>() {
+                            Ok(n) if (1..=i32::MAX as i64).contains(&n) => {}
+                            Ok(n) if n < 1 => return err("adjustment too small"),
+                            Ok(_) => return err("adjustment too large"),
+                            Err(_) => return err("adjustment invalid"),
+                        }
+                    }
+                    if let Some(c) = self.clients.get_mut(&cid) {
+                        c.dirty = true;
+                    }
+                    return Ok(Flow::Next);
+                }
                 if let Some(size) = o.get('C') {
                     // control clients: -C WxH (or W,H)
                     let (w, h) = size.split_once(['x', ',']).ok_or_else(|| format!("bad size: {size}"))?;
@@ -2565,6 +2581,9 @@ impl Server {
             }
             "display-menu" => {
                 let cid = self.resolve_client(ctx, o.get('c'))?;
+                if let Some(b) = o.get('b').filter(|b| !super::modes::BOX_LINES.contains(b)) {
+                    return err(format!("menu-border-lines unknown value: {b}"));
+                }
                 if self.clients.get(&cid).is_some_and(|c| c.overlay.is_some()) {
                     return Ok(Flow::Next);
                 }
@@ -2604,12 +2623,21 @@ impl Server {
                 let (w, h) = Menu::box_size(&title, &items);
                 let Some((x, y)) = self.overlay_position(cid, tt, ctx.mouse.as_ref(), o.get('x'), o.get('y'), w, h) else { return Ok(Flow::Next) };
                 let nomouse = ctx.mouse.is_none() && !o.has('M');
-                let menu = Menu::at(title, items, x, y, tt.pane, nomouse, o.has('O'), start);
+                let mut menu = Menu::at(title, items, x, y, tt.pane, nomouse, o.has('O'), start);
+                menu.look = super::modes::OverlayLook {
+                    style: o.get('s').map(String::from),
+                    selected_style: o.get('H').map(String::from),
+                    border_style: o.get('S').map(String::from),
+                    lines: o.get('b').map(String::from),
+                };
                 let epoch = self.replace_overlay(cid, Some(Overlay::Menu(menu)))?;
                 Ok(Flow::WaitOverlay(cid, epoch))
             }
             "display-popup" => {
                 let cid = self.resolve_client(ctx, o.get('c'))?;
+                if let Some(b) = o.get('b').filter(|b| !super::modes::BOX_LINES.contains(b)) {
+                    return err(format!("popup-border-lines unknown value: {b}"));
+                }
                 if o.has('C') {
                     if matches!(self.clients.get(&cid).and_then(|c| c.overlay.as_ref()), Some(Overlay::Popup(_))) {
                         self.replace_overlay(cid, None)?;
@@ -2634,13 +2662,17 @@ impl Server {
                 let h = dim(o.get('h'), ch).clamp(3, ch);
                 let x = o.get('x').and_then(|v| v.parse().ok()).unwrap_or(((cw - 1) / 2).saturating_sub(w / 2)).min(cw - w);
                 let y = o.get('y').and_then(|v| v.parse().ok()).unwrap_or(((ch - 1) / 2).saturating_sub(h / 2)).min(ch - h);
-                let border = !o.has('B');
+                // -B, or -b none: no border
+                let border = !o.has('B') && o.get('b') != Some("none");
                 let (iw, ih) = if border { (w - 2, h - 2) } else { (w, h) };
                 let tt = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
                 let cwd = o.get('d').map(|d| self.expand(tt, Some(cid), d)).or_else(|| tt.pane.and_then(|p| self.panes.get(&p)).map(|p| p.current_path.clone()));
                 let pane = self.spawn_pane(tt.sid, iw.max(1), ih.max(1), &o.rest, cwd.as_deref(), &env)?;
                 let title = o.get('T').map(|s| self.expand(tt, Some(cid), s)).unwrap_or_default();
-                let epoch = self.replace_overlay(cid, Some(Overlay::Popup(Popup { pane, x, y, w, h, border, close_on_exit: o.has('E'), title })))?;
+                let epoch = self.replace_overlay(cid, Some(Overlay::Popup(Popup {
+                    pane, x, y, w, h, border, close_on_exit: o.has('E'), title, any_key: o.has('k') && !o.has('N'),
+                    look: super::modes::OverlayLook { style: o.get('s').map(String::from), border_style: o.get('S').map(String::from), lines: o.get('b').map(String::from), ..Default::default() },
+                })))?;
                 Ok(Flow::WaitOverlay(cid, epoch))
             }
             // ---------------------------------------------------------------- prompts & messages

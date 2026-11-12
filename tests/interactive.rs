@@ -455,3 +455,34 @@ fn send_keys_as_typed_and_detach_exec() {
     t.wait_exit();
     assert_eq!(ctx.ok(&["list-clients"]), "");
 }
+
+#[test]
+fn menu_and_popup_lines_styles_and_closing_keys() {
+    let ctx = Ctx::new("menu-look");
+    let t = start(&ctx, "m");
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    // menus and popups make the command wait until they close
+    let bg = |args: &[&str]| ctx.command().args(args).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    assert!(ctx.fails(&["display-menu", "-c", &client, "-b", "wavy", "x", "x", "display x"]).contains("menu-border-lines unknown value: wavy"));
+    let mut w1 = bg(&["display-menu", "-c", &client, "-b", "double", "-x", "0", "-y", "10", "-T", "T", "First", "f", "display first"]);
+    t.wait_screen("double menu border", |s| s.contains('╔') && s.contains("First"));
+    t.send(b"\x1b");
+    t.wait_screen("menu closed", |s| !s.contains('╔'));
+    assert!(ctx.fails(&["display-popup", "-c", &client, "-b", "wavy", "true"]).contains("popup-border-lines unknown value: wavy"));
+    // -b rounded; the command exits; without -k only Escape or C-c close it
+    let mut w2 = bg(&["display-popup", "-c", &client, "-b", "rounded", "-w", "30", "-h", "8", "echo POPUP-DONE"]);
+    t.wait_screen("rounded popup", |s| s.contains('╭') && s.contains("POPUP-DONE"));
+    t.send(b"x");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(t.contents().contains('╭'), "a key other than Escape closed the popup");
+    t.send(b"\x1b");
+    t.wait_screen("popup closed", |s| !s.contains('╭'));
+    // -k: any key closes it once the command has exited
+    let mut w3 = bg(&["display-popup", "-c", &client, "-k", "-b", "heavy", "-w", "30", "-h", "8", "echo POPUP-K"]);
+    t.wait_screen("heavy popup", |s| s.contains('┏') && s.contains("POPUP-K"));
+    t.send(b"x");
+    t.wait_screen("popup closed by any key", |s| !s.contains('┏'));
+    for w in [&mut w1, &mut w2, &mut w3] {
+        wait_for("waiting command", || w.try_wait().unwrap().is_some());
+    }
+}

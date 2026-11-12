@@ -331,8 +331,11 @@ impl Server {
             }
             Some(Overlay::Popup(p)) => {
                 let pane = p.pane;
-                if self.panes.get(&pane).is_some_and(|x| x.dead.is_some()) {
-                    // any key closes a popup whose command has exited
+                let dead = self.panes.get(&pane).is_none_or(|x| x.dead.is_some());
+                // popup_key_cb: Escape and C-c close it unless it closes when its command
+                // exits (and that is still running); -k: any key once the command exited
+                let esc = (k.code == KeyCode::Escape && k.mods.is_empty()) || (k.code == KeyCode::Char('c') && k.mods.ctrl && !k.mods.meta);
+                if (esc && (!p.close_on_exit || dead)) || (dead && p.any_key) {
                     let c = self.clients.get_mut(&cid).unwrap();
                     c.overlay = None;
                     c.dirty = true;
