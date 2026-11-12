@@ -412,6 +412,14 @@ impl Vars for VarCtx<'_> {
         None
     }
 
+    fn environ(&self, name: &str) -> Option<String> {
+        let sess = self.t.sid.and_then(|s| self.srv.sessions.get(&s));
+        match sess.and_then(|s| s.env.get(name)) {
+            Some(v) => v.clone(),
+            None => self.srv.env.get(name).cloned().flatten(),
+        }
+    }
+
     fn user_options(&self) -> Vec<(String, String)> {
         self.t.wid.and_then(|w| self.srv.windows.get(&w)).map(|w| w.options.0.iter()
             .filter(|(k, _)| k.starts_with('@')).map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default()

@@ -48,6 +48,12 @@ pub trait Vars {
     fn theme_color(&self, _name: &str) -> Option<Color> {
         None
     }
+    /// The session environment, then the global one: format_find's last resort for a name
+    /// that is not a variable or option. A name removed (-r) in the session has no value and
+    /// is not looked up globally.
+    fn environ(&self, _name: &str) -> Option<String> {
+        None
+    }
 }
 
 impl Vars for HashMap<String, String> {
@@ -242,7 +248,7 @@ fn parse_modifiers(s: &str) -> Option<(Vec<Modifier>, &str)> {
 
 /// strtonum(3): an integer with optional leading space and sign, nothing after it.
 fn strtonum(s: &str) -> Option<i64> {
-    s.trim_start().parse().ok()
+    s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']).parse().ok()
 }
 
 fn truthy(s: &str) -> bool {
@@ -263,14 +269,16 @@ impl<'a> Expander<'a> {
         Expander { vars, now: self.now, budget: self.budget, cycle: self.cycle, nojobs: self.nojobs, time: self.time }
     }
 
-    fn lookup(&self, name: &str) -> Option<String> {
+    /// format_find: a variable or option, then (unless for the t modifier) the session and
+    /// global environment.
+    fn lookup(&self, name: &str, time: bool) -> Option<String> {
         if let Some(v) = self.vars.get(name) {
             return Some(v);
         }
         if name == "host_short" {
             return self.vars.get("host").map(|h| h.split('.').next().unwrap_or("").to_string());
         }
-        None
+        if time { None } else { self.vars.environ(name) }
     }
 
     fn expand(&self, s: &str, depth: usize) -> String {
@@ -289,12 +297,20 @@ impl<'a> Expander<'a> {
         let mut out = String::with_capacity(s.len());
         let mut i = 0;
         let mut lit = 0;
+        // End (the `]`) of the last `#[` style seen; single-letter aliases are not expanded
+        // inside one, so colours such as #DDDDDD are left alone.
+        let mut style_end: Option<usize> = None;
         while i < b.len() {
-            if b[i] != b'#' || i + 1 >= b.len() {
+            if b[i] != b'#' {
                 i += 1;
                 continue;
             }
             out.push_str(&s[lit..i]);
+            if i + 1 >= b.len() {
+                // As format_expand1, a trailing `#` is dropped.
+                lit = b.len();
+                break;
+            }
             let c = b[i + 1];
             match c {
                 b'{' => match skip(s, i, b"}") {
@@ -334,23 +350,35 @@ impl<'a> Expander<'a> {
                     }
                     i = (j + 1).min(b.len());
                 }
-                b'#' => {
-                    // Keep `##[` so the style parser sees an escaped `#[`.
-                    out.push_str(if b.get(i + 2) == Some(&b'[') { "##" } else { "#" });
-                    i += 2;
+                b'[' | b'#' => {
+                    let run = b[i..].iter().take_while(|&&c| c == b'#').count();
+                    if b.get(i + run) == Some(&b'[') {
+                        // `#[`, `##[`, `###[` ...: a style, left (with all its `#`s) for
+                        // format_draw.
+                        style_end = skip(s, i, b"]");
+                        out.push_str(&s[i..=i + run]);
+                        i += run + 1;
+                    } else {
+                        // `##` is `#`; an odd `#` at the end of the run starts the next item.
+                        out.extend(std::iter::repeat_n('#', run / 2));
+                        i += run - run % 2;
+                    }
                 }
-                b',' | b'}' | b':' => {
+                b',' | b'}' => {
                     out.push(c as char);
                     i += 2;
                 }
                 _ => {
-                    if let Some(name) = alias(c) {
-                        out.push_str(&self.lookup(name).unwrap_or_default());
-                        i += 2;
-                    } else {
-                        // `#[` style directives and anything else pass through.
-                        out.push('#');
-                        i += 1;
+                    match alias(c).filter(|_| style_end.is_none_or(|e| i + 2 > e)) {
+                        Some(name) => {
+                            out.push_str(&self.lookup(name, false).unwrap_or_default());
+                            i += 2;
+                        }
+                        None => {
+                            // Anything else (`#:` too) passes through.
+                            out.push('#');
+                            i += 1;
+                        }
                     }
                 }
             }
@@ -374,24 +402,30 @@ impl<'a> Expander<'a> {
                 *a = self.expand(&unescape_format(a), depth + 1);
             }
         }
+        // format_replace walks the modifiers in order, so of a repeated modifier the last one
+        // counts; most ignore an occurrence without arguments, and flags of I, c and N add up.
         let get = |n: &str| mods.iter().find(|m| m.name == n);
-        let flags = |n: &str| get(n).and_then(|m| m.args.first()).map(String::as_str).unwrap_or("");
+        let last = |n: &str| mods.iter().rev().find(|m| m.name == n);
+        let last_args = |n: &str| mods.iter().rev().find(|m| m.name == n && !m.args.is_empty());
+        let all_flags = |n: &str| mods.iter().filter(|m| m.name == n).filter_map(|m| m.args.first()).map(String::as_str).collect::<String>();
         let ex = |s: &str| self.expand(s, depth + 1);
         // I/e wins over I/f over I/c, as the later checks in tmux overwrite the value.
-        let info = get("I").map(|_| flags("I")).and_then(|f| ['e', 'f', 'c'].into_iter().find(|k| f.contains(*k)));
+        let info = get("I").map(|_| all_flags("I")).and_then(|f| ['e', 'f', 'c'].into_iter().find(|k| f.contains(*k)));
         let loop_kind = ['S', 'W', 'P', 'L', 'O', 'V'].into_iter().find(|c| get(&c.to_string()).is_some());
-        let name_kind = get("N").and_then(|m| match m.args.first() {
-            None => Some('W'),
-            Some(f) if f.contains('w') => Some('W'),
-            Some(f) if f.contains('s') => Some('S'),
-            _ => None,
-        });
-        let compare = mods.iter().find(|m| ["==", "!=", "<", ">", "<=", ">=", "m"].contains(&m.name));
+        let name_kind = if mods.iter().any(|m| m.name == "N" && m.args.first().is_none_or(|f| f.contains('w'))) {
+            Some('W')
+        } else if mods.iter().any(|m| m.name == "N" && m.args.first().is_some_and(|f| f.contains('s'))) {
+            Some('S')
+        } else {
+            None
+        };
+        let compare = mods.iter().rev().find(|m| ["==", "!=", "<", ">", "<=", ">=", "m"].contains(&m.name));
+        let time = get("t").is_some();
 
         let mut value = if let Some(kind) = info {
             self.vars.client_info(kind, copy).unwrap_or_default()
-        } else if let Some(m) = get("A") {
-            let count = m.args.first().and_then(|s| strtonum(s)).filter(|n| (1..=100).contains(n)).unwrap_or(1) as u64;
+        } else if get("A").is_some() {
+            let count = last_args("A").and_then(|m| strtonum(&m.args[0])).filter(|n| (1..=100).contains(n)).unwrap_or(1) as u64;
             self.cycle(copy, count)
         } else if get("l").is_some() {
             unescape_format(copy)
@@ -402,14 +436,18 @@ impl<'a> Expander<'a> {
                 .map(String::from)
                 .unwrap_or_default()
         } else if get("c").is_some() {
-            colour_format(&ex(copy), flags("c"), self.vars)
+            colour_format(&ex(copy), &all_flags("c"), self.vars)
         } else if let Some(kind) = loop_kind {
-            self.expand_loop(kind, flags(&kind.to_string()), copy, depth)?
+            // The sort flags of S, W, P and L come from the last one; O and V take one argument.
+            let name = kind.to_string();
+            let m = if "OV".contains(kind) { mods.iter().rev().find(|m| m.name == name && m.args.len() == 1) } else { last(&name) };
+            let flags = m.and_then(|m| m.args.first()).map(String::as_str).unwrap_or("");
+            self.expand_loop(kind, flags, copy, depth)?
         } else if let Some(kind) = name_kind {
             let name = ex(copy);
             let key = if kind == 'S' { "session_name" } else { "window_name" };
             bool_str(self.vars.contexts(kind, "").iter().any(|(v, _)| v.get(key).as_deref() == Some(&name)))
-        } else if let Some(m) = get("C") {
+        } else if let Some(m) = last("C") {
             let flags = m.args.first().map(String::as_str).unwrap_or("");
             self.vars.search(&ex(copy), flags.contains('r'), flags.contains('i')).to_string()
         } else if get("R").is_some() {
@@ -424,7 +462,7 @@ impl<'a> Expander<'a> {
             bool_str(!truthy(&ex(copy)))
         } else if get("!!").is_some() {
             bool_str(truthy(&ex(copy)))
-        } else if let Some(m) = mods.iter().find(|m| m.name == "||" || m.name == "&&") {
+        } else if let Some(m) = mods.iter().rev().find(|m| m.name == "||" || m.name == "&&") {
             // n-ary, short-circuiting: #{||:a,b,c}
             let mut parts = Vec::new();
             let mut rest = copy;
@@ -461,7 +499,7 @@ impl<'a> Expander<'a> {
             let mut i = 0;
             let mut chosen = None;
             while i + 1 < parts.len() {
-                let cond = match self.lookup(parts[i]) {
+                let cond = match self.lookup(parts[i], time) {
                     Some(v) => v,
                     None => {
                         let e = ex(parts[i]);
@@ -478,44 +516,49 @@ impl<'a> Expander<'a> {
                 chosen = Some(parts[parts.len() - 1]);
             }
             chosen.map(ex).unwrap_or_default()
-        } else if let Some(m) = get("e").filter(|m| (1..=3).contains(&m.args.len())) {
-            let (a, b) = split2(copy)?;
-            arith(&m.args, &ex(a), &ex(b)).unwrap_or_default()
+        } else if let Some(m) = mods.iter().rev().find(|m| m.name == "e" && (1..=3).contains(&m.args.len())) {
+            // A bad expression (no comma too) is empty but does not stop the expansion.
+            split2(copy).and_then(|(a, b)| arith(&m.args, &ex(a), &ex(b))).unwrap_or_default()
+        } else if copy.contains("#{") {
+            // As tmux, a name containing a format is expanded instead, and t, b, d and q do
+            // not apply to it.
+            ex(copy)
         } else {
-            let found = match self.lookup(copy) {
-                Some(v) => Some(v),
-                // As tmux, a name containing a format is expanded instead. Extension: the
-                // modifiers below apply to it too, as in #{b:#{pane_current_path}}.
-                None if copy.contains("#{") => Some(ex(copy)),
-                None => None,
-            };
-            // t, b, d and q only change a value that was found.
-            match found {
+            match self.lookup(copy, time) {
                 None => String::new(),
+                Some(v) if time => self.format_time(&v, &mods).unwrap_or_default(),
                 Some(mut v) => {
-                    if let Some(m) = get("t") {
-                        v = self.format_time(&v, &m.args);
-                    }
+                    // b, d and q only change a value that was found.
                     if get("b").is_some() {
                         v = basename(&v);
                     }
                     if get("d").is_some() {
                         v = dirname(&v);
                     }
-                    if let Some(m) = get("q") {
-                        let flags = m.args.first().map(String::as_str).unwrap_or("");
-                        v = if m.args.is_empty() {
-                            shell_quote(&v)
-                        } else if flags.contains('s') {
-                            format!("'{}'", v.replace('\'', "'\\''"))
-                        } else if flags.contains('e') || flags.contains('h') {
-                            // Escape # for styles.
-                            v.replace('#', "##")
-                        } else if flags.contains('a') {
-                            quote_argument(&v)
-                        } else {
-                            v
-                        };
+                    // Each q sets one kind of quoting; tmux applies all that are set, in order.
+                    let mut quote = [false; 4];
+                    for m in mods.iter().filter(|m| m.name == "q") {
+                        let f = m.args.first().map(String::as_str);
+                        match f {
+                            None => quote[0] = true,
+                            Some(f) if f.contains('s') => quote[1] = true,
+                            Some(f) if f.contains('e') || f.contains('h') => quote[2] = true,
+                            Some(f) if f.contains('a') => quote[3] = true,
+                            _ => {}
+                        }
+                    }
+                    if quote[0] {
+                        v = shell_quote(&v);
+                    }
+                    if quote[1] {
+                        v = format!("'{}'", v.replace('\'', "'\\''"));
+                    }
+                    if quote[2] {
+                        // Escape # for styles.
+                        v = v.replace('#', "##");
+                    }
+                    if quote[3] {
+                        v = quote_argument(&v);
                     }
                     v
                 }
@@ -533,17 +576,19 @@ impl<'a> Expander<'a> {
             value = regex_substitute(&ex(&m.args[0]), &ex(&m.args[1]), &value, flags.contains('i'));
         }
         // Widths outside -10000..10000 are ignored.
-        let width_arg = |n: &str| get(n).and_then(|m| m.args.first()).and_then(|a| strtonum(a)).filter(|n| n.unsigned_abs() <= 10000).unwrap_or(0);
+        let width_arg = |n: &str| last_args(n).and_then(|m| strtonum(&m.args[0])).filter(|n| n.unsigned_abs() <= 10000).unwrap_or(0);
         let limit = width_arg("=");
         if limit != 0 {
-            let marker = get("=").and_then(|m| m.args.get(1)).map(String::as_str).unwrap_or("");
+            // The marker is kept from the last = that has one.
+            let marker = mods.iter().rev().filter(|m| m.name == "=" && !m.args.is_empty()).find_map(|m| m.args.get(1)).map(String::as_str).unwrap_or("");
             let n = limit.unsigned_abs() as usize;
             if fmt_width(&value) > n {
                 value = if limit > 0 { trim_left(&value, n) + marker } else { marker.to_string() + &trim_right(&value, n) };
             }
         }
+        // utf8_padcstr measures the raw string: `#[...]` and `##` count as text here.
         let pad = width_arg("p");
-        let w = fmt_width(&value);
+        let w = cstr_width(&value);
         if (pad.unsigned_abs() as usize) > w {
             let fill = " ".repeat(pad.unsigned_abs() as usize - w);
             value = if pad > 0 { value + &fill } else { fill + &value };
@@ -629,31 +674,47 @@ impl<'a> Expander<'a> {
         Some(out)
     }
 
-    /// `t:` modifier: format a unix timestamp. `t/p` = pretty (short), `t/f/<fmt>` = strftime.
-    fn format_time(&self, v: &str, args: &[String]) -> String {
-        let Ok(secs) = v.trim().parse::<i64>() else { return String::new() };
-        if secs <= 0 { return String::new(); }
-        let Some(t) = Local.timestamp_opt(secs, 0).single() else { return String::new() };
-        let flags = args.first().map(String::as_str).unwrap_or("");
-        let age = self.now.timestamp() - secs;
-        if !flags.contains('p') && flags.contains('r') { return relative_time(age); }
-        if !flags.contains('p') && flags.contains('d') { return age.to_string(); }
-        match flags {
-            f if !f.contains('p') && f.contains('f') && args.len() >= 2 => strftime(args.get(1).map(String::as_str).unwrap_or(""), &t),
-            p if p.contains('p') => {
-                let age = self.now.signed_duration_since(t);
-                if age.num_hours() < 24 {
-                    t.format("%H:%M").to_string()
-                } else if (t.year() == self.now.year() && t.month() == self.now.month()) || age.num_days() < 28 {
-                    t.format("%a%d").to_string()
-                } else if (t.year() == self.now.year() && t.month() < self.now.month()) || (t.year() == self.now.year() - 1 && t.month() > self.now.month()) {
-                    t.format("%d%b").to_string()
-                } else {
-                    t.format("%b%y").to_string()
-                }
+    /// `t:` modifier: format a unix timestamp (format_find). Each t adds one of p (pretty),
+    /// r (relative) and d (difference), or with f sets the strftime format; relative wins
+    /// over difference over pretty over the format, and the default is ctime(3). None for a
+    /// value that is not a positive number.
+    fn format_time(&self, v: &str, mods: &[Modifier]) -> Option<String> {
+        let (mut pretty, mut relative, mut difference, mut format) = (false, false, false, None);
+        for m in mods.iter().filter(|m| m.name == "t") {
+            let Some(f) = m.args.first() else { continue };
+            if f.contains('p') {
+                pretty = true;
+            } else if f.contains('r') {
+                relative = true;
+            } else if f.contains('d') {
+                difference = true;
+            } else if f.contains('f') && m.args.len() >= 2 {
+                format = Some(m.args[1].as_str());
             }
-            _ => t.format("%a %b %e %H:%M:%S %Y").to_string(),
         }
+        let secs = strtonum(v).filter(|n| *n > 0)?;
+        let t = Local.timestamp_opt(secs, 0).single()?;
+        let age = self.now.timestamp() - secs;
+        Some(if relative {
+            relative_time(age)
+        } else if difference {
+            age.to_string()
+        } else if pretty {
+            let age = self.now.signed_duration_since(t);
+            if age.num_hours() < 24 {
+                t.format("%H:%M").to_string()
+            } else if (t.year() == self.now.year() && t.month() == self.now.month()) || age.num_days() < 28 {
+                t.format("%a%d").to_string()
+            } else if (t.year() == self.now.year() && t.month() < self.now.month()) || (t.year() == self.now.year() - 1 && t.month() > self.now.month()) {
+                t.format("%d%b").to_string()
+            } else {
+                t.format("%b%y").to_string()
+            }
+        } else if let Some(f) = format {
+            strftime(f, &t)
+        } else {
+            t.format("%a %b %e %H:%M:%S %Y").to_string()
+        })
     }
 }
 
@@ -714,6 +775,9 @@ impl Vars for Overlay<'_> {
     }
     fn theme_color(&self, name: &str) -> Option<Color> {
         self.base.theme_color(name)
+    }
+    fn environ(&self, name: &str) -> Option<String> {
+        self.base.environ(name)
     }
 }
 
@@ -1053,8 +1117,8 @@ fn arith(args: &[String], a: &str, b: &str) -> Option<String> {
         Some(p) => match strtonum(p).filter(|n| (-100..=100).contains(n))? { n if n < 0 => 6, n => n as usize },
         None => if float { 2 } else { 0 },
     };
-    let mut x: f64 = a.trim().parse().ok()?;
-    let mut y: f64 = b.trim().parse().ok()?;
+    let mut x = strtod(a)?;
+    let mut y = strtod(b)?;
     if !float {
         x = x.trunc();
         y = y.trunc();
@@ -1086,8 +1150,66 @@ fn arith(args: &[String], a: &str, b: &str) -> Option<String> {
     Some(format!("{r:.prec$}"))
 }
 
+/// strtod(3) that must use the whole string, as format_replace_expression checks: leading
+/// (not trailing) space, a sign, decimal or hexadecimal (0x, with p exponent) numbers, inf,
+/// infinity and nan. An empty string is 0.
+fn strtod(s: &str) -> Option<f64> {
+    if s.is_empty() {
+        return Some(0.0);
+    }
+    let t = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let (neg, body) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let lower = body.to_ascii_lowercase();
+    // Length of digits[.digits] (at least one digit) at the start of m.
+    let mantissa = |m: &str, radix: u32| -> Option<usize> {
+        let (mut digits, mut dot, mut n) = (0, false, 0);
+        for c in m.chars() {
+            match c {
+                '.' if !dot => dot = true,
+                c if c.is_digit(radix) => digits += 1,
+                _ => break,
+            }
+            n += 1;
+        }
+        (digits > 0).then_some(n)
+    };
+    // An exponent: the marker, an optional sign and at least one digit.
+    let exponent = |e: &str, marker: char| -> Option<i32> {
+        let e = e.strip_prefix(marker)?;
+        let digits = e.strip_prefix(['+', '-']).unwrap_or(e);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some(e.parse::<i32>().unwrap_or(if e.starts_with('-') { -100000 } else { 100000 }))
+    };
+    let v = if lower == "inf" || lower == "infinity" {
+        f64::INFINITY
+    } else if lower == "nan" || (lower.starts_with("nan(") && lower.ends_with(')') && lower[4..lower.len() - 1].chars().all(|c| c.is_ascii_alphanumeric() || c == '_')) {
+        f64::NAN
+    } else if let Some(n) = lower.strip_prefix("0x").and_then(|h| mantissa(h, 16)) {
+        let h = &lower[2..];
+        let (int, frac) = h[..n].split_once('.').unwrap_or((&h[..n], ""));
+        let v = int.chars().chain(frac.chars()).fold(0f64, |v, c| v * 16.0 + c.to_digit(16).unwrap_or(0) as f64);
+        let exp = if n < h.len() { exponent(&h[n..], 'p')? } else { 0 };
+        v * 2f64.powi(exp.saturating_sub(4 * frac.len() as i32))
+    } else {
+        let n = mantissa(&lower, 10)?;
+        if n < lower.len() {
+            exponent(&lower[n..], 'e')?;
+        }
+        lower.parse::<f64>().ok()?
+    };
+    Some(if neg { -v } else { v })
+}
+
+/// A path separator for b and d: as POSIX basename(3) and dirname(3) only `/`, and on
+/// Windows `\` too.
 fn is_sep(c: char) -> bool {
-    c == '/' || c == '\\'
+    c == '/' || (cfg!(windows) && c == '\\')
 }
 
 fn basename(p: &str) -> String {
@@ -1157,6 +1279,11 @@ fn units(s: &str) -> Vec<Unit<'_>> {
 
 fn fmt_width(s: &str) -> usize {
     units(s).iter().map(|u| if let Unit::Text(_, w) = u { *w } else { 0 }).sum()
+}
+
+/// utf8_cstrwidth: the width of every printable character, styles and `##` included.
+fn cstr_width(s: &str) -> usize {
+    s.chars().map(|c| if c.is_ascii() { usize::from(c > '\x1f' && c != '\x7f') } else { c.width().unwrap_or(0) }).sum()
 }
 
 fn trim_left(s: &str, limit: usize) -> String {
@@ -1310,33 +1437,72 @@ pub fn regex_matches(pattern: &str, text: &str, ignore_case: bool) -> bool {
     compile_regex(pattern, ignore_case).is_some_and(|re| re.is_match(text).unwrap_or(false))
 }
 
+/// regsub: replace every match of `pattern` in `text`, with `\0` to `\9` for the groups.
+/// Empty text stays empty and an empty pattern changes nothing. As in tmux, each search
+/// starts afresh at the end of the last match (so `^` can match there), a pattern starting
+/// with `^` replaces only the first match, an empty match right after another match is
+/// skipped, and `\N` for a group that matched nothing is the digit itself.
 fn regex_substitute(pattern: &str, replacement: &str, text: &str, ignore_case: bool) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    if pattern.is_empty() {
+        return text.to_string();
+    }
     let Some(re) = compile_regex(pattern, ignore_case) else { return text.to_string() };
     let mut out = String::new();
-    let mut pos = 0;
-    for captures in re.captures_iter(text) {
-        let Ok(captures) = captures else { return text.to_string() };
-        let whole = captures.get(0).unwrap();
-        out.push_str(&text[pos..whole.start()]);
+    let expand = |out: &mut String, at: usize, captures: &fancy_regex::Captures<str>| {
         let mut chars = replacement.chars();
         while let Some(c) = chars.next() {
-            if out.len() > MAX_FORMAT_BYTES { return String::new(); }
-            if c == '\\' {
-                match chars.next() {
-                    Some(d @ '0'..='9') => {
-                        if let Some(m) = captures.get(d as usize - '0' as usize) {
-                            out.push_str(m.as_str());
+            let c = match c {
+                '\\' => match chars.next() {
+                    Some(d @ '0'..='9') => match captures.get(d as usize - '0' as usize).filter(|m| !m.as_str().is_empty()) {
+                        Some(m) => {
+                            out.push_str(&text[at + m.start()..at + m.end()]);
+                            continue;
                         }
-                    }
-                    Some(c) => out.push(c),
-                    None => out.push('\\'),
-                }
-            } else { out.push(c); }
+                        None => d,
+                    },
+                    Some(c) => c,
+                    None => '\\',
+                },
+                c => c,
+            };
+            out.push(c);
         }
-        pos = whole.end();
+    };
+    let (mut start, mut last, mut empty) = (0, 0, false);
+    while start <= text.len() {
+        let captures = match re.captures(&text[start..]) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                out.push_str(&text[last..]);
+                break;
+            }
+            Err(_) => return text.to_string(),
+        };
+        let whole = captures.get(0).unwrap();
+        let (so, eo) = (start + whole.start(), start + whole.end());
+        out.push_str(&text[last..so]);
+        if out.len() > MAX_FORMAT_BYTES { return String::new(); }
+        if pattern.starts_with('^') {
+            expand(&mut out, start, &captures);
+            out.push_str(&text[eo..]);
+            break;
+        }
+        if empty || so != last || so != eo {
+            expand(&mut out, start, &captures);
+            last = eo;
+            start = eo;
+            empty = false;
+        } else {
+            // An empty match where the last one ended: try again one character on.
+            last = eo;
+            start = eo + text[eo..].chars().next().map_or(1, char::len_utf8);
+            empty = true;
+        }
     }
-    if out.len().saturating_add(text.len() - pos) > MAX_FORMAT_BYTES { return String::new(); }
-    out.push_str(&text[pos..]);
+    if out.len() > MAX_FORMAT_BYTES { return String::new(); }
     out
 }
 
@@ -1452,17 +1618,17 @@ pub fn theme_color(name: &str, theme: Theme) -> Option<Color> {
 
 /// parse_color, resolving theme names through the client of a format context if any.
 pub fn parse_color_with(s: &str, vars: Option<&dyn Vars>) -> Option<Color> {
-    let name = s.trim();
-    if THEMES.iter().any(|t| name.eq_ignore_ascii_case(t.0)) {
-        return vars.and_then(|v| v.theme_color(&name.to_ascii_lowercase())).or_else(|| theme_color(name, default_theme()));
+    if THEMES.iter().any(|t| s.eq_ignore_ascii_case(t.0)) {
+        return vars.and_then(|v| v.theme_color(&s.to_ascii_lowercase())).or_else(|| theme_color(s, default_theme()));
     }
     parse_color(s)
 }
 
 /// colour_fromstring: names, brightNAME, 0-7 and 90-97, colourN, #rrggbb, theme names,
-/// grayN/greyN (0-100) and the X11 colour names.
+/// grayN/greyN (0-100) and the X11 colour names. As tmux, the string is not trimmed, but the
+/// numbers of colourN and greyN may have leading space (strtonum).
 pub fn parse_color(s: &str) -> Option<Color> {
-    let s = s.trim().to_ascii_lowercase();
+    let s = s.to_ascii_lowercase();
     const NAMES: [&str; 8] = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
     if s == "default" || s == "terminal" {
         return Some(Color::Default);
@@ -1484,7 +1650,7 @@ pub fn parse_color(s: &str) -> Option<Color> {
         return Some(Color::Rgb((v >> 16) as u8, (v >> 8) as u8, v as u8));
     }
     if let Some(num) = s.strip_prefix("colour").or_else(|| s.strip_prefix("color")) {
-        return num.parse::<u8>().ok().map(Color::Idx);
+        return strtonum(num).filter(|n| (0..=255).contains(n)).map(|n| Color::Idx(n as u8));
     }
     match s.as_str() {
         "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" => return s.parse().ok().map(Color::Idx),
@@ -1495,7 +1661,7 @@ pub fn parse_color(s: &str) -> Option<Color> {
         let c = if n.is_empty() {
             0xbe
         } else {
-            let n: u8 = n.parse().ok().filter(|n| *n <= 100)?;
+            let n = strtonum(n).filter(|n| (0..=100).contains(n))?;
             (2.55 * n as f64).round() as u8
         };
         return Some(Color::Rgb(c, c, c));
@@ -1525,7 +1691,7 @@ const ATTRS: [(&str, u8); 15] = [
 /// Apply one style word. Returns Err for unknown words or bad values. Theme colours are
 /// resolved through `vars` when given.
 fn apply_word(word: &str, st: &mut Style, align: &mut Align, base: Style, vars: Option<&dyn Vars>) -> Result<(), String> {
-    let w = word.trim().to_ascii_lowercase();
+    let w = word.to_ascii_lowercase();
     if w.is_empty() {
         return Ok(());
     }
@@ -1541,8 +1707,8 @@ fn apply_word(word: &str, st: &mut Style, align: &mut Align, base: Style, vars: 
             "align" => {
                 *align = match val {
                     "left" => Align::Left,
-                    "centre" | "center" => Align::Centre,
-                    "absolute-centre" | "absolute-center" => Align::AbsoluteCentre,
+                    "centre" => Align::Centre,
+                    "absolute-centre" => Align::AbsoluteCentre,
                     "right" => Align::Right,
                     _ => return Err(format!("bad align: {val}")),
                 }
@@ -1558,7 +1724,15 @@ fn apply_word(word: &str, st: &mut Style, align: &mut Align, base: Style, vars: 
                 }
             }
             "range" => {
-                Range::parse(val)?;
+                // As style_parse, an empty argument after `|` is an error and an unknown kind
+                // is accepted but changes nothing.
+                let (kind, arg) = val.split_once('|').map_or((val, None), |(k, a)| (k, Some(a)));
+                if val.is_empty() || arg == Some("") {
+                    return Err(format!("bad range: {val}"));
+                }
+                if ["left", "right", "control", "pane", "window", "session", "user"].contains(&kind) {
+                    Range::parse(val)?;
+                }
             }
             "width" | "pad" => {
                 // width=N or width=N% (at most 100%).
@@ -1595,8 +1769,9 @@ fn parse_dim(val: &str) -> Result<u8, String> {
     val.strip_suffix('%').unwrap_or(val).parse::<u8>().ok().filter(|n| *n <= 100).ok_or_else(|| format!("bad dim: {val}"))
 }
 
+/// The words of a style, split at style_parse's delimiters (space, comma and newline).
 fn style_words(s: &str) -> impl Iterator<Item = &str> {
-    s.split([',', ' ', '\t', '\n']).filter(|w| !w.is_empty())
+    s.split([',', ' ', '\n']).filter(|w| !w.is_empty())
 }
 
 /// Parse a style string like "fg=red,bg=colour235,bold,noitalics" applying it on top of `base`.
@@ -1652,10 +1827,13 @@ pub enum Range {
     Pane(u32),
     Session(u32),
     User(String),
+    /// control|0 to control|9 (3.8), as in the default pane-border-format.
+    Control(u32),
 }
 
 impl Range {
-    /// Parses the value of `range=`: left, right, window|N, pane|%N, session|$N, user|X.
+    /// Parses the value of `range=`: left, right, window|N, pane|%N, session|$N, user|X,
+    /// control|N (N from 0 to 9).
     /// `Ok(None)` is tmux's STYLE_RANGE_NONE.
     pub fn parse(v: &str) -> Result<Option<Range>, String> {
         let (kind, arg) = match v.split_once('|') {
@@ -1672,6 +1850,7 @@ impl Range {
             "window" => Range::Window(num(arg, "@")?),
             "pane" => Range::Pane(num(arg, "%")?),
             "session" => Range::Session(num(arg, "$")?),
+            "control" => Range::Control(arg.and_then(strtonum).filter(|n| (0..=9).contains(n)).ok_or_else(|| format!("bad range: {v}"))? as u32),
             "user" => match arg {
                 Some(a) if !a.is_empty() => Range::User(a.to_string()),
                 _ => return Err(format!("bad range: {v}")),
@@ -1689,6 +1868,7 @@ impl Range {
             Range::Pane(_) => "pane",
             Range::Session(_) => "session",
             Range::User(_) => "user",
+            Range::Control(_) => "control",
         }
     }
 }
@@ -1709,7 +1889,8 @@ pub struct Span {
 
 /// Split already-expanded text into styled spans: `#[fg=red]a#[default]b`.
 /// `#[default]` resets to the current default (initially `base`), `#[push-default]` makes the
-/// current style the default, `#[pop-default]` restores the previous one. Unknown words are ignored.
+/// current style the default, `#[pop-default]` restores the previous one. A directive with an
+/// invalid word is ignored.
 pub fn spans(text: &str, base: Style) -> Vec<Span> {
     let mut out: Vec<Span> = Vec::new();
     let mut cur = base;
@@ -1748,6 +1929,12 @@ pub fn spans(text: &str, base: Style) -> Vec<Span> {
         } else if rest.starts_with("#[")
             && let Some(e) = rest.find(']')
         {
+            // As format_draw, a directive with any invalid word is ignored as a whole.
+            let (mut st, mut al) = (cur, align);
+            if !style_words(&rest[2..e]).all(|w| apply_word(w, &mut st, &mut al, default, None).is_ok()) {
+                i += e + 1;
+                continue;
+            }
             flush(&mut out, &mut buf, cur, align, &range, &link);
             let before = range.clone();
             let saved = cur;
@@ -1782,6 +1969,10 @@ pub fn spans(text: &str, base: Style) -> Vec<Span> {
                         let _ = apply_word(w, &mut cur, &mut align, default, None);
                     }
                 }
+            }
+            // Control ranges all match (format_is_type), so a new one continues the open one.
+            if matches!((&before, &range), (Some(Range::Control(_)), Some(Range::Control(_)))) {
+                range = before.clone();
             }
             if range != before {
                 // the open range ends here (format_draw adds it to the list)
@@ -1977,9 +2168,15 @@ mod tests {
 
     #[test]
     fn escapes() {
-        assert_eq!(x("a##b #, #} #:", &[]), "a#b , } :");
-        assert_eq!(x("#", &[]), "#");
-        assert_eq!(x("x#", &[]), "x#");
+        // As format_expand1: only #, and #} are single escapes, #: stays, a trailing # is
+        // dropped and a run of # before [ is kept whole for the style.
+        assert_eq!(x("a##b #, #} #:", &[]), "a#b , } #:");
+        assert_eq!(x("#", &[]), "");
+        assert_eq!(x("x#", &[]), "x");
+        assert_eq!(x("#x#", &[]), "#x");
+        assert_eq!(x("#####", &[]), "##");
+        assert_eq!(x("###a", &[]), "##a");
+        assert_eq!(x("###[x]|####[x]|#####[x]", &[]), "###[x]|####[x]|#####[x]");
         assert_eq!(x("#z", &[]), "#z");
         // `##[` stays escaped for the style parser.
         assert_eq!(x("##[x]", &[]), "##[x]");
@@ -2156,12 +2353,20 @@ mod tests {
         let v = [("p", "/home/user/src/"), ("w", r"C:\Users\me\proj"), ("r", "/"), ("f", "file")];
         assert_eq!(x("#{b:p}", &v), "src");
         assert_eq!(x("#{d:p}", &v), "/home/user");
-        assert_eq!(x("#{b:w}", &v), "proj");
-        assert_eq!(x("#{d:w}", &v), r"C:\Users\me");
+        // A backslash separates only on Windows, as POSIX basename and dirname on Unix.
+        if cfg!(windows) {
+            assert_eq!(x("#{b:w}", &v), "proj");
+            assert_eq!(x("#{d:w}", &v), r"C:\Users\me");
+        } else {
+            assert_eq!(x("#{b:w}|#{d:w}", &v), r"C:\Users\me\proj|.");
+            assert_eq!(x(r"#{b:x}|#{d:x}", &[("x", r"a\b")]), r"a\b|.");
+        }
         assert_eq!(x("#{b:r}|#{d:r}", &v), "/|/");
         assert_eq!(x("#{b:f}|#{d:f}", &v), "file|.");
         assert_eq!(x("#{d:x}", &[("x", "/a")]), "/");
-        assert_eq!(x("#{b:#{p}}", &v), "src");
+        // As tmux, b and d do not apply to a format inside: it is only expanded.
+        assert_eq!(x("#{b:#{p}}|#{d:#{p}}", &v), "/home/user/src/|/home/user/src/");
+        assert_eq!(x("#{q:#{q}}|#{t:#{n}}", &[("q", "a b"), ("n", "42")]), "a b|42");
     }
 
     #[test]
@@ -2619,10 +2824,13 @@ mod tests {
         assert_eq!(sp[0].text, "a");
         assert_eq!(sp[1].text, "b#c#[x]");
         assert_eq!(sp[1].style.attrs, BOLD);
-        // none clears attrs only; unknown words ignored.
-        let sp = spans("#[fg=blue,bold,sparkly]x#[none]y", base);
+        // none clears attrs only.
+        let sp = spans("#[fg=blue,bold]x#[none]y", base);
         assert_eq!(sp[0].style, st(Color::Idx(4), BOLD));
         assert_eq!(sp[1].style, st(Color::Idx(4), 0));
+        // As format_draw, a directive with an unknown word is ignored as a whole.
+        let sp = spans("#[fg=blue,bold,sparkly]x#[fg=red,bogus]y", base);
+        assert_eq!((sp.len(), sp[0].text.as_str(), sp[0].style), (1, "xy", base));
         // Unterminated directive is text.
         assert_eq!(spans("#[fg=red", base)[0].text, "#[fg=red");
         assert!(spans("", base).is_empty());
@@ -2722,6 +2930,115 @@ mod tests {
         assert_eq!(cells[8].style, Style::default());
         assert_eq!(cells[11].style.fg, Color::Idx(1));
     }
+
+    // ----- tmux 3.8 comparisons (outputs checked against tmux 3.8) -----
+
+    #[test]
+    fn aliases_are_not_expanded_inside_styles() {
+        let v = [("pane_id", "%3"), ("window_flags", "*"), ("num", "42")];
+        assert_eq!(x("#[fg=#DDDDDD]x", &v), "#[fg=#DDDDDD]x");
+        assert_eq!(x("#[fg=#FFFFFF,bg=#000000]y", &v), "#[fg=#FFFFFF,bg=#000000]y");
+        assert_eq!(x("##[fg=#DDD]", &v), "##[fg=#DDD]");
+        // After the `]` they are expanded again; #{} is expanded inside too.
+        assert_eq!(x("#[fg=red]#D#[x]", &v), "#[fg=red]%3#[x]");
+        assert_eq!(x("#[#{num}#D]#D", &v), "#[42#D]%3");
+        // Without a `]` there is no style to skip.
+        assert_eq!(x("#[fg=red #D", &v), "#[fg=red %3");
+    }
+
+    #[test]
+    fn expressions_parse_operands_like_strtod() {
+        assert_eq!(x("#{e|+|:5}after", &[]), "after");
+        assert_eq!(x("#{e|+|:,5}|#{e|+|:#{unset},1}|#{e|+|:1,}", &[]), "5|1|1");
+        assert_eq!(x("#{e|+|:0x10,1}|#{e|+|: 1,1}|#{e|+|:1 ,1}|#{e|+|:1e,1}", &[]), "17|2||");
+        assert_eq!(x("#{e|*|f|:.5,4}|#{e|*|f|:5.,4}|#{e|+|f|:1e1,0X1P1}", &[]), "2.00|20.00|12.00");
+        assert_eq!(x("#{e|+|:+,1}|#{e|+|: ,1}|#{e|+|f|:nan,1}|#{e|+|:inf,1}", &[]), "||nan|-9223372036854775808");
+    }
+
+    #[test]
+    fn repeated_modifiers_use_the_last() {
+        let v = [("path", "/usr/local/bin/"), ("num", "42")];
+        assert_eq!(x("#{=3;=5:path}|#{=5;=3:path}", &v), "/usr/|/us");
+        assert_eq!(x("#{=/3/..;=5:path}|#{=/5/..;=4:path}", &v), "/usr/..|/usr..");
+        assert_eq!(x("#{p8;p3:num}|", &v), "42 |");
+        assert_eq!(x("#{==;!=:a,a}|#{m;==:a*,ab}|#{<;>:a,b}", &v), "0|0|0");
+        assert_eq!(x("#{e|+|;e|*|:2,3}", &v), "6");
+        // t: relative wins over pretty whatever the order.
+        let secs = fixed_time().timestamp() - 90;
+        let t = vars(&[("t", &secs.to_string())]);
+        let budget = std::cell::Cell::new(MAX_FORMAT_WORK);
+        let e = Expander::top(&t, fixed_time(), None, &budget);
+        assert_eq!(e.expand("#{t/r;t/p:t}|#{t/p;t/r:t}", 0), "1m30s|1m30s");
+        assert_eq!(e.expand("#{t/f/%H;t/p:t}", 0), e.expand("#{t/p:t}", 0));
+    }
+
+    #[test]
+    fn substitution_follows_regsub() {
+        let v = [("num", "42"), ("empty", ""), ("abc", "abc")];
+        assert_eq!(x("#{s//x/:num}", &v), "42");
+        assert_eq!(x(r"#{s/(4)/[\2]/:num}|#{s/(4)(x?)/[\2]/:num}", &v), "[2]2|[2]2");
+        assert_eq!(x("#{s/^/>/:empty}|#{s/$/</:nope}", &v), "|");
+        assert_eq!(x("#{s/x*/-/:abc}|#{s/b*/-/:abc}", &v), "a-b-c-|a-c-");
+        assert_eq!(x("#{s/(^a|c)/X/:abc}|#{s/^a|c/X/:abc}|#{s/b|$/Y/:abc}", &v), "XbX|Xbc|aYcY");
+        assert_eq!(x(r"#{s/.?/<\0>/:abc}|#{s/b/[\0\q\]/:abc}|#{s/b/x\/:abc}", &v), r"<a><b><c>|a[bq]c|ax\c");
+    }
+
+    #[test]
+    fn padding_counts_styles_as_text() {
+        assert_eq!(x("#{p10:#{l:#[fg=red]ab}}|", &[]), "#[fg=red]ab|");
+        assert_eq!(x("#{p-6:#{l:##x}}|", &[]), "    #x|");
+        assert_eq!(cstr_width("a\u{7f}\u{1}漢"), 3);
+    }
+
+    #[test]
+    fn environment_is_the_last_lookup() {
+        struct Env(HashMap<String, String>);
+        impl Vars for Env {
+            fn get(&self, name: &str) -> Option<String> {
+                self.0.get(name).cloned()
+            }
+            fn environ(&self, name: &str) -> Option<String> {
+                (name == "VFMTVAR" || name == "num").then(|| "env".to_string())
+            }
+        }
+        let v = Env(vars(&[("num", "42")]));
+        assert_eq!(expand("#{VFMTVAR}|#{q:VFMTVAR}|#{?VFMTVAR,yes,no}|#{num}|#{nope}|", &v), "env|env|yes|42||");
+        // Not for t, which wants a time.
+        assert_eq!(expand("#{t:VFMTVAR}|", &v), "|");
+    }
+
+    #[test]
+    fn colour_names_are_not_trimmed() {
+        assert_eq!(x("#{c:colour 5}|#{c:GREY 50}|#{c:colour+5}", &[]), "800080|7f7f7f|800080");
+        assert_eq!(x("#{c: red}|#{c:red }", &[]), "|");
+        assert_eq!(parse_color(" red"), None);
+        assert_eq!(parse_color("colour 300"), None);
+    }
+
+    #[test]
+    fn styles_are_as_strict_as_style_parse() {
+        let base = Style::default();
+        for s in ["align=center", "align=absolute-center", "fg=red\tbold", "fg=red,bogus", "fg= red", "fg=colour 5x", "range=control", "range=control|", "range=control|10"] {
+            assert!(parse_style(s, base).is_err(), "{s}");
+        }
+        assert!(parse_style("align=centre,align=absolute-centre", base).is_ok());
+        assert_eq!(Range::parse("control|7"), Ok(Some(Range::Control(7))));
+        assert_eq!(Range::parse("control|0"), Ok(Some(Range::Control(0))));
+        assert!(parse_style("fg=red,range=control|9", base).is_ok());
+        assert_eq!(Range::Control(3).name(), "control");
+        let sp = spans("#[fg=red,range=control|7]y#[norange]z", base);
+        assert_eq!((sp[0].range.clone(), sp[0].style.fg), (Some(Range::Control(7)), Color::Idx(1)));
+        // Control ranges match each other (format_is_type), so the first one continues.
+        let sp = spans("#[range=control|7]a#[range=control|8]b#[norange]c", base);
+        assert_eq!(sp[0].text, "ab");
+        assert_eq!(sp[0].range, Some(Range::Control(7)));
+        // An invalid directive changes nothing; an unknown range kind is no error.
+        let sp = spans("#[fg=red,bogus]x#[fg=blue,align=center]y#[fg=red,range=foo|x]z", base);
+        assert_eq!((sp.len(), sp[1].text.as_str(), sp[1].style.fg, sp[1].range.clone()), (2, "z", Color::Idx(1), None));
+        assert!(parse_style("range=foo", base).is_ok());
+        assert!(parse_style("range=", base).is_err() && parse_style("range=foo|", base).is_err());
+    }
+
 }
 
 // X11 colour data from tmux 3.8 colour.c (Nicholas Marriott, ISC licensed).
