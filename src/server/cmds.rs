@@ -6,47 +6,52 @@ use super::*;
 use crate::cmdparse;
 use crate::layout::{self, Dir};
 use crate::opts::{getopt, Opts};
+use std::cmp::Ordering;
+
+mod json;
+mod sort;
+mod vis;
 
 /// (name, alias, flags without value, flags with value)
 const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("attach-session", "attach", "dErx", "cfst"),
     ("bind-key", "bind", "nr", "TN"),
     ("break-pane", "breakp", "abdP", "FnstL"),
-    ("capture-pane", "capturep", "aCeJNpPqT", "bESt"),
-    ("choose-buffer", "", "NrZ", "FfKOt"),
-    ("choose-client", "", "NrZ", "FfKOt"),
-    ("choose-tree", "", "GNrswZ", "FfKOt"),
+    ("capture-pane", "capturep", "aCeFHIJLMNpPqRT", "bESt"),
+    ("choose-buffer", "", "NrZy", "FfKOt"),
+    ("choose-client", "", "iNrZy", "FfKOt"),
+    ("choose-tree", "", "GNrswZy", "FfKOt"),
     ("clear-history", "clearhist", "H", "t"),
     ("clear-prompt-history", "clearphist", "", "T"),
     ("clock-mode", "", "", "t"),
-    ("command-prompt", "", "1bFkiN", "IpTt"),
+    ("command-prompt", "", "1bCeFkilN", "IpTt"),
     ("confirm-before", "confirm", "by", "cpt"),
-    ("copy-mode", "", "eHMqu", "st"),
-    ("customize-mode", "", "NZ", "Fft"),
+    ("copy-mode", "", "deHMqSu", "st"),
+    ("customize-mode", "", "NZy", "Fft"),
     ("delete-buffer", "deleteb", "", "b"),
     ("detach-client", "detach", "aP", "Esct"),
     ("display-menu", "menu", "MO", "bcCHstSTxy"),
-    ("display-message", "display", "aINpv", "cdt"),
+    ("display-message", "display", "aCIjlNpv", "cdFt"),
     ("display-panes", "displayp", "bN", "dt"),
-    ("display-popup", "popup", "BCEk", "bcdeHhsStTwxy"),
+    ("display-popup", "popup", "BCEkN", "bcdeHhsStTwxy"),
     ("find-window", "findw", "CiNrTZ", "t"),
     ("has-session", "has", "", "t"),
     ("if-shell", "if", "bF", "t"),
-    ("join-pane", "joinp", "bdfhv", "lst"),
-    ("kill-pane", "killp", "a", "t"),
+    ("join-pane", "joinp", "bdfhv", "lpst"),
+    ("kill-pane", "killp", "a", "ft"),
     ("kill-server", "", "", ""),
-    ("kill-session", "", "aC", "t"),
-    ("kill-window", "killw", "a", "t"),
+    ("kill-session", "", "aCg", "ft"),
+    ("kill-window", "killw", "a", "ft"),
     ("last-pane", "lastp", "deZ", "t"),
     ("last-window", "last", "", "t"),
     ("link-window", "linkw", "abdk", "st"),
-    ("list-buffers", "lsb", "", "Ff"),
-    ("list-clients", "lsc", "", "Fft"),
+    ("list-buffers", "lsb", "r", "FfO"),
+    ("list-clients", "lsc", "r", "FfOt"),
     ("list-commands", "lscm", "", "F"),
-    ("list-keys", "lsk", "1aN", "PT"),
-    ("list-panes", "lsp", "as", "Fft"),
-    ("list-sessions", "ls", "", "Ff"),
-    ("list-windows", "lsw", "a", "Fft"),
+    ("list-keys", "lsk", "1aNr", "FOPT"),
+    ("list-panes", "lsp", "ars", "FfOt"),
+    ("list-sessions", "ls", "r", "FfO"),
+    ("list-windows", "lsw", "ar", "FfOt"),
     ("load-buffer", "loadb", "w", "bt"),
     ("lock-client", "lockc", "", "t"),
     ("lock-server", "lock", "", ""),
@@ -54,29 +59,29 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("move-pane", "movep", "bdfhv", "lst"),
     ("move-window", "movew", "abdkr", "st"),
     ("new-session", "new", "AdDEPX", "cefFnstxy"),
-    ("new-window", "neww", "abdkPS", "cefFnt"),
+    ("new-window", "neww", "abdEkPS", "cefFnt"),
     ("next-layout", "nextl", "", "t"),
     ("next-window", "next", "a", "t"),
-    ("paste-buffer", "pasteb", "dpr", "bst"),
+    ("paste-buffer", "pasteb", "dprS", "bst"),
     ("pipe-pane", "pipep", "IOo", "t"),
     ("previous-layout", "prevl", "", "t"),
     ("previous-window", "prev", "a", "t"),
-    ("refresh-client", "refresh", "cDlLRSU", "ABCfFt"),
+    ("refresh-client", "refresh", "cDlLRSU", "ABCfFrt"),
     ("rename-session", "rename", "", "t"),
     ("rename-window", "renamew", "", "t"),
     ("resize-pane", "resizep", "DLMRTUZ", "txy"),
     ("resize-window", "resizew", "aADLRU", "txy"),
-    ("respawn-pane", "respawnp", "k", "cet"),
-    ("respawn-window", "respawnw", "k", "cet"),
+    ("respawn-pane", "respawnp", "Ek", "cet"),
+    ("respawn-window", "respawnw", "Ek", "cet"),
     ("rotate-window", "rotatew", "DUZ", "t"),
-    ("run-shell", "run", "bC", "cdt"),
+    ("run-shell", "run", "bCE", "cdst"),
     ("save-buffer", "saveb", "a", "b"),
     ("select-layout", "selectl", "Enop", "t"),
-    ("select-pane", "selectp", "DdegLlMmRUZ", "Tt"),
+    ("select-pane", "selectp", "DdegLlMmRUZ", "PTt"),
     ("select-window", "selectw", "lnpT", "t"),
     ("send-keys", "send", "FHKlMRX", "cNt"),
     ("send-prefix", "", "2", "t"),
-    ("server-access", "", "adlrw", ""),
+    ("server-access", "", "adglrw", ""),
     ("set-buffer", "setb", "aw", "bnt"),
     ("set-environment", "setenv", "Fhgru", "t"),
     ("set-hook", "", "agpRuw", "t"),
@@ -84,18 +89,18 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("set-window-option", "setw", "aFgoqu", "t"),
     ("show-buffer", "showb", "", "b"),
     ("show-environment", "showenv", "hgs", "t"),
-    ("show-hooks", "", "gpw", "t"),
+    ("show-hooks", "", "gpw", "Ft"),
     ("show-messages", "showmsgs", "JT", "t"),
-    ("show-options", "show", "AgHpqsvw", "t"),
+    ("show-options", "show", "AgHpqsvw", "Ft"),
     ("show-prompt-history", "showphist", "", "T"),
-    ("show-window-options", "showw", "gv", "t"),
+    ("show-window-options", "showw", "gv", "Ft"),
     ("source-file", "source", "Fnqv", "t"),
-    ("split-window", "splitw", "bdfhIvPZ", "cefFlt"),
+    ("split-window", "splitw", "bdEfhIvPZ", "cefFlt"),
     ("start-server", "start", "", ""),
     ("suspend-client", "suspendc", "", "t"),
     ("swap-pane", "swapp", "dDUZ", "st"),
     ("swap-window", "swapw", "d", "st"),
-    ("switch-client", "switchc", "ElnprZ", "ctT"),
+    ("switch-client", "switchc", "EFlnprZ", "cOtT"),
     ("unbind-key", "unbind", "anq", "T"),
     ("unlink-window", "unlinkw", "k", "t"),
     ("wait-for", "wait", "LSU", ""),
@@ -108,6 +113,20 @@ pub fn canonical(name: &str) -> Option<&'static str> {
     // unique prefix, like tmux
     let m: Vec<&(&str, &str, &str, &str)> = COMMANDS.iter().filter(|c| c.0.starts_with(name)).collect();
     if m.len() == 1 { Some(m[0].0) } else { None }
+}
+
+/// The command given to spawn_pane for a pane without a process (-E, or an empty command).
+pub const EMPTY_PANE: &str = "\u{1}empty-pane";
+
+/// The command for a new pane: -E (or a single empty argument, or `input` for split-window
+/// -I) makes an empty pane, which can't also be given a command.
+fn spawn_command(o: &Opts, input: bool) -> Result<Vec<String>, String> {
+    let empty_arg = matches!(o.rest.as_slice(), [one] if one.is_empty());
+    let empty = o.has('E') || input || empty_arg;
+    if empty && !o.rest.is_empty() && !empty_arg {
+        return err("command cannot be given for empty pane");
+    }
+    Ok(if empty { vec![EMPTY_PANE.to_string()] } else { o.rest.clone() })
 }
 
 fn err<T>(s: impl Into<String>) -> Result<T, String> {
@@ -178,6 +197,23 @@ impl Server {
         }
     }
 
+    /// A whole target of `@`, `{current}` or `{active}` (tmux 3.7): the current window and
+    /// active pane of the client running the command, which must be attached.
+    fn client_current(&self, ctx: &Ctx, t: &str) -> Option<Result<Target, String>> {
+        if !matches!(t, "@" | "{current}" | "{active}") {
+            return None;
+        }
+        let sid = ctx.client.and_then(|c| self.clients.get(&c)).filter(|c| c.attached).and_then(|c| c.session).filter(|s| self.sessions.contains_key(s));
+        Some(match sid {
+            Some(sid) => {
+                let s = &self.sessions[&sid];
+                let wid = s.active_window();
+                Ok(Target { sid: Some(sid), idx: Some(s.active), wid: Some(wid), pane: Some(self.windows[&wid].active) })
+            }
+            None => err("no current client"),
+        })
+    }
+
     fn find_session(&self, ctx: &Ctx, name: &str) -> Result<SessId, String> {
         if name.is_empty() {
             return self.current(ctx).sid.ok_or_else(|| "no current session".to_string());
@@ -222,6 +258,9 @@ impl Server {
         match t {
             None => self.current(ctx).sid.ok_or_else(|| "no current session".to_string()),
             Some(t) => {
+                if let Some(c) = self.client_current(ctx, t) {
+                    return c.map(|c| c.sid.unwrap());
+                }
                 let s = t.split(':').next().unwrap_or("");
                 self.find_session(ctx, s)
             }
@@ -297,6 +336,9 @@ impl Server {
             let c = self.current(ctx);
             return if c.wid.is_some() { Ok(c) } else { err("no current window") };
         };
+        if let Some(c) = self.client_current(ctx, t) {
+            return c;
+        }
         let mk = |sid: SessId, idx: u32| -> Target {
             let wid = self.sessions[&sid].links[&idx];
             Target { sid: Some(sid), idx: Some(idx), wid: Some(wid), pane: Some(self.windows[&wid].active) }
@@ -407,6 +449,9 @@ impl Server {
             let c = self.current(ctx);
             return if c.pane.is_some() { Ok(c) } else { err("no current pane") };
         };
+        if let Some(c) = self.client_current(ctx, t) {
+            return c;
+        }
         if let Some(id) = t.strip_prefix('%').and_then(|i| i.parse::<PaneId>().ok()) {
             if self.panes.contains_key(&id) && self.window_of(id).is_some() {
                 return Ok(self.target_for_pane(id));
@@ -475,6 +520,75 @@ impl Server {
                     .ok_or_else(|| "no current client".to_string())
             }
         }
+    }
+
+    // ---- list helpers (sort.c orders) -------------------------------------------------------
+
+    /// Sessions in tmux's natural order (by name) or the -O order.
+    fn sorted_sessions(&self, crit: sort::Criteria) -> Vec<SessId> {
+        let mut v: Vec<&Session> = self.sessions.values().collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        crit.sort(&mut v, |a, b, order| {
+            match order {
+                sort::Order::Index => a.id.cmp(&b.id),
+                sort::Order::Creation => (a.created, a.id).cmp(&(b.created, b.id)),
+                sort::Order::Activity => b.activity.cmp(&a.activity),
+                sort::Order::Name => a.name.cmp(&b.name),
+                _ => Ordering::Equal,
+            }
+            .then_with(|| a.name.cmp(&b.name))
+        });
+        v.into_iter().map(|s| s.id).collect()
+    }
+
+    /// Winlinks (session, index, window) sorted by the -O order.
+    fn sort_winlinks(&self, v: &mut [(SessId, u32, WinId)], crit: sort::Criteria) {
+        crit.sort(v, |a, b, order| {
+            let (wa, wb) = (&self.windows[&a.2], &self.windows[&b.2]);
+            match order {
+                sort::Order::Index => a.1.cmp(&b.1),
+                sort::Order::Creation => (wa.created, wa.id).cmp(&(wb.created, wb.id)),
+                sort::Order::Activity => wb.activity.cmp(&wa.activity),
+                sort::Order::Name => wa.name.cmp(&wb.name),
+                sort::Order::Size => (wa.sx as u32 * wa.sy as u32).cmp(&(wb.sx as u32 * wb.sy as u32)),
+                _ => Ordering::Equal,
+            }
+            .then_with(|| wa.name.cmp(&wb.name))
+        });
+    }
+
+    /// The panes of a window sorted by the -O order. Activity approximates tmux's
+    /// active_point: panes never active, then the last active, then the active pane.
+    fn sorted_panes(&self, wid: WinId, crit: sort::Criteria) -> Vec<PaneId> {
+        let w = &self.windows[&wid];
+        let order_of = w.panes();
+        let mut v = order_of.clone();
+        let title = |p: &PaneId| self.panes.get(p).map(|x| x.title.as_str()).unwrap_or("");
+        let index = |p: &PaneId| order_of.iter().position(|x| x == p).unwrap_or(0);
+        let point = |p: &PaneId| if *p == w.active { 2 } else if w.last_active == Some(*p) { 1 } else { 0 };
+        let size = |p: &PaneId| self.panes.get(p).map(|x| x.size.0 as u32 * x.size.1 as u32).unwrap_or(0);
+        crit.sort(&mut v, |a, b, order| {
+            match order {
+                sort::Order::Activity => point(a).cmp(&point(b)),
+                sort::Order::Creation => a.cmp(b),
+                sort::Order::Size => size(a).cmp(&size(b)),
+                sort::Order::Index | sort::Order::Z => index(a).cmp(&index(b)),
+                sort::Order::Name => title(a).cmp(title(b)),
+                _ => Ordering::Equal,
+            }
+            .then_with(|| title(a).cmp(title(b)))
+        });
+        v
+    }
+
+    /// One line of a list command: `filter` (-f) decides, `fmt` (-F) is printed.
+    fn list_line(&self, ctx: &mut Ctx, t: Target, client: Option<ClientId>, fmt: &str, filter: Option<&str>, extra: HashMap<String, String>) {
+        if filter.is_some_and(|f| !truthy(&self.expand_extra(t, client, f, extra.clone()))) {
+            return;
+        }
+        let line = self.expand_extra(t, client, fmt, extra);
+        ctx.out.push_str(&line);
+        ctx.out.push('\n');
     }
 
     // ---- lifecycle helpers ----------------------------------------------------------------
@@ -976,18 +1090,19 @@ impl Server {
                     c.dirty = true;
                     return Ok(Flow::Next);
                 }
+                // -r toggles read-only and also reverses the -n/-p order; -F is accepted and
+                // unused, as in tmux
                 if o.has('r') {
                     let c = self.clients.get_mut(&cid).unwrap();
                     if c.is_readonly() { return err("client is read-only"); }
                     c.readonly = !c.readonly;
-                    return Ok(Flow::Next);
+                    if t.is_none() && !o.has('n') && !o.has('p') && !o.has('l') {
+                        return Ok(Flow::Next);
+                    }
                 }
+                let crit = sort::Criteria::from_args(o.get('O'), o.has('r'))?;
                 let cur = self.client_session(cid);
-                let sorted: Vec<SessId> = {
-                    let mut v: Vec<&Session> = self.sessions.values().collect();
-                    v.sort_by(|a, b| a.name.cmp(&b.name));
-                    v.iter().map(|s| s.id).collect()
-                };
+                let sorted = self.sorted_sessions(crit);
                 if sorted.is_empty() { return err("no sessions"); }
                 let pos = cur.and_then(|c| sorted.iter().position(|s| *s == c)).unwrap_or(0);
                 let sid = if o.has('l') {
@@ -1047,15 +1162,30 @@ impl Server {
             "has-session" => self.resolve_session(ctx, t).map(|_| Flow::Next),
             "kill-session" => {
                 let sid = self.resolve_session(ctx, t)?;
+                let filter = o.get('f');
+                if filter.is_some() && (!o.has('a') || o.has('C')) {
+                    return err("-f only valid with -a");
+                }
                 if o.has('C') {
                     self.sessions.get_mut(&sid).unwrap().alerts.clear();
                     self.mark_session_dirty(sid);
                     return Ok(Flow::Next);
                 }
                 if o.has('a') {
-                    let others: Vec<SessId> = self.sessions.keys().filter(|s| **s != sid).copied().collect();
+                    let others: Vec<SessId> = self.sorted_sessions(sort::Criteria { order: None, reversed: false }).into_iter().filter(|s| *s != sid).collect();
                     for s in others {
-                        self.kill_session(s, false);
+                        let tt = Target { sid: Some(s), ..Target::default() };
+                        if self.sessions.contains_key(&s) && filter.is_none_or(|f| truthy(&self.expand(tt, None, f))) {
+                            self.kill_session(s, false);
+                        }
+                    }
+                } else if let Some(g) = self.sessions[&sid].group.filter(|_| o.has('g')) {
+                    // -g: every session in the target's group
+                    let members: Vec<SessId> = self.sessions.values().filter(|s| s.group == Some(g)).map(|s| s.id).collect();
+                    for s in members {
+                        if self.sessions.contains_key(&s) {
+                            self.kill_session(s, false);
+                        }
                     }
                 } else {
                     self.kill_session(sid, false);
@@ -1083,30 +1213,37 @@ impl Server {
                 Ok(Flow::Next)
             }
             "list-sessions" => {
-                let fmt = o.get('F').unwrap_or("#{session_name}: #{session_windows} windows (created #{t:session_created})#{?session_attached, (attached),}");
-                let filter = o.get('f');
-                let ids: Vec<SessId> = self.sessions.keys().copied().collect();
-                for sid in ids {
+                let fmt = o.get('F').unwrap_or("#{session_name}: #{session_windows} windows (created #{t:session_created})#{?session_grouped, (group ,}#{session_group}#{?session_grouped,),}#{?session_attached, (attached),}");
+                let crit = sort::Criteria::from_args(o.get('O'), o.has('r'))?;
+                for (i, sid) in self.sorted_sessions(crit).into_iter().enumerate() {
                     let tt = Target { sid: Some(sid), idx: Some(self.sessions[&sid].active), wid: Some(self.sessions[&sid].active_window()), pane: None };
-                    if filter.is_some_and(|f| !truthy(&self.expand(tt, ctx.client, f))) {
-                        continue;
-                    }
-                    let line = self.expand(tt, ctx.client, fmt);
-                    ctx.out.push_str(&line);
-                    ctx.out.push('\n');
+                    self.list_line(ctx, tt, ctx.client, fmt, o.get('f'), HashMap::from([("line".to_string(), i.to_string())]));
                 }
                 Ok(Flow::Next)
             }
             "list-clients" => {
-                let fmt = o.get('F').unwrap_or("#{client_name}: #{session_name} [#{client_width}x#{client_height} #{client_termname}]#{?client_readonly, (ro),}");
+                let fmt = o.get('F').unwrap_or("#{client_name}: #{session_name} [#{client_width}x#{client_height} #{client_termname}] #{?#{!=:#{client_uid},#{uid}},[user #{?client_user,#{client_user},#{client_uid},}] ,}#{?client_flags,(,}#{client_flags}#{?client_flags,),}");
+                let crit = sort::Criteria::from_args(o.get('O'), o.has('r'))?;
                 let only = t.map(|t| self.find_session(ctx, t)).transpose()?;
-                let cids: Vec<ClientId> = self.clients.values().filter(|c| c.attached && (only.is_none() || c.session == only)).map(|c| c.id).collect();
-                for cid in cids {
-                    let sid = self.client_session(cid);
-                    let tt = sid.map(|s| Target { sid: Some(s), idx: Some(self.sessions[&s].active), wid: Some(self.sessions[&s].active_window()), pane: None }).unwrap_or_default();
-                    let line = self.expand(tt, Some(cid), fmt);
-                    ctx.out.push_str(&line);
-                    ctx.out.push('\n');
+                let mut cids: Vec<ClientId> = self.clients.values().filter(|c| c.attached).map(|c| c.id).collect();
+                crit.sort(&mut cids, |a, b, order| {
+                    let (a, b) = (&self.clients[a], &self.clients[b]);
+                    match order {
+                        sort::Order::Name => a.name().cmp(&b.name()),
+                        sort::Order::Size => a.size.cmp(&b.size),
+                        sort::Order::Creation => (a.created, a.id).cmp(&(b.created, b.id)),
+                        sort::Order::Activity => b.activity.cmp(&a.activity),
+                        _ => Ordering::Equal,
+                    }
+                    .then_with(|| a.name().cmp(&b.name()))
+                });
+                for (i, cid) in cids.into_iter().enumerate() {
+                    let Some(sid) = self.client_session(cid) else { continue };
+                    if only.is_some_and(|o| o != sid) {
+                        continue;
+                    }
+                    let tt = Target { sid: Some(sid), idx: Some(self.sessions[&sid].active), wid: Some(self.sessions[&sid].active_window()), pane: None };
+                    self.list_line(ctx, tt, Some(cid), fmt, o.get('f'), HashMap::from([("line".to_string(), i.to_string())]));
                 }
                 Ok(Flow::Next)
             }
@@ -1183,6 +1320,7 @@ impl Server {
             }
             // ---------------------------------------------------------------- windows
             "new-window" => {
+                let command = spawn_command(&o, false)?;
                 let (sid, base_idx) = match t {
                     Some(tt) if tt.contains(':') => {
                         let (s, w) = tt.split_once(':').unwrap();
@@ -1231,9 +1369,10 @@ impl Server {
                 let status = self.status_lines(Some(sid));
                 let (sx, sy) = (s.cols.max(1), s.rows.saturating_sub(status).max(1));
                 let cwd = o.get('c').map(|c| self.expand(self.current(ctx), ctx.client, c)).or_else(|| Some(s.cwd.clone()));
-                let pane = self.spawn_pane(Some(sid), sx, sy, &o.rest, cwd.as_deref(), &env)?;
+                let pane = self.spawn_pane(Some(sid), sx, sy, &command, cwd.as_deref(), &env)?;
                 let name = o.get('n').map(|n| self.expand(self.current(ctx), ctx.client, n));
-                let wname = name.clone().unwrap_or_else(|| self.window_name_for(&o.rest, Some(sid)));
+                let named = if command.first().is_some_and(|c| c == EMPTY_PANE) { &[][..] } else { &command[..] };
+                let wname = name.clone().unwrap_or_else(|| self.window_name_for(named, Some(sid)));
                 let wid = self.new_window_obj(wname, pane, sx, sy);
                 if name.is_some() {
                     self.windows.get_mut(&wid).unwrap().options.set("automatic-rename", "off".into());
@@ -1256,17 +1395,31 @@ impl Server {
             }
             "kill-window" => {
                 let wt = self.resolve_window(ctx, t)?;
-                let (sid, idx) = (wt.sid.unwrap(), wt.idx.unwrap());
+                let (sid, idx, wid) = (wt.sid.unwrap(), wt.idx.unwrap(), wt.wid.unwrap());
+                let filter = o.get('f');
+                if filter.is_some() && !o.has('a') {
+                    return err("-f only valid with -a");
+                }
                 if o.has('a') {
+                    let matches = |s: &Server, i: u32, w: WinId| {
+                        let tt = Target { sid: Some(sid), idx: Some(i), wid: Some(w), pane: Some(s.windows[&w].active) };
+                        filter.is_none_or(|f| truthy(&s.expand(tt, None, f)))
+                    };
                     // collect ids, not indices: renumber-windows shifts indices as we go
-                    let others: Vec<WinId> = self.sessions[&sid].links.iter().filter(|(i, _)| **i != idx).map(|(_, w)| *w).collect();
+                    let others: Vec<WinId> = self.sessions[&sid].links.iter().filter(|(i, w)| **w != wid && matches(self, **i, **w)).map(|(_, w)| *w).collect();
                     for w in others {
                         if self.windows.contains_key(&w) {
                             self.kill_window(w);
                         }
                     }
+                    // the current window too if it is linked here more than once and matches
+                    let again: Vec<u32> = self.sessions.get(&sid).map(|s| s.links.iter().filter(|(_, w)| **w == wid).map(|(i, _)| *i).collect()).unwrap_or_default();
+                    if again.len() > 1 && again.iter().any(|i| matches(self, *i, wid)) {
+                        self.kill_window(wid);
+                    }
                 } else {
-                    self.kill_window(wt.wid.unwrap());
+                    let _ = idx;
+                    self.kill_window(wid);
                 }
                 Ok(Flow::Next)
             }
@@ -1452,6 +1605,7 @@ impl Server {
                 }
             }
             "respawn-window" | "respawn-pane" => {
+                let requested = spawn_command(&o, false)?;
                 let tt = if cmd == "respawn-window" { self.resolve_window(ctx, t)? } else { self.resolve_pane(ctx, t)? };
                 let wid = tt.wid.unwrap();
                 let pane = if cmd == "respawn-window" {
@@ -1459,8 +1613,10 @@ impl Server {
                     let w = &self.windows[&wid];
                     let keep = w.active;
                     let alive: Vec<PaneId> = w.panes().into_iter().filter(|p| *p != keep).collect();
-                    if !o.has('k') && w.panes().iter().any(|p| self.panes.get(p).is_some_and(|x| x.dead.is_none())) {
-                        return err(format!("window still active: {}", w.name));
+                    // a pane is active while it has a process (empty panes have none)
+                    if !o.has('k') && w.panes().iter().any(|p| self.panes.get(p).is_some_and(|x| x.dead.is_none() && x.pid.is_some())) {
+                        let sname = tt.sid.and_then(|s| self.sessions.get(&s)).map(|s| s.name.clone()).unwrap_or_default();
+                        return err(format!("respawn window failed: window {sname}:{} still active", tt.idx.unwrap_or(0)));
                     }
                     for p in alive {
                         self.destroy_pane(p);
@@ -1473,15 +1629,17 @@ impl Server {
                 } else {
                     tt.pane.unwrap()
                 };
+                let index = self.windows[&wid].panes().iter().position(|x| *x == pane).unwrap_or(0) as i64 + self.opt_window_num(Some(wid), "pane-base-index");
+                let sname = tt.sid.and_then(|s| self.sessions.get(&s)).map(|s| s.name.clone()).unwrap_or_default();
                 let p = self.panes.get_mut(&pane).ok_or("no pane")?;
-                if p.dead.is_none() && !o.has('k') {
-                    return err(format!("pane still active: %{pane}"));
+                if p.dead.is_none() && p.pid.is_some() && !o.has('k') {
+                    return err(format!("respawn pane failed: pane {sname}:{}.{index} still active", tt.idx.unwrap_or(0)));
                 }
                 p.kill();
                 let generation = p.generation + 1;
                 let size = p.size;
                 let cwd = o.get('c').map(String::from).unwrap_or_else(|| p.start_path.clone());
-                let cmdv = if o.rest.is_empty() && !p.start_cmd.is_empty() { vec![p.start_cmd.clone()] } else { o.rest.clone() };
+                let cmdv = if o.rest.is_empty() && !p.start_cmd.is_empty() && !o.has('E') { vec![p.start_cmd.clone()] } else { requested };
                 self.spawn_into(pane, generation, tt.sid, size.0, size.1, &cmdv, Some(&cwd), &env)?;
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
@@ -1498,7 +1656,8 @@ impl Server {
                 for (i, p) in order.iter().enumerate() { w.layout.replace(*p, PaneId::MAX - i as u32); }
                 for (i, p) in rotated.iter().enumerate() { w.layout.replace(PaneId::MAX - i as u32, *p); }
                 w.pane_order = rotated;
-                w.zoomed = false;
+                // -Z keeps a zoomed window zoomed
+                w.zoomed = w.zoomed && o.has('Z');
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
                 Ok(Flow::Next)
@@ -1588,19 +1747,20 @@ impl Server {
                 Ok(Flow::Next)
             }
             "list-windows" => {
-                let fmt = o.get('F').unwrap_or("#{window_index}: #{window_name}#{window_raw_flags} (#{window_panes} panes) [#{window_width}x#{window_height}] [layout #{window_layout}] #{window_id}#{?window_active, (active),}");
-                let fmt = if o.has('a') && o.get('F').is_none() { "#{session_name}:#{window_index}: #{window_name}#{window_raw_flags} (#{window_panes} panes) [#{window_width}x#{window_height}] " } else { fmt };
-                let sids: Vec<SessId> = if o.has('a') { self.sessions.keys().copied().collect() } else { vec![self.resolve_session(ctx, t)?] };
-                for sid in sids {
-                    for (idx, wid) in self.sessions[&sid].links.clone() {
-                        let tt = Target { sid: Some(sid), idx: Some(idx), wid: Some(wid), pane: Some(self.windows[&wid].active) };
-                        if o.get('f').is_some_and(|f| !truthy(&self.expand(tt, ctx.client, f))) {
-                            continue;
-                        }
-                        let line = self.expand(tt, ctx.client, fmt);
-                        ctx.out.push_str(&line);
-                        ctx.out.push('\n');
-                    }
+                let fmt = match o.get('F') {
+                    Some(f) => f,
+                    None if o.has('a') => "#{session_name}:#{window_index}: #{window_name}#{window_raw_flags} (#{window_panes} panes) [#{window_width}x#{window_height}] ",
+                    None => "#{window_index}: #{window_name}#{window_raw_flags} (#{window_panes} panes) [#{window_width}x#{window_height}] [layout #{window_layout}] #{window_id}#{?window_active, (active),}",
+                };
+                let crit = sort::Criteria::from_args(o.get('O'), o.has('r'))?;
+                let sids: Vec<SessId> = if o.has('a') { self.sorted_sessions(sort::Criteria { order: None, reversed: false }) } else { vec![self.resolve_session(ctx, t)?] };
+                let mut wls: Vec<(SessId, u32, WinId)> = sids.iter().flat_map(|sid| self.sessions[sid].links.iter().map(|(i, w)| (*sid, *i, *w))).collect();
+                self.sort_winlinks(&mut wls, crit);
+                // like tmux, #{line} is the number of windows here
+                let n = wls.len().to_string();
+                for (sid, idx, wid) in wls {
+                    let tt = Target { sid: Some(sid), idx: Some(idx), wid: Some(wid), pane: Some(self.windows[&wid].active) };
+                    self.list_line(ctx, tt, ctx.client, fmt, o.get('f'), HashMap::from([("line".to_string(), n.clone())]));
                 }
                 Ok(Flow::Next)
             }
@@ -1619,7 +1779,8 @@ impl Server {
                     None => None,
                 };
                 let cwd = o.get('c').map(|c| self.expand(tt, ctx.client, c));
-                let new = self.split_pane(tt, o.has('h'), o.has('b'), size, o.has('f'), cwd, &o.rest, &env)?;
+                let command = spawn_command(&o, o.has('I'))?;
+                let new = self.split_pane(tt, o.has('h'), o.has('b'), size, o.has('f'), cwd, &command, &env)?;
                 let wid = tt.wid.unwrap();
                 if !o.has('d') {
                     self.select_pane(wid, new);
@@ -1639,9 +1800,18 @@ impl Server {
             }
             "kill-pane" => {
                 let tt = self.resolve_pane(ctx, t)?;
+                let filter = o.get('f');
+                if filter.is_some() && !o.has('a') {
+                    return err("-f only valid with -a");
+                }
                 if o.has('a') {
                     let keep = tt.pane.unwrap();
-                    let others: Vec<PaneId> = self.windows[&tt.wid.unwrap()].panes().into_iter().filter(|p| *p != keep).collect();
+                    let wid = tt.wid.unwrap();
+                    let others: Vec<PaneId> = self.windows[&wid]
+                        .panes()
+                        .into_iter()
+                        .filter(|p| *p != keep && filter.is_none_or(|f| truthy(&self.expand(Target { pane: Some(*p), ..tt }, None, f))))
+                        .collect();
                     for p in others {
                         self.kill_pane(p);
                     }
@@ -1670,6 +1840,14 @@ impl Server {
                     let v = if o.has('d') { "on" } else { "off" };
                     self.panes.get_mut(&pane).unwrap().options.set("@input-disabled", v.into());
                     return Ok(Flow::Next);
+                }
+                if let Some(style) = o.get('P') {
+                    // deprecated -P: the pane's window-style and window-active-style
+                    let v = options::validate("window-style", Some(style), None).map_err(|_| format!("bad style: {style}"))?;
+                    let p = self.panes.get_mut(&pane).unwrap();
+                    p.options.set("window-style", v.clone());
+                    p.options.set("window-active-style", v);
+                    self.mark_window_dirty(wid);
                 }
                 if o.has('g') {
                     ctx.out.push_str(&self.opt_pane(pane, "window-style"));
@@ -1918,10 +2096,16 @@ impl Server {
                 if total < 3 {
                     return err("target pane too small");
                 }
-                let size = match o.get('l') {
-                    Some(l) if l.ends_with('%') => l.trim_end_matches('%').parse::<u32>().ok().map(|p| (total as u32 * p / 100) as u16),
-                    Some(l) => l.parse().ok(),
-                    None => None,
+                let size = match (o.get('l'), o.get('p')) {
+                    (Some(l), _) if l.ends_with('%') => l.trim_end_matches('%').parse::<u32>().ok().map(|p| (total as u32 * p / 100) as u16),
+                    (Some(l), _) => l.parse().ok(),
+                    // -p: a percentage of the target (tmux's older form of -l N%)
+                    (None, Some(p)) => {
+                        let v = self.expand(dst, ctx.client, p);
+                        let pct = v.parse::<u32>().ok().filter(|v| *v <= 100).ok_or_else(|| format!("size or position invalid tiled geometry {v}"))?;
+                        Some((total as u32 * pct / 100) as u16)
+                    }
+                    (None, None) => None,
                 };
                 // detach from source window
                 let sw = self.windows.get_mut(&swid).unwrap();
@@ -1968,33 +2152,32 @@ impl Server {
                 Ok(Flow::Next)
             }
             "list-panes" => {
-                let fmt = o.get('F').unwrap_or("#{pane_index}: [#{pane_width}x#{pane_height}] [history #{history_size}/#{history_limit}] #{pane_id}#{?pane_active, (active),}");
+                let crit = sort::Criteria::from_args(o.get('O'), o.has('r'))?;
                 let mut targets: Vec<(SessId, u32, WinId)> = Vec::new();
-                if o.has('a') {
-                    for s in self.sessions.values() {
-                        for (i, w) in &s.links {
-                            targets.push((s.id, *i, *w));
-                        }
+                let sids = if o.has('a') { self.sorted_sessions(sort::Criteria { order: None, reversed: false }) } else if o.has('s') { vec![self.resolve_session(ctx, t)?] } else { Vec::new() };
+                for sid in &sids {
+                    for (i, w) in &self.sessions[sid].links {
+                        targets.push((*sid, *i, *w));
                     }
-                } else if o.has('s') {
-                    let sid = self.resolve_session(ctx, t)?;
-                    for (i, w) in &self.sessions[&sid].links {
-                        targets.push((sid, *i, *w));
-                    }
-                } else {
+                }
+                if !o.has('a') && !o.has('s') {
                     let wt = self.resolve_window(ctx, t)?;
                     targets.push((wt.sid.unwrap(), wt.idx.unwrap(), wt.wid.unwrap()));
                 }
-                let fmt = if (o.has('a') || o.has('s')) && o.get('F').is_none() { "#{session_name}:#{window_index}.#{pane_index}: [#{pane_width}x#{pane_height}] [history #{history_size}/#{history_limit}] #{pane_id}#{?pane_active, (active),}" } else { fmt };
+                const SIZE: &str = "[#{pane_width}x#{pane_height}#{?pane_floating_flag, #{pane_x}#,#{pane_y}#,#{pane_z}}] [history #{history_size}/#{history_limit}, #{history_bytes} bytes] #{pane_id}#{?pane_active, (active),}#{?pane_dead, (dead),}";
+                let fmt = match o.get('F') {
+                    Some(f) => f.to_string(),
+                    None if o.has('a') => format!("#{{session_name}}:#{{window_index}}.#{{pane_index}}: {SIZE}"),
+                    None if o.has('s') => format!("#{{window_index}}.#{{pane_index}}: {SIZE}"),
+                    None => format!("#{{pane_index}}: {SIZE}"),
+                };
                 for (sid, idx, wid) in targets {
-                    for p in self.windows[&wid].panes() {
+                    // panes are sorted within each window, as tmux does
+                    let panes = self.sorted_panes(wid, crit);
+                    let n = panes.len().to_string();
+                    for p in panes {
                         let tt = Target { sid: Some(sid), idx: Some(idx), wid: Some(wid), pane: Some(p) };
-                        if o.get('f').is_some_and(|f| !truthy(&self.expand(tt, ctx.client, f))) {
-                            continue;
-                        }
-                        let line = self.expand(tt, ctx.client, fmt);
-                        ctx.out.push_str(&line);
-                        ctx.out.push('\n');
+                        self.list_line(ctx, tt, ctx.client, &fmt, o.get('f'), HashMap::from([("line".to_string(), n.clone())]));
                     }
                 }
                 Ok(Flow::Next)
@@ -2003,40 +2186,87 @@ impl Server {
                 let tt = self.resolve_pane(ctx, t)?;
                 let p = self.panes.get(&tt.pane.unwrap()).ok_or("no pane")?;
                 let screen = p.screen();
-                // only the requested rows are read; plain text skips per-cell conversion
-                let total = screen.history_rows_len() as i64;
-                let hist = screen.scrollback_len() as i64;
-                let rows = p.size.1 as i64;
-                let parse = |v: Option<&str>, default: i64| -> i64 {
-                    match v {
-                        Some("-") => i64::MIN,
-                        Some(s) => s.parse().unwrap_or(default),
-                        None => default,
-                    }
-                };
-                let start = parse(o.get('S'), 0);
-                let end = parse(o.get('E'), rows - 1);
-                let to_abs = |v: i64| -> i64 { if v == i64::MIN { 0 } else { (hist + v).clamp(0, total - 1) } };
-                let (a, b) = (to_abs(start), if o.get('E') == Some("-") { total - 1 } else { to_abs(end) });
                 let mut out = String::new();
-                let mut i = a;
-                while i <= b {
-                    let (text, wrapped) = if o.has('e') || o.has('N') {
-                        let line = crate::cells::line_at(screen, i as usize);
-                        let text = if o.has('e') { render::line_with_escapes(&line) } else { line.cells.iter().map(|c| c.text.as_str()).collect() };
-                        (text, line.wrapped)
-                    } else {
-                        crate::cells::text_at(screen, i as usize)
-                    };
-                    out.push_str(&text);
-                    if !(o.has('J') && wrapped) {
-                        out.push('\n');
+                if o.has('R') {
+                    out = capture_grid(screen, self.opt_session_num(tt.sid, "history-limit").max(0) as usize);
+                } else if (o.has('P') && !o.has('H')) || (o.has('a') && !screen.alternate_screen()) {
+                    // -P: the start of an incomplete escape sequence; the parser keeps none to show
+                    if !o.has('P') && !o.has('q') {
+                        return err("no alternate screen");
                     }
-                    i += 1;
+                } else {
+                    let cols = p.size.0;
+                    let mode_lines = match (&p.mode, o.has('M')) {
+                        (Some(PaneMode::Copy(cm)), true) => Some(cm.render().0),
+                        _ => None,
+                    };
+                    // the rows to read: the mode's screen (-M), the normal screen saved under
+                    // the alternate screen (-a, no history) or the pane with its history
+                    let (total, hist) = if o.has('a') {
+                        (p.size.1 as i64, 0)
+                    } else if let Some(l) = &mode_lines {
+                        (l.len() as i64, 0)
+                    } else {
+                        (screen.history_rows_len() as i64, screen.scrollback_len() as i64)
+                    };
+                    let rows = total - hist;
+                    let parse = |v: Option<&str>, default: i64| -> i64 {
+                        match v {
+                            Some("-") => i64::MIN,
+                            Some(s) => s.parse().unwrap_or(default),
+                            None => default,
+                        }
+                    };
+                    let start = parse(o.get('S'), 0);
+                    let end = parse(o.get('E'), rows - 1);
+                    let to_abs = |v: i64| -> i64 { if v == i64::MIN { 0 } else { (hist + v).clamp(0, total - 1) } };
+                    let (mut a, mut b) = (to_abs(start), if o.get('E') == Some("-") { total - 1 } else { to_abs(end) });
+                    if b < a {
+                        std::mem::swap(&mut a, &mut b);
+                    }
+                    let line_at = |i: usize| -> crate::cells::Line {
+                        if let Some(l) = &mode_lines {
+                            return l.get(i).cloned().unwrap_or_default();
+                        }
+                        if o.has('a') {
+                            return screen.saved_row(i as u16).map(|r| row_line(&r, cols)).unwrap_or_default();
+                        }
+                        crate::cells::line_at(screen, i)
+                    };
+                    for i in a..=b {
+                        let (text, wrapped) = if o.has('H') {
+                            // hyperlinks (OSC 8) are not kept, so no line has any
+                            (String::new(), false)
+                        } else if o.has('e') || o.has('N') || o.has('C') || o.has('a') || mode_lines.is_some() {
+                            let line = line_at(i as usize);
+                            (capture_line(&line, o.has('e'), o.has('N') && !o.has('J'), o.has('T'), o.has('C')), line.wrapped)
+                        } else {
+                            crate::cells::text_at(screen, i as usize)
+                        };
+                        if o.has('H') && text.is_empty() {
+                            continue;
+                        }
+                        if o.has('L') {
+                            out.push_str(&format!("{} ", i - hist));
+                        }
+                        if o.has('I') {
+                            // when the line entered the history: not recorded here
+                            out.push_str("0 ");
+                        }
+                        if o.has('F') {
+                            out.push_str(if wrapped { "W " } else { "- " });
+                        }
+                        out.push_str(&text);
+                        if !(o.has('J') && wrapped) {
+                            out.push('\n');
+                        }
+                    }
                 }
                 if o.has('p') {
-                    ctx.out.push_str(&out);
-                } else {
+                    // like tmux: the last newline is replaced by one of its own
+                    ctx.out.push_str(out.strip_suffix('\n').unwrap_or(&out));
+                    ctx.out.push('\n');
+                } else if !out.is_empty() {
                     self.add_buffer(o.get('b').map(String::from), out.into_bytes(), false);
                 }
                 Ok(Flow::Next)
@@ -2270,28 +2500,52 @@ impl Server {
                 let cid = self.resolve_client(ctx, t)?;
                 let tt = self.current(&Ctx { client: Some(cid), ..ctx.clone() });
                 let template = o.rest.first().cloned().unwrap_or_else(|| "%1".into());
+                // -F: the template is a format, expanded now
+                let template = if o.has('F') { self.expand(tt, Some(cid), &template) } else { template };
+                // -l: one prompt and input taken literally, not split at commas
+                let split = |v: &str| -> Vec<String> { if o.has('l') { vec![v.to_string()] } else { v.split(',').map(String::from).collect() } };
                 let labels: Vec<String> = match o.get('p') {
-                    Some(p) => p.split(',').map(|s| self.expand(tt, Some(cid), s)).collect(),
+                    Some(p) => split(p).iter().map(|s| self.expand(tt, Some(cid), s)).collect(),
                     None => vec![if o.rest.is_empty() { ":".into() } else { format!("({})", template.split_whitespace().next().unwrap_or("")) }],
                 };
                 let inits: Vec<String> = match o.get('I') {
-                    Some(i) => i.split(',').map(|s| self.expand(tt, Some(cid), s)).collect(),
+                    Some(i) => split(i).iter().map(|s| self.expand(tt, Some(cid), s)).collect(),
                     None => Vec::new(),
                 };
                 let prompts: Vec<(String, String)> = labels.into_iter().enumerate().map(|(i, l)| (l, inits.get(i).cloned().unwrap_or_default())).collect();
                 let kind = if o.has('k') { PromptKind::Key } else { PromptKind::Command };
                 self.open_prompt(cid, kind, prompts, template, ctx.pane, o.has('N'), o.has('1'));
+                // -e: backspace on empty input closes the prompt; -C (keep updating panes) is
+                // how prompts behave here anyway
+                if let Some(pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
+                    pr.bspace_exit = o.has('e') && !o.has('1') && !o.has('N') && !o.has('i') && !o.has('k');
+                }
                 Ok(Flow::Next)
             }
             "confirm-before" => {
                 let cid = self.resolve_client(ctx, t)?;
                 let command = o.rest.first().ok_or("confirm-before needs a command")?.clone();
                 let tt = self.current(&Ctx { client: Some(cid), ..ctx.clone() });
+                // -c: the confirming key (printable ASCII), -y: Enter confirms too
+                let key = match o.get('c') {
+                    Some(c) => match c.as_bytes() {
+                        [b] if (32..127).contains(b) => *b as char,
+                        _ => return err("invalid confirm key"),
+                    },
+                    None => 'y',
+                };
                 let label = match o.get('p') {
                     Some(p) => self.expand(tt, Some(cid), p),
-                    None => format!("Confirm '{}'? (y/n)", command),
+                    None => {
+                        // tmux names the first command, not the whole command line
+                        let name = cmdparse::parse(&command).ok().and_then(|c| c.first().and_then(|c| c.first()).cloned()).map(|n| canonical(&n).map(String::from).unwrap_or(n));
+                        format!("Confirm '{}'? ({key}/n)", name.unwrap_or_else(|| command.clone()))
+                    }
                 };
                 self.open_prompt(cid, PromptKind::Confirm, vec![(label, String::new())], command, ctx.pane, false, true);
+                if let Some(pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
+                    pr.confirm = (key, o.has('y'));
+                }
                 Ok(Flow::Next)
             }
             "display-message" => {
@@ -2299,7 +2553,7 @@ impl Server {
                 let cid = o.get('c').map(|c| self.resolve_client(ctx, Some(c))).transpose()?
                     .or_else(|| ctx.client.filter(|id| self.clients.get(id).is_some_and(|c| c.attached)))
                     .or_else(|| self.resolve_client(ctx, None).ok()).or(ctx.client);
-                if o.has('a') {
+                if o.has('a') && !o.has('j') {
                     let mut names: Vec<&str> = VAR_NAMES.to_vec();
                     names.sort();
                     let vc = super::vars::VarCtx { srv: self, t: tt, client: cid, extra: HashMap::new() };
@@ -2309,8 +2563,18 @@ impl Server {
                     }
                     return Ok(Flow::Next);
                 }
-                let fmt = o.rest.first().map(String::as_str).unwrap_or("[#{session_name}] #{window_index}:#{window_name}, current pane #{pane_index} - (%H:%M %d-%b-%y)");
-                let msg = self.expand_time(tt, cid, fmt);
+                if o.has('F') && !o.rest.is_empty() {
+                    return err("only one of -F or argument must be given");
+                }
+                let fmt = match o.rest.first().map(String::as_str).or(o.get('F')) {
+                    Some(f) => f,
+                    None if o.has('j') => "",
+                    None => "[#{session_name}] #{window_index}:#{window_name}, current pane #{pane_index} - (%H:%M %d-%b-%y)",
+                };
+                // -l: literal, -j: JSON printed back in tmux's form; -C (keep updating the
+                // pane) and -N (ignore keys) are how messages behave here anyway
+                let msg = if o.has('l') { fmt.to_string() } else { self.expand_time(tt, cid, fmt) };
+                let msg = if o.has('j') { json::normalize(&msg)? } else { msg };
                 let attached_client = cid.filter(|c| self.clients.get(c).is_some_and(|c| c.attached));
                 if o.has('p') || attached_client.is_none() {
                     ctx.out.push_str(&msg);
@@ -2378,27 +2642,105 @@ impl Server {
                 Ok(Flow::Next)
             }
             "list-keys" => {
-                let only_table = o.get('T');
-                let only_key = o.rest.first().map(|k| keys::parse_key_name(k).map(|k| keys::key_name(&k)).unwrap_or(k.clone()));
-                for (table, tb) in &self.bindings {
-                    if only_table.is_some_and(|t| t != table) {
-                        continue;
+                let crit = sort::Criteria::from_args(o.get('O'), o.has('r'))?;
+                let only_key = match o.rest.first() {
+                    Some(k) if k.chars().count() > 1 && keys::parse_key_name(k).is_none() && sort::key_code(k) == u64::MAX >> 8 => return err(format!("invalid key: {k}")),
+                    Some(k) => Some(keys::parse_key_name(k).map(|k| keys::key_name(&k)).unwrap_or(k.clone())),
+                    None => None,
+                };
+                if let Some(tb) = o.get('T').filter(|tb| !self.bindings.contains_key(*tb)) {
+                    return err(format!("table {tb} doesn't exist"));
+                }
+                let prefix = match o.get('P') {
+                    Some(p) => p.to_string(),
+                    None => self.opt_session(None, "prefix").replace("None", ""),
+                };
+                let notes_only = o.has('N');
+                // each table is in key order; -N lists prefix then root, each sorted on its own
+                fn table_list<'a>(all: &'a BTreeMap<String, BTreeMap<String, Binding>>, tb: &str) -> Vec<(&'a str, &'a str, &'a Binding)> {
+                    let mut v: Vec<(&str, &str, &Binding)> = all.get_key_value(tb).map(|(t, m)| m.iter().map(|(k, b)| (t.as_str(), k.as_str(), b)).collect()).unwrap_or_default();
+                    v.sort_by_key(|(_, k, _)| sort::key_code(k));
+                    v
+                }
+                let cmp = |a: &(&str, &str, &Binding), b: &(&str, &str, &Binding), order: sort::Order| {
+                    let (ka, kb) = (sort::key_code(a.1), sort::key_code(b.1));
+                    let mods = 0x00ff_0000_0000_00u64;
+                    match order {
+                        sort::Order::Index => ka.cmp(&kb),
+                        sort::Order::Modifier => (ka & mods).cmp(&(kb & mods)),
+                        sort::Order::Name => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
+                        _ => Ordering::Equal,
                     }
-                    for (key, b) in tb {
-                        if only_key.as_ref().is_some_and(|k| k != key) {
-                            continue;
+                    .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+                    .then_with(|| ka.cmp(&kb))
+                };
+                let mut l: Vec<(&str, &str, &Binding)> = Vec::new();
+                if let Some(tb) = o.get('T') {
+                    l = table_list(&self.bindings, tb);
+                    crit.sort(&mut l, cmp);
+                } else if notes_only {
+                    for tb in ["prefix", "root"] {
+                        let mut v = table_list(&self.bindings, tb);
+                        crit.sort(&mut v, cmp);
+                        l.extend(v);
+                    }
+                } else {
+                    for tb in self.bindings.keys() {
+                        l.extend(table_list(&self.bindings, tb));
+                    }
+                    crit.sort(&mut l, cmp);
+                }
+                l.retain(|(_, k, b)| only_key.as_ref().is_none_or(|o| o == k) && !(notes_only && !o.has('a') && b.note.is_empty()));
+                if let (Some(k), true) = (o.rest.first(), l.is_empty()) {
+                    if only_key.is_some() {
+                        return err(format!("unknown key: {k}"));
+                    }
+                }
+                if o.has('1') {
+                    l.truncate(1);
+                }
+                let has_repeat = l.iter().any(|(_, _, b)| b.repeat);
+                let key_width = l.iter().map(|(_, k, _)| crate::format::width(k)).max().unwrap_or(0);
+                let table_width = l.iter().map(|(t, _, _)| crate::format::width(t)).max().unwrap_or(0);
+                let pad = |s: &str, w: usize| format!("{s}{}", " ".repeat(w.saturating_sub(crate::format::width(s))));
+                let mut lines = Vec::new();
+                for (table, key, b) in &l {
+                    let line = match o.get('F') {
+                        Some(f) => {
+                            let vars = HashMap::from([
+                                ("notes_only".to_string(), (notes_only as u8).to_string()),
+                                ("key_has_repeat".to_string(), (has_repeat as u8).to_string()),
+                                ("key_string_width".to_string(), key_width.to_string()),
+                                ("key_table_width".to_string(), table_width.to_string()),
+                                ("key_repeat".to_string(), (b.repeat as u8).to_string()),
+                                ("key_note".to_string(), b.note.clone()),
+                                ("key_prefix".to_string(), prefix.clone()),
+                                ("key_table".to_string(), table.to_string()),
+                                ("key_string".to_string(), key.to_string()),
+                                ("key_command".to_string(), b.cmd.clone()),
+                            ]);
+                            self.expand_extra(self.current(ctx), ctx.client, f, vars)
                         }
-                        if o.has('N') {
-                            if b.note.is_empty() && !o.has('a') {
-                                continue;
-                            }
-                            let prefix = if table == "prefix" { format!("{} ", self.opt_session(None, "prefix")) } else { String::new() };
-                            ctx.out.push_str(&format!("{}{prefix}{key:<10} {}\n", o.get('P').unwrap_or(""), if b.note.is_empty() { &b.cmd } else { &b.note }));
-                        } else {
-                            ctx.out.push_str(&format!("bind-key {}-T {table} {} {}\n", if b.repeat { "-r " } else { "   " }, cmdparse::quote(key), b.cmd));
+                        None if notes_only => format!("{prefix} {} {}", pad(key, key_width), if b.note.is_empty() { &b.cmd } else { &b.note }),
+                        None => {
+                            let r = if !has_repeat { "" } else if b.repeat { "-r" } else { "  " };
+                            format!("bind-key {r} -T {} {} {}", pad(table, table_width), pad(&vis::args_escape(key), key_width), b.cmd)
                         }
-                        if o.has('1') {
-                            return Ok(Flow::Next);
+                    };
+                    if !line.is_empty() {
+                        lines.push(line);
+                    }
+                }
+                let attached = ctx.client.filter(|c| self.clients.get(c).is_some_and(|c| c.attached && c.control == 0));
+                match (o.has('1'), attached, lines.first()) {
+                    (true, Some(c), Some(line)) => {
+                        let line = line.clone();
+                        self.set_message(c, &line);
+                    }
+                    _ => {
+                        for line in lines {
+                            ctx.out.push_str(&line);
+                            ctx.out.push('\n');
                         }
                     }
                 }
@@ -2523,10 +2865,22 @@ impl Server {
             }
             "list-buffers" => {
                 let fmt = o.get('F').unwrap_or("#{buffer_name}: #{buffer_size} bytes: \"#{buffer_sample}\"");
-                let lines: Vec<String> = self.buffers.iter().map(|b| self.expand_extra(Target::default(), ctx.client, fmt, buffer_vars(b))).collect();
-                for l in lines {
-                    ctx.out.push_str(&l);
-                    ctx.out.push('\n');
+                let crit = sort::Criteria::from_args(o.get('O'), o.has('r'))?;
+                // natural order is newest first, which is also tmux's creation order
+                let mut idx: Vec<usize> = (0..self.buffers.len()).collect();
+                crit.sort(&mut idx, |a, b, order| {
+                    let (pa, pb) = (&self.buffers[*a], &self.buffers[*b]);
+                    match order {
+                        sort::Order::Name => pa.name.cmp(&pb.name),
+                        sort::Order::Creation => a.cmp(b),
+                        sort::Order::Size => pa.data.len().cmp(&pb.data.len()),
+                        _ => Ordering::Equal,
+                    }
+                    .then_with(|| pa.name.cmp(&pb.name))
+                });
+                for i in idx {
+                    let vars = buffer_vars(&self.buffers[i]);
+                    self.list_line(ctx, Target::default(), ctx.client, fmt, o.get('f'), vars);
                 }
                 Ok(Flow::Next)
             }
@@ -2583,6 +2937,9 @@ impl Server {
                     }
                 };
                 let data = self.buffers[idx].data.clone();
+                // tmux 3.8 passes the text through vis(3) so it can't carry control sequences
+                // (a bracketed paste end, for one); -S pastes it unchanged
+                let data = if o.has('S') { data } else { vis::strvis(&data, vis::SAFE | vis::NOSLASH) };
                 self.paste(tt.pane.unwrap(), &data, o.has('p'), o.has('r'), o.get('s'));
                 if o.has('d') {
                     self.buffers.remove(idx);
@@ -2644,9 +3001,33 @@ impl Server {
             }
             "show-hooks" => {
                 let map = if o.has('g') { self.hooks.clone() } else { self.resolve_session(ctx, t).ok().map(|s| self.sessions[&s].hooks.clone()).unwrap_or_default() };
+                let ft = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
                 for (k, v) in map {
+                    if o.rest.first().is_some_and(|n| n.split('[').next() != Some(k.as_str())) {
+                        continue;
+                    }
                     for (i, c) in v.iter().enumerate() {
-                        ctx.out.push_str(&format!("{k}[{i}] {c}\n"));
+                        match o.get('F') {
+                            Some(f) => {
+                                let vars = HashMap::from([
+                                    ("option_name".to_string(), k.clone()),
+                                    ("option_value".to_string(), c.clone()),
+                                    ("option_value_only".to_string(), "0".to_string()),
+                                    ("option_is_parent".to_string(), "0".to_string()),
+                                    ("option_is_array".to_string(), "1".to_string()),
+                                    ("option_is_string".to_string(), "1".to_string()),
+                                    ("option_is_hook".to_string(), "1".to_string()),
+                                    ("option_is_user".to_string(), (k.starts_with('@') as u8).to_string()),
+                                    ("option_has_value".to_string(), "1".to_string()),
+                                    ("option_has_array_key".to_string(), "1".to_string()),
+                                    ("option_array_key".to_string(), i.to_string()),
+                                ]);
+                                let line = self.expand_extra(ft, ctx.client, f, vars);
+                                ctx.out.push_str(&line);
+                                ctx.out.push('\n');
+                            }
+                            None => ctx.out.push_str(&format!("{k}[{i}] {c}\n")),
+                        }
                     }
                 }
                 Ok(Flow::Next)
@@ -2725,12 +3106,15 @@ impl Server {
                     let secs = d.parse::<f64>().ok().filter(|s| s.is_finite() && *s >= 0.0).ok_or_else(|| format!("invalid delay time: {d}"))?;
                     return Err(format!(" delay {}", (secs * 1000.0).min(u32::MAX as f64) as u64));
                 }
-                let command = o.rest.first().map(|c| self.expand(tt, ctx.client, c)).unwrap_or_default();
+                // arguments after the command are #{1}, #{2}, ...
+                let args: HashMap<String, String> = o.rest.iter().skip(1).enumerate().map(|(i, a)| ((i + 1).to_string(), a.clone())).collect();
+                let command = o.rest.first().map(|c| self.expand_extra(tt, ctx.client, c, args)).unwrap_or_default();
                 if command.is_empty() {
                     return Ok(Flow::Next);
                 }
-                let cwd = o.get('c').map(String::from).or_else(|| tt.pane.and_then(|p| self.panes.get(&p)).map(|p| p.current_path.clone()));
-                Err(format!("\0job-run\0{command}\0{}\0{}\0{}", cwd.unwrap_or_default(), if o.has('b') { "b" } else { "" }, tt.pane.map(|p| p.to_string()).unwrap_or_default()))
+                let cwd = o.get('c').map(|c| self.expand(tt, ctx.client, c)).or_else(|| tt.pane.and_then(|p| self.panes.get(&p)).map(|p| p.current_path.clone()));
+                let flags = format!("{}{}", if o.has('b') { "b" } else { "" }, if o.has('E') { "E" } else { "" });
+                Err(format!("\0job-run\0{command}\0{}\0{flags}\0{}", cwd.unwrap_or_default(), tt.pane.map(|p| p.to_string()).unwrap_or_default()))
             }
             "wait-for" => {
                 let ch = o.rest.first().ok_or("wait-for needs a channel")?.clone();
@@ -2786,30 +3170,92 @@ impl Server {
                     let alias = if a.is_empty() { String::new() } else { format!(" ({a})") };
                     let flags = if b.is_empty() { String::new() } else { format!(" [-{b}]") };
                     let vals: String = v.chars().map(|c| format!(" [-{c} arg]")).collect();
-                    ctx.out.push_str(&format!("{n}{alias}{flags}{vals}\n"));
+                    match o.get('F') {
+                        Some(f) => {
+                            let vars = HashMap::from([
+                                ("command_list_name".to_string(), n.to_string()),
+                                ("command_list_alias".to_string(), a.to_string()),
+                                ("command_list_usage".to_string(), format!("{flags}{vals}").trim_start().to_string()),
+                            ]);
+                            let line = self.expand_extra(self.current(ctx), ctx.client, f, vars);
+                            if !line.is_empty() {
+                                ctx.out.push_str(&line);
+                                ctx.out.push('\n');
+                            }
+                        }
+                        None => ctx.out.push_str(&format!("{n}{alias}{flags}{vals}\n")),
+                    }
                 }
                 Ok(Flow::Next)
             }
             "clear-prompt" => Ok(Flow::Next),
             "server-access" => {
                 if o.has('l') {
+                    // user entries are U, group entries G; R read-only, W writable
                     for (id, write) in &self.acl {
-                        ctx.out.push_str(&format!("{} ({})\n", ipc::user_name_for_id(id), if *write { "W" } else { "R" }));
+                        let kind = if id.starts_with("g:") { 'G' } else { 'U' };
+                        ctx.out.push_str(&format!("{} ({kind},{})\n", ipc::user_name_for_id(id), if *write { "W" } else { "R" }));
                     }
                     return Ok(Flow::Next);
                 }
                 if ctx.client.and_then(|c| self.clients.get(&c)).is_some_and(|c| c.user.as_ref().is_some_and(|u| *u != self.owner && !ipc::is_superuser(u))) {
                     return err("only the server owner can change access");
                 }
-                let name = o.rest.first().ok_or("server-access needs a user")?;
-                let id = ipc::user_id_for_name(name).ok_or_else(|| format!("unknown user: {name}"))?;
-                if id == self.owner {
-                    return err("the server owner always has access");
+                let arg = o.rest.first().ok_or("missing user or group argument")?;
+                let name = self.expand(self.current(ctx), ctx.client, arg);
+                let group = o.has('g');
+                let kind = if group { "group" } else { "user" };
+                let id = if group {
+                    if cfg!(windows) {
+                        return err("groups are not supported on Windows");
+                    }
+                    ipc::group_id_for_name(&name)
+                } else {
+                    ipc::user_id_for_name(&name)
+                };
+                let id = id.ok_or_else(|| format!("unknown {kind}: {name}"))?;
+                if !group && (id == self.owner || ipc::is_superuser(&id)) {
+                    return err(format!("{name} owns the server, can't change access"));
                 }
-                let clients_of = |s: &Server| -> Vec<ClientId> { s.clients.values().filter(|c| c.user.as_deref() == Some(id.as_str())).map(|c| c.id).collect() };
+                if o.has('a') && o.has('d') {
+                    return err("-a and -d cannot be used together");
+                }
+                if o.has('r') && o.has('w') {
+                    return err("-r and -w cannot be used together");
+                }
+                // the clients an entry applies to: its user, or members of its group without a
+                // user entry of their own
+                let clients_of = |s: &Server| -> Vec<ClientId> {
+                    s.clients
+                        .values()
+                        .filter(|c| {
+                            c.user.as_deref().is_some_and(|u| {
+                                if group {
+                                    // the owner and root are never limited by a group entry
+                                    u != s.owner && !ipc::is_superuser(u) && ipc::group_id_of_user(u).as_deref() == Some(id.as_str()) && !s.acl.iter().any(|a| a.0 == u)
+                                } else {
+                                    u == id
+                                }
+                            })
+                        })
+                        .map(|c| c.id)
+                        .collect()
+                };
                 if o.has('d') {
+                    if !self.acl.iter().any(|a| a.0 == id) {
+                        return err(format!("{kind} {name} not found"));
+                    }
                     self.acl.retain(|a| a.0 != id);
                     for cid in clients_of(self) {
+                        // still allowed by the user's group entry?
+                        let other = self.clients.get(&cid).and_then(|c| c.user.clone()).and_then(|u| ipc::group_id_of_user(&u)).and_then(|g| self.acl.iter().find(|a| a.0 == g).cloned());
+                        if let Some((_, write)) = other {
+                            if let Some(c) = self.clients.get_mut(&cid) {
+                                c.acl_readonly = !write;
+                                c.readonly = !write;
+                            }
+                            continue;
+                        }
                         if self.clients.get(&cid).is_some_and(|c| c.attached) {
                             self.detach_client(cid, "[access not allowed]");
                         }
@@ -2822,23 +3268,28 @@ impl Server {
                     }
                     return Ok(Flow::Next);
                 }
-                let write = !o.has('r');
                 if o.has('a') {
                     if self.acl.iter().any(|a| a.0 == id) {
-                        return err(format!("user {name} is already added"));
+                        return err(format!("{kind} {name} is already added"));
                     }
-                    self.acl.push((id.clone(), write));
-                    ipc::set_shared(true);
-                    if cfg!(windows) && self.pipe_acl.as_ref().is_some_and(|p| !p.contains(&id)) {
-                        ctx.out.push_str("note: the named pipe's ACL is set when the server starts; put this in the config file or restart the server for it to take effect\n");
-                    }
-                } else if o.has('r') || o.has('w') {
-                    let e = self.acl.iter_mut().find(|a| a.0 == id).ok_or_else(|| format!("user {name} not found"))?;
-                    e.1 = o.has('w');
-                } else {
-                    return err("server-access needs -a, -d, -l, -r or -w");
                 }
-                let write = self.acl.iter().find(|a| a.0 == id).map_or(write, |a| a.1);
+                if o.has('a') || o.has('r') || o.has('w') {
+                    // -r and -w add the entry if it is missing (tmux 3.8)
+                    if !self.acl.iter().any(|a| a.0 == id) {
+                        self.acl.push((id.clone(), !o.has('r')));
+                        ipc::set_shared(true);
+                        if cfg!(windows) && self.pipe_acl.as_ref().is_some_and(|p| !p.contains(&id)) {
+                            ctx.out.push_str("note: the named pipe's ACL is set when the server starts; put this in the config file or restart the server for it to take effect\n");
+                        }
+                    }
+                } else {
+                    return Ok(Flow::Next);
+                }
+                if o.has('r') || o.has('w') {
+                    let e = self.acl.iter_mut().find(|a| a.0 == id).unwrap();
+                    e.1 = o.has('w');
+                }
+                let write = self.acl.iter().find(|a| a.0 == id).is_none_or(|a| a.1);
                 for cid in clients_of(self) {
                     if let Some(c) = self.clients.get_mut(&cid) {
                         c.acl_readonly = !write;
@@ -3138,7 +3589,34 @@ impl Server {
             }
             found = true;
             let star = if inherited { "*" } else { "" };
-            if o.has('v') {
+            if let Some(f) = o.get('F') {
+                // show-options -F: the option as format variables
+                let (base, key) = match k.split_once('[') {
+                    Some((b, rest)) => (b.to_string(), Some(rest.trim_end_matches(']').to_string())),
+                    None => (k.clone(), None),
+                };
+                let def = options::def(&base);
+                let is_array = def.is_some_and(|d| d.kind == options::Kind::Array);
+                let is_string = def.is_none_or(|d| matches!(d.kind, options::Kind::Str | options::Kind::Style | options::Kind::Array));
+                let b = |v: bool| if v { "1".to_string() } else { "0".to_string() };
+                let vars = HashMap::from([
+                    ("option_name".to_string(), base),
+                    ("option_value".to_string(), v.clone()),
+                    ("option_value_only".to_string(), b(o.has('v'))),
+                    ("option_is_parent".to_string(), b(inherited)),
+                    ("option_is_array".to_string(), b(is_array)),
+                    ("option_is_string".to_string(), b(is_string)),
+                    ("option_is_hook".to_string(), "0".to_string()),
+                    ("option_is_user".to_string(), b(def.is_none())),
+                    ("option_has_value".to_string(), "1".to_string()),
+                    ("option_has_array_key".to_string(), b(key.is_some())),
+                    ("option_array_key".to_string(), key.unwrap_or_default()),
+                ]);
+                let ft = self.resolve_pane(ctx, o.get('t')).unwrap_or(tt);
+                let line = self.expand_extra(ft, ctx.client, f, vars);
+                ctx.out.push_str(&line);
+                ctx.out.push('\n');
+            } else if o.has('v') {
                 ctx.out.push_str(&format!("{v}\n"));
             } else {
                 ctx.out.push_str(&format!("{k}{star} {}\n", cmdparse::quote(&v)));
@@ -3177,7 +3655,7 @@ impl Server {
         let input: Vec<char> = init.chars().collect();
         let cursor = input.len();
         if let Some(c) = self.clients.get_mut(&cid) {
-            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single, copy_incremental: None });
+            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false, confirm: ('y', false) });
             c.dirty = true;
         }
     }
@@ -3232,6 +3710,87 @@ fn glob_files(path: &str) -> Vec<String> {
         .unwrap_or_default();
     v.sort();
     v
+}
+
+/// A history row as cells (see cells::line_at).
+fn row_line(row: &vt100::capture::RowContents, cols: u16) -> crate::cells::Line {
+    crate::cells::Line { cells: (0..cols).map(|c| row.cell(c).map(crate::cells::cell_from_vt).unwrap_or_default()).collect(), wrapped: row.wrapped() }
+}
+
+/// One captured line: -e adds attribute sequences, `keep` (-N) keeps trailing spaces (up to
+/// the last styled cell with -T), -C escapes backslashes and writes ESC as \033.
+fn capture_line(line: &crate::cells::Line, escapes: bool, keep: bool, trim_unused: bool, escape: bool) -> String {
+    let mut line = line.clone();
+    if escape {
+        for c in &mut line.cells {
+            if c.text == "\\" {
+                c.text = "\\\\".into();
+            }
+        }
+    }
+    if keep && trim_unused {
+        while line.cells.last().is_some_and(|c| c.text == " " && c.style == crate::cells::Style::default()) {
+            line.cells.pop();
+        }
+    }
+    let text = if escapes {
+        render::line_with_escapes(&line)
+    } else {
+        line.cells.iter().map(|c| c.text.as_str()).collect::<String>()
+    };
+    let text = if escape { text.replace('\x1b', "\\033") } else { text };
+    if keep || escapes { text } else { text.trim_end_matches(' ').to_string() }
+}
+
+/// capture-pane -R: a dump of the pane's grid in the shape of tmux's (sizes, then each line
+/// and cell with its flags, attributes and colours).
+fn capture_grid(screen: &vt100::Screen, limit: usize) -> String {
+    use std::fmt::Write as _;
+    let (sy, sx) = (screen.size().0.get(), screen.size().1.get());
+    let hsize = screen.scrollback_len();
+    let mut out = format!("G {sx}x{sy} ({hsize}/{limit})\n");
+    let colour = |c: vt100::Color| -> (String, u32) {
+        const NAMES: [&str; 8] = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
+        match c {
+            vt100::Color::Default => ("default".into(), 8),
+            vt100::Color::Idx(n) if n < 8 => (NAMES[n as usize].into(), n as u32),
+            vt100::Color::Idx(n) if n < 16 => (format!("bright{}", NAMES[n as usize - 8]), 90 + n as u32 - 8),
+            vt100::Color::Idx(n) => (format!("colour{n}"), 0x0100_0000 | n as u32),
+            vt100::Color::Rgb(r, g, b) => (format!("#{r:02x}{g:02x}{b:02x}"), 0x0200_0000 | (r as u32) << 16 | (g as u32) << 8 | b as u32),
+        }
+    };
+    let names = |v: u32, table: &[(u32, &str)]| -> String {
+        let s: Vec<&str> = table.iter().filter(|(m, _)| v & m != 0).map(|(_, n)| *n).collect();
+        if s.is_empty() { "NONE".into() } else { s.join(",") }
+    };
+    for yy in 0..screen.history_rows_len() {
+        let Some(row) = screen.history_row(yy) else { continue };
+        let p = if yy < hsize { "-".to_string() } else { (yy - hsize).to_string() };
+        let cells: Vec<Option<&vt100::Cell>> = (0..sx).map(|x| row.cell(x)).collect();
+        let used = cells.iter().rposition(|c| c.is_some_and(|c| c.has_contents())).map_or(0, |i| i + 1);
+        let lflags = row.wrapped() as u32;
+        let _ = writeln!(out, "\tL {yy} ({p}) flags={}[{lflags:x}] {used}/{}", names(lflags, &[(1, "WRAPPED")]), cells.len());
+        for (xx, c) in cells.iter().enumerate() {
+            let (data, width, padding) = match c {
+                Some(c) if c.is_wide_continuation() => (String::new(), 0, true),
+                Some(c) if c.has_contents() => (c.contents().to_string(), if c.is_wide() { 2 } else { 1 }, false),
+                _ => (" ".to_string(), 1, false),
+            };
+            let (fg, fgv) = colour(c.map_or(vt100::Color::Default, |c| c.fgcolor()));
+            let (bg, bgv) = colour(c.map_or(vt100::Color::Default, |c| c.bgcolor()));
+            let attr = c.map_or(0, |c| c.bold() as u32 | (c.dim() as u32) << 1 | (c.underline() as u32) << 2 | (c.inverse() as u32) << 4 | (c.italic() as u32) << 6);
+            let flags = (fgv & 0x0100_0000 != 0) as u32 | ((bgv & 0x0100_0000 != 0) as u32) << 1 | (padding as u32) << 2;
+            let escaped = String::from_utf8_lossy(&vis::strvis(data.as_bytes(), vis::OCTAL | vis::CSTYLE | vis::TAB | vis::NL)).into_owned();
+            let _ = writeln!(
+                out,
+                "\t\tC {yy},{xx} data=({width},{},{escaped}) flags={}[{flags:x}] attr={}[{attr:x}] fg={fg}[{fgv:x}] bg={bg}[{bgv:x}] us=default[8] link=NONE linkid=NONE",
+                data.len(),
+                names(flags, &[(1, "FG256"), (2, "BG256"), (4, "PADDING")]),
+                names(attr, &[(1, "BRIGHT"), (2, "DIM"), (4, "UNDERSCORE"), (0x10, "REVERSE"), (0x40, "ITALICS")]),
+            );
+        }
+    }
+    out
 }
 
 pub const VAR_NAMES: &[&str] = &[

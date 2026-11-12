@@ -516,6 +516,10 @@ pub struct Prompt {
     pub numeric: bool,
     pub single_key: bool,
     pub copy_incremental: Option<(PaneId, bool)>,
+    /// command-prompt -e: backspace on an empty prompt closes it.
+    pub bspace_exit: bool,
+    /// confirm-before: the key that confirms (-c) and whether Enter does too (-y).
+    pub confirm: (char, bool),
 }
 
 pub enum Overlay {
@@ -733,7 +737,8 @@ pub enum Flow {
 }
 
 pub enum JobKind {
-    RunShell { pane: Option<PaneId>, background: bool },
+    /// `stderr`: run-shell -E shows the command's stderr (tmux discards it otherwise).
+    RunShell { pane: Option<PaneId>, background: bool, stderr: bool },
     IfShell { then: String, otherwise: Option<String> },
 }
 
@@ -1149,7 +1154,8 @@ impl Server {
                     first = false;
                     let user = ipc::peer_user_id(&recv);
                     let allowed = user.as_ref().is_some_and(|id| !id.is_empty()
-                        && (id == &owner || ipc::is_superuser(id) || allowed_users.contains(id)));
+                        && (id == &owner || ipc::is_superuser(id) || allowed_users.contains(id)
+                            || ipc::group_id_of_user(id).is_some_and(|g| allowed_users.contains(&g))));
                     if !allowed {
                         // No writer output exists before identification. Send the
                         // refusal here so closing the cancelled connection cannot
@@ -1257,7 +1263,9 @@ impl Server {
     fn client_user(&mut self, cid: ClientId, user: Option<String>) {
         let Some(c) = self.clients.get_mut(&cid) else { return };
         let id = user.unwrap_or_default();
-        let entry = self.acl.iter().find(|a| a.0 == id).cloned();
+        // a user entry takes precedence over the user's group entry (server-access -g)
+        let group = ipc::group_id_of_user(&id).filter(|_| id != self.owner && !ipc::is_superuser(&id));
+        let entry = self.acl.iter().find(|a| a.0 == id).or_else(|| self.acl.iter().find(|a| Some(&a.0) == group.as_ref())).cloned();
         let allowed = !id.is_empty() && (id == self.owner || ipc::is_superuser(&id) || entry.is_some());
         c.user = Some(id.clone());
         if !allowed {
@@ -1508,7 +1516,7 @@ impl Server {
         let Some(parked) = self.jobs.remove(&id) else { return };
         let mut queue = parked.queue;
         match parked.kind {
-            JobKind::RunShell { pane, background } => {
+            JobKind::RunShell { pane, background, .. } => {
                 if !output.is_empty() && !background {
                     if queue.ctx.reply.is_some_and(|c| !self.clients.get(&c).is_some_and(|c| c.attached)) {
                         queue.ctx.out.push_str(&output);
@@ -1800,6 +1808,9 @@ impl Server {
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_into(&mut self, id: PaneId, generation: u32, sid: Option<SessId>, cols: u16, rows: u16, cmd: &[String], cwd: Option<&str>, extra_env: &[(String, String)]) -> Result<(), String> {
         let (cols, rows) = (cols.max(1), rows.max(1));
+        // an empty pane (new-window -E and friends) gets a terminal but no process
+        let empty = matches!(cmd, [one] if one == cmds::EMPTY_PANE);
+        let cmd: &[String] = if empty { &[] } else { cmd };
         let shell = self.opt_session(sid, "default-shell");
         let shell = if shell.is_empty() { procinfo::default_shell() } else { shell };
         let default_cmd = self.opt_session(sid, "default-command");
@@ -1851,12 +1862,12 @@ impl Server {
         for (k, v) in extra_env {
             cb.env(k, v);
         }
-        let mut child = pair.slave.spawn_command(cb).map_err(|e| format!("create pane failed: {} ({e})", argv[0]))?;
+        let child = if empty { None } else { Some(pair.slave.spawn_command(cb).map_err(|e| format!("create pane failed: {} ({e})", argv[0]))?) };
         drop(pair.slave);
-        let pid = child.process_id();
+        let pid = child.as_ref().and_then(|c| c.process_id());
         let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
         let mut writer = pair.master.take_writer().map_err(|e| e.to_string())?;
-        let killer = child.clone_killer();
+        let killer = child.as_ref().map(|c| c.clone_killer());
 
         let tx = self.tx.clone();
         thread::spawn(move || {
@@ -1872,11 +1883,13 @@ impl Server {
                 }
             }
         });
-        let tx = self.tx.clone();
-        thread::spawn(move || {
-            let status = child.wait().ok().map(|s| s.exit_code() as i32);
-            let _ = tx.send(Event::PaneExit(id, generation, status));
-        });
+        if let Some(mut child) = child {
+            let tx = self.tx.clone();
+            thread::spawn(move || {
+                let status = child.wait().ok().map(|s| s.exit_code() as i32);
+                let _ = tx.send(Event::PaneExit(id, generation, status));
+            });
+        }
         let (itx, irx) = mpsc::channel::<Vec<u8>>();
         thread::spawn(move || {
             for data in irx {
@@ -1898,7 +1911,7 @@ impl Server {
                 parser: vt100::Parser::new_with_callbacks(nz(rows), nz(cols), history, PaneCb::default()),
                 input: itx,
                 master: pair.master,
-                killer: Some(killer),
+                killer,
                 size: (cols, rows),
                 pid,
                 start_cmd,
@@ -2341,7 +2354,7 @@ impl Server {
                 q.ctx.files.pop();
                 continue;
             }
-            let delay_cmd = (name == "run-shell").then(|| cmd.clone());
+            let delay_cmd = (cmds::canonical(&name) == Some("run-shell")).then(|| cmd.clone());
             let saved_mouse = std::mem::replace(&mut self.cur_mouse, q.ctx.mouse.clone());
             let saved_file = std::mem::replace(&mut self.cur_file, q.ctx.files.last().cloned());
             let result = self.exec(cmd, &mut q.ctx);
@@ -2382,10 +2395,10 @@ impl Server {
                             return;
                         }
                         "job-run" => {
-                            let background = get(4) == "b";
+                            let background = get(4).contains('b');
                             let pane = get(5).parse().ok();
                             let cwd = Some(get(3)).filter(|s| !s.is_empty());
-                            let kind = JobKind::RunShell { pane, background };
+                            let kind = JobKind::RunShell { pane, background, stderr: get(4).contains('E') };
                             if background {
                                 let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: Default::default(), ..q.ctx.clone() }, soft: 0 };
                                 self.spawn_job(&get(2), cwd, kind, sub);
@@ -2488,6 +2501,9 @@ impl Server {
             cmd.current_dir(d);
         }
         cmd.stdin(std::process::Stdio::null());
+        if !matches!(kind, JobKind::RunShell { stderr: true, .. }) {
+            cmd.stderr(std::process::Stdio::null());
+        }
         thread::spawn(move || {
             let (status, out) = match cmd.output() {
                 Ok(o) => (o.status.code().unwrap_or(1), String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr)),
@@ -2530,7 +2546,7 @@ fn strip_delay(cmd: &[String]) -> Vec<String> {
                 }
                 continue;
             }
-            let takes_value = flags.ends_with(['c', 't']);
+            let takes_value = flags.ends_with(['c', 's', 't']);
             out.push(a.clone());
             if takes_value && let Some(v) = it.next() {
                 out.push(v.clone());

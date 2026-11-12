@@ -356,7 +356,52 @@ pub fn user_id_for_name(name: &str) -> Option<String> {
     }
 }
 
+/// server-access -g: a group's ACL id ("g:" and the gid). Groups are Unix only.
+pub fn group_id_for_name(name: &str) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let c = std::ffi::CString::new(name).ok()?;
+        let gr = unsafe { libc::getgrnam(c.as_ptr()) };
+        if gr.is_null() {
+            return None;
+        }
+        Some(format!("g:{}", unsafe { (*gr).gr_gid }))
+    }
+    #[cfg(windows)]
+    {
+        let _ = name;
+        None
+    }
+}
+
+/// The group ACL id a user is matched by: their primary group (tmux uses the client's
+/// effective gid, which is that group unless the client changed it).
+pub fn group_id_of_user(id: &str) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let uid = id.parse::<u32>().ok()?;
+        let pw = unsafe { libc::getpwuid(uid) };
+        if pw.is_null() {
+            return None;
+        }
+        Some(format!("g:{}", unsafe { (*pw).pw_gid }))
+    }
+    #[cfg(windows)]
+    {
+        let _ = id;
+        None
+    }
+}
+
 pub fn user_name_for_id(id: &str) -> String {
+    #[cfg(unix)]
+    if let Some(gid) = id.strip_prefix("g:").and_then(|g| g.parse::<u32>().ok()) {
+        let gr = unsafe { libc::getgrgid(gid) };
+        if gr.is_null() {
+            return gid.to_string();
+        }
+        return unsafe { std::ffi::CStr::from_ptr((*gr).gr_name) }.to_string_lossy().into_owned();
+    }
     #[cfg(unix)]
     {
         let Ok(uid) = id.parse::<u32>() else { return id.to_string() };

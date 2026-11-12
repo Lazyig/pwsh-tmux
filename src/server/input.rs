@@ -596,7 +596,8 @@ impl Server {
         let incremental = pr.copy_incremental;
         match pr.kind {
             PromptKind::Confirm => {
-                let yes = matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) || (name == "Enter" && false);
+                let (key, default_yes) = pr.confirm;
+                let yes = (k.code == KeyCode::Char(key) && !k.mods.ctrl && !k.mods.meta) || (k.code == KeyCode::Enter && default_yes);
                 let pr = c.prompt.take().unwrap();
                 if yes {
                     self.run_string(cid, &pr.template, pr.pane);
@@ -651,12 +652,13 @@ impl Server {
             _ if ctrl('c') || ctrl('g') => {
                 c.prompt = None;
             }
+            KeyCode::BSpace | KeyCode::Char('h') if pr.bspace_exit && pr.input.is_empty() && (k.code == KeyCode::BSpace || ctrl('h')) => {
+                c.prompt = None;
+            }
             KeyCode::BSpace => {
                 if pr.cursor > 0 {
                     pr.cursor -= 1;
                     pr.input.remove(pr.cursor);
-                } else if pr.input.is_empty() {
-                    c.prompt = None;
                 }
             }
             _ if ctrl('h') => {
