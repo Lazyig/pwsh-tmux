@@ -1192,3 +1192,40 @@ fn display_all_samples_and_printed_commands() {
     assert_eq!(is_string(&["-g", "status-style"]), "1");
     assert_eq!(is_string(&["-g", "display-time"]), "0");
 }
+
+#[test]
+fn hidden_environment_variables() {
+    let ctx = Ctx::new("p1fix-env");
+    ctx.ok(&["new-session", "-d", "-s", "e"]);
+    ctx.ok(&["set-environment", "-g", "-h", "P1FIX_HID", "sec$ret \"x\" `y` \\z"]);
+    ctx.ok(&["set-environment", "-g", "P1FIX_VIS", "visible"]);
+    ctx.ok(&["set-environment", "-t", "e", "-h", "P1FIX_HID2", "two"]);
+    // hidden variables show only with -h, and -h shows only hidden ones
+    assert_eq!(ctx.ok(&["show-environment", "-g", "P1FIX_HID"]), "");
+    assert_eq!(ctx.ok(&["show-environment", "-gh"]), "P1FIX_HID=sec$ret \"x\" `y` \\z\n");
+    assert_eq!(ctx.ok(&["show-environment", "-gh", "-s"]), "P1FIX_HID=\"sec\\$ret \\\"x\\\" \\`y\\` \\\\z\"; export P1FIX_HID;\n");
+    assert_eq!(ctx.ok(&["show-environment", "-t", "e", "-h"]), "P1FIX_HID2=two\n");
+    assert!(!ctx.ok(&["show-environment", "-t", "e"]).contains("P1FIX_HID2"));
+    assert!(ctx.fails(&["show-environment", "-t", "e", "NOPE"]).contains("unknown variable: NOPE"));
+    // still a format variable, and #{environ_hidden}
+    assert_eq!(ctx.fmt("e:", "#{P1FIX_HID2}"), "two");
+    assert_eq!(ctx.fmt("e:", "#{V/g:#{?#{m:P1FIX_*,#{environ_name}},#{environ_name}=#{environ_hidden};,}}"), "P1FIX_HID=1;P1FIX_VIS=0;");
+    // not passed to new processes
+    let out = std::env::temp_dir().join(format!("p1fix-env-{}", std::process::id()));
+    let cmd = format!("env > '{}'; sleep 30", out.display());
+    #[cfg(unix)]
+    {
+        ctx.ok(&["new-window", "-d", "-t", "e", &cmd]);
+        wait_for("child environment", || std::fs::read_to_string(&out).is_ok_and(|s| s.contains("P1FIX_VIS=")));
+        let env = std::fs::read_to_string(&out).unwrap();
+        let _ = std::fs::remove_file(&out);
+        assert!(!env.contains("P1FIX_HID"), "{env}");
+    }
+    let _ = cmd;
+    // setting without -h shows it again; errors as tmux reports them
+    ctx.ok(&["set-environment", "-g", "P1FIX_HID", "shown"]);
+    assert_eq!(ctx.ok(&["show-environment", "-g", "P1FIX_HID"]), "P1FIX_HID=shown\n");
+    assert!(ctx.fails(&["set-environment", "-g", "", "x"]).contains("empty variable name"));
+    assert!(ctx.fails(&["set-environment", "-g", "A=B", "x"]).contains("variable name contains ="));
+    assert!(ctx.fails(&["set-environment", "-g", "-u", "P1FIX_VIS", "x"]).contains("can't specify a value with -u"));
+}

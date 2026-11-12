@@ -33,6 +33,9 @@ pub struct Flags {
     pub no_output: bool,
     pub wait_exit: bool,
     pub ignore_size: bool,
+    /// no-detach-on-destroy: switch to another session when this one is destroyed
+    pub no_detach_on_destroy: bool,
+    pub new_layouts: bool,
     pub exiting: std::cell::Cell<bool>,
     pub panes: HashMap<PaneId, PaneOutput>,
     /// name -> (what, format, last value per target)
@@ -186,21 +189,25 @@ impl Server {
                 None => (true, flag),
             };
             let c = self.clients.get_mut(&cid).ok_or("no client")?;
+            // server_client_set_flags: the control mode flags only apply to control
+            // clients and unknown flags are ignored
+            let control = c.control > 0;
             match name.split_once('=') {
-                Some(("pause-after", v)) => {
+                Some(("pause-after", v)) if control => {
                     let secs: u64 = v.parse().map_err(|_| format!("bad pause-after: {v}"))?;
                     c.ctl.pause_after = (on && secs > 0).then(|| Duration::from_secs(secs));
                 }
-                None if name == "pause-after" => c.ctl.pause_after = None,
-                None if name == "no-output" => c.ctl.no_output = on,
-                None if name == "wait-exit" => c.ctl.wait_exit = on,
+                None if name == "pause-after" && control => c.ctl.pause_after = None,
+                None if name == "no-output" && control => c.ctl.no_output = on,
+                None if name == "wait-exit" && control => c.ctl.wait_exit = on,
+                None if name == "new-layouts" && control => c.ctl.new_layouts = on,
                 None if name == "read-only" => {
                     if !on && c.is_readonly() { return Err("client is read-only".into()); }
                     c.readonly = on || c.acl_readonly;
                 }
                 None if name == "ignore-size" => c.ctl.ignore_size = on,
-                None if matches!(name, "active-pane" | "no-detach-on-destroy") => {}
-                _ => return Err(format!("unknown flag: {name}")),
+                None if name == "no-detach-on-destroy" => c.ctl.no_detach_on_destroy = on,
+                _ => {}
             }
         }
         if let Some(sid) = self.client_session(cid) {

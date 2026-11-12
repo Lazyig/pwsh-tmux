@@ -640,7 +640,28 @@ impl Vars for VarCtx<'_> {
             }),
             // dark/light detection (OSC 11 / mode 2031) is not done: unknown, as tmux shows it
             "client_theme" => None,
-            "client_flags" => client.map(|c| if c.attached { "attached".into() } else { String::new() }),
+            // server_client_get_flags (focus is not tracked)
+            "client_flags" => client.map(|c| {
+                let pause = c.ctl.pause_after.map(|d| format!("pause-after={}", d.as_secs()));
+                [
+                    (c.attached, "attached"),
+                    (c.control > 0, "control-mode"),
+                    (c.ctl.ignore_size, "ignore-size"),
+                    (c.ctl.no_detach_on_destroy, "no-detach-on-destroy"),
+                    (c.ctl.no_output, "no-output"),
+                    (c.ctl.wait_exit, "wait-exit"),
+                    (c.ctl.new_layouts, "new-layouts"),
+                    (pause.is_some(), pause.as_deref().unwrap_or("")),
+                    (c.is_readonly(), "read-only"),
+                    (c.suspended, "suspended"),
+                    (true, "UTF-8"),
+                ]
+                .iter()
+                .filter(|(on, _)| *on)
+                .map(|(_, n)| *n)
+                .collect::<Vec<_>>()
+                .join(",")
+            }),
             "client_cwd" => client.and_then(|c| c.ident.as_ref()).map(|i| i.cwd.clone()),
             _ => None,
         };
@@ -715,6 +736,7 @@ impl Vars for VarCtx<'_> {
         let srv = self.srv;
         if kind == 'V' {
             // V or V/s: the session environment, V/g: global, V/c: the client's.
+            let level = match flags { "" | "s" => self.t.sid.unwrap_or(u32::MAX), "g" => 0, _ => u32::MAX };
             let mut env: Vec<(String, Option<String>)> = match flags {
                 "" | "s" => self.t.sid.and_then(|s| srv.sessions.get(&s)).map(|s| s.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default(),
                 "g" => srv.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -725,10 +747,10 @@ impl Vars for VarCtx<'_> {
             env.sort();
             env.dedup_by(|a, b| a.0 == b.0);
             return env.into_iter().map(|(name, value)| HashMap::from([
+                ("environ_hidden".into(), b(srv.env_hidden.contains(&(level, name.clone())))),
                 ("environ_name".into(), name),
                 ("environ_removed".into(), b(value.is_none())),
                 ("environ_value".into(), value.unwrap_or_default()),
-                ("environ_hidden".into(), "0".into()),
             ])).collect();
         }
         if kind != 'O' {

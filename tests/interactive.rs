@@ -385,3 +385,32 @@ fn current_target_sorted_switch_and_prompt_flags() {
     std::thread::sleep(Duration::from_millis(300));
     assert!(ctx.ok(&["show-options", "-gqv", "@conf2"]).trim().is_empty());
 }
+
+#[test]
+fn attach_flags_environment_and_destroy() {
+    let ctx = Ctx::new("attach-flags");
+    ctx.ok(&["new-session", "-d", "-s", "a1"]);
+    ctx.ok(&["new-session", "-d", "-s", "a2"]);
+    ctx.ok(&["set", "-g", "update-environment", "P1FIX_*"]);
+    let mut cb = portable_pty::CommandBuilder::new(common::binary());
+    cb.args(["attach-session", "-E", "-f", "ignore-size,no-detach-on-destroy,bogus", "-t", "a1"]);
+    cb.env("PWSH_TMUX_SOCKET", &ctx.socket);
+    cb.env_remove("PWSH_TMUX");
+    cb.env_remove("PWSH_TMUX_PANE");
+    cb.env("TERM", "xterm-256color");
+    cb.env("P1FIX_VAR", "yes");
+    let t = Term::spawn(cb, 80, 24);
+    t.wait_screen("attach", |s| s.contains("[a1]"));
+    // server_client_get_flags; unknown flags are ignored
+    assert_eq!(ctx.ok(&["list-clients", "-F", "#{client_flags}|#{session_name}"]).trim_end(), "attached,ignore-size,no-detach-on-destroy,UTF-8|a1");
+    // -E: no update-environment; switch-client without -E applies it (patterns match)
+    assert!(ctx.fails(&["show-environment", "-t", "a1", "P1FIX_VAR"]).contains("unknown variable: P1FIX_VAR"));
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    ctx.ok(&["switch-client", "-c", &client, "-t", "a2"]);
+    assert_eq!(ctx.ok(&["show-environment", "-t", "a2", "P1FIX_VAR"]), "P1FIX_VAR=yes\n");
+    // detach-on-destroy is on, but this client moves to another session
+    ctx.ok(&["kill-session", "-t", "a2"]);
+    wait_for("moved to a1", || ctx.ok(&["list-clients", "-F", "#{session_name}"]).trim() == "a1");
+    ctx.ok(&["refresh-client", "-t", &client, "-f", "!ignore-size,!no-detach-on-destroy"]);
+    assert_eq!(ctx.ok(&["list-clients", "-F", "#{client_flags}"]).trim_end(), "attached,UTF-8");
+}

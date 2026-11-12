@@ -282,6 +282,20 @@ fn take_env(args: &mut Vec<String>) -> Vec<(String, String)> {
     env
 }
 
+/// environ_update: each update-environment pattern copies the matching variables of the
+/// client's environment, or marks the pattern removed when none match.
+pub fn environ_update(patterns: &[String], src: &[(String, String)]) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    for p in patterns {
+        let found: Vec<&(String, String)> = src.iter().filter(|(k, _)| fnmatch(p, k)).collect();
+        if found.is_empty() {
+            out.push((p.clone(), None));
+        }
+        out.extend(found.into_iter().map(|(k, v)| (k.clone(), Some(v.clone()))));
+    }
+    out
+}
+
 fn fnmatch(pat: &str, s: &str) -> bool {
     fn m(p: &[char], s: &[char]) -> bool {
         match (p.first(), s.first()) {
@@ -826,11 +840,7 @@ impl Server {
             .unwrap_or_default();
         let mut senv = BTreeMap::new();
         if let Some(ident) = ctx.client.and_then(|c| self.clients.get(&c)).and_then(|c| c.ident.as_ref()) {
-            for n in self.opt_array(None, "update-environment") {
-                if let Some((_, v)) = ident.env.iter().find(|(k, _)| *k == n) {
-                    senv.insert(n, Some(v.clone()));
-                }
-            }
+            senv.extend(environ_update(&self.opt_array(None, "update-environment"), &ident.env));
         }
         for (k, v) in env {
             senv.insert(k.clone(), Some(v.clone()));
@@ -1142,7 +1152,7 @@ impl Server {
                 if o.has('A') {
                     if let Some(n) = &name {
                         if let Some(sid) = self.sessions.values().find(|s| &s.name == n).map(|s| s.id) {
-                            return self.attach_or_switch(ctx, sid, o.has('D'), false, o.has('E'));
+                            return self.attach_or_switch(ctx, sid, o.has('D'), false, o.has('E'), None);
                         }
                     }
                 }
@@ -1174,6 +1184,12 @@ impl Server {
                 }
                 let cwd = o.get('c').map(|c| self.expand(self.current(ctx), ctx.client, c));
                 let sid = self.create_session(ctx, name, cols, rows, cwd, o.get('n').map(String::from), &o.rest, &env)?;
+                if o.has('E') {
+                    // -E: no update-environment, only the -e variables
+                    if let Some(s) = self.sessions.get_mut(&sid) {
+                        s.env = env.iter().map(|(k, v)| (k.clone(), Some(v.clone()))).collect();
+                    }
+                }
                 if o.has('P') {
                     let fmt = o.get('F').unwrap_or("#{session_name}:");
                     let s = self.expand(Target { sid: Some(sid), ..Target::default() }, None, fmt);
@@ -1201,7 +1217,7 @@ impl Server {
                     let c = self.expand(self.current(ctx), None, c);
                     self.sessions.get_mut(&sid).unwrap().cwd = c;
                 }
-                self.attach_or_switch(ctx, sid, o.has('d') || o.has('x'), o.has('r'), o.has('E'))
+                self.attach_or_switch(ctx, sid, o.has('d') || o.has('x'), o.has('r'), o.has('E'), o.get('f'))
             }
             "switch-client" => {
                 let cid = self.resolve_client(ctx, o.get('c'))?;
@@ -1216,7 +1232,9 @@ impl Server {
                 if o.has('r') {
                     let c = self.clients.get_mut(&cid).unwrap();
                     if c.is_readonly() { return err("client is read-only"); }
+                    // read-only and ignore-size together
                     c.readonly = !c.readonly;
+                    c.ctl.ignore_size = c.readonly;
                     if t.is_none() && !o.has('n') && !o.has('p') && !o.has('l') {
                         return Ok(Flow::Next);
                     }
@@ -1251,7 +1269,8 @@ impl Server {
                         self.apply_layout(wid);
                     }
                 }
-                self.switch_client(cid, sid);
+                // -E: no update-environment
+                self.switch_client_env(cid, sid, !o.has('E'));
                 Ok(Flow::Next)
             }
             "detach-client" => {
@@ -3099,25 +3118,46 @@ impl Server {
             "set-environment" => {
                 let name = o.rest.first().ok_or("set-environment needs a name")?.clone();
                 let value = o.rest.get(1).map(|v| if o.has('F') { self.expand(self.current(ctx), ctx.client, v) } else { v.clone() });
-                let map = if o.has('g') { &mut self.env } else { &mut self.sessions.get_mut(&self.resolve_session(ctx, t)?).unwrap().env };
+                if name.is_empty() { return err("empty variable name"); }
+                if name.contains('=') { return err("variable name contains ="); }
+                let level = if o.has('g') { 0 } else { self.resolve_session(ctx, t)? };
+                let map = if level == 0 { &mut self.env } else { &mut self.sessions.get_mut(&level).unwrap().env };
                 if o.has('u') {
+                    if value.is_some() { return err("can't specify a value with -u"); }
                     map.remove(&name);
+                    self.env_hidden.remove(&(level, name));
                 } else if o.has('r') {
+                    // environ_clear keeps the hidden flag
+                    if value.is_some() { return err("can't specify a value with -r"); }
                     map.insert(name, None);
                 } else {
-                    map.insert(name, Some(value.ok_or("no value specified")?));
+                    map.insert(name.clone(), Some(value.ok_or("no value specified")?));
+                    // -h: hidden, not passed to new processes; setting without -h shows it again
+                    if o.has('h') { self.env_hidden.insert((level, name)); } else { self.env_hidden.remove(&(level, name)); }
                 }
                 Ok(Flow::Next)
             }
             "show-environment" => {
-                let map = if o.has('g') { self.env.clone() } else { self.sessions[&self.resolve_session(ctx, t)?].env.clone() };
+                let level = if o.has('g') { 0 } else { self.resolve_session(ctx, t)? };
+                let map = if level == 0 { self.env.clone() } else { self.sessions[&level].env.clone() };
+                if let Some(n) = o.rest.first().filter(|n| !map.contains_key(*n)) {
+                    return err(format!("unknown variable: {n}"));
+                }
                 for (k, v) in map {
                     if o.rest.first().is_some_and(|n| *n != k) {
                         continue;
                     }
+                    // hidden variables show only with -h, and -h shows only those
+                    if self.env_hidden.contains(&(level, k.clone())) != o.has('h') {
+                        continue;
+                    }
                     match (v, o.has('s')) {
                         (Some(v), false) => ctx.out.push_str(&format!("{k}={v}\n")),
-                        (Some(v), true) => ctx.out.push_str(&format!("{k}={}; export {k};\n", cmdparse::quote(&v))),
+                        (Some(v), true) => {
+                            // POSIX interprets $ ` " and \ in double quotes
+                            let escaped: String = v.chars().flat_map(|c| if matches!(c, '$' | '`' | '"' | '\\') { vec!['\\', c] } else { vec![c] }).collect();
+                            ctx.out.push_str(&format!("{k}=\"{escaped}\"; export {k};\n"));
+                        }
                         (None, false) => ctx.out.push_str(&format!("-{k}\n")),
                         (None, true) => ctx.out.push_str(&format!("unset {k};\n")),
                     }
@@ -3501,12 +3541,12 @@ impl Server {
         let cid = ctx.reply.or(ctx.client);
         let attachable = cid.and_then(|c| self.clients.get(&c)).is_some_and(|c| c.attached || c.ident.as_ref().is_some_and(|i| i.tty));
         if !detached && attachable {
-            return self.attach_or_switch(ctx, sid, false, false, false);
+            return self.attach_or_switch(ctx, sid, false, false, false, None);
         }
         Ok(Flow::Next)
     }
 
-    fn attach_or_switch(&mut self, ctx: &mut Ctx, sid: SessId, detach_others: bool, readonly: bool, _no_env: bool) -> Result<Flow, String> {
+    fn attach_or_switch(&mut self, ctx: &mut Ctx, sid: SessId, detach_others: bool, readonly: bool, no_env: bool, flags: Option<&str>) -> Result<Flow, String> {
         let cid = ctx.reply.or(ctx.client).ok_or("no client")?;
         let c = self.clients.get(&cid).ok_or("no client")?;
         if !c.attached {
@@ -3525,10 +3565,15 @@ impl Server {
                 self.detach_client(o, &format!("[detached (from session {name})]"));
             }
         }
+        // -f sets client flags; -r is read-only,ignore-size
+        if let Some(f) = flags {
+            self.control_flags(cid, f)?;
+        }
         if let Some(c) = self.clients.get_mut(&cid) {
             c.readonly |= readonly || c.acl_readonly;
+            c.ctl.ignore_size |= readonly;
         }
-        self.switch_client(cid, sid);
+        self.switch_client_env(cid, sid, !no_env);
         Ok(Flow::Next)
     }
 

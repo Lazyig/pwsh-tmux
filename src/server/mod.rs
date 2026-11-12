@@ -758,6 +758,9 @@ pub struct Server {
     pub opts_session: Options,
     pub opts_window: Options,
     pub env: BTreeMap<String, Option<String>>,
+    /// Hidden environment variables (set-environment -h, %hidden): (session or 0 for
+    /// the global environment, name). Not given to new processes.
+    pub env_hidden: std::collections::HashSet<(SessId, String)>,
     pub hooks: BTreeMap<String, Vec<String>>,
     pub buffers: Vec<Buffer>,
     pub buffer_seq: u32,
@@ -897,6 +900,7 @@ impl Server {
             opts_session: Options::defaults(Scope::Session),
             opts_window: Options::defaults(Scope::Window),
             env,
+            env_hidden: std::collections::HashSet::new(),
             hooks: BTreeMap::new(),
             buffers: Vec::new(),
             buffer_seq: 0,
@@ -1801,11 +1805,22 @@ impl Server {
 
     // ---- panes ------------------------------------------------------------------------
 
+    /// environ_for_session: the global environment then the session's, without hidden
+    /// variables.
     pub fn session_env(&self, sid: Option<SessId>) -> Vec<(String, Option<String>)> {
-        let mut env: BTreeMap<String, Option<String>> = self.env.clone();
+        let mut env: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for (k, v) in &self.env {
+            if !self.env_hidden.contains(&(0, k.clone())) {
+                env.insert(k.clone(), v.clone());
+            }
+        }
         if let Some(s) = sid.and_then(|s| self.sessions.get(&s)) {
             for (k, v) in &s.env {
-                env.insert(k.clone(), v.clone());
+                if self.env_hidden.contains(&(s.id, k.clone())) {
+                    env.remove(k);
+                } else {
+                    env.insert(k.clone(), v.clone());
+                }
             }
         }
         env.into_iter().collect()
@@ -2116,6 +2131,8 @@ impl Server {
                     .and_then(|c| c.last_session)
                     .filter(|s| self.sessions.contains_key(s))
                     .or_else(|| self.current_session()),
+                // a no-detach-on-destroy client goes to any other session
+                _ if self.clients.get(&cid).is_some_and(|c| c.ctl.no_detach_on_destroy) => self.current_session(),
                 _ => None,
             };
             match next {
@@ -2145,6 +2162,12 @@ impl Server {
     }
 
     pub fn attach_client(&mut self, cid: ClientId, sid: SessId) {
+        self.attach_client_env(cid, sid, true);
+    }
+
+    /// attach_client; `update_env` false (attach-session/switch-client -E) skips
+    /// update-environment.
+    pub fn attach_client_env(&mut self, cid: ClientId, sid: SessId, update_env: bool) {
         let Some(c) = self.clients.get_mut(&cid) else { return };
         let was_attached = c.attached;
         if c.session != Some(sid) {
@@ -2166,15 +2189,8 @@ impl Server {
         if let Some(s) = self.sessions.get_mut(&sid) {
             s.last_attached = now;
             s.activity = now;
-            for n in names.iter().filter(|_| writable) {
-                match env.iter().find(|(k, _)| k == n) {
-                    Some((_, v)) => {
-                        s.env.insert(n.clone(), Some(v.clone()));
-                    }
-                    None => {
-                        s.env.insert(n.clone(), None);
-                    }
-                }
+            if writable && update_env {
+                s.env.extend(cmds::environ_update(&names, &env));
             }
             let active = s.active;
             if writable { s.alerts.remove(&active); }
@@ -2194,8 +2210,12 @@ impl Server {
     }
 
     pub fn switch_client(&mut self, cid: ClientId, sid: SessId) {
+        self.switch_client_env(cid, sid, true);
+    }
+
+    pub fn switch_client_env(&mut self, cid: ClientId, sid: SessId, update_env: bool) {
         let old = self.clients.get(&cid).and_then(|c| c.session);
-        self.attach_client(cid, sid);
+        self.attach_client_env(cid, sid, update_env);
         if let Some(o) = old.filter(|o| *o != sid) {
             self.update_session_size(o);
             self.check_destroy_unattached(o);
@@ -2278,8 +2298,8 @@ impl Server {
         let clients: Vec<(u64, (u16, u16))> = self
             .clients
             .values()
-            .filter(|c| c.attached && c.session == Some(sid) && !c.is_readonly())
-            .filter_map(|c| if c.control > 0 { c.control_size.filter(|_| !c.ctl.ignore_size).map(|s| (c.activity, s)) } else { Some((c.activity, c.size)) })
+            .filter(|c| c.attached && c.session == Some(sid) && !c.is_readonly() && !c.ctl.ignore_size)
+            .filter_map(|c| if c.control > 0 { c.control_size.map(|s| (c.activity, s)) } else { Some((c.activity, c.size)) })
             .collect();
         let latest = clients.iter().max_by_key(|c| c.0).map(|c| c.1);
         let smallest = clients.iter().map(|c| c.1).reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)));
