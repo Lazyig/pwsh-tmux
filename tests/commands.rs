@@ -1229,3 +1229,28 @@ fn hidden_environment_variables() {
     assert!(ctx.fails(&["set-environment", "-g", "A=B", "x"]).contains("variable name contains ="));
     assert!(ctx.fails(&["set-environment", "-g", "-u", "P1FIX_VIS", "x"]).contains("can't specify a value with -u"));
 }
+
+#[test]
+fn message_log_jobs_and_prompt_history_types() {
+    let ctx = Ctx::new("p1fix-msgs");
+    ctx.ok(&["new-session", "-d", "-s", "m"]);
+    // without -p and with no client to show it on, the message goes nowhere
+    assert_eq!(ctx.ok(&["display-message", "hello msg"]), "");
+    // commands from clients are logged, newest first
+    let log = ctx.ok(&["show-messages"]);
+    let lines: Vec<&str> = log.lines().collect();
+    assert!(lines[0].ends_with(" command: show-messages"), "{log}");
+    assert!(lines[1].ends_with(" command: display-message \"hello msg\""), "{log}");
+    // -J: running jobs
+    ctx.ok(&["run-shell", "-b", "sleep 5"]);
+    let jobs = ctx.ok(&["show-messages", "-J"]);
+    assert!(jobs.starts_with("Job 0: sleep 5 [fd=-1, pid="), "{jobs}");
+    // no attached clients: -T lists no terminals
+    assert_eq!(ctx.ok(&["show-messages", "-T"]), "");
+    // tmux 3.8 has a command and a search history
+    assert_eq!(ctx.ok(&["show-prompt-history"]), "History for command:\n\n\nHistory for search:\n\n\n");
+    assert_eq!(ctx.ok(&["show-prompt-history", "-T", "search"]), "History for search:\n\n\n");
+    assert!(ctx.fails(&["show-prompt-history", "-T", "window-target"]).contains("invalid type: window-target"));
+    ctx.ok(&["clear-prompt-history", "-T", "command"]);
+    assert!(ctx.fails(&["clear-prompt-history", "-T", "bogus"]).contains("invalid type: bogus"));
+}

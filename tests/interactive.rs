@@ -414,3 +414,21 @@ fn attach_flags_environment_and_destroy() {
     ctx.ok(&["refresh-client", "-t", &client, "-f", "!ignore-size,!no-detach-on-destroy"]);
     assert_eq!(ctx.ok(&["list-clients", "-F", "#{client_flags}"]).trim_end(), "attached,UTF-8");
 }
+
+#[test]
+fn prompt_types_keep_separate_histories() {
+    let ctx = Ctx::new("prompt-types");
+    let t = start(&ctx, "h");
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    ctx.ok(&["command-prompt", "-t", &client, "-T", "search", "set -g @searched '%%'"]);
+    t.send(b"needle\r");
+    wait_for("search prompt ran", || ctx.fmt("h", "#{@searched}") == "needle");
+    ctx.ok(&["command-prompt", "-t", &client, "set -g @typed '%%'"]);
+    t.send(b"typed\r");
+    wait_for("command prompt ran", || ctx.fmt("h", "#{@typed}") == "typed");
+    assert_eq!(ctx.ok(&["show-prompt-history", "-T", "search"]), "History for search:\n\n1: needle\n\n");
+    assert_eq!(ctx.ok(&["show-prompt-history", "-T", "command"]), "History for command:\n\n1: typed\n\n");
+    assert!(ctx.fails(&["command-prompt", "-t", &client, "-T", "window-target", "x"]).contains("unknown type: window-target"));
+    // commands run from the prompt are logged for its client
+    assert!(ctx.ok(&["show-messages"]).contains(&format!("{client} command: set-option -g @typed typed")));
+}

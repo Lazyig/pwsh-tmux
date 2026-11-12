@@ -1117,6 +1117,14 @@ impl Server {
         if ctx.readonly {
             self.check_readonly_command(full, &o, ctx)?;
         }
+        // cmdq_add_message: commands from clients go in the message log (show-messages)
+        if let Some(c) = ctx.client.or(ctx.reply).and_then(|c| self.clients.get(&c)) {
+            let words = std::iter::once(full.to_string()).chain(args.iter().cloned()).map(|a| (a, false)).collect();
+            let printed = print_parsed_command(words, &[], false).ok().and_then(|v| v.into_iter().next())
+                .unwrap_or_else(|| std::iter::once(full).chain(args.iter().map(String::as_str)).collect::<Vec<_>>().join(" "));
+            let msg = format!("{} command: {printed}", c.name());
+            self.add_message(&msg);
+        }
         self.command(full, o, env, ctx)
     }
 
@@ -2654,11 +2662,18 @@ impl Server {
                 };
                 let prompts: Vec<(String, String)> = labels.into_iter().enumerate().map(|(i, l)| (l, inits.get(i).cloned().unwrap_or_default())).collect();
                 let kind = if o.has('k') { PromptKind::Key } else { PromptKind::Command };
+                // -T: which history the prompt uses (tmux 3.8 has command and search)
+                let search = match o.get('T') {
+                    None | Some("command") => false,
+                    Some("search") => true,
+                    Some(ty) => return err(format!("unknown type: {ty}")),
+                };
                 self.open_prompt(cid, kind, prompts, template, ctx.pane, o.has('N'), o.has('1'));
                 // -e: backspace on empty input closes the prompt; -C (keep updating panes) is
                 // how prompts behave here anyway
                 if let Some(pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
                     pr.bspace_exit = o.has('e') && !o.has('1') && !o.has('N') && !o.has('i') && !o.has('k');
+                    pr.search = search;
                 }
                 Ok(Flow::Next)
             }
@@ -2737,11 +2752,13 @@ impl Server {
                 };
                 let msg = if o.has('j') { json::normalize(&msg)? } else { msg };
                 let attached_client = cid.filter(|c| self.clients.get(c).is_some_and(|c| c.attached));
-                if o.has('p') || attached_client.is_none() {
+                // without -p the message needs a client to show it on; with none, tmux
+                // shows nothing (a command without any client, as from the configuration,
+                // reports it as an error)
+                if o.has('p') || (attached_client.is_none() && ctx.client.is_none() && ctx.reply.is_none()) {
                     ctx.out.push_str(&msg);
                     ctx.out.push('\n');
-                } else {
-                    let c = attached_client.unwrap();
+                } else if let Some(c) = attached_client {
                     self.set_message(c, &msg);
                     if let Some(ms) = o.get('d').and_then(|v| v.parse::<u64>().ok()) {
                         if let Some(cl) = self.clients.get_mut(&c) {
@@ -2754,18 +2771,57 @@ impl Server {
                 Ok(Flow::Next)
             }
             "show-messages" => {
-                for (t, m) in &self.messages {
-                    ctx.out.push_str(&format!("{}: {m}\n", crate::format::expand_time(&format!("#{{t:@t}}"), &HashMap::from([("@t".to_string(), t.to_string())]))));
+                // -T: the clients' terminals (there is no terminfo description to list,
+                // only which terminal each client has), -J: the running jobs
+                let mut blank = false;
+                if o.has('T') {
+                    let only = o.get('t').map(|t| self.resolve_client(ctx, Some(t))).transpose()?;
+                    let mut n = 0;
+                    for c in self.clients.values().filter(|c| c.attached && c.control == 0 && only.is_none_or(|o| o == c.id)) {
+                        let term = c.ident.as_ref().map(|i| i.term.as_str()).unwrap_or("");
+                        ctx.out.push_str(&format!("Terminal {n}: {term} for {}, flags=0x0:\n", c.name()));
+                        n += 1;
+                    }
+                    blank = n != 0;
+                }
+                if o.has('J') {
+                    let mut jobs: Vec<(&u32, &Parked)> = self.jobs.iter().collect();
+                    jobs.sort_by_key(|(id, j)| std::cmp::Reverse((j.started, **id)));
+                    for (n, (_, j)) in jobs.into_iter().enumerate() {
+                        if std::mem::take(&mut blank) {
+                            ctx.out.push('\n');
+                        }
+                        let pid = j.pid.map_or(-1, |p| p as i64);
+                        ctx.out.push_str(&format!("Job {n}: {} [fd=-1, pid={pid}, status=0]\n", j.cmd));
+                    }
+                }
+                if o.has('T') || o.has('J') {
+                    return Ok(Flow::Next);
+                }
+                // newest first, as "#{t/p:message_time}: #{message_text}"
+                for (t, m) in self.messages.iter().rev() {
+                    let vars = HashMap::from([("message_time".to_string(), t.to_string())]);
+                    ctx.out.push_str(&format!("{}: {m}\n", crate::format::expand(&format!("#{{t/p:message_time}}"), &vars)));
                 }
                 Ok(Flow::Next)
             }
-            "clear-prompt-history" => {
-                self.prompt_history.clear();
-                Ok(Flow::Next)
-            }
-            "show-prompt-history" => {
-                for h in &self.prompt_history {
-                    ctx.out.push_str(h);
+            "clear-prompt-history" | "show-prompt-history" => {
+                // two histories: command and search
+                let types: Vec<&str> = match o.get('T') {
+                    Some(ty @ ("command" | "search")) => vec![ty],
+                    Some(ty) => return err(format!("invalid type: {ty}")),
+                    None => vec!["command", "search"],
+                };
+                for ty in types {
+                    let h = if ty == "search" { &mut self.prompt_history_search } else { &mut self.prompt_history };
+                    if cmd == "clear-prompt-history" {
+                        h.clear();
+                        continue;
+                    }
+                    ctx.out.push_str(&format!("History for {ty}:\n\n"));
+                    for (i, v) in h.iter().enumerate() {
+                        ctx.out.push_str(&format!("{}: {v}\n", i + 1));
+                    }
                     ctx.out.push('\n');
                 }
                 Ok(Flow::Next)
@@ -4011,7 +4067,7 @@ impl Server {
         let input: Vec<char> = init.chars().collect();
         let cursor = input.len();
         if let Some(c) = self.clients.get_mut(&cid) {
-            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false, confirm: ('y', false) });
+            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false, confirm: ('y', false), search: false });
             c.dirty = true;
         }
     }

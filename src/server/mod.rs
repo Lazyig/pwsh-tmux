@@ -519,6 +519,8 @@ pub struct Prompt {
     pub bspace_exit: bool,
     /// confirm-before: the key that confirms (-c) and whether Enter does too (-y).
     pub confirm: (char, bool),
+    /// command-prompt -T search: uses the search history.
+    pub search: bool,
 }
 
 pub enum Overlay {
@@ -744,6 +746,10 @@ pub enum JobKind {
 pub struct Parked {
     pub queue: Queue,
     pub kind: JobKind,
+    /// The job's command and process (show-messages -J), and when it started.
+    pub cmd: String,
+    pub pid: Option<u32>,
+    pub started: u64,
 }
 
 pub struct Server {
@@ -767,6 +773,7 @@ pub struct Server {
     pub bindings: BTreeMap<String, BTreeMap<String, Binding>>,
     pub messages: VecDeque<(u64, String)>,
     pub prompt_history: Vec<String>,
+    pub prompt_history_search: Vec<String>,
     pub jobs: HashMap<u32, Parked>,
     pub waits: HashMap<String, (bool, Vec<Queue>)>,
     /// wait-for channels signalled while nobody waited (the next wait returns at once).
@@ -907,6 +914,7 @@ impl Server {
             bindings: input::default_bindings(),
             messages: VecDeque::new(),
             prompt_history: Vec::new(),
+            prompt_history_search: Vec::new(),
             jobs: HashMap::new(),
             waits: HashMap::new(),
             waits_woken: Default::default(),
@@ -2532,17 +2540,23 @@ impl Server {
             cmd.current_dir(d);
         }
         cmd.stdin(std::process::Stdio::null());
-        if !matches!(kind, JobKind::RunShell { stderr: true, .. }) {
+        cmd.stdout(std::process::Stdio::piped());
+        if matches!(kind, JobKind::RunShell { stderr: true, .. }) {
+            cmd.stderr(std::process::Stdio::piped());
+        } else {
             cmd.stderr(std::process::Stdio::null());
         }
+        // started here so the job's process id is known while it runs
+        let child = cmd.spawn();
+        let pid = child.as_ref().ok().map(|c| c.id());
         thread::spawn(move || {
-            let (status, out) = match cmd.output() {
+            let (status, out) = match child.and_then(|c| c.wait_with_output()) {
                 Ok(o) => (o.status.code().unwrap_or(1), String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr)),
                 Err(e) => (127, format!("{e}\n")),
             };
             let _ = tx.send(Event::Job(id, status, out));
         });
-        self.jobs.insert(id, Parked { queue, kind });
+        self.jobs.insert(id, Parked { queue, kind, cmd: command.to_string(), pid, started: now_ms() });
         id
     }
 }

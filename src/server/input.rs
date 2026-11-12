@@ -44,12 +44,12 @@ pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
         ("$", "command-prompt -I '#S' { rename-session -- '%%' }", false, "Rename current session"),
         ("%", "split-window -h", false, "Split window horizontally"),
         ("&", "confirm-before -p \"kill-window #W? (y/n)\" kill-window", false, "Kill current window"),
-        ("'", "command-prompt -T window-target -p index { select-window -t ':%%' }", false, "Prompt for window index to select"),
+        ("'", "command-prompt -p index { select-window -t ':%%' }", false, "Prompt for window index to select"),
         ("(", "switch-client -p", false, "Switch to previous client"),
         (")", "switch-client -n", false, "Switch to next client"),
         (",", "command-prompt -I '#W' { rename-window -- '%%' }", false, "Rename current window"),
         ("-", "delete-buffer", false, "Delete the most recent paste buffer"),
-        (".", "command-prompt -T target { move-window -t '%%' }", false, "Move the current window"),
+        (".", "command-prompt { move-window -t '%%' }", false, "Move the current window"),
         ("/", "command-prompt -k -p key { list-keys -1N '%%' }", false, "Describe key binding"),
         (":", "command-prompt", false, "Prompt for a command"),
         (";", "last-pane", false, "Move to the previously active pane"),
@@ -589,7 +589,8 @@ impl Server {
     // ---- prompt ----------------------------------------------------------------------
 
     fn prompt_key(&mut self, cid: ClientId, k: &Key, name: &str) {
-        let hist_len = self.prompt_history.len();
+        let search = self.clients.get(&cid).and_then(|c| c.prompt.as_ref()).is_some_and(|p| p.search);
+        let hist_len = if search { self.prompt_history_search.len() } else { self.prompt_history.len() };
         let c = self.clients.get_mut(&cid).unwrap();
         c.dirty = true;
         let pr = c.prompt.as_mut().unwrap();
@@ -625,11 +626,12 @@ impl Server {
                 let input: String = pr.input.iter().collect();
                 pr.answers.push(input.clone());
                 if !input.is_empty() && !pr.template.starts_with("send-keys -X ") {
-                    self.prompt_history.retain(|h| h != &input);
-                    self.prompt_history.push(input);
                     let lim = self.opt_server_num("prompt-history-limit").max(1) as usize;
-                    while self.prompt_history.len() > lim {
-                        self.prompt_history.remove(0);
+                    let history = if search { &mut self.prompt_history_search } else { &mut self.prompt_history };
+                    history.retain(|h| h != &input);
+                    history.push(input);
+                    while history.len() > lim {
+                        history.remove(0);
                     }
                 }
                 if pr.answers.len() < pr.prompts.len() {
@@ -705,7 +707,7 @@ impl Server {
                 if hist_len > 0 {
                     let pos = pr.history_pos.map(|p| p.min(hist_len).saturating_sub(1)).unwrap_or(hist_len - 1);
                     pr.history_pos = Some(pos);
-                    pr.input = self.prompt_history[pos].chars().collect();
+                    pr.input = if search { &self.prompt_history_search } else { &self.prompt_history }[pos].chars().collect();
                     pr.cursor = pr.input.len();
                 }
             }
@@ -713,7 +715,7 @@ impl Server {
                 if let Some(p) = pr.history_pos.map(|p| p.min(hist_len)) {
                     if p + 1 < hist_len {
                         pr.history_pos = Some(p + 1);
-                        pr.input = self.prompt_history[p + 1].chars().collect();
+                        pr.input = if search { &self.prompt_history_search } else { &self.prompt_history }[p + 1].chars().collect();
                     } else {
                         pr.history_pos = None;
                         pr.input.clear();
