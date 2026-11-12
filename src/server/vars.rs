@@ -515,4 +515,9 @@ impl Vars for VarCtx<'_> {
         }).collect()
     }
 
+    fn schedule_animation(&self) {
+        if let Some(cid) = self.client {
+            self.srv.animation_deadlines.borrow_mut().entry(cid).or_insert_with(|| Instant::now() + Duration::from_millis(100));
+        }
+    }
 }

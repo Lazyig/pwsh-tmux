@@ -213,6 +213,10 @@ const BORDER_SETS: [(&str, [&str; 11]); 4] = [
 ];
 
 impl Server {
+    fn expand_status_time(&self, t: Target, cid: ClientId, template: &str) -> String {
+        format::expand_status_time(template, &vars::VarCtx { srv: self, t, client: Some(cid), extra: HashMap::new() })
+    }
+
     pub fn render_all(&mut self) {
         let ids: Vec<ClientId> = self.clients.iter().filter(|(_, c)| c.dirty && c.attached && !c.suspended && c.control == 0 && c.session.is_some()).map(|(id, _)| *id).collect();
         for id in ids {
@@ -240,8 +244,8 @@ impl Server {
         let cur = Target { sid: Some(sid), idx: Some(s.active), wid: Some(s.active_window()), pane: Some(self.windows[&s.active_window()].active) };
         let left_style = format::parse_style(&self.opt_session(Some(sid), "status-left-style"), base).unwrap_or(base);
         let right_style = format::parse_style(&self.opt_session(Some(sid), "status-right-style"), base).unwrap_or(base);
-        let left = self.expand_time(cur, Some(cid), &self.opt_session(Some(sid), "status-left"));
-        let right = self.expand_time(cur, Some(cid), &self.opt_session(Some(sid), "status-right"));
+        let left = self.expand_status_time(cur, cid, &self.opt_session(Some(sid), "status-left"));
+        let right = self.expand_status_time(cur, cid, &self.opt_session(Some(sid), "status-right"));
         let left_len = self.opt_session_num(Some(sid), "status-left-length").max(0) as usize;
         let right_len = self.opt_session_num(Some(sid), "status-right-length").max(0) as usize;
         let lcells = spans_cells(&format::spans(&left, left_style), left_len.min(width), base);
@@ -272,7 +276,7 @@ impl Server {
             } else if alerts & (ALERT_ACTIVITY | ALERT_SILENCE) != 0 {
                 st = format::parse_style(&self.opt_window(Some(wid), "window-status-activity-style"), st).unwrap_or(st);
             }
-            let text = self.expand_time(t, Some(cid), &fmt);
+            let text = self.expand_status_time(t, cid, &fmt);
             let start = wcells.len();
             wcells.extend(spans_cells(&format::spans(&text, st), usize::MAX, st));
             wtags.resize(wcells.len(), Some(format::Range::Window(*idx)));
@@ -622,7 +626,7 @@ impl Server {
                 let (line, tags) = if !custom.is_empty() {
                     let base = self.status_style(sid);
                     let cur = Target { sid: Some(sid), idx: Some(s.active), wid: Some(wid), pane: Some(win.active) };
-                    let text = self.expand_time(cur, Some(cid), custom);
+                    let text = self.expand_status_time(cur, cid, custom);
                     format::layout_line_ranged(&format::spans(&text, base), cw as usize, base)
                 } else if i == 0 {
                     self.status_line(cid, sid, cw)
