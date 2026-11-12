@@ -384,3 +384,37 @@ fn current_target_sorted_switch_and_prompt_flags() {
     std::thread::sleep(Duration::from_millis(300));
     assert!(ctx.ok(&["show-options", "-gqv", "@conf2"]).trim().is_empty());
 }
+
+#[test]
+fn floating_and_modal_panes_on_screen() {
+    let ctx = Ctx::new("float-ui");
+    let t = start(&ctx, "fu");
+    ctx.ok(&["set", "-g", "pane-border-status", "top-floating"]);
+    let f = ctx.ok(&["new-pane", "-P", "-F", "#{pane_id}", "-t", "fu", "-x", "30", "-y", "8", "-X", "10", "-Y", "5", "-T", "flt-title", "-B", "double", "cat"]).trim().to_string();
+    // the border is drawn around the content with the pane's lines and its title on top
+    t.wait_screen("floating pane border", |s| s.contains("flt-title"));
+    let top = t.row(5);
+    assert!(top.contains('╔') && top.contains('╗') && top.contains("flt-title"), "{top:?}");
+    assert!(t.row(12).contains('╚'), "{:?}", t.row(12));
+    // typed text goes to the floating pane, which is active
+    t.send(b"typed-into-float\r");
+    wait_for("text in the floating pane", || ctx.capture(&f).contains("typed-into-float"));
+    // a modal pane with -K gets the prefix key too; -D closes it with Escape
+    let m = ctx.ok(&["new-pane", "-O", "-K", "-D", "-P", "-F", "#{pane_id}", "-t", "fu", "cat -v"]).trim().to_string();
+    wait_for("modal pane", || ctx.fmt("fu", "#{window_modal_pane}") == m);
+    t.send(b"\x02x");
+    wait_for("prefix sent to the modal pane", || ctx.capture(&m).contains("^Bx"));
+    assert_eq!(ctx.fmt("fu", "#{window_panes}"), "3");
+    t.send(b"\x1b");
+    wait_for("modal pane closed", || ctx.fmt("fu", "#{window_modal_pane}").is_empty() && ctx.fmt("fu", "#{window_panes}") == "2");
+    // the pane active before the modal one is active again
+    assert_eq!(ctx.fmt("fu", "#{pane_id}"), f);
+    // a click on the tiled pane makes it active; the floating pane is still drawn above it
+    ctx.ok(&["set", "-g", "mouse", "on"]);
+    t.mouse(0, 60, 20, false);
+    t.mouse(0, 60, 20, true);
+    wait_for("click selects the tiled pane", || ctx.fmt("fu", "#{pane_floating_flag}") == "0");
+    t.mouse(0, 15, 8, false);
+    t.mouse(0, 15, 8, true);
+    wait_for("click selects the floating pane", || ctx.fmt("fu", "#{pane_id}") == f);
+}
