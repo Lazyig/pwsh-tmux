@@ -4,6 +4,9 @@
 /// don't have an impact on the terminal screen directly, as well as to emit
 /// other events like [`on_scroll`](Self::on_scroll).
 pub trait Callbacks {
+    /// Complete DCS payload, excluding ESC P and ST.
+    fn dcs(&mut self, _: &mut crate::Screen, _payload: &[u8]) {}
+
     /// This callback is called when the terminal requests an audible bell
     /// (typically with `^G`).
     fn audible_bell(&mut self, _: &mut crate::Screen) {}
@@ -33,6 +36,10 @@ pub trait Callbacks {
         _ty: &[u8],
         _data: &[u8],
     ) {
+    }
+    /// Clipboard query with the original OSC terminator preserved.
+    fn clipboard_query(&mut self, screen: &mut crate::Screen, ty: &[u8], _bel: bool) {
+        self.paste_from_clipboard(screen, ty);
     }
     /// This callback is called when the terminal requests data to be pasted
     /// from the system clipboard (typically with `\e]52;<ty>;?\a`).

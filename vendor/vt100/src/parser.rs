@@ -2,6 +2,12 @@
 /// the terminal contents.
 pub struct Parser<CB: crate::Callbacks = ()> {
     parser: vte::Parser,
+    string: alloc::vec::Vec<u8>,
+    string_kind: Option<u8>,
+    string_overflow: bool,
+    escape: bool,
+    string_escapes: usize,
+    input_limit: usize,
     screen: crate::screen::WrappedScreen<CB>,
 }
 
@@ -55,6 +61,8 @@ impl<CB: crate::Callbacks> Parser<CB> {
         );
         Self {
             parser: vte::Parser::new(),
+            string: alloc::vec::Vec::new(), string_kind: None, string_overflow: false,
+            escape: false, string_escapes: 0, input_limit: 1048576,
             screen: crate::screen::WrappedScreen { screen, callbacks },
         }
     }
@@ -62,8 +70,42 @@ impl<CB: crate::Callbacks> Parser<CB> {
     /// Processes the contents of the given byte string, and updates the
     /// in-memory terminal state.
     pub fn process(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.screen, bytes);
+        // Buffer control strings separately: vte's std OSC buffer has no limit.
+        // DCS tmux; escapes embedded ESC bytes by doubling them.
+        for &b in bytes {
+            if let Some(kind) = self.string_kind {
+                let end = (kind == b']' && b == 7) || (b == b'\\' && self.string_escapes % 2 == 1);
+                let cancel = b == 0x18 || b == 0x1a;
+                if !self.string_overflow {
+                    if self.string.len() >= self.input_limit { self.string.clear(); self.string_overflow = true; }
+                    else { self.string.push(b); }
+                }
+                if end || cancel {
+                    if !self.string_overflow && !cancel {
+                        if kind == b'P' {
+                            let len = self.string.len().saturating_sub(2);
+                            self.screen.callbacks.dcs(&mut self.screen.screen, &self.string[..len]);
+                        } else {
+                            self.parser.advance(&mut self.screen, b"\x1b]");
+                            self.parser.advance(&mut self.screen, &self.string);
+                        }
+                    }
+                    self.string.clear(); self.string_kind = None; self.string_overflow = false; self.string_escapes = 0;
+                } else if b == 0x1b { self.string_escapes += 1; } else { self.string_escapes = 0; }
+                continue;
+            }
+            if self.escape {
+                self.escape = false;
+                if b == b']' || b == b'P' { self.string_kind = Some(b); continue; }
+                self.parser.advance(&mut self.screen, &[0x1b]);
+            }
+            if b == 0x1b { self.escape = true; }
+            else { self.parser.advance(&mut self.screen, &[b]); }
+        }
     }
+
+    /// Maximum bytes in a terminal control string before discarding it.
+    pub fn set_input_buffer_size(&mut self, limit: usize) { self.input_limit = limit; }
 
     /// Resizes the terminal.
     ///

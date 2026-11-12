@@ -190,7 +190,7 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
         }
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bel_terminated: bool) {
+    fn osc_dispatch(&mut self, params: &[&[u8]], bel_terminated: bool) {
         match params {
             [b"0", s] => {
                 self.callbacks.set_window_icon_name(&mut self.screen, s);
@@ -209,7 +209,7 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
                 ) {
                     (true, b"?") => {
                         self.callbacks
-                            .paste_from_clipboard(&mut self.screen, ty);
+                            .clipboard_query(&mut self.screen, ty, bel_terminated);
                     }
                     (true, data)
                         if data.iter().all(|c| BASE64.contains(c)) =>

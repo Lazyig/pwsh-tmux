@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 #[allow(dead_code)]
 pub const KNOWN: &[&str] = &[
     "256", "RGB", "bpaste", "ccolour", "clipboard", "cstyle", "extkeys", "focus", "hyperlinks", "ignorefkeys", "margins", "mouse", "osc7", "overline",
-    "rectfill", "strikethrough", "sync", "title", "usstyle",
+    "rectfill", "strikethrough", "sync", "title", "usstyle", "utf8", "appesc",
 ];
 
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
@@ -19,6 +19,10 @@ impl Features {
 
     fn add(&mut self, list: &str) {
         for f in list.split([',', ':']).map(str::trim).filter(|f| !f.is_empty()) {
+            if let Some(name) = f.strip_suffix('@').or_else(|| f.strip_prefix('@')) {
+                self.0.remove(name);
+                continue;
+            }
             // tmux aliases
             let f = match f {
                 "Tc" | "24bit" | "truecolor" => "RGB",
@@ -56,8 +60,9 @@ pub fn compute(term: &str, colorterm: &str, table: &[String], extra: &str) -> Fe
     let mut f = Features::default();
     if term.is_empty() {
         // Windows console / Windows Terminal: a modern VT implementation
-        f.add("RGB,mouse,bpaste,title,ccolour,cstyle,focus,clipboard,strikethrough,sync,usstyle,overline,hyperlinks");
+        f.add("utf8,RGB,mouse,bpaste,title,ccolour,cstyle,focus,clipboard,strikethrough,sync,usstyle,overline,hyperlinks");
     } else if term != "dumb" {
+        f.add("utf8");
         if term != "linux" && !term.starts_with("vt1") {
             f.add("mouse,bpaste,strikethrough");
         }
@@ -70,6 +75,9 @@ pub fn compute(term: &str, colorterm: &str, table: &[String], extra: &str) -> Fe
     }
     if matches!(colorterm, "truecolor" | "24bit") {
         f.add("RGB");
+    }
+    if term.contains("wezterm") || term.contains("WezTerm") || term.contains("ghostty") {
+        f.add("RGB,clipboard,cstyle,ccolour,extkeys,focus,margins,usstyle,hyperlinks,utf8");
     }
     for entry in table {
         let mut parts = entry.splitn(2, ':');
@@ -105,7 +113,7 @@ const ANSI16: [(u8, u8, u8); 16] = [
     (127, 127, 127), (255, 0, 0), (0, 255, 0), (255, 255, 0), (92, 92, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255),
 ];
 
-fn idx_to_rgb(i: u8) -> (u8, u8, u8) {
+pub fn idx_to_rgb(i: u8) -> (u8, u8, u8) {
     match i {
         0..=15 => ANSI16[i as usize],
         16..=231 => {
@@ -172,4 +180,109 @@ mod tests {
         c256.add("256");
         assert_eq!(fit_color(vt100::Color::Rgb(0, 0, 0), &c256), vt100::Color::Idx(16));
     }
+}
+
+/// Apply terminfo overrides to the capabilities used by our VT renderer.
+/// String capabilities are retained so an explicit Ss/Se is never replaced by cstyle.
+pub fn overrides(term: &str, table: &[String], features: &mut Features) -> std::collections::BTreeMap<String, String> {
+    let mut caps = terminfo_capabilities(term);
+    for entry in table {
+        let mut parts = entry.split(':');
+        if !fnmatch(parts.next().unwrap_or(""), term) { continue; }
+        for cap in parts {
+            let (name, value) = cap.split_once('=').map(|(n, v)| (n, v.to_string()))
+                .unwrap_or_else(|| (cap.trim_end_matches('@'), if cap.ends_with('@') { String::new() } else { "1".into() }));
+            let feature = match name {
+                "Tc" | "RGB" => "RGB", "colors" => "256", "Ss" | "Se" => "cstyle", "Cs" | "Cr" => "ccolour",
+                "Ms" => "clipboard", "Enbp" | "Dsbp" => "bpaste", "XT" => "title", "Dsfcs" | "Enfcs" => "focus",
+                _ => "",
+            };
+            if !feature.is_empty() {
+                if value.is_empty() || (name == "colors" && value.parse::<u32>().unwrap_or(0) < 256) { features.0.remove(feature); }
+                else { features.add(feature); }
+            }
+            caps.insert(name.to_string(), decode_capability(&value));
+        }
+    }
+    caps
+}
+
+fn decode_capability(s: &str) -> String {
+    let mut out = String::new(); let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next() {
+                Some('E' | 'e') => out.push('\x1b'), Some('n') => out.push('\n'), Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'), Some(c @ '0'..='7') => {
+                    let mut n = c.to_digit(8).unwrap();
+                    for _ in 0..2 { if chars.clone().next().is_some_and(|c| ('0'..='7').contains(&c)) { n = n * 8 + chars.next().unwrap().to_digit(8).unwrap(); } }
+                    if let Some(c) = char::from_u32(n) { out.push(c); }
+                }
+                Some(c) => out.push(c), None => out.push('\\'),
+            },
+            '^' => if let Some(c) = chars.next() { out.push(if c == '?' { '\x7f' } else { ((c as u8) & 31) as char }); },
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+pub fn cursor_style(s: &str) -> u8 {
+    match s { "blinking-block" => 1, "block" => 2, "blinking-underline" => 3, "underline" => 4, "blinking-bar" => 5, "bar" => 6, _ => 0 }
+}
+
+pub fn cursor_sequence(caps: &std::collections::BTreeMap<String, String>, style: u8) -> String {
+    if style == 0 { if let Some(se) = caps.get("Se") { return se.clone(); } }
+    caps.get("Ss").map(|s| s.replace("%p1%d", &style.to_string()).replace("%d", &style.to_string()))
+        .unwrap_or_else(|| format!("\x1b[{style} q"))
+}
+
+/// tmux ignores malformed width entries, including reversed or invalid ranges.
+pub fn codepoint_widths(entries: &[String]) -> Vec<(u32, u32, u16)> {
+    entries.iter().filter_map(|s| {
+        let (range, width) = s.split_once('=')?;
+        let width = width.parse::<u16>().ok().filter(|n| *n <= 2)?;
+        let cp = |s: &str| s.strip_prefix("U+").and_then(|s| u32::from_str_radix(s, 16).ok()).filter(|n| *n > 0 && *n <= 0x10ffff);
+        let (a, b) = if range.starts_with("U+") {
+            if let Some((a, b)) = range.split_once('-') { (cp(a)?, cp(b)?) } else { let n = cp(range)?; (n, n) }
+        } else { let mut chars = range.chars(); let ch = chars.next()?; if chars.next().is_some() { return None; } (ch as u32, ch as u32) };
+        (a <= b).then_some((a, b, width))
+    }).collect()
+}
+
+/// Windows consoles have no terminfo database; use their native VT capabilities.
+#[cfg(windows)]
+fn terminfo_capabilities(_: &str) -> std::collections::BTreeMap<String, String> { Default::default() }
+
+#[cfg(unix)]
+fn terminfo_capabilities(term: &str) -> std::collections::BTreeMap<String, String> {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<BTreeMap<String, BTreeMap<String, String>>>> = OnceLock::new();
+    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+    if let Some(caps) = cache.get(term) { return caps.clone(); }
+    let mut caps = BTreeMap::new();
+    if !term.is_empty() && !term.starts_with('-') {
+        if let Ok(output) = std::process::Command::new("infocmp").args(["-1", "-x", term]).output() {
+            if output.status.success() {
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    let line = line.trim().trim_end_matches(',');
+                    if let Some((name, value)) = line.split_once('=') {
+                        caps.insert(name.to_string(), decode_capability(value));
+                    }
+                }
+            }
+        }
+    }
+    if cache.len() < 128 { cache.insert(term.to_string(), caps.clone()); }
+    caps
+}
+
+/// Expand the parameter forms used by VT cursor and selection capabilities.
+pub fn string_capability(caps: &std::collections::BTreeMap<String, String>, name: &str, fallback: &str, params: &[&str]) -> String {
+    let mut sequence = caps.get(name).map(String::as_str).unwrap_or(fallback).to_string();
+    for (index, value) in params.iter().enumerate() {
+        sequence = sequence.replace(&format!("%p{}%s", index + 1), value).replace(&format!("%p{}%d", index + 1), value);
+    }
+    sequence
 }
