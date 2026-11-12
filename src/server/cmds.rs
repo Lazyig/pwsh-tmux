@@ -6,47 +6,51 @@ use super::*;
 use crate::cmdparse;
 use crate::layout::{self, Dir};
 use crate::opts::{getopt, Opts};
+use std::cmp::Ordering;
+
+mod sort;
+mod vis;
 
 /// (name, alias, flags without value, flags with value)
 const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("attach-session", "attach", "dErx", "cfst"),
     ("bind-key", "bind", "nr", "TN"),
     ("break-pane", "breakp", "abdP", "FnstL"),
-    ("capture-pane", "capturep", "aCeJNpPqT", "bESt"),
-    ("choose-buffer", "", "NrZ", "FfKOt"),
-    ("choose-client", "", "NrZ", "FfKOt"),
-    ("choose-tree", "", "GNrswZ", "FfKOt"),
+    ("capture-pane", "capturep", "aCeFHIJLMNpPqRT", "bESt"),
+    ("choose-buffer", "", "NrZy", "FfKOt"),
+    ("choose-client", "", "iNrZy", "FfKOt"),
+    ("choose-tree", "", "GNrswZy", "FfKOt"),
     ("clear-history", "clearhist", "H", "t"),
     ("clear-prompt-history", "clearphist", "", "T"),
     ("clock-mode", "", "", "t"),
-    ("command-prompt", "", "1bFkiN", "IpTt"),
+    ("command-prompt", "", "1bCeFkilN", "IpTt"),
     ("confirm-before", "confirm", "by", "cpt"),
-    ("copy-mode", "", "eHMqu", "st"),
-    ("customize-mode", "", "NZ", "Fft"),
+    ("copy-mode", "", "deHMqSu", "st"),
+    ("customize-mode", "", "NZy", "Fft"),
     ("delete-buffer", "deleteb", "", "b"),
     ("detach-client", "detach", "aP", "Esct"),
     ("display-menu", "menu", "MO", "bcCHstSTxy"),
-    ("display-message", "display", "aINpv", "cdt"),
+    ("display-message", "display", "aCIjlNpv", "cdFt"),
     ("display-panes", "displayp", "bN", "dt"),
-    ("display-popup", "popup", "BCEk", "bcdeHhsStTwxy"),
+    ("display-popup", "popup", "BCEkN", "bcdeHhsStTwxy"),
     ("find-window", "findw", "CiNrTZ", "t"),
     ("has-session", "has", "", "t"),
     ("if-shell", "if", "bF", "t"),
-    ("join-pane", "joinp", "bdfhv", "lst"),
-    ("kill-pane", "killp", "a", "t"),
+    ("join-pane", "joinp", "bdfhv", "lpst"),
+    ("kill-pane", "killp", "a", "ft"),
     ("kill-server", "", "", ""),
-    ("kill-session", "", "aC", "t"),
-    ("kill-window", "killw", "a", "t"),
+    ("kill-session", "", "aCg", "ft"),
+    ("kill-window", "killw", "a", "ft"),
     ("last-pane", "lastp", "deZ", "t"),
     ("last-window", "last", "", "t"),
     ("link-window", "linkw", "abdk", "st"),
-    ("list-buffers", "lsb", "", "Ff"),
-    ("list-clients", "lsc", "", "Fft"),
+    ("list-buffers", "lsb", "r", "FfO"),
+    ("list-clients", "lsc", "r", "FfOt"),
     ("list-commands", "lscm", "", "F"),
-    ("list-keys", "lsk", "1aN", "PT"),
-    ("list-panes", "lsp", "as", "Fft"),
-    ("list-sessions", "ls", "", "Ff"),
-    ("list-windows", "lsw", "a", "Fft"),
+    ("list-keys", "lsk", "1aNr", "FOPT"),
+    ("list-panes", "lsp", "ars", "FfOt"),
+    ("list-sessions", "ls", "r", "FfO"),
+    ("list-windows", "lsw", "ar", "FfOt"),
     ("load-buffer", "loadb", "w", "bt"),
     ("lock-client", "lockc", "", "t"),
     ("lock-server", "lock", "", ""),
@@ -54,29 +58,29 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("move-pane", "movep", "bdfhv", "lst"),
     ("move-window", "movew", "abdkr", "st"),
     ("new-session", "new", "AdDEPX", "cefFnstxy"),
-    ("new-window", "neww", "abdkPS", "cefFnt"),
+    ("new-window", "neww", "abdEkPS", "cefFnt"),
     ("next-layout", "nextl", "", "t"),
     ("next-window", "next", "a", "t"),
-    ("paste-buffer", "pasteb", "dpr", "bst"),
+    ("paste-buffer", "pasteb", "dprS", "bst"),
     ("pipe-pane", "pipep", "IOo", "t"),
     ("previous-layout", "prevl", "", "t"),
     ("previous-window", "prev", "a", "t"),
-    ("refresh-client", "refresh", "cDlLRSU", "ABCfFt"),
+    ("refresh-client", "refresh", "cDlLRSU", "ABCfFrt"),
     ("rename-session", "rename", "", "t"),
     ("rename-window", "renamew", "", "t"),
     ("resize-pane", "resizep", "DLMRTUZ", "txy"),
     ("resize-window", "resizew", "aADLRU", "txy"),
-    ("respawn-pane", "respawnp", "k", "cet"),
-    ("respawn-window", "respawnw", "k", "cet"),
+    ("respawn-pane", "respawnp", "Ek", "cet"),
+    ("respawn-window", "respawnw", "Ek", "cet"),
     ("rotate-window", "rotatew", "DUZ", "t"),
-    ("run-shell", "run", "bC", "cdt"),
+    ("run-shell", "run", "bCE", "cdst"),
     ("save-buffer", "saveb", "a", "b"),
     ("select-layout", "selectl", "Enop", "t"),
-    ("select-pane", "selectp", "DdegLlMmRUZ", "Tt"),
+    ("select-pane", "selectp", "DdegLlMmRUZ", "PTt"),
     ("select-window", "selectw", "lnpT", "t"),
     ("send-keys", "send", "FHKlMRX", "cNt"),
     ("send-prefix", "", "2", "t"),
-    ("server-access", "", "adlrw", ""),
+    ("server-access", "", "adglrw", ""),
     ("set-buffer", "setb", "aw", "bnt"),
     ("set-environment", "setenv", "Fhgru", "t"),
     ("set-hook", "", "agpRuw", "t"),
@@ -84,18 +88,18 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("set-window-option", "setw", "aFgoqu", "t"),
     ("show-buffer", "showb", "", "b"),
     ("show-environment", "showenv", "hgs", "t"),
-    ("show-hooks", "", "gpw", "t"),
+    ("show-hooks", "", "gpw", "Ft"),
     ("show-messages", "showmsgs", "JT", "t"),
-    ("show-options", "show", "AgHpqsvw", "t"),
+    ("show-options", "show", "AgHpqsvw", "Ft"),
     ("show-prompt-history", "showphist", "", "T"),
-    ("show-window-options", "showw", "gv", "t"),
+    ("show-window-options", "showw", "gv", "Ft"),
     ("source-file", "source", "Fnqv", "t"),
-    ("split-window", "splitw", "bdfhIvPZ", "cefFlt"),
+    ("split-window", "splitw", "bdEfhIvPZ", "cefFlt"),
     ("start-server", "start", "", ""),
     ("suspend-client", "suspendc", "", "t"),
     ("swap-pane", "swapp", "dDUZ", "st"),
     ("swap-window", "swapw", "d", "st"),
-    ("switch-client", "switchc", "ElnprZ", "ctT"),
+    ("switch-client", "switchc", "EFlnprZ", "cOtT"),
     ("unbind-key", "unbind", "anq", "T"),
     ("unlink-window", "unlinkw", "k", "t"),
     ("wait-for", "wait", "LSU", ""),
@@ -475,6 +479,75 @@ impl Server {
                     .ok_or_else(|| "no current client".to_string())
             }
         }
+    }
+
+    // ---- list helpers (sort.c orders) -------------------------------------------------------
+
+    /// Sessions in tmux's natural order (by name) or the -O order.
+    fn sorted_sessions(&self, crit: sort::Criteria) -> Vec<SessId> {
+        let mut v: Vec<&Session> = self.sessions.values().collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        crit.sort(&mut v, |a, b, order| {
+            match order {
+                sort::Order::Index => a.id.cmp(&b.id),
+                sort::Order::Creation => (a.created, a.id).cmp(&(b.created, b.id)),
+                sort::Order::Activity => b.activity.cmp(&a.activity),
+                sort::Order::Name => a.name.cmp(&b.name),
+                _ => Ordering::Equal,
+            }
+            .then_with(|| a.name.cmp(&b.name))
+        });
+        v.into_iter().map(|s| s.id).collect()
+    }
+
+    /// Winlinks (session, index, window) sorted by the -O order.
+    fn sort_winlinks(&self, v: &mut [(SessId, u32, WinId)], crit: sort::Criteria) {
+        crit.sort(v, |a, b, order| {
+            let (wa, wb) = (&self.windows[&a.2], &self.windows[&b.2]);
+            match order {
+                sort::Order::Index => a.1.cmp(&b.1),
+                sort::Order::Creation => (wa.created, wa.id).cmp(&(wb.created, wb.id)),
+                sort::Order::Activity => wb.activity.cmp(&wa.activity),
+                sort::Order::Name => wa.name.cmp(&wb.name),
+                sort::Order::Size => (wa.sx as u32 * wa.sy as u32).cmp(&(wb.sx as u32 * wb.sy as u32)),
+                _ => Ordering::Equal,
+            }
+            .then_with(|| wa.name.cmp(&wb.name))
+        });
+    }
+
+    /// The panes of a window sorted by the -O order. Activity approximates tmux's
+    /// active_point: panes never active, then the last active, then the active pane.
+    fn sorted_panes(&self, wid: WinId, crit: sort::Criteria) -> Vec<PaneId> {
+        let w = &self.windows[&wid];
+        let order_of = w.panes();
+        let mut v = order_of.clone();
+        let title = |p: &PaneId| self.panes.get(p).map(|x| x.title.as_str()).unwrap_or("");
+        let index = |p: &PaneId| order_of.iter().position(|x| x == p).unwrap_or(0);
+        let point = |p: &PaneId| if *p == w.active { 2 } else if w.last_active == Some(*p) { 1 } else { 0 };
+        let size = |p: &PaneId| self.panes.get(p).map(|x| x.size.0 as u32 * x.size.1 as u32).unwrap_or(0);
+        crit.sort(&mut v, |a, b, order| {
+            match order {
+                sort::Order::Activity => point(a).cmp(&point(b)),
+                sort::Order::Creation => a.cmp(b),
+                sort::Order::Size => size(a).cmp(&size(b)),
+                sort::Order::Index | sort::Order::Z => index(a).cmp(&index(b)),
+                sort::Order::Name => title(a).cmp(title(b)),
+                _ => Ordering::Equal,
+            }
+            .then_with(|| title(a).cmp(title(b)))
+        });
+        v
+    }
+
+    /// One line of a list command: `filter` (-f) decides, `fmt` (-F) is printed.
+    fn list_line(&self, ctx: &mut Ctx, t: Target, client: Option<ClientId>, fmt: &str, filter: Option<&str>, extra: HashMap<String, String>) {
+        if filter.is_some_and(|f| !truthy(&self.expand_extra(t, client, f, extra.clone()))) {
+            return;
+        }
+        let line = self.expand_extra(t, client, fmt, extra);
+        ctx.out.push_str(&line);
+        ctx.out.push('\n');
     }
 
     // ---- lifecycle helpers ----------------------------------------------------------------
@@ -1040,15 +1113,30 @@ impl Server {
             "has-session" => self.resolve_session(ctx, t).map(|_| Flow::Next),
             "kill-session" => {
                 let sid = self.resolve_session(ctx, t)?;
+                let filter = o.get('f');
+                if filter.is_some() && (!o.has('a') || o.has('C')) {
+                    return err("-f only valid with -a");
+                }
                 if o.has('C') {
                     self.sessions.get_mut(&sid).unwrap().alerts.clear();
                     self.mark_session_dirty(sid);
                     return Ok(Flow::Next);
                 }
                 if o.has('a') {
-                    let others: Vec<SessId> = self.sessions.keys().filter(|s| **s != sid).copied().collect();
+                    let others: Vec<SessId> = self.sorted_sessions(sort::Criteria { order: None, reversed: false }).into_iter().filter(|s| *s != sid).collect();
                     for s in others {
-                        self.kill_session(s, false);
+                        let tt = Target { sid: Some(s), ..Target::default() };
+                        if self.sessions.contains_key(&s) && filter.is_none_or(|f| truthy(&self.expand(tt, None, f))) {
+                            self.kill_session(s, false);
+                        }
+                    }
+                } else if let Some(g) = self.sessions[&sid].group.filter(|_| o.has('g')) {
+                    // -g: every session in the target's group
+                    let members: Vec<SessId> = self.sessions.values().filter(|s| s.group == Some(g)).map(|s| s.id).collect();
+                    for s in members {
+                        if self.sessions.contains_key(&s) {
+                            self.kill_session(s, false);
+                        }
                     }
                 } else {
                     self.kill_session(sid, false);
@@ -1076,30 +1164,37 @@ impl Server {
                 Ok(Flow::Next)
             }
             "list-sessions" => {
-                let fmt = o.get('F').unwrap_or("#{session_name}: #{session_windows} windows (created #{t:session_created})#{?session_attached, (attached),}");
-                let filter = o.get('f');
-                let ids: Vec<SessId> = self.sessions.keys().copied().collect();
-                for sid in ids {
+                let fmt = o.get('F').unwrap_or("#{session_name}: #{session_windows} windows (created #{t:session_created})#{?session_grouped, (group ,}#{session_group}#{?session_grouped,),}#{?session_attached, (attached),}");
+                let crit = sort::Criteria::from_args(o.get('O'), o.has('r'))?;
+                for (i, sid) in self.sorted_sessions(crit).into_iter().enumerate() {
                     let tt = Target { sid: Some(sid), idx: Some(self.sessions[&sid].active), wid: Some(self.sessions[&sid].active_window()), pane: None };
-                    if filter.is_some_and(|f| !truthy(&self.expand(tt, ctx.client, f))) {
-                        continue;
-                    }
-                    let line = self.expand(tt, ctx.client, fmt);
-                    ctx.out.push_str(&line);
-                    ctx.out.push('\n');
+                    self.list_line(ctx, tt, ctx.client, fmt, o.get('f'), HashMap::from([("line".to_string(), i.to_string())]));
                 }
                 Ok(Flow::Next)
             }
             "list-clients" => {
-                let fmt = o.get('F').unwrap_or("#{client_name}: #{session_name} [#{client_width}x#{client_height} #{client_termname}]#{?client_readonly, (ro),}");
+                let fmt = o.get('F').unwrap_or("#{client_name}: #{session_name} [#{client_width}x#{client_height} #{client_termname}] #{?#{!=:#{client_uid},#{uid}},[user #{?client_user,#{client_user},#{client_uid},}] ,}#{?client_flags,(,}#{client_flags}#{?client_flags,),}");
+                let crit = sort::Criteria::from_args(o.get('O'), o.has('r'))?;
                 let only = t.map(|t| self.find_session(ctx, t)).transpose()?;
-                let cids: Vec<ClientId> = self.clients.values().filter(|c| c.attached && (only.is_none() || c.session == only)).map(|c| c.id).collect();
-                for cid in cids {
-                    let sid = self.client_session(cid);
-                    let tt = sid.map(|s| Target { sid: Some(s), idx: Some(self.sessions[&s].active), wid: Some(self.sessions[&s].active_window()), pane: None }).unwrap_or_default();
-                    let line = self.expand(tt, Some(cid), fmt);
-                    ctx.out.push_str(&line);
-                    ctx.out.push('\n');
+                let mut cids: Vec<ClientId> = self.clients.values().filter(|c| c.attached).map(|c| c.id).collect();
+                crit.sort(&mut cids, |a, b, order| {
+                    let (a, b) = (&self.clients[a], &self.clients[b]);
+                    match order {
+                        sort::Order::Name => a.name().cmp(&b.name()),
+                        sort::Order::Size => a.size.cmp(&b.size),
+                        sort::Order::Creation => (a.created, a.id).cmp(&(b.created, b.id)),
+                        sort::Order::Activity => b.activity.cmp(&a.activity),
+                        _ => Ordering::Equal,
+                    }
+                    .then_with(|| a.name().cmp(&b.name()))
+                });
+                for (i, cid) in cids.into_iter().enumerate() {
+                    let Some(sid) = self.client_session(cid) else { continue };
+                    if only.is_some_and(|o| o != sid) {
+                        continue;
+                    }
+                    let tt = Target { sid: Some(sid), idx: Some(self.sessions[&sid].active), wid: Some(self.sessions[&sid].active_window()), pane: None };
+                    self.list_line(ctx, tt, Some(cid), fmt, o.get('f'), HashMap::from([("line".to_string(), i.to_string())]));
                 }
                 Ok(Flow::Next)
             }
@@ -1249,17 +1344,31 @@ impl Server {
             }
             "kill-window" => {
                 let wt = self.resolve_window(ctx, t)?;
-                let (sid, idx) = (wt.sid.unwrap(), wt.idx.unwrap());
+                let (sid, idx, wid) = (wt.sid.unwrap(), wt.idx.unwrap(), wt.wid.unwrap());
+                let filter = o.get('f');
+                if filter.is_some() && !o.has('a') {
+                    return err("-f only valid with -a");
+                }
                 if o.has('a') {
+                    let matches = |s: &Server, i: u32, w: WinId| {
+                        let tt = Target { sid: Some(sid), idx: Some(i), wid: Some(w), pane: Some(s.windows[&w].active) };
+                        filter.is_none_or(|f| truthy(&s.expand(tt, None, f)))
+                    };
                     // collect ids, not indices: renumber-windows shifts indices as we go
-                    let others: Vec<WinId> = self.sessions[&sid].links.iter().filter(|(i, _)| **i != idx).map(|(_, w)| *w).collect();
+                    let others: Vec<WinId> = self.sessions[&sid].links.iter().filter(|(i, w)| **w != wid && matches(self, **i, **w)).map(|(_, w)| *w).collect();
                     for w in others {
                         if self.windows.contains_key(&w) {
                             self.kill_window(w);
                         }
                     }
+                    // the current window too if it is linked here more than once and matches
+                    let again: Vec<u32> = self.sessions.get(&sid).map(|s| s.links.iter().filter(|(_, w)| **w == wid).map(|(i, _)| *i).collect()).unwrap_or_default();
+                    if again.len() > 1 && again.iter().any(|i| matches(self, *i, wid)) {
+                        self.kill_window(wid);
+                    }
                 } else {
-                    self.kill_window(wt.wid.unwrap());
+                    let _ = idx;
+                    self.kill_window(wid);
                 }
                 Ok(Flow::Next)
             }
@@ -1581,19 +1690,20 @@ impl Server {
                 Ok(Flow::Next)
             }
             "list-windows" => {
-                let fmt = o.get('F').unwrap_or("#{window_index}: #{window_name}#{window_raw_flags} (#{window_panes} panes) [#{window_width}x#{window_height}] [layout #{window_layout}] #{window_id}#{?window_active, (active),}");
-                let fmt = if o.has('a') && o.get('F').is_none() { "#{session_name}:#{window_index}: #{window_name}#{window_raw_flags} (#{window_panes} panes) [#{window_width}x#{window_height}] " } else { fmt };
-                let sids: Vec<SessId> = if o.has('a') { self.sessions.keys().copied().collect() } else { vec![self.resolve_session(ctx, t)?] };
-                for sid in sids {
-                    for (idx, wid) in self.sessions[&sid].links.clone() {
-                        let tt = Target { sid: Some(sid), idx: Some(idx), wid: Some(wid), pane: Some(self.windows[&wid].active) };
-                        if o.get('f').is_some_and(|f| !truthy(&self.expand(tt, ctx.client, f))) {
-                            continue;
-                        }
-                        let line = self.expand(tt, ctx.client, fmt);
-                        ctx.out.push_str(&line);
-                        ctx.out.push('\n');
-                    }
+                let fmt = match o.get('F') {
+                    Some(f) => f,
+                    None if o.has('a') => "#{session_name}:#{window_index}: #{window_name}#{window_raw_flags} (#{window_panes} panes) [#{window_width}x#{window_height}] ",
+                    None => "#{window_index}: #{window_name}#{window_raw_flags} (#{window_panes} panes) [#{window_width}x#{window_height}] [layout #{window_layout}] #{window_id}#{?window_active, (active),}",
+                };
+                let crit = sort::Criteria::from_args(o.get('O'), o.has('r'))?;
+                let sids: Vec<SessId> = if o.has('a') { self.sorted_sessions(sort::Criteria { order: None, reversed: false }) } else { vec![self.resolve_session(ctx, t)?] };
+                let mut wls: Vec<(SessId, u32, WinId)> = sids.iter().flat_map(|sid| self.sessions[sid].links.iter().map(|(i, w)| (*sid, *i, *w))).collect();
+                self.sort_winlinks(&mut wls, crit);
+                // like tmux, #{line} is the number of windows here
+                let n = wls.len().to_string();
+                for (sid, idx, wid) in wls {
+                    let tt = Target { sid: Some(sid), idx: Some(idx), wid: Some(wid), pane: Some(self.windows[&wid].active) };
+                    self.list_line(ctx, tt, ctx.client, fmt, o.get('f'), HashMap::from([("line".to_string(), n.clone())]));
                 }
                 Ok(Flow::Next)
             }
@@ -1632,9 +1742,18 @@ impl Server {
             }
             "kill-pane" => {
                 let tt = self.resolve_pane(ctx, t)?;
+                let filter = o.get('f');
+                if filter.is_some() && !o.has('a') {
+                    return err("-f only valid with -a");
+                }
                 if o.has('a') {
                     let keep = tt.pane.unwrap();
-                    let others: Vec<PaneId> = self.windows[&tt.wid.unwrap()].panes().into_iter().filter(|p| *p != keep).collect();
+                    let wid = tt.wid.unwrap();
+                    let others: Vec<PaneId> = self.windows[&wid]
+                        .panes()
+                        .into_iter()
+                        .filter(|p| *p != keep && filter.is_none_or(|f| truthy(&self.expand(Target { pane: Some(*p), ..tt }, None, f))))
+                        .collect();
                     for p in others {
                         self.kill_pane(p);
                     }
@@ -1961,33 +2080,32 @@ impl Server {
                 Ok(Flow::Next)
             }
             "list-panes" => {
-                let fmt = o.get('F').unwrap_or("#{pane_index}: [#{pane_width}x#{pane_height}] [history #{history_size}/#{history_limit}] #{pane_id}#{?pane_active, (active),}");
+                let crit = sort::Criteria::from_args(o.get('O'), o.has('r'))?;
                 let mut targets: Vec<(SessId, u32, WinId)> = Vec::new();
-                if o.has('a') {
-                    for s in self.sessions.values() {
-                        for (i, w) in &s.links {
-                            targets.push((s.id, *i, *w));
-                        }
+                let sids = if o.has('a') { self.sorted_sessions(sort::Criteria { order: None, reversed: false }) } else if o.has('s') { vec![self.resolve_session(ctx, t)?] } else { Vec::new() };
+                for sid in &sids {
+                    for (i, w) in &self.sessions[sid].links {
+                        targets.push((*sid, *i, *w));
                     }
-                } else if o.has('s') {
-                    let sid = self.resolve_session(ctx, t)?;
-                    for (i, w) in &self.sessions[&sid].links {
-                        targets.push((sid, *i, *w));
-                    }
-                } else {
+                }
+                if !o.has('a') && !o.has('s') {
                     let wt = self.resolve_window(ctx, t)?;
                     targets.push((wt.sid.unwrap(), wt.idx.unwrap(), wt.wid.unwrap()));
                 }
-                let fmt = if (o.has('a') || o.has('s')) && o.get('F').is_none() { "#{session_name}:#{window_index}.#{pane_index}: [#{pane_width}x#{pane_height}] [history #{history_size}/#{history_limit}] #{pane_id}#{?pane_active, (active),}" } else { fmt };
+                const SIZE: &str = "[#{pane_width}x#{pane_height}#{?pane_floating_flag, #{pane_x}#,#{pane_y}#,#{pane_z}}] [history #{history_size}/#{history_limit}, #{history_bytes} bytes] #{pane_id}#{?pane_active, (active),}#{?pane_dead, (dead),}";
+                let fmt = match o.get('F') {
+                    Some(f) => f.to_string(),
+                    None if o.has('a') => format!("#{{session_name}}:#{{window_index}}.#{{pane_index}}: {SIZE}"),
+                    None if o.has('s') => format!("#{{window_index}}.#{{pane_index}}: {SIZE}"),
+                    None => format!("#{{pane_index}}: {SIZE}"),
+                };
                 for (sid, idx, wid) in targets {
-                    for p in self.windows[&wid].panes() {
+                    // panes are sorted within each window, as tmux does
+                    let panes = self.sorted_panes(wid, crit);
+                    let n = panes.len().to_string();
+                    for p in panes {
                         let tt = Target { sid: Some(sid), idx: Some(idx), wid: Some(wid), pane: Some(p) };
-                        if o.get('f').is_some_and(|f| !truthy(&self.expand(tt, ctx.client, f))) {
-                            continue;
-                        }
-                        let line = self.expand(tt, ctx.client, fmt);
-                        ctx.out.push_str(&line);
-                        ctx.out.push('\n');
+                        self.list_line(ctx, tt, ctx.client, &fmt, o.get('f'), HashMap::from([("line".to_string(), n.clone())]));
                     }
                 }
                 Ok(Flow::Next)
@@ -2368,27 +2486,105 @@ impl Server {
                 Ok(Flow::Next)
             }
             "list-keys" => {
-                let only_table = o.get('T');
-                let only_key = o.rest.first().map(|k| keys::parse_key_name(k).map(|k| keys::key_name(&k)).unwrap_or(k.clone()));
-                for (table, tb) in &self.bindings {
-                    if only_table.is_some_and(|t| t != table) {
-                        continue;
+                let crit = sort::Criteria::from_args(o.get('O'), o.has('r'))?;
+                let only_key = match o.rest.first() {
+                    Some(k) if k.chars().count() > 1 && keys::parse_key_name(k).is_none() && sort::key_code(k) == u64::MAX >> 8 => return err(format!("invalid key: {k}")),
+                    Some(k) => Some(keys::parse_key_name(k).map(|k| keys::key_name(&k)).unwrap_or(k.clone())),
+                    None => None,
+                };
+                if let Some(tb) = o.get('T').filter(|tb| !self.bindings.contains_key(*tb)) {
+                    return err(format!("table {tb} doesn't exist"));
+                }
+                let prefix = match o.get('P') {
+                    Some(p) => p.to_string(),
+                    None => self.opt_session(None, "prefix").replace("None", ""),
+                };
+                let notes_only = o.has('N');
+                // each table is in key order; -N lists prefix then root, each sorted on its own
+                fn table_list<'a>(all: &'a BTreeMap<String, BTreeMap<String, Binding>>, tb: &str) -> Vec<(&'a str, &'a str, &'a Binding)> {
+                    let mut v: Vec<(&str, &str, &Binding)> = all.get_key_value(tb).map(|(t, m)| m.iter().map(|(k, b)| (t.as_str(), k.as_str(), b)).collect()).unwrap_or_default();
+                    v.sort_by_key(|(_, k, _)| sort::key_code(k));
+                    v
+                }
+                let cmp = |a: &(&str, &str, &Binding), b: &(&str, &str, &Binding), order: sort::Order| {
+                    let (ka, kb) = (sort::key_code(a.1), sort::key_code(b.1));
+                    let mods = 0x00ff_0000_0000_00u64;
+                    match order {
+                        sort::Order::Index => ka.cmp(&kb),
+                        sort::Order::Modifier => (ka & mods).cmp(&(kb & mods)),
+                        sort::Order::Name => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
+                        _ => Ordering::Equal,
                     }
-                    for (key, b) in tb {
-                        if only_key.as_ref().is_some_and(|k| k != key) {
-                            continue;
+                    .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+                    .then_with(|| ka.cmp(&kb))
+                };
+                let mut l: Vec<(&str, &str, &Binding)> = Vec::new();
+                if let Some(tb) = o.get('T') {
+                    l = table_list(&self.bindings, tb);
+                    crit.sort(&mut l, cmp);
+                } else if notes_only {
+                    for tb in ["prefix", "root"] {
+                        let mut v = table_list(&self.bindings, tb);
+                        crit.sort(&mut v, cmp);
+                        l.extend(v);
+                    }
+                } else {
+                    for tb in self.bindings.keys() {
+                        l.extend(table_list(&self.bindings, tb));
+                    }
+                    crit.sort(&mut l, cmp);
+                }
+                l.retain(|(_, k, b)| only_key.as_ref().is_none_or(|o| o == k) && !(notes_only && !o.has('a') && b.note.is_empty()));
+                if let (Some(k), true) = (o.rest.first(), l.is_empty()) {
+                    if only_key.is_some() {
+                        return err(format!("unknown key: {k}"));
+                    }
+                }
+                if o.has('1') {
+                    l.truncate(1);
+                }
+                let has_repeat = l.iter().any(|(_, _, b)| b.repeat);
+                let key_width = l.iter().map(|(_, k, _)| crate::format::width(k)).max().unwrap_or(0);
+                let table_width = l.iter().map(|(t, _, _)| crate::format::width(t)).max().unwrap_or(0);
+                let pad = |s: &str, w: usize| format!("{s}{}", " ".repeat(w.saturating_sub(crate::format::width(s))));
+                let mut lines = Vec::new();
+                for (table, key, b) in &l {
+                    let line = match o.get('F') {
+                        Some(f) => {
+                            let vars = HashMap::from([
+                                ("notes_only".to_string(), (notes_only as u8).to_string()),
+                                ("key_has_repeat".to_string(), (has_repeat as u8).to_string()),
+                                ("key_string_width".to_string(), key_width.to_string()),
+                                ("key_table_width".to_string(), table_width.to_string()),
+                                ("key_repeat".to_string(), (b.repeat as u8).to_string()),
+                                ("key_note".to_string(), b.note.clone()),
+                                ("key_prefix".to_string(), prefix.clone()),
+                                ("key_table".to_string(), table.to_string()),
+                                ("key_string".to_string(), key.to_string()),
+                                ("key_command".to_string(), b.cmd.clone()),
+                            ]);
+                            self.expand_extra(self.current(ctx), ctx.client, f, vars)
                         }
-                        if o.has('N') {
-                            if b.note.is_empty() && !o.has('a') {
-                                continue;
-                            }
-                            let prefix = if table == "prefix" { format!("{} ", self.opt_session(None, "prefix")) } else { String::new() };
-                            ctx.out.push_str(&format!("{}{prefix}{key:<10} {}\n", o.get('P').unwrap_or(""), if b.note.is_empty() { &b.cmd } else { &b.note }));
-                        } else {
-                            ctx.out.push_str(&format!("bind-key {}-T {table} {} {}\n", if b.repeat { "-r " } else { "   " }, cmdparse::quote(key), b.cmd));
+                        None if notes_only => format!("{prefix} {} {}", pad(key, key_width), if b.note.is_empty() { &b.cmd } else { &b.note }),
+                        None => {
+                            let r = if !has_repeat { "" } else if b.repeat { "-r" } else { "  " };
+                            format!("bind-key {r} -T {} {} {}", pad(table, table_width), pad(&vis::args_escape(key), key_width), b.cmd)
                         }
-                        if o.has('1') {
-                            return Ok(Flow::Next);
+                    };
+                    if !line.is_empty() {
+                        lines.push(line);
+                    }
+                }
+                let attached = ctx.client.filter(|c| self.clients.get(c).is_some_and(|c| c.attached && c.control == 0));
+                match (o.has('1'), attached, lines.first()) {
+                    (true, Some(c), Some(line)) => {
+                        let line = line.clone();
+                        self.set_message(c, &line);
+                    }
+                    _ => {
+                        for line in lines {
+                            ctx.out.push_str(&line);
+                            ctx.out.push('\n');
                         }
                     }
                 }
@@ -2513,10 +2709,22 @@ impl Server {
             }
             "list-buffers" => {
                 let fmt = o.get('F').unwrap_or("#{buffer_name}: #{buffer_size} bytes: \"#{buffer_sample}\"");
-                let lines: Vec<String> = self.buffers.iter().map(|b| self.expand_extra(Target::default(), ctx.client, fmt, buffer_vars(b))).collect();
-                for l in lines {
-                    ctx.out.push_str(&l);
-                    ctx.out.push('\n');
+                let crit = sort::Criteria::from_args(o.get('O'), o.has('r'))?;
+                // natural order is newest first, which is also tmux's creation order
+                let mut idx: Vec<usize> = (0..self.buffers.len()).collect();
+                crit.sort(&mut idx, |a, b, order| {
+                    let (pa, pb) = (&self.buffers[*a], &self.buffers[*b]);
+                    match order {
+                        sort::Order::Name => pa.name.cmp(&pb.name),
+                        sort::Order::Creation => a.cmp(b),
+                        sort::Order::Size => pa.data.len().cmp(&pb.data.len()),
+                        _ => Ordering::Equal,
+                    }
+                    .then_with(|| pa.name.cmp(&pb.name))
+                });
+                for i in idx {
+                    let vars = buffer_vars(&self.buffers[i]);
+                    self.list_line(ctx, Target::default(), ctx.client, fmt, o.get('f'), vars);
                 }
                 Ok(Flow::Next)
             }
@@ -2634,9 +2842,33 @@ impl Server {
             }
             "show-hooks" => {
                 let map = if o.has('g') { self.hooks.clone() } else { self.resolve_session(ctx, t).ok().map(|s| self.sessions[&s].hooks.clone()).unwrap_or_default() };
+                let ft = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
                 for (k, v) in map {
+                    if o.rest.first().is_some_and(|n| n.split('[').next() != Some(k.as_str())) {
+                        continue;
+                    }
                     for (i, c) in v.iter().enumerate() {
-                        ctx.out.push_str(&format!("{k}[{i}] {c}\n"));
+                        match o.get('F') {
+                            Some(f) => {
+                                let vars = HashMap::from([
+                                    ("option_name".to_string(), k.clone()),
+                                    ("option_value".to_string(), c.clone()),
+                                    ("option_value_only".to_string(), "0".to_string()),
+                                    ("option_is_parent".to_string(), "0".to_string()),
+                                    ("option_is_array".to_string(), "1".to_string()),
+                                    ("option_is_string".to_string(), "1".to_string()),
+                                    ("option_is_hook".to_string(), "1".to_string()),
+                                    ("option_is_user".to_string(), (k.starts_with('@') as u8).to_string()),
+                                    ("option_has_value".to_string(), "1".to_string()),
+                                    ("option_has_array_key".to_string(), "1".to_string()),
+                                    ("option_array_key".to_string(), i.to_string()),
+                                ]);
+                                let line = self.expand_extra(ft, ctx.client, f, vars);
+                                ctx.out.push_str(&line);
+                                ctx.out.push('\n');
+                            }
+                            None => ctx.out.push_str(&format!("{k}[{i}] {c}\n")),
+                        }
                     }
                 }
                 Ok(Flow::Next)
@@ -3128,7 +3360,34 @@ impl Server {
             }
             found = true;
             let star = if inherited { "*" } else { "" };
-            if o.has('v') {
+            if let Some(f) = o.get('F') {
+                // show-options -F: the option as format variables
+                let (base, key) = match k.split_once('[') {
+                    Some((b, rest)) => (b.to_string(), Some(rest.trim_end_matches(']').to_string())),
+                    None => (k.clone(), None),
+                };
+                let def = options::def(&base);
+                let is_array = def.is_some_and(|d| d.kind == options::Kind::Array);
+                let is_string = def.is_none_or(|d| matches!(d.kind, options::Kind::Str | options::Kind::Style | options::Kind::Array));
+                let b = |v: bool| if v { "1".to_string() } else { "0".to_string() };
+                let vars = HashMap::from([
+                    ("option_name".to_string(), base),
+                    ("option_value".to_string(), v.clone()),
+                    ("option_value_only".to_string(), b(o.has('v'))),
+                    ("option_is_parent".to_string(), b(inherited)),
+                    ("option_is_array".to_string(), b(is_array)),
+                    ("option_is_string".to_string(), b(is_string)),
+                    ("option_is_hook".to_string(), "0".to_string()),
+                    ("option_is_user".to_string(), b(def.is_none())),
+                    ("option_has_value".to_string(), "1".to_string()),
+                    ("option_has_array_key".to_string(), b(key.is_some())),
+                    ("option_array_key".to_string(), key.unwrap_or_default()),
+                ]);
+                let ft = self.resolve_pane(ctx, o.get('t')).unwrap_or(tt);
+                let line = self.expand_extra(ft, ctx.client, f, vars);
+                ctx.out.push_str(&line);
+                ctx.out.push('\n');
+            } else if o.has('v') {
                 ctx.out.push_str(&format!("{v}\n"));
             } else {
                 ctx.out.push_str(&format!("{k}{star} {}\n", cmdparse::quote(&v)));
