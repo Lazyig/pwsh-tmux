@@ -691,6 +691,18 @@ impl Screen {
         self.grid().absolute_row(index).map(crate::capture::RowContents)
     }
 
+    /// Visible row `row` of the normal screen while the alternate screen is
+    /// active (tmux's saved grid, read by `capture-pane -a`); `None` otherwise.
+    #[must_use]
+    pub fn saved_row(&self, row: u16) -> Option<crate::capture::RowContents<'_>> {
+        if !self.mode(MODE_ALTERNATE_SCREEN) {
+            return None;
+        }
+        self.grid
+            .absolute_row(self.grid.scrollback_len() + usize::from(row))
+            .map(crate::capture::RowContents)
+    }
+
     /// Returns whether the text in row `row` should wrap to the next line.
     #[must_use]
     pub fn row_wrapped(&self, row: u16) -> bool {

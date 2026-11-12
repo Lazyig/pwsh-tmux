@@ -115,6 +115,20 @@ pub fn canonical(name: &str) -> Option<&'static str> {
     if m.len() == 1 { Some(m[0].0) } else { None }
 }
 
+/// The command given to spawn_pane for a pane without a process (-E, or an empty command).
+pub const EMPTY_PANE: &str = "\u{1}empty-pane";
+
+/// The command for a new pane: -E (or a single empty argument, or `input` for split-window
+/// -I) makes an empty pane, which can't also be given a command.
+fn spawn_command(o: &Opts, input: bool) -> Result<Vec<String>, String> {
+    let empty_arg = matches!(o.rest.as_slice(), [one] if one.is_empty());
+    let empty = o.has('E') || input || empty_arg;
+    if empty && !o.rest.is_empty() && !empty_arg {
+        return err("command cannot be given for empty pane");
+    }
+    Ok(if empty { vec![EMPTY_PANE.to_string()] } else { o.rest.clone() })
+}
+
 fn err<T>(s: impl Into<String>) -> Result<T, String> {
     Err(s.into())
 }
@@ -1272,6 +1286,7 @@ impl Server {
             }
             // ---------------------------------------------------------------- windows
             "new-window" => {
+                let command = spawn_command(&o, false)?;
                 let (sid, base_idx) = match t {
                     Some(tt) if tt.contains(':') => {
                         let (s, w) = tt.split_once(':').unwrap();
@@ -1320,9 +1335,10 @@ impl Server {
                 let status = self.status_lines(Some(sid));
                 let (sx, sy) = (s.cols.max(1), s.rows.saturating_sub(status).max(1));
                 let cwd = o.get('c').map(|c| self.expand(self.current(ctx), ctx.client, c)).or_else(|| Some(s.cwd.clone()));
-                let pane = self.spawn_pane(Some(sid), sx, sy, &o.rest, cwd.as_deref(), &env)?;
+                let pane = self.spawn_pane(Some(sid), sx, sy, &command, cwd.as_deref(), &env)?;
                 let name = o.get('n').map(|n| self.expand(self.current(ctx), ctx.client, n));
-                let wname = name.clone().unwrap_or_else(|| self.window_name_for(&o.rest, Some(sid)));
+                let named = if command[0] == EMPTY_PANE { &[][..] } else { &command[..] };
+                let wname = name.clone().unwrap_or_else(|| self.window_name_for(named, Some(sid)));
                 let wid = self.new_window_obj(wname, pane, sx, sy);
                 if name.is_some() {
                     self.windows.get_mut(&wid).unwrap().options.set("automatic-rename", "off".into());
@@ -1555,6 +1571,7 @@ impl Server {
                 }
             }
             "respawn-window" | "respawn-pane" => {
+                let requested = spawn_command(&o, false)?;
                 let tt = if cmd == "respawn-window" { self.resolve_window(ctx, t)? } else { self.resolve_pane(ctx, t)? };
                 let wid = tt.wid.unwrap();
                 let pane = if cmd == "respawn-window" {
@@ -1562,8 +1579,10 @@ impl Server {
                     let w = &self.windows[&wid];
                     let keep = w.active;
                     let alive: Vec<PaneId> = w.panes().into_iter().filter(|p| *p != keep).collect();
-                    if !o.has('k') && w.panes().iter().any(|p| self.panes.get(p).is_some_and(|x| x.dead.is_none())) {
-                        return err(format!("window still active: {}", w.name));
+                    // a pane is active while it has a process (empty panes have none)
+                    if !o.has('k') && w.panes().iter().any(|p| self.panes.get(p).is_some_and(|x| x.dead.is_none() && x.pid.is_some())) {
+                        let sname = tt.sid.and_then(|s| self.sessions.get(&s)).map(|s| s.name.clone()).unwrap_or_default();
+                        return err(format!("respawn window failed: window {sname}:{} still active", tt.idx.unwrap_or(0)));
                     }
                     for p in alive {
                         self.destroy_pane(p);
@@ -1576,15 +1595,17 @@ impl Server {
                 } else {
                     tt.pane.unwrap()
                 };
+                let index = self.windows[&wid].panes().iter().position(|x| *x == pane).unwrap_or(0) as i64 + self.opt_window_num(Some(wid), "pane-base-index");
+                let sname = tt.sid.and_then(|s| self.sessions.get(&s)).map(|s| s.name.clone()).unwrap_or_default();
                 let p = self.panes.get_mut(&pane).ok_or("no pane")?;
-                if p.dead.is_none() && !o.has('k') {
-                    return err(format!("pane still active: %{pane}"));
+                if p.dead.is_none() && p.pid.is_some() && !o.has('k') {
+                    return err(format!("respawn pane failed: pane {sname}:{}.{index} still active", tt.idx.unwrap_or(0)));
                 }
                 p.kill();
                 let generation = p.generation + 1;
                 let size = p.size;
                 let cwd = o.get('c').map(String::from).unwrap_or_else(|| p.start_path.clone());
-                let cmdv = if o.rest.is_empty() && !p.start_cmd.is_empty() { vec![p.start_cmd.clone()] } else { o.rest.clone() };
+                let cmdv = if o.rest.is_empty() && !p.start_cmd.is_empty() && !o.has('E') { vec![p.start_cmd.clone()] } else { requested };
                 self.spawn_into(pane, generation, tt.sid, size.0, size.1, &cmdv, Some(&cwd), &env)?;
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
@@ -1723,7 +1744,8 @@ impl Server {
                     None => None,
                 };
                 let cwd = o.get('c').map(|c| self.expand(tt, ctx.client, c));
-                let new = self.split_pane(tt, o.has('h'), o.has('b'), size, o.has('f'), cwd, &o.rest, &env)?;
+                let command = spawn_command(&o, o.has('I'))?;
+                let new = self.split_pane(tt, o.has('h'), o.has('b'), size, o.has('f'), cwd, &command, &env)?;
                 let wid = tt.wid.unwrap();
                 if !o.has('d') {
                     self.select_pane(wid, new);
@@ -2115,40 +2137,87 @@ impl Server {
                 let tt = self.resolve_pane(ctx, t)?;
                 let p = self.panes.get(&tt.pane.unwrap()).ok_or("no pane")?;
                 let screen = p.screen();
-                // only the requested rows are read; plain text skips per-cell conversion
-                let total = screen.history_rows_len() as i64;
-                let hist = screen.scrollback_len() as i64;
-                let rows = p.size.1 as i64;
-                let parse = |v: Option<&str>, default: i64| -> i64 {
-                    match v {
-                        Some("-") => i64::MIN,
-                        Some(s) => s.parse().unwrap_or(default),
-                        None => default,
-                    }
-                };
-                let start = parse(o.get('S'), 0);
-                let end = parse(o.get('E'), rows - 1);
-                let to_abs = |v: i64| -> i64 { if v == i64::MIN { 0 } else { (hist + v).clamp(0, total - 1) } };
-                let (a, b) = (to_abs(start), if o.get('E') == Some("-") { total - 1 } else { to_abs(end) });
                 let mut out = String::new();
-                let mut i = a;
-                while i <= b {
-                    let (text, wrapped) = if o.has('e') || o.has('N') {
-                        let line = crate::cells::line_at(screen, i as usize);
-                        let text = if o.has('e') { render::line_with_escapes(&line) } else { line.cells.iter().map(|c| c.text.as_str()).collect() };
-                        (text, line.wrapped)
-                    } else {
-                        crate::cells::text_at(screen, i as usize)
-                    };
-                    out.push_str(&text);
-                    if !(o.has('J') && wrapped) {
-                        out.push('\n');
+                if o.has('R') {
+                    out = capture_grid(screen, self.opt_session_num(tt.sid, "history-limit").max(0) as usize);
+                } else if (o.has('P') && !o.has('H')) || (o.has('a') && !screen.alternate_screen()) {
+                    // -P: the start of an incomplete escape sequence; the parser keeps none to show
+                    if !o.has('P') && !o.has('q') {
+                        return err("no alternate screen");
                     }
-                    i += 1;
+                } else {
+                    let cols = p.size.0;
+                    let mode_lines = match (&p.mode, o.has('M')) {
+                        (Some(PaneMode::Copy(cm)), true) => Some(cm.render().0),
+                        _ => None,
+                    };
+                    // the rows to read: the mode's screen (-M), the normal screen saved under
+                    // the alternate screen (-a, no history) or the pane with its history
+                    let (total, hist) = if o.has('a') {
+                        (p.size.1 as i64, 0)
+                    } else if let Some(l) = &mode_lines {
+                        (l.len() as i64, 0)
+                    } else {
+                        (screen.history_rows_len() as i64, screen.scrollback_len() as i64)
+                    };
+                    let rows = total - hist;
+                    let parse = |v: Option<&str>, default: i64| -> i64 {
+                        match v {
+                            Some("-") => i64::MIN,
+                            Some(s) => s.parse().unwrap_or(default),
+                            None => default,
+                        }
+                    };
+                    let start = parse(o.get('S'), 0);
+                    let end = parse(o.get('E'), rows - 1);
+                    let to_abs = |v: i64| -> i64 { if v == i64::MIN { 0 } else { (hist + v).clamp(0, total - 1) } };
+                    let (mut a, mut b) = (to_abs(start), if o.get('E') == Some("-") { total - 1 } else { to_abs(end) });
+                    if b < a {
+                        std::mem::swap(&mut a, &mut b);
+                    }
+                    let line_at = |i: usize| -> crate::cells::Line {
+                        if let Some(l) = &mode_lines {
+                            return l.get(i).cloned().unwrap_or_default();
+                        }
+                        if o.has('a') {
+                            return screen.saved_row(i as u16).map(|r| row_line(&r, cols)).unwrap_or_default();
+                        }
+                        crate::cells::line_at(screen, i)
+                    };
+                    for i in a..=b {
+                        let (text, wrapped) = if o.has('H') {
+                            // hyperlinks (OSC 8) are not kept, so no line has any
+                            (String::new(), false)
+                        } else if o.has('e') || o.has('N') || o.has('C') || o.has('a') || mode_lines.is_some() {
+                            let line = line_at(i as usize);
+                            (capture_line(&line, o.has('e'), o.has('N') && !o.has('J'), o.has('T'), o.has('C')), line.wrapped)
+                        } else {
+                            crate::cells::text_at(screen, i as usize)
+                        };
+                        if o.has('H') && text.is_empty() {
+                            continue;
+                        }
+                        if o.has('L') {
+                            out.push_str(&format!("{} ", i - hist));
+                        }
+                        if o.has('I') {
+                            // when the line entered the history: not recorded here
+                            out.push_str("0 ");
+                        }
+                        if o.has('F') {
+                            out.push_str(if wrapped { "W " } else { "- " });
+                        }
+                        out.push_str(&text);
+                        if !(o.has('J') && wrapped) {
+                            out.push('\n');
+                        }
+                    }
                 }
                 if o.has('p') {
-                    ctx.out.push_str(&out);
-                } else {
+                    // like tmux: the last newline is replaced by one of its own
+                    ctx.out.push_str(out.strip_suffix('\n').unwrap_or(&out));
+                    ctx.out.push('\n');
+                } else if !out.is_empty() {
                     self.add_buffer(o.get('b').map(String::from), out.into_bytes(), false);
                 }
                 Ok(Flow::Next)
@@ -3498,6 +3567,87 @@ fn glob_files(path: &str) -> Vec<String> {
         .unwrap_or_default();
     v.sort();
     v
+}
+
+/// A history row as cells (see cells::line_at).
+fn row_line(row: &vt100::capture::RowContents, cols: u16) -> crate::cells::Line {
+    crate::cells::Line { cells: (0..cols).map(|c| row.cell(c).map(crate::cells::cell_from_vt).unwrap_or_default()).collect(), wrapped: row.wrapped() }
+}
+
+/// One captured line: -e adds attribute sequences, `keep` (-N) keeps trailing spaces (up to
+/// the last styled cell with -T), -C escapes backslashes and writes ESC as \033.
+fn capture_line(line: &crate::cells::Line, escapes: bool, keep: bool, trim_unused: bool, escape: bool) -> String {
+    let mut line = line.clone();
+    if escape {
+        for c in &mut line.cells {
+            if c.text == "\\" {
+                c.text = "\\\\".into();
+            }
+        }
+    }
+    if keep && trim_unused {
+        while line.cells.last().is_some_and(|c| c.text == " " && c.style == crate::cells::Style::default()) {
+            line.cells.pop();
+        }
+    }
+    let text = if escapes {
+        render::line_with_escapes(&line)
+    } else {
+        line.cells.iter().map(|c| c.text.as_str()).collect::<String>()
+    };
+    let text = if escape { text.replace('\x1b', "\\033") } else { text };
+    if keep || escapes { text } else { text.trim_end_matches(' ').to_string() }
+}
+
+/// capture-pane -R: a dump of the pane's grid in the shape of tmux's (sizes, then each line
+/// and cell with its flags, attributes and colours).
+fn capture_grid(screen: &vt100::Screen, limit: usize) -> String {
+    use std::fmt::Write as _;
+    let (sy, sx) = (screen.size().0.get(), screen.size().1.get());
+    let hsize = screen.scrollback_len();
+    let mut out = format!("G {sx}x{sy} ({hsize}/{limit})\n");
+    let colour = |c: vt100::Color| -> (String, u32) {
+        const NAMES: [&str; 8] = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
+        match c {
+            vt100::Color::Default => ("default".into(), 8),
+            vt100::Color::Idx(n) if n < 8 => (NAMES[n as usize].into(), n as u32),
+            vt100::Color::Idx(n) if n < 16 => (format!("bright{}", NAMES[n as usize - 8]), 90 + n as u32 - 8),
+            vt100::Color::Idx(n) => (format!("colour{n}"), 0x0100_0000 | n as u32),
+            vt100::Color::Rgb(r, g, b) => (format!("#{r:02x}{g:02x}{b:02x}"), 0x0200_0000 | (r as u32) << 16 | (g as u32) << 8 | b as u32),
+        }
+    };
+    let names = |v: u32, table: &[(u32, &str)]| -> String {
+        let s: Vec<&str> = table.iter().filter(|(m, _)| v & m != 0).map(|(_, n)| *n).collect();
+        if s.is_empty() { "NONE".into() } else { s.join(",") }
+    };
+    for yy in 0..screen.history_rows_len() {
+        let Some(row) = screen.history_row(yy) else { continue };
+        let p = if yy < hsize { "-".to_string() } else { (yy - hsize).to_string() };
+        let cells: Vec<Option<&vt100::Cell>> = (0..sx).map(|x| row.cell(x)).collect();
+        let used = cells.iter().rposition(|c| c.is_some_and(|c| c.has_contents())).map_or(0, |i| i + 1);
+        let lflags = row.wrapped() as u32;
+        let _ = writeln!(out, "\tL {yy} ({p}) flags={}[{lflags:x}] {used}/{}", names(lflags, &[(1, "WRAPPED")]), cells.len());
+        for (xx, c) in cells.iter().enumerate() {
+            let (data, width, padding) = match c {
+                Some(c) if c.is_wide_continuation() => (String::new(), 0, true),
+                Some(c) if c.has_contents() => (c.contents().to_string(), if c.is_wide() { 2 } else { 1 }, false),
+                _ => (" ".to_string(), 1, false),
+            };
+            let (fg, fgv) = colour(c.map_or(vt100::Color::Default, |c| c.fgcolor()));
+            let (bg, bgv) = colour(c.map_or(vt100::Color::Default, |c| c.bgcolor()));
+            let attr = c.map_or(0, |c| c.bold() as u32 | (c.dim() as u32) << 1 | (c.underline() as u32) << 2 | (c.inverse() as u32) << 4 | (c.italic() as u32) << 6);
+            let flags = (fgv & 0x0100_0000 != 0) as u32 | ((bgv & 0x0100_0000 != 0) as u32) << 1 | (padding as u32) << 2;
+            let escaped = String::from_utf8_lossy(&vis::strvis(data.as_bytes(), vis::OCTAL | vis::CSTYLE | vis::TAB | vis::NL)).into_owned();
+            let _ = writeln!(
+                out,
+                "\t\tC {yy},{xx} data=({width},{},{escaped}) flags={}[{flags:x}] attr={}[{attr:x}] fg={fg}[{fgv:x}] bg={bg}[{bgv:x}] us=default[8] link=NONE linkid=NONE",
+                data.len(),
+                names(flags, &[(1, "FG256"), (2, "BG256"), (4, "PADDING")]),
+                names(attr, &[(1, "BRIGHT"), (2, "DIM"), (4, "UNDERSCORE"), (0x10, "REVERSE"), (0x40, "ITALICS")]),
+            );
+        }
+    }
+    out
 }
 
 pub const VAR_NAMES: &[&str] = &[

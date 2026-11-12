@@ -1618,6 +1618,9 @@ impl Server {
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_into(&mut self, id: PaneId, generation: u32, sid: Option<SessId>, cols: u16, rows: u16, cmd: &[String], cwd: Option<&str>, extra_env: &[(String, String)]) -> Result<(), String> {
         let (cols, rows) = (cols.max(1), rows.max(1));
+        // an empty pane (new-window -E and friends) gets a terminal but no process
+        let empty = matches!(cmd, [one] if one == cmds::EMPTY_PANE);
+        let cmd: &[String] = if empty { &[] } else { cmd };
         let shell = self.opt_session(sid, "default-shell");
         let shell = if shell.is_empty() { procinfo::default_shell() } else { shell };
         let default_cmd = self.opt_session(sid, "default-command");
@@ -1663,12 +1666,12 @@ impl Server {
         for (k, v) in extra_env {
             cb.env(k, v);
         }
-        let mut child = pair.slave.spawn_command(cb).map_err(|e| format!("create pane failed: {} ({e})", argv[0]))?;
+        let child = if empty { None } else { Some(pair.slave.spawn_command(cb).map_err(|e| format!("create pane failed: {} ({e})", argv[0]))?) };
         drop(pair.slave);
-        let pid = child.process_id();
+        let pid = child.as_ref().and_then(|c| c.process_id());
         let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
         let mut writer = pair.master.take_writer().map_err(|e| e.to_string())?;
-        let killer = child.clone_killer();
+        let killer = child.as_ref().map(|c| c.clone_killer());
 
         let tx = self.tx.clone();
         thread::spawn(move || {
@@ -1684,11 +1687,13 @@ impl Server {
                 }
             }
         });
-        let tx = self.tx.clone();
-        thread::spawn(move || {
-            let status = child.wait().ok().map(|s| s.exit_code() as i32);
-            let _ = tx.send(Event::PaneExit(id, generation, status));
-        });
+        if let Some(mut child) = child {
+            let tx = self.tx.clone();
+            thread::spawn(move || {
+                let status = child.wait().ok().map(|s| s.exit_code() as i32);
+                let _ = tx.send(Event::PaneExit(id, generation, status));
+            });
+        }
         let (itx, irx) = mpsc::channel::<Vec<u8>>();
         thread::spawn(move || {
             for data in irx {
@@ -1710,7 +1715,7 @@ impl Server {
                 parser: vt100::Parser::new_with_callbacks(nz(rows), nz(cols), history, PaneCb::default()),
                 input: itx,
                 master: pair.master,
-                killer: Some(killer),
+                killer,
                 size: (cols, rows),
                 pid,
                 start_cmd,
