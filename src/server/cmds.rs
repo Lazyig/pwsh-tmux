@@ -1649,7 +1649,8 @@ impl Server {
                 for (i, p) in order.iter().enumerate() { w.layout.replace(*p, PaneId::MAX - i as u32); }
                 for (i, p) in rotated.iter().enumerate() { w.layout.replace(PaneId::MAX - i as u32, *p); }
                 w.pane_order = rotated;
-                w.zoomed = false;
+                // -Z keeps a zoomed window zoomed
+                w.zoomed = w.zoomed && o.has('Z');
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
                 Ok(Flow::Next)
@@ -2489,6 +2490,8 @@ impl Server {
                 let cid = self.resolve_client(ctx, t)?;
                 let tt = self.current(&Ctx { client: Some(cid), ..ctx.clone() });
                 let template = o.rest.first().cloned().unwrap_or_else(|| "%1".into());
+                // -F: the template is a format, expanded now
+                let template = if o.has('F') { self.expand(tt, Some(cid), &template) } else { template };
                 // -l: one prompt and input taken literally, not split at commas
                 let split = |v: &str| -> Vec<String> { if o.has('l') { vec![v.to_string()] } else { v.split(',').map(String::from).collect() } };
                 let labels: Vec<String> = match o.get('p') {
@@ -2513,11 +2516,26 @@ impl Server {
                 let cid = self.resolve_client(ctx, t)?;
                 let command = o.rest.first().ok_or("confirm-before needs a command")?.clone();
                 let tt = self.current(&Ctx { client: Some(cid), ..ctx.clone() });
+                // -c: the confirming key (printable ASCII), -y: Enter confirms too
+                let key = match o.get('c') {
+                    Some(c) => match c.as_bytes() {
+                        [b] if (32..127).contains(b) => *b as char,
+                        _ => return err("invalid confirm key"),
+                    },
+                    None => 'y',
+                };
                 let label = match o.get('p') {
                     Some(p) => self.expand(tt, Some(cid), p),
-                    None => format!("Confirm '{}'? (y/n)", command),
+                    None => {
+                        // tmux names the first command, not the whole command line
+                        let name = cmdparse::parse(&command).ok().and_then(|c| c.first().and_then(|c| c.first()).cloned()).map(|n| canonical(&n).map(String::from).unwrap_or(n));
+                        format!("Confirm '{}'? ({key}/n)", name.unwrap_or_else(|| command.clone()))
+                    }
                 };
                 self.open_prompt(cid, PromptKind::Confirm, vec![(label, String::new())], command, ctx.pane, false, true);
+                if let Some(pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
+                    pr.confirm = (key, o.has('y'));
+                }
                 Ok(Flow::Next)
             }
             "display-message" => {
@@ -3627,7 +3645,7 @@ impl Server {
         let input: Vec<char> = init.chars().collect();
         let cursor = input.len();
         if let Some(c) = self.clients.get_mut(&cid) {
-            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false });
+            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false, confirm: ('y', false) });
             c.dirty = true;
         }
     }

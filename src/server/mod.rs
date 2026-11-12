@@ -365,6 +365,8 @@ pub struct Prompt {
     pub copy_incremental: Option<(PaneId, bool)>,
     /// command-prompt -e: backspace on an empty prompt closes it.
     pub bspace_exit: bool,
+    /// confirm-before: the key that confirms (-c) and whether Enter does too (-y).
+    pub confirm: (char, bool),
 }
 
 pub enum Overlay {

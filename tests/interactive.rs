@@ -355,4 +355,16 @@ fn current_target_sorted_switch_and_prompt_flags() {
     wait_for("-e prompt", || t.row(29).starts_with("exits"));
     t.send(b"\x7f");
     wait_for("-e closes", || !t.row(29).starts_with("exits"));
+    // confirm-before -c sets the key, -y makes Enter confirm; the prompt names the command
+    ctx.ok(&["bind-key", "-n", "F12", "confirm-before", "-y", "-c", "x", "set -g @conf yes"]);
+    t.send(b"\x1b[24~");
+    t.wait_screen("confirm prompt", |s| s.contains("Confirm 'set-option'? (x/n)"));
+    t.send(b"\r");
+    wait_for("-y confirms", || ctx.ok(&["show-options", "-gqv", "@conf"]).trim() == "yes");
+    ctx.ok(&["bind-key", "-n", "F12", "confirm-before", "-c", "x", "set -g @conf2 yes"]);
+    t.send(b"\x1b[24~");
+    t.wait_screen("confirm prompt", |s| s.contains("(x/n)"));
+    t.send(b"y");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(ctx.ok(&["show-options", "-gqv", "@conf2"]).trim().is_empty());
 }
