@@ -335,8 +335,8 @@ fn compatible_layout_history_and_pane_indices() {
     ctx.ok(&["select-layout", "-o", "-t", "s"]);
     assert_eq!(ctx.fmt("s", "#{window_layout}"), spread);
     ctx.ok(&["select-layout", "-o", "-t", "s"]);
-    // Restoring a layout string assigns panes in list order, like tmux.
-    assert_eq!(ctx.fmt("s:0.2", "#{pane_left} #{pane_width}"), "41 80");
+    // Restoring a JSON layout puts each pane back in the cell of its index (tmux 3.8).
+    assert_eq!(ctx.fmt("s:0.0", "#{pane_left} #{pane_width}"), "41 80");
     ctx.ok(&["select-layout", "-t", "s", "even-horiz"]);
     ctx.fails(&["select-layout", "-t", "s", "even-"]);
 }

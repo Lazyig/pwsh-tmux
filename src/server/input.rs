@@ -345,6 +345,20 @@ impl Server {
             None => {}
         }
         let Some(sid) = self.client_session(cid) else { return };
+        // a modal pane closes on Escape or C-c with -D; with -K it gets every key, the
+        // prefix included, unless it is in a mode (tmux server_client_handle_key)
+        if let Some(pane) = self.client_active_pane(cid) {
+            let fl = self.panes.get(&pane).map_or(0, |p| p.fflags);
+            let modal = self.window_of(pane).is_some_and(|w| self.windows[&w].modal == Some(pane));
+            if modal && fl & super::float::CLOSE_ON_CANCEL != 0 && (name == "Escape" || name == "C-c") {
+                self.kill_pane(pane);
+                return;
+            }
+            if fl & super::float::CAPTURE_KEYS != 0 && self.panes.get(&pane).is_some_and(|p| p.mode.is_none() && p.dead.is_none()) {
+                self.send_key_to_pane(cid, pane, &k, raw);
+                return;
+            }
+        }
         let mut table = self.clients[&cid].key_table.clone();
         let repeating = self.clients[&cid].repeat_until.is_some_and(|d| d > Instant::now());
         if table == "root" {

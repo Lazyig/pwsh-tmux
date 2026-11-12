@@ -367,6 +367,164 @@ impl Server {
         (line, tags)
     }
 
+    /// Draw a pane's content (or its mode) with its top left at (x0, y0) of the window,
+    /// clipped to `clip` (window columns and rows on the client); sets the cursor and the
+    /// terminal modes for the active pane.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_pane_body(&self, f: &mut Frame, cid: ClientId, wid: WinId, id: PaneId, (x0, y0, w, h): (i32, i32, u16, u16), clip: (u16, u16), oy: u16, modes: &mut Modes, cursor: &mut Option<(u16, u16)>) {
+        let win = &self.windows[&wid];
+        let Some(p) = self.panes.get(&id) else { return };
+        let cw = clip.0;
+        // columns and rows of the pane that are on the client
+        let vis = |x: u16, y: u16| -> Option<(u16, u16)> {
+            let (ax, ay) = (x0 + x as i32, y0 + y as i32);
+            (ax >= 0 && ay >= 0 && ax < clip.0 as i32 && ay < clip.1 as i32).then_some((ax as u16, ay as u16))
+        };
+        let cr = Rect { x: x0.max(0) as u16, y: y0.max(0) as u16, w, h };
+        let is_active = id == win.active;
+        let pane_target = self.target_for_pane(id);
+        let pst = |name: &str| self.style_option(&self.opt_pane(id, name), Style::default(), pane_target, Some(cid)).unwrap_or_default();
+        let wstyle = pst(if is_active { "window-active-style" } else { "window-style" });
+        let wstyle = if is_active && wstyle == Style::default() { pst("window-style") } else { wstyle };
+        let mode_lines: Option<(Vec<Line>, Option<(u16, u16)>)> = match &p.mode {
+            Some(PaneMode::Copy(cm)) => {
+                let style = self.style_option(&self.opt_window(Some(wid), "mode-style"), Style::default(), pane_target, Some(cid)).unwrap_or_default();
+                let (lines, cur) = cm.render_with_style(style);
+                Some((lines, Some((cur.1, cur.0))))
+            }
+            Some(PaneMode::Tree(t)) => Some((t.render(self, w, h), None)),
+            Some(PaneMode::Clock) => Some((Vec::new(), None)),
+            None => None,
+        };
+        match &mode_lines {
+            Some((lines, _)) => {
+                for (y, line) in lines.iter().enumerate().take(h as usize) {
+                    for (x, cell) in line.cells.iter().enumerate().take(w as usize) {
+                        let mut cell = cell.clone();
+                        overlay_style(&mut cell.style, wstyle);
+                        if let Some((ax, ay)) = vis(x as u16, y as u16) {
+                            f.set(ax, oy + ay, cell);
+                        }
+                    }
+                }
+            }
+            None => {
+                let scr = p.screen();
+                for y in 0..h {
+                    for x in 0..w {
+                        let Some((ax, ay)) = vis(x, y) else { continue };
+                        let Some(vc) = scr.cell(y, x) else {
+                            f.set(ax, oy + ay, Cell { text: " ".into(), style: wstyle });
+                            continue;
+                        };
+                        let mut cell = crate::cells::cell_from_vt(vc);
+                        if vc.is_wide() && (x + 1 >= w || ax + 1 >= cw) {
+                            cell.text = " ".into();
+                        }
+                        overlay_style(&mut cell.style, wstyle);
+                        f.set(ax, oy + ay, cell);
+                    }
+                }
+            }
+        }
+        if matches!(p.mode, Some(PaneMode::Clock)) {
+            let colour = format::parse_color(&self.opt_window(Some(wid), "clock-mode-colour")).unwrap_or(Color::Idx(4));
+            let text = clock_text(self.opt_window(Some(wid), "clock-mode-style") != "12");
+            let rr = Rect { y: oy + cr.y, h: cr.h.saturating_sub(1), ..cr };
+            if cr.h < 6 || !big_text(f, rr, &text, colour) {
+                f.text(cr.x, oy + cr.y + cr.h / 2, &text, Style { fg: colour, ..Style::default() }, cr.x + cr.w);
+            }
+        }
+        if is_active {
+            match &mode_lines {
+                Some((_, Some((cx, cy)))) => {
+                    if *cx < w && *cy < h {
+                        *cursor = vis(*cx, *cy).map(|(x, y)| (x, oy + y));
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    let scr = p.screen();
+                    modes.app_cursor = scr.application_cursor();
+                    modes.bracketed_paste = scr.bracketed_paste();
+                    modes.cursor_style = scr.cursor_style() as u8;
+                    if !scr.hide_cursor() {
+                        let (cy, cx) = scr.cursor_position();
+                        if cx < w && cy < h {
+                            *cursor = vis(cx, cy).map(|(x, y)| (x, oy + y));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Draw the floating panes above the tiled ones, back to front: border lines (the pane's
+    /// own pane-border-lines, -style and -status), the title on the border and the content.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_floats(&self, f: &mut Frame, cid: ClientId, wid: WinId, clip: (u16, u16), oy: u16, modes: &mut Modes, cursor: &mut Option<(u16, u16)>) {
+        let win = &self.windows[&wid];
+        let floats = self.float_rects(wid);
+        if floats.is_empty() {
+            return;
+        }
+        // a floating pane above the active pane's cursor hides it
+        if let Some((cx, cy)) = *cursor {
+            let (wx, wy) = (cx as i32, cy as i32 - oy as i32);
+            if floats.iter().any(|(p, _)| *p != win.active && self.float_contains(wid, *p, wx, wy)) && !win.is_floating(win.active) {
+                *cursor = None;
+            }
+        }
+        for (id, g) in floats {
+            if win.is_floating(win.active) && id == win.active {
+                *cursor = None;
+            }
+            let t = self.target_for_pane(id);
+            let lines = self.pane_lines(wid, id);
+            let active = id == win.active;
+            let base = self.style_option(&self.opt_pane(id, "pane-border-style"), Style::default(), t, Some(cid)).unwrap_or_default();
+            let st = if active { self.style_option(&self.opt_pane(id, "pane-active-border-style"), base, t, Some(cid)).unwrap_or(base) } else { base };
+            let st = if self.marked == Some(id) { Style { attrs: st.attrs | INVERSE, ..st } } else { st };
+            let put = |f: &mut Frame, x: i32, y: i32, text: &str| {
+                if x >= 0 && y >= 0 && x < clip.0 as i32 && y < clip.1 as i32 {
+                    f.set(x as u16, oy + y as u16, Cell { text: text.into(), style: st });
+                }
+            };
+            if lines != "none" {
+                let set: [&str; 6] = match lines.as_str() {
+                    "double" => ["═", "║", "╔", "╗", "╚", "╝"],
+                    "heavy" => ["━", "┃", "┏", "┓", "┗", "┛"],
+                    "simple" => ["-", "|", "+", "+", "+", "+"],
+                    "spaces" => [" "; 6],
+                    _ => ["─", "│", "┌", "┐", "└", "┘"],
+                };
+                let (l, r, top, bot) = (g.x - 1, g.x + g.w as i32, g.y - 1, g.y + g.h as i32);
+                for x in l..=r {
+                    let (tc, bc) = if x == l { (set[2], set[4]) } else if x == r { (set[3], set[5]) } else { (set[0], set[0]) };
+                    put(f, x, top, tc);
+                    put(f, x, bot, bc);
+                }
+                for y in g.y..bot {
+                    put(f, l, y, set[1]);
+                    put(f, r, y, set[1]);
+                }
+                let status = self.pane_status(wid, id);
+                if status != "off" {
+                    let by = if status == "top" { top } else { bot };
+                    let text = self.expand_for_pane(id, &self.opt_pane(id, "pane-border-format"));
+                    let cells = spans_cells(&format::spans(&text, st), g.w.saturating_sub(2) as usize, st);
+                    for (i, c) in cells.into_iter().enumerate() {
+                        let x = g.x + 2 + i as i32;
+                        if x >= 0 && by >= 0 && x < clip.0 as i32 && by < clip.1 as i32 && x < r {
+                            f.set(x as u16, oy + by as u16, c);
+                        }
+                    }
+                }
+            }
+            self.draw_pane_body(f, cid, wid, id, (g.x, g.y, g.w, g.h), clip, oy, modes, cursor);
+        }
+    }
+
     fn compose(&self, cid: ClientId) -> Option<RenderState> {
         let c = self.clients.get(&cid)?;
         let sid = c.session?;
@@ -384,7 +542,11 @@ impl Server {
         let mut modes = Modes { mouse: self.outer_mouse_mode(cid), focus: options::is_on(&self.opt_server("focus-events")), ..Modes::default() };
         let active_rect = rects.iter().find(|(p, _)| *p == win.active).map(|(_, r)| *r);
         let area_h = ch.saturating_sub(nstatus);
-        let border_status = self.opt_window(Some(wid), "pane-border-status");
+        // top-floating and bottom-floating show status lines on floating panes only
+        let border_status = match self.opt_window(Some(wid), "pane-border-status").as_str() {
+            s @ ("top" | "bottom") => s.to_string(),
+            _ => "off".to_string(),
+        };
         let active_target = self.target_for_pane(win.active);
         let active_border = self.style_option(&self.opt_window(Some(wid), "pane-active-border-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
         let inactive_border = self.style_option(&self.opt_window(Some(wid), "pane-border-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
@@ -393,78 +555,8 @@ impl Server {
 
         // panes
         for (id, r) in &rects {
-            let Some(p) = self.panes.get(id) else { continue };
             let cr = self.content_rect(wid, *r);
-            let is_active = *id == win.active;
-            let pane_target = self.target_for_pane(*id);
-            let pst = |name: &str| self.style_option(&self.opt_pane(*id, name), Style::default(), pane_target, Some(cid)).unwrap_or_default();
-            let wstyle = pst(if is_active { "window-active-style" } else { "window-style" });
-            let wstyle = if is_active && wstyle == Style::default() { pst("window-style") } else { wstyle };
-            let mode_lines: Option<(Vec<Line>, Option<(u16, u16)>)> = match &p.mode {
-                Some(PaneMode::Copy(cm)) => {
-                    let style = self.style_option(&self.opt_window(Some(wid), "mode-style"), Style::default(), pane_target, Some(cid)).unwrap_or_default();
-                    let (lines, cur) = cm.render_with_style(style);
-                    Some((lines, Some((cur.1, cur.0))))
-                }
-                Some(PaneMode::Tree(t)) => Some((t.render(self, cr.w, cr.h), None)),
-                Some(PaneMode::Clock) => Some((Vec::new(), None)),
-                None => None,
-            };
-            match &mode_lines {
-                Some((lines, _)) => {
-                    for (y, line) in lines.iter().enumerate().take(cr.h as usize) {
-                        for (x, cell) in line.cells.iter().enumerate().take(cr.w as usize) {
-                            let mut cell = cell.clone();
-                            overlay_style(&mut cell.style, wstyle);
-                            f.set(cr.x + x as u16, oy + cr.y + y as u16, cell);
-                        }
-                    }
-                }
-                None => {
-                    let scr = p.screen();
-                    for y in 0..cr.h {
-                        for x in 0..cr.w {
-                            let Some(vc) = scr.cell(y, x) else { continue };
-                            let mut cell = crate::cells::cell_from_vt(vc);
-                            if vc.is_wide() && (x + 1 >= cr.w || cr.x + x + 1 >= cw) {
-                                cell.text = " ".into();
-                            }
-                            overlay_style(&mut cell.style, wstyle);
-                            f.set(cr.x + x, oy + cr.y + y, cell);
-                        }
-                    }
-                }
-            }
-            if matches!(p.mode, Some(PaneMode::Clock)) {
-                let colour = format::parse_color(&self.opt_window(Some(wid), "clock-mode-colour")).unwrap_or(Color::Idx(4));
-                let text = clock_text(self.opt_window(Some(wid), "clock-mode-style") != "12");
-                let rr = Rect { y: oy + cr.y, h: cr.h.saturating_sub(1), ..cr };
-                if cr.h < 6 || !big_text(&mut f, rr, &text, colour) {
-                    f.text(cr.x, oy + cr.y + cr.h / 2, &text, Style { fg: colour, ..Style::default() }, cr.x + cr.w);
-                }
-            }
-            if is_active {
-                match &mode_lines {
-                    Some((_, Some((cx, cy)))) => {
-                        if *cx < cr.w && *cy < cr.h {
-                            cursor = Some((cr.x + cx, oy + cr.y + cy));
-                        }
-                    }
-                    Some(_) => {}
-                    None => {
-                        let scr = p.screen();
-                        modes.app_cursor = scr.application_cursor();
-                        modes.bracketed_paste = scr.bracketed_paste();
-                        modes.cursor_style = scr.cursor_style() as u8;
-                        if !scr.hide_cursor() {
-                            let (cy, cx) = scr.cursor_position();
-                            if cx < cr.w && cy < cr.h {
-                                cursor = Some((cr.x + cx, oy + cr.y + cy));
-                            }
-                        }
-                    }
-                }
-            }
+            self.draw_pane_body(&mut f, cid, wid, *id, (cr.x as i32, cr.y as i32, cr.w, cr.h), (cw, area_h), oy, &mut modes, &mut cursor);
         }
 
         // borders with junctions
@@ -558,6 +650,8 @@ impl Server {
                 }
             }
         }
+        // floating panes above the tiled ones
+        self.draw_floats(&mut f, cid, wid, (cw.min(win.sx), area_h.min(win.sy)), oy, &mut modes, &mut cursor);
         // area outside the window (client bigger than window)
         for y in 0..area_h {
             for x in 0..cw {

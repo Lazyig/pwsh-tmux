@@ -2376,6 +2376,7 @@ impl Server {
             if (w.sx, w.sy) != (sx, sy) {
                 w.sx = sx;
                 w.sy = sy;
+                self.clamp_floats(wid);
                 self.apply_layout(wid);
             }
         }

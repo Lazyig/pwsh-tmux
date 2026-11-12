@@ -196,6 +196,15 @@ impl Server {
                 }
             }
         };
+        // a press outside a modal pane closes it with new-pane -C
+        if matches!(ty, Type::Down | Type::Second | Type::Triple) {
+            if let Some(modal) = self.modal_outside(cid, x, y) {
+                if self.panes.get(&modal).is_some_and(|p| p.fflags & super::float::CLOSE_ON_CLICK != 0) {
+                    self.kill_pane(modal);
+                    return;
+                }
+            }
+        }
         let Some((wh, mut ctx)) = self.mouse_where(cid, x, y) else { return };
         ctx.x = m.x;
         ctx.y = m.y;
@@ -285,6 +294,19 @@ impl Server {
         let w = &self.windows[&wid];
         if x > w.sx || py > w.sy {
             return None;
+        }
+        // floating panes are above the tiled ones and their status lines; nothing outside a
+        // modal pane can be reached (tmux window_get_active_at)
+        match self.float_at(wid, x as i32, py as i32) {
+            Some(None) => return None,
+            Some(Some(p)) => {
+                ctx.pane = Some(p);
+                let g = w.layout.geom(p)?;
+                let (xi, yi) = (x as i32, py as i32);
+                let inside = xi >= g.x && xi < g.x + g.w as i32 && yi >= g.y && yi < g.y + g.h as i32;
+                return Some((if inside { Where::Pane } else { Where::Border }, ctx));
+            }
+            None => {}
         }
         let rects: Vec<(PaneId, Rect)> = self.rects(wid).0.into_iter().map(|(p, r)| (p, self.content_rect(wid, r))).collect();
         // window_get_active_at: the pane including its right and bottom border
@@ -398,9 +420,22 @@ impl Server {
         }
     }
 
+    /// The modal pane of the client's window when (x, y) of the client is outside it.
+    fn modal_outside(&self, cid: ClientId, x: u16, y: u16) -> Option<PaneId> {
+        let sid = self.client_session(cid)?;
+        let wid = self.sessions[&sid].active_window();
+        let modal = self.windows[&wid].modal?;
+        let nstatus = self.status_lines(Some(sid)).min(self.clients[&cid].size.1.saturating_sub(1));
+        let py = if self.opt_session(Some(sid), "status-position") == "top" { y.checked_sub(nstatus)? } else { y };
+        (!self.float_contains(wid, modal, x as i32, py as i32)).then_some(modal)
+    }
+
     /// Visible content rectangle of a pane in its window.
     pub fn pane_rect(&self, pane: PaneId) -> Option<Rect> {
         let wid = self.window_of(pane)?;
+        if let Some(g) = self.pane_geom(wid, pane).filter(|_| self.shown_floating(wid, pane)) {
+            return Some(Rect { x: g.x.max(0) as u16, y: g.y.max(0) as u16, w: g.w, h: g.h });
+        }
         let (rects, _) = self.rects(wid);
         rects.into_iter().find(|(p, _)| *p == pane).map(|(_, r)| self.content_rect(wid, r))
     }

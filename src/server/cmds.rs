@@ -1861,6 +1861,7 @@ impl Server {
                 if o.has('D') {
                     w.sy = w.sy.saturating_add(n).min(MAX_SIZE);
                 }
+                self.clamp_floats(wid);
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
                 Ok(Flow::Next)
