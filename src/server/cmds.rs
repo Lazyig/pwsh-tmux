@@ -1288,7 +1288,7 @@ impl Server {
                     let cids: Vec<ClientId> = self.clients.values().filter(|c| c.attached && c.session == Some(sid)).map(|c| c.id).collect();
                     let m = msg_for(self, Some(sid));
                     for c in cids {
-                        self.detach_client(c, &m);
+                        self.detach_client_exec(c, &m, o.get('E'));
                     }
                     return Ok(Flow::Next);
                 }
@@ -1299,11 +1299,11 @@ impl Server {
                     let cids: Vec<ClientId> = self.clients.values().filter(|c| c.attached && c.id != cid).map(|c| c.id).collect();
                     for c in cids {
                         let m = msg_for(self, self.client_session(c));
-                        self.detach_client(c, &m);
+                        self.detach_client_exec(c, &m, o.get('E'));
                     }
                 } else {
                     let m = if o.has('P') { "[detached and SIGHUP]".to_string() } else { m };
-                    self.detach_client(cid, &m);
+                    self.detach_client_exec(cid, &m, o.get('E'));
                 }
                 Ok(Flow::Next)
             }
@@ -3003,6 +3003,31 @@ impl Server {
                     let m = ctx.mouse.clone().ok_or("no mouse target")?;
                     let p = self.mouse_pane(&m).ok_or("no mouse target")?;
                     self.window_pane_mouse(p, ctx.client, &m);
+                    return Ok(Flow::Next);
+                }
+                if o.has('K') {
+                    // -K: the keys are handled as if the client (-c) typed them (prefix, key
+                    // tables, bindings); bindings run before the commands after send-keys
+                    let Ok(cid) = self.resolve_client(ctx, o.get('c')) else { return Ok(Flow::Next) };
+                    let app = self.panes.get(&pane).is_some_and(|p| p.screen().application_cursor());
+                    let mut list = Vec::new();
+                    for k in &o.rest {
+                        let k = if o.has('F') { self.expand(tt, ctx.client, k) } else { k.clone() };
+                        let text = if o.has('H') {
+                            let bytes = k.split_whitespace().map(|h| u8::from_str_radix(h, 16).map_err(|_| format!("invalid hex: {h}"))).collect::<Result<Vec<u8>, String>>()?;
+                            String::from_utf8_lossy(&bytes).into_owned()
+                        } else { k };
+                        match keys::parse_key_name(&text).filter(|_| !o.has('l') && !o.has('H')) {
+                            Some(key) => list.push(key),
+                            None => list.extend(text.chars().filter_map(|c| keys::parse_key_name(&c.to_string()))),
+                        }
+                    }
+                    let n: usize = o.get('N').and_then(|v| v.parse().ok()).unwrap_or(1);
+                    for _ in 0..n {
+                        for key in &list {
+                            self.handle_key(cid, key.clone(), keys::encode_key(key, app));
+                        }
+                    }
                     return Ok(Flow::Next);
                 }
                 if o.has('R') {

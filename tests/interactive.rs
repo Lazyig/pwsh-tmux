@@ -432,3 +432,26 @@ fn prompt_types_keep_separate_histories() {
     // commands run from the prompt are logged for its client
     assert!(ctx.ok(&["show-messages"]).contains(&format!("{client} command: set-option -g @typed typed")));
 }
+
+#[test]
+fn send_keys_as_typed_and_detach_exec() {
+    let ctx = Ctx::new("sendk");
+    let mut t = start(&ctx, "k");
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    ctx.ok(&["bind-key", "-n", "F9", "set", "-ga", "@order", "a"]);
+    // -K: through the client's key tables; the binding runs before the next command
+    ctx.ok(&["send-keys", "-K", "-c", &client, "F9", ";", "set", "-ga", "@order", "b"]);
+    assert_eq!(ctx.fmt("k", "#{@order}"), "ab");
+    // the prefix and a prefix binding
+    ctx.ok(&["send-keys", "-K", "-c", &client, "C-b", "c"]);
+    wait_for("new window", || ctx.fmt("k", "#{session_windows}") == "2");
+    // without a client there is nothing to type into
+    let ctx2 = Ctx::new("sendk-none");
+    ctx2.ok(&["new-session", "-d", "-s", "n"]);
+    ctx2.ok(&["send-keys", "-K", "-t", "n", "x"]);
+    // detach-client -E: the command replaces the client
+    ctx.ok(&["detach-client", "-t", &client, "-E", "echo EXEC-REPLACED-42"]);
+    t.wait_screen("exec output", |s| s.contains("EXEC-REPLACED-42"));
+    t.wait_exit();
+    assert_eq!(ctx.ok(&["list-clients"]), "");
+}

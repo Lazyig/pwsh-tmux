@@ -2231,6 +2231,13 @@ impl Server {
     }
 
     pub fn detach_client(&mut self, cid: ClientId, msg: &str) {
+        self.detach_client_exec(cid, msg, None);
+    }
+
+    /// detach_client; with `exec` (detach-client -E) the client runs that command with
+    /// the session's default-shell instead of printing the message.
+    pub fn detach_client_exec(&mut self, cid: ClientId, msg: &str, exec: Option<&str>) {
+        let shell = self.clients.get(&cid).and_then(|c| c.session).map(|s| self.opt_session(Some(s), "default-shell")).unwrap_or_default();
         let Some(c) = self.clients.get_mut(&cid) else { return };
         if !c.attached {
             return;
@@ -2238,7 +2245,10 @@ impl Server {
         let sid = c.session;
         c.attached = false;
         c.session = None;
-        c.send_exit(msg);
+        match exec.filter(|e| !e.is_empty() && c.control == 0) {
+            Some(cmd) => c.send(S_EXEC, format!("{cmd}\0{shell}").as_bytes()),
+            None => c.send_exit(msg),
+        }
         let readonly = c.is_readonly();
         if let Some(sid) = sid {
             self.update_session_size(sid);

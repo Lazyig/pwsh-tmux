@@ -291,7 +291,7 @@ impl Server {
         }
     }
 
-    fn handle_key(&mut self, cid: ClientId, k: Key, raw: Vec<u8>) {
+    pub(super) fn handle_key(&mut self, cid: ClientId, k: Key, raw: Vec<u8>) {
         let name = keys::key_name(&k);
         let Some(c) = self.clients.get(&cid) else { return };
         if c.is_readonly() && (c.prompt.is_some() || c.overlay.is_some()) { return; }
