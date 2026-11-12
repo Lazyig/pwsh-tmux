@@ -2,7 +2,6 @@
 
 use super::modes::{MenuAction, TreeAction};
 use super::*;
-use crate::copymode::Action;
 use crate::keys::{Input, Key, KeyCode};
 
 pub use super::mouse::MouseCtx;
@@ -15,17 +14,6 @@ const WINDOW_MENU: &str = r##"display-menu -T "#[align=centre]#{window_index}:#{
 const SESSION_MENU: &str = r##"display-menu -T "#[align=centre]#{session_name}" -t = -x M -y W Next n { switch-client -n } Previous p { switch-client -p } '' Renumber N { move-window -r } Rename n { command-prompt -I "#S" { rename-session "%%" } } '' "New Session" s { new-session } "New Window" w { new-window }"##;
 
 const IN_MODE: &str = "#{||:#{pane_in_mode},#{mouse_any_flag}}";
-
-/// Mouse bindings of the copy-mode and copy-mode-vi tables.
-const COPY_MODE_MOUSE: &[(&str, &str)] = &[
-    ("MouseDown1Pane", "select-pane"),
-    ("MouseDrag1Pane", "select-pane ; send-keys -X begin-selection"),
-    ("MouseDragEnd1Pane", "send-keys -X copy-pipe-and-cancel"),
-    ("WheelUpPane", "select-pane ; send-keys -X -N 5 scroll-up"),
-    ("WheelDownPane", "select-pane ; send-keys -X -N 5 scroll-down"),
-    ("DoubleClick1Pane", "select-pane ; send-keys -X select-word ; run-shell -d 0.3 ; send-keys -X copy-pipe-and-cancel"),
-    ("TripleClick1Pane", "select-pane ; send-keys -X select-line ; run-shell -d 0.3 ; send-keys -X copy-pipe-and-cancel"),
-];
 
 pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
     let mut t: BTreeMap<String, BTreeMap<String, Binding>> = BTreeMap::new();
@@ -116,9 +104,9 @@ pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
     let root: Vec<(&str, String)> = vec![
         ("MouseDown1Pane", "select-pane -t = ; send-keys -M".into()),
         ("MouseDown1Status", "switch-client -t =".into()),
-        ("MouseDown1ScrollbarUp", "copy-mode -u".into()),
-        ("MouseDown1ScrollbarDown", "copy-mode -d".into()),
-        ("MouseDrag1ScrollbarSlider", "copy-mode -S".into()),
+        ("MouseDown1ScrollbarUp", "if-shell -F -t = \"#{pane_in_mode}\" { send-keys -X page-up } { copy-mode -u }".into()),
+        ("MouseDown1ScrollbarDown", "if-shell -F -t = \"#{pane_in_mode}\" { send-keys -X page-down } { copy-mode -d }".into()),
+        ("MouseDrag1ScrollbarSlider", "if-shell -F -t = \"#{pane_in_mode}\" { send-keys -X scroll-to-mouse } { copy-mode -S }".into()),
         ("MouseDown2Pane", format!("select-pane -t = ; if-shell -F '{IN_MODE}' {{ send-keys -M }} {{ paste-buffer -p }}")),
         ("MouseDown3Pane", format!("if-shell -F -t = '#{{||:#{{mouse_any_flag}},#{{&&:#{{pane_in_mode}},#{{?#{{m/r:(copy|view)-mode,#{{pane_mode}}}},0,1}}}}}}' {{ select-pane -t = ; send-keys -M }} {{ {PANE_MENU} }}")),
         ("M-MouseDown3Pane", PANE_MENU.to_string()),
@@ -137,12 +125,10 @@ pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
     for (k, c) in &root {
         add("root", k, c, false, "");
     }
+    // the copy mode tables of tmux 3.8, run by the copy mode engine while unchanged
     for (table, vi) in [("copy-mode", false), ("copy-mode-vi", true)] {
         for (k, c) in CopyMode::default_bindings(vi) {
-            t.entry(table.to_string()).or_default().insert(k.to_string(), Binding { cmd: format!("send-keys -X {c}"), repeat: false, note: "default".into() });
-        }
-        for (k, c) in COPY_MODE_MOUSE {
-            t.entry(table.to_string()).or_default().insert(k.to_string(), Binding { cmd: c.to_string(), repeat: false, note: String::new() });
+            add(table, k, c, false, "");
         }
     }
     t
@@ -377,7 +363,7 @@ impl Server {
                         c.key_table = "root".into();
                     }
                     c.dirty = true;
-                    self.run_string(cid, &cmd, pane);
+                    self.run_binding(cid, &cmd, pane);
                     return;
                 }
                 None if table != "root" => {
@@ -437,9 +423,11 @@ impl Server {
         }
     }
 
-    /// A key for a pane that is in a mode (copy, tree, clock).
+    /// A key for a pane that is in a mode (copy, tree, clock). Read-only clients may use
+    /// copy mode (but not copy), not the other modes.
     pub fn mode_key(&mut self, pane: PaneId, cid: Option<ClientId>, name: &str) {
-        if self.client_is_readonly(cid) { return; }
+        let copy = matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(_)));
+        if self.client_is_readonly(cid) && !copy { return; }
         let Some(p) = self.panes.get_mut(&pane) else { return };
         match &mut p.mode {
             Some(PaneMode::Clock) => self.exit_mode(pane),
@@ -488,101 +476,8 @@ impl Server {
                     self.mark_window_dirty(wid);
                 }
             }
-            Some(PaneMode::Copy(_)) => {
-                let vi = self.opt_window(self.window_of(pane), "mode-keys") == "vi";
-                let table = if vi { "copy-mode-vi" } else { "copy-mode" };
-                let binding = self.bindings.get(table).and_then(|t| t.get(name)).map(|b| (b.cmd.clone(), b.note == "default"));
-                match binding {
-                    Some((cmd, false)) => {
-                        // user binding in the copy-mode table
-                        if let Some(c) = cid {
-                            self.run_string(c, &cmd, Some(pane));
-                        }
-                    }
-                    _ => {
-                        let action = match self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
-                            Some(PaneMode::Copy(cm)) => cm.key(name),
-                            _ => return,
-                        };
-                        self.copy_action(pane, cid, action, None);
-                    }
-                }
-            }
+            Some(PaneMode::Copy(_)) => self.copy_key(pane, cid, name),
             None => {}
-        }
-    }
-
-    pub fn copy_mode_command(&mut self, pane: PaneId, cid: Option<ClientId>, name: &str, args: &[String]) {
-        // copy-pipe without a command uses copy-command
-        let piped = name.starts_with("copy-pipe");
-        let pipe = if !piped {
-            None
-        } else if !args.is_empty() {
-            Some(args[0].clone())
-        } else {
-            Some(self.opt_server("copy-command")).filter(|c| !c.is_empty())
-        };
-        let run_args: Vec<String> = if piped && !args.is_empty() { args[1..].to_vec() } else { args.to_vec() };
-        let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) else {
-            if let Some(PaneMode::Tree(_)) = self.panes.get(&pane).and_then(|p| p.mode.as_ref()) {
-                // tree mode understands a few -X commands
-                let key = match name {
-                    "cursor-up" => "Up",
-                    "cursor-down" => "Down",
-                    "cancel" => "q",
-                    _ => "",
-                };
-                if !key.is_empty() {
-                    self.mode_key(pane, cid, key);
-                }
-            }
-            return;
-        };
-        let action = cm.run(name, &run_args);
-        self.copy_action(pane, cid, action, pipe);
-    }
-
-    fn copy_action(&mut self, pane: PaneId, cid: Option<ClientId>, action: Action, pipe: Option<String>) {
-        match action {
-            Action::None => {}
-            Action::Cancel => self.exit_mode(pane),
-            Action::Copy { text, cancel } => {
-                if let Some(cmd) = pipe {
-                    let mut c = procinfo::job_command(&cmd);
-                    c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-                    if let Ok(mut child) = c.spawn() {
-                        let data = text.clone();
-                        thread::spawn(move || {
-                            if let Some(mut si) = child.stdin.take() {
-                                let _ = si.write_all(data.as_bytes());
-                            }
-                            let _ = child.wait();
-                        });
-                    }
-                }
-                self.copy_text(text, cid);
-                if cancel {
-                    self.exit_mode(pane);
-                }
-            }
-            Action::Prompt { label, command } => {
-                if let Some(c) = cid {
-                    // the pane is the prompt's context target (a %id in the template would read as %N)
-                    let template = format!("send-keys -X {command} '%%'");
-                    self.open_prompt(c, PromptKind::Command, vec![(label, String::new())], template, Some(pane), false, false);
-                    if command.ends_with("-incremental") {
-                        if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
-                            cm.begin_incremental_search();
-                        }
-                        if let Some(pr) = self.clients.get_mut(&c).and_then(|c| c.prompt.as_mut()) {
-                            pr.copy_incremental = Some((pane, command.starts_with("search-forward")));
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(wid) = self.window_of(pane) {
-            self.mark_window_dirty(wid);
         }
     }
 

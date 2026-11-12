@@ -212,6 +212,9 @@ impl Server {
             c.mouse_drag_flag = 0;
             if let Some(Drag { kind: DragKind::Copy { pane } }) = c.drag.take() {
                 self.copy_drag_timers.remove(&pane);
+                if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
+                    cm.end_drag();
+                }
             }
             let key = format!("{mods}MouseDragEnd{button}{}", wh.name());
             self.mouse_key(cid, key, ctx);
@@ -339,7 +342,7 @@ impl Server {
                     c.key_table = default_table.clone();
                 }
                 c.dirty = true;
-                match crate::cmdparse::parse(&cmd) {
+                match super::copy::binding_commands(&cmd) {
                     Ok(cmds) => {
                         let qctx = Ctx { client: Some(cid), pane: fs_pane, mouse: Some(ctx), from_key: true, ..Ctx::default() };
                         self.run_queue(Queue { cmds: cmds.into(), ctx: qctx, soft: 0 });
@@ -817,7 +820,7 @@ fn is_word_separator(ws: &str, c: Option<&crate::cells::Cell>) -> bool {
 }
 
 /// The word around (x, y), following wrapped lines (format_grid_word).
-fn grid_word(get: impl Fn(usize) -> Option<Line>, rows: usize, mut x: usize, mut y: usize, ws: &str) -> Option<String> {
+pub(super) fn grid_word(get: impl Fn(usize) -> Option<Line>, rows: usize, mut x: usize, mut y: usize, ws: &str) -> Option<String> {
     let mut line = get(y)?;
     let mut found = false;
     loop {

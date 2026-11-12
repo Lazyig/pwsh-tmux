@@ -511,33 +511,8 @@ impl Vars for VarCtx<'_> {
             "alternate_on" => pane.map(|p| b(p.screen().alternate_screen())),
             "history_size" => pane.map(|p| p.screen().scrollback_len().to_string()),
             "history_limit" => pane.map(|p| p.screen().scrollback_capacity().to_string()),
-            "scroll_position" => pane.and_then(|p| match &p.mode {
-                Some(PaneMode::Copy(c)) => Some(c.scroll_offset().to_string()),
-                _ => None,
-            }),
-            "copy_cursor_x" | "copy_cursor_y" => pane.and_then(|p| match &p.mode {
-                Some(PaneMode::Copy(c)) => {
-                    let (y, x) = c.render().1;
-                    Some(if name == "copy_cursor_x" { x } else { y }.to_string())
-                }
-                _ => None,
-            }),
-            "selection_start_x" | "selection_start_y" | "selection_end_x" | "selection_end_y" => pane.and_then(|p| match &p.mode {
-                Some(PaneMode::Copy(c)) => c.selection_ends().map(|(s, e)| {
-                    match name {
-                        "selection_start_x" => s.0,
-                        "selection_start_y" => s.1,
-                        "selection_end_x" => e.0,
-                        _ => e.1,
-                    }
-                    .to_string()
-                }),
-                _ => None,
-            }),
-            "selection_present" => pane.and_then(|p| match &p.mode {
-                Some(PaneMode::Copy(c)) => Some(b(c.selection_active())),
-                _ => None,
-            }),
+            // copy mode (window_copy_formats)
+            _ if super::copy::is_copy_var(name) => t.pane.and_then(|p| self.srv.copy_var(p, name)),
             "mouse_x" | "mouse_y" | "mouse_word" | "mouse_line" | "mouse_hyperlink" | "mouse_status_line" | "mouse_status_range" | "mouse_pane" => {
                 self.srv.mouse_var(name, self.client)
             }

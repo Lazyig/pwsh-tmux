@@ -6,6 +6,7 @@
 
 mod cmds;
 mod control;
+mod copy;
 pub mod features;
 mod input;
 mod modes;
@@ -1583,6 +1584,7 @@ impl Server {
         }
         let vi = self.opt_window(self.window_of(pane), "mode-keys") == "vi";
         let mut cm = CopyMode::new(lines, w, h, (0, 0), vi);
+        cm.set_view_mode();
         // Start at the top of the output.
         cm.run("history-top", &[]);
         if let Some(p) = self.panes.get_mut(&pane) {
@@ -1608,6 +1610,9 @@ impl Server {
             }
         }
         for d in self.animation_deadlines.borrow().values() {
+            t = t.min(d.saturating_duration_since(now));
+        }
+        if let Some(d) = self.copy_refresh_deadline() {
             t = t.min(d.saturating_duration_since(now));
         }
         t.max(Duration::from_millis(5))
@@ -1648,6 +1653,7 @@ impl Server {
         if !self.copy_drag_timers.is_empty() {
             self.copy_drag_timers_due(now);
         }
+        self.copy_refresh_timers(now);
         if self.delayed.iter().any(|(d, _)| *d <= now) {
             let (due, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.delayed).into_iter().partition(|(d, _)| *d <= now);
             self.delayed = rest;

@@ -24,9 +24,9 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("clear-history", "clearhist", "H", "t"),
     ("clear-prompt-history", "clearphist", "", "T"),
     ("clock-mode", "", "", "t"),
-    ("command-prompt", "", "1bCeFkilN", "IpTt"),
+    ("command-prompt", "", "1bCeFkilNP", "IpTt"),
     ("confirm-before", "confirm", "by", "cpt"),
-    ("copy-mode", "", "deHMqSu", "st"),
+    ("copy-mode", "", "dekHMqSu", "st"),
     ("customize-mode", "", "NZy", "Fft"),
     ("delete-buffer", "deleteb", "", "b"),
     ("detach-client", "detach", "aP", "Esct"),
@@ -953,20 +953,26 @@ impl Server {
         Ok(new)
     }
 
-    pub fn enter_copy_mode(&mut self, pane: PaneId) {
+    /// copy-mode -s: the content comes from `source`, shown in `pane`.
+    pub fn enter_copy_mode_from(&mut self, pane: PaneId, source: PaneId) {
         let Some(p) = self.panes.get(&pane) else { return };
         if matches!(p.mode, Some(PaneMode::Copy(_))) {
             return;
         }
-        let lines = p.snapshot();
         let (w, h) = p.size;
-        let (cy, cx) = p.screen().cursor_position();
+        let Some(src) = self.panes.get(&source) else { return };
+        let lines = src.snapshot();
+        let (cy, cx) = src.screen().cursor_position();
         let wid = self.window_of(pane);
         let vi = self.opt_window(wid, "mode-keys") == "vi";
         let sid = self.session_of_pane(pane).map(|x| x.0);
         let mut cm = CopyMode::new(lines, w, h, (cy, cx), vi);
         cm.set_word_separators(&self.opt_session(sid, "word-separators"));
-        self.panes.get_mut(&pane).unwrap().mode = Some(PaneMode::Copy(Box::new(cm)));
+        cm.from_other = source != pane;
+        cm.set_line_number_option(crate::copymode::LineNumbers::parse(&self.opt_window(wid, "copy-mode-line-numbers")));
+        let p = self.panes.get_mut(&pane).unwrap();
+        p.mode = Some(PaneMode::Copy(Box::new(cm)));
+        p.track.unseen_changes = false;
         if let Some(wid) = wid {
             self.mark_window_dirty(wid);
         }
@@ -981,7 +987,13 @@ impl Server {
                 }
             }
             p.track.unseen_changes = false;
+            // copy-mode -k: the pane goes with the mode
+            let kill = matches!(&p.mode, Some(PaneMode::Copy(cm)) if cm.kill);
             p.mode = None;
+            if kill {
+                self.kill_pane(pane);
+                return;
+            }
         }
         if let Some(wid) = self.window_of(pane) {
             self.mark_window_dirty(wid);
@@ -1106,6 +1118,8 @@ impl Server {
                 && self.resolve_client(ctx, o.get('t').or(o.get('c')))? == own,
             "refresh-client" => self.resolve_client(ctx, o.get('t'))? == own,
             "capture-pane" => o.has('p'),
+            // copy mode works for read-only clients, its commands check themselves
+            "send-keys" => o.has('X'),
             "display-message" => (o.has('p') || o.has('a')) && !o.has('I'),
             "server-access" => o.has('l') && !['a', 'd', 'r', 'w'].into_iter().any(|f| o.has(f)),
             _ => true,
@@ -2302,7 +2316,10 @@ impl Server {
                 } else {
                     let cols = p.size.0;
                     let mode_lines = match (&p.mode, o.has('M')) {
-                        (Some(PaneMode::Copy(cm)), true) => Some(cm.render().0),
+                        (Some(PaneMode::Copy(cm)), true) => {
+                            let st = crate::copymode::RenderStyle { no_selection: true, ..self.copy_render_style(p.id, ctx.client) };
+                            Some(cm.render_with(&st).0)
+                        }
                         _ => None,
                     };
                     // the rows to read: the mode's screen (-M), the normal screen saved under
@@ -2462,30 +2479,41 @@ impl Server {
                     }
                     pane = p;
                 }
+                // -s: copy from another pane
+                let source = match o.get('s') {
+                    Some(s) => self.resolve_pane(ctx, Some(s))?.pane.unwrap_or(pane),
+                    None => pane,
+                };
+                // entered with the mouse, line numbers stay off
+                let line_numbers = ctx.mouse.is_none();
                 let already = matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(_)));
                 if !already {
-                    self.enter_copy_mode(pane);
+                    self.enter_copy_mode_from(pane, source);
                     if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
                         cm.set_exit_on_bottom(o.has('e'));
-                        if o.has('H') {
-                            cm.set_show_position(false);
-                        }
+                        cm.set_show_position(!o.has('H'));
+                        cm.kill = o.has('k');
+                        cm.set_line_numbers(line_numbers);
                     }
                     if o.has('M') {
                         if let (Some(cid), Some(m)) = (ctx.client, ctx.mouse.clone()) {
                             self.start_copy_drag(cid, &m);
                         }
                     }
+                } else if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
+                    cm.set_line_numbers(line_numbers);
                 }
                 if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
                     if o.has('u') {
-                        cm.run("page-up", &[]);
+                        cm.page_up_once();
                     }
-                    if o.has('d') {
-                        let exit = o.has('e');
-                        if cm.page_down_exit(exit) {
-                            self.exit_mode(pane);
-                        }
+                    if o.has('d') && cm.page_down_exit(o.has('e')) {
+                        self.exit_mode(pane);
+                    }
+                }
+                if o.has('S') {
+                    if let (Some(_), Some(m)) = (ctx.client, ctx.mouse.clone()) {
+                        self.copy_scroll_to_mouse(pane, &m, o.has('e'));
                     }
                 }
                 if let Some(w) = tt.wid {
@@ -2660,6 +2688,11 @@ impl Server {
                     .or_else(|| self.resolve_client(ctx, None).ok()).or(ctx.client);
                 if o.has('a') && !o.has('j') {
                     let mut names: Vec<&str> = VAR_NAMES.to_vec();
+                    // a mode adds its own (window_copy_formats)
+                    if let Some(p) = tt.pane {
+                        let extra: Vec<&str> = super::copy::COPY_VARS.iter().copied().filter(|n| !names.contains(n) && self.copy_var(p, n).is_some()).collect();
+                        names.extend(extra);
+                    }
                     names.sort();
                     let vc = super::vars::VarCtx { srv: self, t: tt, client: cid, extra: HashMap::new() };
                     for n in names {
@@ -2862,10 +2895,30 @@ impl Server {
                     }
                     return Ok(Flow::Next);
                 }
+                // -N sets the repeat count of a mode (with -X, or with no keys at all)
+                let in_copy = matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(_)));
+                if in_copy && (o.has('X') || o.rest.is_empty()) {
+                    if let Some(n) = o.get('N') {
+                        let n: usize = n.parse().map_err(|_| format!("repeat count {n}"))?;
+                        if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
+                            cm.set_count(n);
+                        }
+                    }
+                    if !o.has('X') {
+                        return Ok(Flow::Next);
+                    }
+                }
                 if o.has('X') {
                     let name = o.rest.first().ok_or("send-keys -X needs a command")?.clone();
                     let rest: Vec<String> = o.rest[1..].iter().map(|a| if o.has('F') { self.expand(tt, ctx.client, a) } else { a.clone() }).collect();
-                    let n: usize = o.get('N').and_then(|v| v.parse().ok()).unwrap_or(1);
+                    let n: usize = if in_copy { 1 } else { o.get('N').and_then(|v| v.parse().ok()).unwrap_or(1) };
+                    if name == "scroll-to-mouse" {
+                        // the scrollbar slider follows the mouse (-e: leave at the bottom)
+                        if let (Some(_), Some(m)) = (ctx.client, ctx.mouse.clone()) {
+                            self.copy_scroll_to_mouse(pane, &m, rest.iter().any(|a| a == "-e"));
+                        }
+                        return Ok(Flow::Next);
+                    }
                     if let Some(m) = ctx.mouse.clone() {
                         // from a mouse binding: the cursor goes to the mouse first, and
                         // begin-selection starts a drag (window_copy_command)
@@ -3711,6 +3764,7 @@ impl Server {
             _ => {}
         }
         self.run_hook(None, "option-changed", Ctx::default());
+        self.copy_sync_all();
         self.mark_all_dirty();
         for c in self.clients.values_mut() {
             c.prev = None;
@@ -3925,7 +3979,7 @@ impl Server {
 const READ_ONLY_OK: &[&str] = &[
     "attach-session", "detach-client", "has-session", "list-sessions", "list-windows", "list-panes", "list-clients", "list-buffers", "list-keys",
     "list-commands", "display-message", "show-options", "show-window-options", "show-environment", "show-hooks", "show-messages", "show-buffer",
-    "capture-pane", "refresh-client", "switch-client", "server-access",
+    "capture-pane", "refresh-client", "switch-client", "server-access", "copy-mode", "send-keys",
 ];
 
 pub fn truthy(s: &str) -> bool {
