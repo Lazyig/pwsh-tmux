@@ -568,7 +568,8 @@ pub enum Flow {
 }
 
 pub enum JobKind {
-    RunShell { pane: Option<PaneId>, background: bool },
+    /// `stderr`: run-shell -E shows the command's stderr (tmux discards it otherwise).
+    RunShell { pane: Option<PaneId>, background: bool, stderr: bool },
     IfShell { then: String, otherwise: Option<String> },
 }
 
@@ -1325,7 +1326,7 @@ impl Server {
         let Some(parked) = self.jobs.remove(&id) else { return };
         let mut queue = parked.queue;
         match parked.kind {
-            JobKind::RunShell { pane, background } => {
+            JobKind::RunShell { pane, background, .. } => {
                 if !output.is_empty() && !background {
                     if queue.ctx.reply.is_some_and(|c| !self.clients.get(&c).is_some_and(|c| c.attached)) {
                         queue.ctx.out.push_str(&output);
@@ -2151,7 +2152,7 @@ impl Server {
                 q.ctx.files.pop();
                 continue;
             }
-            let delay_cmd = (name == "run-shell").then(|| cmd.clone());
+            let delay_cmd = (cmds::canonical(&name) == Some("run-shell")).then(|| cmd.clone());
             let saved_mouse = std::mem::replace(&mut self.cur_mouse, q.ctx.mouse.clone());
             let saved_file = std::mem::replace(&mut self.cur_file, q.ctx.files.last().cloned());
             let result = self.exec(cmd, &mut q.ctx);
@@ -2192,10 +2193,10 @@ impl Server {
                             return;
                         }
                         "job-run" => {
-                            let background = get(4) == "b";
+                            let background = get(4).contains('b');
                             let pane = get(5).parse().ok();
                             let cwd = Some(get(3)).filter(|s| !s.is_empty());
-                            let kind = JobKind::RunShell { pane, background };
+                            let kind = JobKind::RunShell { pane, background, stderr: get(4).contains('E') };
                             if background {
                                 let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: Default::default(), ..q.ctx.clone() }, soft: 0 };
                                 self.spawn_job(&get(2), cwd, kind, sub);
@@ -2298,6 +2299,9 @@ impl Server {
             cmd.current_dir(d);
         }
         cmd.stdin(std::process::Stdio::null());
+        if !matches!(kind, JobKind::RunShell { stderr: true, .. }) {
+            cmd.stderr(std::process::Stdio::null());
+        }
         thread::spawn(move || {
             let (status, out) = match cmd.output() {
                 Ok(o) => (o.status.code().unwrap_or(1), String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr)),
@@ -2340,7 +2344,7 @@ fn strip_delay(cmd: &[String]) -> Vec<String> {
                 }
                 continue;
             }
-            let takes_value = flags.ends_with(['c', 't']);
+            let takes_value = flags.ends_with(['c', 's', 't']);
             out.push(a.clone());
             if takes_value && let Some(v) = it.next() {
                 out.push(v.clone());

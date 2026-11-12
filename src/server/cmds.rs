@@ -8,6 +8,7 @@ use crate::layout::{self, Dir};
 use crate::opts::{getopt, Opts};
 use std::cmp::Ordering;
 
+mod json;
 mod sort;
 mod vis;
 
@@ -2407,7 +2408,7 @@ impl Server {
                 let cid = o.get('c').map(|c| self.resolve_client(ctx, Some(c))).transpose()?
                     .or_else(|| ctx.client.filter(|id| self.clients.get(id).is_some_and(|c| c.attached)))
                     .or_else(|| self.resolve_client(ctx, None).ok()).or(ctx.client);
-                if o.has('a') {
+                if o.has('a') && !o.has('j') {
                     let mut names: Vec<&str> = VAR_NAMES.to_vec();
                     names.sort();
                     let vc = super::vars::VarCtx { srv: self, t: tt, client: cid, extra: HashMap::new() };
@@ -2417,8 +2418,18 @@ impl Server {
                     }
                     return Ok(Flow::Next);
                 }
-                let fmt = o.rest.first().map(String::as_str).unwrap_or("[#{session_name}] #{window_index}:#{window_name}, current pane #{pane_index} - (%H:%M %d-%b-%y)");
-                let msg = self.expand_time(tt, cid, fmt);
+                if o.has('F') && !o.rest.is_empty() {
+                    return err("only one of -F or argument must be given");
+                }
+                let fmt = match o.rest.first().map(String::as_str).or(o.get('F')) {
+                    Some(f) => f,
+                    None if o.has('j') => "",
+                    None => "[#{session_name}] #{window_index}:#{window_name}, current pane #{pane_index} - (%H:%M %d-%b-%y)",
+                };
+                // -l: literal, -j: JSON printed back in tmux's form; -C (keep updating the
+                // pane) and -N (ignore keys) are how messages behave here anyway
+                let msg = if o.has('l') { fmt.to_string() } else { self.expand_time(tt, cid, fmt) };
+                let msg = if o.has('j') { json::normalize(&msg)? } else { msg };
                 let attached_client = cid.filter(|c| self.clients.get(c).is_some_and(|c| c.attached));
                 if o.has('p') || attached_client.is_none() {
                     ctx.out.push_str(&msg);
@@ -2781,6 +2792,9 @@ impl Server {
                     }
                 };
                 let data = self.buffers[idx].data.clone();
+                // tmux 3.8 passes the text through vis(3) so it can't carry control sequences
+                // (a bracketed paste end, for one); -S pastes it unchanged
+                let data = if o.has('S') { data } else { vis::strvis(&data, vis::SAFE | vis::NOSLASH) };
                 self.paste(tt.pane.unwrap(), &data, o.has('p'), o.has('r'), o.get('s'));
                 if o.has('d') {
                     self.buffers.remove(idx);
@@ -2947,12 +2961,15 @@ impl Server {
                     let secs = d.parse::<f64>().ok().filter(|s| s.is_finite() && *s >= 0.0).ok_or_else(|| format!("invalid delay time: {d}"))?;
                     return Err(format!(" delay {}", (secs * 1000.0).min(u32::MAX as f64) as u64));
                 }
-                let command = o.rest.first().map(|c| self.expand(tt, ctx.client, c)).unwrap_or_default();
+                // arguments after the command are #{1}, #{2}, ...
+                let args: HashMap<String, String> = o.rest.iter().skip(1).enumerate().map(|(i, a)| ((i + 1).to_string(), a.clone())).collect();
+                let command = o.rest.first().map(|c| self.expand_extra(tt, ctx.client, c, args)).unwrap_or_default();
                 if command.is_empty() {
                     return Ok(Flow::Next);
                 }
-                let cwd = o.get('c').map(String::from).or_else(|| tt.pane.and_then(|p| self.panes.get(&p)).map(|p| p.current_path.clone()));
-                Err(format!("\0job-run\0{command}\0{}\0{}\0{}", cwd.unwrap_or_default(), if o.has('b') { "b" } else { "" }, tt.pane.map(|p| p.to_string()).unwrap_or_default()))
+                let cwd = o.get('c').map(|c| self.expand(tt, ctx.client, c)).or_else(|| tt.pane.and_then(|p| self.panes.get(&p)).map(|p| p.current_path.clone()));
+                let flags = format!("{}{}", if o.has('b') { "b" } else { "" }, if o.has('E') { "E" } else { "" });
+                Err(format!("\0job-run\0{command}\0{}\0{flags}\0{}", cwd.unwrap_or_default(), tt.pane.map(|p| p.to_string()).unwrap_or_default()))
             }
             "wait-for" => {
                 let ch = o.rest.first().ok_or("wait-for needs a channel")?.clone();
