@@ -29,8 +29,9 @@ fn readonly_terminal_blocks_keys_paste_mouse_and_shared_resize() {
     t.mouse(0, 1, 1, false);
     t.mouse(0, 1, 1, true);
     // A writable input/output barrier ensures these checks run after the input.
+    // -J: a long shell prompt wraps the command line in the half-width pane.
     ctx.ok(&["send-keys", "-t", "ro", "echo WRITABLE_BARRIER", "Enter"]);
-    wait_for("writable input barrier", || ctx.capture("ro").matches("WRITABLE_BARRIER").count() >= 2);
+    wait_for("writable input barrier", || ctx.ok(&["capture-pane", "-p", "-J", "-t", "ro"]).matches("WRITABLE_BARRIER").count() >= 2);
     let capture = ctx.ok(&["capture-pane", "-p", "-t", "ro", "-S", "-"]);
     assert!(!capture.contains("READONLY_TYPED") && !capture.contains("READONLY_PASTED"), "{capture}");
     assert_eq!(ctx.fmt("ro", "#{pane_id}:#{window_width}x#{window_height}:#{session_windows}"), before);

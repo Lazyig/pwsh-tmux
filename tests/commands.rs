@@ -347,12 +347,14 @@ fn format_loops_and_utf8_length() {
     ctx.ok(&["new-session", "-d", "-s", "z"]);
     ctx.ok(&["new-session", "-d", "-s", "a"]);
     ctx.ok(&["split-window", "-d", "-t", "z:0.0"]);
-    assert_eq!(ctx.fmt("z", "#{S:#S;}"), "z;a;");
-    assert_eq!(ctx.fmt("z", "#{S/n:#S;}"), "a;z;");
-    assert_eq!(ctx.fmt("z", "#{P:#P,[#P]}"), "[0]1");
-    assert_eq!(ctx.fmt("z", "#{S:#{W:#{P:#S:#I.#P;}}}"), "z:0.0;z:0.1;a:0.0;");
+    // "z:" not "z": a bare name tries the current session's windows first, and the
+    // shell's window (e.g. "zsh") would match it, as in tmux
+    assert_eq!(ctx.fmt("z:", "#{S:#S;}"), "z;a;");
+    assert_eq!(ctx.fmt("z:", "#{S/n:#S;}"), "a;z;");
+    assert_eq!(ctx.fmt("z:", "#{P:#P,[#P]}"), "[0]1");
+    assert_eq!(ctx.fmt("z:", "#{S:#{W:#{P:#S:#I.#P;}}}"), "z:0.0;z:0.1;a:0.0;");
     ctx.ok(&["set", "-g", "@text", "가나"]);
-    assert_eq!(ctx.fmt("z", "#{n:@text} #{s/./X/:@text}"), "6 XX");
+    assert_eq!(ctx.fmt("z:", "#{n:@text} #{s/./X/:@text}"), "6 XX");
 }
 
 #[test]
