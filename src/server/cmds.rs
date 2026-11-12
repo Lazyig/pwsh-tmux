@@ -1792,8 +1792,7 @@ impl Server {
                 let old_layout = self.window_layout(wid, false, ctx.client).unwrap_or_default();
                 let w = &self.windows[&wid];
                 // presets arrange the tiled panes; floating ones stay as they are
-                let tiled: Vec<PaneId> = w.panes().into_iter().filter(|p| !w.is_floating(*p)).collect();
-                let floats: Vec<(PaneId, crate::layout::FGeom)> = w.panes().into_iter().filter_map(|p| w.layout.geom(p).map(|g| (p, g))).collect();
+                let all: Vec<(PaneId, Option<crate::layout::FGeom>)> = w.panes().into_iter().map(|p| (p, w.layout.geom(p))).collect();
                 let name: Option<String> = if cmd == "next-layout" || o.has('n') {
                     Some(layout::PRESETS[w.layout_cycle.map_or(0, |i| (i + 1) % layout::PRESETS.len())].to_string())
                 } else if cmd == "previous-layout" || o.has('p') {
@@ -1814,10 +1813,7 @@ impl Server {
                 match name {
                     Some(name) => match layout::preset_name(&name).filter(|_| !o.has('o')) {
                         Some(preset) => {
-                            if let Some(mut n) = layout::preset(preset, &tiled, area, main_size(self, preset)) {
-                                for (p, g) in floats {
-                                    n = layout::attach_float(n, p, g);
-                                }
+                            if let Some(n) = layout::preset_with_floats(preset, &all, area, main_size(self, preset)) {
                                 self.windows.get_mut(&wid).unwrap().layout = n;
                             }
                             self.windows.get_mut(&wid).unwrap().layout_cycle = layout::PRESETS.iter().position(|p| *p == preset);

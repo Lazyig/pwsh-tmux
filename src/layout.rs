@@ -1304,6 +1304,51 @@ impl Node {
     }
 }
 
+/// A preset for a window whose panes (in order) may float (`Some` cell). Like tmux's
+/// layout_set_*, it arranges the tiled panes, keeps the floating ones where they are and
+/// links their cells in pane order into the node holding the other panes (even-*, and main-*
+/// with several other panes), or at the end of the root. None when there are not two tiled
+/// panes (tmux leaves the layout alone).
+pub fn preset_with_floats(name: &str, panes: &[(PaneId, Option<FGeom>)], area: Rect, main_size: Option<u16>) -> Option<Node> {
+    let tiled: Vec<PaneId> = panes.iter().filter(|p| p.1.is_none()).map(|p| p.0).collect();
+    if tiled.len() <= 1 {
+        return None;
+    }
+    let mut cell = preset(name, &tiled, area, main_size)?.to_cell(area);
+    let float = |id: PaneId, g: FGeom| Cell { w: g.w, h: g.h, x: g.x, y: g.y, kind: CellKind::Float(id) };
+    // interleave the floating cells with the tiled cells of a node, in pane order
+    let interleave = |c: &mut Cell, skip: Option<PaneId>| {
+        let CellKind::Container(_, ch) = &mut c.kind else { return false };
+        let mut old = std::mem::take(ch).into_iter();
+        for (id, g) in panes.iter().filter(|p| Some(p.0) != skip) {
+            match g {
+                Some(g) => ch.push(float(*id, *g)),
+                None => ch.extend(old.next()),
+            }
+        }
+        ch.extend(old);
+        true
+    };
+    let main = tiled[0];
+    let linked = match name {
+        "even-horizontal" | "even-vertical" => interleave(&mut cell, None),
+        n if n.starts_with("main-") => match &mut cell.kind {
+            CellKind::Container(_, ch) => match ch.iter_mut().find(|c| matches!(c.kind, CellKind::Container(..))) {
+                Some(other) => interleave(other, Some(main)),
+                None => false,
+            },
+            _ => false,
+        },
+        _ => false,
+    };
+    if !linked {
+        if let CellKind::Container(_, ch) = &mut cell.kind {
+            ch.extend(panes.iter().filter_map(|(id, g)| g.map(|g| float(*id, g))));
+        }
+    }
+    Some(cell.into_tree())
+}
+
 /// Add a floating pane at the end of the root node (a leaf root becomes a top-bottom node),
 /// as tmux does for floating panes kept by an old-format layout or a preset.
 pub fn attach_float(root: Node, id: PaneId, g: FGeom) -> Node {
@@ -2029,6 +2074,76 @@ mod tests {
         let t = parse_layout_string(&format!("{},{body}", tmux_csum(body)), &[1, 2], area(81, 30)).unwrap();
         assert_eq!(rect_of(&t, area(81, 30), 1).w, 40);
         assert_cover(&t, area(81, 30));
+    }
+
+    fn json(n: &Node, a: Rect) -> String {
+        n.to_json_layout(a, &|p| LeafInfo { active: p == 1, last: None, index: p as usize, z: n.is_float(p).then_some(0) })
+    }
+
+    #[test]
+    fn floating_cells_take_no_tiled_space() {
+        let a = area(80, 24);
+        let g = FGeom { x: 4, y: 2, w: 40, h: 6 };
+        let mut n = Node::Leaf(1);
+        n.insert_float(Some(1), 2, g);
+        assert_eq!(rects(&n, a), vec![(1, a)]);
+        assert_eq!(n.floats(), vec![(2, g)]);
+        assert_eq!(json(&n, a), r#"{"V":2,"L":{"t":"v","w":80,"h":24,"x":0,"y":0,"c":[{"t":"p","w":80,"h":24,"x":0,"y":0,"a":true,"i":1,"I":"%1"},{"t":"p","w":40,"h":6,"x":4,"y":2,"i":2,"z":0,"I":"%2"}]}}"#);
+        // the old format leaves floating panes out
+        assert_eq!(&n.to_layout_string(a)[5..], "80x24,0,0,1");
+        // splitting the tiled pane nests it; the floating cell stays after it
+        n.split_ex(1, 3, true, false, None, a);
+        assert_eq!(rects(&n, a), vec![(1, Rect { w: 40, ..a }), (3, Rect { x: 41, w: 39, ..a })]);
+        assert!(json(&n, a).contains(r#""c":[{"t":"h","w":80,"h":24,"x":0,"y":0,"c":[{"t":"p","w":40"#));
+        // floating a tiled pane gives its space to the neighbour; tiling it takes half back
+        n.float_pane(3, g, a).unwrap();
+        assert_eq!(rects(&n, a), vec![(1, a)]);
+        assert!(n.float_pane(3, g, a).is_err());
+        n.tile_pane(3, a).unwrap();
+        // (the last cell takes the bigger half from the cell before it)
+        assert_eq!(rects(&n, a), vec![(1, Rect { w: 39, ..a }), (3, Rect { x: 40, w: 40, ..a })]);
+        // closing a pane gives its space to the next one (tmux layout_destroy_cell)
+        let n = preset("even-horizontal", &[1, 3, 4], a, None).unwrap().close(1, a).unwrap();
+        assert_eq!(rects(&n, a), vec![(3, Rect { x: 0, w: 53, ..a }), (4, Rect { x: 54, w: 26, ..a })]);
+    }
+
+    #[test]
+    fn presets_link_floating_cells_like_tmux() {
+        let a = area(80, 24);
+        let g = FGeom { x: 4, y: 2, w: 40, h: 6 };
+        let panes = [(1, None), (2, Some(g)), (3, None), (4, None)];
+        let n = preset_with_floats("even-horizontal", &panes, a, None).unwrap();
+        let ids: Vec<PaneId> = n.panes();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+        assert!(json(&n, a).starts_with(r#"{"V":2,"L":{"t":"h","w":80,"h":24,"x":0,"y":0,"c":[{"t":"p","w":26"#));
+        // main-*: the floating cell joins the other panes
+        let n = preset_with_floats("main-vertical", &panes, a, None).unwrap();
+        assert!(json(&n, a).ends_with(r#"{"t":"p","w":40,"h":6,"x":4,"y":2,"i":2,"z":0,"I":"%2"},{"t":"p","w":1,"h":12,"x":79,"y":0,"i":3,"I":"%3"},{"t":"p","w":1,"h":11,"x":79,"y":13,"i":4,"I":"%4"}]}]}}"#), "{}", json(&n, a));
+        // tiled: at the end of the root
+        let n = preset_with_floats("tiled", &panes, a, None).unwrap();
+        assert_eq!(n.panes(), vec![1, 3, 4, 2]);
+        // one tiled pane: unchanged
+        assert!(preset_with_floats("tiled", &[(1, None), (2, Some(g))], a, None).is_none());
+    }
+
+    #[test]
+    fn json_layouts_parse_and_check() {
+        let a = area(80, 24);
+        let s = r#"{"V":2,"L":{"t":"v","w":80,"h":24,"x":0,"y":0,"c":[{"t":"p","w":80,"h":24,"x":0,"y":0,"l":0,"i":0},{"t":"p","w":20,"h":5,"x":-3,"y":3,"a":true,"i":1,"z":0}]}}"#;
+        let ap = apply_layout_string(s, &[7, 8], &[]).unwrap();
+        assert_eq!(ap.version, 2);
+        assert_eq!(ap.active, Some(8));
+        assert_eq!(ap.last, vec![7]);
+        assert_eq!(ap.zorder, vec![8]);
+        assert_eq!(ap.node.floats(), vec![(8, FGeom { x: -3, y: 3, w: 20, h: 5 })]);
+        assert_eq!(rects(&ap.node, a), vec![(7, a)]);
+        let err = |s: &str| apply_layout_string(s, &[7, 8], &[]).unwrap_err();
+        assert_eq!(err(r#"{"V":2,"L":{"t":"p","w":0,"h":24,"x":0,"y":0,"i":0}}"#), "invalid width 0");
+        assert_eq!(err(r#"{"V":2,"L":{"t":"v","w":80,"h":24,"x":0,"y":0,"c":[{"t":"p","w":80,"h":24,"x":0,"y":0,"a":true,"i":0},{"t":"p","w":80,"h":24,"x":0,"y":0,"a":true,"i":1,"z":0}]}}"#), "more than one active pane");
+        assert_eq!(err(r#"{"V":2,"L":{"t":"v","w":80,"h":24,"x":0,"y":0,"c":[{"t":"p","w":80,"h":24,"x":0,"y":0,"i":0},{"t":"p","w":80,"h":24,"x":0,"y":0,"i":0,"z":0}]}}"#), "duplicate pane index");
+        assert_eq!(err(r#"{"V":2,"L":{"t":"h","w":80,"h":24,"x":0,"y":0,"c":[{"t":"p","w":40,"h":24,"x":0,"y":0,"i":0},{"t":"p","w":39,"h":23,"x":41,"y":0,"i":1}]}}"#), "size mismatch after applying layout");
+        assert_eq!(err(r#"{"V":2,"L":{"t":"p","w":80,"h":24,"x":0,"y":0,"i":0,"c":[]}}"#), "panes cannot have children");
+        assert_eq!(err(r#"{"L":{}}"#), "key \"V\" not found");
     }
 
     #[test]
