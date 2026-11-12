@@ -1,5 +1,8 @@
 //! Binary split tree for the panes of one window.
 
+use crate::server::Json;
+use std::collections::HashMap;
+
 pub type PaneId = u32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -27,9 +30,23 @@ pub enum Dir {
     Down,
 }
 
+/// A floating pane's cell (tmux `layout_cell.g` with LAYOUT_CELL_FLOATING): the size and
+/// position of the pane's content; its border, when it has one, is drawn one cell outside.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct FGeom {
+    pub x: i32,
+    pub y: i32,
+    pub w: u16,
+    pub h: u16,
+}
+
 #[derive(Debug, Clone)]
 pub enum Node {
     Leaf(PaneId),
+    /// A floating pane. tmux keeps floating cells in the layout tree (after the cell they
+    /// were created from, or where a tiled pane was floated), but they take no tiled space:
+    /// a split with no tiled pane on one side gives the whole area to the other side.
+    Float(PaneId, FGeom),
     /// `horizontal`: children side by side (tmux `split-window -h`), else stacked.
     Split {
         horizontal: bool,
@@ -67,7 +84,7 @@ impl Node {
 
     fn collect(&self, out: &mut Vec<PaneId>) {
         match self {
-            Node::Leaf(p) => out.push(*p),
+            Node::Leaf(p) | Node::Float(p, _) => out.push(*p),
             Node::Split { a, b, .. } => {
                 a.collect(out);
                 b.collect(out);
@@ -75,9 +92,122 @@ impl Node {
         }
     }
 
+    /// The tiled panes (no floating ones), in tree order.
+    pub fn tiled(&self) -> Vec<PaneId> {
+        let mut out = Vec::new();
+        self.visit(&mut |n| if let Node::Leaf(p) = n { out.push(*p) });
+        out
+    }
+
+    /// The floating panes and their cells, in tree order.
+    pub fn floats(&self) -> Vec<(PaneId, FGeom)> {
+        let mut out = Vec::new();
+        self.visit(&mut |n| if let Node::Float(p, g) = n { out.push((*p, *g)) });
+        out
+    }
+
+    fn visit(&self, f: &mut dyn FnMut(&Node)) {
+        f(self);
+        if let Node::Split { a, b, .. } = self {
+            a.visit(f);
+            b.visit(f);
+        }
+    }
+
+    /// tmux `layout_cell_is_tiled || layout_cell_has_tiled_child`.
+    pub fn has_tiled(&self) -> bool {
+        match self {
+            Node::Leaf(_) => true,
+            Node::Float(..) => false,
+            Node::Split { a, b, .. } => a.has_tiled() || b.has_tiled(),
+        }
+    }
+
+    pub fn is_float(&self, id: PaneId) -> bool {
+        self.geom(id).is_some()
+    }
+
+    /// The cell of floating pane `id`.
+    pub fn geom(&self, id: PaneId) -> Option<FGeom> {
+        match self {
+            Node::Float(p, g) if *p == id => Some(*g),
+            Node::Split { a, b, .. } => a.geom(id).or_else(|| b.geom(id)),
+            _ => None,
+        }
+    }
+
+    pub fn geom_mut(&mut self, id: PaneId) -> Option<&mut FGeom> {
+        match self {
+            Node::Float(p, g) if *p == id => Some(g),
+            Node::Split { a, b, .. } => match a.geom_mut(id) {
+                Some(g) => Some(g),
+                None => b.geom_mut(id),
+            },
+            _ => None,
+        }
+    }
+
+    /// Turn tiled pane `id` into a floating one in place (tmux `layout_remove_tile`: its
+    /// space goes to its neighbours) or back (`layout_insert_tile`).
+    pub fn set_floating(&mut self, id: PaneId, g: Option<FGeom>) -> bool {
+        match self {
+            Node::Leaf(p) if *p == id => match g {
+                Some(g) => {
+                    *self = Node::Float(id, g);
+                    true
+                }
+                None => false,
+            },
+            Node::Float(p, _) if *p == id => match g {
+                Some(_) => false,
+                None => {
+                    *self = Node::Leaf(id);
+                    true
+                }
+            },
+            Node::Split { a, b, .. } => a.set_floating(id, g) || b.set_floating(id, g),
+            _ => false,
+        }
+    }
+
+    /// tmux `layout_floating_pane`: a new floating cell after the cell of `after` (in its
+    /// parent, so it joins that node; a root leaf is first replaced by a top-bottom node).
+    pub fn insert_float(&mut self, after: Option<PaneId>, new: PaneId, g: FGeom) {
+        fn find(n: &mut Node, id: PaneId, parent: Option<bool>) -> Option<(&mut Node, Option<bool>)> {
+            match n {
+                Node::Leaf(p) | Node::Float(p, _) if *p == id => Some((n, parent)),
+                Node::Split { horizontal, a, b, .. } => {
+                    let h = Some(*horizontal);
+                    match find(a, id, h) {
+                        Some(x) => Some(x),
+                        None => find(b, id, h),
+                    }
+                }
+                _ => None,
+            }
+        }
+        let float = Node::Float(new, g);
+        let (n, parent) = match after {
+            Some(a) if self.panes().contains(&a) => find(self, a, None).unwrap(),
+            _ => (self, None),
+        };
+        let horizontal = parent.unwrap_or(false);
+        let old = std::mem::replace(n, Node::Leaf(PaneId::MAX));
+        *n = Node::Split { horizontal, ratio: 0.5, a: Box::new(old), b: Box::new(float) };
+    }
+
     pub fn layout(&self, r: Rect, panes: &mut Vec<(PaneId, Rect)>, seps: &mut Vec<Sep>) {
+        if let Node::Split { a, b, .. } = self {
+            match (a.has_tiled(), b.has_tiled()) {
+                (true, false) => return a.layout(r, panes, seps),
+                (false, true) => return b.layout(r, panes, seps),
+                (false, false) => return,
+                _ => {}
+            }
+        }
         match self {
             Node::Leaf(p) => panes.push((*p, r)),
+            Node::Float(..) => {}
             Node::Split { horizontal: true, ratio, a, b } => {
                 let (wa, wb) = split_len(r.w, *ratio);
                 a.layout(Rect { w: wa, ..r }, panes, seps);
@@ -113,7 +243,7 @@ impl Node {
                 };
                 true
             }
-            Node::Leaf(_) => false,
+            Node::Leaf(_) | Node::Float(..) => false,
             Node::Split { a, b, .. } => a.split(target, new, horizontal) || b.split(target, new, horizontal),
         }
     }
@@ -121,8 +251,8 @@ impl Node {
     /// Remove a leaf, collapsing its parent split. Returns None when the tree becomes empty.
     pub fn remove(self, target: PaneId) -> Option<Node> {
         match self {
-            Node::Leaf(p) if p == target => None,
-            leaf @ Node::Leaf(_) => Some(leaf),
+            Node::Leaf(p) | Node::Float(p, _) if p == target => None,
+            leaf @ (Node::Leaf(_) | Node::Float(..)) => Some(leaf),
             Node::Split { horizontal, ratio, a, b } => match (a.remove(target), b.remove(target)) {
                 (Some(a), Some(b)) => Some(Node::Split { horizontal, ratio, a: Box::new(a), b: Box::new(b) }),
                 (Some(n), None) | (None, Some(n)) => Some(n),
@@ -141,6 +271,10 @@ impl Node {
     fn resize_inner(&mut self, target: PaneId, dir: Dir, cells: u16, r: Rect) -> Option<bool> {
         match self {
             Node::Leaf(p) => (*p == target).then_some(false),
+            Node::Float(..) => None,
+            // a side with only floating panes is not part of the tiled layout
+            Node::Split { a, b, .. } if !a.has_tiled() => b.resize_inner(target, dir, cells, r),
+            Node::Split { a, b, .. } if !b.has_tiled() => a.resize_inner(target, dir, cells, r),
             Node::Split { horizontal, ratio, a, b } => {
                 let total = if *horizontal { r.w } else { r.h };
                 let (la, _) = split_len(total, *ratio);
@@ -235,6 +369,11 @@ fn child_rects(horizontal: bool, ratio: f32, r: Rect) -> (Rect, Rect) {
     }
 }
 
+/// [`child_rects`] for a split whose side without tiled panes takes no space.
+fn tiled_rects(horizontal: bool, ratio: f32, a: &Node, b: &Node, r: Rect) -> (Rect, Rect) {
+    if a.has_tiled() && b.has_tiled() { child_rects(horizontal, ratio, r) } else { (r, r) }
+}
+
 fn along(horizontal: bool, r: Rect) -> u16 {
     if horizontal { r.w } else { r.h }
 }
@@ -268,7 +407,9 @@ fn chain(mut items: Vec<(Node, u16)>, horizontal: bool) -> Node {
         return items.pop().unwrap().0;
     }
     let (first, sa) = items.remove(0);
-    let tb: u32 = items.iter().map(|(_, s)| *s as u32).sum::<u32>() + items.len() as u32 - 1;
+    // floating items take no space
+    let tiled: Vec<u16> = items.iter().filter(|(n, _)| n.has_tiled()).map(|(_, s)| *s).collect();
+    let tb: u32 = tiled.iter().map(|s| *s as u32).sum::<u32>() + (tiled.len() as u32).saturating_sub(1);
     let tb = tb.min(u16::MAX as u32) as u16;
     let rest = chain(items, horizontal);
     Node::Split { horizontal, ratio: exact_ratio(sa, tb), a: Box::new(first), b: Box::new(rest) }
@@ -353,14 +494,15 @@ pub fn preset(name: &str, panes: &[PaneId], area: Rect, main_size: Option<u16>) 
 struct Cell {
     w: u16,
     h: u16,
-    x: u16,
-    y: u16,
+    x: i32,
+    y: i32,
     kind: CellKind,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum CellKind {
     Leaf(Option<PaneId>),
+    Float(PaneId),
     /// `true` = left-right (`{}`), `false` = top-bottom (`[]`).
     Container(bool, Vec<Cell>),
 }
@@ -375,7 +517,74 @@ fn layout_checksum(s: &str) -> u16 {
     csum
 }
 
+/// What a JSON layout says about a pane besides its cell.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LeafInfo {
+    pub active: bool,
+    /// Position in the window's last-panes stack.
+    pub last: Option<usize>,
+    pub index: usize,
+    /// Position among the floating panes (0 is the front), for floating panes.
+    pub z: Option<usize>,
+}
+
 impl Cell {
+    fn tiled_only(self) -> Option<Cell> {
+        match self.kind {
+            CellKind::Float(_) => None,
+            CellKind::Leaf(_) => Some(self),
+            CellKind::Container(h, ch) => {
+                let mut ch: Vec<Cell> = ch.into_iter().filter_map(Cell::tiled_only).collect();
+                match ch.len() {
+                    0 => None,
+                    1 => ch.pop(),
+                    _ => Some(Cell { kind: CellKind::Container(h, ch), ..self }),
+                }
+            }
+        }
+    }
+
+    fn dump_json(&self, out: &mut String, info: &dyn Fn(PaneId) -> LeafInfo) {
+        use std::fmt::Write;
+        let t = match &self.kind {
+            CellKind::Container(true, _) => 'h',
+            CellKind::Container(false, _) => 'v',
+            _ => 'p',
+        };
+        let _ = write!(out, "{{\"t\":\"{t}\",\"w\":{},\"h\":{},\"x\":{},\"y\":{}", self.w, self.h, self.x, self.y);
+        match &self.kind {
+            CellKind::Container(_, ch) => {
+                out.push_str(",\"c\":[");
+                for (i, c) in ch.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    c.dump_json(out, info);
+                }
+                out.push(']');
+            }
+            kind => {
+                let (id, floating) = match kind {
+                    CellKind::Leaf(id) => (id.unwrap_or(0), false),
+                    CellKind::Float(id) => (*id, true),
+                    _ => unreachable!(),
+                };
+                let li = info(id);
+                if li.active {
+                    out.push_str(",\"a\":true");
+                } else if let Some(l) = li.last {
+                    let _ = write!(out, ",\"l\":{l}");
+                }
+                let _ = write!(out, ",\"i\":{}", li.index);
+                if floating {
+                    let _ = write!(out, ",\"z\":{}", li.z.unwrap_or(0));
+                }
+                let _ = write!(out, ",\"I\":\"%{id}\"");
+            }
+        }
+        out.push('}');
+    }
+
     fn dump(&self, out: &mut String) {
         use std::fmt::Write;
         let _ = write!(out, "{}x{},{},{}", self.w, self.h, self.x, self.y);
@@ -385,6 +594,7 @@ impl Cell {
                     let _ = write!(out, ",{id}");
                 }
             }
+            CellKind::Float(_) => {}
             CellKind::Container(h, children) => {
                 out.push(if *h { '{' } else { '[' });
                 for (i, c) in children.iter().enumerate() {
@@ -398,50 +608,6 @@ impl Cell {
         }
     }
 
-    fn leaves(&self) -> usize {
-        match &self.kind {
-            CellKind::Leaf(_) => 1,
-            CellKind::Container(_, ch) => ch.iter().map(Cell::leaves).sum(),
-        }
-    }
-
-    /// tmux `layout_check`: children fill their container exactly.
-    fn check(&self) -> Result<(), String> {
-        if let CellKind::Container(h, ch) = &self.kind {
-            if ch.is_empty() {
-                return Err("empty layout container".into());
-            }
-            let mut sum = ch.len() as u32 - 1;
-            for c in ch {
-                let (cross, size, pcross) = if *h { (c.h, c.w, self.h) } else { (c.w, c.h, self.w) };
-                if cross != pcross {
-                    return Err("layout cell size mismatch".into());
-                }
-                sum += size as u32;
-                c.check()?;
-            }
-            if sum != along(*h, Rect { x: 0, y: 0, w: self.w, h: self.h }) as u32 {
-                return Err("layout cell sizes do not add up".into());
-            }
-        }
-        Ok(())
-    }
-
-    fn into_node(self, ids: &mut impl Iterator<Item = PaneId>) -> Node {
-        match self.kind {
-            CellKind::Leaf(_) => Node::Leaf(ids.next().expect("pane count checked")),
-            CellKind::Container(h, ch) => {
-                let items = ch
-                    .into_iter()
-                    .map(|c| {
-                        let s = if h { c.w } else { c.h };
-                        (c.into_node(ids), s)
-                    })
-                    .collect();
-                chain(items, h)
-            }
-        }
-    }
 }
 
 struct Parser<'a> {
@@ -484,9 +650,9 @@ impl Parser<'_> {
         self.expect(b'x')?;
         let h = self.num16()?;
         self.expect(b',')?;
-        let x = self.num16()?;
+        let x = self.num16()? as i32;
         self.expect(b',')?;
-        let y = self.num16()?;
+        let y = self.num16()? as i32;
         let mut cell = Cell { w, h, x, y, kind: CellKind::Leaf(None) };
         match self.peek() {
             Some(b',') => {
@@ -518,38 +684,644 @@ impl Parser<'_> {
     }
 }
 
-/// Parse a tmux layout string (checksum verified) and map its pane slots, in
-/// order, onto `panes`. The returned tree's ratios reproduce the string's cell
-/// sizes exactly when laid out over an area of the same size as the layout, and
-/// proportionally otherwise.
-#[allow(dead_code)]
-pub fn parse_layout_string(s: &str, panes: &[PaneId], _area: Rect) -> Result<Node, String> {
-    let s = s.trim();
-    let (sum, body) = s.split_once(',').ok_or("invalid layout: missing checksum")?;
-    if sum.len() != 4 {
-        return Err("invalid layout: bad checksum field".into());
+/// tmux PANE_MAXIMUM and WINDOW_MAXIMUM.
+const PANE_MAX: i64 = 10000;
+const WINDOW_MAX: i64 = 10000;
+
+/// A JSON layout's attributes of one pane cell.
+#[derive(Clone, Copy, Debug, Default)]
+struct LeafAttr {
+    index: i64,
+    active: bool,
+    last: Option<i64>,
+    z: Option<i64>,
+}
+
+/// A layout string applied to a window.
+#[derive(Debug)]
+pub struct Applied {
+    pub node: Node,
+    pub version: u8,
+    /// JSON layouts: the floating panes, front first.
+    pub zorder: Vec<PaneId>,
+    /// JSON layouts: the active pane and the last-panes stack.
+    pub active: Option<PaneId>,
+    pub last: Vec<PaneId>,
+}
+
+impl Cell {
+    fn count(&self, with_floating: bool) -> usize {
+        match &self.kind {
+            CellKind::Leaf(_) => 1,
+            CellKind::Float(_) => usize::from(with_floating),
+            CellKind::Container(_, ch) => ch.iter().map(|c| c.count(with_floating)).sum(),
+        }
     }
-    let want = u16::from_str_radix(sum, 16).map_err(|_| "invalid layout: bad checksum field".to_string())?;
-    if layout_checksum(body) != want {
-        return Err("invalid layout: checksum mismatch".into());
+
+    fn has_tiled(&self) -> bool {
+        match &self.kind {
+            CellKind::Leaf(_) => true,
+            CellKind::Float(_) => false,
+            CellKind::Container(_, ch) => ch.iter().any(Cell::has_tiled),
+        }
+    }
+
+    /// tmux `layout_destroy_cell` of the bottom-right cell (the last child, recursively):
+    /// its space goes to the previous cell and a node left with one child is replaced by it.
+    /// Returns the slot of the removed leaf.
+    fn remove_bottom_right(&mut self) -> Option<PaneId> {
+        let CellKind::Container(h, ch) = &mut self.kind else { return None };
+        let h = *h;
+        let last = ch.last_mut()?;
+        if matches!(last.kind, CellKind::Container(..)) {
+            return last.remove_bottom_right();
+        }
+        let gone = ch.pop()?;
+        let slot = match gone.kind {
+            CellKind::Leaf(s) => s,
+            CellKind::Float(s) => Some(s),
+            _ => None,
+        };
+        if gone.has_tiled() {
+            if let Some(prev) = ch.iter_mut().rev().find(|c| c.has_tiled()) {
+                let add = if h { gone.w } else { gone.h } + 1;
+                prev.grow(h, add);
+            }
+        }
+        if ch.len() == 1 {
+            let only = ch.pop().unwrap();
+            let (x, y) = (self.x, self.y);
+            *self = only;
+            if self.has_tiled() && matches!(self.kind, CellKind::Leaf(_)) {
+                (self.x, self.y) = (x, y);
+            }
+        }
+        slot
+    }
+
+    /// Grow a cell along one axis, the last tiled child of a node of that axis taking it.
+    fn grow(&mut self, horizontal: bool, add: u16) {
+        if horizontal { self.w += add } else { self.h += add }
+        match &mut self.kind {
+            CellKind::Container(h, ch) if *h == horizontal => {
+                if let Some(c) = ch.iter_mut().rev().find(|c| c.has_tiled()) {
+                    c.grow(horizontal, add);
+                }
+            }
+            CellKind::Container(_, ch) => {
+                for c in ch.iter_mut().filter(|c| c.has_tiled()) {
+                    c.grow(horizontal, add);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// tmux `layout_check`, which ignores cells with no tiled pane.
+    fn check_tiled(&self) -> bool {
+        let CellKind::Container(h, ch) = &self.kind else { return true };
+        let mut n = 0u32;
+        for c in ch.iter().filter(|c| c.has_tiled()) {
+            let (cross, size, pcross) = if *h { (c.h, c.w, self.h) } else { (c.w, c.h, self.w) };
+            if cross != pcross || !c.check_tiled() {
+                return false;
+            }
+            n += size as u32 + 1;
+        }
+        n == 0 || n - 1 == along(*h, Rect { x: 0, y: 0, w: self.w, h: self.h }) as u32
+    }
+
+    /// Leaf slots (tiled and floating) in tree order.
+    fn slots(&self, out: &mut Vec<(PaneId, bool)>) {
+        match &self.kind {
+            CellKind::Leaf(s) => out.push((s.unwrap_or(0), false)),
+            CellKind::Float(s) => out.push((*s, true)),
+            CellKind::Container(_, ch) => ch.iter().for_each(|c| c.slots(out)),
+        }
+    }
+
+    /// Replace leaf slots with pane ids.
+    fn assign(&mut self, map: &HashMap<PaneId, PaneId>) {
+        match &mut self.kind {
+            CellKind::Leaf(s) => *s = s.and_then(|s| map.get(&s).copied()),
+            CellKind::Float(s) => *s = map[s],
+            CellKind::Container(_, ch) => ch.iter_mut().for_each(|c| c.assign(map)),
+        }
+    }
+
+    fn into_tree(self) -> Node {
+        match self.kind {
+            CellKind::Leaf(id) => Node::Leaf(id.unwrap_or(0)),
+            CellKind::Float(id) => Node::Float(id, FGeom { x: self.x, y: self.y, w: self.w, h: self.h }),
+            CellKind::Container(h, ch) => chain(ch.into_iter().map(|c| (if h { c.w } else { c.h }, c)).map(|(s, c)| (c.into_tree(), s)).collect(), h),
+        }
+    }
+}
+
+/// tmux `layout_construct_v1`: checksum, then the cells.
+fn parse_v1(s: &str) -> Result<Cell, String> {
+    let (sum, body) = match s.split_once(',') {
+        Some((sum, body)) if sum.len() == 4 && sum.bytes().all(|c| c.is_ascii_hexdigit()) => (sum, body),
+        _ => return Err("malformed layout header".into()),
+    };
+    if layout_checksum(body) != u16::from_str_radix(sum, 16).unwrap_or(0) {
+        return Err("invalid layout checksum".into());
     }
     let mut p = Parser { s: body.as_bytes(), i: 0 };
-    let cell = p.cell()?;
+    let mut cell = p.cell().map_err(|_| "invalid layout".to_string())?;
     if p.i != body.len() {
-        return Err(format!("invalid layout: trailing data at offset {}", p.i));
+        return Err("trailing data".into());
     }
-    cell.check()?;
-    if cell.leaves() != panes.len() {
-        return Err(format!("layout has {} panes, window has {}", cell.leaves(), panes.len()));
+    fn valid(c: &Cell) -> bool {
+        (1..=PANE_MAX).contains(&(c.w as i64)) && (1..=PANE_MAX).contains(&(c.h as i64)) && c.x as i64 <= WINDOW_MAX && c.y as i64 <= WINDOW_MAX
+            && match &c.kind { CellKind::Container(_, ch) => ch.iter().all(valid), _ => true }
     }
-    Ok(cell.into_node(&mut panes.iter().copied()))
+    if !valid(&cell) {
+        return Err("invalid layout".into());
+    }
+    let mut n = 0;
+    fn number(c: &mut Cell, n: &mut PaneId) {
+        match &mut c.kind {
+            CellKind::Leaf(s) => {
+                *s = Some(*n);
+                *n += 1;
+            }
+            CellKind::Container(_, ch) => ch.iter_mut().for_each(|c| number(c, n)),
+            CellKind::Float(_) => {}
+        }
+    }
+    number(&mut cell, &mut n);
+    Ok(cell)
+}
+
+/// tmux `layout_parse_json_layout`: one cell of a JSON layout; leaves get slot numbers.
+fn parse_json_cell(node: &Json, attrs: &mut Vec<LeafAttr>, active: &mut usize) -> Result<Cell, String> {
+    let find = |key: &str| -> Option<&Json> { match node { Json::Object(m) => m.get(key), _ => None } };
+    let not_found = |key: &str| format!("key \"{key}\" not found");
+    let string = |key: &str| match find(key) {
+        None => Err(not_found(key)),
+        Some(Json::Str(s)) => Ok(s.clone()),
+        _ => Err(format!("key \"{key}\" expected a string")),
+    };
+    let number = |key: &str| match find(key) {
+        None => Err(not_found(key)),
+        Some(Json::Num(n)) => Ok(*n),
+        _ => Err(format!("key \"{key}\" expected a number")),
+    };
+    let t = string("t")?;
+    let kind = match t.as_str() {
+        "p" => None,
+        "v" => Some(false),
+        "h" => Some(true),
+        _ => return Err(format!("unknown cell type \"{t}\"")),
+    };
+    let w = number("w")?;
+    if !(1..=PANE_MAX).contains(&w) {
+        return Err(format!("invalid width {w}"));
+    }
+    let h = number("h")?;
+    if !(1..=PANE_MAX).contains(&h) {
+        return Err(format!("invalid height {h}"));
+    }
+    let x = number("x")?;
+    if !(-WINDOW_MAX..=WINDOW_MAX).contains(&x) {
+        return Err(format!("invalid x-offset {x}"));
+    }
+    let y = number("y")?;
+    if !(-WINDOW_MAX..=WINDOW_MAX).contains(&y) {
+        return Err(format!("invalid y-offset {y}"));
+    }
+    let (w, h, x, y) = (w as u16, h as u16, x as i32, y as i32);
+    let Some(horizontal) = kind else {
+        if find("c").is_some() {
+            return Err("panes cannot have children".into());
+        }
+        let index = number("i")?;
+        if !(0..=i32::MAX as i64).contains(&index) {
+            return Err(format!("invalid index {index}"));
+        }
+        let mut attr = LeafAttr { index, ..LeafAttr::default() };
+        if let Some(a) = find("a") {
+            let Json::Bool(a) = a else { return Err("key \"a\" expected a boolean".into()) };
+            attr.active = *a;
+            *active += usize::from(*a);
+        } else if find("l").is_some() {
+            let l = number("l")?;
+            if !(0..=i32::MAX as i64).contains(&l) {
+                return Err(format!("invalid last {l}"));
+            }
+            attr.last = Some(l);
+        }
+        if find("z").is_some() {
+            let z = number("z")?;
+            if !(0..i32::MAX as i64).contains(&z) {
+                return Err(format!("invalid floating zindex {z}"));
+            }
+            attr.z = Some(z);
+        }
+        let slot = attrs.len() as PaneId;
+        attrs.push(attr);
+        let kind = if attr.z.is_some() { CellKind::Float(slot) } else { CellKind::Leaf(Some(slot)) };
+        return Ok(Cell { w, h, x, y, kind });
+    };
+    let members = match find("c") {
+        None => return Err(not_found("c")),
+        Some(Json::Array(m)) => m,
+        Some(_) => return Err("key \"c\" expected an array".into()),
+    };
+    if members.len() < 2 {
+        return Err("nodes must have more than one child".into());
+    }
+    let ch = members.iter().map(|m| parse_json_cell(m, attrs, active)).collect::<Result<Vec<_>, _>>()?;
+    Ok(Cell { w, h, x, y, kind: CellKind::Container(horizontal, ch) })
+}
+
+/// tmux `layout_parse`: apply a layout string, in the old format (`csum,WxH,X,Y...`) or the
+/// JSON one (`{"V":2,"L":{...}}`), to a window whose panes are `panes` (in order) and whose
+/// floating panes are `floating`. Extra cells are closed from the bottom right; the old
+/// format has only tiled panes, so floating panes stay as they are and are added to the root.
+pub fn apply_layout_string(s: &str, panes: &[PaneId], floating: &[(PaneId, FGeom)]) -> Result<Applied, String> {
+    let s = s.trim_start();
+    let mut attrs = Vec::new();
+    let (version, mut cell) = if !s.starts_with('{') {
+        (1u8, parse_v1(s)?)
+    } else {
+        let json = crate::server::json_parse(s)?;
+        let Json::Object(top) = &json else { return Err("invalid layout json".into()) };
+        let v = match top.get("V") {
+            None => return Err("key \"V\" not found".into()),
+            Some(Json::Num(n)) => *n,
+            Some(_) => return Err("key \"V\" expected a number".into()),
+        };
+        let root = match top.get("L") {
+            None => return Err("key \"L\" not found".into()),
+            Some(o @ Json::Object(_)) => o,
+            Some(_) => return Err("key \"L\" expected an object".into()),
+        };
+        let mut active = 0;
+        let cell = parse_json_cell(root, &mut attrs, &mut active)?;
+        if v != 2 {
+            return Err("version mismatch".into());
+        }
+        if active > 1 {
+            return Err("more than one active pane".into());
+        }
+        // tmux layout_parse_ctx_check_indexes
+        let dup = |mut v: Vec<i64>| {
+            v.sort_unstable();
+            v.windows(2).any(|w| w[0] == w[1])
+        };
+        if dup(attrs.iter().map(|a| a.index).collect()) {
+            return Err("duplicate pane index".into());
+        }
+        if dup(attrs.iter().filter_map(|a| a.z).collect()) {
+            return Err("duplicate pane z-index".into());
+        }
+        if dup(attrs.iter().filter_map(|a| a.last).collect()) {
+            return Err("duplicate last pane index".into());
+        }
+        (2u8, cell)
+    };
+    let with_floating = version > 1;
+    let npanes = if with_floating { panes.len() } else { panes.len() - floating.len() };
+    if npanes == 0 {
+        return Err("window has no panes".into());
+    }
+    loop {
+        let ncells = cell.count(with_floating);
+        if npanes > ncells {
+            return Err(format!("have {npanes} panes but need {ncells}"));
+        }
+        if npanes == ncells {
+            break;
+        }
+        if cell.remove_bottom_right().is_none() {
+            return Err("invalid layout".into());
+        }
+    }
+    // older tmux could write a top cell bigger than its children
+    if let CellKind::Container(h, ch) = &cell.kind {
+        let tiled: Vec<&Cell> = ch.iter().filter(|c| c.has_tiled()).collect();
+        if let Some(first) = tiled.first() {
+            let sum = tiled.iter().map(|c| along(*h, Rect { x: 0, y: 0, w: c.w, h: c.h }) as u32 + 1).sum::<u32>() - 1;
+            let (w, hh) = if *h { (sum as u16, first.h) } else { (first.w, sum as u16) };
+            (cell.w, cell.h) = (w, hh);
+        }
+    }
+    if !cell.check_tiled() {
+        return Err("size mismatch after applying layout".into());
+    }
+    let mut slots = Vec::new();
+    cell.slots(&mut slots);
+    let mut map = HashMap::new();
+    let mut applied = Applied { node: Node::Leaf(0), version, zorder: Vec::new(), active: None, last: Vec::new() };
+    if with_floating {
+        // cells in index order get the panes in order
+        let mut order: Vec<PaneId> = slots.iter().map(|s| s.0).collect();
+        order.sort_by_key(|s| attrs[*s as usize].index);
+        for (slot, pane) in order.iter().zip(panes) {
+            map.insert(*slot, *pane);
+        }
+        let mut z: Vec<(i64, PaneId)> = slots.iter().filter(|s| s.1).map(|s| (attrs[s.0 as usize].z.unwrap_or(0), map[&s.0])).collect();
+        z.sort_unstable();
+        applied.zorder = z.into_iter().map(|z| z.1).collect();
+        applied.active = slots.iter().find(|s| attrs[s.0 as usize].active).map(|s| map[&s.0]);
+        let mut last: Vec<(i64, PaneId)> = slots.iter().filter_map(|s| {
+            let a = attrs[s.0 as usize];
+            a.last.filter(|_| !a.active).map(|l| (l, map[&s.0]))
+        }).collect();
+        last.sort_unstable();
+        applied.last = last.into_iter().map(|l| l.1).collect();
+        cell.assign(&map);
+        applied.node = cell.into_tree();
+    } else {
+        let tiled: Vec<PaneId> = panes.iter().copied().filter(|p| !floating.iter().any(|f| f.0 == *p)).collect();
+        for (slot, pane) in slots.iter().zip(&tiled) {
+            map.insert(slot.0, *pane);
+        }
+        cell.assign(&map);
+        let mut node = cell.into_tree();
+        for p in panes {
+            if let Some((_, g)) = floating.iter().find(|f| f.0 == *p) {
+                node = attach_float(node, *p, *g);
+            }
+        }
+        applied.node = node;
+    }
+    Ok(applied)
+}
+
+// ---- n-ary cell operations ----------------------------------------------------------------
+//
+// Floating and tiling a pane and closing a cell follow tmux's n-ary layout cells exactly:
+// the tree is converted to cells at the window size, changed like tmux changes its cells,
+// and converted back (which reproduces the cell sizes exactly).
+
+impl Cell {
+    fn size(&self, horizontal: bool) -> u16 {
+        if horizontal { self.w } else { self.h }
+    }
+
+    fn at(&self, path: &[usize]) -> &Cell {
+        match (path.split_first(), &self.kind) {
+            (Some((i, rest)), CellKind::Container(_, ch)) => ch[*i].at(rest),
+            _ => self,
+        }
+    }
+
+    fn at_mut(&mut self, path: &[usize]) -> &mut Cell {
+        let mut c = self;
+        for i in path {
+            if !matches!(c.kind, CellKind::Container(..)) {
+                break;
+            }
+            let CellKind::Container(_, ch) = &mut c.kind else { unreachable!() };
+            c = &mut ch[*i];
+        }
+        c
+    }
+
+    fn path_to(&self, id: PaneId) -> Option<Vec<usize>> {
+        match &self.kind {
+            CellKind::Leaf(Some(p)) | CellKind::Float(p) if *p == id => Some(Vec::new()),
+            CellKind::Container(_, ch) => ch.iter().enumerate().find_map(|(i, c)| {
+                c.path_to(id).map(|mut p| {
+                    p.insert(0, i);
+                    p
+                })
+            }),
+            _ => None,
+        }
+    }
+
+    /// tmux `layout_resize_check`: how much the cell can shrink.
+    fn resize_check(&self, horizontal: bool) -> i32 {
+        match &self.kind {
+            CellKind::Container(h, ch) if *h == horizontal => ch.iter().filter(|c| c.has_tiled()).map(|c| c.resize_check(horizontal)).sum(),
+            CellKind::Container(_, ch) => ch.iter().filter(|c| c.has_tiled()).map(|c| c.resize_check(horizontal)).min().unwrap_or(0),
+            _ => (self.size(horizontal) as i32 - PANE_MIN as i32).max(0),
+        }
+    }
+
+    /// tmux `layout_resize_adjust`: change the size, sharing it out among the children.
+    fn adjust(&mut self, horizontal: bool, mut change: i32) {
+        let v = (self.size(horizontal) as i32 + change).max(0) as u16;
+        if horizontal { self.w = v } else { self.h = v }
+        let CellKind::Container(h, ch) = &mut self.kind else { return };
+        if *h != horizontal {
+            for c in ch.iter_mut().filter(|c| c.has_tiled()) {
+                c.adjust(horizontal, change);
+            }
+            return;
+        }
+        while change != 0 {
+            let mut changed = false;
+            for c in ch.iter_mut().filter(|c| c.has_tiled()) {
+                if change == 0 {
+                    break;
+                }
+                if change > 0 {
+                    c.adjust(horizontal, 1);
+                    change -= 1;
+                    changed = true;
+                } else if c.resize_check(horizontal) > 0 {
+                    c.adjust(horizontal, -1);
+                    change += 1;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    /// tmux `layout_cell_get_neighbour`: the nearest tiled sibling, after the cell unless it
+    /// is the last one.
+    fn neighbour(&self, path: &[usize]) -> Option<usize> {
+        let (idx, parent) = path.split_last()?;
+        let CellKind::Container(_, ch) = &self.at(parent).kind else { return None };
+        let after = |i: usize| (i + 1..ch.len()).find(|j| ch[*j].has_tiled());
+        let before = |i: usize| (0..i).rev().find(|j| ch[*j].has_tiled());
+        if *idx + 1 == ch.len() { before(*idx).or_else(|| after(*idx)) } else { after(*idx).or_else(|| before(*idx)) }
+    }
+
+    fn parent_type(&self, path: &[usize]) -> Option<bool> {
+        let (_, parent) = path.split_last()?;
+        match &self.at(parent).kind {
+            CellKind::Container(h, _) => Some(*h),
+            _ => None,
+        }
+    }
+
+    /// tmux `layout_remove_tile`: give the cell's space to its neighbour.
+    fn remove_tile(&mut self, path: &[usize]) {
+        let Some(h) = self.parent_type(path) else { return };
+        let (_, parent) = path.split_last().unwrap();
+        match self.neighbour(path) {
+            None => self.remove_tile(parent),
+            Some(n) => {
+                let add = self.at(path).size(h) as i32 + 1;
+                let mut np = parent.to_vec();
+                np.push(n);
+                self.at_mut(&np).adjust(h, add);
+            }
+        }
+        let lc = self.at_mut(path);
+        (lc.w, lc.h, lc.x, lc.y) = (0, 0, 0, 0);
+    }
+
+    /// tmux `layout_insert_tile`: take half the space of the cell's neighbour.
+    fn insert_tile(&mut self, path: &[usize], area: Rect) -> Result<(), String> {
+        let Some(h) = self.parent_type(path) else {
+            let lc = self.at_mut(path);
+            (lc.w, lc.h, lc.x, lc.y) = (area.w, area.h, 0, 0);
+            return Ok(());
+        };
+        let (_, parent) = path.split_last().unwrap();
+        match self.neighbour(path) {
+            None => {
+                self.insert_tile(parent, area)?;
+                let size = self.at(parent).size(h);
+                let lc = self.at_mut(path);
+                if h { lc.w = size } else { lc.h = size }
+            }
+            Some(n) => {
+                let mut np = parent.to_vec();
+                np.push(n);
+                let ss = self.at(&np).size(h);
+                if ss < PANE_MIN * 2 + 1 {
+                    return Err("no space for a new pane".into());
+                }
+                let s2 = ((ss + 1) / 2 - 1).clamp(PANE_MIN, ss - 2);
+                let s1 = ss - 1 - s2;
+                self.at_mut(&np).adjust(h, s2 as i32 - ss as i32);
+                let lc = self.at_mut(path);
+                if h { lc.w = s1 } else { lc.h = s1 }
+            }
+        }
+        let cross = self.at(parent).size(!h);
+        let lc = self.at_mut(path);
+        if h { lc.h = cross } else { lc.w = cross }
+        Ok(())
+    }
+
+    /// tmux `layout_fix_offsets`: tiled children follow one another.
+    fn fix_offsets(&mut self) {
+        let (x, y) = (self.x, self.y);
+        let CellKind::Container(h, ch) = &mut self.kind else { return };
+        let mut off = if *h { x } else { y };
+        for c in ch.iter_mut().filter(|c| c.has_tiled()) {
+            if *h { (c.x, c.y) = (off, y) } else { (c.x, c.y) = (x, off) }
+            c.fix_offsets();
+            off += c.size(*h) as i32 + 1;
+        }
+    }
+
+    /// tmux `layout_destroy_cell`. Returns false when no cell is left.
+    fn destroy(&mut self, path: &[usize]) -> bool {
+        let Some((idx, parent)) = path.split_last() else { return false };
+        let h = self.parent_type(path).unwrap_or(false);
+        if self.at(path).has_tiled() {
+            match self.neighbour(path) {
+                Some(n) => {
+                    let add = self.at(path).size(h) as i32 + 1;
+                    let mut np = parent.to_vec();
+                    np.push(n);
+                    self.at_mut(&np).adjust(h, add);
+                }
+                None => self.remove_tile(parent),
+            }
+        }
+        let pc = self.at_mut(parent);
+        if let CellKind::Container(_, ch) = &mut pc.kind {
+            ch.remove(*idx);
+            if ch.len() == 1 {
+                let only = ch.pop().unwrap();
+                *pc = only;
+                if parent.is_empty() && pc.has_tiled() {
+                    (pc.x, pc.y) = (0, 0);
+                }
+            }
+        }
+        true
+    }
+}
+
+impl Node {
+    /// Apply a tmux cell operation to the tree laid out over `area`.
+    fn with_cells<T>(&mut self, area: Rect, f: impl FnOnce(&mut Cell) -> Result<T, String>) -> Result<T, String> {
+        let mut cell = self.to_cell(area);
+        let out = f(&mut cell)?;
+        if cell.has_tiled() && matches!(cell.kind, CellKind::Leaf(_) | CellKind::Container(..)) {
+            (cell.x, cell.y) = (0, 0);
+            cell.fix_offsets();
+        }
+        *self = cell.into_tree();
+        Ok(out)
+    }
+
+    /// break-pane -W: float tiled pane `id` at `g`, its space going to its neighbour.
+    pub fn float_pane(&mut self, id: PaneId, g: FGeom, area: Rect) -> Result<(), String> {
+        self.with_cells(area, |c| {
+            let path = c.path_to(id).ok_or("pane not found")?;
+            if !matches!(c.at(&path).kind, CellKind::Leaf(_)) {
+                return Err("pane is already floating".into());
+            }
+            c.remove_tile(&path);
+            let lc = c.at_mut(&path);
+            *lc = Cell { w: g.w, h: g.h, x: g.x, y: g.y, kind: CellKind::Float(id) };
+            Ok(())
+        })
+    }
+
+    /// join-pane of a floating pane onto itself: tile it again where it was.
+    pub fn tile_pane(&mut self, id: PaneId, area: Rect) -> Result<(), String> {
+        self.with_cells(area, |c| {
+            let path = c.path_to(id).ok_or("pane not found")?;
+            if !matches!(c.at(&path).kind, CellKind::Float(_)) {
+                return Err("pane is not floating".into());
+            }
+            c.at_mut(&path).kind = CellKind::Leaf(Some(id));
+            c.insert_tile(&path, area)
+        })
+    }
+
+    /// tmux `layout_close_pane`: remove pane `id`, its space going to its neighbour. None
+    /// when no pane is left.
+    pub fn close(mut self, id: PaneId, area: Rect) -> Option<Node> {
+        let mut alive = true;
+        let found = self.with_cells(area, |c| {
+            let path = c.path_to(id).ok_or("pane not found")?;
+            alive = c.destroy(&path);
+            Ok(())
+        });
+        match found {
+            Err(_) => Some(self),
+            Ok(()) if alive => Some(self),
+            Ok(()) => None,
+        }
+    }
+}
+
+/// Add a floating pane at the end of the root node (a leaf root becomes a top-bottom node),
+/// as tmux does for floating panes kept by an old-format layout or a preset.
+pub fn attach_float(root: Node, id: PaneId, g: FGeom) -> Node {
+    let horizontal = matches!(root, Node::Split { horizontal: true, .. } if root.has_tiled());
+    Node::Split { horizontal, ratio: 0.5, a: Box::new(root), b: Box::new(Node::Float(id, g)) }
+}
+
+/// Parse a tmux layout string onto `panes` (all tiled).
+#[allow(dead_code)]
+pub fn parse_layout_string(s: &str, panes: &[PaneId], _area: Rect) -> Result<Node, String> {
+    apply_layout_string(s, panes, &[]).map(|a| a.node)
 }
 
 #[allow(dead_code)]
 impl Node {
     fn leaves_mut<'a>(&'a mut self, out: &mut Vec<&'a mut PaneId>) {
         match self {
-            Node::Leaf(p) => out.push(p),
+            Node::Leaf(p) | Node::Float(p, _) => out.push(p),
             Node::Split { a, b, .. } => {
                 a.leaves_mut(out);
                 b.leaves_mut(out);
@@ -559,7 +1331,7 @@ impl Node {
 
     fn contains(&self, id: PaneId) -> bool {
         match self {
-            Node::Leaf(p) => *p == id,
+            Node::Leaf(p) | Node::Float(p, _) => *p == id,
             Node::Split { a, b, .. } => a.contains(id) || b.contains(id),
         }
     }
@@ -622,7 +1394,7 @@ impl Node {
             return Some(self);
         }
         match self {
-            Node::Leaf(_) => None,
+            Node::Leaf(_) | Node::Float(..) => None,
             Node::Split { a, b, .. } => match a.find_leaf_node(id) {
                 Some(n) => Some(n),
                 None => b.find_leaf_node(id),
@@ -659,6 +1431,7 @@ impl Node {
     /// orientation `horizontal` flattened, as tmux stores them).
     fn group_count(&self, horizontal: bool) -> usize {
         match self {
+            _ if !self.has_tiled() => 0,
             Node::Split { horizontal: h, a, b, .. } if *h == horizontal => a.group_count(horizontal) + b.group_count(horizontal),
             _ => 1,
         }
@@ -666,9 +1439,12 @@ impl Node {
 
     /// The flattened group items with their rects.
     fn group_items<'a>(&'a mut self, horizontal: bool, r: Rect, out: &mut Vec<(&'a mut Node, Rect)>) {
+        if !self.has_tiled() {
+            return;
+        }
         if self.is_split(horizontal) {
             if let Node::Split { ratio, a, b, .. } = self {
-                let (ra, rb) = child_rects(horizontal, *ratio, r);
+                let (ra, rb) = tiled_rects(horizontal, *ratio, a, b, r);
                 a.group_items(horizontal, ra, out);
                 b.group_items(horizontal, rb, out);
             }
@@ -681,6 +1457,8 @@ impl Node {
     /// Returns the total cell count of the group.
     fn assign_group(&mut self, horizontal: bool, sizes: &[u16]) -> u16 {
         match self {
+            Node::Split { horizontal: h, a, b, .. } if *h == horizontal && !a.has_tiled() => b.assign_group(horizontal, sizes),
+            Node::Split { horizontal: h, a, b, .. } if *h == horizontal && !b.has_tiled() => a.assign_group(horizontal, sizes),
             Node::Split { horizontal: h, ratio, a, b } if *h == horizontal => {
                 let na = a.group_count(horizontal);
                 let ta = a.assign_group(horizontal, &sizes[..na]);
@@ -710,6 +1488,7 @@ impl Node {
     fn set_size_axis(&mut self, target: PaneId, horizontal: bool, want: u16, r: Rect) -> Option<bool> {
         let h = match self {
             Node::Leaf(p) => return (*p == target).then_some(false),
+            Node::Float(..) => return None,
             Node::Split { horizontal, .. } => *horizontal,
         };
         let mut items = Vec::new();
@@ -735,7 +1514,7 @@ impl Node {
     /// ancestors only if that group already has tmux's even sizes.
     pub fn spread(&mut self, target: PaneId, area: Rect) -> bool {
         let h = match self {
-            Node::Leaf(_) => return false,
+            Node::Leaf(_) | Node::Float(..) => return false,
             Node::Split { horizontal, .. } => *horizontal,
         };
         let mut items = Vec::new();
@@ -757,8 +1536,9 @@ impl Node {
     fn to_cell(&self, r: Rect) -> Cell {
         let kind = match self {
             Node::Leaf(p) => CellKind::Leaf(Some(*p)),
+            Node::Float(p, g) => return Cell { w: g.w, h: g.h, x: g.x, y: g.y, kind: CellKind::Float(*p) },
             Node::Split { horizontal, ratio, a, b } => {
-                let (ra, rb) = child_rects(*horizontal, *ratio, r);
+                let (ra, rb) = tiled_rects(*horizontal, *ratio, a, b, r);
                 let mut children = Vec::new();
                 for c in [a.to_cell(ra), b.to_cell(rb)] {
                     match c.kind {
@@ -769,14 +1549,29 @@ impl Node {
                 CellKind::Container(*horizontal, children)
             }
         };
-        Cell { w: r.w, h: r.h, x: r.x, y: r.y, kind }
+        Cell { w: r.w, h: r.h, x: r.x as i32, y: r.y as i32, kind }
     }
 
-    /// tmux layout string (`csum,WxH,X,Y{...}`) for this tree laid out over `area`.
+    /// tmux's old (version 1) layout string (`csum,WxH,X,Y{...}`) for this tree laid out
+    /// over `area`. It has only the tiled panes (tmux `layout_custom_copy_layout`): floating
+    /// cells are left out and nodes left with one child are replaced by it.
     pub fn to_layout_string(&self, area: Rect) -> String {
+        let Some(mut cell) = self.to_cell(area).tiled_only() else { return "0000,".into() };
+        if matches!(cell.kind, CellKind::Leaf(_)) {
+            (cell.x, cell.y) = (0, 0);
+        }
         let mut body = String::new();
-        self.to_cell(area).dump(&mut body);
+        cell.dump(&mut body);
         format!("{:04x},{body}", layout_checksum(&body))
+    }
+
+    /// tmux's JSON (version 2) layout string: every cell, including floating ones, with
+    /// what `info` tells about each pane.
+    pub fn to_json_layout(&self, area: Rect, info: &dyn Fn(PaneId) -> LeafInfo) -> String {
+        let mut out = String::from("{\"V\":2,\"L\":");
+        self.to_cell(area).dump_json(&mut out, info);
+        out.push('}');
+        out
     }
 }
 
@@ -1243,10 +2038,18 @@ mod tests {
         let good = format!("{},{body}", tmux_csum(body));
         assert!(parse_layout_string(&good, &[1, 2], a).is_ok());
         assert!(parse_layout_string(&good, &[1, 2, 3], a).is_err());
-        assert!(parse_layout_string(&good, &[1], a).is_err());
+        // fewer panes than cells: tmux closes cells from the bottom right
+        let t = parse_layout_string(&good, &[1], a).unwrap();
+        assert_eq!(rects(&t, a), vec![(1, a)]);
+        assert_eq!(parse_layout_string(&good, &[1, 2, 3], a).unwrap_err(), "have 3 panes but need 2");
+        assert_eq!(parse_layout_string("bad", &[1], a).unwrap_err(), "malformed layout header");
+        assert_eq!(parse_layout_string("1234,80x24,0,0", &[1], a).unwrap_err(), "invalid layout checksum");
         assert!(parse_layout_string(&format!("0000,{body}"), &[1, 2], a).is_err());
         assert!(parse_layout_string(body, &[1, 2], a).is_err());
-        for bad in ["159x48,0,0{79x48,0,0,1,78x48,80,0,2}", "159x48,0,0{79x48,0,0,1,79x47,80,0,2}", "159x48,0,0{79x48,0,0,1", "159x48,0,0,1junk", "x"] {
+        // a top cell bigger than its children is corrected (older tmux wrote such layouts)
+        let fixed = "159x48,0,0{79x48,0,0,1,78x48,80,0,2}";
+        assert!(parse_layout_string(&format!("{},{fixed}", tmux_csum(fixed)), &[1, 2], a).is_ok());
+        for bad in ["159x48,0,0{79x48,0,0,1,79x47,80,0,2}", "159x48,0,0{79x48,0,0,1", "159x48,0,0,1junk", "x"] {
             assert!(parse_layout_string(&format!("{},{bad}", tmux_csum(bad)), &[1, 2], a).is_err(), "{bad}");
         }
     }

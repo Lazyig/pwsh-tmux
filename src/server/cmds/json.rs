@@ -20,7 +20,7 @@ enum Tok {
     Eof,
 }
 
-enum Node {
+pub enum Node {
     Str(String),
     Num(i64),
     Bool(bool),
@@ -267,8 +267,8 @@ fn append(out: &mut String, n: &Node) {
     }
 }
 
-/// Parses `input` and prints it back in tmux's canonical form.
-pub fn normalize(input: &str) -> Result<String, String> {
+/// Parses `input` (tmux `json_parse`); the top level is an object.
+pub fn parse(input: &str) -> Result<Node, String> {
     if input.is_empty() {
         return Err("empty input".into());
     }
@@ -281,6 +281,12 @@ pub fn normalize(input: &str) -> Result<String, String> {
     if p.ty() != Tok::Eof {
         return Err(p.err("unexpected trailing data"));
     }
+    Ok(node)
+}
+
+/// Parses `input` and prints it back in tmux's canonical form.
+pub fn normalize(input: &str) -> Result<String, String> {
+    let node = parse(input)?;
     let mut out = String::new();
     append(&mut out, &node);
     Ok(out)

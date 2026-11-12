@@ -33,6 +33,8 @@ pub struct Flags {
     pub no_output: bool,
     pub wait_exit: bool,
     pub ignore_size: bool,
+    /// new-layouts: JSON layouts in formats and %layout-change (others get the old format).
+    pub new_layouts: bool,
     pub exiting: std::cell::Cell<bool>,
     pub panes: HashMap<PaneId, PaneOutput>,
     /// name -> (what, format, last value per target)
@@ -199,6 +201,7 @@ impl Server {
                     c.readonly = on || c.acl_readonly;
                 }
                 None if name == "ignore-size" => c.ctl.ignore_size = on,
+                None if name == "new-layouts" => c.ctl.new_layouts = on,
                 None if matches!(name, "active-pane" | "no-detach-on-destroy") => {}
                 _ => return Err(format!("unknown flag: {name}")),
             }
@@ -312,7 +315,9 @@ impl Server {
         seen.active_window = Some(s.active_window());
         for wid in s.links.values() {
             let w = &self.windows[wid];
-            seen.windows.insert(*wid, (w.name.clone(), w.layout.to_layout_string(self.window_area(*wid))));
+            // "#{window_layout} #{window_visible_layout}": old-format unless new-layouts
+            let layouts = format!("{} {}", self.window_layout(*wid, false, Some(cid)).unwrap_or_default(), self.window_layout(*wid, true, Some(cid)).unwrap_or_default());
+            seen.windows.insert(*wid, (w.name.clone(), layouts));
             seen.active_pane.insert(*wid, w.active);
             for p in w.panes() {
                 seen.pane_modes.insert(p, self.panes.get(&p).is_some_and(|x| x.mode.is_some()));
@@ -354,7 +359,7 @@ impl Server {
                             }
                             if old_layout != layout {
                                 let zoomed = self.windows.get(wid).is_some_and(|w| w.zoomed);
-                                out.push_str(&format!("%layout-change @{wid} {layout} {layout} {}\n", if zoomed { "*Z" } else { "*" }));
+                                out.push_str(&format!("%layout-change @{wid} {layout} {}\n", if zoomed { "*Z" } else { "*" }));
                             }
                         }
                     }

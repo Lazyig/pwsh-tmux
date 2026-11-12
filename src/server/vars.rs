@@ -142,6 +142,9 @@ impl Server {
         if self.marked.is_some_and(|m| w.panes().contains(&m)) {
             f.push('M');
         }
+        if w.modal.is_some() {
+            f.push('O');
+        }
         if w.zoomed {
             f.push('Z');
         }
@@ -357,7 +360,8 @@ impl Vars for VarCtx<'_> {
             "window_zoomed_flag" => win.map(|w| b(w.zoomed)),
             "window_width" => win.map(|w| w.sx.to_string()),
             "window_height" => win.map(|w| w.sy.to_string()),
-            "window_layout" | "window_visible_layout" => win.map(|w| w.layout.to_layout_string(srv.window_area(w.id))),
+            // JSON layouts (tmux 3.8), the old format for control clients without new-layouts
+            "window_layout" | "window_visible_layout" => win.and_then(|w| srv.window_layout(w.id, name == "window_visible_layout", self.client)),
             "window_activity" => win.map(|w| w.activity.to_string()),
             "window_created" => win.map(|w| w.created.to_string()),
             "window_activity_flag" => Some(b(sess.zip(t.idx).is_some_and(|(s, i)| s.alerts.get(&i).is_some_and(|a| a & ALERT_ACTIVITY != 0)))),
@@ -389,8 +393,7 @@ impl Vars for VarCtx<'_> {
                 if srv.opt_window(Some(w.id), "window-size") != "manual" { String::new() }
                 else if name == "window_manual_width" { w.sx.to_string() } else { w.sy.to_string() }
             }),
-            // no floating panes yet, so never a modal one
-            "window_modal_pane" => None,
+            "window_modal_pane" => win.and_then(|w| w.modal).map(|m| format!("%{m}")),
             "window_offset_x" | "window_offset_y" => Some("0".into()),
             "window_format" => Some(b(win.is_some())),
             // pane
@@ -413,7 +416,7 @@ impl Vars for VarCtx<'_> {
             "pane_width" => pane.map(|p| p.size.0.to_string()),
             "pane_height" => pane.map(|p| p.size.1.to_string()),
             "pane_active" => Some(b(win.zip(t.pane).is_some_and(|(w, p)| w.active == p))),
-            "pane_last" => Some(b(win.zip(t.pane).is_some_and(|(w, p)| w.last_active == Some(p)))),
+            "pane_last" => Some(b(win.zip(t.pane).is_some_and(|(w, p)| w.last() == Some(p)))),
             "pane_marked" => Some(b(t.pane.is_some() && srv.marked == t.pane)),
             "pane_marked_set" => Some(b(srv.marked.is_some())),
             "pane_dead" => pane.map(|p| b(p.dead.is_some())),
@@ -430,17 +433,21 @@ impl Vars for VarCtx<'_> {
             "pane_synchronized" => t.pane.map(|p| b(options::is_on(&srv.opt_pane(p, "synchronize-panes")))),
             "pane_format" => Some(b(pane.is_some())),
             "pane_created" => pane.map(|p| p.created.to_string()),
+            // tmux window_pane_printable_flags: active, last, zoomed, floating, above the zoom, modal
             "pane_flags" => win.zip(pane).map(|(w, p)| {
                 let mut f = String::new();
                 if w.active == p.id { f.push('*'); }
-                if w.last_active == Some(p.id) { f.push('-'); }
-                if w.zoomed && w.active == p.id { f.push('Z'); }
+                if w.last() == Some(p.id) { f.push('-'); }
+                if srv.zoomed_pane(w.id) == Some(p.id) { f.push('Z'); }
+                if srv.shown_floating(w.id, p.id) { f.push('F'); }
+                if p.fflags & super::float::OVER_ZOOM != 0 { f.push('A'); }
+                if w.modal == Some(p.id) { f.push('O'); }
                 f
             }),
-            "pane_zoomed_flag" => win.zip(pane).map(|(w, p)| b(w.zoomed && w.active == p.id)),
-            // floating panes are not implemented: every pane is tiled, none is modal
-            "pane_floating_flag" | "pane_modal_flag" => pane.map(|_| "0".into()),
-            "pane_z" => pane.map(|_| "1".into()),
+            "pane_zoomed_flag" => win.zip(pane).map(|(w, p)| b(srv.zoomed_pane(w.id) == Some(p.id))),
+            "pane_floating_flag" => win.zip(pane).map(|(w, p)| b(srv.shown_floating(w.id, p.id))),
+            "pane_modal_flag" => win.zip(pane).map(|(w, p)| b(w.modal == Some(p.id))),
+            "pane_z" => win.zip(pane).map(|(w, p)| srv.pane_z(w.id, p.id).to_string()),
             "pane_input_off" => pane.map(|p| b(p.options.get("@input-disabled").is_some_and(options::is_on))),
             "pane_unseen_changes" => pane.map(|p| b(p.track.unseen_changes && p.mode.is_some())),
             "pane_last_output_time" => pane.map(|p| p.track.last_output_time).filter(|t| *t != 0).map(|t| t.to_string()),
@@ -477,8 +484,24 @@ impl Vars for VarCtx<'_> {
             | "pane_unzoomed_width" | "pane_unzoomed_height" => {
                 let (w, p) = (win?, t.pane?);
                 let area = srv.window_area(w.id);
+                // a floating pane's cell (also while hidden by a zoom)
+                if let Some(g) = w.layout.geom(p).filter(|_| srv.zoomed_pane(w.id) != Some(p)) {
+                    let (right, bottom) = (g.x + g.w as i32, g.y + g.h as i32);
+                    return Some(match name {
+                        "pane_left" | "pane_x" => g.x.to_string(),
+                        "pane_top" | "pane_y" => g.y.to_string(),
+                        "pane_right" => (right - 1).to_string(),
+                        "pane_bottom" => (bottom - 1).to_string(),
+                        "pane_unzoomed_width" => g.w.to_string(),
+                        "pane_unzoomed_height" => g.h.to_string(),
+                        "pane_at_left" => b(g.x == 0),
+                        "pane_at_top" => b(g.y == 0),
+                        "pane_at_right" => b(right == w.sx as i32),
+                        _ => b(bottom == w.sy as i32),
+                    });
+                }
                 // a pane hidden by zoom keeps its place in the unzoomed layout
-                let r = if w.zoomed && p != w.active {
+                let r = if srv.zoomed_pane(w.id).is_some_and(|z| z != p) {
                     let (mut panes, mut seps) = (Vec::new(), Vec::new());
                     w.layout.layout(area, &mut panes, &mut seps);
                     panes.into_iter().find(|(id, _)| *id == p)?.1
