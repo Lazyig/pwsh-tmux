@@ -665,6 +665,123 @@ impl Vars for VarCtx<'_> {
         }
         None
     }
+
+    fn environ(&self, name: &str) -> Option<String> {
+        let sess = self.t.sid.and_then(|s| self.srv.sessions.get(&s));
+        match sess.and_then(|s| s.env.get(name)) {
+            Some(v) => v.clone(),
+            None => self.srv.env.get(name).cloned().flatten(),
+        }
+    }
+
+    fn user_options(&self) -> Vec<(String, String)> {
+        self.t.wid.and_then(|w| self.srv.windows.get(&w)).map(|w| w.options.0.iter()
+            .filter(|(k, _)| k.starts_with('@')).map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default()
+    }
+
+    fn client_info(&self, kind: char, name: &str) -> Option<String> {
+        let c = self.client.and_then(|id| self.srv.clients.get(&id)).filter(|c| c.attached)?;
+        let ident = c.ident.as_ref()?;
+        Some(match kind {
+            'e' => ident.env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()).unwrap_or_default(),
+            'f' => b(c.features.list().split(',').any(|f| f == name)),
+            // No terminfo database is kept, so no capability is known.
+            _ => "0".into(),
+        })
+    }
+
+    fn client_contexts(&self, flags: &str) -> Vec<Box<dyn Vars + '_>> {
+        // Attached clients in creation order, or by name (n) or most recent activity (t).
+        let mut clients: Vec<_> = self.srv.clients.values().filter(|c| c.attached).collect();
+        clients.sort_by_key(|c| c.id);
+        if flags.contains('n') {
+            clients.sort_by_key(|c| c.name());
+        } else if flags.contains('t') {
+            clients.sort_by_key(|c| (std::cmp::Reverse(c.activity), c.name()));
+        }
+        if flags.contains('r') {
+            clients.reverse();
+        }
+        clients.into_iter().map(|c| -> Box<dyn Vars + '_> {
+            Box::new(VarCtx { srv: self.srv, t: self.t, client: Some(c.id), extra: self.extra.clone() })
+        }).collect()
+    }
+
+    fn entries(&self, kind: char, flags: &str) -> Vec<HashMap<String, String>> {
+        let srv = self.srv;
+        if kind == 'V' {
+            // V or V/s: the session environment, V/g: global, V/c: the client's.
+            let mut env: Vec<(String, Option<String>)> = match flags {
+                "" | "s" => self.t.sid.and_then(|s| srv.sessions.get(&s)).map(|s| s.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default(),
+                "g" => srv.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                "c" => self.client.and_then(|c| srv.clients.get(&c)).and_then(|c| c.ident.as_ref())
+                    .map(|i| i.env.iter().map(|(k, v)| (k.clone(), Some(v.clone()))).collect()).unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            env.sort();
+            env.dedup_by(|a, b| a.0 == b.0);
+            return env.into_iter().map(|(name, value)| HashMap::from([
+                ("environ_name".into(), name),
+                ("environ_removed".into(), b(value.is_none())),
+                ("environ_value".into(), value.unwrap_or_default()),
+                ("environ_hidden".into(), "0".into()),
+            ])).collect();
+        }
+        if kind != 'O' {
+            return Vec::new();
+        }
+        // Local options of the target by default; g for global, v server, w window, s session, p pane.
+        let flags = if flags.is_empty() { "s" } else { flags };
+        let global = flags.contains('g');
+        let opts = if flags.contains('v') {
+            Some(&srv.opts_server)
+        } else if flags.contains('w') {
+            if global { Some(&srv.opts_window) } else { self.t.wid.and_then(|w| srv.windows.get(&w)).map(|w| &w.options) }
+        } else if flags.contains('s') {
+            if global { Some(&srv.opts_session) } else { self.t.sid.and_then(|s| srv.sessions.get(&s)).map(|s| &s.options) }
+        } else if flags.contains('p') {
+            if global { None } else { self.t.pane.and_then(|p| srv.panes.get(&p)).map(|p| &p.options) }
+        } else if global {
+            Some(&srv.opts_session)
+        } else {
+            None
+        };
+        let Some(opts) = opts else { return Vec::new() };
+        // Array items (name[index]) follow their option in index order.
+        let mut items: Vec<(&str, Option<&str>, &String)> = opts.0.iter().map(|(key, value)| {
+            match key.split_once('[') {
+                Some((name, index)) => (name, Some(index.trim_end_matches(']')), value),
+                None => (key.as_str(), None, value),
+            }
+        }).collect();
+        let index_key = |i: Option<&str>| i.map(|i| (i.parse::<u64>().unwrap_or(u64::MAX), i.to_string()));
+        items.sort_by(|a, b| a.0.cmp(b.0).then_with(|| index_key(a.1).cmp(&index_key(b.1))));
+        items.iter().enumerate().map(|(i, &(name, index, value))| {
+            let is_array = index.is_some() || options::def(name).is_some_and(|d| d.kind == options::Kind::Array);
+            let count = items.iter().filter(|o| o.0 == name && o.1.is_some()).count();
+            let first = index.is_none() || i == 0 || items[i - 1].0 != name;
+            let last = index.is_none() || items.get(i + 1).is_none_or(|o| o.0 != name);
+            HashMap::from([
+                ("option_name".into(), name.to_string()),
+                ("option_value".into(), value.clone()),
+                ("option_is_array".into(), b(is_array)),
+                ("option_array_key".into(), index.unwrap_or("").to_string()),
+                ("option_array_index".into(), index.unwrap_or("").to_string()),
+                ("option_array_count".into(), count.to_string()),
+                ("option_array_first".into(), b(is_array && first)),
+                ("option_array_last".into(), b(is_array && last)),
+                // Hooks are not kept as options here.
+                ("option_is_hook".into(), "0".into()),
+                ("option_is_user".into(), b(name.starts_with('@'))),
+            ])
+        }).collect()
+    }
+
+    fn schedule_animation(&self) {
+        if let Some(cid) = self.client {
+            self.srv.animation_deadlines.borrow_mut().entry(cid).or_insert_with(|| Instant::now() + Duration::from_millis(100));
+        }
+    }
 }
 
 #[cfg(test)]

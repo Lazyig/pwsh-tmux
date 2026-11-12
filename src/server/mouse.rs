@@ -50,6 +50,8 @@ enum Where {
     StatusLeft,
     StatusRight,
     StatusDefault,
+    /// A `range=control|N` (KEYC_MOUSE_LOCATION_CONTROL0 + N).
+    Control(u32),
 }
 
 impl Where {
@@ -61,6 +63,7 @@ impl Where {
             Where::StatusLeft => "StatusLeft",
             Where::StatusRight => "StatusRight",
             Where::StatusDefault => "StatusDefault",
+            Where::Control(n) => ["Control0", "Control1", "Control2", "Control3", "Control4", "Control5", "Control6", "Control7", "Control8", "Control9"][n.min(9) as usize],
         }
     }
 }
@@ -269,6 +272,7 @@ impl Server {
                     Where::Status
                 }
                 Some(Range::User(_)) => Where::Status,
+                Some(Range::Control(n)) => Where::Control(n),
             };
             return Some((wh, ctx));
         }

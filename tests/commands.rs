@@ -720,7 +720,8 @@ fn readonly_control_client_cannot_execute_or_remove_restriction() {
     writeln!(stdin, "display-message -p 'READONLY=#{{client_readonly}}'").unwrap();
     stdin.flush().unwrap();
     wait_for("readonly flag retained", || text().contains("READONLY=1"));
-    let oversized = vec!["display-message -p '#{p1048576:#{l:x}}'"; 16].join(" ; ");
+    // About 1MB per reply; tmux limits each padding to 10000 columns.
+    let oversized = vec![format!("display-message -p '{}'", "#{p10000:#{l:x}}".repeat(100)); 16].join(" ; ");
     writeln!(stdin, "{oversized}").unwrap();
     stdin.flush().unwrap();
     wait_for("combined reply rejected", || text().contains("command output limit exceeded"));
@@ -736,8 +737,9 @@ fn readonly_control_client_cannot_execute_or_remove_restriction() {
         .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
     wait_for("subscription client attach", || ctx.ok(&["list-clients"]).lines().count() == 1);
     let mut feed = overflowing.stdin.take().unwrap();
-    writeln!(feed, "refresh-client -B 'first::#{{p1048576:#{{l:x}}}}'").unwrap();
-    writeln!(feed, "refresh-client -B 'second::#{{p1048576:#{{l:x}}}}'").unwrap();
+    let big = "#{p10000:#{l:x}}".repeat(100);
+    writeln!(feed, "refresh-client -B 'first::{big}'").unwrap();
+    writeln!(feed, "refresh-client -B 'second::{big}'").unwrap();
     feed.flush().unwrap();
     wait_for("subscription cache overflow disconnect", || overflowing.try_wait().unwrap().is_some());
     assert!(!overflowing.try_wait().unwrap().unwrap().success());
@@ -972,4 +974,26 @@ fn server_access_groups() {
     assert!(ctx.fails(&["server-access", "-g", "-a", "-d", &group]).contains("cannot be used together"));
     ctx.ok(&["server-access", "-g", "-d", &group]);
     assert_eq!(ctx.ok(&["server-access", "-l"]), "");
+}
+
+#[test]
+fn format_option_environment_and_window_loops() {
+    let ctx = Ctx::new("fmt-loops-38");
+    ctx.ok(&["new-session", "-d", "-s", "f", "-n", "first"]);
+    ctx.ok(&["new-window", "-d", "-t", "f:1", "-n", "second"]);
+    ctx.ok(&["set", "-t", "f", "@b", "2"]);
+    ctx.ok(&["set", "-t", "f", "@a", "1"]);
+    ctx.ok(&["setw", "-t", "f:1", "@c", "red"]);
+    ctx.ok(&["set-environment", "-t", "f", "FMT_SET", "yes"]);
+    ctx.ok(&["set-environment", "-t", "f", "-r", "FMT_GONE"]);
+    let user = "#{O:#{?#{m:@*,#{option_name}},#{option_name}=#{option_value}/#{option_is_user};,}}";
+    assert_eq!(ctx.fmt("f", user), "@a=1/1;@b=2/1;");
+    assert_eq!(ctx.fmt("f", "#{O/gw:#{?#{==:#{option_name},mode-keys},#{option_value},}}"), "emacs");
+    let env = "#{V:#{?#{m:FMT_*,#{environ_name}},#{environ_name}=#{environ_value}/#{environ_removed};,}}";
+    assert_eq!(ctx.fmt("f", env), "FMT_GONE=/1;FMT_SET=yes/0;");
+    assert_eq!(ctx.fmt("f", "#{W:#{window_index}/#{next_window_index}/#{next_@c}/#{window_after_active};}"), "0/1/red/0;1///1;");
+    assert_eq!(ctx.fmt("f", "#{N:second}#{N:third}#{N/s:f}"), "101");
+    // No attached client: no client loop rows, client information or animation.
+    assert_eq!(ctx.fmt("f", "[#{L:x}#{I/f:RGB}#{A:a,b}]"), "[]");
+    assert_eq!(ctx.fmt("f", "#{c:red}#{c/f:themered}#{R:ab,2}"), "800000\x1b[31mabab");
 }

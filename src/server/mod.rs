@@ -786,6 +786,8 @@ pub struct Server {
     pub quit: bool,
     pub had_session: bool,
     pub last_tick: Instant,
+    /// One-shot deadlines armed by status animation formats.
+    pub animation_deadlines: std::cell::RefCell<HashMap<ClientId, Instant>>,
     /// `#(command)` results: last output, when it last started, whether it is running.
     pub shell_cache: std::cell::RefCell<HashMap<String, (String, Instant, bool)>>,
     /// Restriction of the current request, independent of format/command targets.
@@ -917,6 +919,7 @@ impl Server {
             quit: false,
             had_session: false,
             last_tick: Instant::now(),
+            animation_deadlines: Default::default(),
             shell_cache: Default::default(),
             readonly_context: Default::default(),
             groups: HashMap::new(),
@@ -1604,6 +1607,9 @@ impl Server {
                 t = t.min(until.saturating_duration_since(now));
             }
         }
+        for d in self.animation_deadlines.borrow().values() {
+            t = t.min(d.saturating_duration_since(now));
+        }
         t.max(Duration::from_millis(5))
     }
 
@@ -1658,6 +1664,14 @@ impl Server {
                 self.overlay_waits.push((cid, epoch, name, queue));
             }
         }
+        // Animation cycles request a one-shot status redraw every 100ms.
+        self.animation_deadlines.borrow_mut().retain(|cid, deadline| {
+            if *deadline > now { return self.clients.contains_key(cid); }
+            if let Some(c) = self.clients.get_mut(cid) {
+                if c.message.is_none() && c.prompt.is_none() { c.dirty = true; }
+            }
+            false
+        });
         // once a second: status refresh, automatic-rename, silence
         if self.last_tick.elapsed() >= Duration::from_secs(1) {
             self.last_tick = Instant::now();

@@ -289,6 +289,22 @@ fn terminal_features_and_extended_keys() {
 }
 
 #[test]
+fn style_options_are_expanded_as_formats() {
+    // 3.8: a style option with #{ is expanded for the client before it is parsed, so the
+    // comma inside the conditional does not split the style.
+    let ctx = Ctx::new("styleformat");
+    ctx.ok(&["new-session", "-d", "-s", "sf"]);
+    ctx.ok(&["set", "-g", "status-style", "bg=#{?#{==:#{session_name},sf},colour196,colour21}"]);
+    ctx.ok(&["set", "-g", "window-status-current-style", "fg=#{@wfg}"]);
+    ctx.ok(&["set", "-w", "-t", "sf:0", "@wfg", "colour46"]);
+    let t = Term::attach(&ctx, &["attach", "-t", "sf"], 80, 24);
+    t.wait_screen("status", |s| s.contains("[sf]"));
+    wait_for("status-style from a format", || t.raw_text().contains("48;5;196"));
+    wait_for("window style from a window option", || t.raw_text().contains("38;5;46"));
+    assert!(!t.raw_text().contains("48;5;21m"));
+}
+
+#[test]
 fn progress_bar_preserves_dark_truecolor_background_on_blank_cells() {
     let ctx = Ctx::new("progress-colors");
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/ui_fixture.py");
