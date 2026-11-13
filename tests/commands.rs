@@ -1274,3 +1274,31 @@ fn capture_pane_history_times() {
         if *n < 0 { assert!(*time >= before && *time <= before + 60, "{out}"); } else { assert_eq!(*time, 0, "{out}"); }
     }
 }
+
+#[test]
+fn display_message_verbose() {
+    let ctx = Ctx::new("p1fix-dv");
+    ctx.ok(&["new-session", "-d", "-s", "v", "sleep 100"]);
+    // -v: the expansion steps as tmux's format_log prints them, then the result
+    let out = ctx.ok(&["display-message", "-p", "-v", "-t", "v", "#{session_name} #{?#{==:a,a},y,n}"]);
+    let want = "# expanding format: #{session_name} #{?#{==:a,a},y,n}\n\
+# found #{}: session_name\n\
+# format 'session_name' found: v\n\
+# replaced 'session_name' with 'v'\n\
+# found #{}: ?#{==:a,a},y,n\n\
+# condition is: #{==:a,a}\n\
+#  expanding format: #{==:a,a}\n\
+#  found #{}: ==:a,a\n\
+#  modifier 0 is ==\n\
+#   expanding format: a\n\
+#   result is: a\n\
+#   expanding format: a\n\
+#   result is: a\n\
+#  compare == left is: a\n\
+#  compare == right is: a\n\
+#  replaced '==:a,a' with '1'\n\
+#  result is: 1\n\
+# condition '#{==:a,a}' is true\n";
+    assert!(out.starts_with(want), "{out}");
+    assert!(out.ends_with("# result is: v y\nv y\n"), "{out}");
+}

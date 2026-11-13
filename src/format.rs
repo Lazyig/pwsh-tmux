@@ -94,6 +94,15 @@ pub fn expand_status_time(template: &str, vars: &dyn Vars) -> String {
     Expander { time: true, ..Expander::top(vars, Local::now(), Some(ms), &budget) }.expand(template, 0)
 }
 
+/// display-message -v: expand_time, also returning the steps as tmux's FORMAT_VERBOSE logs
+/// them (each line starts with `#` and is indented by the nesting level).
+pub fn expand_time_verbose(template: &str, vars: &dyn Vars) -> (String, Vec<String>) {
+    let budget = std::cell::Cell::new(MAX_FORMAT_WORK);
+    let log = std::cell::RefCell::new(Vec::new());
+    let out = Expander { time: true, log: Some(&log), ..Expander::top(vars, Local::now(), None, &budget) }.expand(template, 0);
+    (out, log.into_inner())
+}
+
 fn expand_time_at(template: &str, vars: &dyn Vars, now: DateTime<Local>) -> String {
     let budget = std::cell::Cell::new(MAX_FORMAT_WORK);
     Expander { time: true, ..Expander::top(vars, now, None, &budget) }.expand(template, 0)
@@ -114,6 +123,8 @@ struct Expander<'a> {
     /// strftime(3) is applied to every format expanded (tmux's FORMAT_EXPAND_TIME), so
     /// also to E: values and other nested formats.
     time: bool,
+    /// FORMAT_VERBOSE: where the expansion steps are logged.
+    log: Option<&'a std::cell::RefCell<Vec<String>>>,
 }
 
 /// Animation frame period in milliseconds (FORMAT_CYCLE_PERIOD).
@@ -261,12 +272,29 @@ fn bool_str(b: bool) -> String {
 
 impl<'a> Expander<'a> {
     fn top(vars: &'a dyn Vars, now: DateTime<Local>, cycle: Option<u64>, budget: &'a std::cell::Cell<usize>) -> Self {
-        Expander { vars, now, budget, cycle, nojobs: false, time: false }
+        Expander { vars, now, budget, cycle, nojobs: false, time: false, log: None }
     }
 
     /// An expander for a nested context (loop row) sharing this one's budget and state.
     fn with<'b>(&'b self, vars: &'b dyn Vars) -> Expander<'b> {
-        Expander { vars, now: self.now, budget: self.budget, cycle: self.cycle, nojobs: self.nojobs, time: self.time }
+        Expander { vars, now: self.now, budget: self.budget, cycle: self.cycle, nojobs: self.nojobs, time: self.time, log: self.log }
+    }
+
+    /// format_log: one verbose line, indented by the nesting level.
+    fn log(&self, depth: usize, line: impl FnOnce() -> String) {
+        if let Some(log) = self.log {
+            log.borrow_mut().push(format!("#{}{}", " ".repeat(depth / 2 + 1), line()));
+        }
+    }
+
+    /// lookup, logged as format_find is.
+    fn lookup_logged(&self, name: &str, time: bool, depth: usize) -> Option<String> {
+        let v = self.lookup(name, time);
+        self.log(depth, || match &v {
+            Some(v) => format!("format '{name}' found: {v}"),
+            None => format!("format '{name}' not found"),
+        });
+        v
     }
 
     /// format_find: a variable or option, then (unless for the t modifier) the session and
@@ -282,6 +310,16 @@ impl<'a> Expander<'a> {
     }
 
     fn expand(&self, s: &str, depth: usize) -> String {
+        if self.log.is_none() || s.is_empty() {
+            return self.expand_inner(s, depth);
+        }
+        self.log(depth, || format!("expanding format: {s}"));
+        let out = self.expand_inner(s, depth);
+        self.log(depth, || format!("result is: {out}"));
+        out
+    }
+
+    fn expand_inner(&self, s: &str, depth: usize) -> String {
         if depth > MAX_DEPTH || s.len() > MAX_FORMAT_BYTES || s.len().saturating_add(1) > self.budget.get() {
             return String::new();
         }
@@ -395,11 +433,29 @@ impl<'a> Expander<'a> {
     /// search, repeat, boolean operators, comparisons, conditionals, expressions, then a
     /// variable) gives the value, which E/T, s, =, p, n and w then modify in that order.
     fn replace(&self, content: &str, depth: usize) -> Option<String> {
+        if self.log.is_none() {
+            return self.replace_inner(content, depth);
+        }
+        self.log(depth, || format!("found #{{}}: {content}"));
+        let v = self.replace_inner(content, depth);
+        if let Some(v) = &v {
+            self.log(depth, || format!("replaced '{content}' with '{v}'"));
+        }
+        v
+    }
+
+    fn replace_inner(&self, content: &str, depth: usize) -> Option<String> {
         let (mut mods, copy) = parse_modifiers(content).unwrap_or((Vec::new(), content));
         // Arguments are unescaped and expanded once, when the modifiers are built.
         for m in &mut mods {
             for a in &mut m.args {
                 *a = self.expand(&unescape_format(a), depth + 1);
+            }
+        }
+        for (i, m) in mods.iter().enumerate() {
+            self.log(depth, || format!("modifier {i} is {}", m.name));
+            for (j, a) in m.args.iter().enumerate() {
+                self.log(depth, || format!("modifier {i} argument {j}: {a}"));
             }
         }
         // format_replace walks the modifiers in order, so of a repeated modifier the last one
@@ -476,6 +532,8 @@ impl<'a> Expander<'a> {
         } else if let Some(m) = compare {
             let (a, b) = split2(copy)?;
             let (a, b) = (ex(a), ex(b));
+            self.log(depth, || format!("compare {} left is: {a}", m.name));
+            self.log(depth, || format!("compare {} right is: {b}", m.name));
             match m.name {
                 "==" => bool_str(a == b),
                 "!=" => bool_str(a != b),
@@ -499,6 +557,7 @@ impl<'a> Expander<'a> {
             let mut i = 0;
             let mut chosen = None;
             while i + 1 < parts.len() {
+                self.log(depth, || format!("condition is: {}", parts[i]));
                 let cond = match self.lookup(parts[i], time) {
                     Some(v) => v,
                     None => {
@@ -506,6 +565,7 @@ impl<'a> Expander<'a> {
                         if e == parts[i] { String::new() } else { e }
                     }
                 };
+                self.log(depth, || format!("condition '{}' is {}", parts[i], if truthy(&cond) { "true" } else { "false" }));
                 if truthy(&cond) {
                     chosen = Some(parts[i + 1]);
                     break;
@@ -524,7 +584,7 @@ impl<'a> Expander<'a> {
             // not apply to it.
             ex(copy)
         } else {
-            match self.lookup(copy, time) {
+            match self.lookup_logged(copy, time, depth) {
                 None => String::new(),
                 Some(v) if time => self.format_time(&v, &mods).unwrap_or_default(),
                 Some(mut v) => {

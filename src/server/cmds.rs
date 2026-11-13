@@ -2780,7 +2780,15 @@ impl Server {
                 };
                 // -l: literal, -j: JSON printed back in tmux's form; -C (keep updating the
                 // pane) and -N (ignore keys) are how messages behave here anyway
-                let msg = if o.has('l') { fmt.to_string() } else {
+                let msg = if o.has('l') { fmt.to_string() } else if o.has('v') {
+                    // -v: the expansion steps are printed first
+                    let (msg, log) = crate::format::expand_time_verbose(fmt, &super::vars::VarCtx { srv: self, t: tt, client: fc, extra });
+                    for line in log {
+                        ctx.out.push_str(&line);
+                        ctx.out.push('\n');
+                    }
+                    msg
+                } else {
                     crate::format::expand_time(fmt, &super::vars::VarCtx { srv: self, t: tt, client: fc, extra })
                 };
                 let msg = if o.has('j') { json::normalize(&msg)? } else { msg };
