@@ -33,6 +33,7 @@ fn fixture() -> (Server, mpsc::Receiver<Event>) {
             last_session: None,
             created: now,
             activity: now,
+            activity_seq: 0,
             drag: None,
             title: String::new(),
             suspended: false,

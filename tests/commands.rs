@@ -1378,3 +1378,54 @@ fn argument_counts_and_parse_errors() {
     assert_eq!(ctx.fails(&["display-message", "-t"]).trim(), "command display-message: -t expects an argument");
     assert_eq!(ctx.ok(&["display-message", "-p", "-t", "a", "#S"]), "a\n");
 }
+
+#[test]
+fn cmd_find_errors_and_canfail_targets() {
+    let ctx = Ctx::new("p1fix-find");
+    ctx.ok(&["new-session", "-d", "-s", "s0", "-x", "80", "-y", "24", "sleep 100"]);
+    // an unknown @id used to recurse until the server's stack overflowed
+    for cmd in ["select-pane", "select-window", "has-session", "list-windows"] {
+        assert_eq!(ctx.fails(&[cmd, "-t", "@99"]).trim(), "can't find window: @99", "{cmd}");
+    }
+    assert_eq!(ctx.ok(&["display-message", "-p", "-t", "@99", "[#S]"]), "[]\n");
+    ctx.ok(&["has-session", "-t", "s0"]);
+    // the failing part, as cmd_find_target reports it
+    for (cmd, t, e) in [
+        ("select-pane", "nosuch", "can't find pane: nosuch"),
+        ("select-window", "nosuch", "can't find window: nosuch"),
+        ("has-session", "nosuch", "can't find session: nosuch"),
+        ("has-session", "nosuch:", "can't find session: nosuch"),
+        ("has-session", ":nosuch", "can't find window: nosuch"),
+        ("has-session", "s0:9", "can't find window: 9"),
+        ("select-window", "s0:0.9", "can't find pane: 9"),
+        ("select-window", "%99", "can't find pane: %99"),
+        ("has-session", "$99", "can't find session: $99"),
+        ("select-pane", "nosuch.1", "can't find window: nosuch"),
+        ("select-pane", "=s", "can't find pane: =s"),
+        ("has-session", "=s", "can't find session: s"),
+    ] {
+        assert_eq!(ctx.fails(&[cmd, "-t", t]).trim(), e, "{cmd} -t {t}");
+    }
+    ctx.ok(&["select-window", "-t", "=s"]);
+    // display-message's target can fail: what was found stays, the rest is empty
+    assert_eq!(ctx.ok(&["display-message", "-p", "-t", "nosuch", "[#S:#I]"]), "[:]\n");
+    assert_eq!(ctx.ok(&["display-message", "-p", "-t", "s0:7", "#{session_format}#{window_format}#{pane_format} [#S:#I.#P]"]), "100 [s0:0.0]\n");
+    assert_eq!(ctx.ok(&["display-message", "-p", "-t", "s0:0.5", "#{session_format}#{window_format}#{pane_format} [#S:#I.#P]"]), "010 [s0:0.0]\n");
+    assert_eq!(ctx.fails(&["display-message", "-d", "abc", "hi"]).trim(), "delay invalid");
+    assert_eq!(ctx.fails(&["display-message", "-d", "-1", "-p", "hi"]).trim(), "delay too small");
+}
+
+#[test]
+fn format_type_follows_the_target() {
+    let ctx = Ctx::new("p1fix-ftype");
+    ctx.ok(&["new-session", "-d", "-s", "s0", "sleep 100"]);
+    ctx.ok(&["new-window", "-d", "sleep 100"]);
+    let f = "#{session_format}#{window_format}#{pane_format}";
+    assert_eq!(ctx.ok(&["display-message", "-p", f]), "001\n");
+    assert_eq!(ctx.ok(&["list-windows", "-F", f]), "010\n010\n");
+    assert_eq!(ctx.ok(&["list-sessions", "-F", f]), "100\n");
+    assert_eq!(ctx.ok(&["list-panes", "-F", f]), "001\n");
+    assert_eq!(ctx.ok(&["display-message", "-p", &format!("#{{S:{f}}} #{{W:{f}}} #{{P:{f}}}")]), "100 010010 001\n");
+    // format_defaults fills in the session's current pane
+    assert_eq!(ctx.ok(&["list-sessions", "-F", "#{pane_index}"]), "0\n");
+}

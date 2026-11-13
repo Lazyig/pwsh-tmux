@@ -597,6 +597,8 @@ pub struct Client {
     pub last_session: Option<SessId>,
     pub created: u64,
     pub activity: u64,
+    /// activity_seq() at the last key: tmux compares activity timevals, finer than seconds.
+    pub activity_seq: u64,
     pub drag: Option<Drag>,
     pub title: String,
     pub suspended: bool,
@@ -1242,6 +1244,7 @@ impl Server {
                 last_session: None,
                 created: now,
                 activity: now,
+                activity_seq: activity_seq(),
                 drag: None,
                 title: String::new(),
                 suspended: false,
@@ -1369,6 +1372,7 @@ impl Server {
             C_INPUT => {
                 if let Some(c) = self.clients.get_mut(&cid) {
                     c.activity = now_secs();
+                    c.activity_seq = activity_seq();
                 }
                 // so does the session's (server_client_handle_key)
                 if let Some(s) = self.clients.get(&cid).filter(|c| c.attached).and_then(|c| c.session).and_then(|s| self.sessions.get_mut(&s)) {

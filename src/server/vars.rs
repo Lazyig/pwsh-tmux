@@ -12,6 +12,10 @@ pub struct Target {
     pub pane: Option<PaneId>,
 }
 
+/// An `extra` entry naming the format's type (format_defaults' ft->type): "S", "W", "P" or
+/// "" for none; without it the type is the most specific part of the target.
+pub const FORMAT_TYPE: &str = "\u{1}format_type";
+
 pub struct VarCtx<'a> {
     pub srv: &'a Server,
     pub t: Target,
@@ -188,8 +192,11 @@ impl Vars for VarCtx<'_> {
             targets.sort_by_key(|(t, _)| std::cmp::Reverse(self.srv.windows[&t.wid.unwrap()].activity));
         }
         if flags.contains('r') { targets.reverse(); }
+        // the loops' format_defaults pass the session, the winlink, or the pane
+        let mut extra = self.extra.clone();
+        extra.insert(FORMAT_TYPE.to_string(), match kind { 'S' => "S", 'W' => "W", _ => "P" }.to_string());
         targets.into_iter().map(|(t, active)| {
-            let ctx: Box<dyn Vars + '_> = Box::new(VarCtx { srv: self.srv, t, client: self.client, extra: self.extra.clone() });
+            let ctx: Box<dyn Vars + '_> = Box::new(VarCtx { srv: self.srv, t, client: self.client, extra: extra.clone() });
             (ctx, active)
         }).collect()
     }
@@ -244,11 +251,30 @@ impl Vars for VarCtx<'_> {
             return Some(v.clone());
         }
         let srv = self.srv;
-        let t = self.t;
+        let mut t = self.t;
+        let client = self.client.and_then(|c| srv.clients.get(&c));
+        let ftype = match self.extra.get(FORMAT_TYPE) {
+            Some(ty) => ty.as_str(),
+            None if t.pane.is_some() => "P",
+            None if t.wid.is_some() => "W",
+            None if t.sid.is_some() => "S",
+            None => "",
+        };
+        // format_defaults: the client's session, the session's current window and the
+        // window's active pane stand in for what the target leaves out
+        if t.sid.is_none() {
+            t.sid = client.and_then(|c| c.session).filter(|s| srv.sessions.contains_key(s));
+        }
+        if t.wid.is_none() && let Some(s) = t.sid.and_then(|s| srv.sessions.get(&s)) {
+            t.idx = Some(s.active);
+            t.wid = s.links.get(&s.active).copied();
+        }
+        if t.pane.is_none() {
+            t.pane = t.wid.and_then(|w| srv.windows.get(&w)).map(|w| w.active);
+        }
         let sess = t.sid.and_then(|s| srv.sessions.get(&s));
         let win = t.wid.and_then(|w| srv.windows.get(&w));
         let pane = t.pane.and_then(|p| srv.panes.get(&p));
-        let client = self.client.and_then(|c| srv.clients.get(&c));
         let v: Option<String> = match name {
             "host" => Some(srv.host.clone()),
             "host_short" => Some(srv.host.split('.').next().unwrap_or("").to_string()),
@@ -314,7 +340,7 @@ impl Vars for VarCtx<'_> {
                     _ => members.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(","),
                 })
             }
-            "session_format" => Some(b(sess.is_some())),
+            "session_format" => Some(b(ftype == "S")),
             "session_active" => sess.zip(client).map(|(s, c)| b(c.session == Some(s.id))),
             "session_activity_flag" | "session_bell_flag" | "session_silence_flag" => sess.map(|s| {
                 let flag = match name { "session_activity_flag" => ALERT_ACTIVITY, "session_bell_flag" => ALERT_BELL, _ => ALERT_SILENCE };
@@ -395,7 +421,7 @@ impl Vars for VarCtx<'_> {
             "window_modal_pane" => None,
             // only set while the client shows part of a larger window, which never happens here
             "window_offset_x" | "window_offset_y" => None,
-            "window_format" => Some(b(win.is_some())),
+            "window_format" => Some(b(ftype == "W")),
             // pane
             "pane_index" => win.zip(t.pane).and_then(|(w, p)| {
                 let base = srv.opt_window_num(Some(w.id), "pane-base-index").max(0) as usize;
@@ -433,7 +459,7 @@ impl Vars for VarCtx<'_> {
                 None => None,
             }),
             "pane_synchronized" => t.pane.map(|p| b(options::is_on(&srv.opt_pane(p, "synchronize-panes")))),
-            "pane_format" => Some(b(pane.is_some())),
+            "pane_format" => Some(b(ftype == "P")),
             "pane_created" => pane.map(|p| p.created.to_string()),
             "pane_flags" => win.zip(pane).map(|(w, p)| {
                 let mut f = String::new();

@@ -309,6 +309,17 @@ fn fnmatch(pat: &str, s: &str) -> bool {
     m(&pat.chars().collect::<Vec<_>>(), &s.chars().collect::<Vec<_>>())
 }
 
+/// The target type of a command (CMD_FIND_SESSION, _WINDOW, _PANE).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Find {
+    Session,
+    Window,
+    Pane,
+}
+
+/// CMD_FIND_CANFAIL: an unresolved target is an empty target, not an error.
+pub const FIND_CANFAIL: u8 = 1;
+
 const DIRS: [(char, Dir); 4] = [('L', Dir::Left), ('R', Dir::Right), ('U', Dir::Up), ('D', Dir::Down)];
 
 impl Server {
@@ -349,56 +360,259 @@ impl Server {
         })
     }
 
-    fn find_session(&self, ctx: &Ctx, name: &str) -> Result<SessId, String> {
-        if name.is_empty() {
-            return self.current(ctx).sid.ok_or_else(|| "no current session".to_string());
-        }
-        if name == "{mouse}" || name == "=" {
-            return ctx.mouse.as_ref().and_then(|m| m.sid).ok_or_else(|| "no mouse target".to_string());
-        }
-        if name == "{marked}" || name == "~" {
-            return self.marked.and_then(|p| self.session_of_pane(p)).map(|x| x.0).ok_or_else(|| "no marked target".to_string());
-        }
-        if let Some(id) = name.strip_prefix('$').and_then(|i| i.parse().ok()) {
-            if self.sessions.contains_key(&id) {
-                return Ok(id);
-            }
-        }
-        if let Some(exact) = name.strip_prefix('=') {
-            return self.sessions.values().find(|s| s.name == exact).map(|s| s.id).ok_or_else(|| format!("can't find session: {name}"));
+    /// cmd_find_get_session: a `$id`, an exact name, a client's session, else (unless
+    /// exact) a unique prefix and then a unique fnmatch pattern.
+    fn get_session(&self, name: &str, exact: bool) -> Option<SessId> {
+        if let Some(id) = name.strip_prefix('$') {
+            return id.parse().ok().filter(|id| self.sessions.contains_key(id));
         }
         if let Some(s) = self.sessions.values().find(|s| s.name == name) {
-            return Ok(s.id);
+            return Some(s.id);
         }
-        // a pane or window id names its session
-        if name.starts_with('%') || name.starts_with('@') {
-            let t = self.resolve_pane(ctx, Some(name))?;
-            return t.sid.ok_or_else(|| format!("can't find session: {name}"));
+        if let Some(sid) = self.clients.values().find(|c| c.attached && c.name() == name).and_then(|c| c.session).filter(|s| self.sessions.contains_key(s)) {
+            return Some(sid);
         }
-        let m: Vec<SessId> = self.sessions.values().filter(|s| s.name.starts_with(name)).map(|s| s.id).collect();
-        match m.len() {
-            1 => return Ok(m[0]),
-            0 => {}
-            _ => return err(format!("more than one session: {name}")),
+        if exact {
+            return None;
         }
-        let m: Vec<SessId> = self.sessions.values().filter(|s| fnmatch(name, &s.name)).map(|s| s.id).collect();
-        match m.len() {
-            1 => Ok(m[0]),
-            0 => err(format!("can't find session: {name}")),
-            _ => err(format!("more than one session: {name}")),
+        let unique = |f: &dyn Fn(&Session) -> bool| -> Result<Option<SessId>, ()> {
+            let m: Vec<SessId> = self.sessions.values().filter(|s| f(s)).map(|s| s.id).collect();
+            match m.len() {
+                0 => Ok(None),
+                1 => Ok(Some(m[0])),
+                _ => Err(()),
+            }
+        };
+        match unique(&|s| s.name.starts_with(name)) {
+            Ok(Some(s)) => return Some(s),
+            Ok(None) => {}
+            Err(()) => return None,
         }
+        unique(&|s| fnmatch(name, &s.name)).ok().flatten()
+    }
+
+    /// cmd_find_best_session_with_window and cmd_find_best_winlink_with_window: the most
+    /// recently active session holding the window, at its current winlink or the first.
+    fn best_link(&self, wid: WinId, sid: Option<SessId>) -> Option<(SessId, u32)> {
+        let links = self.links_of(wid);
+        let sid = match sid {
+            Some(s) => s,
+            None => links.iter().map(|l| l.0).max_by_key(|s| self.sessions[s].activity_seq)?,
+        };
+        let s = self.sessions.get(&sid)?;
+        if s.links.get(&s.active) == Some(&wid) {
+            return Some((sid, s.active));
+        }
+        s.links.iter().find(|(_, w)| **w == wid).map(|(i, _)| (sid, *i))
+    }
+
+    /// A session by name for commands that look one up directly: a whole session target.
+    fn find_session(&self, ctx: &Ctx, name: &str) -> Result<SessId, String> {
+        let t = self.cmd_find(ctx, Some(name), Find::Session, 0)?;
+        t.sid.ok_or_else(|| format!("can't find session: {name}"))
     }
 
     pub fn resolve_session(&self, ctx: &Ctx, t: Option<&str>) -> Result<SessId, String> {
-        match t {
-            None => self.current(ctx).sid.ok_or_else(|| "no current session".to_string()),
-            Some(t) => {
-                if let Some(c) = self.client_current(ctx, t) {
-                    return c.map(|c| c.sid.unwrap());
+        let t = self.cmd_find(ctx, t, Find::Session, 0)?;
+        t.sid.ok_or_else(|| "no current target".to_string())
+    }
+
+    pub fn resolve_window(&self, ctx: &Ctx, t: Option<&str>) -> Result<Target, String> {
+        self.cmd_find(ctx, t, Find::Window, 0)
+    }
+
+    pub fn resolve_pane(&self, ctx: &Ctx, t: Option<&str>) -> Result<Target, String> {
+        self.cmd_find(ctx, t, Find::Pane, 0)
+    }
+
+    /// cmd_find_target: split a target into session, window and pane parts (a bare
+    /// word is the part the command's target type names, or a `$`/`@`/`%` id), look
+    /// each up, and report the part that failed. With FIND_CANFAIL a failure is an
+    /// empty target instead of an error.
+    pub fn cmd_find(&self, ctx: &Ctx, target: Option<&str>, ty: Find, flags: u8) -> Result<Target, String> {
+        let canfail = flags & FIND_CANFAIL != 0;
+        let fail = |e: String| if canfail { Ok(Target::default()) } else { Err(e) };
+        let target = target.unwrap_or("");
+        if let Some(c) = self.client_current(ctx, target) {
+            return c;
+        }
+        let cur = self.current(ctx);
+        let (Some(csid), Some(cwid)) = (cur.sid, cur.wid) else {
+            return fail("no current target".to_string());
+        };
+        if target.is_empty() {
+            return Ok(cur);
+        }
+        let mk = |sid: SessId, idx: u32| -> Target {
+            let wid = self.sessions[&sid].links[&idx];
+            Target { sid: Some(sid), idx: Some(idx), wid: Some(wid), pane: Some(self.windows[&wid].active) }
+        };
+        if target == "{mouse}" || target == "=" {
+            let m = ctx.mouse.as_ref();
+            if ty == Find::Pane {
+                if let Some(p) = m.and_then(|m| self.mouse_pane(m)) {
+                    let wid = self.window_of(p);
+                    let sid = m.and_then(|m| m.sid).filter(|s| self.sessions.contains_key(s));
+                    let idx = m.and_then(|m| m.idx).filter(|_| sid.is_some());
+                    return Ok(Target { sid: sid.or(cur.sid), idx: idx.or(cur.idx), wid, pane: Some(p) });
                 }
-                let s = t.split(':').next().unwrap_or("");
-                self.find_session(ctx, s)
             }
+            if let Some(wid) = m.and_then(|m| m.wid).filter(|w| self.windows.contains_key(w)) {
+                let sid = m.and_then(|m| m.sid).filter(|s| self.sessions.contains_key(s));
+                return Ok(Target { sid, idx: m.and_then(|m| m.idx), wid: Some(wid), pane: Some(self.windows[&wid].active) });
+            }
+            return fail("no mouse target".to_string());
+        }
+        if target == "{marked}" || target == "~" {
+            return match self.marked.filter(|p| self.window_of(*p).is_some()) {
+                Some(p) => Ok(self.target_for_pane(p)),
+                None => fail("no marked target".to_string()),
+            };
+        }
+
+        let (copy, colon) = match target.split_once(':') {
+            Some((a, b)) => (a, Some(b)),
+            None => (target, None),
+        };
+        let (mut session, mut window, mut pane) = (None, None, None);
+        let (mut window_only, mut pane_only) = (false, false);
+        match colon {
+            Some(rest) => {
+                session = Some(copy);
+                window_only = true;
+                match rest.split_once('.') {
+                    Some((w, p)) => (window, pane, pane_only) = (Some(w), Some(p), true),
+                    None => window = Some(rest),
+                }
+            }
+            None => match copy.split_once('.') {
+                Some((w, p)) => (window, pane, pane_only) = (Some(w), Some(p), true),
+                None if copy.starts_with('$') => session = Some(copy),
+                None if copy.starts_with('@') => window = Some(copy),
+                None if copy.starts_with('%') => pane = Some(copy),
+                None => match ty {
+                    Find::Session => session = Some(copy),
+                    Find::Window => window = Some(copy),
+                    Find::Pane => pane = Some(copy),
+                },
+            },
+        }
+        let exact_session = session.is_some_and(|s| s.starts_with('='));
+        let session = session.map(|s| s.strip_prefix('=').unwrap_or(s)).filter(|s| !s.is_empty());
+        let exact_window = window.is_some_and(|w| w.starts_with('='));
+        let window = window.map(|w| w.strip_prefix('=').unwrap_or(w)).filter(|w| !w.is_empty());
+        let pane = pane.filter(|p| !p.is_empty()).map(|p| match p {
+            "{last}" => "!",
+            "{next}" => "+",
+            "{previous}" => "-",
+            _ => p,
+        });
+
+        // with CANFAIL, what was found before the failing part stays in the state
+        let partial = |t: Target, e: String| if canfail { Ok(t) } else { Err(e) };
+        let no_session = |s: &str| fail(format!("can't find session: {s}"));
+        let no_window = |t: Target, w: &str| partial(t, format!("can't find window: {w}"));
+        let no_pane = |t: Target, p: &str| partial(t, format!("can't find pane: {p}"));
+        let empty = Target::default();
+        // cmd_find_get_window_with_session
+        let window_in = |sid: SessId, w: &str| -> Option<u32> {
+            if let Some(id) = w.strip_prefix('@') {
+                let wid = id.parse::<WinId>().ok()?;
+                return self.best_link(wid, Some(sid)).map(|l| l.1);
+            }
+            let w = if exact_window { format!("={w}") } else { w.to_string() };
+            self.find_window_in(sid, &w, ctx).ok()
+        };
+        // cmd_find_get_pane_with_window
+        let pane_in = |t: Target, p: &str| -> Option<Target> {
+            let wid = t.wid?;
+            let cur_pane = if t.wid == cur.wid { ctx.pane } else { None };
+            if p.starts_with('%') {
+                let id = p[1..].parse::<PaneId>().ok()?;
+                return self.windows[&wid].panes().contains(&id).then_some(Target { pane: Some(id), ..t });
+            }
+            self.find_pane_in(wid, p, cur_pane, ctx).ok().map(|id| Target { pane: Some(id), ..t })
+        };
+        // cmd_find_get_window: an id, a window of the current session, else a session
+        let get_window = |w: &str, only: bool| -> Option<Target> {
+            if let Some(id) = w.strip_prefix('@') {
+                let wid = id.parse::<WinId>().ok().filter(|w| self.windows.contains_key(w))?;
+                let (sid, idx) = self.best_link(wid, None)?;
+                return Some(mk(sid, idx));
+            }
+            if let Some(idx) = window_in(csid, w) {
+                return Some(mk(csid, idx));
+            }
+            if !only && let Some(sid) = self.get_session(w, exact_session) {
+                return Some(mk(sid, self.sessions[&sid].active));
+            }
+            None
+        };
+
+        if let Some(sn) = session {
+            let Some(sid) = self.get_session(sn, exact_session) else { return no_session(sn) };
+            let here = mk(sid, self.sessions[&sid].active);
+            let only_session = Target { sid: Some(sid), ..empty };
+            return match (window, pane) {
+                (None, None) => Ok(here),
+                (Some(w), None) => match window_in(sid, w) {
+                    Some(idx) => Ok(mk(sid, idx)),
+                    None => no_window(only_session, w),
+                },
+                (None, Some(p)) => {
+                    if let Some(id) = p.strip_prefix('%') {
+                        let found = id.parse::<PaneId>().ok().and_then(|id| Some((id, self.window_of(id)?)));
+                        return match found.and_then(|(id, wid)| Some((id, self.best_link(wid, Some(sid))?))) {
+                            Some((id, (_, idx))) => Ok(Target { pane: Some(id), ..mk(sid, idx) }),
+                            None => no_pane(only_session, p),
+                        };
+                    }
+                    match pane_in(here, p) {
+                        Some(t) => Ok(t),
+                        None => no_pane(Target { pane: None, ..here }, p),
+                    }
+                }
+                (Some(w), Some(p)) => {
+                    let Some(idx) = window_in(sid, w) else { return no_window(only_session, w) };
+                    match pane_in(mk(sid, idx), p) {
+                        Some(t) => Ok(t),
+                        None => no_pane(Target { pane: None, ..mk(sid, idx) }, p),
+                    }
+                }
+            };
+        }
+        match (window, pane) {
+            (Some(w), p) => {
+                let Some(t) = get_window(w, window_only) else { return no_window(empty, w) };
+                match p {
+                    None => Ok(t),
+                    Some(p) => match pane_in(t, p) {
+                        Some(t) => Ok(t),
+                        None => no_pane(Target { pane: None, ..t }, p),
+                    },
+                }
+            }
+            (None, Some(p)) => {
+                // cmd_find_get_pane: an id, a pane of the current window, else a window
+                if let Some(id) = p.strip_prefix('%') {
+                    return match id.parse::<PaneId>().ok().filter(|id| self.panes.contains_key(id)).and_then(|id| Some((id, self.window_of(id)?))) {
+                        Some((id, wid)) => match self.best_link(wid, None) {
+                            Some((sid, idx)) => Ok(Target { pane: Some(id), ..mk(sid, idx) }),
+                            None => no_pane(empty, p),
+                        },
+                        None => no_pane(empty, p),
+                    };
+                }
+                let here = Target { sid: Some(csid), idx: cur.idx, wid: Some(cwid), pane: cur.pane };
+                if let Some(t) = pane_in(here, p) {
+                    return Ok(t);
+                }
+                match (!pane_only).then(|| get_window(p, false)).flatten() {
+                    Some(t) => Ok(t),
+                    None => no_pane(empty, p),
+                }
+            }
+            (None, None) => Ok(cur),
         }
     }
 
@@ -466,61 +680,6 @@ impl Server {
         err(format!("can't find window: {w}"))
     }
 
-    pub fn resolve_window(&self, ctx: &Ctx, t: Option<&str>) -> Result<Target, String> {
-        let Some(t) = t else {
-            let c = self.current(ctx);
-            return if c.wid.is_some() { Ok(c) } else { err("no current window") };
-        };
-        if let Some(c) = self.client_current(ctx, t) {
-            return c;
-        }
-        let mk = |sid: SessId, idx: u32| -> Target {
-            let wid = self.sessions[&sid].links[&idx];
-            Target { sid: Some(sid), idx: Some(idx), wid: Some(wid), pane: Some(self.windows[&wid].active) }
-        };
-        if t == "{mouse}" || t == "=" {
-            let m = ctx.mouse.as_ref().ok_or("no mouse target")?;
-            let wid = m.wid.filter(|w| self.windows.contains_key(w)).ok_or("no mouse target")?;
-            let pane = m.pane.filter(|p| self.panes.contains_key(p)).unwrap_or(self.windows[&wid].active);
-            return Ok(Target { sid: m.sid.filter(|s| self.sessions.contains_key(s)), idx: m.idx, wid: Some(wid), pane: Some(pane) });
-        }
-        if t == "{marked}" || t == "~" {
-            let p = self.marked.ok_or("no marked target")?;
-            return Ok(self.target_for_pane(p));
-        }
-        if let Some(id) = t.strip_prefix('@').and_then(|i| i.parse::<WinId>().ok()) {
-            if self.windows.contains_key(&id) {
-                let cur = self.current(ctx).sid;
-                let links = self.links_of(id);
-                let (sid, idx) = links.iter().find(|(s, _)| Some(*s) == cur).or(links.first()).copied().ok_or("window not linked")?;
-                return Ok(mk(sid, idx));
-            }
-        }
-        if t.starts_with('%') {
-            let p = self.resolve_pane(ctx, Some(t))?;
-            return Ok(p);
-        }
-        match t.split_once(':') {
-            Some((s, w)) => {
-                let w = w.split('.').next().unwrap_or("");
-                let sid = self.find_session(ctx, s)?;
-                let idx = self.find_window_in(sid, w, ctx)?;
-                Ok(mk(sid, idx))
-            }
-            None => {
-                let cur = self.current(ctx).sid;
-                if let Some(sid) = cur {
-                    if let Ok(idx) = self.find_window_in(sid, t, ctx) {
-                        return Ok(mk(sid, idx));
-                    }
-                }
-                let sid = self.find_session(ctx, t)?;
-                let idx = self.sessions[&sid].active;
-                Ok(mk(sid, idx))
-            }
-        }
-    }
-
     fn find_pane_in(&self, wid: WinId, p: &str, cur_pane: Option<PaneId>, ctx: &Ctx) -> Result<PaneId, String> {
         let w = &self.windows[&wid];
         let panes = w.panes();
@@ -535,6 +694,13 @@ impl Server {
             let r = rect_of(active).unwrap_or_default();
             layout::neighbour(&rects, active, d, (r.x + cur.1, r.y + cur.0))
         };
+        // window_find_string names a corner or edge, in any case
+        let lower = p.to_ascii_lowercase();
+        let p = match lower.as_str() {
+            "top" | "bottom" | "left" | "right" | "top-left" | "top-right" | "bottom-left" | "bottom-right" => format!("{{{lower}}}"),
+            _ => p.to_string(),
+        };
+        let p = p.as_str();
         let r = match p {
             "" => Some(active),
             "{last}" | "!" => w.last_active,
@@ -579,53 +745,6 @@ impl Server {
         err(format!("can't find pane: {p}"))
     }
 
-    pub fn resolve_pane(&self, ctx: &Ctx, t: Option<&str>) -> Result<Target, String> {
-        let Some(t) = t else {
-            let c = self.current(ctx);
-            return if c.pane.is_some() { Ok(c) } else { err("no current pane") };
-        };
-        if let Some(c) = self.client_current(ctx, t) {
-            return c;
-        }
-        if let Some(id) = t.strip_prefix('%').and_then(|i| i.parse::<PaneId>().ok()) {
-            if self.panes.contains_key(&id) && self.window_of(id).is_some() {
-                return Ok(self.target_for_pane(id));
-            }
-            return err(format!("can't find pane: {t}"));
-        }
-        if t == "{mouse}" || t == "=" {
-            let m = ctx.mouse.as_ref().ok_or("no mouse target")?;
-            let p = self.mouse_pane(m).ok_or("no mouse target")?;
-            return Ok(self.target_for_pane(p));
-        }
-        if t == "{marked}" || t == "~" {
-            return Ok(self.target_for_pane(self.marked.ok_or("no marked target")?));
-        }
-        let (wpart, ppart) = match t.rfind('.') {
-            Some(i) if !t[..i].ends_with(':') || t.contains(':') => (Some(&t[..i]), &t[i + 1..]),
-            _ => (None, t),
-        };
-        if wpart.is_none() && !t.contains(':') {
-            // a bare word: pane in the current window, else a window target
-            let cur = self.current(ctx);
-            if let Some(wid) = cur.wid {
-                if let Ok(p) = self.find_pane_in(wid, t, ctx.pane, ctx) {
-                    return Ok(Target { pane: Some(p), ..cur });
-                }
-            }
-            return self.resolve_window(ctx, Some(t));
-        }
-        let wt = match wpart {
-            Some(w) => self.resolve_window(ctx, Some(w))?,
-            None => self.resolve_window(ctx, Some(t))?,
-        };
-        let wid = wt.wid.unwrap();
-        let ppart = if wpart.is_some() { ppart } else { "" };
-        let cur_pane = if wt.wid == self.current(ctx).wid { ctx.pane } else { None };
-        let p = self.find_pane_in(wid, ppart, cur_pane, ctx)?;
-        Ok(Target { pane: Some(p), ..wt })
-    }
-
     /// Target client for commands with -c/-t client: a client name, or the context's client.
     pub fn resolve_client(&self, ctx: &Ctx, t: Option<&str>) -> Result<ClientId, String> {
         match t {
@@ -635,7 +754,7 @@ impl Server {
                 }
                 // a session name → its most recent client
                 if let Ok(sid) = self.find_session(ctx, name.trim_end_matches(':')) {
-                    if let Some(c) = self.clients.values().filter(|c| c.attached && c.session == Some(sid)).max_by_key(|c| c.activity) {
+                    if let Some(c) = self.clients.values().filter(|c| c.attached && c.session == Some(sid)).max_by_key(|c| c.activity_seq) {
                         return Ok(c.id);
                     }
                 }
@@ -650,7 +769,7 @@ impl Server {
                 self.clients
                     .values()
                     .filter(|c| c.attached && (sid.is_none() || c.session == sid))
-                    .max_by_key(|c| c.activity)
+                    .max_by_key(|c| c.activity_seq)
                     .map(|c| c.id)
                     .ok_or_else(|| "no current client".to_string())
             }
@@ -1384,7 +1503,8 @@ impl Server {
                 let crit = sort::Criteria::from_args(o.get('O'), o.has('r'))?;
                 for (i, sid) in self.sorted_sessions(crit).into_iter().enumerate() {
                     let tt = Target { sid: Some(sid), idx: Some(self.sessions[&sid].active), wid: Some(self.sessions[&sid].active_window()), pane: None };
-                    self.list_line(ctx, tt, ctx.client, fmt, o.get('f'), HashMap::from([("line".to_string(), i.to_string())]));
+                    let extra = HashMap::from([("line".to_string(), i.to_string()), (super::vars::FORMAT_TYPE.to_string(), "S".to_string())]);
+                    self.list_line(ctx, tt, ctx.client, fmt, o.get('f'), extra);
                 }
                 Ok(Flow::Next)
             }
@@ -1410,7 +1530,9 @@ impl Server {
                         continue;
                     }
                     let tt = Target { sid: Some(sid), idx: Some(self.sessions[&sid].active), wid: Some(self.sessions[&sid].active_window()), pane: None };
-                    self.list_line(ctx, tt, Some(cid), fmt, o.get('f'), HashMap::from([("line".to_string(), i.to_string())]));
+                    // format_defaults gets only the client: no format type
+                    let extra = HashMap::from([("line".to_string(), i.to_string()), (super::vars::FORMAT_TYPE.to_string(), String::new())]);
+                    self.list_line(ctx, tt, Some(cid), fmt, o.get('f'), extra);
                 }
                 Ok(Flow::Next)
             }
@@ -1954,7 +2076,8 @@ impl Server {
                 let n = wls.len().to_string();
                 for (sid, idx, wid) in wls {
                     let tt = Target { sid: Some(sid), idx: Some(idx), wid: Some(wid), pane: Some(self.windows[&wid].active) };
-                    self.list_line(ctx, tt, ctx.client, fmt, o.get('f'), HashMap::from([("line".to_string(), n.clone())]));
+                    let extra = HashMap::from([("line".to_string(), n.clone()), (super::vars::FORMAT_TYPE.to_string(), "W".to_string())]);
+                    self.list_line(ctx, tt, ctx.client, fmt, o.get('f'), extra);
                 }
                 Ok(Flow::Next)
             }
@@ -2777,7 +2900,7 @@ impl Server {
                 Ok(Flow::Next)
             }
             "display-message" => {
-                let tt = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
+                let tt = self.cmd_find(ctx, t, Find::Pane, FIND_CANFAIL)?;
                 let cid = o.get('c').map(|c| self.resolve_client(ctx, Some(c))).transpose()?
                     .or_else(|| ctx.client.filter(|id| self.clients.get(id).is_some_and(|c| c.attached)))
                     .or_else(|| self.resolve_client(ctx, None).ok());
@@ -2788,7 +2911,7 @@ impl Server {
                     Some(s) => {
                         let attached = |c: &&Client| c.attached && c.session.is_some_and(|x| self.sessions.contains_key(&x));
                         let on_s = self.clients.values().filter(attached).any(|c| c.session == Some(s));
-                        self.clients.values().filter(attached).filter(|c| !on_s || c.session == Some(s)).max_by_key(|c| (c.activity, c.id)).map(|c| c.id)
+                        self.clients.values().filter(attached).filter(|c| !on_s || c.session == Some(s)).max_by_key(|c| c.activity_seq).map(|c| c.id)
                     }
                     None => None,
                 };
@@ -2813,6 +2936,7 @@ impl Server {
                 if o.has('F') && !o.rest.is_empty() {
                     return err("only one of -F or argument must be given");
                 }
+                let delay = o.get('d').map(|d| options::strtonum(d, 0, u32::MAX as i64).map_err(|e| format!("delay {e}"))).transpose()?;
                 let fmt = match o.rest.first().map(String::as_str).or(o.get('F')) {
                     Some(f) => f,
                     None if o.has('j') => "",
@@ -2839,9 +2963,11 @@ impl Server {
                 if o.has('p') || (attached_client.is_none() && ctx.client.is_none() && ctx.reply.is_none()) {
                     ctx.out.push_str(&msg);
                     ctx.out.push('\n');
+                } else if let Some(c) = attached_client.filter(|c| self.is_control(*c)) {
+                    self.control_write(c, &format!("%message {msg}\n"));
                 } else if let Some(c) = attached_client {
                     self.set_message(c, &msg);
-                    if let Some(ms) = o.get('d').and_then(|v| v.parse::<u64>().ok()) {
+                    if let Some(ms) = delay.map(|d| d as u64) {
                         if let Some(cl) = self.clients.get_mut(&c) {
                             if let Some(m) = &mut cl.message {
                                 m.1 = Instant::now() + Duration::from_millis(if ms == 0 { 86_400_000 } else { ms });
