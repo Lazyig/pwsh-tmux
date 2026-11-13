@@ -9,7 +9,7 @@ use crate::opts::{getopt, Opts};
 use std::cmp::Ordering;
 
 mod json;
-mod sort;
+pub(crate) mod sort;
 mod vis;
 
 /// (name, alias, flags without value, flags with value)

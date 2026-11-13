@@ -379,3 +379,49 @@ fn buffer_editor_keeps_the_final_newline_like_window_buffer_edit_close_cb() {
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(ctx.ok(&["show-buffer", "-b", "nonl"]), "new");
 }
+
+#[test]
+fn customize_mode_adds_items_from_groups_and_keeps_command_lists() {
+    let ctx = Ctx::new("customize-add");
+    let t = start(&ctx, "ca");
+    // s on a group row asks for a new item
+    ctx.ok(&["customize-mode", "-t", "ca"]);
+    t.wait_screen("groups", |s| s.contains("Server Options"));
+    t.send(b"s");
+    t.wait_screen("option prompt", |s| s.contains("New user option: @"));
+    t.send(b"xyz hello\r");
+    wait_for("option set", || ctx.ok(&["show", "-sv", "@xyz"]).trim() == "hello");
+    t.send(b"jjjjjs");
+    t.wait_screen("env prompt", |s| s.contains("New environment: "));
+    t.send(b"NEWV=1\r");
+    wait_for("env set", || ctx.ok(&["showenv", "-g", "NEWV"]).trim() == "NEWV=1");
+    t.send(b"q");
+    wait_for("closed", || ctx.fmt("ca", "#{pane_in_mode}") == "0");
+    // keys are in key code order, as list-keys prints them
+    for k in ["b", "A", "Enter", "1", "C-a"] {
+        ctx.ok(&["bind", "-T", "zz", k, "display", k]);
+    }
+    ctx.ok(&["customize-mode", "-t", "ca", "-f", "#{||:#{==:#{key},Enter},#{||:#{==:#{key},1},#{||:#{==:#{key},A},#{||:#{==:#{key},b},#{==:#{key},C-a}}}}}"]);
+    t.wait_screen("zz table", |s| s.contains("Key Table - zz"));
+    t.send(b"Gl");
+    t.wait_screen("zz keys", |s| {
+        let pos = |k: &str| s.lines().position(|l| l.ends_with(&format!(" {k}")) || l.contains(&format!("+ {k} ")) || l.trim_end().ends_with(&format!("+ {k}")));
+        let v: Vec<_> = ["Enter", "1", "A", "b", "C-a"].iter().map(|k| pos(k)).collect();
+        v.iter().all(|p| p.is_some()) && v.windows(2).all(|w| w[0] < w[1])
+    });
+    t.send(b"q");
+    wait_for("closed", || ctx.fmt("ca", "#{pane_in_mode}") == "0");
+    // toggling Repeat keeps a binding of several commands whole
+    ctx.ok(&["bind-key", "-T", "prefix", "F1", "set -g @a 1 ; set -g @b 2"]);
+    ctx.ok(&["customize-mode", "-t", "ca", "-f", "#{==:#{key},F1}"]);
+    t.wait_screen("prefix", |s| s.contains("Key Table - prefix"));
+    for k in [b"G", b"k", b"k", b"l", b"j", b"l", b"j", b"j", b"j"] {
+        t.send(k);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    t.wait_screen("repeat line", |s| s.contains("Repeat: off"));
+    t.send(b"\r");
+    wait_for("repeat on", || ctx.ok(&["list-keys", "-T", "prefix", "F1"]).contains("bind-key -r"));
+    assert!(ctx.fails(&["show", "-gv", "@b"]).contains("invalid option"));
+    assert!(ctx.ok(&["list-keys", "-T", "prefix", "F1"]).contains("@b 2"));
+}

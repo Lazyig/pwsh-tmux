@@ -87,6 +87,12 @@ pub enum Change {
 
 pub enum PromptFor {
     Set { item: Item, value_scope: Scope },
+    /// A new user option or hook (window_customize_add_option).
+    AddOption { scope: Scope, hook: bool },
+    /// A new environment variable (window_customize_add_environment).
+    AddEnv(Scope),
+    /// A new key in a table (window_customize_add_key).
+    AddKey(String),
     ArrayKey(Item),
     KeyPart(Item),
     Current(Change, Item),
@@ -141,10 +147,14 @@ fn escape(v: &str) -> String {
     quote(v)
 }
 
-pub fn build(tree: &Tree, srv: &Server, b: &mut Builder, filter: Option<&str>) {
+/// The target the mode was opened for while it is valid, else the mode's own pane.
+fn mode_target(tree: &Tree, srv: &Server) -> Target {
     let t = tree.origin;
-    let fixed_t = srv.target_for_pane(tree.owner);
-    let t = if t.sid.is_some_and(|s| srv.sessions.contains_key(&s)) && t.pane.is_some_and(|p| srv.panes.contains_key(&p)) { t } else { fixed_t };
+    if t.sid.is_some_and(|s| srv.sessions.contains_key(&s)) && t.pane.is_some_and(|p| srv.panes.contains_key(&p)) { t } else { srv.target_for_pane(tree.owner) }
+}
+
+pub fn build(tree: &Tree, srv: &Server, b: &mut Builder, filter: Option<&str>) {
+    let t = mode_target(tree, srv);
     let groups: [(&str, OScope, bool); 5] = [
         ("Server Options", OScope::Server, false),
         ("Session Options", OScope::Session, false),
@@ -241,6 +251,9 @@ pub fn build(tree: &Tree, srv: &Server, b: &mut Builder, filter: Option<&str>) {
         let top = b.add(None, format!("k{table}"), title, None, ItemData::Custom(Item::Group), 0);
         b.nodes[top].no_tag = true;
         let mut count = 0;
+        // the key bindings tree is in key code order, as list-keys prints them
+        let mut keys: Vec<(&String, &Binding)> = keys.iter().collect();
+        keys.sort_by_key(|(k, _)| crate::server::cmds::sort::key_code(k));
         for (key, bd) in keys {
             if tree.hide_default && !key_changed(&defaults, table, key, bd) {
                 continue;
@@ -392,7 +405,8 @@ fn set_command(srv: &Server, item: &Item, value_scope: Scope, value: &str) -> Op
                 _ => (value.to_string(), note.to_string()),
             };
             let note = if note.is_empty() { String::new() } else { format!("-N {} ", escape(&note)) };
-            Some(format!("bind-key {}{note}-T {} {} {}", if bd.repeat { "-r " } else { "" }, escape(table), escape(key), cmd))
+            // the command list is one argument, as window_customize_set_key keeps it whole
+            Some(format!("bind-key {}{note}-T {} {} {}", if bd.repeat { "-r " } else { "" }, escape(table), escape(key), escape(&cmd)))
         }
         Item::Group => None,
     }
@@ -424,7 +438,7 @@ fn change_command(srv: &Server, item: &Item, change: Change) -> Option<String> {
             match (change, defaults.get(table).and_then(|t| t.get(key))) {
                 (Change::Reset, Some(d)) => {
                     let note = if d.note.is_empty() { String::new() } else { format!("-N {} ", escape(&d.note)) };
-                    Some(format!("bind-key {}{note}-T {} {} {}", if d.repeat { "-r " } else { "" }, escape(table), escape(key), d.cmd))
+                    Some(format!("bind-key {}{note}-T {} {} {}", if d.repeat { "-r " } else { "" }, escape(table), escape(key), escape(&d.cmd)))
                 }
                 _ => srv.bindings.get(table).and_then(|t| t.get(key)).map(|_| format!("unbind-key -T {} {}", escape(table), escape(key))),
             }
@@ -484,9 +498,38 @@ pub fn key(tree: &mut Tree, name: &str, srv: &Server, b: &mut Built) -> ModeActi
             }
         }
         "a" => {
-            if let Some(it @ Item::Option { key: Some(_), .. }) = item {
-                set_prompt(tree, PromptFor::ArrayKey(it.clone()), "New key: ", "", false);
+            if let Some(it @ Item::Option { key: Some(k), .. }) = &item {
+                let label = format!("({}) ", label_of(it));
+                set_prompt(tree, PromptFor::ArrayKey(it.clone()), &label, &k.clone(), false);
             }
+        }
+        "Enter" | "s" if item.is_none() => {
+            // a group: add a new item to it (window_customize_add_current)
+            let t = mode_target(tree, srv);
+            let group = b.nodes[cur].name.clone();
+            let (kind, label, input) = match group.as_str() {
+                "Server Options" => (PromptFor::AddOption { scope: Scope::Server, hook: false }, "New user option: ".to_string(), "@"),
+                "Session Options" | "Session Hooks" => {
+                    let Some(sid) = t.sid else { return ModeAction::None };
+                    let hook = group.ends_with("Hooks");
+                    (PromptFor::AddOption { scope: Scope::Session(sid), hook }, format!("New user {}: ", if hook { "hook" } else { "option" }), "@")
+                }
+                "Window & Pane Options" | "Window & Pane Hooks" => {
+                    let Some(p) = t.pane else { return ModeAction::None };
+                    let hook = group.ends_with("Hooks");
+                    (PromptFor::AddOption { scope: Scope::Pane(p), hook }, format!("New user {}: ", if hook { "hook" } else { "option" }), "@")
+                }
+                "Global Environment" => (PromptFor::AddEnv(Scope::GlobalEnv), "New environment: ".to_string(), ""),
+                "Session Environment" => {
+                    let Some(sid) = t.sid else { return ModeAction::None };
+                    (PromptFor::AddEnv(Scope::SessionEnv(sid)), "New environment: ".to_string(), "")
+                }
+                g => match g.strip_prefix("Key Table - ") {
+                    Some(table) => (PromptFor::AddKey(table.to_string()), format!("New key in {table}: "), ""),
+                    None => return ModeAction::None,
+                },
+            };
+            set_prompt(tree, kind, &label, input, false);
         }
         "Enter" | "s" | "w" | "S" | "W" => {
             let key_name = name;
@@ -526,7 +569,7 @@ pub fn key(tree: &mut Tree, name: &str, srv: &Server, b: &mut Built) -> ModeActi
                     let Some(bd) = srv.bindings.get(table).and_then(|t| t.get(key)) else { return ModeAction::None };
                     match part {
                         3 => {
-                            let mut cmd = format!("bind-key {}-T {} {} {}", if bd.repeat { "" } else { "-r " }, escape(table), escape(key), bd.cmd);
+                            let mut cmd = format!("bind-key {}-T {} {} {}", if bd.repeat { "" } else { "-r " }, escape(table), escape(key), escape(&bd.cmd));
                             if !bd.note.is_empty() && bd.note != "default" {
                                 cmd = cmd.replacen("bind-key ", &format!("bind-key -N {} ", escape(&bd.note)), 1);
                             }
@@ -586,8 +629,49 @@ pub fn prompt_done(tree: &mut Tree, p: PromptFor, s: String, srv: &Server, b: &m
             }
             set_command(srv, &item, Scope::Server, &s)
         }
+        PromptFor::AddOption { scope, hook } => {
+            if s.is_empty() {
+                return ModeAction::None;
+            }
+            let (name, value) = s.split_once([' ', '\t']).map_or((s.as_str(), ""), |(n, v)| (n, v.trim_start_matches([' ', '\t'])));
+            if name.is_empty() || value.is_empty() {
+                return message("User option must be @name value");
+            }
+            if !name.starts_with('@') || name.contains('[') {
+                return message(&format!("User {} name must start with @", if hook { "hook" } else { "option" }));
+            }
+            Some(if hook { format!("set-hook {} {} {}", scope.flags(), escape(name), escape(value)) } else { format!("set-option {} {} {}", scope.flags(), escape(name), escape(value)) })
+        }
+        PromptFor::AddEnv(scope) => {
+            if s.is_empty() {
+                return ModeAction::None;
+            }
+            if let Some(name) = s.strip_prefix('-') {
+                if name.is_empty() || name.contains('=') {
+                    return message(&format!("Bad environment variable: {s}"));
+                }
+                Some(format!("set-environment {} -r {}", scope.flags(), escape(name)))
+            } else {
+                match s.split_once('=') {
+                    Some((name, value)) if !name.is_empty() => Some(format!("set-environment {} {} {}", scope.flags(), escape(name), escape(value))),
+                    _ => return message("Environment variable must be NAME=value"),
+                }
+            }
+        }
+        PromptFor::AddKey(table) => {
+            if s.is_empty() {
+                return ModeAction::None;
+            }
+            let (key, command) = s.split_once([' ', '\t']).map_or((s.as_str(), ""), |(k, c)| (k, c.trim_start_matches([' ', '\t'])));
+            if key.is_empty() || command.is_empty() {
+                return message("Key binding must be key command");
+            }
+            let Some(k) = crate::keys::parse_key_name(key) else { return message(&format!("Unknown key: {key}")) };
+            Some(format!("bind-key -T {} {} {}", escape(&table), escape(&crate::keys::key_name(&k)), escape(command)))
+        }
         PromptFor::ArrayKey(Item::Option { scope, name, key: Some(old), hook }) => {
-            if s.is_empty() || s == old {
+            // a key that is set already is left alone
+            if s.is_empty() || s == old || option_value(srv, scope, &name, Some(&s), hook).is_some() {
                 return ModeAction::None;
             }
             let value = option_value(srv, scope, &name, Some(&old), hook).unwrap_or_default();
@@ -611,6 +695,11 @@ pub fn prompt_done(tree: &mut Tree, p: PromptFor, s: String, srv: &Server, b: &m
         Some(c) => ModeAction::RunKeep(c),
         None => ModeAction::None,
     }
+}
+
+/// status_message_set for a prompt answer the mode cannot use.
+fn message(text: &str) -> ModeAction {
+    ModeAction::RunKeep(format!("display-message -- {}", escape(&text.replace('#', "##"))))
 }
 
 /// The information shown for the current item (window_customize_draw).
