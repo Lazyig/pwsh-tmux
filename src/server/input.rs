@@ -27,6 +27,56 @@ const COPY_MODE_MOUSE: &[(&str, &str)] = &[
     ("TripleClick1Pane", "select-pane ; send-keys -X select-line ; run-shell -d 0.3 ; send-keys -X copy-pipe-and-cancel"),
 ];
 
+/// Floating pane bindings of the prefix table (tmux 3.8 key-bindings.c; `floating_pane_flag`
+/// is tmux's spelling, which never matches, so these resize like tiled panes).
+const FLOAT_PREFIX: &[(&str, &str, bool, &str)] = &[
+    ("*", "new-pane", false, "New floating pane"),
+    ("@", "if-shell -F \"#{pane_floating_flag}\" { join-pane } { break-pane -W }", false, "Toggle pane between floating and tiled"),
+    ("g", "switch-client -T move", false, "Move a floating pane"),
+    ("M-Up", "if-shell -F \"#{?floating_pane_flag}\" { resize-pane -D -5 } { resize-pane -U 5 }", true, "Resize the pane up by 5"),
+    ("M-Left", "if-shell -F \"#{?floating_pane_flag}\" { resize-pane -R -5 } { resize-pane -L 5 }", true, "Resize the pane left by 5"),
+    ("C-Up", "if-shell -F \"#{?floating_pane_flag}\" { resize-pane -D -1 } { resize-pane -U }", true, "Resize the pane up"),
+    ("C-Left", "if-shell -F \"#{?floating_pane_flag}\" { resize-pane -R -1 } { resize-pane -L }", true, "Resize the pane left"),
+];
+
+/// The move table entered with C-b g.
+const FLOAT_MOVE: &[(&str, &str, &str)] = &[
+    ("1", "move-pane -P top-left", "Move pane to top-left corner"),
+    ("2", "move-pane -P top-right", "Move pane to top-right corner"),
+    ("3", "move-pane -P bottom-left", "Move pane to bottom-left corner"),
+    ("4", "move-pane -P bottom-right", "Move pane to bottom-right corner"),
+    ("M-1", "resize-pane -x \"50%\" -y \"50%\" ; move-pane -P top-left", "Move pane to top-left corner and resize"),
+    ("M-2", "resize-pane -x \"50%\" -y \"50%\" ; move-pane -P top-right", "Move pane to top-right corner and resize"),
+    ("M-3", "resize-pane -x \"50%\" -y \"50%\" ; move-pane -P bottom-left", "Move pane to bottom-left corner and resize"),
+    ("M-4", "resize-pane -x \"50%\" -y \"50%\" ; move-pane -P bottom-right", "Move pane to bottom-right corner and resize"),
+    ("Up", "move-pane -P top-centre", "Move pane to top"),
+    ("Down", "move-pane -P bottom-centre", "Move pane to bottom"),
+    ("Left", "move-pane -P centre-left", "Move pane to left"),
+    ("Right", "move-pane -P centre-right", "Move pane to right"),
+    ("M-Up", "resize-pane -x \"100%\" -y \"50%\" ; move-pane -P top-centre", "Move pane to top and resize"),
+    ("M-Down", "resize-pane -x \"100%\" -y \"50%\" ; move-pane -P bottom-centre", "Move pane to bottom and resize"),
+    ("M-Left", "resize-pane -x \"50%\" -y \"100%\" ; move-pane -P centre-left", "Move pane to left and resize"),
+    ("M-Right", "resize-pane -x \"50%\" -y \"100%\" ; move-pane -P centre-right", "Move pane to right and resize"),
+    ("0", "resize-pane -x \"100%\" -y \"100%\" ; move-pane -P top-left", "Move pane to fill the window"),
+];
+
+/// DEFAULT_MOVE_MENU and DEFAULT_MOVE_RESIZE_MENU items.
+const MOVE_MENU: &str = r#"Centre c { move-pane -P centre } '' "Top Left" 1 { move-pane -P top-left } "Top Right" 2 { move-pane -P top-right } "Bottom Left" 3 { move-pane -P bottom-left } "Bottom Right" 4 { move-pane -P bottom-right } '' Top t { move-pane -P top-centre } Bottom b { move-pane -P bottom-centre } Left l { move-pane -P centre-left } Right r { move-pane -P centre-right }"#;
+const MOVE_RESIZE_MENU: &str = r#"Fill 0 { resize-pane -x "100%" -y "100%" ; move-pane -P top-left } '' "Top Left" 1 { resize-pane -x "50%" -y "50%" ; move-pane -P top-left } "Top Right" 2 { resize-pane -x "50%" -y "50%" ; move-pane -P top-right } "Bottom Left" 3 { resize-pane -x "50%" -y "50%" ; move-pane -P bottom-left } "Bottom Right" 4 { resize-pane -x "50%" -y "50%" ; move-pane -P bottom-right } '' Top t { resize-pane -x "100%" -y "50%" ; move-pane -P top-centre } Bottom b { resize-pane -x "100%" -y "50%" ; move-pane -P bottom-centre } Left l { resize-pane -x "50%" -y "100%" ; move-pane -P centre-left } Right r { resize-pane -x "50%" -y "100%" ; move-pane -P centre-right }"#;
+
+/// Mouse bindings for floating panes and the controls of the default pane-border-format.
+const FLOAT_ROOT: &[(&str, &str)] = &[
+    ("C-MouseDrag1Pane", "new-pane -M"),
+    ("C-MouseDrag1Empty", "new-pane -M"),
+    ("M-MouseDrag1Pane", "move-pane -M"),
+    ("M-MouseDrag1Border", "move-pane -M"),
+    ("MouseDown1Control9", r##"display-menu -O -T "Kill pane #{pane_index}?" -t = -x M -y M Yes y { kill-pane -t = } No n {  }"##),
+    ("MouseDown1Control8", "resize-pane -Z"),
+    ("MouseDown1Control7", r##"if-shell -F -t = "#{pane_floating_flag}" { join-pane } { break-pane -W }"##),
+    ("MouseDown3Empty", r##"display-menu -T "#[align=centre]#{window_index}:#{window_name}" -t = -x M -y M "New Pane" p { new-pane ; join-pane } "New Window" w { new-window }"##),
+    ("M-MouseDown3Empty", r##"display-menu -T "#[align=centre]#{window_index}:#{window_name}" -t = -x M -y M "New Pane" p { new-pane ; join-pane } "New Window" w { new-window }"##),
+];
+
 pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
     let mut t: BTreeMap<String, BTreeMap<String, Binding>> = BTreeMap::new();
     let mut add = |table: &str, key: &str, cmd: &str, repeat: bool, note: &str| {
@@ -135,6 +185,21 @@ pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
         ("TripleClick1Pane", format!("select-pane -t = ; if-shell -F '{IN_MODE}' {{ send-keys -M }} {{ copy-mode -H ; send-keys -X select-line ; run-shell -d 0.3 ; send-keys -X copy-pipe-and-cancel }}")),
     ];
     for (k, c) in &root {
+        add("root", k, c, false, "");
+    }
+    // floating panes (tmux 3.7/3.8): new, float/tile, the C-b g move table and mouse drags
+    for (k, c, r, n) in FLOAT_PREFIX {
+        add("prefix", k, c, *r, n);
+    }
+    let menu = |title: &str, xy: &str, items: &str| format!("display-menu -T \"#[align=centre]{title}\" {xy} {items}");
+    let move_menus = [(",", "Display move menu", menu("Move", "-x P -y P", MOVE_MENU)), (".", "Display move and resize menu", menu("Move & Resize", "-x P -y P", MOVE_RESIZE_MENU))];
+    for (k, n, m) in &move_menus {
+        add("move", k, &format!("if-shell -F \"#{{pane_floating_flag}}\" {{ {m} }}"), false, n);
+    }
+    for (k, c, n) in FLOAT_MOVE {
+        add("move", k, c, false, n);
+    }
+    for (k, c) in FLOAT_ROOT {
         add("root", k, c, false, "");
     }
     for (table, vi) in [("copy-mode", false), ("copy-mode-vi", true)] {

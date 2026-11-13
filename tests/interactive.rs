@@ -443,3 +443,52 @@ fn floating_panes_follow_mouse_drags() {
     t.mouse(8, 21, 11, true);
     wait_for("moved by move-pane -M", || ctx.fmt(&f, "#{pane_x},#{pane_y}") == "14,7");
 }
+
+#[test]
+fn floating_pane_default_mouse_bindings_and_pane_list() {
+    let ctx = Ctx::new("float-bind");
+    let t = start(&ctx, "fb");
+    ctx.ok(&["set", "-g", "mouse", "on"]);
+    t.wait_screen("mouse mode on", |_| t.raw_text().contains("\x1b[?1006h"));
+    ctx.ok(&["select-pane", "-T", "t0"]);
+    ctx.ok(&["split-window", "-h", "-t", "fb", "cat"]);
+    ctx.ok(&["select-pane", "-T", "t1"]);
+    assert_eq!(ctx.fmt("fb", "#{pane_width} #{pane_x}"), "49 51");
+    // C-drag (C-MouseDrag1Pane: new-pane -M) makes a floating pane between the two corners
+    t.mouse(16, 4, 2, false);
+    t.mouse(48, 5, 3, false);
+    t.mouse(48, 19, 8, false);
+    t.mouse(16, 19, 8, true);
+    wait_for("dragged floating pane", || ctx.fmt("fb", "#{pane_floating_flag} #{pane_width}x#{pane_height} #{pane_x},#{pane_y}") == "1 14x5 5,3");
+    let f = ctx.fmt("fb", "#{pane_id}");
+    ctx.ok(&["kill-pane", "-t", &f]);
+    // the [f][z][x] controls of the default pane-border-format: [z] of pane 1 zooms it
+    ctx.ok(&["set", "-g", "pane-border-status", "top"]);
+    t.wait_screen("pane status lines", |s| s.lines().next().is_some_and(|l| l.contains("[f][z][x]┬")));
+    let top = t.row(0);
+    assert!(top.contains("──1 \"t1\"──") && top.ends_with("─[f][z][x]"), "{top:?}");
+    t.mouse(0, 95, 0, false);
+    t.mouse(0, 95, 0, true);
+    wait_for("zoomed by [z]", || ctx.fmt("fb", "#{window_zoomed_flag} #P") == "1 1");
+    // (after the double click time, or this is SecondClick1Control8)
+    std::thread::sleep(Duration::from_millis(400));
+    t.mouse(0, 95, 0, false);
+    t.mouse(0, 95, 0, true);
+    wait_for("unzoomed by [u]", || ctx.fmt("fb", "#{window_zoomed_flag}") == "0");
+    // [f] of pane 0 floats it
+    std::thread::sleep(Duration::from_millis(400));
+    t.mouse(0, 42, 0, false);
+    t.mouse(0, 42, 0, true);
+    wait_for("floated by [f]", || ctx.fmt("fb.0", "#{pane_floating_flag}") == "1");
+    ctx.ok(&["join-pane", "-s", "fb.0"]);
+    // status 2 shows the panes; a click on one selects it
+    ctx.ok(&["set", "-g", "status", "2"]);
+    t.wait_screen("pane list", |s| s.contains("P: "));
+    let list = t.row(29);
+    let other = if ctx.fmt("fb", "#P") == "0" { "1" } else { "0" };
+    let col = list.find(&format!("{other}:[t{other}]")).unwrap_or_else(|| panic!("{list:?}")) as u16;
+    std::thread::sleep(Duration::from_millis(400));
+    t.mouse(0, col + 1, 29, false);
+    t.mouse(0, col + 1, 29, true);
+    wait_for("pane selected from the status line", || ctx.fmt("fb", "#P") == other);
+}

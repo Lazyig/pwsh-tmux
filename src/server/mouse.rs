@@ -52,6 +52,8 @@ enum Where {
     StatusDefault,
     /// A `range=control|N` (KEYC_MOUSE_LOCATION_CONTROL0 + N).
     Control(u32),
+    /// No pane there (a window with only floating panes).
+    Empty,
 }
 
 impl Where {
@@ -63,6 +65,7 @@ impl Where {
             Where::StatusLeft => "StatusLeft",
             Where::StatusRight => "StatusRight",
             Where::StatusDefault => "StatusDefault",
+            Where::Empty => "Empty",
             Where::Control(n) => ["Control0", "Control1", "Control2", "Control3", "Control4", "Control5", "Control6", "Control7", "Control8", "Control9"][n.min(9) as usize],
         }
     }
@@ -304,16 +307,34 @@ impl Server {
                 let g = w.layout.geom(p)?;
                 let (xi, yi) = (x as i32, py as i32);
                 let inside = xi >= g.x && xi < g.x + g.w as i32 && yi >= g.y && yi < g.y + g.h as i32;
-                return Some((if inside { Where::Pane } else { Where::Border }, ctx));
+                if inside {
+                    return Some((Where::Pane, ctx));
+                }
+                let wh = self.status_control(wid, p, xi, yi, (g.x, g.y, g.w, g.h)).map_or(Where::Border, Where::Control);
+                return Some((wh, ctx));
             }
             None => {}
         }
         let rects: Vec<(PaneId, Rect)> = self.rects(wid).0.into_iter().map(|(p, r)| (p, self.content_rect(wid, r))).collect();
-        // window_get_active_at: the pane including its right and bottom border
-        let (pane, r) = *rects.iter().find(|(_, r)| x >= r.x && x <= r.right() && py >= r.y && py <= r.bottom())?;
+        // a pane's top status line goes before the bottom border of the pane above it
+        if self.opt_window(Some(wid), "pane-border-status") == "top" {
+            if let Some((pane, r)) = rects.iter().find(|(_, r)| r.y > 0 && py == r.y - 1 && x >= r.x && x <= r.right()) {
+                ctx.pane = Some(*pane);
+                let wh = self.status_control(wid, *pane, x as i32, py as i32, (r.x as i32, r.y as i32, r.w, r.h)).map_or(Where::Border, Where::Control);
+                return Some((wh, ctx));
+            }
+        }
+        // window_get_active_at: the pane including its right and bottom border; nothing is
+        // the empty area of a window with only floating panes
+        let Some(&(pane, r)) = rects.iter().find(|(_, r)| x >= r.x && x <= r.right() && py >= r.y && py <= r.bottom()) else {
+            return Some((Where::Empty, ctx));
+        };
         ctx.pane = Some(pane);
         if x < r.right() && py < r.bottom() {
             return Some((Where::Pane, ctx));
+        }
+        if let Some(n) = self.status_control(wid, pane, x as i32, py as i32, (r.x as i32, r.y as i32, r.w, r.h)) {
+            return Some((Where::Control(n), ctx));
         }
         if !w.zoomed {
             let on_border = rects.iter().any(|(_, f)| {
@@ -417,6 +438,22 @@ impl Server {
             Some(p) if self.windows[&wid].panes().contains(&p) => Some(p),
             Some(_) => None,
             None => Some(self.windows[&wid].active),
+        }
+    }
+
+    /// The control range (`range=control|N`) of a pane's status line at window position
+    /// (x, y), for a pane with content at `g` (tmux window_pane_status_get_range).
+    fn status_control(&self, wid: WinId, pane: PaneId, x: i32, y: i32, (gx, gy, gw, gh): (i32, i32, u16, u16)) -> Option<u32> {
+        let line = match self.pane_status(wid, pane) {
+            "top" => gy - 1,
+            "bottom" => gy + gh as i32,
+            _ => return None,
+        };
+        // the line starts two cells in
+        let i = usize::try_from(x - gx - 2).ok().filter(|_| y == line)?;
+        match self.pane_status_line(pane, gw.saturating_sub(2) as usize, crate::cells::Style::default()).1.get(i)? {
+            Some(Range::Control(n)) => Some(*n),
+            _ => None,
         }
     }
 
