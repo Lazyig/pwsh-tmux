@@ -681,7 +681,7 @@ impl Server {
             }
             if self.ev.waiters[i].verbose {
                 let mut text = String::new();
-                for (k, v) in &p.items {
+                for (k, v) in p.items.iter().filter(|(k, _)| !k.starts_with('_')) {
                     text.push_str(&format!("{k}={}\n", v.print()));
                 }
                 self.waiter_print(i, &text);
@@ -1637,7 +1637,9 @@ impl Server {
             let rezoom = old.zoomed && now.zoomed && old.size != now.size;
             if rezoom {
                 self.fire_window("window-unzoomed", wid);
-                self.fire_window("window-layout-changed", wid);
+                let mut p = self.payload_window(wid);
+                p.str("_unzoomed_layout", old.layout.clone());
+                self.fire("window-layout-changed", p);
                 self.fire_window("window-zoomed", wid);
                 self.fire_window("window-layout-changed", wid);
             }

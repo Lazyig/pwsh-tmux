@@ -1358,11 +1358,13 @@ fn tmux_38_control_notifications() {
     ctx.ok(&["select-window", "-t", "oth:1"]);
     wait_for("%session-window-changed", || text().contains(&format!("%session-window-changed {other} @")));
     send("refresh-client -f new-layouts");
-    // detaching a control client prints a bare %exit
+    // detaching a control client prints a bare %exit, after the reply
     send("detach-client");
     wait_for("client exit", || child.try_wait().unwrap().is_some());
     wait_for("%exit", || text().contains("%exit"));
-    assert!(text().ends_with("\n%exit\n"), "{}", text());
+    let t = text();
+    let lines: Vec<&str> = t.lines().rev().take(3).collect();
+    assert!(lines[0] == "%exit" && lines[1].starts_with("%end ") && lines[2].starts_with("%begin "), "{t}");
 }
 
 /// The order of tmux 3.8's window and session events, as hooks see them: swap-window

@@ -684,21 +684,30 @@ impl Client {
         Duration::from_millis(now_ms().saturating_sub(self.backlog_since.load(Ordering::SeqCst)))
     }
 
-    /// Ends an attached client; control clients get %exit first.
+    /// Ends an attached client; control clients get %exit first, after the reply
+    /// of the command that is running (server_client_check_exit).
     pub fn send_exit(&self, msg: &str) {
         if self.control > 0 {
-            // a control client is never attached in its client process: detaching
-            // and other exits print a bare %exit; only messages the server provides
-            // (client_dispatch_exit_message) are shown
-            let reason = msg.trim_matches(['[', ']']);
-            let reason = if matches!(reason, "access not allowed" | "too far behind") { reason } else { "" };
-            let line = if reason.is_empty() { "%exit\n".to_string() } else { format!("%exit {reason}\n") };
-            self.send(S_OUTPUT, line.as_bytes());
-            if self.ctl.wait_exit {
-                // wait-exit: the client leaves after its next line
-                self.ctl.exiting.set(true);
-                return;
-            }
+            self.ctl.deferred_exit.borrow_mut().get_or_insert_with(|| msg.to_string());
+            return;
+        }
+        self.send(S_EXIT, msg.as_bytes());
+    }
+
+    /// Sends a control client's deferred exit.
+    pub fn finish_exit(&self) {
+        let Some(msg) = self.ctl.deferred_exit.borrow_mut().take() else { return };
+        // a control client is never attached in its client process: detaching and
+        // other exits print a bare %exit; only messages the server provides
+        // (client_dispatch_exit_message) are shown
+        let reason = msg.trim_matches(['[', ']']);
+        let reason = if matches!(reason, "access not allowed" | "too far behind") { reason } else { "" };
+        let line = if reason.is_empty() { "%exit\n".to_string() } else { format!("%exit {reason}\n") };
+        self.send(S_OUTPUT, line.as_bytes());
+        if self.ctl.wait_exit {
+            // wait-exit: the client leaves after its next line
+            self.ctl.exiting.set(true);
+            return;
         }
         self.send(S_EXIT, msg.as_bytes());
     }
@@ -1871,6 +1880,7 @@ impl Server {
         for c in self.clients.values() {
             if c.attached {
                 c.send_exit("[server exited]");
+                c.finish_exit();
             } else {
                 c.send(S_REPLY, &encode_reply(0, ""));
             }
@@ -2603,6 +2613,9 @@ impl Server {
         if let (Some(seq), Some(cid)) = (ctx.control_seq, ctx.client) {
             self.control_block(cid, seq, ctx.control_line, &ctx.out, err.as_deref());
             self.control_flush(cid);
+            if let Some(c) = self.clients.get(&cid) {
+                c.finish_exit();
+            }
             // a one-shot `pwsh-tmux -C command` that didn't attach ends here
             if let Some(c) = ctx.reply.and_then(|r| self.clients.get(&r)).filter(|c| !c.attached) {
                 c.send(S_OUTPUT, b"%exit\n");

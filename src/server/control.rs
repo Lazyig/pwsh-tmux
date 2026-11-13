@@ -24,6 +24,9 @@ pub struct Flags {
     pub wait_exit: bool,
     pub ignore_size: bool,
     pub exiting: std::cell::Cell<bool>,
+    /// Told to exit (CLIENT_EXIT): the exit is sent once the reply of the running
+    /// command is written.
+    pub deferred_exit: std::cell::RefCell<Option<String>>,
     pub panes: HashMap<PaneId, PaneOutput>,
     /// name -> (what, format, last value per target)
     pub subs: BTreeMap<String, (String, String, HashMap<String, String>)>,
@@ -337,7 +340,13 @@ impl Server {
                 for (c, sid) in &clients {
                     let Some(idx) = in_session(self, *sid, wid) else { continue };
                     let t = Target { sid: *sid, idx: Some(idx), wid: Some(wid), pane: Some(self.windows[&wid].active) };
-                    let line = self.expand(t, Some(*c), "%layout-change #{window_id} #{window_layout} #{window_visible_layout} #{window_raw_flags}");
+                    let mut extra = HashMap::new();
+                    // the unzoomed moment of a zoomed window's resize: its old layout
+                    if let Some(Val::Str(layout)) = p.get("_unzoomed_layout") {
+                        let flags = self.expand(t, Some(*c), "#{window_raw_flags}").replace('Z', "");
+                        extra.extend([("window_layout".to_string(), layout.clone()), ("window_visible_layout".to_string(), layout.clone()), ("window_raw_flags".to_string(), flags)]);
+                    }
+                    let line = self.expand_extra(t, Some(*c), "%layout-change #{window_id} #{window_layout} #{window_visible_layout} #{window_raw_flags}", extra);
                     lines.push((*c, line));
                 }
             }
@@ -425,11 +434,15 @@ impl Server {
         }
     }
 
-    /// Writes every held notification (no command block is open between commands).
+    /// Writes every held notification (no command block is open between commands),
+    /// then lets go of control clients told to exit.
     pub fn control_notify(&mut self) {
         let ids: Vec<ClientId> = self.ev.ctl_queue.keys().copied().collect();
         for cid in ids {
             self.control_flush(cid);
+        }
+        for c in self.clients.values() {
+            c.finish_exit();
         }
     }
 }
