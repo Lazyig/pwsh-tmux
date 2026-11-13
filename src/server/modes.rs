@@ -26,8 +26,9 @@ pub enum ModeAction {
     Run(String),
     /// Run a command and stay in the mode.
     RunKeep(String),
-    /// Open `value` in the editor and run `command` (%% is the new text) when it closes.
-    Edit { value: String, command: String },
+    /// Open `value` in the editor and run `command` (%% is the new text) when it closes,
+    /// or replace the contents of paste buffer `buffer` with it.
+    Edit { value: Vec<u8>, command: String, buffer: Option<String> },
 }
 
 /// Which of session_format, window_format and pane_format a format sees as set (the type
@@ -338,6 +339,8 @@ pub struct PopupEditor {
     pub path: std::path::PathBuf,
     /// Run with %% replaced by the edited text.
     pub command: String,
+    /// The paste buffer being edited (window_buffer_edit_close_cb) instead of a command.
+    pub buffer: Option<String>,
 }
 
 impl Popup {

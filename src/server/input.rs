@@ -535,9 +535,9 @@ impl Server {
                 self.run_mode_command(client, &cmd, pane);
             }
             ModeAction::RunKeep(cmd) => self.run_mode_command(client, &cmd, pane),
-            ModeAction::Edit { value, command } => {
+            ModeAction::Edit { value, command, buffer } => {
                 if let Some(c) = client {
-                    if let Err(e) = self.open_editor(c, &value, command) {
+                    if let Err(e) = self.open_editor(c, &value, command, buffer) {
                         self.set_message(c, &e);
                     }
                 }
@@ -550,13 +550,12 @@ impl Server {
 
     /// spawn_editor: edit `value` in the editor option's program, in a popup over the client;
     /// `command` runs with %% replaced by the text when the editor exits successfully.
-    pub fn open_editor(&mut self, cid: ClientId, value: &str, command: String) -> Result<(), String> {
+    pub fn open_editor(&mut self, cid: ClientId, value: &[u8], command: String, buffer: Option<String>) -> Result<(), String> {
         if self.clients.get(&cid).is_some_and(|c| c.overlay.is_some()) {
             return Err("an overlay is already open".into());
         }
-        let path = std::env::temp_dir().join(format!("tmux.{}.{}", std::process::id(), now_ms()));
-        let text = if value.is_empty() { "\n".to_string() } else { value.to_string() };
-        std::fs::write(&path, text).map_err(|e| format!("editor: {e}"))?;
+        let text: &[u8] = if value.is_empty() { b"\n" } else { value };
+        let path = editor_file(text).map_err(|e| format!("editor: {e}"))?;
         let editor = self.opt_server("editor");
         // the editor option names the program (notepad.exe on Windows); the file is one argument
         let quoted = if cfg!(windows) { format!("\"{}\"", path.display()) } else { crate::cmdparse::quote(&path.display().to_string()) };
@@ -573,23 +572,39 @@ impl Server {
                 return Err(e);
             }
         };
-        let editor = Some(Box::new(super::modes::PopupEditor { path, command }));
+        let editor = Some(Box::new(super::modes::PopupEditor { path, command, buffer }));
         self.replace_overlay(cid, Some(Overlay::Popup(super::modes::Popup { pane, x, y, w, h, border: true, close_on_exit: true, title: String::new(), editor })))?;
         Ok(())
     }
 
-    /// The editor popup closed: run its command with the new text (spawn_editor_finish).
+    /// The editor popup closed (spawn_editor_finish): nothing for a failed editor or an
+    /// empty file, else the paste buffer gets the text (window_buffer_edit_close_cb) or the
+    /// command runs with it, less a final newline.
     pub fn editor_done(&mut self, cid: ClientId, ed: super::modes::PopupEditor, status: Option<i32>) {
-        let text = std::fs::read_to_string(&ed.path).ok();
+        let data = std::fs::read(&ed.path).ok();
         let _ = std::fs::remove_file(&ed.path);
-        let Some(mut text) = text.filter(|_| status.unwrap_or(0) == 0) else { return };
-        if text.ends_with('\n') {
-            text.pop();
-            if text.ends_with('\r') {
-                text.pop();
+        let Some(mut data) = data.filter(|d| status.unwrap_or(0) == 0 && !d.is_empty()) else { return };
+        let strip = |d: &mut Vec<u8>| {
+            if d.last() == Some(&b'\n') {
+                d.pop();
+                if cfg!(windows) && d.last() == Some(&b'\r') {
+                    d.pop();
+                }
             }
+        };
+        if let Some(name) = &ed.buffer {
+            // only a buffer that is still there; its old final newline decides
+            let Some(b) = self.buffers.iter_mut().find(|b| &b.name == name) else { return };
+            if !b.data.is_empty() && b.data.last() != Some(&b'\n') {
+                strip(&mut data);
+            }
+            if !data.is_empty() {
+                b.data = data;
+            }
+            return;
         }
-        let cmd = fill_template(&ed.command, &[text]);
+        strip(&mut data);
+        let cmd = fill_template(&ed.command, &[String::from_utf8_lossy(&data).into_owned()]);
         self.run_string(cid, &cmd, None);
     }
 
@@ -866,6 +881,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn editor_files_are_new_and_private() {
+        let a = editor_file(b"one").unwrap();
+        let b = editor_file(b"two").unwrap();
+        assert_ne!(a, b);
+        assert!(a.file_name().unwrap().to_string_lossy().starts_with("tmux."));
+        assert_eq!(std::fs::read(&a).unwrap(), b"one");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&a).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_file(a);
+        let _ = std::fs::remove_file(b);
+    }
+
+    #[test]
     fn templates() {
         assert_eq!(fill_template("rename-window -- '%%'", &["it's".into()]), "rename-window -- 'it'\\''s'");
         assert_eq!(fill_template("a %1 b %2", &["x".into(), "y z".into()]), "a x b y z");
@@ -875,4 +906,44 @@ mod tests {
         assert!(b["prefix"].contains_key("\""));
         assert!(b["copy-mode-vi"].len() > 20);
     }
+}
+
+/// mkstemp(_PATH_TMP "tmux.XXXXXXXX"): a new file only this user can read, created
+/// exclusively under a random name (never through an existing file or link).
+fn editor_file(data: &[u8]) -> std::io::Result<std::path::PathBuf> {
+    use std::hash::{BuildHasher, Hasher};
+    use std::io::Write;
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let dir = std::env::temp_dir();
+    let mut last = None;
+    for attempt in 0..100u64 {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(now_ms() ^ attempt);
+        h.write_u32(std::process::id());
+        let mut n = h.finish();
+        let name: String = (0..8)
+            .map(|_| {
+                let c = CHARS[(n % CHARS.len() as u64) as usize] as char;
+                n /= CHARS.len() as u64;
+                c
+            })
+            .collect();
+        let path = dir.join(format!("tmux.{name}"));
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+        match o.open(&path) {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(data) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(e);
+                }
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no temporary file")))
 }

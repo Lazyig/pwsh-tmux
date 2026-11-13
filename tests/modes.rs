@@ -352,3 +352,30 @@ fn mode_choices_apply_to_the_client_that_pressed_the_key() {
     });
     let _ = a;
 }
+
+#[cfg(unix)]
+#[test]
+fn buffer_editor_keeps_the_final_newline_like_window_buffer_edit_close_cb() {
+    let ctx = Ctx::new("buffer-editor");
+    let t = start(&ctx, "be");
+    // the editor changes nothing: "line\n" stays "line\n"
+    ctx.ok(&["set", "-s", "editor", "true"]);
+    ctx.ok(&["setb", "-b", "nl", "line\n"]);
+    ctx.ok(&["choose-buffer", "-t", "be", "-F", "x"]);
+    t.wait_screen("buffers", |s| s.contains("(0) nl"));
+    t.send(b"e");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(ctx.ok(&["show-buffer", "-b", "nl"]), "line\n");
+    // a buffer without one loses the newline the editor adds
+    ctx.ok(&["set", "-s", "editor", "printf 'new\\n' >"]);
+    ctx.ok(&["deleteb", "-b", "nl"]);
+    ctx.ok(&["setb", "-b", "nonl", "old"]);
+    wait_for("list", || t.contents().contains("(0) nonl"));
+    t.send(b"e");
+    wait_for("edited", || ctx.ok(&["show-buffer", "-b", "nonl"]) == "new");
+    // an empty file changes nothing
+    ctx.ok(&["set", "-s", "editor", "truncate -s 0"]);
+    t.send(b"e");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(ctx.ok(&["show-buffer", "-b", "nonl"]), "new");
+}

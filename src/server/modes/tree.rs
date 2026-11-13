@@ -1205,7 +1205,7 @@ impl Tree {
             "e" => {
                 if let ItemData::Buffer(n) = &b.nodes[item].data {
                     if let Some(buf) = srv.buffers.iter().find(|x| &x.name == n) {
-                        return ModeAction::Edit { value: String::from_utf8_lossy(&buf.data).into_owned(), command: format!("set-buffer -b {} -- '%%'", crate::cmdparse::quote(n)) };
+                        return ModeAction::Edit { value: buf.data.clone(), command: String::new(), buffer: Some(n.clone()) };
                     }
                 }
             }

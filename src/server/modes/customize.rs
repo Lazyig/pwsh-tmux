@@ -480,7 +480,7 @@ pub fn key(tree: &mut Tree, name: &str, srv: &Server, b: &mut Built) -> ModeActi
             };
             // a placeholder quote() leaves alone stands for the edited text
             if let Some(command) = set_command(srv, &it, scope, "PwshTmuxEditedValue") {
-                return ModeAction::Edit { value, command: command.replace("PwshTmuxEditedValue", "'%%'") };
+                return ModeAction::Edit { value: value.into_bytes(), command: command.replace("PwshTmuxEditedValue", "'%%'"), buffer: None };
             }
         }
         "a" => {
