@@ -802,6 +802,7 @@ impl CopyMode {
     pub fn start_drag(&mut self, row: u16, col: u16) {
         self.dragging = true;
         self.leave_word_mode();
+        self.pinned = None;
         self.lineflag = None;
         let inside = self.mouse_in_selection(row as usize, col as usize);
         let bounds = self.sel_bounds();
@@ -896,7 +897,17 @@ impl CopyMode {
             self.top = (self.top + 1).min(self.hsize());
         }
         self.cy = (self.top + row).min(self.lines.len() - 1);
-        self.sticky_end(norect);
+        // the remembered column is used as it is (window_copy_scroll_up does not clamp
+        // it), unless it is past the line or the cursor was at a line end
+        if norect {
+            let px = self.len(self.cy);
+            if (self.cx >= self.tlastsx && self.cx != px) || self.cx > px {
+                self.cx = self.clamp_x(self.cy, px);
+            }
+        } else {
+            self.cx = self.clamp_x(self.cy, self.cx);
+        }
+        self.cx = self.snap(self.cy, self.cx);
     }
 
     /// Before a vertical move: remember the column unless the cursor is at the end of
@@ -1279,7 +1290,7 @@ impl CopyMode {
         const KEEP: &[&str] = &[
             "jump-", "search-", "set-mark", "toggle-position", "line-numbers-", "refresh-", "scroll-exit-", "copy-",
             "append-", "pipe", "selection-mode", "next-matching-bracket", "previous-matching-bracket", "scroll-up",
-            "scroll-down", "other-end", "cancel",
+            "scroll-down", "other-end", "cancel", "next-prompt", "previous-prompt", "stop-selection",
         ];
         if !KEEP.iter().any(|k| command.starts_with(k)) {
             self.pinned = None;
@@ -1460,12 +1471,7 @@ impl CopyMode {
                 self.lineflag = Some(true);
                 self.anchor = Some(start);
                 // a single character word: the cursor stays on it
-                let end = if single {
-                    start
-                } else {
-                    let end = self.reader_next_word_end(start, &seps);
-                    if self.vi { self.step_left(end).filter(|p| *p >= start).unwrap_or(start) } else { end }
-                };
+                let end = if single { start } else { self.next_word_end(start, &seps) };
                 self.set_cursor(end.0, end.1);
                 let end = (self.cy, self.cx);
                 self.sel_mode = SelMode::Word;
@@ -1480,7 +1486,7 @@ impl CopyMode {
             }
             "selection-mode" => match arg.map(str::to_ascii_lowercase).as_deref() {
                 None | Some("char") | Some("c") => {
-                    self.materialize_word();
+                    self.materialize();
                     self.sel_mode = SelMode::Char;
                 }
                 Some("word") | Some("w") => self.sel_mode = SelMode::Word,
@@ -1506,6 +1512,8 @@ impl CopyMode {
                             self.cx = self.max_x(ey);
                             self.ensure_visible();
                         }
+                        self.word_origin = None;
+                        self.pinned = None;
                     }
                 }
                 Some(_) => {}
@@ -1525,7 +1533,8 @@ impl CopyMode {
                 if (n % 2) != 0 {
                     self.other_end();
                 }
-                self.leave_word_mode();
+                self.materialize();
+                self.word_origin = None;
                 self.sel_mode = SelMode::Char;
             }
             "copy-selection" | "copy-pipe" => return self.copy_selection(true, false, false),
@@ -1634,7 +1643,8 @@ impl CopyMode {
                 }
             }
             "goto-line" => {
-                if let Some(l) = arg.and_then(|a| a.trim().parse::<i64>().ok()) {
+                // window_copy_goto_line: the view moves, the cursor keeps its place on screen
+                if let Some(l) = arg.and_then(|a| a.trim().parse::<i64>().ok()).filter(|l| (-1..=i32::MAX as i64).contains(l)) {
                     let row = self.cy - self.top;
                     let hsize = self.hsize();
                     let oy = if self.line_numbers_absolute() {
@@ -1647,9 +1657,7 @@ impl CopyMode {
                         l as usize
                     };
                     self.top = hsize - oy;
-                    let y = (self.top + row).min(self.lines.len() - 1);
-                    self.cy = y;
-                    self.cx = self.snap(y, self.lastcx.min(self.max_x(y)));
+                    self.cy = (self.top + row).min(self.lines.len() - 1);
                 }
             }
             "previous-paragraph" => (0..n).for_each(|_| self.previous_paragraph()),
@@ -1729,7 +1737,21 @@ impl CopyMode {
     fn leave_word_mode(&mut self) {
         self.materialize_word();
         self.word_origin = None;
-        self.pinned = None;
+    }
+
+    /// The selection becomes a character selection between the ends tmux keeps (until
+    /// the next update): the end the cursor does not drag becomes the anchor.
+    fn materialize(&mut self) {
+        let line = self.line_mode && self.sel_mode == SelMode::Line;
+        if self.frozen.is_some() || !(line || self.pinned_slots().is_some() || self.word_sel().is_some()) {
+            return;
+        }
+        let Some((s, e)) = self.slots() else { return };
+        self.anchor = Some(if self.ends_swapped { e } else { s });
+        self.pinned = Some(((self.cy, self.cx), s, e));
+        if line {
+            self.line_mode = false;
+        }
     }
 
     /// A word selection's fixed end becomes the anchor.
@@ -1752,7 +1774,6 @@ impl CopyMode {
 
     /// window_copy_rectangle_set: the cursor may need to come back within the line.
     fn rectangle_set(&mut self, on: bool) {
-        self.materialize_word();
         self.pinned = None;
         self.rect = on;
         self.lineflag = None;
@@ -2969,39 +2990,57 @@ impl CopyMode {
         Some((x0, x1))
     }
 
+    /// window_copy_get_selection: the text between the selection's ends (a rectangle
+    /// between the cursor's column and the other end's), vi keeping the last character.
     fn selection_text(&self) -> String {
-        let Some(((sy, _), (ey, _))) = self.sel_bounds() else { return String::new() };
+        let Some((a, b)) = self.slots() else { return String::new() };
+        let ((sy, sx), (ey, ex)) = if b < a { (b, a) } else { (a, b) };
+        let ey_last = self.len(ey);
+        let ex = ex.min(ey_last);
+        let one = usize::from(self.vi);
+        let (firstsx, restsx, lastex, restex) = if self.rect {
+            // the column of the end the cursor does not drag
+            let selx = if !self.ends_swapped && self.frozen.is_none() { a.1 } else { b.1 };
+            if selx < self.cx {
+                (selx, selx, self.cx + one, self.cx + one)
+            } else {
+                (self.cx, self.cx, selx + 1, selx + 1)
+            }
+        } else {
+            (sx, 0, ex + one, self.width)
+        };
         let mut out = String::new();
         for y in sy..=ey {
-            let Some((x0, x1)) = self.sel_range(y) else { continue };
-            let len = self.copy_len(y);
-            let end = x1.min(len);
-            for x in x0..end {
-                if let Some(c) = self.cell(y, x) {
-                    out.push_str(&c.text);
-                }
-            }
-            if self.rect {
-                if y != ey {
-                    out.push('\n');
-                }
-            } else if y != ey {
-                if !self.wrapped(y) {
-                    out.push('\n');
-                }
-            } else if self.vi && !self.wrapped(y) && x1 > len {
-                // tmux keeps the final newline in vi mode when the selection runs past the text.
-                out.push('\n');
-            }
+            self.copy_line(&mut out, y, if y == sy { firstsx } else { restsx }, if y == ey { lastex } else { restex });
+        }
+        // the final newline goes (unless vi copied to the end of the line)
+        if (!self.vi || lastex <= ey_last) && (!self.wrapped(ey) || lastex != ey_last) && out.ends_with('\n') {
+            out.pop();
         }
         out
     }
 
-    fn copy_selection(&mut self, clear: bool, cancel: bool, append: bool) -> Action {
-        if self.anchor.is_none() {
-            return if cancel { Action::Cancel } else { Action::None };
+    /// window_copy_copy_line: cells [sx, ex) of a line and a newline unless it wraps.
+    fn copy_line(&self, out: &mut String, y: usize, sx: usize, ex: usize) {
+        if sx > ex {
+            return;
         }
-        let text = self.selection_text();
+        let wrapped = self.wrapped(y);
+        let xx = self.copy_len(y);
+        let (sx, ex) = (sx.min(xx), ex.min(xx));
+        for x in sx..ex {
+            if let Some(c) = self.cell(y, x).filter(|c| !c.is_continuation()) {
+                out.push_str(&c.text);
+            }
+        }
+        if !wrapped || ex != xx {
+            out.push('\n');
+        }
+    }
+
+    fn copy_selection(&mut self, clear: bool, cancel: bool, append: bool) -> Action {
+        // without a selection, the search match at the cursor
+        let text = if self.anchor.is_none() { self.search_match().unwrap_or_default() } else { self.selection_text() };
         if clear {
             self.clear_selection();
         }
@@ -3968,7 +4007,7 @@ mod tests {
         assert_eq!(cm.cx, W as usize, "to the edge of the screen");
         keys(&mut cm, &["j"]);
         assert_eq!(pos(&cm), (1, W as usize), "kept past the end of a short line");
-        assert_eq!(copied(cm.run("copy-selection", &[])), "hello\nab");
+        assert_eq!(copied(cm.run("copy-selection", &[])), "hello\nab\n", "vi keeps the newline past the text");
         // leaving rectangle mode brings the cursor back within the line
         keys(&mut cm, &["v"]);
         assert_eq!(cm.cx, 1);
