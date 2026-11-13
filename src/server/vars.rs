@@ -369,7 +369,8 @@ impl Vars for VarCtx<'_> {
             "window_end_flag" => Some(b(sess.zip(t.idx).is_some_and(|(s, i)| s.links.keys().next_back() == Some(&i)))),
             "window_linked" => win.map(|w| b(srv.links_of(w.id).len() > 1)),
             "window_linked_sessions" => win.map(|w| srv.links_of(w.id).len().to_string()),
-            "window_bigger" => Some("0".into()),
+            // windows always fit their clients here (no offset)
+            "window_bigger" => client.map(|_| "0".into()),
             "window_active_clients" | "window_active_clients_list" => win.map(|w| {
                 let names: Vec<String> = srv.clients.values()
                     .filter(|c| c.attached && c.session.and_then(|s| srv.sessions.get(&s)).is_some_and(|s| s.links.get(&s.active) == Some(&w.id)))
@@ -627,7 +628,7 @@ impl Vars for VarCtx<'_> {
             "client_user" => client.and_then(|c| c.user.as_ref()).map(|u| ipc::user_name_for_id(u)),
             "client_created" => client.map(|c| c.created.to_string()),
             "client_activity" => client.map(|c| c.activity.to_string()),
-            "client_utf8" => Some("1".into()),
+            "client_utf8" => client.map(|_| "1".into()),
             "client_control_mode" => client.map(|c| b(c.control > 0)),
             "client_written" => client.map(|c| c.io.written.load(std::sync::atomic::Ordering::Relaxed).to_string()),
             "client_discarded" => client.map(|c| c.io.discarded.load(std::sync::atomic::Ordering::Relaxed).to_string()),
