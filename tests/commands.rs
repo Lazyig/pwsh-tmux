@@ -741,7 +741,8 @@ fn control_mode() {
     send("no-such-command");
     wait_for("%error", || text().contains("%error "));
     send("refresh-client -C 120x40");
-    wait_for("control size", || ctx.fmt("c", "#{window_width}x#{window_height}") == "120x39");
+    // control clients have no status line: the window gets the whole size
+    wait_for("control size", || ctx.fmt("c", "#{window_width}x#{window_height}") == "120x40");
     // an empty line detaches
     send("");
     wait_for("%exit", || text().contains("%exit"));
@@ -1347,6 +1348,83 @@ fn tmux_38_control_notifications() {
     ctx.ok(&["select-window", "-t", "oth:1"]);
     wait_for("%session-window-changed", || text().contains(&format!("%session-window-changed {other} @")));
     send("refresh-client -f new-layouts");
-    send("");
+    // detaching a control client prints a bare %exit
+    send("detach-client");
     wait_for("client exit", || child.try_wait().unwrap().is_some());
+    wait_for("%exit", || text().contains("%exit"));
+    assert!(text().ends_with("\n%exit\n"), "{}", text());
+}
+
+/// The order of tmux 3.8's window and session events, as hooks see them: swap-window
+/// links nothing, session groups link every window again when one member changes,
+/// windows close after their last unlink and sessions close after what the command did.
+#[test]
+fn tmux_38_event_order() {
+    let ctx = Ctx::new("evorder");
+    ctx.ok(&["new-session", "-d", "-s", "a", "-x", "80", "-y", "24"]);
+    for e in ["window-created", "window-closed", "window-linked", "window-unlinked", "session-window-changed", "session-created", "session-closed", "session-added-to-group", "session-removed-from-group", "window-layout-changed", "window-zoomed", "window-unzoomed", "window-resized", "pane-created", "pane-moved"] {
+        ctx.ok(&["set-hook", "-g", e, "set -gaF @log '#{hook}<#{hook_session_name}:#{hook_window_index}> '"]);
+    }
+    let log = |ctx: &Ctx| -> String {
+        let (_, out) = ctx.cmd(&["show", "-gqv", "@log"]);
+        ctx.ok(&["set", "-gu", "@log"]);
+        out.trim().to_string()
+    };
+    // (as tmux 3.8 prints them)
+    ctx.ok(&["new-window", "-t", "a:1"]);
+    assert_eq!(log(&ctx), "pane-created<a:1> session-window-changed<a:1> window-created<:> window-linked<a:1>");
+    ctx.ok(&["new-window", "-d", "-t", "a:2"]);
+    assert_eq!(log(&ctx), "pane-created<a:2> window-created<:> window-linked<a:2>");
+    // the current winlink stays current with another window in it
+    let before = ctx.fmt("a", "#{window_id}");
+    ctx.ok(&["swap-window", "-s", "a:1", "-t", "a:2"]);
+    assert_eq!(log(&ctx), "");
+    assert_eq!(ctx.fmt("a", "#{window_index}"), "1");
+    assert_ne!(ctx.fmt("a", "#{window_id}"), before);
+    // -d selects the target index, keeping the window
+    ctx.ok(&["swap-window", "-d", "-s", "a:1", "-t", "a:0"]);
+    assert_eq!(log(&ctx), "session-window-changed<a:0>");
+    assert_eq!(ctx.fmt("a", "#{window_index}"), "0");
+    // a group: joining comes first, the new member gets every window (tmux also
+    // spawns and closes a window of its own first)
+    ctx.ok(&["new-session", "-d", "-s", "b", "-t", "a"]);
+    assert_eq!(log(&ctx), "session-added-to-group<a:> session-added-to-group<b:> window-linked<b:0> window-linked<b:1> window-linked<b:2> session-created<b:>");
+    ctx.ok(&["new-window", "-d", "-t", "a:3"]);
+    assert_eq!(log(&ctx), "pane-created<a:3> window-created<:> window-linked<a:3> window-linked<b:0> window-linked<b:1> window-linked<b:2> window-linked<b:3>");
+    ctx.ok(&["kill-window", "-t", "a:3"]);
+    assert_eq!(log(&ctx), "window-unlinked<a:3> window-linked<b:0> window-linked<b:1> window-linked<b:2> window-unlinked<b:3> window-closed<:>");
+    ctx.ok(&["kill-session", "-t", "b"]);
+    assert_eq!(log(&ctx), "session-closed<b:> session-removed-from-group<b:> window-unlinked<b:0> window-unlinked<b:1> window-unlinked<b:2>");
+    // a session closed by moving its last window away goes after the move
+    ctx.ok(&["new-session", "-d", "-s", "c"]);
+    assert_eq!(log(&ctx), "pane-created<c:0> window-created<:> window-linked<c:0> session-created<c:>");
+    ctx.ok(&["move-window", "-s", "c:0", "-t", "a:7"]);
+    assert_eq!(log(&ctx), "window-linked<a:7> session-window-changed<a:7> session-closed<c:> window-unlinked<c:0>");
+    // linking over a window closes it before the new link
+    ctx.ok(&["new-session", "-d", "-s", "d"]);
+    log(&ctx);
+    ctx.ok(&["link-window", "-k", "-s", "a:1", "-t", "d:0"]);
+    assert_eq!(log(&ctx), "window-unlinked<d:0> window-closed<:> window-linked<d:0> session-window-changed<d:0>");
+    // layouts: select-layout and resize-pane fire it themselves too; rotate-window does not
+    ctx.ok(&["split-window", "-d", "-t", "a:0"]);
+    assert_eq!(log(&ctx), "pane-created<a:0> window-layout-changed<:>");
+    ctx.ok(&["select-layout", "-t", "a:0", "even-horizontal"]);
+    assert_eq!(log(&ctx), "window-layout-changed<:> window-layout-changed<:>");
+    ctx.ok(&["select-layout", "-t", "a:0", "even-horizontal"]);
+    assert_eq!(log(&ctx), "window-layout-changed<:> window-layout-changed<:>");
+    ctx.ok(&["select-layout", "-t", "a:1", "tiled"]);
+    assert_eq!(log(&ctx), "window-layout-changed<:>");
+    ctx.ok(&["rotate-window", "-t", "a:0"]);
+    assert_eq!(log(&ctx), "");
+    // resizing a zoomed window unzooms and zooms it again
+    ctx.ok(&["resize-pane", "-Z", "-t", "a:0"]);
+    assert_eq!(log(&ctx), "window-zoomed<:> window-layout-changed<:>");
+    ctx.ok(&["resize-window", "-t", "a:0", "-x", "60", "-y", "20"]);
+    assert_eq!(log(&ctx), "window-unzoomed<:> window-layout-changed<:> window-zoomed<:> window-layout-changed<:> window-layout-changed<:> window-resized<:>");
+    ctx.ok(&["resize-pane", "-Z", "-t", "a:0"]);
+    log(&ctx);
+    // swap-pane across windows moves both panes
+    ctx.ok(&["swap-pane", "-d", "-s", "a:0.0", "-t", "a:7.0"]);
+    let out = log(&ctx);
+    assert!(out.contains("pane-moved<:7>") && out.contains("pane-moved<:0>"), "{out}");
 }

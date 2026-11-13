@@ -222,6 +222,13 @@ pub struct State {
     pub cur_formats: Option<Arc<HashMap<String, String>>>,
     pub seen: Seen,
     pub spawned: Vec<Spawned>,
+    /// session-closed payloads of sessions destroyed since the last check.
+    pub closed: Vec<(SessId, Payload)>,
+    /// Group members synchronized from a changed session: (changed, others).
+    pub synced: Vec<(SessId, Vec<SessId>)>,
+    /// Windows whose command fires window-layout-changed itself: how many times in
+    /// all, counting the change itself.
+    pub layout_fired: Vec<(WinId, usize)>,
     /// Panes with output since the last turn of the loop (PANE_ACTIVITY).
     pub activity: HashSet<PaneId>,
     /// Panes that have focus (PANE_FOCUSED) and clients that lost it (~CLIENT_FOCUSED).
@@ -1317,66 +1324,155 @@ impl Server {
     // ---- change detection --------------------------------------------------------------
 
     /// session-window-changed for sessions whose current window changed.
-    fn detect_current_windows(&mut self) {
-        let sids: Vec<SessId> = self.sessions.keys().copied().collect();
-        for &sid in &sids {
-            let s = &self.sessions[&sid];
-            let Some(&wid) = s.links.get(&s.active) else { continue };
-            let now = (s.active, wid);
-            let old = self.ev.seen.sessions.get(&sid).map(|x| x.active);
-            if let Some(old) = old.filter(|o| *o != now) {
-                let mut p = self.payload_winlink(sid, now.0, now.1);
-                p.set("new_window", self.val_window(now.1)).int("new_window_index", now.0 as i64);
-                p.set("old_window", self.val_window(old.1)).int("old_window_index", old.0 as i64);
-                if let Some(x) = self.ev.seen.sessions.get_mut(&sid) {
-                    x.active = now;
-                }
-                self.ev.focus_dirty = true;
-                self.fire("session-window-changed", p);
-            }
+    /// session-window-changed when a session's current winlink changed. After
+    /// swap-window the winlink is the same with another window in it: no event.
+    fn detect_current_window(&mut self, sid: SessId, swapped: bool) {
+        let Some(s) = self.sessions.get(&sid) else { return };
+        let Some(&wid) = s.links.get(&s.active) else { return };
+        let now = (s.active, wid);
+        let Some(old) = self.ev.seen.sessions.get(&sid).map(|x| x.active).filter(|o| *o != now) else { return };
+        if let Some(x) = self.ev.seen.sessions.get_mut(&sid) {
+            x.active = now;
+        }
+        if old == (0, 0) || (swapped && old.0 == now.0) {
+            return;
+        }
+        let mut p = self.payload_winlink(sid, now.0, now.1);
+        p.set("new_window", self.val_window(now.1)).int("new_window_index", now.0 as i64);
+        p.set("old_window", self.val_window(old.1)).int("old_window_index", old.0 as i64);
+        self.ev.focus_dirty = true;
+        self.fire("session-window-changed", p);
+    }
+
+    /// window-created for a new window as it is first linked (spawn_window).
+    fn detect_window_created(&mut self, wid: WinId) {
+        if self.ev.seen.windows.contains_key(&wid) {
+            return;
+        }
+        let Some(w) = self.windows.get(&wid) else { return };
+        let seen = WinSeen { name: w.name.clone(), active: w.active, zoomed: w.zoomed, size: (w.sx, w.sy), layout: w.layout.to_layout_string(self.window_area(wid)) };
+        self.ev.seen.windows.insert(wid, seen);
+        self.fire_window("window-created", wid);
+    }
+
+    /// window-unlinked, and window-closed once its last link went (window_remove_ref).
+    pub(crate) fn fire_unlinked(&mut self, p: Payload, wid: WinId) {
+        self.fire("window-unlinked", p);
+        let linked = self.ev.seen.sessions.values().any(|s| s.links.values().any(|w| *w == wid));
+        if !linked && !self.windows.contains_key(&wid) && self.ev.seen.windows.remove(&wid).is_some() {
+            let mut p = Payload::default();
+            p.set("window", self.val_window(wid));
+            self.fire("window-closed", p);
+            self.ev.seen.panes.retain(|_, s| s.wid != wid);
+            self.ev.latest.remove(&wid);
         }
     }
 
-    /// window-created for new windows, then window-linked and window-unlinked.
-    fn detect_windows_and_links(&mut self) {
-        let sids: Vec<SessId> = self.sessions.keys().copied().collect();
-        let mut wids: Vec<WinId> = self.windows.keys().copied().collect();
-        wids.sort_unstable();
-        // windows created
-        for &wid in &wids {
-            if !self.ev.seen.windows.contains_key(&wid) {
-                let w = &self.windows[&wid];
-                let seen = WinSeen { name: w.name.clone(), active: w.active, zoomed: w.zoomed, size: (w.sx, w.sy), layout: w.layout.to_layout_string(self.window_area(wid)) };
-                self.ev.seen.windows.insert(wid, seen);
-                self.fire_window("window-created", wid);
+    /// Session by session (in name order, as tmux walks them): the current window,
+    /// windows unlinked (and closed), windows created and linked. link-window and
+    /// move-window link before selecting (server_link_window); elsewhere the current
+    /// window changes first (session_detach, spawn_window). swap-window swaps the
+    /// windows inside the winlinks: nothing is linked or unlinked.
+    fn detect_links(&mut self, command: Option<&str>) {
+        let links_first = matches!(command, Some("link-window" | "move-window"));
+        let swapped = command == Some("swap-window");
+        let synced = std::mem::take(&mut self.ev.synced);
+        let mut sids: Vec<(String, SessId)> = self.sessions.values().map(|s| (s.name.clone(), s.id)).collect();
+        sids.sort_unstable();
+        let followers: HashSet<SessId> = synced.iter().flat_map(|s| s.1.iter().copied()).collect();
+        for (_, sid) in sids {
+            if followers.contains(&sid) {
+                continue;
+            }
+            self.detect_session_links(sid, links_first, swapped);
+            // the rest of its group follow it
+            for (_, others) in synced.iter().filter(|s| s.0 == sid) {
+                for &o in others {
+                    self.detect_group_sync(o);
+                }
             }
         }
-        // links
-        for &sid in &sids {
-            let Some(s) = self.sessions.get(&sid) else { continue };
-            let links = s.links.clone();
-            let old = self.ev.seen.sessions.get(&sid).map(|x| x.links.clone()).unwrap_or_default();
+        // followers whose leader went
+        for (leader, others) in &synced {
+            if !self.sessions.contains_key(leader) {
+                for &o in others {
+                    self.detect_group_sync(o);
+                }
+            }
+        }
+        // windows not linked anywhere
+        let mut wids: Vec<WinId> = self.windows.keys().copied().collect();
+        wids.sort_unstable();
+        for wid in wids {
+            self.detect_window_created(wid);
+        }
+    }
+
+    fn detect_session_links(&mut self, sid: SessId, links_first: bool, swapped: bool) {
+        let Some(s) = self.sessions.get(&sid) else { return };
+        let links = s.links.clone();
+        let name = s.name.clone();
+        let e = self.ev.seen.sessions.entry(sid).or_default();
+        let new_session = e.links.is_empty();
+        let old = std::mem::replace(&mut e.links, links.clone());
+        e.name = name;
+        if !links_first && !new_session {
+            self.detect_current_window(sid, swapped);
+        }
+        if !swapped {
             for (idx, wid) in &old {
                 if links.get(idx) != Some(wid) {
                     let p = self.payload_winlink(sid, *idx, *wid);
-                    self.fire("window-unlinked", p);
+                    self.fire_unlinked(p, *wid);
                 }
-            }
-            for (idx, wid) in &links {
-                if old.get(idx) != Some(wid) {
-                    self.fire_winlink("window-linked", sid, *idx, *wid);
-                }
-            }
-            let Some(s) = self.sessions.get(&sid) else { continue };
-            let active = s.links.get(&s.active).map(|w| (s.active, *w)).unwrap_or_default();
-            let name = s.name.clone();
-            let e = self.ev.seen.sessions.entry(sid).or_default();
-            e.links = links;
-            e.name = name;
-            if e.active == (0, 0) || old.is_empty() {
-                e.active = active;
             }
         }
+        for (idx, wid) in &links {
+            self.detect_window_created(*wid);
+            if !swapped && old.get(idx) != Some(wid) {
+                self.fire_winlink("window-linked", sid, *idx, *wid);
+            }
+        }
+        if new_session {
+            // no session-window-changed for the first window
+            self.seen_active_now(sid);
+        } else if links_first {
+            self.detect_current_window(sid, swapped);
+        }
+    }
+
+    fn seen_active_now(&mut self, sid: SessId) {
+        let active = self.sessions.get(&sid).and_then(|s| s.links.get(&s.active).map(|w| (s.active, *w))).unwrap_or_default();
+        if let Some(e) = self.ev.seen.sessions.get_mut(&sid) {
+            e.active = active;
+        }
+    }
+
+    /// session_group_synchronize1: a new current window if the old one went, every
+    /// window linked again, then the windows no longer there unlinked.
+    fn detect_group_sync(&mut self, sid: SessId) {
+        let Some(s) = self.sessions.get(&sid) else { return };
+        let links = s.links.clone();
+        let name = s.name.clone();
+        let e = self.ev.seen.sessions.entry(sid).or_default();
+        let new_session = e.links.is_empty();
+        let old = std::mem::replace(&mut e.links, links.clone());
+        e.name = name;
+        let old_active = e.active;
+        if !new_session && !links.contains_key(&old_active.0) {
+            self.detect_current_window(sid, false);
+        }
+        for (idx, wid) in &links {
+            self.detect_window_created(*wid);
+            self.fire_winlink("window-linked", sid, *idx, *wid);
+        }
+        for (idx, wid) in &old {
+            if !links.values().any(|w| w == wid) {
+                let p = self.payload_winlink(sid, *idx, *wid);
+                self.fire_unlinked(p, *wid);
+            }
+        }
+        self.seen_active_now(sid);
     }
 
     /// Fires the events for what changed since the last check: windows created,
@@ -1384,12 +1480,31 @@ impl Server {
     /// modes, sizes, moves and focus, and session groups. `command` is the command
     /// that ran, if any.
     pub fn detect_changes(&mut self, command: Option<&str>) {
-        // link-window and move-window link before selecting (server_link_window);
-        // elsewhere the session's current window changes first (session_detach,
-        // spawn_window)
-        let links_first = matches!(command, Some("link-window" | "move-window"));
-        if !links_first {
-            self.detect_current_windows();
+        // panes resized as layouts were fixed come first
+        let mut panes: Vec<(PaneId, WinId)> = Vec::new();
+        let mut all: Vec<WinId> = self.windows.keys().copied().collect();
+        all.sort_unstable();
+        for &wid in &all {
+            if let Some(w) = self.windows.get(&wid) {
+                panes.extend(w.panes().into_iter().map(|p| (p, wid)));
+            }
+        }
+        let live: HashSet<PaneId> = panes.iter().map(|p| p.0).collect();
+        self.ev.seen.panes.retain(|p, _| live.contains(p));
+        self.ev.focused.retain(|p| live.contains(p));
+        let mut pane_changes: Vec<(PaneId, WinId, Option<u32>, String, PaneSeen)> = Vec::new();
+        for (pane, wid) in panes {
+            let Some(pp) = self.panes.get(&pane) else { continue };
+            let size = pp.size;
+            let mode = self.expand(Target { pane: Some(pane), wid: Some(wid), ..Target::default() }, None, "#{pane_mode}");
+            let idx = self.session_of_pane(pane).map(|x| x.1);
+            let Some(old) = self.ev.seen.panes.insert(pane, PaneSeen { wid, idx, size, mode: mode.clone() }) else { continue };
+            if old.size != size {
+                let mut p = self.payload_pane(pane);
+                p.int("width", size.0 as i64).int("height", size.1 as i64).int("old_width", old.size.0 as i64).int("old_height", old.size.1 as i64);
+                self.fire("pane-resized", p);
+            }
+            pane_changes.push((pane, wid, idx, mode, old));
         }
         // panes spawned since: pane-created once they are in a window
         let spawned = std::mem::take(&mut self.ev.spawned);
@@ -1414,15 +1529,18 @@ impl Server {
             p.str("pane_current_path", sp.cwd).int("created_empty", sp.empty as i64).int("created_respawn", sp.respawn as i64);
             self.fire("pane-created", p);
         }
-        self.detect_windows_and_links();
-        if links_first {
-            self.detect_current_windows();
-        }
+        self.detect_groups();
+        self.detect_links(command);
         let mut wids: Vec<WinId> = self.windows.keys().copied().collect();
         wids.sort_unstable();
         // sessions gone: their links went too
         let gone: Vec<SessId> = self.ev.seen.sessions.keys().copied().filter(|s| !self.sessions.contains_key(s)).collect();
         for sid in gone {
+            // session_destroy: session-closed, then the group, then the unlinks
+            if let Some(i) = self.ev.closed.iter().position(|c| c.0 == sid) {
+                let (_, p) = self.ev.closed.remove(i);
+                self.fire("session-closed", p);
+            }
             // session_group_remove fires before the session leaves the group
             let size = self.ev.seen.sessions[&sid].group.as_ref().map(|g| self.seen_group_size(g.0));
             let seen = self.ev.seen.sessions.remove(&sid).unwrap();
@@ -1434,8 +1552,12 @@ impl Server {
             for (idx, wid) in seen.links {
                 let mut p = Payload::default();
                 p.set("session", Val::Session(sid, seen.name.clone())).set("window", self.val_window(wid)).int("window_index", idx as i64);
-                self.fire("window-unlinked", p);
+                self.fire_unlinked(p, wid);
             }
+        }
+        // sessions that came and went unseen
+        for (_, p) in std::mem::take(&mut self.ev.closed) {
+            self.fire("session-closed", p);
         }
         // windows closed
         let closed: Vec<WinId> = self.ev.seen.windows.keys().copied().filter(|w| !self.windows.contains_key(w)).collect();
@@ -1447,8 +1569,7 @@ impl Server {
             self.ev.seen.panes.retain(|_, s| s.wid != wid);
             self.ev.latest.remove(&wid);
         }
-        // tmux's order: the active pane changes, panes are resized as the layout
-        // is fixed, then the window events, then pane moves and modes
+        // then the active pane changes, pane moves, the window events and modes
         let mut changed: Vec<(WinId, WinSeen, WinSeen)> = Vec::new();
         for &wid in &wids {
             let Some(w) = self.windows.get(&wid) else { continue };
@@ -1467,50 +1588,10 @@ impl Server {
                 self.fire("window-pane-changed", p);
             }
         }
-        let mut panes: Vec<(PaneId, WinId)> = Vec::new();
-        for &wid in &wids {
-            if let Some(w) = self.windows.get(&wid) {
-                panes.extend(w.panes().into_iter().map(|p| (p, wid)));
-            }
-        }
-        let live: HashSet<PaneId> = panes.iter().map(|p| p.0).collect();
-        self.ev.seen.panes.retain(|p, _| live.contains(p));
-        self.ev.focused.retain(|p| live.contains(p));
-        let mut pane_changes: Vec<(PaneId, WinId, Option<u32>, String, PaneSeen)> = Vec::new();
-        for (pane, wid) in panes {
-            let Some(pp) = self.panes.get(&pane) else { continue };
-            let size = pp.size;
-            let mode = self.expand(Target { pane: Some(pane), wid: Some(wid), ..Target::default() }, None, "#{pane_mode}");
-            let idx = self.session_of_pane(pane).map(|x| x.1);
-            let Some(old) = self.ev.seen.panes.insert(pane, PaneSeen { wid, idx, size, mode: mode.clone() }) else { continue };
-            if old.size != size {
-                let mut p = self.payload_pane(pane);
-                p.int("width", size.0 as i64).int("height", size.1 as i64).int("old_width", old.size.0 as i64).int("old_height", old.size.1 as i64);
-                self.fire("pane-resized", p);
-            }
-            pane_changes.push((pane, wid, idx, mode, old));
-        }
-        for (wid, old, now) in changed {
-            if old.name != now.name {
-                let mut p = self.payload_window(wid);
-                p.str("old_name", old.name.clone()).str("new_name", now.name.clone());
-                self.fire("window-renamed", p);
-            }
-            if old.zoomed != now.zoomed {
-                self.fire_window(if now.zoomed { "window-zoomed" } else { "window-unzoomed" }, wid);
-            }
-            if old.layout != now.layout || old.zoomed != now.zoomed || old.size != now.size {
-                self.fire_window("window-layout-changed", wid);
-            }
-            if old.size != now.size {
-                let mut p = self.payload_window(wid);
-                p.int("width", now.size.0 as i64).int("height", now.size.1 as i64)
-                    .int("old_width", old.size.0 as i64).int("old_height", old.size.1 as i64);
-                self.fire("window-resized", p);
-            }
-        }
-        for (pane, wid, idx, mode, old) in pane_changes {
-            if old.wid != wid && command != Some("swap-pane") {
+        // panes moved to another window (break-pane, join-pane, swap-pane)
+        for (pane, wid, idx, _, old) in &pane_changes {
+            let (pane, wid, idx) = (*pane, *wid, *idx);
+            if old.wid != wid {
                 let mut p = self.payload_pane(pane);
                 p.set("window", self.val_window(wid)).set("new_window", self.val_window(wid)).set("old_window", self.val_window(old.wid));
                 if let Some(i) = old.idx {
@@ -1521,6 +1602,47 @@ impl Server {
                 }
                 self.fire("pane-moved", p);
             }
+        }
+        let mut layout_seen = Vec::new();
+        for (wid, old, now) in changed {
+            if old.name != now.name {
+                let mut p = self.payload_window(wid);
+                p.str("old_name", old.name.clone()).str("new_name", now.name.clone());
+                self.fire("window-renamed", p);
+            }
+            // resizing a zoomed window unzooms it and zooms it again (resize_window)
+            let rezoom = old.zoomed && now.zoomed && old.size != now.size;
+            if rezoom {
+                self.fire_window("window-unzoomed", wid);
+                self.fire_window("window-layout-changed", wid);
+                self.fire_window("window-zoomed", wid);
+                self.fire_window("window-layout-changed", wid);
+            }
+            if old.zoomed != now.zoomed {
+                self.fire_window(if now.zoomed { "window-zoomed" } else { "window-unzoomed" }, wid);
+            }
+            // rotate-window does not fire it
+            if (old.layout != now.layout || old.zoomed != now.zoomed || old.size != now.size) && command != Some("rotate-window") {
+                self.fire_window("window-layout-changed", wid);
+                layout_seen.push(wid);
+            }
+            if old.size != now.size {
+                let mut p = self.payload_window(wid);
+                p.int("width", now.size.0 as i64).int("height", now.size.1 as i64)
+                    .int("old_width", old.size.0 as i64).int("old_height", old.size.1 as i64);
+                self.fire("window-resized", p);
+            }
+        }
+        // commands that fire it themselves as well (select-layout, resize-pane)
+        for (wid, n) in std::mem::take(&mut self.ev.layout_fired) {
+            let n = if layout_seen.contains(&wid) { n - 1 } else { n };
+            for _ in 0..n {
+                if self.windows.contains_key(&wid) {
+                    self.fire_window("window-layout-changed", wid);
+                }
+            }
+        }
+        for (pane, _, _, mode, old) in pane_changes {
             if old.mode != mode {
                 let entered = !mode.is_empty();
                 let mut p = self.payload_pane(pane);
@@ -1545,13 +1667,17 @@ impl Server {
         if std::mem::take(&mut self.ev.focus_dirty) {
             self.update_focus();
         }
-        // session groups, oldest session first
+    }
+
+    /// Sessions joining and leaving groups (session_group_add/remove), oldest
+    /// session first; a new session joins before its windows are synchronized.
+    fn detect_groups(&mut self) {
         let mut by_age: Vec<(u64, SessId)> = self.sessions.values().map(|s| (s.created, s.id)).collect();
         by_age.sort_unstable();
         for (_, sid) in by_age {
             let Some(s) = self.sessions.get(&sid) else { continue };
             let group = s.group.map(|g| (g, self.group_name(g)));
-            let Some(old) = self.ev.seen.sessions.get(&sid).map(|x| x.group.clone()) else { continue };
+            let old = self.ev.seen.sessions.entry(sid).or_default().group.clone();
             if group.as_ref().map(|g| g.0) == old.as_ref().map(|g| g.0) {
                 continue;
             }

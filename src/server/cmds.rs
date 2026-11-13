@@ -1629,8 +1629,13 @@ impl Server {
                 let (wa, wb) = (src.wid.unwrap(), dst.wid.unwrap());
                 self.sessions.get_mut(&a.0).unwrap().links.insert(a.1, wb);
                 self.sessions.get_mut(&b.0).unwrap().links.insert(b.1, wa);
-                if !o.has('d') {
+                // the winlinks stay current with the windows swapped inside; -d
+                // selects the target (and source) index, keeping the window
+                if o.has('d') {
                     self.select_window(b.0, b.1);
+                    if a.0 != b.0 {
+                        self.select_window(a.0, a.1);
+                    }
                 }
                 self.update_session_size(a.0);
                 self.update_session_size(b.0);
@@ -1801,6 +1806,7 @@ impl Server {
                     w.zoomed = false;
                     self.apply_layout(wid);
                     self.mark_window_dirty(wid);
+                    self.ev.layout_fired.push((wid, 1));
                     return Ok(Flow::Next);
                 } else {
                     o.rest.first().cloned().or_else(|| {
@@ -1825,6 +1831,8 @@ impl Server {
                 w.zoomed = false;
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
+                // layout_set_select and layout_parse fire it too, with panes to lay out
+                self.ev.layout_fired.push((wid, if panes.len() > 1 { 2 } else { 1 }));
                 Ok(Flow::Next)
             }
             "resize-window" => {
@@ -2076,8 +2084,11 @@ impl Server {
                         w.layout.resize(pane, d, n, area);
                     }
                 }
+                let n = self.windows[&wid].panes().len();
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
+                // as does layout_resize_pane, with other panes
+                self.ev.layout_fired.push((wid, if n > 1 { 2 } else { 1 }));
                 Ok(Flow::Next)
             }
             "swap-pane" => {

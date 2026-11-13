@@ -687,7 +687,11 @@ impl Client {
     /// Ends an attached client; control clients get %exit first.
     pub fn send_exit(&self, msg: &str) {
         if self.control > 0 {
+            // a control client is never attached in its client process: detaching
+            // and other exits print a bare %exit; only messages the server provides
+            // (client_dispatch_exit_message) are shown
             let reason = msg.trim_matches(['[', ']']);
+            let reason = if matches!(reason, "access not allowed" | "too far behind") { reason } else { "" };
             let line = if reason.is_empty() { "%exit\n".to_string() } else { format!("%exit {reason}\n") };
             self.send(S_OUTPUT, line.as_bytes());
             if self.ctl.wait_exit {
@@ -2122,6 +2126,10 @@ impl Server {
             let canonical = self.groups[&gid].clone();
             let Some(changed) = members.iter().find(|m| self.sessions[m].links != canonical).copied() else { continue };
             let links = self.sessions[&changed].links.clone();
+            // session_group_synchronize_from: the others are linked again, oldest first
+            let mut others: Vec<(u64, SessId)> = members.iter().filter(|m| **m != changed).map(|m| (self.sessions[m].created, *m)).collect();
+            others.sort_unstable();
+            self.ev.synced.push((changed, others.into_iter().map(|o| o.1).collect()));
             for m in &members {
                 let s = self.sessions.get_mut(m).unwrap();
                 if s.links == links {
@@ -2176,12 +2184,13 @@ impl Server {
     }
 
     pub fn kill_session(&mut self, sid: SessId, _empty: bool) {
-        // session-closed fires as the session goes (session_destroy), before its unlinks
+        // session-closed fires with the session's unlinks once the change is seen
+        // (session_destroy), after what the command did before
         let closed = self.sessions.contains_key(&sid).then(|| self.payload_session(sid));
         let Some(s) = self.sessions.remove(&sid) else { return };
         if let Some(mut p) = closed {
             p.target = vars::Target::default();
-            self.fire("session-closed", p);
+            self.ev.closed.push((sid, p));
         }
         let detach_mode = s.options.get("detach-on-destroy").map(String::from).unwrap_or_else(|| self.opt_session(None, "detach-on-destroy"));
         for (_, wid) in &s.links {
@@ -2372,12 +2381,13 @@ impl Server {
     pub fn update_session_size(&mut self, sid: SessId) {
         let Some(s) = self.sessions.get(&sid) else { return };
         let status = self.status_lines(Some(sid));
-        // control clients only count once they set a size (refresh-client -C)
+        // control clients only count once they set a size (refresh-client -C), and
+        // have no status line (status_line_size): their size is all window
         let clients: Vec<(u64, (u16, u16))> = self
             .clients
             .values()
             .filter(|c| c.attached && c.session == Some(sid) && !c.is_readonly())
-            .filter_map(|c| if c.control > 0 { c.control_size.filter(|_| !c.ctl.ignore_size).map(|s| (c.activity, s)) } else { Some((c.activity, c.size)) })
+            .filter_map(|c| if c.control > 0 { c.control_size.filter(|_| !c.ctl.ignore_size).map(|s| (c.activity, (s.0, s.1.saturating_add(status)))) } else { Some((c.activity, c.size)) })
             .collect();
         let latest = clients.iter().max_by_key(|c| c.0).map(|c| c.1);
         let smallest = clients.iter().map(|c| c.1).reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)));
@@ -2458,7 +2468,8 @@ impl Server {
             let saved_formats = std::mem::replace(&mut self.ev.cur_formats, q.ctx.formats.clone());
             let saved_hook = std::mem::replace(&mut self.ev.in_hook, q.ctx.hook_depth > 1);
             let result = self.exec(cmd, &mut q.ctx);
-            // events for what the command changed, as its own
+            // events for what the command changed, as its own (groups synchronized)
+            self.sync_groups();
             let readonly = self.readonly_context.replace(q.ctx.readonly);
             self.detect_changes(cmds::canonical(&name));
             self.readonly_context.set(readonly);
