@@ -279,6 +279,10 @@ fn chain(mut items: Vec<(Node, u16)>, horizontal: bool) -> Node {
 /// or columns (main-vertical); `None` uses tmux's defaults (24 / 80), clamped to fit.
 #[allow(dead_code)]
 pub fn preset(name: &str, panes: &[PaneId], area: Rect, main_size: Option<u16>) -> Option<Node> {
+    preset_with_options(name, panes, area, main_size, None, 0)
+}
+
+pub fn preset_with_options(name: &str, panes: &[PaneId], area: Rect, main_size: Option<u16>, other_size: Option<u16>, max_columns: usize) -> Option<Node> {
     if !PRESETS.contains(&name) || panes.is_empty() {
         return None;
     }
@@ -304,7 +308,8 @@ pub fn preset(name: &str, panes: &[PaneId], area: Rect, main_size: Option<u16>) 
             if main as u32 + PANE_MIN as u32 >= avail as u32 {
                 main = if avail <= 2 * PANE_MIN { PANE_MIN } else { avail - PANE_MIN };
             }
-            let other = avail.saturating_sub(main);
+            let other = other_size.filter(|s| *s > 0).unwrap_or(avail.saturating_sub(main)).min(avail.saturating_sub(main));
+            main = avail.saturating_sub(other);
             let others = even(&panes[1..], along(!horizontal, area), !horizontal);
             let mut items = vec![(Node::Leaf(panes[0]), main), (others, other)];
             if name.ends_with("-mirrored") {
@@ -317,7 +322,7 @@ pub fn preset(name: &str, panes: &[PaneId], area: Rect, main_size: Option<u16>) 
             let (mut rows, mut cols) = (1usize, 1usize);
             while rows * cols < n {
                 rows += 1;
-                if rows * cols < n {
+                if rows * cols < n && (max_columns == 0 || cols < max_columns) {
                     cols += 1;
                 }
             }
@@ -1248,6 +1253,26 @@ mod tests {
         assert!(parse_layout_string(body, &[1, 2], a).is_err());
         for bad in ["159x48,0,0{79x48,0,0,1,78x48,80,0,2}", "159x48,0,0{79x48,0,0,1,79x47,80,0,2}", "159x48,0,0{79x48,0,0,1", "159x48,0,0,1junk", "x"] {
             assert!(parse_layout_string(&format!("{},{bad}", tmux_csum(bad)), &[1, 2], a).is_err(), "{bad}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod display_option_tests {
+    use super::*;
+    #[test]
+    fn tiled_columns_and_other_sizes() {
+        let area = Rect { x: 0, y: 0, w: 120, h: 50 };
+        let panes: Vec<_> = (0..7).collect();
+        let node = preset_with_options("tiled", &panes, area, None, None, 1).unwrap();
+        let mut rects = Vec::new();
+        node.layout(area, &mut rects, &mut Vec::new());
+        assert!(rects.iter().all(|(_, r)| r.w == 120));
+        for name in ["main-horizontal", "main-horizontal-mirrored", "main-vertical", "main-vertical-mirrored"] {
+            let node = preset_with_options(name, &panes, area, Some(10), Some(15), 0).unwrap();
+            rects.clear(); node.layout(area, &mut rects, &mut Vec::new());
+            let r = rects.iter().find(|(p, _)| *p == 0).unwrap().1;
+            assert_eq!(if name.starts_with("main-horizontal") { r.h } else { r.w }, if name.starts_with("main-horizontal") { 34 } else { 104 });
         }
     }
 }
