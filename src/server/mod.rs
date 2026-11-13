@@ -618,6 +618,9 @@ pub struct Client {
     /// refresh-client -l: until when a clipboard reply from the terminal makes a buffer
     /// (TTY_OSC52QUERY).
     pub clipboard_query: Option<Instant>,
+    /// CLIENT_FOCUSED: set when the client gets a session, then follows the terminal's
+    /// focus reports.
+    pub focused: bool,
     /// Frames queued for the writer thread, and since when the queue has been non-empty
     /// (ms since the epoch): how far behind the client is (control mode pause-after).
     pub pending: Arc<std::sync::atomic::AtomicUsize>,
@@ -1252,6 +1255,7 @@ impl Server {
                 seen: Default::default(),
                 features: Default::default(),
                 clipboard_query: None,
+                focused: false,
                 pending,
                 queued_bytes,
                 closed,
@@ -2206,6 +2210,7 @@ impl Server {
     pub fn attach_client_env(&mut self, cid: ClientId, sid: SessId, update_env: bool) {
         let Some(c) = self.clients.get_mut(&cid) else { return };
         let was_attached = c.attached;
+        c.focused = true;
         if c.session != Some(sid) {
             c.last_session = c.session;
         }

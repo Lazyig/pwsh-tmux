@@ -209,6 +209,12 @@ impl Server {
                 self.clipboard_reply(cid, raw);
                 return;
             }
+            // focus reports set the client's focus (also for read-only clients)
+            if raw == b"\x1b[I" || raw == b"\x1b[O" {
+                if let Some(c) = self.clients.get_mut(&cid) {
+                    c.focused = raw == b"\x1b[I";
+                }
+            }
         }
         if self.client_is_readonly(Some(cid)) && !matches!(&input, Input::Key(_, _)) {
             return;

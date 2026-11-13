@@ -646,6 +646,7 @@ impl Vars for VarCtx<'_> {
                 let pause = c.ctl.pause_after.map(|d| format!("pause-after={}", d.as_secs()));
                 [
                     (c.attached, "attached"),
+                    (c.focused, "focused"),
                     (c.control > 0, "control-mode"),
                     (c.ctl.ignore_size, "ignore-size"),
                     (c.ctl.no_detach_on_destroy, "no-detach-on-destroy"),

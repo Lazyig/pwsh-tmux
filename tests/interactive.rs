@@ -402,7 +402,7 @@ fn attach_flags_environment_and_destroy() {
     let t = Term::spawn(cb, 80, 24);
     t.wait_screen("attach", |s| s.contains("[a1]"));
     // server_client_get_flags; unknown flags are ignored
-    assert_eq!(ctx.ok(&["list-clients", "-F", "#{client_flags}|#{session_name}"]).trim_end(), "attached,ignore-size,no-detach-on-destroy,UTF-8|a1");
+    assert_eq!(ctx.ok(&["list-clients", "-F", "#{client_flags}|#{session_name}"]).trim_end(), "attached,focused,ignore-size,no-detach-on-destroy,UTF-8|a1");
     // -E: no update-environment; switch-client without -E applies it (patterns match)
     assert!(ctx.fails(&["show-environment", "-t", "a1", "P1FIX_VAR"]).contains("unknown variable: P1FIX_VAR"));
     let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
@@ -412,7 +412,7 @@ fn attach_flags_environment_and_destroy() {
     ctx.ok(&["kill-session", "-t", "a2"]);
     wait_for("moved to a1", || ctx.ok(&["list-clients", "-F", "#{session_name}"]).trim() == "a1");
     ctx.ok(&["refresh-client", "-t", &client, "-f", "!ignore-size,!no-detach-on-destroy"]);
-    assert_eq!(ctx.ok(&["list-clients", "-F", "#{client_flags}"]).trim_end(), "attached,UTF-8");
+    assert_eq!(ctx.ok(&["list-clients", "-F", "#{client_flags}"]).trim_end(), "attached,focused,UTF-8");
 }
 
 #[test]
@@ -523,4 +523,16 @@ fn refresh_client_l_reads_the_terminal_clipboard() {
     wait_for("clipboard buffer", || ctx.ok(&["list-buffers", "-F", "#{buffer_sample}"]) == "hello clip\n");
     // the reply is not typed into the pane
     assert!(!ctx.capture("clip").contains("52;"));
+}
+
+#[test]
+fn client_focus_flag_follows_focus_reports() {
+    let ctx = Ctx::new("p1fix-focus");
+    let t = start(&ctx, "fo");
+    let flags = || ctx.ok(&["list-clients", "-F", "#{client_flags}"]);
+    assert_eq!(flags(), "attached,focused,UTF-8\n");
+    t.send(b"\x1b[O");
+    wait_for("focus out", || flags() == "attached,UTF-8\n");
+    t.send(b"\x1b[I");
+    wait_for("focus in", || flags() == "attached,focused,UTF-8\n");
 }

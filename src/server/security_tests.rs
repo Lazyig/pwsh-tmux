@@ -46,6 +46,7 @@ fn fixture() -> (Server, mpsc::Receiver<Event>) {
             seen: Default::default(),
             features: Default::default(),
             clipboard_query: None,
+            focused: false,
             pending,
             queued_bytes: Default::default(),
             closed: Default::default(),
