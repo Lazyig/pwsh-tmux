@@ -204,13 +204,50 @@ fn spans_cells(spans: &[Span], max: usize, fill: Style) -> Vec<Cell> {
     format::layout_line(&left_aligned, total.min(max), fill)
 }
 
-const BORDER_SETS: [(&str, [&str; 11]); 4] = [
+const BORDER_SETS: [(&str, [&str; 11]); 6] = [
     // h, v, tl, tr, bl, br, cross, t-down, t-up, t-right, t-left
     ("single", ["─", "│", "┌", "┐", "└", "┘", "┼", "┬", "┴", "├", "┤"]),
     ("double", ["═", "║", "╔", "╗", "╚", "╝", "╬", "╦", "╩", "╠", "╣"]),
     ("heavy", ["━", "┃", "┏", "┓", "┗", "┛", "╋", "┳", "┻", "┣", "┫"]),
     ("simple", ["-", "|", "+", "+", "+", "+", "+", "+", "+", "+", "+"]),
+    // tmux window_get_border_cell draws both as blanks; the borders keep their cells
+    ("spaces", [" "; 11]),
+    ("none", [" "; 11]),
 ];
+
+/// The pane a border cell is drawn for (tmux redraw_get_pane_for_border_style): the pane chosen
+/// by the two-pane colouring, else the active pane if it borders the cell, else the pane above,
+/// below, to the left or to the right, in that order. `rects` are the tiled panes; `status` the
+/// window pane-border-status, which drops the upper (top) or lower (bottom) pane's own line.
+/// `two` is the two-pane colouring split (left-right, window width and height) when it applies.
+fn border_owner(rects: &[(PaneId, Rect)], active: PaneId, two: Option<(bool, u16, u16)>, status: &str, x: u16, y: u16) -> Option<PaneId> {
+    let (cx, cy) = (x, y);
+    let (x, y) = (x as i32, y as i32);
+    let span_x = |r: &Rect| x >= r.x as i32 - 1 && x <= r.right() as i32;
+    let span_y = |r: &Rect| y >= r.y as i32 - 1 && y <= r.bottom() as i32;
+    let above = rects.iter().find(|(_, r)| status != "top" && y == r.bottom() as i32 && span_x(r)).map(|(p, _)| *p);
+    let below = rects.iter().find(|(_, r)| status != "bottom" && y + 1 == r.y as i32 && span_x(r)).map(|(p, _)| *p);
+    let left = rects.iter().find(|(_, r)| x == r.right() as i32 && span_y(r)).map(|(p, _)| *p);
+    let right = rects.iter().find(|(_, r)| x + 1 == r.x as i32 && span_y(r)).map(|(p, _)| *p);
+    match two {
+        Some((true, _, sy)) if left.is_some() && right.is_some() => return if cy <= sy / 2 { left } else { right },
+        Some((false, sx, _)) if above.is_some() && below.is_some() => return if cx <= sx / 2 { above } else { below },
+        _ => {}
+    }
+    let all = [above, below, left, right];
+    if all.contains(&Some(active)) {
+        return Some(active);
+    }
+    all.into_iter().flatten().next()
+}
+
+/// The digit tmux draws for pane-border-lines number: the pane index, modulo 10.
+fn border_number(panes: &[PaneId], base: usize, pane: Option<PaneId>) -> String {
+    match pane.and_then(|p| panes.iter().position(|q| *q == p)) {
+        Some(i) => char::from(b'0' + ((i + base) % 10) as u8).to_string(),
+        None => "*".into(),
+    }
+}
 
 impl Server {
     fn expand_status_time(&self, t: Target, cid: ClientId, template: &str) -> String {
@@ -478,6 +515,9 @@ impl Server {
                 *cursor = None;
             }
         }
+        let panes = win.panes();
+        let base_index = self.opt_window_num(Some(wid), "pane-base-index").max(0) as usize;
+        let arrows = matches!(self.opt_window(Some(wid), "pane-border-indicators").as_str(), "arrows" | "both");
         for (id, g) in floats {
             if win.is_floating(win.active) && id == win.active {
                 *cursor = None;
@@ -494,11 +534,14 @@ impl Server {
                 }
             };
             if lines != "none" {
+                // number draws the pane's own index (tmux window_get_border_cell)
+                let digit = border_number(&panes, base_index, Some(id));
                 let set: [&str; 6] = match lines.as_str() {
                     "double" => ["═", "║", "╔", "╗", "╚", "╝"],
                     "heavy" => ["━", "┃", "┏", "┓", "┗", "┛"],
                     "simple" => ["-", "|", "+", "+", "+", "+"],
                     "spaces" => [" "; 6],
+                    "number" => [digit.as_str(); 6],
                     _ => ["─", "│", "┌", "┐", "└", "┘"],
                 };
                 let (l, r, top, bot) = (g.x - 1, g.x + g.w as i32, g.y - 1, g.y + g.h as i32);
@@ -510,6 +553,19 @@ impl Server {
                 for y in g.y..bot {
                     put(f, l, y, set[1]);
                     put(f, r, y, set[1]);
+                }
+                // tmux redraw_mark_border_arrows: the active floating pane's own border
+                // points at it (the cells taken by the status line are skipped below)
+                if active && arrows {
+                    let (ax, ay) = (g.x + 1, g.y + 1);
+                    if ax <= r {
+                        put(f, ax, top, "↓");
+                        put(f, ax, bot, "↑");
+                    }
+                    if ay < bot {
+                        put(f, l, ay, "→");
+                        put(f, r, ay, "←");
+                    }
                 }
                 let status = self.pane_status(wid, id);
                 if status != "off" {
@@ -554,6 +610,10 @@ impl Server {
         let inactive_border = self.style_option(&self.opt_window(Some(wid), "pane-border-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
         let lines_kind = self.opt_window(Some(wid), "pane-border-lines");
         let bset = BORDER_SETS.iter().find(|(n, _)| *n == lines_kind).map(|(_, s)| *s).unwrap_or(BORDER_SETS[0].1);
+        let indicators = self.opt_window(Some(wid), "pane-border-indicators");
+        let all_panes = win.panes();
+        let base_index = self.opt_window_num(Some(wid), "pane-base-index").max(0) as usize;
+        let tiled_two = rects.len() == 2;
 
         // panes
         for (id, r) in &rects {
@@ -599,16 +659,9 @@ impl Server {
                     }
                 }
                 let text = if lines_kind == "number" {
-                    // The pane below or to the right owns a shared border.
-                    let panes = win.panes();
-                    let active = panes.iter().position(|p| *p == win.active).unwrap_or(0);
-                    (0..panes.len()).map(|i| (active+i)%panes.len()).find(|i| {
-                        rects.iter().find(|(p,_)| *p==panes[*i]).is_some_and(|(_,a)|
-                            (x == a.right() && y >= a.y && y <= a.bottom()) ||
-                            (x + 1 == a.x && y >= a.y && y <= a.bottom()) ||
-                            (y == a.bottom() && x >= a.x && x <= a.right()) ||
-                            (y + 1 == a.y && x >= a.x && x <= a.right()))
-                    }).map(|i| char::from(b'0' + (i%10) as u8).to_string()).unwrap_or_else(|| "*".into())
+                    // tmux redraw_mark_two_pane_colours splits a two-pane window's border in half
+                    let two = (tiled_two && matches!(indicators.as_str(), "colour" | "both")).then(|| (rects[0].1.y == rects[1].1.y, win.sx, win.sy));
+                    border_number(&all_panes, base_index, border_owner(&rects, win.active, two, &border_status, x, y))
                 } else { ch.into() };
                 f.set(x, oy + y, Cell { text, style: if near { active_border } else { inactive_border } });
             }
@@ -674,15 +727,35 @@ impl Server {
                     let colour = format::parse_color(&self.opt_window(Some(wid), "display-panes-colour")).unwrap_or(Color::Idx(4));
                     let acolour = format::parse_color(&self.opt_window(Some(wid), "display-panes-active-colour")).unwrap_or(Color::Idx(1));
                     let base = self.opt_window_num(Some(wid), "pane-base-index").max(0) as usize;
-                    for (i, (id, r)) in rects.iter().enumerate() {
-                        let col = if *id == win.active { acolour } else { colour };
-                        let label = (i + base).to_string();
-                        let rr = Rect { y: oy + r.y, ..*r };
-                        if !big_text(&mut f, rr, &label, col) {
-                            f.text(r.x + r.w / 2, oy + r.y + r.h / 2, &label, Style { fg: col, ..Style::default() }, r.right());
+                    let label = |f: &mut Frame, id: PaneId, r: Rect| {
+                        let col = if id == win.active { acolour } else { colour };
+                        let label = (all_panes.iter().position(|p| *p == id).unwrap_or(0) + base).to_string();
+                        // tmux window_panes_draw_number: big digits only from 7 rows (the
+                        // size line takes one) and len * 6 - 1 columns
+                        let small = r.w < label.len() as u16 * 6 - 1 || r.h < 7;
+                        if small || !big_text(f, Rect { y: oy + r.y, ..r }, &label, col) {
+                            f.text(r.x + r.w.saturating_sub(label.len() as u16) / 2, oy + r.y + r.h / 2, &label, Style { fg: col, ..Style::default() }, r.right());
                         }
                         let size = format!("{}x{}", r.w, r.h);
                         f.text(r.right().saturating_sub(size.len() as u16), oy + r.y, &size, Style { fg: col, ..Style::default() }, r.right());
+                    };
+                    for (id, r) in &rects {
+                        label(&mut f, *id, *r);
+                    }
+                    // tmux window_panes_draw_screen: the floating panes go over the tiled
+                    // numbers, back to front, each with its own number clipped to the window
+                    let clip = (cw.min(win.sx), area_h.min(win.sy));
+                    let floats = self.float_rects(wid);
+                    if !floats.is_empty() {
+                        let mut ignored = None;
+                        self.draw_floats(&mut f, cid, wid, clip, oy, &mut modes, &mut ignored);
+                        for (id, g) in floats {
+                            let (x0, y0) = (g.x.max(0), g.y.max(0));
+                            let (x1, y1) = ((g.x + g.w as i32).min(clip.0 as i32), (g.y + g.h as i32).min(clip.1 as i32));
+                            if x1 > x0 && y1 > y0 {
+                                label(&mut f, id, Rect { x: x0 as u16, y: y0 as u16, w: (x1 - x0) as u16, h: (y1 - y0) as u16 });
+                            }
+                        }
                     }
                 }
                 Overlay::Menu(m) => {
