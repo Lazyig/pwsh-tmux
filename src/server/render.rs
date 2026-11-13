@@ -147,6 +147,8 @@ fn push_color(out: &mut String, c: Color, base: u8) {
 /// Colours and attributes the client's terminal can show.
 fn fit_style(mut st: Style, f: &super::features::Features) -> Style {
     let palette_fg = matches!(st.fg, Color::Rgb(..) | Color::Idx(16..=255));
+    // tty_check_fg runs before tty_check_bg: black-on-black compares with the unconverted bg
+    let bg = st.bg;
     st.fg = super::features::fit_color(st.fg, f);
     st.bg = super::features::fit_color(st.bg, f);
     if f.colours() < 16 {
@@ -154,7 +156,7 @@ fn fit_style(mut st: Style, f: &super::features::Features) -> Style {
         if let Color::Idx(i @ 8..=15) = st.fg {
             st.fg = Color::Idx(i & 7);
             if !palette_fg { st.attrs |= BOLD; }
-            else if st.fg == st.bg && matches!(st.fg, Color::Idx(0 | 7)) {
+            else if st.fg == bg && matches!(st.fg, Color::Idx(0 | 7)) {
                 st.fg = if st.fg == Color::Idx(0) { Color::Idx(7) } else { Color::Idx(0) };
             }
         }
@@ -232,7 +234,9 @@ impl Server {
         self.notify_pane_themes();
         let ids: Vec<ClientId> = self.clients.iter().filter(|(_, c)| c.dirty && c.attached && !c.suspended && c.control == 0 && c.session.is_some()).map(|(id, _)| *id).collect();
         for id in ids {
-            self.render(id);
+            // theme colours parsed without a client are drawn in this client's palette
+            let palette = vars::VarCtx { srv: self, t: Target::default(), client: Some(id), extra: HashMap::new() }.theme_palette();
+            format::with_draw_palette(palette, || self.render(id));
         }
     }
 
@@ -865,6 +869,9 @@ mod theme_tests {
         assert_eq!((style.fg, style.bg, style.attrs & BOLD), (Color::Idx(1), Color::Idx(7), 0));
         let style = fit_style(Style { fg: Color::Idx(244), bg: Color::Idx(0), ..Style::default() }, &f);
         assert_eq!(style.fg, Color::Idx(7)); // don't map grey to black on black
+        // the swap looks at the bg before it is converted: colour233 is not black yet
+        let style = fit_style(Style { fg: Color::Idx(244), bg: Color::Idx(233), ..Style::default() }, &f);
+        assert_eq!((style.fg, style.bg), (Color::Idx(0), Color::Idx(0)));
         let f = super::super::features::compute("xterm-16color", "", &[], "");
         let style = fit_style(Style { fg: Color::Idx(196), bg: Color::Idx(231), ..Style::default() }, &f);
         assert_eq!((style.fg, style.bg), (Color::Idx(9), Color::Idx(15)));

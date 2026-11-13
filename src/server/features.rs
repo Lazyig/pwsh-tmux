@@ -32,13 +32,21 @@ impl Features {
         }
     }
 
+    /// client_colours (format_cb_client_colours): only the RGB and 256 features count as
+    /// more than 16 colours; otherwise terminfo colors, which is capped at 16.
     pub fn colours(&self) -> u32 {
         if self.has("RGB") { 16777216 } else if self.has("256") { 256 }
-        else if self.has("16") { 16 } else if self.has("mono") { 2 } else { 8 }
+        else if self.has("16") || self.has("t256") { 16 } else if self.has("mono") { 2 } else { 8 }
+    }
+
+    /// Whether 256-colour cells can be drawn: the 256 feature or terminfo colors#256
+    /// (tty_check_fg/tty_check_bg).
+    pub fn render_256(&self) -> bool {
+        self.has("256") || self.has("t256")
     }
 
     pub fn list(&self) -> String {
-        self.0.iter().filter(|f| !matches!(f.as_str(), "16" | "mono")).cloned().collect::<Vec<_>>().join(",")
+        self.0.iter().filter(|f| !matches!(f.as_str(), "16" | "mono" | "t256")).cloned().collect::<Vec<_>>().join(",")
     }
 }
 
@@ -57,10 +65,13 @@ pub fn fnmatch(pat: &str, s: &str) -> bool {
 
 /// `term`: the client's TERM (empty for a Windows console client), `colorterm`: its COLORTERM,
 /// `table`: terminal-features entries ("pattern:feature:feature"), `extra`: the `-T` list.
+/// Without terminfo, the TERM name stands in for its colors capability: "t256" (colors#256,
+/// which is not the 256 feature), "16" (16 or 88 colours) or "mono" (none, as dumb and vt100).
 pub fn compute(term: &str, colorterm: &str, table: &[String], extra: &str) -> Features {
     let mut f = Features::default();
-    if term == "dumb" { f.add("mono"); }
-    if term.contains("16color") { f.add("16"); }
+    let vt = term.strip_prefix("vt").is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()));
+    if term == "dumb" || (vt && !term.contains("color")) { f.add("mono"); }
+    if term.contains("16color") || term.contains("88color") || term == "rxvt-unicode" { f.add("16"); }
     if term.is_empty() {
         // Windows console / Windows Terminal: a modern VT implementation
         f.add("RGB,mouse,bpaste,title,ccolour,cstyle,focus,clipboard,strikethrough,sync,usstyle,overline,hyperlinks");
@@ -69,14 +80,17 @@ pub fn compute(term: &str, colorterm: &str, table: &[String], extra: &str) -> Fe
             f.add("mouse,bpaste,strikethrough");
         }
         if term.contains("256col") || term.contains("direct") || term.starts_with("tmux") || term.starts_with("alacritty") || term.starts_with("xterm-kitty") {
-            f.add("256");
+            f.add("t256");
         }
         if term.contains("direct") {
             f.add("RGB");
         }
     }
-    if matches!(colorterm, "truecolor" | "24bit") {
+    // tty_term_create: COLORTERM truecolor/24bit is RGB, any other value with 256 in it is 256
+    if colorterm.eq_ignore_ascii_case("truecolor") || colorterm.eq_ignore_ascii_case("24bit") {
         f.add("RGB");
+    } else if colorterm.contains("256") {
+        f.add("256");
     }
     for entry in table {
         let mut parts = entry.splitn(2, ':');
@@ -160,13 +174,13 @@ pub fn fit_color(c: vt100::Color, f: &Features) -> vt100::Color {
     use vt100::Color::*;
     match c {
         Rgb(r, g, b) if !f.has("RGB") => {
-            if f.has("256") {
+            if f.render_256() {
                 Idx(rgb_to_256(r, g, b))
             } else {
                 Idx(idx_to_16(rgb_to_256(r, g, b)))
             }
         }
-        Idx(i) if i >= 16 && !f.has("256") => {
+        Idx(i) if i >= 16 && !f.render_256() => {
             Idx(idx_to_16(i))
         }
         other => other,
@@ -181,7 +195,16 @@ mod tests {
     fn computes_features() {
         let table = vec!["xterm*:clipboard:ccolour:cstyle:focus:title".to_string(), "screen*:title".to_string()];
         let x = compute("xterm-256color", "", &table, "");
-        assert!(x.has("256") && x.has("clipboard") && x.has("mouse") && !x.has("RGB"));
+        // terminfo colors#256 draws 256 colours but is not the 256 feature
+        assert!(x.render_256() && !x.has("256") && x.has("clipboard") && x.has("mouse") && !x.has("RGB"));
+        assert_eq!((x.colours(), x.list().contains("256")), (16, false));
+        assert_eq!(compute("xterm-256color", "rxvt-256color", &table, "").colours(), 256);
+        assert_eq!(compute("xterm", "TrueColor", &table, "").colours(), 16777216);
+        assert_eq!(compute("screen-256color", "", &table, "256").colours(), 256);
+        // terminfo colors: none (vt100) is 2, 8 stays 8, 16 and 88 are 16
+        for (term, n) in [("vt100", 2), ("vt220", 2), ("dumb", 2), ("vte-256color", 16), ("linux", 8), ("screen", 8), ("xterm-16color", 16), ("rxvt-unicode", 16), ("xterm-88color", 16)] {
+            assert_eq!(compute(term, "", &table, "").colours(), n, "{term}");
+        }
         assert!(compute("xterm-256color", "truecolor", &table, "").has("RGB"));
         let l = compute("linux", "", &table, "");
         assert!(!l.has("256") && !l.has("mouse"));

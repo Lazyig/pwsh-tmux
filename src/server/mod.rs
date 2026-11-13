@@ -1313,9 +1313,12 @@ impl Server {
                 let colorterm = ident.env.iter().find(|(k, _)| k == "COLORTERM").map(|(_, v)| v.as_str()).unwrap_or("");
                 let table: Vec<String> = self.opts_server.0.iter().filter(|(k, _)| k.starts_with("terminal-features[")).map(|(_, v)| v.clone()).collect();
                 let features = features::compute(&ident.term, colorterm, &table, &get(8));
+                let overrides: Vec<String> = self.opts_server.array_items("terminal-overrides").into_iter().map(|(_, v)| v).collect();
+                let vt100 = theme::vt100_like(&ident.term, &overrides);
                 if let Some(c) = self.clients.get_mut(&cid) {
                     c.control = control;
                     c.features = features;
+                    c.terminal.vt100 = vt100;
                     c.size = (ident.cols.max(1), ident.rows.max(1));
                     c.ident = Some(ident);
                 }
@@ -1355,6 +1358,7 @@ impl Server {
                 if let Some(sid) = c.session {
                     self.update_session_size(sid);
                 }
+                self.repeat_terminal_queries(cid);
             }
             C_CONTROL_LINE => {
                 let line = String::from_utf8_lossy(&payload).into_owned();
@@ -1363,9 +1367,13 @@ impl Server {
             C_RESUMED => {
                 if let Some(c) = self.clients.get_mut(&cid) {
                     c.suspended = false;
-                    c.terminal.query_started();
                     c.prev = None;
                     c.dirty = true;
+                    // tty_start_tty: subscribe to theme changes and ask for the theme again
+                    if c.control == 0 && c.terminal.vt100 {
+                        c.terminal.query_started();
+                        c.send(S_OUTPUT, b"\x1b[?2031h\x1b[?996n");
+                    }
                 }
             }
             _ => {}
@@ -1379,6 +1387,8 @@ impl Server {
         self.control_output(id, data);
         let scroll_on_clear = options::is_on(&self.opt_pane(id, "scroll-on-clear"));
         let colours = self.pane_colours(id);
+        // like notify_pane_themes, wait for the colour replies a theme report asked for
+        let discovering = self.pane_clients(id).any(|c| c.terminal.querying());
         let p = self.panes.get_mut(&id).unwrap();
         p.parser.callbacks_mut().colours.update(colours);
         p.parser.screen_mut().set_scroll_on_clear(scroll_on_clear);
@@ -1399,7 +1409,7 @@ impl Server {
                 p.track.pipe_pid = None;
             }
         }
-        let enabled = p.screen().theme_updates();
+        let enabled = p.screen().theme_updates() && !discovering;
         let cb = p.parser.callbacks_mut();
         cb.colours.notify(enabled, &mut cb.replies);
         let replies = std::mem::take(&mut cb.replies);
@@ -2174,8 +2184,8 @@ impl Server {
         c.dirty = true;
         c.key_table = "root".into();
         if !was_attached {
-            if c.control == 0 { c.terminal.query_started(); }
             c.send(S_ATTACHED, b"");
+            self.start_terminal_queries(cid);
         }
         let writable = !self.client_is_readonly(Some(cid));
         let now = now_secs();

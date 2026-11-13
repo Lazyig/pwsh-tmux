@@ -1,7 +1,7 @@
 //! Format variables (#{session_name}, #{pane_current_path}, ...) for a target.
 
 use super::*;
-use crate::cells::{Color, Style};
+use crate::cells::Color;
 use crate::format::{self, Vars};
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -475,11 +475,17 @@ impl Vars for VarCtx<'_> {
             }),
             "pane_start_command_list" => pane.map(|p| p.track.argv.iter().map(|a| format!("'{}'", a.replace('\'', "'\\''"))).collect::<Vec<_>>().join(" ")),
             "pane_fg" | "pane_bg" => win.zip(t.pane).map(|(w, p)| {
-                // window-active-style colours win over window-style ones for the active pane
-                let style = |o: &str| crate::format::parse_style(&srv.expand_for_pane(p, &srv.opt_pane(p, o)), Style::default()).unwrap_or_default();
-                let (normal, active) = (style("window-style"), style("window-active-style"));
-                let pick = |n: Color, a: Color| if w.active == p && a != Color::Default { a } else { n };
-                colour_name(if name == "pane_fg" { pick(normal.fg, active.fg) } else { pick(normal.bg, active.bg) })
+                use super::theme::{style_colours, StyleColour};
+                // window-active-style colours win for the active pane, then the pane's
+                // OSC 10/11 colours, then window-style; theme colours print their names
+                let ctx = VarCtx { srv, t: srv.target_for_pane(p), client: None, extra: HashMap::new() };
+                let style = |o: &str| style_colours(&srv.opt_pane(p, o), &ctx);
+                let ((nfg, nbg), (afg, abg)) = (style("window-style"), style("window-active-style"));
+                let palette = srv.panes.get(&p).map(|pp| &pp.parser.callbacks().colours);
+                let pick = |n: StyleColour, a: StyleColour, own: Option<Color>| {
+                    if w.active == p && a != StyleColour::Default { a } else { own.map_or(n, StyleColour::Colour) }
+                };
+                if name == "pane_fg" { pick(nfg, afg, palette.and_then(|c| c.fg)) } else { pick(nbg, abg, palette.and_then(|c| c.bg)) }.name()
             }),
             "pane_left" | "pane_top" | "pane_right" | "pane_bottom" | "pane_at_left" | "pane_at_right" | "pane_at_top" | "pane_at_bottom" | "pane_x" | "pane_y"
             | "pane_unzoomed_width" | "pane_unzoomed_height" => {
@@ -581,6 +587,7 @@ impl Vars for VarCtx<'_> {
                 None => {
                     // the cursor-colour option, "none" when unset
                     let o = srv.opt_pane(p.id, "cursor-colour");
+                    if let Some(i) = crate::format::theme_index(&o) { return crate::format::theme_name(i).into(); }
                     crate::format::parse_color(&o).filter(|_| !o.is_empty() && o != "none").map_or("none".into(), colour_name)
                 }
             }),

@@ -63,7 +63,12 @@ fn main() {
                 'S' => unsafe { std::env::set_var("PWSH_TMUX_SOCKET_PATH", value().unwrap_or_default()) },
                 'f' => g.config = value(),
                 'c' => shell_cmd = value(),
-                'T' => g.features = value().unwrap_or_default(),
+                // -T and -2 add to the client's features (tty_parse_features)
+                'T' | '2' => {
+                    let f = if c == '2' { "256".to_string() } else { value().unwrap_or_default() };
+                    if !g.features.is_empty() { g.features.push(','); }
+                    g.features.push_str(&f);
+                }
                 'N' => g.no_start = true,
                 'V' => {
                     println!("pwsh-tmux {}", env!("CARGO_PKG_VERSION"));
@@ -74,7 +79,7 @@ fn main() {
                     return;
                 }
                 'C' => g.control = (g.control + 1).min(2),
-                '2' | 'D' | 'l' | 'u' | 'v' => {}
+                'D' | 'l' | 'u' | 'v' => {}
                 '-' => {
                     if a == "--help" {
                         print!("{USAGE}");

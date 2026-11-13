@@ -1595,20 +1595,39 @@ pub enum Theme {
     Terminal,
 }
 
-static DEFAULT_THEME: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-/// Set the theme used for theme colour names in styles parsed without a client (default dark).
-#[allow(dead_code)] // for the theme option
-pub fn set_default_theme(theme: Theme) {
-    DEFAULT_THEME.store(theme as u8, std::sync::atomic::Ordering::Relaxed);
+thread_local! {
+    /// The theme palette of the client being drawn. tmux keeps theme colours unresolved in
+    /// styles parsed without a client and maps them per client as it draws
+    /// (tty_map_theme_colour); here names parsed without a client while a client is drawn
+    /// use that client's palette, and the dark defaults otherwise.
+    static DRAW_PALETTE: std::cell::Cell<Option<[Color; 10]>> = const { std::cell::Cell::new(None) };
 }
 
-fn default_theme() -> Theme {
-    match DEFAULT_THEME.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => Theme::Light,
-        2 => Theme::Terminal,
-        _ => Theme::Dark,
+/// Run `f` with theme names parsed without a client resolving to `palette` (one colour per
+/// theme_index).
+pub fn with_draw_palette<R>(palette: [Color; 10], f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<[Color; 10]>);
+    impl Drop for Restore {
+        fn drop(&mut self) { DRAW_PALETTE.with(|p| p.set(self.0)); }
     }
+    let _restore = Restore(DRAW_PALETTE.with(|p| p.replace(Some(palette))));
+    f()
+}
+
+/// A theme name parsed without a client: the drawn client's colour, else the dark default.
+fn default_theme_color(name: &str) -> Option<Color> {
+    let i = theme_index(name)?;
+    DRAW_PALETTE.with(|p| p.get()).map(|p| p[i]).or_else(|| theme_color(name, Theme::Dark))
+}
+
+/// The position of a theme colour name in theme_name order.
+pub fn theme_index(name: &str) -> Option<usize> {
+    THEMES.iter().position(|t| name.eq_ignore_ascii_case(t.0))
+}
+
+/// The theme colour name at a theme_index (themeblack ... thememagenta).
+pub fn theme_name(i: usize) -> &'static str {
+    THEMES[i].0
 }
 
 /// The colour of a theme name (themeblack, themewhite, themelightgrey, themedarkgrey,
@@ -1625,7 +1644,7 @@ pub fn theme_color(name: &str, theme: Theme) -> Option<Color> {
 /// parse_color, resolving theme names through the client of a format context if any.
 pub fn parse_color_with(s: &str, vars: Option<&dyn Vars>) -> Option<Color> {
     if THEMES.iter().any(|t| s.eq_ignore_ascii_case(t.0)) {
-        return vars.and_then(|v| v.theme_color(&s.to_ascii_lowercase())).or_else(|| theme_color(s, default_theme()));
+        return vars.and_then(|v| v.theme_color(&s.to_ascii_lowercase())).or_else(|| default_theme_color(s));
     }
     parse_color(s)
 }
@@ -1640,7 +1659,7 @@ pub fn parse_color(s: &str) -> Option<Color> {
         return Some(Color::Default);
     }
     if THEMES.iter().any(|t| t.0 == s) {
-        return theme_color(&s, default_theme());
+        return default_theme_color(&s);
     }
     if let Some(i) = NAMES.iter().position(|n| *n == s) {
         return Some(Color::Idx(i as u8));
@@ -1782,6 +1801,7 @@ fn style_words(s: &str) -> impl Iterator<Item = &str> {
 
 /// Parse a style string like "fg=red,bg=colour235,bold,noitalics" applying it on top of `base`.
 /// `default` resets to `base`. `align=`, `fill=`, `list=` etc are validated but have no effect.
+#[allow(dead_code)] // the tests' shorthand for parse_style_with
 pub fn parse_style(s: &str, base: Style) -> Result<Style, String> {
     parse_style_with(s, base, None).map(|p| p.style)
 }

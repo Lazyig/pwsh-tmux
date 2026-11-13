@@ -2,7 +2,7 @@
 //! menus, popups, the clock and big digits for display-panes.
 
 use super::*;
-use crate::cells::{Cell, Color, Line, Style, BOLD, INVERSE};
+use crate::cells::{Cell, Color, Line, Style, INVERSE};
 use std::collections::HashSet;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -325,7 +325,9 @@ impl Tree {
             let last = self.items.get(i + 1).is_none_or(|n| n.depth < it.depth) || !self.items[i+1..].iter().take_while(|n| n.depth >= it.depth).any(|n| n.depth == it.depth);
             let indent = if it.depth == 0 { String::new() } else { format!("{}{}", "    ".repeat(it.depth.saturating_sub(1) as usize), if last { "└─> " } else { "├─> " }) };
             let text = format!("{quick}{indent}{arrow}{}{}", it.label, if self.tagged.contains(&it.id) { "*" } else { "" });
-            let style = if i == self.sel { selected } else if self.tagged.contains(&it.id) { Style { fg: crate::format::parse_color_with("themecyan", Some(&ctx)).unwrap_or(Color::Default), attrs: BOLD, ..Style::default() } } else { Style::default() };
+            let mut style = if i == self.sel { selected } else { Style::default() };
+            // mode_tree_draw: tagged items are themecyan, selected or not
+            if self.tagged.contains(&it.id) { style.fg = crate::format::parse_color_with("themecyan", Some(&ctx)).unwrap_or(Color::Default); }
             f.put_cells(0, row as u16, &line_from(&text, w as usize, style, &ctx, i == self.sel).cells);
         }
         let y = list_h as u16;

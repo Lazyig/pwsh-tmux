@@ -1383,6 +1383,22 @@ impl Server {
             }
             "refresh-client" => {
                 let cid = self.resolve_client(ctx, t)?;
+                // cmd_refresh_client: -F/-f and -r apply first, then -A, -B or -C end the
+                // command; otherwise the client is redrawn.
+                for f in [o.get('F'), o.get('f')].into_iter().flatten() {
+                    self.control_flags(cid, f)?;
+                }
+                if let Some(report) = o.get('r') {
+                    self.theme_control_report(report);
+                }
+                if let Some(a) = o.get('A') {
+                    self.control_pane_action(cid, a)?;
+                    return Ok(Flow::Next);
+                }
+                if let Some(b) = o.get('B') {
+                    self.control_subscribe(cid, b)?;
+                    return Ok(Flow::Next);
+                }
                 if let Some(size) = o.get('C') {
                     // control clients: -C WxH (or W,H)
                     let (w, h) = size.split_once(['x', ',']).ok_or_else(|| format!("bad size: {size}"))?;
@@ -1393,26 +1409,6 @@ impl Server {
                     if let Some(sid) = self.client_session(cid) {
                         self.update_session_size(sid);
                     }
-                    return Ok(Flow::Next);
-                }
-                if let Some(report) = o.get('r') {
-                    self.theme_control_report(report);
-                    return Ok(Flow::Next);
-                }
-                let mut handled = false;
-                if let Some(a) = o.get('A') {
-                    self.control_pane_action(cid, a)?;
-                    handled = true;
-                }
-                if let Some(b) = o.get('B') {
-                    self.control_subscribe(cid, b)?;
-                    handled = true;
-                }
-                if let Some(f) = o.get('f').or(o.get('F')) {
-                    self.control_flags(cid, f)?;
-                    handled = true;
-                }
-                if handled {
                     return Ok(Flow::Next);
                 }
                 if o.has('S') {
