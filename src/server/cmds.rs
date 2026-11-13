@@ -969,6 +969,7 @@ impl Server {
         let mut cm = CopyMode::new(lines, w, h, (cy, cx), vi);
         cm.set_word_separators(&self.opt_session(sid, "word-separators"));
         cm.from_other = source != pane;
+        cm.set_pane_search(&p.track.search);
         cm.set_line_number_option(crate::copymode::LineNumbers::parse(&self.opt_window(wid, "copy-mode-line-numbers")));
         let p = self.panes.get_mut(&pane).unwrap();
         p.mode = Some(PaneMode::Copy(Box::new(cm)));
@@ -2897,7 +2898,12 @@ impl Server {
                 let in_copy = matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(_)));
                 if in_copy && (o.has('X') || o.rest.is_empty()) {
                     if let Some(n) = o.get('N') {
-                        let n: usize = n.parse().map_err(|_| format!("repeat count {n}"))?;
+                        let n: usize = match n.parse::<i64>() {
+                            Ok(v) if v < 1 => return err("repeat count too small"),
+                            Ok(v) if v > u32::MAX as i64 => return err("repeat count too large"),
+                            Ok(v) => v as usize,
+                            Err(_) => return err("repeat count invalid"),
+                        };
                         if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
                             cm.set_count(n);
                         }

@@ -506,6 +506,15 @@ pub struct CopyMode {
     show_mark: bool,
     show_position: bool,
     search_marks: bool,
+    /// tmux's searchcount: None once the marks are cleared (-1), 0 before any search.
+    found_count: Option<usize>,
+    /// tmux's searchall: the first search counts every match.
+    search_all: bool,
+    /// The pane's last search (wp->searchstr): searching for it again only marks.
+    pane_search: Option<String>,
+    wrap_search: bool,
+    /// tmux's searchdirection: the last search went down.
+    searched_down: bool,
     exit_on_bottom: bool,
     /// tmux's lastcx / lastsx: the column to return to and the length of the line it was on,
     /// for vertical motion and scrolling (both start at 0).
@@ -558,6 +567,11 @@ impl CopyMode {
             show_mark: false,
             show_position: true,
             search_marks: false,
+            found_count: Some(0),
+            search_all: true,
+            pane_search: None,
+            wrap_search: true,
+            searched_down: false,
             exit_on_bottom: false,
             tlastcx: 0,
             tlastsx: 0,
@@ -733,7 +747,7 @@ impl CopyMode {
     /// window_copy_size_changed: the selection and search marks go.
     fn size_changed(&mut self) {
         self.clear_selection();
-        self.search_marks = false;
+        self.clear_marks();
         self.mark.0 = self.mark.0.min(self.lines.len() - 1);
     }
 
@@ -951,13 +965,34 @@ impl CopyMode {
         self.search_marks && self.search.as_ref().is_some_and(|s| !s.0.is_empty())
     }
 
-    /// search_count: how many matches there are (while marked).
+    /// window_copy_clear_marks.
+    fn clear_marks(&mut self) {
+        self.search_marks = false;
+        self.found_count = None;
+    }
+
+    /// search_count: how many matches the last full search found; 0 before any search and
+    /// none once the marks are cleared.
     pub fn search_count(&self) -> Option<usize> {
-        if !self.search_present() {
-            return None;
+        self.found_count
+    }
+
+    /// The pane's last search, which search-again repeats upwards (window_copy_common_init).
+    pub fn set_pane_search(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.search = Some((text.into(), false));
+            self.pane_search = Some(text.into());
         }
-        let needle = self.search.as_ref()?.0.clone();
-        Some((0..self.lines.len()).map(|y| self.row_matches(y, &needle).len()).sum())
+    }
+
+    /// mode-keys, which tmux looks up as copy mode runs.
+    pub fn set_vi(&mut self, vi: bool) {
+        self.vi = vi;
+    }
+
+    /// The wrap-search option.
+    pub fn set_wrap_search(&mut self, on: bool) {
+        self.wrap_search = on;
     }
 
     /// search_match: the match under the cursor.
@@ -966,7 +1001,10 @@ impl CopyMode {
             return None;
         }
         let needle = self.search.as_ref()?.0.clone();
-        let (x0, x1) = self.row_matches(self.cy, &needle).into_iter().find(|(a, b)| self.cx >= *a && self.cx < *b)?;
+        // window_copy_match_at_cursor allows one position after the match
+        let m = self.row_matches(self.cy, &needle);
+        let at = |x: usize| m.iter().copied().find(|(a, b)| x >= *a && x < *b);
+        let (x0, x1) = at(self.cx).or_else(|| self.cx.checked_sub(1).and_then(at))?;
         Some((x0..x1).filter_map(|x| self.cell(self.cy, x)).map(|c| c.text.as_str()).collect())
     }
 
@@ -1015,7 +1053,6 @@ impl CopyMode {
         self.top = top;
         self.search = search;
         if !text.is_empty() {
-            self.search_marks = true;
             self.search = Some((text.into(), forward));
             self.do_search(text, forward, 1);
         }
@@ -1188,7 +1225,7 @@ impl CopyMode {
         if !command.starts_with("search-") && self.search_marks {
             let clear = COMMANDS.iter().find(|c| c.0 == command).map_or(Clear::Never, |c| c.2);
             if clear == Clear::Always || (clear == Clear::EmacsOnly && !self.vi) {
-                self.search_marks = false;
+                self.clear_marks();
             }
         }
         action
@@ -1322,8 +1359,6 @@ impl CopyMode {
                     self.vertical(1);
                     self.end_of_line();
                 }
-                let x = self.max_x(self.cy);
-                self.cx = x;
                 self.sel_mode = SelMode::Line;
             }
             "select-word" => {
@@ -1340,8 +1375,13 @@ impl CopyMode {
                 self.line_mode = false;
                 self.frozen = None;
                 self.anchor = Some(start);
-                let end = if single { self.step_right(start).unwrap_or(start) } else { self.reader_next_word_end(start, &seps) };
-                let end = if self.vi { self.step_left(end).filter(|p| *p >= start).unwrap_or(start) } else { end };
+                // a single character word: the cursor stays on it
+                let end = if single {
+                    start
+                } else {
+                    let end = self.reader_next_word_end(start, &seps);
+                    if self.vi { self.step_left(end).filter(|p| *p >= start).unwrap_or(start) } else { end }
+                };
                 self.set_cursor(end.0, end.1);
                 self.sel_mode = SelMode::Word;
             }
@@ -1725,7 +1765,9 @@ impl CopyMode {
             }
             if let Some(needle) = needle {
                 for (x0, x1) in self.row_matches(y, needle) {
-                    let current = y == self.cy && self.cx >= x0 && self.cx < x1.max(x0 + 1);
+                    // the match at the cursor; after an emacs search down, the one before it
+                    let cx = if !self.vi && self.searched_down && self.cx > 0 { self.cx - 1 } else { self.cx };
+                    let current = y == self.cy && cx >= x0 && cx < x1.max(x0 + 1);
                     let ms = if current { st.current_match } else { st.matched };
                     for (x, c) in line.cells.iter_mut().enumerate().take(x1.min(content)).skip(x0) {
                         let inv = mark_row && x == self.mark.1;
@@ -1780,7 +1822,7 @@ impl CopyMode {
             None => {
                 let (pos, limit) = self.position();
                 let mut ind = format!("#[align=right][{pos}/{limit}]");
-                if let Some(n) = self.search_count() {
+                if let Some(n) = self.search_count().filter(|&n| n > 0) {
                     ind.push_str(&format!(" ({n} results)"));
                 }
                 ind
@@ -2424,49 +2466,82 @@ impl CopyMode {
         out
     }
 
-    fn find_match(&self, needle: &str, forward: bool) -> Option<Pos> {
+    /// window_copy_search_jump: the next match (row and columns). Forward, vi starts after
+    /// the match under the cursor (or the next cell), emacs at the cursor; backward starts
+    /// left of the cursor. Wraps around with wrap-search.
+    fn find_match(&self, needle: &str, forward: bool) -> Option<(usize, (usize, usize))> {
         let total = self.lines.len();
         let (cy, cx) = (self.cy, self.cx);
         if forward {
+            let from = if !self.vi {
+                cx
+            } else {
+                let on = self.search_present().then(|| self.row_matches(cy, needle).into_iter().find(|r| r.0 <= cx && cx < r.1)).flatten();
+                on.map_or(cx + 1, |r| r.1)
+            };
             for i in 0..=total {
+                if !self.wrap_search && cy + i >= total {
+                    break;
+                }
                 let y = (cy + i) % total;
                 let m = self.row_matches(y, needle);
                 let found = if i == 0 {
-                    m.iter().find(|r| r.0 > cx)
+                    m.into_iter().find(|r| r.0 >= from)
                 } else if i == total {
-                    m.iter().find(|r| r.0 <= cx)
+                    m.into_iter().find(|r| r.0 < from)
                 } else {
-                    m.first()
+                    m.into_iter().next()
                 };
                 if let Some(r) = found {
-                    return Some((y, r.0));
+                    return Some((y, r));
                 }
             }
         } else {
             for i in 0..=total {
+                if !self.wrap_search && i > cy {
+                    break;
+                }
                 let y = (cy + total * 2 - i) % total;
                 let m = self.row_matches(y, needle);
                 let found = if i == 0 {
-                    m.iter().rev().find(|r| r.0 < cx)
+                    m.into_iter().rev().find(|r| r.0 < cx)
                 } else if i == total {
-                    m.iter().rev().find(|r| r.0 >= cx)
+                    m.into_iter().rev().find(|r| r.0 >= cx)
                 } else {
-                    m.last()
+                    m.into_iter().next_back()
                 };
                 if let Some(r) = found {
-                    return Some((y, r.0));
+                    return Some((y, r));
                 }
             }
         }
         None
     }
 
+    /// window_copy_search, `n` times: a search for a new text clears the marks and counts
+    /// the matches; the pane's last search again only marks them. Emacs forward searches
+    /// leave the cursor just after the match.
     fn do_search(&mut self, needle: &str, forward: bool, n: usize) {
-        self.search_marks = true;
         for _ in 0..n {
-            match self.find_match(needle, forward) {
-                Some(p) => self.scroll_to(p),
-                None => break,
+            let visible_only = !self.search_all && self.pane_search.as_deref() == Some(needle);
+            self.search_all = false;
+            if !visible_only {
+                self.clear_marks();
+            }
+            self.pane_search = Some(needle.into());
+            self.searched_down = forward;
+            let Some((y, (x0, x1))) = self.find_match(needle, forward) else { break };
+            self.scroll_to((y, x0));
+            self.search_marks = true;
+            if !visible_only {
+                self.found_count = Some((0..self.lines.len()).map(|y| self.row_matches(y, needle).len()).sum());
+            }
+            if forward && !self.vi {
+                let (y, x) = if x1 >= self.width && y + 1 < self.lines.len() { (y + 1, 0) } else { (y, x1.min(self.width - 1)) };
+                self.cy = y;
+                self.cx = x;
+                self.lastcx = x;
+                self.ensure_visible();
             }
         }
     }
@@ -3292,7 +3367,7 @@ mod tests {
             cm.run("select-word", &[]);
             match cm.run("copy-selection", &[]) {
                 Action::Copy { text, .. } => text,
-                other => panic!("{other:?}"),
+                _ => String::new(),
             }
         };
         for vi in [false, true] {
@@ -3301,9 +3376,11 @@ mod tests {
             assert_eq!(pick("history 48 filler", 10, vi), "48");
             // separators end words; a run of separators is a word
             assert_eq!(pick("gamma-delta", 18 - 10, vi), "delta");
-            assert_eq!(pick("x=1 y=22", 2, vi), "1");
             assert_eq!(pick("a -- b", 3, vi), "--");
         }
+        // a single character word leaves the cursor on it: an empty selection in emacs
+        assert_eq!(pick("x=1 y=22", 2, true), "1");
+        assert_eq!(pick("x=1 y=22", 2, false), "");
     }
 
     #[test]
@@ -3332,11 +3409,15 @@ mod tests {
         let (view,_) = cm.render_with_style(selected);
         assert_eq!(view[0].cells[0].style, selected);
         assert_eq!(view[0].cells[2].style.bg, Color::Default);
-        // the count goes with the marks (tmux 3.7)
+        // the count goes with the marks (tmux 3.7); searching again for the same text
+        // marks the matches but does not count them
         assert!(!view[0].text().contains("results"));
+        assert_eq!(cm.search_count(), None);
         cm.run("search-again", &[]);
         assert!(cm.search_marks);
-        assert!(cm.render().0[0].text().ends_with("(2 results)"));
+        assert_eq!(cm.search_count(), None);
+        cm.run("search-forward", &["las".into()]);
+        assert!(cm.render().0[0].text().ends_with("(1 results)"));
     }
 
     #[test]
@@ -3470,8 +3551,10 @@ mod tests {
         assert_eq!((view[1].cells[mx].style.fg, view[1].cells[mx].style.bg), (mark.bg, mark.fg));
         cm.run("search-forward", &["ab".into()]);
         let (view, _) = cm.render_with(&st);
-        assert_eq!(view[0].cells[3].style.bg, MAGENTA, "the match at the cursor");
-        assert_eq!(view[0].cells[0].style.bg, CYAN);
+        // emacs leaves the cursor after the match, which is the current one
+        assert_eq!(cm.cx, 2);
+        assert_eq!(view[0].cells[0].style.bg, MAGENTA, "the match at the cursor");
+        assert_eq!(view[0].cells[3].style.bg, CYAN);
         assert_eq!(view[1].cells[1].style.bg, CYAN, "matches are drawn over the mark line");
         assert_eq!(view[1].cells[0].style.bg, mark.fg, "the mark cell stays reversed");
         // jump-to-mark swaps the mark and the cursor

@@ -43,8 +43,12 @@ impl Server {
     /// Options copy mode reads as it runs (tmux looks them up each time).
     pub(super) fn copy_sync_options(&mut self, pane: PaneId) {
         let ln = self.copy_line_numbers_option(pane);
+        let wrap = self.opt_window(self.window_of(pane), "wrap-search") == "on";
+        let vi = self.opt_window(self.window_of(pane), "mode-keys") == "vi";
         if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
             cm.set_line_number_option(ln);
+            cm.set_wrap_search(wrap);
+            cm.set_vi(vi);
         }
     }
 
