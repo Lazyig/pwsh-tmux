@@ -204,6 +204,9 @@ impl Server {
     }
 
     pub fn dispatch_input(&mut self, cid: ClientId, input: Input) {
+        if let Input::Unknown(raw) = &input {
+            if self.terminal_report(cid, raw) { return; }
+        }
         if self.client_is_readonly(Some(cid)) && !matches!(&input, Input::Key(_, _)) {
             return;
         }

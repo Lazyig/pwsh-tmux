@@ -32,8 +32,13 @@ impl Features {
         }
     }
 
+    pub fn colours(&self) -> u32 {
+        if self.has("RGB") { 16777216 } else if self.has("256") { 256 }
+        else if self.has("16") { 16 } else if self.has("mono") { 2 } else { 8 }
+    }
+
     pub fn list(&self) -> String {
-        self.0.iter().cloned().collect::<Vec<_>>().join(",")
+        self.0.iter().filter(|f| !matches!(f.as_str(), "16" | "mono")).cloned().collect::<Vec<_>>().join(",")
     }
 }
 
@@ -54,6 +59,8 @@ pub fn fnmatch(pat: &str, s: &str) -> bool {
 /// `table`: terminal-features entries ("pattern:feature:feature"), `extra`: the `-T` list.
 pub fn compute(term: &str, colorterm: &str, table: &[String], extra: &str) -> Features {
     let mut f = Features::default();
+    if term == "dumb" { f.add("mono"); }
+    if term.contains("16color") { f.add("16"); }
     if term.is_empty() {
         // Windows console / Windows Terminal: a modern VT implementation
         f.add("RGB,mouse,bpaste,title,ccolour,cstyle,focus,clipboard,strikethrough,sync,usstyle,overline,hyperlinks");
@@ -84,7 +91,7 @@ pub fn compute(term: &str, colorterm: &str, table: &[String], extra: &str) -> Fe
 
 /// Nearest xterm-256 colour for an RGB value.
 pub fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
-    let cube = |v: u8| -> u8 { if v < 48 { 0 } else if v < 115 { 1 } else { (v - 35) / 40 } };
+    let cube = |v: u8| -> u8 { if v < 48 { 0 } else if v < 114 { 1 } else { (v - 35) / 40 } };
     let (cr, cg, cb) = (cube(r), cube(g), cube(b));
     let level = |c: u8| -> u8 { if c == 0 { 0 } else { 55 + c * 40 } };
     let cube_idx = 16 + 36 * cr + 6 * cg + cb;
@@ -101,11 +108,11 @@ fn dist(a: (u8, u8, u8), b: (u8, u8, u8)) -> u32 {
 }
 
 const ANSI16: [(u8, u8, u8); 16] = [
-    (0, 0, 0), (205, 0, 0), (0, 205, 0), (205, 205, 0), (0, 0, 238), (205, 0, 205), (0, 205, 205), (229, 229, 229),
-    (127, 127, 127), (255, 0, 0), (0, 255, 0), (255, 255, 0), (92, 92, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255),
+    (0, 0, 0), (128, 0, 0), (0, 128, 0), (128, 128, 0), (0, 0, 128), (128, 0, 128), (0, 128, 128), (192, 192, 192),
+    (128, 128, 128), (255, 0, 0), (0, 255, 0), (255, 255, 0), (0, 0, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255),
 ];
 
-fn idx_to_rgb(i: u8) -> (u8, u8, u8) {
+pub(super) fn idx_to_rgb(i: u8) -> (u8, u8, u8) {
     match i {
         0..=15 => ANSI16[i as usize],
         16..=231 => {
@@ -120,8 +127,32 @@ fn idx_to_rgb(i: u8) -> (u8, u8, u8) {
     }
 }
 
+#[cfg(test)]
 pub fn rgb_to_16(r: u8, g: u8, b: u8) -> u8 {
     (0..16u8).min_by_key(|i| dist((r, g, b), ANSI16[*i as usize])).unwrap()
+}
+
+/// tmux colour_256to16 table.
+pub fn idx_to_16(i: u8) -> u8 {
+    const TABLE: [u8; 256] = [
+        0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+        0,  4,  4,  4, 12, 12,  2,  6,  4,  4, 12, 12,  2,  2,  6,  4,
+		12, 12,  2,  2,  2,  6, 12, 12, 10, 10, 10, 10, 14, 12, 10, 10,
+		10, 10, 10, 14,  1,  5,  4,  4, 12, 12,  3,  8,  4,  4, 12, 12,
+        2,  2,  6,  4, 12, 12,  2,  2,  2,  6, 12, 12, 10, 10, 10, 10,
+		14, 12, 10, 10, 10, 10, 10, 14,  1,  1,  5,  4, 12, 12,  1,  1,
+        5,  4, 12, 12,  3,  3,  8,  4, 12, 12,  2,  2,  2,  6, 12, 12,
+		10, 10, 10, 10, 14, 12, 10, 10, 10, 10, 10, 14,  1,  1,  1,  5,
+		12, 12,  1,  1,  1,  5, 12, 12,  1,  1,  1,  5, 12, 12,  3,  3,
+        3,  7, 12, 12, 10, 10, 10, 10, 14, 12, 10, 10, 10, 10, 10, 14,
+        9,  9,  9,  9, 13, 12,  9,  9,  9,  9, 13, 12,  9,  9,  9,  9,
+		13, 12,  9,  9,  9,  9, 13, 12, 11, 11, 11, 11,  7, 12, 10, 10,
+		10, 10, 10, 14,  9,  9,  9,  9,  9, 13,  9,  9,  9,  9,  9, 13,
+        9,  9,  9,  9,  9, 13,  9,  9,  9,  9,  9, 13,  9,  9,  9,  9,
+        9, 13, 11, 11, 11, 11, 11, 15,  0,  0,  0,  0,  0,  0,  8,  8,
+        8,  8,  8,  8,  7,  7,  7,  7,  7,  7, 15, 15, 15, 15, 15, 15
+    ];
+    TABLE[i as usize]
 }
 
 /// Downgrades a colour to what the terminal can show.
@@ -132,12 +163,11 @@ pub fn fit_color(c: vt100::Color, f: &Features) -> vt100::Color {
             if f.has("256") {
                 Idx(rgb_to_256(r, g, b))
             } else {
-                Idx(rgb_to_16(r, g, b))
+                Idx(idx_to_16(rgb_to_256(r, g, b)))
             }
         }
         Idx(i) if i >= 16 && !f.has("256") => {
-            let (r, g, b) = idx_to_rgb(i);
-            Idx(rgb_to_16(r, g, b))
+            Idx(idx_to_16(i))
         }
         other => other,
     }

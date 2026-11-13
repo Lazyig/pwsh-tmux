@@ -15,6 +15,7 @@ mod render;
 mod vars;
 mod transport;
 mod output;
+mod theme;
 
 use crate::cells::Line;
 use crate::copymode::CopyMode;
@@ -83,6 +84,7 @@ pub struct PaneInfo {
 /// Answers terminal queries and collects title / bell / cwd reports from a pane.
 #[derive(Default)]
 pub struct PaneCb {
+    pub colours: theme::PaneColours,
     pub replies: Vec<u8>,
     pub bell: bool,
     pub title: Option<String>,
@@ -258,13 +260,15 @@ fn decode_file_url(url: &str) -> Option<String> {
 }
 
 impl vt100::Callbacks for PaneCb {
+    fn theme_subscription(&mut self, _: &mut vt100::Screen) { self.colours.subscribe(); }
     fn audible_bell(&mut self, _: &mut vt100::Screen) {
         self.bell = true;
     }
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
         self.title = Some(String::from_utf8_lossy(title).into_owned());
     }
-    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+    fn unhandled_osc_terminated(&mut self, _: &mut vt100::Screen, params: &[&[u8]], bel: bool) {
+        self.colours.osc(params, bel, &mut self.replies);
         self.osc.osc(params);
         match params {
             [b"7", url, ..] => self.cwd = decode_file_url(&String::from_utf8_lossy(url)),
@@ -275,6 +279,10 @@ impl vt100::Callbacks for PaneCb {
     fn unhandled_csi(&mut self, screen: &mut vt100::Screen, i1: Option<u8>, _i2: Option<u8>, params: &[&[u16]], c: char) {
         let first = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
         match (i1, c, first) {
+            (Some(b'?'), 'p', 2031) if _i2 == Some(b'$') => {
+                self.replies.extend(format!("\x1b[?2031;{}$y", if screen.theme_updates() { 1 } else { 2 }).bytes());
+            }
+            (Some(b'?'), 'n', 996) => self.colours.report(&mut self.replies),
             (None, 'n', 6) => {
                 let (r, c) = screen.cursor_position();
                 self.replies.extend(format!("\x1b[{};{}R", r + 1, c + 1).bytes());
@@ -597,6 +605,7 @@ pub struct Client {
     pub seen: control::Seen,
     /// What the client's terminal supports (terminal-features, -T).
     pub features: features::Features,
+    pub terminal: theme::Terminal,
     /// Frames queued for the writer thread, and since when the queue has been non-empty
     /// (ms since the epoch): how far behind the client is (control mode pause-after).
     pub pending: Arc<std::sync::atomic::AtomicUsize>,
@@ -1220,6 +1229,7 @@ impl Server {
                 control_seq: 0,
                 seen: Default::default(),
                 features: Default::default(),
+                terminal: Default::default(),
                 pending,
                 queued_bytes,
                 closed,
@@ -1367,7 +1377,9 @@ impl Server {
         }
         self.control_output(id, data);
         let scroll_on_clear = options::is_on(&self.opt_pane(id, "scroll-on-clear"));
+        let colours = self.pane_colours(id);
         let p = self.panes.get_mut(&id).unwrap();
+        p.parser.callbacks_mut().colours.update(colours);
         p.parser.screen_mut().set_scroll_on_clear(scroll_on_clear);
         p.parser.process(data);
         p.last_output = Instant::now();
@@ -1386,7 +1398,9 @@ impl Server {
                 p.track.pipe_pid = None;
             }
         }
+        let enabled = p.screen().theme_updates();
         let cb = p.parser.callbacks_mut();
+        cb.colours.notify(enabled, &mut cb.replies);
         let replies = std::mem::take(&mut cb.replies);
         let bell = std::mem::take(&mut cb.bell);
         let title = cb.title.take();

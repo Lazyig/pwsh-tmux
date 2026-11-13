@@ -1395,6 +1395,10 @@ impl Server {
                     }
                     return Ok(Flow::Next);
                 }
+                if let Some(report) = o.get('r') {
+                    self.theme_control_report(report);
+                    return Ok(Flow::Next);
+                }
                 let mut handled = false;
                 if let Some(a) = o.get('A') {
                     self.control_pane_action(cid, a)?;

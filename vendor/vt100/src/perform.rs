@@ -190,7 +190,7 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
         }
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bel_terminated: bool) {
+    fn osc_dispatch(&mut self, params: &[&[u8]], bel_terminated: bool) {
         match params {
             [b"0", s] => {
                 self.callbacks.set_window_icon_name(&mut self.screen, s);
@@ -222,12 +222,12 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
                     }
                     _ => {
                         self.callbacks
-                            .unhandled_osc(&mut self.screen, params);
+                            .unhandled_osc_terminated(&mut self.screen, params, bel_terminated);
                     }
                 }
             }
             _ => {
-                self.callbacks.unhandled_osc(&mut self.screen, params);
+                self.callbacks.unhandled_osc_terminated(&mut self.screen, params, bel_terminated);
             }
         }
     }

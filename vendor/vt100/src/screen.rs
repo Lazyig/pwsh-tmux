@@ -1650,7 +1650,10 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                 }
                 [2004] => screen.set_mode(MODE_BRACKETED_PASTE),
                 [2026] => screen.set_xmode(XMODE_SYNC, true),
-                [2031] => screen.set_xmode(XMODE_THEME_UPDATES, true),
+                [2031] => {
+                    screen.set_xmode(XMODE_THEME_UPDATES, true);
+                    self.callbacks.theme_subscription(&mut self.screen);
+                },
                 _ => unhandled(self),
             }
         }

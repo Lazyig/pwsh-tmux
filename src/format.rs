@@ -48,6 +48,8 @@ pub trait Vars {
     fn theme_color(&self, _name: &str) -> Option<Color> {
         None
     }
+    /// A colour escape using the current client's terminal capabilities.
+    fn colour_escape(&self, _name: &str, _background: bool) -> Option<String> { None }
     /// The session environment, then the global one: format_find's last resort for a name
     /// that is not a variable or option. A name removed (-r) in the session has no value and
     /// is not looked up globally.
@@ -776,6 +778,9 @@ impl Vars for Overlay<'_> {
     fn theme_color(&self, name: &str) -> Option<Color> {
         self.base.theme_color(name)
     }
+    fn colour_escape(&self, name: &str, background: bool) -> Option<String> {
+        self.base.colour_escape(name, background)
+    }
     fn environ(&self, name: &str) -> Option<String> {
         self.base.environ(name)
     }
@@ -894,10 +899,11 @@ fn colour_format(s: &str, flags: &str, vars: &dyn Vars) -> String {
     if lower == "none" {
         return "\x1b[0m".into();
     }
+    if let Some(escape) = vars.colour_escape(s, bg) { return escape; }
     let base = if bg { 40 } else { 30 };
     let (color, is256) = match theme {
         Some(i) => match vars.theme_color(&lower) {
-            Some(c) => (c, true),
+            Some(c) => (c, matches!(c, Color::Idx(16..=255))),
             None => (Color::Idx(THEMES[i].3), false),
         },
         None => match parse_color(s) {
@@ -1892,6 +1898,11 @@ pub struct Span {
 /// current style the default, `#[pop-default]` restores the previous one. A directive with an
 /// invalid word is ignored.
 pub fn spans(text: &str, base: Style) -> Vec<Span> {
+    spans_with(text, base, None)
+}
+
+/// Styled text with per-client theme colours.
+pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span> {
     let mut out: Vec<Span> = Vec::new();
     let mut cur = base;
     let mut link = None;
@@ -1931,7 +1942,7 @@ pub fn spans(text: &str, base: Style) -> Vec<Span> {
         {
             // As format_draw, a directive with any invalid word is ignored as a whole.
             let (mut st, mut al) = (cur, align);
-            if !style_words(&rest[2..e]).all(|w| apply_word(w, &mut st, &mut al, default, None).is_ok()) {
+            if !style_words(&rest[2..e]).all(|w| apply_word(w, &mut st, &mut al, default, vars).is_ok()) {
                 i += e + 1;
                 continue;
             }
@@ -1963,10 +1974,10 @@ pub fn spans(text: &str, base: Style) -> Vec<Span> {
                     "default" => {
                         link = None;
                         range = None;
-                        let _ = apply_word(w, &mut cur, &mut align, default, None);
+                        let _ = apply_word(w, &mut cur, &mut align, default, vars);
                     }
                     _ => {
-                        let _ = apply_word(w, &mut cur, &mut align, default, None);
+                        let _ = apply_word(w, &mut cur, &mut align, default, vars);
                     }
                 }
             }

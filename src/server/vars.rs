@@ -150,6 +150,14 @@ impl Server {
 }
 
 impl Vars for VarCtx<'_> {
+    fn theme_color(&self, name: &str) -> Option<Color> {
+        self.resolve_theme_colour(name)
+    }
+
+    fn colour_escape(&self, name: &str, background: bool) -> Option<String> {
+        self.client_colour_escape(name, background)
+    }
+
     fn contexts(&self, kind: char, flags: &str) -> Vec<(Box<dyn Vars + '_>, bool)> {
         let mut targets = Vec::new();
         match kind {
@@ -632,10 +640,9 @@ impl Vars for VarCtx<'_> {
             "client_cell_width" => client.filter(|c| c.attached && c.control == 0).map(|_| "16".into()),
             "client_cell_height" => client.filter(|c| c.attached && c.control == 0).map(|_| "32".into()),
             "client_colours" => client.filter(|c| c.attached && c.control == 0).map(|c| {
-                if c.features.has("RGB") { "16777216" } else if c.features.has("256") { "256" } else { "8" }.into()
+                c.features.colours().to_string()
             }),
-            // dark/light detection (OSC 11 / mode 2031) is not done: unknown, as tmux shows it
-            "client_theme" => None,
+            "client_theme" => client.and_then(|c| c.terminal.reported).map(|t| if t == format::Theme::Light { "light" } else { "dark" }.into()),
             "client_flags" => client.map(|c| if c.attached { "attached".into() } else { String::new() }),
             "client_cwd" => client.and_then(|c| c.ident.as_ref()).map(|i| i.cwd.clone()),
             _ => None,

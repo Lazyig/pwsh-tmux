@@ -272,7 +272,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
     let paused = Arc::new(AtomicBool::new(false));
     let mut out = std::io::stdout();
     let restore = |out: &mut std::io::Stdout| {
-        let _ = out.write_all(b"\x1b[0m\x1b[?25h\x1b[?1l\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1004l\x1b[>4m\x1b[0 q\x1b[?1049l");
+        let _ = out.write_all(b"\x1b[?2031l\x1b[0m\x1b[?25h\x1b[?1l\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1004l\x1b[>4m\x1b[0 q\x1b[?1049l");
         let _ = out.flush();
     };
     loop {
@@ -337,7 +337,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                             return 1;
                         }
                     }
-                    let _ = out.write_all(b"\x1b[?1049h\x1b[H\x1b[2J");
+                    let _ = out.write_all(b"\x1b[?1049h\x1b[H\x1b[2J\x1b[?2031h\x1b[?996n\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
                     let _ = out.flush();
                     let input_post = post.clone();
                     let paused = paused.clone();
@@ -400,7 +400,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                     libc::raise(libc::SIGTSTP);
                 }
                 raw = term::RawMode::enter().ok();
-                let _ = out.write_all(b"\x1b[?1049h");
+                let _ = out.write_all(b"\x1b[?1049h\x1b[?2031h\x1b[?996n\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
                 let _ = out.flush();
                 let (c, r) = term::size();
                 post(C_RESIZE, &encode_size(c, r));
@@ -416,7 +416,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                 let cmd = String::from_utf8_lossy(&p).into_owned();
                 let _ = crate::server::procinfo::job_command(&cmd).status();
                 raw = term::RawMode::enter().ok();
-                let _ = out.write_all(b"\x1b[?1049h");
+                let _ = out.write_all(b"\x1b[?1049h\x1b[?2031h\x1b[?996n\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
                 let _ = out.flush();
                 paused.store(false, Ordering::SeqCst);
                 post(C_RESUMED, b"");

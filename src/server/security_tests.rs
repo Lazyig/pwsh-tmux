@@ -45,6 +45,7 @@ fn fixture() -> (Server, mpsc::Receiver<Event>) {
             control_seq: 0,
             seen: Default::default(),
             features: Default::default(),
+            terminal: Default::default(),
             pending,
             queued_bytes: Default::default(),
             closed: Default::default(),

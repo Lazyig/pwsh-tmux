@@ -350,6 +350,15 @@ fn parse_esc(buf: &[u8], force: bool) -> Res {
             Csi::Incomplete if !force => Res::Incomplete,
             Csi::Incomplete | Csi::Invalid => meta_fallback(buf),
         },
+        b']' if buf.starts_with(b"\x1b]10;") || buf.starts_with(b"\x1b]11;") || b"\x1b]10;".starts_with(buf) || b"\x1b]11;".starts_with(buf) => {
+            let end = buf.iter().position(|b| *b == 7).map(|i| i + 1)
+                .or_else(|| find(buf, b"\x1b\\").map(|i| i + 2));
+            match end {
+                Some(n) => Res::Done(unknown_tok(&buf[..n]), n),
+                None if !force && buf.len() < 256 => Res::Incomplete,
+                None => meta_fallback(buf),
+            }
+        }
         b'O' => parse_ss3(buf, force),
         ESC => {
             if buf.len() == 2 {
