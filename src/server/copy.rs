@@ -34,6 +34,16 @@ pub(super) fn binding_commands(cmd: &str) -> Result<Vec<Vec<String>>, String> {
     Ok(cmds.iter().flat_map(|c| crate::cmdparse::split_commands(c)).collect())
 }
 
+/// Commands a read-only client's key binding may run (CMD_READONLY).
+const READONLY_BINDING_CMDS: &[&str] = &["attach-session", "copy-mode", "detach-client", "list-clients", "send-keys", "switch-client"];
+
+/// key_bindings_dispatch: a read-only client's binding runs only if all its commands may.
+fn binding_allowed_readonly(cmd: &str) -> bool {
+    binding_commands(cmd).is_ok_and(|cmds| {
+        cmds.iter().all(|c| c.first().and_then(|n| super::cmds::canonical(n)).is_some_and(|n| READONLY_BINDING_CMDS.contains(&n)))
+    })
+}
+
 impl Server {
     /// The copy-mode-line-numbers option for a pane's window.
     fn copy_line_numbers_option(&self, pane: PaneId) -> LineNumbers {
@@ -72,6 +82,13 @@ impl Server {
         let pending = matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(cm)) if cm.waiting_for_key());
         let binding = self.bindings.get(table).and_then(|t| t.get(name)).map(|b| b.cmd.clone());
         let default = copymode::CopyMode::default_bindings(vi).iter().find(|(k, _)| keys::parse_key_name(k).map(|k| keys::key_name(&k)).as_deref().unwrap_or(k) == name).map(|(_, c)| *c);
+        // a read-only client cannot prompt or run other commands from copy mode
+        if let (Some(cmd), Some(c), false) = (&binding, cid, pending) {
+            if self.client_is_readonly(cid) && !binding_allowed_readonly(cmd) {
+                self.set_message(c, "client is read-only");
+                return;
+            }
+        }
         match binding {
             Some(cmd) if !pending && Some(cmd.as_str()) != default => {
                 if let Some(c) = cid {
@@ -382,5 +399,19 @@ fn pipe_to(cmd: &str, text: String) {
             }
             let _ = child.wait();
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::binding_allowed_readonly;
+
+    #[test]
+    fn readonly_copy_bindings() {
+        assert!(binding_allowed_readonly("send-keys -X cursor-up"));
+        assert!(binding_allowed_readonly(r"send -X history-top \; copy-mode -q"));
+        // the search and count prompts are not for read-only clients
+        assert!(!binding_allowed_readonly("command-prompt -T search -p \"(search down)\" { send-keys -X search-forward -- \"%%\" }"));
+        assert!(!binding_allowed_readonly(r"send-keys -X cancel \; select-pane -L"));
     }
 }
