@@ -1469,3 +1469,30 @@ fn tmux_38_client_detach_events() {
     wait_for("hooks", || ctx.cmd(&["show", "-gv", "@log"]).1.contains("client-detached"));
     assert_eq!(ctx.ok(&["show", "-gv", "@log"]).trim(), "pane-focus-in session-closed client-detached");
 }
+
+/// Changing the active pane updates focus (if focus-events is on) before
+/// window-pane-changed fires.
+#[test]
+fn tmux_38_focus_then_pane_changed() {
+    let ctx = Ctx::new("focusord");
+    ctx.ok(&["new-session", "-d", "-s", "f"]);
+    ctx.ok(&["split-window", "-d", "-t", "f"]);
+    for e in ["pane-focus-in", "pane-focus-out", "window-pane-changed"] {
+        ctx.ok(&["set-hook", "-g", e, "set -gaF @log '#{hook} '"]);
+    }
+    let mut child = ctx.command().args(["-C", "attach", "-t", "f"]).stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+    wait_for("focused", || ctx.cmd(&["show", "-gv", "@log"]).1.contains("pane-focus-in"));
+    ctx.ok(&["set", "-gu", "@log"]);
+    ctx.ok(&["select-pane", "-t", "f:0.1"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@log"]).trim(), "window-pane-changed");
+    ctx.ok(&["set", "-gu", "@log"]);
+    // (the first pane kept its focus: nothing changes going back to it)
+    ctx.ok(&["set", "-g", "focus-events", "on"]);
+    ctx.ok(&["select-pane", "-t", "f:0.0"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@log"]).trim(), "window-pane-changed");
+    ctx.ok(&["set", "-gu", "@log"]);
+    ctx.ok(&["select-pane", "-t", "f:0.1"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@log"]).trim(), "pane-focus-out pane-focus-in window-pane-changed");
+    child.kill().unwrap();
+    let _ = child.wait();
+}

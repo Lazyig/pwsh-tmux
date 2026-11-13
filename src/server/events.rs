@@ -1363,7 +1363,8 @@ impl Server {
         let mut p = self.payload_winlink(sid, now.0, now.1);
         p.set("new_window", self.val_window(now.1)).int("new_window_index", now.0 as i64);
         p.set("old_window", self.val_window(old.1)).int("old_window_index", old.0 as i64);
-        self.ev.focus_dirty = true;
+        // session_set_current updates focus if focus-events is on
+        self.ev.focus_dirty |= options::is_on(&self.opt_server("focus-events"));
         self.fire("session-window-changed", p);
     }
 
@@ -1603,8 +1604,12 @@ impl Server {
                 changed.push((wid, old, now));
             }
         }
+        // window_set_active_pane updates focus before window-pane-changed, if
+        // focus-events is on
+        if changed.iter().any(|(_, old, now)| old.active != now.active) && options::is_on(&self.opt_server("focus-events")) {
+            self.update_focus();
+        }
         for (wid, old, now) in &changed {
-            self.ev.focus_dirty |= old.active != now.active;
             if old.active != now.active && self.windows.get(wid).is_some_and(|w| w.active == now.active) {
                 let mut p = Payload { target: self.target_for_pane(now.active), ..Payload::default() };
                 p.set("window", self.val_window(*wid)).set("pane", Val::Pane(now.active)).set("new_pane", Val::Pane(now.active)).set("old_pane", Val::Pane(old.active));
