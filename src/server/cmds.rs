@@ -3335,33 +3335,57 @@ impl Server {
                 let map = if o.has('g') { self.hooks.clone() } else { self.resolve_session(ctx, t).ok().map(|s| self.sessions[&s].hooks.clone()).unwrap_or_default() };
                 let ft = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
                 let aliases = self.command_aliases();
-                for (k, v) in map {
-                    if o.rest.first().is_some_and(|n| n.split('[').next() != Some(k.as_str())) {
+                // cmd_show_options_all: user hooks, then the table's hooks of the scope (-p
+                // pane hooks, -w window and pane hooks, else session hooks; global pane
+                // options don't exist); global options hold every table hook, so an
+                // empty one is shown by name
+                use crate::options::{Scope, HOOKS};
+                let in_scope = |sc: Scope| if o.has('p') { sc == Scope::Pane && !o.has('g') } else if o.has('w') { sc != Scope::Session } else { sc == Scope::Session };
+                let names: Vec<String> = match o.rest.first() {
+                    Some(n) => vec![n.split('[').next().unwrap_or(n).to_string()],
+                    None => map.keys().filter(|k| k.starts_with('@')).cloned()
+                        .chain(HOOKS.iter().filter(|(_, sc)| in_scope(*sc)).map(|(n, _)| n.to_string()))
+                        .collect(),
+                };
+                // hook[N] shows only that element
+                let only: Option<usize> = o.rest.first().and_then(|n| n.split_once('[')).and_then(|(_, i)| i.trim_end_matches(']').parse().ok());
+                for k in names {
+                    let items: Vec<(usize, &String)> = map.get(&k).map(|v| v.iter().enumerate().filter(|(i, c)| !c.is_empty() && only.is_none_or(|o| o == *i)).collect()).unwrap_or_default();
+                    let empty = items.is_empty();
+                    if empty && !(o.has('g') && only.is_none() && crate::options::hook_scope(&k).is_some()) {
                         continue;
                     }
-                    // hook[N] shows only that element
-                    let only: Option<usize> = o.rest.first().and_then(|n| n.split_once('[')).and_then(|(_, i)| i.trim_end_matches(']').parse().ok());
-                    for (i, c) in v.iter().enumerate().filter(|(i, c)| !c.is_empty() && only.is_none_or(|o| o == *i)) {
+                    let rows: Vec<(Option<usize>, String)> = if empty {
+                        vec![(None, String::new())]
+                    } else {
+                        items.into_iter().map(|(i, c)| (Some(i), print_command_string(c, &aliases, false))).collect()
+                    };
+                    for (i, value) in rows {
                         match o.get('F') {
                             Some(f) => {
                                 let vars = HashMap::from([
                                     ("option_name".to_string(), k.clone()),
-                                    ("option_value".to_string(), print_command_string(c, &aliases, false)),
+                                    ("option_value".to_string(), value),
                                     ("option_value_only".to_string(), "0".to_string()),
                                     ("option_is_parent".to_string(), "0".to_string()),
                                     ("option_is_array".to_string(), "1".to_string()),
                                     ("option_is_string".to_string(), "0".to_string()),
-                                    ("option_is_hook".to_string(), "1".to_string()),
+                                    ("option_is_hook".to_string(), (!k.starts_with('@') as u8).to_string()),
                                     ("option_is_user".to_string(), (k.starts_with('@') as u8).to_string()),
-                                    ("option_has_value".to_string(), "1".to_string()),
-                                    ("option_has_array_key".to_string(), "1".to_string()),
-                                    ("option_array_key".to_string(), i.to_string()),
+                                    ("option_has_value".to_string(), (i.is_some() as u8).to_string()),
+                                    ("option_has_array_key".to_string(), (i.is_some() as u8).to_string()),
+                                    ("option_array_key".to_string(), i.map(|i| i.to_string()).unwrap_or_default()),
+                                    // only monitor hooks count their firings
+                                    ("hook_fire_count".to_string(), "0".to_string()),
                                 ]);
                                 let line = self.expand_extra(ft, ctx.client, f, vars);
                                 ctx.out.push_str(&line);
                                 ctx.out.push('\n');
                             }
-                            None => ctx.out.push_str(&format!("{k}[{i}] {}\n", print_command_string(c, &aliases, false))),
+                            None => match i {
+                                Some(i) => ctx.out.push_str(&format!("{k}[{i}] {value}\n")),
+                                None => ctx.out.push_str(&format!("{k}\n")),
+                            },
                         }
                     }
                 }

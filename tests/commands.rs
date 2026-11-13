@@ -1009,7 +1009,20 @@ fn show_options_and_hooks_formats() {
     assert_eq!(ctx.ok(&["show", "-gv", "-F", "V=#{option_value}#{option_value_only}", "status-left"]), "V=L R1\n");
     ctx.ok(&["set-hook", "-g", "session-renamed", "display hi"]);
     assert_eq!(ctx.ok(&["show-hooks", "-g", "-F", "#{option_name}[#{option_array_key}] #{option_value} #{option_is_hook}", "session-renamed"]), "session-renamed[0] display-message hi 1\n");
-    assert_eq!(ctx.ok(&["show-hooks", "-g", "client-attached"]), "");
+    // global options hold every hook of their scope: empty ones are shown by name
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "client-attached"]), "client-attached\n");
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "-F", "#{option_name}:#{option_has_value}:#{option_is_array}:#{hook_fire_count}", "after-new-window"]), "after-new-window:0:1:0\n");
+    let all = ctx.ok(&["show-hooks", "-g"]);
+    assert!(all.starts_with("after-bind-key\nafter-capture-pane\n") && all.contains("\nsession-renamed[0] display-message hi\n") && all.ends_with("\nwindow-unlinked\n"), "{all}");
+    assert_eq!(all.lines().count(), 62);
+    let win = ctx.ok(&["show-hooks", "-gw"]);
+    assert!(win.starts_with("pane-activity\n") && win.ends_with("\nwindow-zoomed\n") && win.lines().count() == 27, "{win}");
+    assert_eq!(ctx.ok(&["show-hooks", "-gp"]), "");
+    // a session's options only hold the hooks set there, -w lists window hooks only
+    ctx.ok(&["set-hook", "-t", "o", "session-renamed", "display s"]);
+    ctx.ok(&["set-hook", "-w", "-t", "o", "pane-focus-in", "display w"]);
+    assert_eq!(ctx.ok(&["show-hooks", "-t", "o"]), "session-renamed[0] display-message s\n");
+    assert_eq!(ctx.ok(&["show-hooks", "-w", "-t", "o"]), "pane-focus-in[0] display-message w\n");
 }
 
 #[test]
