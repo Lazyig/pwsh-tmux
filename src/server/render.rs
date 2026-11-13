@@ -1,6 +1,6 @@
 //! Composes a client's screen (panes, borders, status line, overlays) and sends the diff.
 
-use super::modes::{big_text, clock_text};
+use super::modes::{clock_text, draw_clock};
 use super::vars::Target;
 use super::*;
 use crate::cells::{Cell, Color, Line, Style, BLINK, BOLD, DIM, INVERSE, ITALIC, STRIKE, UNDERLINE};
@@ -442,12 +442,11 @@ impl Server {
                 }
             }
             if matches!(p.mode, Some(PaneMode::Clock)) {
-                let colour = format::parse_color(&self.opt_window(Some(wid), "clock-mode-colour")).unwrap_or(Color::Idx(4));
-                let text = clock_text(self.opt_window(Some(wid), "clock-mode-style") != "12");
-                let rr = Rect { y: oy + cr.y, h: cr.h.saturating_sub(1), ..cr };
-                if cr.h < 6 || !big_text(&mut f, rr, &text, colour) {
-                    f.text(cr.x, oy + cr.y + cr.h / 2, &text, Style { fg: colour, ..Style::default() }, cr.x + cr.w);
-                }
+                // style_apply of clock-mode-colour: a format, theme colours from the client
+                let t = Target { sid: Some(sid), idx: None, wid: Some(wid), pane: Some(p.id) };
+                let colour = self.style_option(&format!("fg={}", self.opt_window(Some(wid), "clock-mode-colour")), Style::default(), t, Some(cid)).map_or(Color::Idx(4), |s| s.fg);
+                let text = clock_text(&self.opt_window(Some(wid), "clock-mode-style"), chrono::Local::now().time());
+                draw_clock(&mut f, Rect { y: oy + cr.y, ..cr }, &text, colour);
             }
             if is_active {
                 match &mode_lines {

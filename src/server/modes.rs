@@ -368,36 +368,68 @@ pub(super) const FONT: [(char, [&str; 5]); 14] = [
     ('M', ["#   #", "## ##", "# # #", "#   #", "#   #"]),
 ];
 
-/// Draws `text` in 5x5 block digits centred in the rect; returns false if it doesn't fit.
-pub fn big_text(f: &mut super::render::Frame, r: Rect, text: &str, colour: Color) -> bool {
-    let n = text.chars().count() as u16;
-    let width = n * 6;
-    if r.w < width || r.h < 5 {
-        return false;
+/// The clock-mode text for a clock-mode-style (window_clock_draw_screen): "12" and
+/// "12-with-seconds" are strftime "%l:%M " or "%l:%M:%S " plus AM or PM, the others "%H:%M"
+/// or "%H:%M:%S".
+pub fn clock_text(style: &str, now: chrono::NaiveTime) -> String {
+    use chrono::Timelike;
+    let seconds = style.ends_with("-with-seconds");
+    if style.starts_with("12") {
+        let (pm, h) = now.hour12();
+        let mut t = format!("{:2}:{:02}", h, now.minute());
+        if seconds {
+            t += &format!(":{:02}", now.second());
+        }
+        t + if pm { " PM" } else { " AM" }
+    } else if seconds {
+        format!("{:02}:{:02}:{:02}", now.hour(), now.minute(), now.second())
+    } else {
+        format!("{:02}:{:02}", now.hour(), now.minute())
     }
-    let x0 = r.x + (r.w - width) / 2;
-    let y0 = r.y + (r.h - 5) / 2;
-    let block = Style { bg: colour, ..Style::default() };
-    for (i, ch) in text.chars().enumerate() {
-        let Some((_, rows)) = FONT.iter().find(|(c, _)| *c == ch) else { continue };
-        for (dy, row) in rows.iter().enumerate() {
-            for (dx, b) in row.chars().enumerate() {
-                if b == '#' {
-                    f.set(x0 + i as u16 * 6 + dx as u16, y0 + dy as u16, Cell { text: " ".into(), style: block });
+}
+
+/// window_clock_draw_screen: big 5x5 digits from (sx / 2 - 3 * len, sy / 2 - 3) drawn as
+/// '#' in the colour on the colour (spaces only advance), or the plain text in the middle
+/// when the pane is too small, or nothing when it is narrower than the text.
+pub fn draw_clock(f: &mut super::render::Frame, r: Rect, text: &str, colour: Color) {
+    let len = text.chars().count() as u16;
+    if r.w < 6 * len || r.h < 6 {
+        if r.w >= len && r.h != 0 {
+            f.text(r.x + r.w / 2 - len / 2, r.y + r.h / 2, text, Style { fg: colour, ..Style::default() }, r.x + r.w);
+        }
+        return;
+    }
+    let (mut x, y) = (r.x + r.w / 2 - 3 * len, r.y + r.h / 2 - 3);
+    let block = Style { fg: colour, bg: colour, ..Style::default() };
+    for ch in text.chars() {
+        if let Some((_, rows)) = FONT.iter().find(|(c, _)| *c == ch) {
+            for (dy, row) in rows.iter().enumerate() {
+                for (dx, b) in row.chars().enumerate() {
+                    if b == '#' {
+                        f.set(x + dx as u16, y + dy as u16, Cell { text: "#".into(), style: block });
+                    }
                 }
             }
         }
+        x += 6;
     }
-    true
 }
 
-pub fn clock_text(style24: bool) -> String {
-    use chrono::Timelike;
-    let now = chrono::Local::now();
-    if style24 {
-        format!("{:02}:{:02}", now.hour(), now.minute())
-    } else {
-        let (pm, h) = now.hour12();
-        format!("{:2}:{:02} {}", h, now.minute(), if pm { "PM" } else { "AM" }).trim_start().replace(' ', "")
+#[cfg(test)]
+mod clock_tests {
+    use super::clock_text;
+    use chrono::NaiveTime;
+
+    #[test]
+    fn clock_mode_styles() {
+        let t = NaiveTime::from_hms_opt(9, 5, 7).unwrap();
+        assert_eq!(clock_text("24", t), "09:05");
+        assert_eq!(clock_text("24-with-seconds", t), "09:05:07");
+        assert_eq!(clock_text("12", t), " 9:05 AM");
+        assert_eq!(clock_text("12-with-seconds", t), " 9:05:07 AM");
+        let t = NaiveTime::from_hms_opt(0, 30, 0).unwrap();
+        assert_eq!(clock_text("12", t), "12:30 AM");
+        let t = NaiveTime::from_hms_opt(23, 59, 59).unwrap();
+        assert_eq!(clock_text("12-with-seconds", t), "11:59:59 PM");
     }
 }
