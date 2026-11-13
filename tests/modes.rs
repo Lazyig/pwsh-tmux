@@ -201,3 +201,22 @@ fn pane_prompt_and_menus_on_all_clients() {
     t.wait_screen("closed everywhere", |s| !s.contains("One (1)"));
     assert!(menu.wait().unwrap().success());
 }
+
+#[test]
+fn customize_mode_empty_list_keeps_screen_and_any_key_exits() {
+    let ctx = Ctx::new("customize-empty");
+    let t = start(&ctx, "e");
+    // nothing changed from the defaults (default-shell is set from $SHELL at startup)
+    ctx.ok(&["set", "-gu", "default-shell"]);
+    // a filter that matches nothing leaves the groups without items
+    ctx.ok(&["customize-mode", "-f", "#{==:#{option_name},nosuch}", "-t", "e"]);
+    t.wait_screen("groups", |s| s.contains("(0)   Server Options") && s.contains("(1)   Session Options"));
+    // C with nothing changed empties the list: tmux does not redraw, the old items stay
+    t.send(b"C");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(ctx.fmt("e", "#{pane_mode}"), "options-mode");
+    assert!(t.contents().contains("(0)   Server Options"), "{}", t.contents());
+    // with an empty list any key leaves the mode
+    t.send(b"j");
+    wait_for("exited", || ctx.fmt("e", "#{pane_in_mode}") == "0");
+}

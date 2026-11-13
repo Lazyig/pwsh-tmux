@@ -280,6 +280,9 @@ pub struct Tree {
     /// -k: kill the pane when the mode exits.
     pub kill: bool,
     pub client: Option<ClientId>,
+    /// The last list drawn: mode_tree_draw leaves the screen alone when the list is empty
+    /// (customize C with nothing changed), so the old items stay on screen.
+    last_grid: std::cell::RefCell<Option<Vec<Vec<Cell>>>>,
 }
 
 impl Tree {
@@ -322,6 +325,7 @@ impl Tree {
             zoomed: None,
             kill: false,
             client: None,
+            last_grid: std::cell::RefCell::new(None),
         }
     }
 
@@ -1272,7 +1276,11 @@ impl Tree {
         let n = b.lines.len();
         let height = self.list_height(hu, n);
         let (cur, offset) = self.resolve(&b, height);
-        if n != 0 && wu != 0 && hu != 0 {
+        if n == 0 {
+            if let Some(last) = self.last_grid.borrow().as_ref().filter(|g| g.len() == hu && g.first().is_none_or(|l| l.len() == wu)) {
+                grid = last.clone();
+            }
+        } else if wu != 0 && hu != 0 {
             self.draw_list(srv, &b, &mut grid, wu, height, cur, offset, t);
             if self.preview != Preview::Off && !(hu <= 4 || height < 2 || hu - height <= 4 || wu <= 4) {
                 let item = b.lines[cur].item;
@@ -1302,6 +1310,9 @@ impl Tree {
                     self.draw_preview(srv, &b, item, &mut grid, 2, height + 1, bx, by);
                 }
             }
+        }
+        if n != 0 {
+            *self.last_grid.borrow_mut() = Some(grid.clone());
         }
         if self.help {
             self.draw_help(srv, &mut grid, wu, hu, t);
