@@ -1098,7 +1098,7 @@ impl Server {
             return Ok(Flow::Next);
         }
         let full = canonical(name).ok_or_else(|| format!("unknown command: {name}"))?;
-        if matches!(full, "display-menu" | "display-popup") && self.overlay_waits.len() >= 64 {
+        if full == "display-popup" && self.overlay_waits.len() >= 64 {
             return err("too many waiting overlays");
         }
         let spec = COMMANDS.iter().find(|c| c.0 == full).unwrap();
@@ -2616,13 +2616,10 @@ impl Server {
             }
             "display-menu" => {
                 let cid = self.resolve_client(ctx, o.get('c'))?;
-                if self.clients.get(&cid).is_some_and(|c| c.overlay.is_some()) {
-                    return Ok(Flow::Next);
-                }
                 let tt = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
                 let start = match o.get('C') {
                     Some("-") => None,
-                    Some(v) => Some(v.parse::<usize>().map_err(|_| format!("starting choice {v} invalid"))?),
+                    Some(v) => Some(options::strtonum(v, 0, u32::MAX as i64).map_err(|e| format!("starting choice {e}"))? as usize),
                     None => Some(0),
                 };
                 let mut items: Vec<MenuItem> = Vec::new();
@@ -2654,11 +2651,20 @@ impl Server {
                 let title = o.get('T').map(|s| self.expand(tt, Some(cid), s)).unwrap_or_default();
                 let (w, h) = Menu::box_size(&title, &items);
                 let Some((x, y)) = self.overlay_position(cid, tt, ctx.mouse.as_ref(), o.get('x'), o.get('y'), w, h) else { return Ok(Flow::Next) };
+                if let Some(v) = o.get('b') {
+                    options::validate("menu-border-lines", Some(v), None).map_err(|e| format!("menu-border-lines {e}"))?;
+                }
                 let nomouse = ctx.mouse.is_none() && !o.has('M');
+                // the menu belongs to the target window and is placed in it (menu_display)
+                let Some(wid) = tt.wid.or_else(|| self.client_window(cid)) else { return Ok(Flow::Next) };
+                let (wsx, wsy) = self.windows.get(&wid).map_or((0, 0), |w| (w.sx, w.sy));
+                let fit = |p: u16, size: u16, total: u16| if size >= total { 0 } else if p + size > total { total - size } else { p };
+                let x = fit(x, w, wsx);
+                let y = fit(y.saturating_sub(self.client_window_top(cid)), h, wsy);
                 let menu = Menu::at(title, items, x, y, tt.pane, nomouse, o.has('O'), start);
-                let epoch = self.replace_overlay(cid, Some(Overlay::Menu(menu)))?;
-                self.menu_changed(cid);
-                Ok(Flow::WaitOverlay(cid, epoch))
+                self.set_window_menu(wid, Some(menu));
+                // tmux 3.8 does not wait for the menu to close
+                Ok(Flow::Next)
             }
             "display-popup" => {
                 let cid = self.resolve_client(ctx, o.get('c'))?;

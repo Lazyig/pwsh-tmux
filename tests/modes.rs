@@ -268,3 +268,28 @@ fn send_keys_reach_tree_like_modes_only_with_a_client() {
     ctx.ok(&["send-keys", "-t", "b", "q"]);
     wait_for("copy mode left", || ctx.fmt("b", "#{pane_mode}") == "switch-mode");
 }
+
+#[test]
+fn menus_belong_to_the_window_and_do_not_block() {
+    let ctx = Ctx::new("window-menu");
+    let t = start(&ctx, "w");
+    ctx.ok(&["new-window", "-d", "-t", "w"]);
+    let c1 = client(&ctx);
+    // display-menu returns at once (3.8) and the rest of the list runs
+    ctx.ok(&["display-menu", "-c", &c1, "-x", "2", "-y", "10", "-T", "T1", "One", "1", "set -g @m one", ";", "set", "-g", "@after", "yes"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@after"]).trim(), "yes");
+    t.wait_screen("menu", |s| s.contains("One (1)"));
+    // a second menu on the window replaces the first
+    ctx.ok(&["display-menu", "-c", &c1, "-x", "2", "-y", "10", "-T", "T2", "Two", "2", "set -g @m two"]);
+    t.wait_screen("second menu", |s| s.contains("Two (2)") && !s.contains("One (1)"));
+    // it stays with its window
+    ctx.ok(&["select-window", "-t", "w:1"]);
+    t.wait_screen("no menu on window 1", |s| !s.contains("Two (2)"));
+    ctx.ok(&["select-window", "-t", "w:0"]);
+    t.wait_screen("menu again", |s| s.contains("Two (2)"));
+    t.send(b"2");
+    wait_for("chosen", || ctx.ok(&["show", "-gv", "@m"]).trim() == "two");
+    // bad -b and -C values
+    assert!(ctx.fails(&["display-menu", "-c", &c1, "-b", "bogus", "a", "a", ""]).contains("menu-border-lines unknown value: bogus"));
+    assert!(ctx.fails(&["display-menu", "-c", &c1, "-C", "9x", "a", "a", ""]).contains("starting choice invalid"));
+}

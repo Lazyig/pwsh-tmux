@@ -297,27 +297,22 @@ impl Server {
     fn handle_key(&mut self, cid: ClientId, k: Key, raw: Vec<u8>) {
         let name = keys::key_name(&k);
         let Some(c) = self.clients.get(&cid) else { return };
-        if c.is_readonly() && (c.prompt.is_some() || c.overlay.is_some()) { return; }
+        let menu = if c.overlay.is_none() { self.client_window(cid).filter(|w| self.menus.contains_key(w)) } else { None };
+        if c.is_readonly() && (c.prompt.is_some() || c.overlay.is_some() || menu.is_some()) { return; }
+        // the menu of the client's window comes before the prompt (server_client_handle_menu_key)
+        if let Some(wid) = menu {
+            let action = match self.menus.get_mut(&wid) {
+                Some(m) => m.key(&name),
+                None => MenuAction::None,
+            };
+            self.menu_action(cid, wid, action);
+            return;
+        }
         if c.prompt.is_some() {
             self.prompt_key(cid, &k, &name);
             return;
         }
-        // overlays; a menu belongs to its window, so other clients on the window use it too
-        let menu_owner = self.window_menu_owner(cid);
-        let (cid, c) = match menu_owner {
-            Some(_) if c.is_readonly() => return,
-            Some(o) => (o, &self.clients[&o]),
-            None => (cid, c),
-        };
         match &c.overlay {
-            Some(Overlay::Menu(_)) => {
-                let action = match &mut self.clients.get_mut(&cid).unwrap().overlay {
-                    Some(Overlay::Menu(m)) => m.key(&name),
-                    _ => MenuAction::None,
-                };
-                self.menu_action(cid, action);
-                return;
-            }
             Some(Overlay::Popup(p)) => {
                 let pane = p.pane;
                 if self.panes.get(&pane).is_some_and(|x| x.dead.is_some()) {
@@ -402,53 +397,47 @@ impl Server {
         }
     }
 
-    /// The client whose menu is shown over this client's window when this client has no
-    /// overlay of its own (tmux 3.8 keeps the menu in the window).
-    pub fn window_menu_owner(&self, cid: ClientId) -> Option<ClientId> {
-        let c = self.clients.get(&cid)?;
-        if c.overlay.is_some() {
-            return None;
+    /// The window a client shows.
+    pub fn client_window(&self, cid: ClientId) -> Option<WinId> {
+        self.client_session(cid).and_then(|s| self.sessions.get(&s)).map(|s| s.active_window())
+    }
+
+    /// The rows above the window on a client (status lines at the top).
+    pub fn client_window_top(&self, cid: ClientId) -> u16 {
+        let Some(c) = self.clients.get(&cid) else { return 0 };
+        if c.session.is_none() || self.opt_session(c.session, "status-position") != "top" {
+            return 0;
         }
-        let wid = self.sessions.get(&c.session?)?.active_window();
-        self.clients.values().find(|o| o.id != cid && o.attached && matches!(&o.overlay, Some(Overlay::Menu(m)) if self.menu_window(m, o.id) == Some(wid))).map(|o| o.id)
+        self.status_lines(c.session).min(c.size.1.saturating_sub(1))
     }
 
-    /// The window a menu belongs to: its pane's, else the opening client's current window.
-    pub fn menu_window(&self, m: &super::modes::Menu, owner: ClientId) -> Option<WinId> {
-        m.pane.and_then(|p| self.window_of(p)).or_else(|| self.client_session(owner).and_then(|s| self.sessions.get(&s)).map(|s| s.active_window()))
-    }
-
-    /// Redraw every client showing the window of a client's menu.
-    pub fn menu_changed(&mut self, owner: ClientId) {
-        let wid = match self.clients.get(&owner).and_then(|c| c.overlay.as_ref()) {
-            Some(Overlay::Menu(m)) => self.menu_window(m, owner),
-            _ => self.client_session(owner).and_then(|s| self.sessions.get(&s)).map(|s| s.active_window()),
-        };
-        if let Some(w) = wid {
-            self.mark_window_dirty(w);
+    /// A menu belongs to a window (tmux 3.8 w->menu): every client showing the window sees
+    /// and uses it, and opening another menu there replaces it (menu_close).
+    pub fn set_window_menu(&mut self, wid: WinId, menu: Option<super::modes::Menu>) {
+        match menu {
+            Some(m) => {
+                self.menus.insert(wid, m);
+            }
+            None => {
+                self.menus.remove(&wid);
+            }
+        }
+        if self.windows.contains_key(&wid) {
+            self.mark_window_dirty(wid);
         }
     }
 
-    pub(crate) fn menu_action(&mut self, cid: ClientId, action: MenuAction) {
-        self.menu_changed(cid);
+    pub(crate) fn menu_action(&mut self, cid: ClientId, wid: WinId, action: MenuAction) {
         match action {
             MenuAction::None => {
-                if let Some(c) = self.clients.get_mut(&cid) {
-                    c.dirty = true;
+                if self.windows.contains_key(&wid) {
+                    self.mark_window_dirty(wid);
                 }
             }
-            MenuAction::Cancel => {
-                let c = self.clients.get_mut(&cid).unwrap();
-                c.overlay = None;
-                c.dirty = true;
-            }
+            MenuAction::Cancel => self.set_window_menu(wid, None),
             MenuAction::Run(cmd) => {
-                let c = self.clients.get_mut(&cid).unwrap();
-                let pane = match c.overlay.take() {
-                    Some(Overlay::Menu(m)) => m.pane,
-                    _ => None,
-                };
-                c.dirty = true;
+                let pane = self.menus.get(&wid).and_then(|m| m.pane).filter(|p| self.panes.contains_key(p));
+                self.set_window_menu(wid, None);
                 self.run_string(cid, &cmd, pane.or_else(|| self.client_active_pane(cid)));
             }
         }

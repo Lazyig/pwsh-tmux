@@ -573,19 +573,18 @@ impl Server {
         }
 
         // overlays
-        let shared = self.window_menu_owner(cid).and_then(|o| self.clients[&o].overlay.as_ref());
-        if let Some(ov) = c.overlay.as_ref().or(shared) {
+        if let Some(m) = self.menus.get(&wid).filter(|_| c.overlay.is_none()) {
+            let ost = |name: &str, base: Style| self.style_option(&self.opt_window(Some(wid), name), base, active_target, Some(cid)).unwrap_or(base);
+            let st = ost("popup-style", Style::default());
+            let bst = ost("popup-border-style", Style::default());
+            let st = ost("menu-style", st);
+            let bst = ost("menu-border-style", bst);
+            let selected = ost("menu-selected-style", Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() });
+            m.draw(&mut f, oy, st, bst, selected);
+            cursor = None;
+        }
+        if let Some(ov) = c.overlay.as_ref() {
             match ov {
-                Overlay::Menu(m) => {
-                    let ost = |name: &str, base: Style| self.style_option(&self.opt_window(Some(wid), name), base, active_target, Some(cid)).unwrap_or(base);
-                    let st = ost("popup-style", Style::default());
-                    let bst = ost("popup-border-style", Style::default());
-                    let st = ost("menu-style", st);
-                    let bst = ost("menu-border-style", bst);
-                    let selected = ost("menu-selected-style", Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() });
-                    m.draw(&mut f, st, bst, selected);
-                    cursor = None;
-                }
                 Overlay::Popup(pp) => {
                     let st = self.style_option(&self.opt_window(Some(wid), "popup-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
                     let bst = self.style_option(&self.opt_window(Some(wid), "popup-border-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();

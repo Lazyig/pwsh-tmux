@@ -113,15 +113,22 @@ impl Server {
 
     /// Menus get the raw events (tmux menu_key_cb); true when the event was used.
     fn mouse_overlay(&mut self, cid: ClientId, m: &Mouse) -> bool {
-        // a menu belongs to its window: other clients on the window use it too (3.8)
-        let cid = self.window_menu_owner(cid).unwrap_or(cid);
+        let Some(c) = self.clients.get(&cid) else { return true };
+        // a menu belongs to its window: every client on the window uses it (3.8), with the
+        // event in window coordinates (server_client_handle_menu_key)
+        if c.overlay.is_none() {
+            if let Some(wid) = self.client_window(cid).filter(|w| self.menus.contains_key(w)) {
+                let top = self.client_window_top(cid);
+                let lines = self.status_lines(c.session).min(c.size.1.saturating_sub(1));
+                let area = c.size.1.saturating_sub(lines);
+                let wm = if m.y < top || m.y >= top + area { Mouse { x: u16::MAX, y: u16::MAX, ..*m } } else { Mouse { y: m.y - top, ..*m } };
+                let action = self.menus.get_mut(&wid).map_or(MenuAction::None, |menu| menu.mouse(&wm));
+                self.menu_action(cid, wid, action);
+                return true;
+            }
+        }
         let Some(c) = self.clients.get_mut(&cid) else { return true };
         match &mut c.overlay {
-            Some(Overlay::Menu(menu)) => {
-                let action = menu.mouse(m);
-                self.menu_action(cid, action);
-                true
-            }
             Some(Overlay::Popup(p)) => {
                 let (ix, iy, iw, ih) = p.inner();
                 let pane = p.pane;
@@ -729,14 +736,14 @@ impl Server {
             P::AnyMotion => 1003,
         };
         let pane_mode = |p: PaneId| self.panes.get(&p).filter(|p| p.mode.is_none()).map_or(0, |p| level(p.screen().mouse_protocol_mode()));
-        let mut mode = match &c.overlay {
-            Some(Overlay::Menu(menu)) if !menu.nomouse => 1003,
-            Some(Overlay::Popup(p)) => pane_mode(p.pane),
-            Some(_) => 0,
-            None => pane_mode(self.windows[&wid].active),
+        let menu = if c.overlay.is_none() { self.menus.get(&wid) } else { None };
+        let mut mode = match (&c.overlay, menu) {
+            (Some(Overlay::Popup(p)), _) => pane_mode(p.pane),
+            (None, Some(menu)) => if menu.nomouse { 0 } else { 1003 },
+            (None, None) => pane_mode(self.windows[&wid].active),
         };
         if self.opt_session_on(Some(sid), "mouse") {
-            if c.overlay.is_none() {
+            if c.overlay.is_none() && menu.is_none() {
                 mode = if self.windows[&wid].panes().iter().any(|p| pane_mode(*p) == 1003) { 1003 } else { 0 };
             }
             if mode != 1003 {

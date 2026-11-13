@@ -581,7 +581,6 @@ pub struct Prompt {
 }
 
 pub enum Overlay {
-    Menu(modes::Menu),
     Popup(modes::Popup),
 }
 
@@ -827,6 +826,8 @@ pub struct Server {
     /// wait-for channels signalled while nobody waited (the next wait returns at once).
     pub waits_woken: std::collections::HashSet<String>,
     pub overlay_waits: Vec<(ClientId, u64, String, Queue)>,
+    /// Open menus by window (w->menu).
+    pub menus: HashMap<WinId, modes::Menu>,
     /// Copy-mode panes scrolling while a selection drag rests at an edge.
     pub copy_drag_timers: HashMap<PaneId, Instant>,
     /// A lookup of what the panes run is in progress (at most one at a time).
@@ -965,6 +966,7 @@ impl Server {
             waits: HashMap::new(),
             waits_woken: Default::default(),
             overlay_waits: Vec::new(),
+            menus: HashMap::new(),
             copy_drag_timers: HashMap::new(),
             pane_info_busy: false,
             delayed: Vec::new(),
@@ -1725,6 +1727,10 @@ impl Server {
             for (_, q) in due {
                 self.run_queue(q);
             }
+        }
+        if !self.menus.is_empty() {
+            let windows = &self.windows;
+            self.menus.retain(|w, _| windows.contains_key(w));
         }
         let waiting = std::mem::take(&mut self.overlay_waits);
         for (cid, epoch, name, queue) in waiting {

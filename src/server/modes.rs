@@ -286,8 +286,9 @@ impl Menu {
         }
     }
 
-    pub fn draw(&self, f: &mut super::render::Frame, style: Style, border: Style, selected_style: Style) {
-        let (x0, y0, w, h) = (self.x, self.y, self.w, self.h);
+    /// Draw the menu with the window `oy` rows down the client.
+    pub fn draw(&self, f: &mut super::render::Frame, oy: u16, style: Style, border: Style, selected_style: Style) {
+        let (x0, y0, w, h) = (self.x, self.y + oy, self.w, self.h);
         super::render::draw_box(f, x0, y0, w, h, border, &self.title);
         for (i, it) in self.items.iter().enumerate() {
             let y = y0 + 1 + i as u16;
