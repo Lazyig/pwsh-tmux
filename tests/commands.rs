@@ -430,8 +430,10 @@ fn windows_and_sessions() {
     assert_eq!(ctx.fmt("a", "#{window_index}"), "1");
     ctx.ok(&["rename-window", "-t", "a:1", "uno"]);
     assert_eq!(ctx.fmt("a:1", "#W #{automatic-rename}"), "uno 0");
+    // find-window opens tree mode filtered to the matches (tmux 3.8)
     ctx.ok(&["find-window", "-t", "a", "-N", "zero"]);
-    assert_eq!(ctx.fmt("a", "#{window_name}"), "zero");
+    assert_eq!(ctx.fmt("a", "#{pane_mode}"), "tree-mode");
+    ctx.ok(&["copy-mode", "-q", "-t", "a"]);
     // link into another session
     ctx.ok(&["new-session", "-d", "-s", "b"]);
     ctx.ok(&["link-window", "-s", "a:uno", "-t", "b:5"]);

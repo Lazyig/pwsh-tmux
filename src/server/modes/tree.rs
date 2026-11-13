@@ -293,8 +293,6 @@ pub struct Tree {
     pub preview_offset: std::cell::Cell<i32>,
     /// -y: no confirmation prompts.
     pub accept: bool,
-    /// find-window: only these windows.
-    pub win_filter: Option<Vec<WinId>>,
     /// The target the mode was opened for (H, and the first selection).
     pub origin: Target,
     /// customize-mode C and H.
@@ -343,7 +341,6 @@ impl Tree {
             info: false,
             preview_offset: std::cell::Cell::new(0),
             accept: false,
-            win_filter: None,
             origin,
             hide_default: false,
             hide_global: false,
@@ -536,7 +533,7 @@ impl Tree {
             });
             let mut empty = 0;
             for (idx, wid) in &wls {
-                if self.win_filter.as_ref().is_some_and(|f| !f.contains(wid)) || !self.build_window(srv, b, s, *idx, *wid, si, filter, after) {
+                if !self.build_window(srv, b, s, *idx, *wid, si, filter, after) {
                     empty += 1;
                 }
             }

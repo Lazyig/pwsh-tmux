@@ -425,3 +425,21 @@ fn customize_mode_adds_items_from_groups_and_keeps_command_lists() {
     assert!(ctx.fails(&["show", "-gv", "@b"]).contains("invalid option"));
     assert!(ctx.ok(&["list-keys", "-T", "prefix", "F1"]).contains("@b 2"));
 }
+
+#[test]
+fn find_window_opens_a_filtered_tree() {
+    let ctx = Ctx::new("find-window");
+    let t = start(&ctx, "fw");
+    ctx.ok(&["new-window", "-d", "-t", "fw", "-n", "editor"]);
+    ctx.ok(&["new-window", "-d", "-t", "fw", "-n", "other"]);
+    // one match does not switch to it, the tree shows it
+    ctx.ok(&["find-window", "-N", "-t", "fw:0", "edi"]);
+    assert_eq!(ctx.fmt("fw:0", "#{pane_mode}"), "tree-mode");
+    t.wait_screen("filtered", |s| s.contains("1: editor") && !s.contains("2: other") && s.contains("(filter: active)"));
+    assert_eq!(ctx.fmt("fw", "#{window_index}"), "0");
+    t.send(b"q");
+    wait_for("left", || ctx.fmt("fw:0", "#{pane_in_mode}") == "0");
+    // no match: the whole tree (mode_tree_build drops a filter matching nothing)
+    ctx.ok(&["find-window", "-N", "-t", "fw:0", "nosuch"]);
+    t.wait_screen("unfiltered", |s| s.contains("2: other"));
+}

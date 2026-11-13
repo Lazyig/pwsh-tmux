@@ -1704,40 +1704,40 @@ impl Server {
                 Ok(Flow::Next)
             }
             "find-window" => {
+                // cmd_find_window_exec: tree mode with a filter made from the match string
                 let pat = o.rest.first().ok_or("find-window needs a match string")?.clone();
-                let (bn, bt, bc) = (o.has('N'), o.has('T'), o.has('C'));
-                let all = !bn && !bt && !bc;
-                let sid = self.resolve_session(ctx, t)?;
-                let mut hits = Vec::new();
-                for (idx, wid) in self.sessions[&sid].links.clone() {
-                    let w = &self.windows[&wid];
-                    let m = |s: &str| if o.has('r') { s.contains(&pat) } else if o.has('i') { s.to_lowercase().contains(&pat.to_lowercase()) } else { fnmatch(&format!("*{pat}*"), s) };
-                    let mut hit = (all || bn) && m(&w.name);
-                    for p in w.panes() {
-                        if let Some(pp) = self.panes.get(&p) {
-                            hit |= (all || bt) && m(&pp.title);
-                            hit |= (all || bc) && m(&pp.screen().contents());
-                        }
-                    }
-                    if hit {
-                        hits.push(idx);
-                    }
+                let tt = self.resolve_pane(ctx, t)?;
+                let pane = tt.pane.ok_or("no pane")?;
+                let star = if o.has('r') { "" } else { "*" };
+                let suffix = match (o.has('r'), o.has('i')) {
+                    (true, true) => "/ri",
+                    (true, false) => "/r",
+                    (false, true) => "/i",
+                    _ => "",
+                };
+                let (mut c, mut n, mut tf) = (o.has('C'), o.has('N'), o.has('T'));
+                if !c && !n && !tf {
+                    (c, n, tf) = (true, true, true);
                 }
-                match hits.as_slice() {
-                    [] => err(format!("no windows matching: {pat}")),
-                    [one] => {
-                        self.select_window(sid, *one);
-                        Ok(Flow::Next)
-                    }
-                    _ => {
-                        let pane = self.current(ctx).pane.ok_or("no pane")?;
-                        let filter: Vec<WinId> = hits.iter().map(|i| self.sessions[&sid].links[i]).collect();
-                        let mut tree = Tree::new(TreeKind::Tree, pane, self.target_for_pane(pane));
-                        tree.win_filter = Some(filter);
-                        self.open_tree(pane, tree, o.has('Z'), ctx);
-                        Ok(Flow::Next)
-                    }
+                let content = format!("#{{C{suffix}:{pat}}}");
+                let name = format!("#{{m{suffix}:{star}{pat}{star},#{{window_name}}}}");
+                let title = format!("#{{m{suffix}:{star}{pat}{star},#{{pane_title}}}}");
+                let filter = match (c, n, tf) {
+                    (true, true, true) => format!("#{{||:{content},#{{||:{name},{title}}}}}"),
+                    (true, true, false) => format!("#{{||:{content},{name}}}"),
+                    (true, false, true) => format!("#{{||:{content},{title}}}"),
+                    (false, true, true) => format!("#{{||:{name},{title}}}"),
+                    (true, false, false) => content,
+                    (false, true, false) => name,
+                    _ => title,
+                };
+                if self.raise_mode(pane, "tree-mode", Some(false)) {
+                    return Ok(Flow::Next);
                 }
+                let mut tree = Tree::new(TreeKind::Tree, pane, tt);
+                tree.filter = Some(filter);
+                self.open_tree(pane, tree, o.has('Z'), ctx);
+                Ok(Flow::Next)
             }
             "respawn-window" | "respawn-pane" => {
                 let requested = spawn_command(&o, false)?;
