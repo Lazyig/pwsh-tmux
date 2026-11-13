@@ -251,7 +251,7 @@ impl Lexer<'_> {
                     self.directive(&mut stack, &mut cmds, cond)?;
                     continue;
                 }
-                '{' if is_blank(self.peek_at(1)) => {
+                '{' => {
                     let body = self.read_brace()?;
                     cur.push((body, false, true));
                     // `};` ends the command even without a following blank.
@@ -934,10 +934,14 @@ mod tests {
         );
         // `}` followed by `;` separates.
         assert_eq!(p("a { b };c"), vec![v(&["a", "b"]), v(&["c"])]);
-        // `{` that is not a standalone word is literal.
-        assert_eq!(p("x {a} a{"), vec![v(&["x", "{a}", "a{"])]);
-        assert_eq!(p("x {}"), vec![v(&["x", "{}"])]);
+        // A leading brace opens a command block without requiring whitespace.
+        assert_eq!(p("x {a} a{"), vec![v(&["x", "a", "a{"])]);
+        assert_eq!(p("x {}"), vec![v(&["x", ""])]);
         assert_eq!(p("x { }"), vec![v(&["x", ""])]);
+        let menu = p("display-menu Kill X {kill-pane} Split h {splitw -h} Paste p {copy-mode -q; paste-buffer}");
+        assert_eq!(menu[0][3], "kill-pane");
+        assert_eq!(menu[0][6], "splitw -h");
+        assert_eq!(p(&menu[0][9]), vec![v(&["copy-mode", "-q"]), v(&["paste-buffer"])]);
     }
 
     #[test]
