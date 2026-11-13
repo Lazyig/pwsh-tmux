@@ -1444,6 +1444,17 @@ impl Server {
                     }
                     return Ok(Flow::Next);
                 }
+                if o.has('l') {
+                    // tty_clipboard_query: ask the terminal for its clipboard (Ms with "?");
+                    // a reply within 5 seconds makes a new buffer
+                    if let Some(c) = self.clients.get_mut(&cid).filter(|c| c.attached && c.control == 0 && c.features.has("clipboard")) {
+                        if c.clipboard_query.is_none_or(|d| Instant::now() >= d) {
+                            c.send(S_OUTPUT, b"\x1b]52;;?\x07");
+                            c.clipboard_query = Some(Instant::now() + Duration::from_secs(5));
+                        }
+                    }
+                    return Ok(Flow::Next);
+                }
                 if let Some(size) = o.get('C') {
                     // control clients: -C WxH (or W,H)
                     let (w, h) = size.split_once(['x', ',']).ok_or_else(|| format!("bad size: {size}"))?;
@@ -4163,6 +4174,39 @@ pub fn truthy(s: &str) -> bool {
     !s.is_empty() && s != "0"
 }
 
+/// b64_pton: whitespace is skipped, '=' ends the data; None for anything invalid.
+pub fn base64_decode(data: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let (mut acc, mut bits) = (0u32, 0u32);
+    let mut padding = false;
+    for &b in data {
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => {
+                padding = true;
+                continue;
+            }
+            b if b.is_ascii_whitespace() => continue,
+            _ => return None,
+        };
+        if padding {
+            return None;
+        }
+        acc = acc << 6 | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
 pub fn base64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
@@ -4337,6 +4381,10 @@ mod tests {
     fn helpers() {
         assert_eq!(base64(b"hello"), "aGVsbG8=");
         assert_eq!(base64(b"ab"), "YWI=");
+        assert_eq!(base64_decode(b"aGVs\nbG8="), Some(b"hello".to_vec()));
+        assert_eq!(base64_decode(b"YWI"), Some(b"ab".to_vec()));
+        assert_eq!(base64_decode(b"a*b"), None);
+        assert_eq!(base64_decode(b"YQ==YQ"), None);
         assert!(fnmatch("*.conf", "a.conf") && !fnmatch("a?", "abc"));
         assert_eq!(canonical("neww"), Some("new-window"));
         assert_eq!(canonical("list-k"), Some("list-keys"));

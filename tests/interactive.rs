@@ -506,3 +506,21 @@ fn attaching_and_typing_make_the_session_current() {
     t.send(b"x");
     wait_for("key activity", || ctx.ok(&["display-message", "-p", "#S"]) == "a\n");
 }
+
+#[test]
+fn refresh_client_l_reads_the_terminal_clipboard() {
+    let ctx = Ctx::new("p1fix-clip");
+    let t = start(&ctx, "clip");
+    // replies nobody asked for are dropped
+    t.send(b"\x1b]52;c;aWdub3JlZA==\x07");
+    ctx.ok(&["set-option", "-g", "@sync", "1"]);
+    assert_eq!(ctx.ok(&["list-buffers"]), "");
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]);
+    ctx.ok(&["refresh-client", "-l", "-t", client.trim()]);
+    // tty_clipboard_query: Ms with "?"
+    wait_for("clipboard query", || t.raw_text().contains("\x1b]52;;?\x07"));
+    t.send(b"\x1b]52;c;aGVsbG8gY2xpcA==\x07");
+    wait_for("clipboard buffer", || ctx.ok(&["list-buffers", "-F", "#{buffer_sample}"]) == "hello clip\n");
+    // the reply is not typed into the pane
+    assert!(!ctx.capture("clip").contains("52;"));
+}

@@ -204,6 +204,12 @@ impl Server {
     }
 
     pub fn dispatch_input(&mut self, cid: ClientId, input: Input) {
+        if let Input::Unknown(raw) = &input {
+            if raw.starts_with(b"\x1b]52;") {
+                self.clipboard_reply(cid, raw);
+                return;
+            }
+        }
         if self.client_is_readonly(Some(cid)) && !matches!(&input, Input::Key(_, _)) {
             return;
         }
@@ -238,6 +244,26 @@ impl Server {
                     }
                 }
             }
+        }
+    }
+
+    /// tty_keys_clipboard: the terminal's OSC 52 reply makes a buffer if refresh-client -l
+    /// asked for it in the last few seconds.
+    fn clipboard_reply(&mut self, cid: ClientId, raw: &[u8]) {
+        let Some(c) = self.clients.get_mut(&cid) else { return };
+        if c.clipboard_query.take().is_none_or(|d| Instant::now() >= d) {
+            return;
+        }
+        let body = &raw[5..];
+        let body = body.strip_suffix(b"\x07").or_else(|| body.strip_suffix(b"\x1b\\")).unwrap_or(body);
+        // skip the selection argument
+        let Some(pos) = body.iter().position(|&b| b == b';') else { return };
+        let data = &body[pos + 1..];
+        if data.is_empty() {
+            return;
+        }
+        if let Some(data) = super::cmds::base64_decode(data).filter(|d| !d.is_empty()) {
+            self.add_buffer(None, data, false);
         }
     }
 

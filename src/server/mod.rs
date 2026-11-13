@@ -615,6 +615,9 @@ pub struct Client {
     pub seen: control::Seen,
     /// What the client's terminal supports (terminal-features, -T).
     pub features: features::Features,
+    /// refresh-client -l: until when a clipboard reply from the terminal makes a buffer
+    /// (TTY_OSC52QUERY).
+    pub clipboard_query: Option<Instant>,
     /// Frames queued for the writer thread, and since when the queue has been non-empty
     /// (ms since the epoch): how far behind the client is (control mode pause-after).
     pub pending: Arc<std::sync::atomic::AtomicUsize>,
@@ -1248,6 +1251,7 @@ impl Server {
                 control_seq: 0,
                 seen: Default::default(),
                 features: Default::default(),
+                clipboard_query: None,
                 pending,
                 queued_bytes,
                 closed,
