@@ -18,6 +18,8 @@ pub struct Global {
     pub control: u8,
     /// -T: extra terminal features ("RGB,sync,...")
     pub features: String,
+    /// -u: the terminal is UTF-8 whatever the locale says
+    pub utf8: bool,
 }
 
 fn spawn_server(config: Option<&str>) -> std::io::Result<()> {
@@ -149,6 +151,15 @@ fn is_tty() -> bool {
 
 /// A native Windows console supports VT even when a launcher inherited TERM=dumb.
 /// Preserve explicit terminal names and non-console clients (including Unix).
+/// CLIENT_UTF8: -u, running inside tmux, or a UTF-8 locale (LC_ALL, then LC_CTYPE, then LANG).
+/// Windows consoles are driven in UTF-8.
+fn client_utf8(flag: bool) -> bool {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let inside = std::env::var_os("TMUX").is_some() || var("PWSH_TMUX").is_some();
+    let locale = var("LC_ALL").or_else(|| var("LC_CTYPE")).or_else(|| var("LANG")).unwrap_or_default().to_ascii_uppercase();
+    flag || cfg!(windows) || inside || locale.contains("UTF-8") || locale.contains("UTF8")
+}
+
 fn terminal_name(term: String, windows_console: bool) -> String {
     if windows_console && term == "dumb" { String::new() } else { term }
 }
@@ -247,6 +258,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
         std::env::var("PWSH_TMUX_PANE").ok().filter(|_| std::env::var_os("PWSH_TMUX").is_some()).unwrap_or_default(),
         g.control.to_string(),
         g.features.clone(),
+        if client_utf8(g.utf8) { "1".into() } else { "0".into() },
     ];
     ident.extend(std::env::vars().map(|(k, v)| format!("{k}={v}")));
     let stream = Arc::new(stream);
@@ -271,7 +283,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
     let paused = Arc::new(AtomicBool::new(false));
     let mut out = std::io::stdout();
     let restore = |out: &mut std::io::Stdout, alternate: bool| {
-        let _ = out.write_all(b"\x1b[0m\x1b[?25h\x1b[?1l\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1004l\x1b[>4m\x1b[?7727l\x1b[0 q\x1b]112\x07");
+        let _ = out.write_all(b"\x1b[0m\x1b[?25h\x1b[?1l\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1004l\x1b[>4m");
         let _ = out.write_all(if alternate { b"\x1b[?1049l" } else { b"\x1b[H\x1b[2J" });
         let _ = out.flush();
     };

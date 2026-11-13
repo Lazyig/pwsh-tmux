@@ -2,7 +2,6 @@ use alloc::vec::Vec;
 
 const BASE64: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
-const CLIPBOARD_SELECTOR: &[u8] = b"cpqs01234567";
 
 impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
     fn print(&mut self, c: char) {
@@ -203,8 +202,9 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
                 self.callbacks.set_window_title(&mut self.screen, s);
             }
             [b"52", ty, data] => {
+                // tmux keeps the allowed selector characters and drops the rest
                 match (
-                    ty.iter().all(|c| CLIPBOARD_SELECTOR.contains(c)),
+                    ty.iter().all(|c| !matches!(c, 0..=0x1f | 0x7f)),
                     *data,
                 ) {
                     (true, b"?") => {

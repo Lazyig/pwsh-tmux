@@ -3,41 +3,62 @@
 
 use std::collections::BTreeSet;
 
-#[allow(dead_code)]
+/// tmux's tty_features table, in its order (client_termfeatures lists features this way).
 pub const KNOWN: &[&str] = &[
-    "256", "RGB", "bpaste", "ccolour", "clipboard", "cstyle", "extkeys", "focus", "hyperlinks", "ignorefkeys", "margins", "mouse", "osc7", "overline",
-    "rectfill", "strikethrough", "sync", "title", "usstyle", "utf8", "appesc",
+    "256", "appesc", "bpaste", "ccolour", "clipboard", "hyperlinks", "cstyle", "extkeys", "focus", "ignorefkeys", "margins", "mouse", "osc7",
+    "overline", "progressbar", "rectfill", "RGB", "sixel", "strikethrough", "sync", "title", "usstyle", "utf8",
 ];
 
+/// Enabled features and the ones removed with `feature@` (term_features / term_nofeatures).
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
-pub struct Features(pub BTreeSet<String>);
+pub struct Features(pub BTreeSet<String>, pub BTreeSet<String>);
 
 impl Features {
     pub fn has(&self, f: &str) -> bool {
-        self.0.contains(f)
+        // RGB implies 256 colours (TERM_256COLOURS) without listing the 256 feature
+        self.0.contains(f) || (f == "256" && self.0.contains("RGB"))
     }
 
     fn add(&mut self, list: &str) {
-        for f in list.split([',', ':']).map(str::trim).filter(|f| !f.is_empty()) {
-            if let Some(name) = f.strip_suffix('@').or_else(|| f.strip_prefix('@')) {
-                self.0.remove(name);
-                continue;
+        self.parse(list, &[',', ':']);
+    }
+
+    /// tty_parse_features: a trailing `@` removes a feature and keeps later lists from adding it
+    /// back; an unknown name ends the list.
+    pub fn parse(&mut self, list: &str, sep: &[char]) {
+        for f in list.split(sep) {
+            let (name, remove) = match f.strip_suffix('@') { Some(n) => (n, true), None => (f, false) };
+            // pwsh-tmux aliases for RGB and 256
+            let name = match name { "Tc" | "24bit" | "truecolor" => "RGB", "256color" => "256", other => other };
+            let Some(known) = KNOWN.iter().find(|k| k.eq_ignore_ascii_case(name)) else { break };
+            if remove {
+                self.0.remove(*known);
+                self.1.insert(known.to_string());
+            } else if !self.1.contains(*known) {
+                self.0.insert(known.to_string());
             }
-            // tmux aliases
-            let f = match f {
-                "Tc" | "24bit" | "truecolor" => "RGB",
-                "256color" => "256",
-                other => other,
-            };
-            if f == "RGB" {
-                self.0.insert("256".into());
-            }
-            self.0.insert(f.to_string());
         }
     }
 
     pub fn list(&self) -> String {
-        self.0.iter().cloned().collect::<Vec<_>>().join(",")
+        KNOWN.iter().filter(|f| self.0.contains(**f)).copied().collect::<Vec<_>>().join(",")
+    }
+}
+
+/// tty_default_features: what tmux enables for a terminal it identifies (by XDA there, by
+/// TERM_PROGRAM or TERM here since no device attributes are requested).
+fn default_features(name: &str) -> &'static [&'static str] {
+    const BASE: &str = "256,RGB,bpaste,clipboard,mouse,strikethrough,title";
+    match name {
+        "mintty" => &[BASE, "appesc,ccolour,cstyle,extkeys,margins,overline,usstyle"],
+        "tmux" => &[BASE, "ccolour,cstyle,extkeys,focus,overline,usstyle,hyperlinks,progressbar"],
+        "rxvt-unicode" => &["256,bpaste,ccolour,cstyle,mouse,title,ignorefkeys"],
+        "iTerm2" | "iTerm.app" => &[BASE, "cstyle,extkeys,margins,usstyle,sync,osc7,hyperlinks,progressbar"],
+        "foot" => &[BASE, "ccolour,cstyle,extkeys,usstyle,sync,osc7,hyperlinks"],
+        "WezTerm" => &[BASE, "ccolour,cstyle,extkeys,focus,hyperlinks,margins,usstyle"],
+        "ghostty" => &[BASE, "ccolour,cstyle,extkeys,focus,margins,overline,hyperlinks,osc7,sync,usstyle,progressbar"],
+        "Rio" | "rio" => &[BASE, "ccolour,cstyle,focus,overline,hyperlinks,osc7,sync,usstyle,progressbar"],
+        _ => &[],
     }
 }
 
@@ -62,12 +83,27 @@ pub fn compute(term: &str, colorterm: &str, table: &[String], extra: &str) -> Fe
 }
 
 pub fn compute_named(term: &str, program: &str, colorterm: &str, table: &[String], extra: &str) -> Features {
+    // tmux order: -T, terminal-features, COLORTERM, then what the terminal is known to support;
+    // a `feature@` removal keeps the later additions out.
     let mut f = Features::default();
+    f.parse(extra, &[':', ',']);
+    for entry in table {
+        // the pattern is read like an override (`::` is a colon), the features split at `:`
+        let pat = override_tokens(entry).swap_remove(0);
+        let rest = entry.get(pat.len() + pat.matches(':').count() + 1..).unwrap_or("");
+        if !pat.is_empty() && fnmatch(&pat, term) && !rest.is_empty() {
+            f.parse(rest, &[':']);
+        }
+    }
+    if colorterm.eq_ignore_ascii_case("truecolor") || colorterm.eq_ignore_ascii_case("24bit") {
+        f.add("RGB");
+    } else if colorterm.contains("256") {
+        f.add("256");
+    }
     if term.is_empty() {
         // Windows console / Windows Terminal: a modern VT implementation
-        f.add("utf8,RGB,mouse,bpaste,title,ccolour,cstyle,focus,clipboard,strikethrough,sync,usstyle,overline,hyperlinks");
+        f.add("RGB,mouse,bpaste,title,ccolour,cstyle,focus,clipboard,strikethrough,sync,usstyle,overline,hyperlinks");
     } else if term != "dumb" {
-        f.add("utf8");
         if term != "linux" && !term.starts_with("vt1") {
             f.add("mouse,bpaste,strikethrough");
         }
@@ -78,20 +114,11 @@ pub fn compute_named(term: &str, program: &str, colorterm: &str, table: &[String
             f.add("RGB");
         }
     }
-    if matches!(colorterm, "truecolor" | "24bit") {
-        f.add("RGB");
+    let lower = term.to_ascii_lowercase();
+    let name = if lower.contains("wezterm") || program.eq_ignore_ascii_case("wezterm") { "WezTerm" } else if lower.contains("ghostty") { "ghostty" } else { program };
+    for list in default_features(name) {
+        f.add(list);
     }
-    if term.to_ascii_lowercase().contains("wezterm") || term.contains("ghostty") || matches!(program.to_ascii_lowercase().as_str(), "wezterm" | "ghostty") {
-        f.add("RGB,clipboard,cstyle,ccolour,extkeys,focus,margins,usstyle,hyperlinks,utf8");
-    }
-    for entry in table {
-        let mut parts = entry.splitn(2, ':');
-        let pat = parts.next().unwrap_or("");
-        if !pat.is_empty() && fnmatch(pat, term) {
-            f.add(parts.next().unwrap_or(""));
-        }
-    }
-    f.add(extra);
     f
 }
 
@@ -118,7 +145,7 @@ const ANSI16: [(u8, u8, u8); 16] = [
     (127, 127, 127), (255, 0, 0), (0, 255, 0), (255, 255, 0), (92, 92, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255),
 ];
 
-pub fn idx_to_rgb(i: u8) -> (u8, u8, u8) {
+fn idx_to_rgb(i: u8) -> (u8, u8, u8) {
     match i {
         0..=15 => ANSI16[i as usize],
         16..=231 => {
@@ -130,6 +157,19 @@ pub fn idx_to_rgb(i: u8) -> (u8, u8, u8) {
             let v = 8 + 10 * (i - 232);
             (v, v, v)
         }
+    }
+}
+
+/// colour_force_rgb with tmux's colour_256toRGB table; None for the default colour.
+pub fn colour_force_rgb(c: vt100::Color) -> Option<(u8, u8, u8)> {
+    const ANSI: [u32; 16] = [0x000000, 0x800000, 0x008000, 0x808000, 0x000080, 0x800080, 0x008080, 0xc0c0c0, 0x808080, 0xff0000, 0x00ff00, 0xffff00, 0x0000ff, 0xff00ff, 0x00ffff, 0xffffff];
+    const CUBE: [u8; 6] = [0x00, 0x5f, 0x87, 0xaf, 0xd7, 0xff];
+    match c {
+        vt100::Color::Rgb(r, g, b) => Some((r, g, b)),
+        vt100::Color::Idx(i @ 0..=15) => { let v = ANSI[i as usize]; Some(((v >> 16) as u8, (v >> 8) as u8, v as u8)) }
+        vt100::Color::Idx(i @ 16..=231) => { let i = i - 16; Some((CUBE[(i / 36) as usize], CUBE[(i / 6 % 6) as usize], CUBE[(i % 6) as usize])) }
+        vt100::Color::Idx(i) => { let v = 8 + 10 * (i - 232); Some((v, v, v)) }
+        vt100::Color::Default => None,
     }
 }
 
@@ -192,9 +232,10 @@ mod tests {
 pub fn overrides(term: &str, table: &[String], features: &mut Features) -> std::collections::BTreeMap<String, String> {
     let mut caps = terminfo_capabilities(term);
     for entry in table {
-        let mut parts = entry.split(':');
+        let parts = override_tokens(entry);
+        let mut parts = parts.iter().map(String::as_str);
         if !fnmatch(parts.next().unwrap_or(""), term) { continue; }
-        for cap in parts {
+        for cap in parts.filter(|c| !c.is_empty()) {
             let (name, value) = cap.split_once('=').map(|(n, v)| (n, v.to_string()))
                 .unwrap_or_else(|| (cap.trim_end_matches('@'), if cap.ends_with('@') { String::new() } else { "1".into() }));
             let feature = match name {
@@ -210,6 +251,18 @@ pub fn overrides(term: &str, table: &[String], features: &mut Features) -> std::
         }
     }
     caps
+}
+
+/// tty_term_override_next: split at `:`, where `::` is a literal colon.
+pub fn override_tokens(s: &str) -> Vec<String> {
+    let mut out = vec![String::new()];
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != ':' { out.last_mut().unwrap().push(c); }
+        else if chars.peek() == Some(&':') { chars.next(); out.last_mut().unwrap().push(':'); }
+        else { out.push(String::new()); }
+    }
+    out
 }
 
 fn decode_capability(s: &str) -> String {

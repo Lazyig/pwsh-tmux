@@ -1032,7 +1032,8 @@ impl Screen {
         let pos = self.grid().pos();
         let size = self.grid().size();
 
-        let width = self.widths.iter().rev().find(|(a, b, _)| (*a..=*b).contains(&(c as u32)))
+        // codepoint-widths never applies to 7-bit characters (tmux does not look them up)
+        let width = self.widths.iter().rev().find(|(a, b, _)| !c.is_ascii() && (*a..=*b).contains(&(c as u32)))
             .map(|(_, _, w)| *w as usize).or_else(|| c.width());
         if width.is_none() && (u32::from(c)) < 256 {
             // don't even try to draw control characters
@@ -1313,8 +1314,10 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                 .drawing_cell_mut(base_pos)
                 .unwrap()
                 .append(c);
-            if c == '\u{FE0F}' && screen.variation_wide {
-                screen.grid_mut().drawing_cell_mut(base_pos).unwrap().set_wide(true);
+            // VS16 makes a narrow base wide only with variation-selector-always-wide on
+            if c == '\u{FE0F}' {
+                let wide = screen.variation_wide || cell_was_wide;
+                screen.grid_mut().drawing_cell_mut(base_pos).unwrap().set_wide(wide);
             }
             let cell_is_wide =
                 screen.grid().drawing_cell(base_pos).unwrap().is_wide();

@@ -521,7 +521,8 @@ fn keys_config_and_capture() {
     ctx.ok(&["source-file", &conf.to_string_lossy()]);
     let _ = std::fs::remove_file(&conf);
     assert_eq!(ctx.fmt("k", "#{@conf} #{@cond}"), "loaded yes");
-    assert!(ctx.ok(&["list-keys", "-T", "root", "F5"]).contains("set -g @f5 pressed"));
+    // bindings are parsed when bound, so list-keys prints the canonical command
+    assert!(ctx.ok(&["list-keys", "-T", "root", "F5"]).contains("set-option -g @f5 pressed"));
     ctx.fails(&["source-file", "/no/such/file.conf"]);
     ctx.ok(&["source-file", "-q", "/no/such/file.conf"]);
     // #{current_file} and assignments used by the next lines, as theme plugins
@@ -974,14 +975,14 @@ fn list_keys_layout_format_and_order() {
     ctx.ok(&["bind-key", "-T", "mytab", "#", "display", "hash"]);
     ctx.ok(&["bind-key", "-N", "a note", "-T", "mytab", "\"", "display", "q"]);
     // tmux 3.8: padded table and key columns, keys in key-code order, quoted keys
-    assert_eq!(ctx.ok(&["list-keys", "-T", "mytab"]), "bind-key    -T mytab \\\" display q\nbind-key    -T mytab \\# display hash\nbind-key -r -T mytab x display hi\n");
-    assert_eq!(ctx.ok(&["lsk", "-T", "mytab", "-O", "name", "-r"]).lines().next(), Some("bind-key -r -T mytab x display hi"));
-    assert_eq!(ctx.ok(&["lsk", "-1", "-T", "mytab"]), "bind-key  -T mytab \\\" display q\n");
+    assert_eq!(ctx.ok(&["list-keys", "-T", "mytab"]), "bind-key    -T mytab \\\" display-message q\nbind-key    -T mytab \\# display-message hash\nbind-key -r -T mytab x display-message hi\n");
+    assert_eq!(ctx.ok(&["lsk", "-T", "mytab", "-O", "name", "-r"]).lines().next(), Some("bind-key -r -T mytab x display-message hi"));
+    assert_eq!(ctx.ok(&["lsk", "-1", "-T", "mytab"]), "bind-key  -T mytab \\\" display-message q\n");
     assert_eq!(
         ctx.ok(&["lsk", "-T", "mytab", "-F", "#{key_table}|#{key_string}|#{key_repeat}|#{key_note}|#{key_command}|#{key_string_width}|#{key_has_repeat}"]),
         "mytab|\"|0|a note|display q|1|1\nmytab|#|0||display hash|1|1\nmytab|x|1||display hi|1|1\n"
     );
-    assert_eq!(ctx.ok(&["lsk", "-T", "mytab", "x"]), "bind-key -r -T mytab x display hi\n");
+    assert_eq!(ctx.ok(&["lsk", "-T", "mytab", "x"]), "bind-key -r -T mytab x display-message hi\n");
     assert!(ctx.fails(&["lsk", "-T", "mytab", "y"]).contains("unknown key: y"));
     assert!(ctx.fails(&["lsk", "-T", "mytab", "zzz"]).contains("invalid key: zzz"));
     assert!(ctx.fails(&["lsk", "-T", "nosuch"]).contains("table nosuch doesn't exist"));

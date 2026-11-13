@@ -14,8 +14,13 @@ pub fn expand(cap: &str, args: &[&str]) -> Option<String> {
         if ch != '%' { if active { out.push(ch); } continue; }
         let op = chars.next()?;
         match op {
+            // (enclosing branch active, a branch of this %? already taken)
             '?' => branches.push((active, false)),
-            't' => { let b = branches.last_mut()?; b.1 = b.0 && number(stack.pop()?) != 0; active = b.0 && b.1; }
+            // A condition after a taken branch was never evaluated, so there is nothing to pop.
+            't' => {
+                let b = branches.last_mut()?;
+                if b.0 && !b.1 { b.1 = number(stack.pop()?) != 0; active = b.1; } else { active = false; }
+            }
             'e' => { let b = branches.last()?; active = b.0 && !b.1; }
             ';' => { active = branches.pop()?.0; }
             'p' => { let n = chars.next()?.to_digit(10)? as usize; if active { stack.push(params.get(n.checked_sub(1)?)?.clone()); } }
@@ -86,5 +91,20 @@ mod tests {
         assert_eq!(expand(cap, &["5"]).unwrap(), "high");
         assert_eq!(expand("%p1%Pa%ga%{2}%*%d", &["3"]).unwrap(), "6");
         assert!(expand("%p1%{0}%/%d", &["1"]).is_none());
+    }
+    #[test]
+    fn flat_else_if_chains() {
+        let cap = "%?%p1%{2}%<%tlow%e%p1%{4}%<%tmid%ehigh%;";
+        assert_eq!(expand(cap, &["1"]).unwrap(), "low");
+        assert_eq!(expand(cap, &["3"]).unwrap(), "mid");
+        assert_eq!(expand(cap, &["5"]).unwrap(), "high");
+        let setaf = "\x1b[%?%p1%{8}%<%t3%p1%d%e%p1%{16}%<%t9%p1%{8}%-%d%e38;5;%p1%d%;m";
+        assert_eq!(expand(setaf, &["1"]).unwrap(), "\x1b[31m");
+        assert_eq!(expand(setaf, &["9"]).unwrap(), "\x1b[91m");
+        assert_eq!(expand(setaf, &["100"]).unwrap(), "\x1b[38;5;100m");
+        assert_eq!(expand("%?%p1%{1}%=%tone%e%p1%{2}%=%ttwo%eother%;", &["1"]).unwrap(), "one");
+        // a nested %? inside a skipped branch
+        assert_eq!(expand("%?%p1%t%?%p2%tA%eB%;%eC%;", &["0", "1"]).unwrap(), "C");
+        assert_eq!(expand("%?%p1%t%?%p2%tA%eB%;%eC%;", &["1", "0"]).unwrap(), "B");
     }
 }

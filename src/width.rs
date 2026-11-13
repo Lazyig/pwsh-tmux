@@ -10,7 +10,9 @@ impl Drop for Guard { fn drop(&mut self) { RULES.with(|r| *r.borrow_mut() = std:
 pub fn enter(ranges: Vec<(u32, u32, u16)>, variation: bool) -> Guard {
     Guard(RULES.with(|r| r.replace((ranges, variation))))
 }
+/// codepoint-widths applies to UTF-8 characters only: tmux handles 7-bit characters directly.
 pub fn char_width(ch: char) -> Option<usize> {
+    if ch.is_ascii() { return ch.width(); }
     RULES.with(|r| r.borrow().0.iter().rev().find(|(a, b, _)| (*a..=*b).contains(&(ch as u32))).map(|(_, _, w)| *w as usize))
         .or_else(|| ch.width())
 }

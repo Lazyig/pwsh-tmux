@@ -1339,7 +1339,8 @@ impl Server {
                 let fmt = o.get('F').unwrap_or("#{client_name}: #{session_name} [#{client_width}x#{client_height} #{client_termname}] #{?#{!=:#{client_uid},#{uid}},[user #{?client_user,#{client_user},#{client_uid},}] ,}#{?client_flags,(,}#{client_flags}#{?client_flags,),}");
                 let crit = sort::Criteria::from_args(o.get('O'), o.has('r'))?;
                 let only = t.map(|t| self.find_session(ctx, t)).transpose()?;
-                let mut cids: Vec<ClientId> = self.clients.values().filter(|c| c.attached).map(|c| c.id).collect();
+                // sort_get_clients skips CLIENT_UNATTACHEDFLAGS (suspended or locked clients)
+                let mut cids: Vec<ClientId> = self.clients.values().filter(|c| c.attached && !c.suspended).map(|c| c.id).collect();
                 crit.sort(&mut cids, |a, b, order| {
                     let (a, b) = (&self.clients[a], &self.clients[b]);
                     match order {
@@ -1376,6 +1377,7 @@ impl Server {
             "suspend-client" => {
                 let cid = self.resolve_client(ctx, t)?;
                 if let Some(c) = self.clients.get_mut(&cid) {
+                    c.tty_stop();
                     c.suspended = true;
                     c.send(S_SUSPEND, b"");
                 }
@@ -2619,11 +2621,13 @@ impl Server {
                 };
                 let prompts: Vec<(String, String)> = labels.into_iter().enumerate().map(|(i, l)| (l, inits.get(i).cloned().unwrap_or_default())).collect();
                 let kind = if o.has('k') { PromptKind::Key } else { PromptKind::Command };
+                let history_type = match o.get('T') { Some(ty) => input::prompt_type(ty).ok_or_else(|| format!("unknown type: {ty}"))?, None => 0 };
                 self.open_prompt(cid, kind, prompts, template, ctx.pane, o.has('N'), o.has('1'));
                 // -e: backspace on empty input closes the prompt; -C (keep updating panes) is
                 // how prompts behave here anyway
                 if let Some(pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
                     pr.bspace_exit = o.has('e') && !o.has('1') && !o.has('N') && !o.has('i') && !o.has('k');
+                    pr.history_type = history_type;
                 }
                 Ok(Flow::Next)
             }
@@ -2703,14 +2707,15 @@ impl Server {
                 }
                 Ok(Flow::Next)
             }
-            "clear-prompt-history" => {
-                self.prompt_history.clear();
-                self.save_prompt_history();
-                Ok(Flow::Next)
-            }
-            "show-prompt-history" => {
-                for h in &self.prompt_history {
-                    ctx.out.push_str(h);
+            "clear-prompt-history" | "show-prompt-history" => {
+                let types: Vec<usize> = match o.get('T') {
+                    Some(t) => vec![input::prompt_type(t).ok_or_else(|| format!("invalid type: {t}"))?],
+                    None => (0..input::PROMPT_TYPES.len()).collect(),
+                };
+                for ty in types {
+                    if cmd == "clear-prompt-history" { self.prompt_history[ty].clear(); continue; }
+                    ctx.out.push_str(&format!("History for {}:\n\n", input::PROMPT_TYPES[ty]));
+                    for (i, h) in self.prompt_history[ty].iter().enumerate() { ctx.out.push_str(&format!("{}: {h}\n", i + 1)); }
                     ctx.out.push('\n');
                 }
                 Ok(Flow::Next)
@@ -2722,12 +2727,20 @@ impl Server {
                     return err("bind-key needs a key");
                 }
                 let key = args.remove(0);
-                let kname = keys::parse_key_name(&key).map(|k| keys::key_name(&k)).unwrap_or(key.clone());
+                let parsed = keys::parse_key_name(&key);
+                // key_string_lookup_string: UserN beyond KEYC_NUSER and unknown names fail
+                if parsed.is_none() && (key.contains("User") || sort::key_code(&key) == u64::MAX >> 8) {
+                    return err(format!("unknown key: {key}"));
+                }
+                let kname = parsed.map(|k| keys::key_name(&k)).unwrap_or(key.clone());
                 let table = if o.has('n') { "root".to_string() } else { o.get('T').unwrap_or("prefix").to_string() };
                 let command = if args.len() == 1 { args[0].clone() } else { args.iter().map(|a| if a == ";" { "\\;".into() } else { cmdparse::quote(a) }).collect::<Vec<_>>().join(" ") };
                 if command.is_empty() {
                     return err("bind-key needs a command");
                 }
+                // tmux parses the command when binding: aliases expand now and unknown commands
+                // or flags are rejected; list-keys prints the parsed list
+                let command = command_list_string(&command, &self.command_aliases())?;
                 self.bindings.entry(table).or_default().insert(kname, Binding { cmd: command, repeat: o.has('r'), note: o.get('N').unwrap_or("").to_string() });
                 Ok(Flow::Next)
             }
@@ -2859,7 +2872,7 @@ impl Server {
                     let name = self.opt_session(tt.sid, if o.has('2') { "prefix2" } else { "prefix" });
                     if let Some(k) = keys::parse_key_name(&name) {
                         let app = self.panes.get(&pane).is_some_and(|p| p.screen().application_cursor());
-                        self.panes[&pane].send(self.encode_pane_key(pane, &k, keys::encode_key(&k, app)));
+                        if let Some(bytes) = self.encode_pane_key(pane, &k, keys::encode_key(&k, app)) { self.panes[&pane].send(bytes); }
                     }
                     return Ok(Flow::Next);
                 }
@@ -2911,7 +2924,8 @@ impl Server {
                         continue;
                     }
                     match keys::parse_key_name(&k) {
-                        Some(key) if k.chars().count() > 1 || k == " " => data.extend(self.encode_pane_key(pane, &key, keys::encode_key(&key, app))),
+                        // a key the pane cannot represent goes as its name (window_pane_key failed)
+                        Some(key) if k.chars().count() > 1 || k == " " => data.extend(self.encode_pane_key(pane, &key, keys::encode_key(&key, app)).unwrap_or_else(|| k.as_bytes().to_vec())),
                         _ => data.extend(k.as_bytes()),
                     }
                 }
@@ -2946,10 +2960,9 @@ impl Server {
                     return Ok(Flow::Next);
                 }
                 let data = o.rest.first().ok_or("no data specified")?.clone();
+                // tty_set_selection on the target client (CMD_CLIENT_CANFAIL), clip ""
                 if o.has('w') {
-                    if let Some(c) = ctx.client.and_then(|c| self.clients.get(&c)) {
-                        c.send(S_OUTPUT, format!("\x1b]52;c;{}\x07", base64(data.as_bytes())).as_bytes());
-                    }
+                    if let Ok(cid) = self.resolve_client(ctx, o.get('t')) { self.set_selection(cid, "", data.as_bytes()); }
                 }
                 self.add_buffer(name, data.into_bytes(), o.has('a'));
                 Ok(Flow::Next)
@@ -3024,9 +3037,7 @@ impl Server {
                     std::fs::read(&p).map_err(|e| format!("{p}: {e}"))?
                 };
                 if o.has('w') {
-                    if let Some(c) = ctx.client.and_then(|c| self.clients.get(&c)) {
-                        c.send(S_OUTPUT, format!("\x1b]52;c;{}\x07", base64(&data)).as_bytes());
-                    }
+                    if let Ok(cid) = self.resolve_client(ctx, o.get('t')) { self.set_selection(cid, "", &data); }
                 }
                 self.add_buffer(o.get('b').map(String::from), data, false);
                 Ok(Flow::Next)
@@ -3697,7 +3708,6 @@ impl Server {
             store.set(&name, v);
         }
         // side effects
-        if name.starts_with("terminal-features") || name.starts_with("terminal-overrides") { self.refresh_terminal_features(); }
         match name.as_str() {
             "status" | "status-position" | "pane-border-status" | "window-size" => {
                 let sids: Vec<SessId> = self.sessions.keys().copied().collect();
@@ -3917,7 +3927,7 @@ impl Server {
         let input: Vec<char> = init.chars().collect();
         let cursor = input.len();
         if let Some(c) = self.clients.get_mut(&cid) {
-            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, command_mode: false, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false, confirm: ('y', false) });
+            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, history_type: 0, command_mode: false, copied: None, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false, confirm: ('y', false) });
             c.dirty = true;
         }
     }

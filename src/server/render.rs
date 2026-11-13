@@ -8,6 +8,20 @@ use crate::format::{self, Span};
 use std::fmt::Write as _;
 use crate::width::char_width;
 
+/// tty_check_codeset for a client without UTF-8: line drawing goes through the ACS charset and
+/// anything else becomes one underscore per column.
+fn non_utf8_text(text: &str) -> String {
+    const ACS: &[(char, u8)] = &[('\u{b7}', b'~'), ('\u{2500}', b'q'), ('\u{2501}', b'q'), ('\u{2502}', b'x'), ('\u{2503}', b'x'), ('\u{250c}', b'l'), ('\u{250f}', b'k'), ('\u{2510}', b'k'), ('\u{2513}', b'l'), ('\u{2514}', b'm'), ('\u{2517}', b'm'), ('\u{2518}', b'j'), ('\u{251b}', b'j'), ('\u{251c}', b't'), ('\u{2523}', b't'), ('\u{2524}', b'u'), ('\u{252b}', b'u'), ('\u{2533}', b'w'), ('\u{2534}', b'v'), ('\u{253b}', b'v'), ('\u{253c}', b'n'), ('\u{254b}', b'n'), ('\u{2550}', b'q'), ('\u{2551}', b'x'), ('\u{2554}', b'l'), ('\u{2557}', b'k'), ('\u{255a}', b'm'), ('\u{255d}', b'j'), ('\u{2560}', b't'), ('\u{2563}', b'u'), ('\u{2566}', b'w'), ('\u{2569}', b'v'), ('\u{256c}', b'n')];
+    let mut chars = text.chars();
+    if let (Some(ch), None) = (chars.next(), chars.next()) {
+        if let Some((_, acs)) = ACS.iter().find(|(c, _)| *c == ch) {
+            return format!("\x1b(0{}\x1b(B", *acs as char);
+        }
+    }
+    let width = text.chars().filter_map(char_width).sum::<usize>().clamp(1, 2);
+    "_".repeat(width)
+}
+
 // ConPTY counts decomposed accents as extra columns. Compose when Windows can do
 // so, and retain the original text if the platform cannot normalize it.
 fn terminal_text(text: &str) -> std::borrow::Cow<'_, str> {
@@ -461,7 +475,8 @@ impl Server {
                         modes.cursor_style = scr.cursor_style() as u8;
                         if modes.cursor_style == 0 { modes.cursor_style = features::cursor_style(&self.opt_pane(*id, "cursor-style")); }
                         let colour = p.parser.callbacks().osc.cursor_colour.clone().unwrap_or_else(|| self.opt_pane(*id, "cursor-colour"));
-                        modes.cursor_colour = format::parse_color(&self.expand(pane_target, Some(cid), &colour)).filter(|c| *c != vt100::Color::Default);
+                        // a colour option, not a format (OPTIONS_TABLE_IS_COLOUR)
+                        modes.cursor_colour = format::parse_color(&colour).filter(|c| *c != vt100::Color::Default);
                         if !scr.hide_cursor() {
                             let (cy, cx) = scr.cursor_position();
                             if cx < cr.w && cy < cr.h {
@@ -708,7 +723,7 @@ impl Server {
             let command = pr.command_mode;
             let prefix = if command { "prompt-command-cursor" } else { "prompt-cursor" };
             modes.cursor_style = features::cursor_style(&self.opt_session(Some(sid), &format!("{prefix}-style")));
-            modes.cursor_colour = format::parse_color(&self.expand(active_target, Some(cid), &self.opt_session(Some(sid), &format!("{prefix}-colour")))).filter(|c| *c != vt100::Color::Default);
+            modes.cursor_colour = format::parse_color(&self.opt_session(Some(sid), &format!("{prefix}-colour"))).filter(|c| *c != vt100::Color::Default);
         }
         modes.appesc = c.features.has("appesc");
         if self.opt_session_on(Some(sid), "mouse") && self.opt_session_on(Some(sid), "focus-follows-mouse") { modes.mouse = 1003; }
@@ -782,8 +797,8 @@ impl Server {
                     push_sgr(&mut out, &fit_style(cell.style, &feats));
                     cur = Some(cell.style);
                 }
-                if feats.has("utf8") { out.push_str(&terminal_text(&cell.text)); }
-                else { for ch in cell.text.chars() { if ch.is_ascii() { out.push(ch); } else if char_width(ch).unwrap_or(0) > 0 { out.push('_'); if char_width(ch) == Some(2) { out.push('_'); } } } }
+                if c.utf8() || cell.text.is_ascii() { out.push_str(&terminal_text(&cell.text)); }
+                else { out.push_str(&non_utf8_text(&cell.text)); }
                 if cfg!(windows) && cell.text.chars().any(|c| char_width(c) == Some(0)) {
                     let width = cell.text.chars().filter_map(|c| char_width(c)).sum::<usize>();
                     if x + width < next.frame.w as usize { let _ = write!(out, "\x1b[{};{}H", y + 1, x + width + 1); }
@@ -822,17 +837,21 @@ impl Server {
                 _ => "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h",
             });
             out.push_str(&features::string_capability(&c.term_caps, if m.focus { "Enfcs" } else { "Dsfcs" }, if m.focus { "\x1b[?1004h" } else { "\x1b[?1004l" }, &[]));
-            if feats.has("cstyle") {
-                out.push_str(&features::cursor_sequence(&c.term_caps, m.cursor_style));
-            }
-            if feats.has("ccolour") && pm.and_then(|p| p.cursor_colour) != m.cursor_colour {
-                match m.cursor_colour {
-                    Some(colour) => {
-                        let (r, g, b) = match colour { vt100::Color::Rgb(r, g, b) => (r, g, b), vt100::Color::Idx(i) => features::idx_to_rgb(i), _ => unreachable!() };
-                        out.push_str(&features::string_capability(&c.term_caps, "Cs", "\x1b]12;%p1%s\x07", &[&format!("#{r:02x}{g:02x}{b:02x}")]));
-                    }
-                    _ => out.push_str(&features::string_capability(&c.term_caps, "Cr", "\x1b]112\x07", &[])),
+            // tty_force_cursor_colour: Cs with rgb:RR/GG/BB (colour_force_rgb), Cr back to the
+            // default, each only when the colour the terminal has changes
+            let colour = m.cursor_colour.and_then(features::colour_force_rgb);
+            if feats.has("ccolour") && colour != c.input_state.tty_ccolour {
+                match colour {
+                    Some((r, g, b)) => out.push_str(&features::string_capability(&c.term_caps, "Cs", "\x1b]12;%p1%s\x07", &[&format!("rgb:{r:02x}/{g:02x}/{b:02x}")])),
+                    None => out.push_str(&features::string_capability(&c.term_caps, "Cr", "\x1b]112\x07", &[])),
                 }
+                c.input_state.tty_ccolour = colour;
+            }
+            // tty_update_cursor: the style when it changes, and a set style again on a full
+            // redraw (tty_invalidate resets the cursor modes)
+            if feats.has("cstyle") && (m.cursor_style != c.input_state.tty_cstyle || (pm.is_none() && m.cursor_style != 0)) {
+                out.push_str(&features::cursor_sequence(&c.term_caps, m.cursor_style));
+                c.input_state.tty_cstyle = m.cursor_style;
             }
             if pm.is_none_or(|p| p.appesc != m.appesc) && (m.appesc || pm.is_some_and(|p| p.appesc)) { out.push_str(&features::string_capability(&c.term_caps, if m.appesc { "Enesc" } else { "Dsesc" }, if m.appesc { "\x1b[?7727h" } else { "\x1b[?7727l" }, &[])); }
             if pm.map_or(0, |p| p.extkeys) != m.extkeys {

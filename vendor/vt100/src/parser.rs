@@ -62,7 +62,7 @@ impl<CB: crate::Callbacks> Parser<CB> {
         Self {
             parser: vte::Parser::new(),
             string: alloc::vec::Vec::new(), string_kind: None, string_overflow: false,
-            escape: false, string_escapes: 0, input_limit: 1048576,
+            escape: false, string_escapes: 0, input_limit: 1048575,
             screen: crate::screen::WrappedScreen { screen, callbacks },
         }
     }
@@ -76,12 +76,14 @@ impl<CB: crate::Callbacks> Parser<CB> {
             if let Some(kind) = self.string_kind {
                 let end = (kind == b']' && b == 7) || (b == b'\\' && self.string_escapes % 2 == 1);
                 let cancel = b == 0x18 || b == 0x1a;
+                let cap = self.input_limit;
                 if !self.string_overflow {
-                    if self.string.len() >= self.input_limit { self.string.clear(); self.string_overflow = true; }
+                    if self.string.len() >= cap + 2 { self.string.clear(); self.string_overflow = true; }
                     else { self.string.push(b); }
                 }
                 if end || cancel {
-                    if !self.string_overflow && !cancel {
+                    let payload = self.string.len().saturating_sub(if b == 7 { 1 } else { 2 });
+                    if !self.string_overflow && !cancel && payload <= cap {
                         if kind == b'P' {
                             let len = self.string.len().saturating_sub(2);
                             self.screen.callbacks.dcs(&mut self.screen.screen, &self.string[..len]);
@@ -104,8 +106,14 @@ impl<CB: crate::Callbacks> Parser<CB> {
         }
     }
 
-    /// Maximum bytes in a terminal control string before discarding it.
-    pub fn set_input_buffer_size(&mut self, limit: usize) { self.input_limit = limit; }
+    /// input-buffer-size: tmux grows its string buffer from 32 bytes by doubling and discards
+    /// the string once the doubled size passes the limit, so the longest string kept is a power
+    /// of two less one.
+    pub fn set_input_buffer_size(&mut self, limit: usize) {
+        let mut space = 32usize;
+        while space.saturating_mul(2) <= limit { space *= 2; }
+        self.input_limit = space - 1;
+    }
 
     /// Resizes the terminal.
     ///

@@ -260,13 +260,25 @@ impl Parser {
             if self.buf.is_empty() {
                 break;
             }
-            if let Some((n, seq)) = self.user_keys.iter().find(|(_, v)| self.buf.starts_with(v)) {
-                let (n, len) = (*n, seq.len());
-                out.push(Input::Key(Key::plain(KeyCode::User(n)), self.buf.drain(..len).collect()));
-                continue;
+            // User keys share tmux's key tree with the built-in sequences: wait while a longer
+            // user key may still match, and the longest complete match wins (a user key wins ties
+            // because tty_keys_build adds user keys last).
+            if !force && self.user_keys.iter().any(|(_, v)| v.len() > self.buf.len() && v.starts_with(&self.buf)) { break; }
+            let user = self.user_keys.iter().filter(|(_, v)| self.buf.starts_with(v)).max_by_key(|(_, v)| v.len()).map(|(n, v)| (*n, v.len()));
+            let parsed = parse_one(&self.buf, force);
+            if let Some((n, len)) = user {
+                let builtin = match &parsed {
+                    Res::Done(Tok::In(Input::Key(..)), m) => *m > len,
+                    Res::Done(Tok::In(Input::Unknown(_)), _) => false,
+                    // a partial built-in sequence waits for escape-time like tmux's partial key
+                    Res::Incomplete | Res::Done(_, _) => true,
+                };
+                if !builtin {
+                    out.push(Input::Key(Key::plain(KeyCode::User(n)), self.buf.drain(..len).collect()));
+                    continue;
+                }
             }
-            if !force && self.user_keys.iter().any(|(_, v)| v.starts_with(&self.buf)) { break; }
-            match parse_one(&self.buf, force) {
+            match parsed {
                 Res::Incomplete => break,
                 Res::Done(tok, n) => {
                     self.buf.drain(..n);
@@ -382,7 +394,9 @@ fn parse_esc(buf: &[u8], force: bool) -> Res {
             Csi::Incomplete if !force => Res::Incomplete,
             Csi::Incomplete | Csi::Invalid => meta_fallback(buf),
         },
-        b']' => {
+        // Only an OSC 52 reply is held back (tty_keys_clipboard); any other ESC ] is M-].
+        b']' if !force && buf.len() < 5 && b"\x1b]52;".starts_with(buf) => Res::Incomplete,
+        b']' if buf.starts_with(b"\x1b]52;") => {
             let end = buf.iter().position(|b| *b == 7).map(|n| n + 1)
                 .or_else(|| find(buf, b"\x1b\\").map(|n| n + 2));
             match end {
@@ -848,11 +862,15 @@ pub fn parse_key_name(s: &str) -> Option<Key> {
 }
 
 fn lookup_name(name: &str) -> Option<KeyCode> {
-    if let Some(n) = name.strip_prefix("User").and_then(|s| s.parse::<u16>().ok()).filter(|n| *n < 1000) {
-        return Some(KeyCode::User(n));
-    }
     if let Some((_, c)) = NAMES.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
         return Some(c.clone());
+    }
+    // sscanf(string, "User%u") <= KEYC_NUSER: case-sensitive, trailing text ignored.
+    if let Some(rest) = name.strip_prefix("User") {
+        let rest = rest.trim_start().strip_prefix('+').unwrap_or(rest.trim_start());
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let n = rest[..digits].bytes().fold(0u64, |n, d| n.saturating_mul(10).saturating_add(u64::from(d - b'0')));
+        if digits > 0 && n <= 1000 { return Some(KeyCode::User(n as u16)); }
     }
     let b = name.as_bytes();
     if b.len() >= 2 && (b[0] == b'F' || b[0] == b'f') {
@@ -938,11 +956,9 @@ pub fn encode_extended(k: &Key, all: bool, csi_u: bool) -> Option<Vec<u8>> {
         // arrows, F-keys, paging keys already carry modifiers (CSI 1;N X)
         _ => return None,
     };
-    let lossy = match k.code {
-        // C-letter and M-anything encode fine; C-S-letter, C-digit, C-punctuation don't
-        KeyCode::Char(c) => (m.ctrl && (m.shift || !(c.is_ascii_alphabetic() || "[\\]^_@ ".contains(c)))) || (m.shift && !m.ctrl && !m.meta),
-        _ => m.ctrl || m.shift,
-    };
+    // input_key_mode1: Meta without Ctrl, and Ctrl with Space, '/', '2'-'8' or '@'-'~', keep
+    // their standard form; everything else is reported extended.
+    let lossy = if m.ctrl { !matches!(code, 32 | 47 | 50..=56 | 64..=126) } else { !m.meta };
     if !lossy && !all {
         return None;
     }
@@ -2261,7 +2277,7 @@ mod compatibility_input_tests {
         assert_eq!(parser.feed(b"7~"), vec![Input::Key(Key::plain(KeyCode::User(7)), b"\x1b[77~".to_vec())]);
         assert_eq!(parse_key_name("User7"), Some(Key::plain(KeyCode::User(7))));
         assert_eq!(key_name(&Key::plain(KeyCode::User(7))), "User7");
-        assert!(parse_key_name("User1000").is_none());
+        assert!(parse_key_name("User1001").is_none());
         parser.set_user_keys(vec![]);
         assert!(matches!(&parser.feed(b"\x1b[77~")[0], Input::Unknown(_)));
     }

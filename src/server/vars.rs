@@ -626,7 +626,7 @@ impl Vars for VarCtx<'_> {
             "client_user" => client.and_then(|c| c.user.as_ref()).map(|u| ipc::user_name_for_id(u)),
             "client_created" => client.map(|c| c.created.to_string()),
             "client_activity" => client.map(|c| c.activity.to_string()),
-            "client_utf8" => Some("1".into()),
+            "client_utf8" => Some(client.map_or("1", |c| if c.utf8() { "1" } else { "0" }).into()),
             "client_control_mode" => client.map(|c| b(c.control > 0)),
             "client_written" => client.map(|c| c.io.written.load(std::sync::atomic::Ordering::Relaxed).to_string()),
             "client_discarded" => client.map(|c| c.io.discarded.load(std::sync::atomic::Ordering::Relaxed).to_string()),

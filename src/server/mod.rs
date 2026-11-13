@@ -91,6 +91,8 @@ pub struct PaneCb {
     /// modifyOtherKeys level the application asked for (CSI > 4 ; n m).
     pub ext_keys: u8,
     pub clipboard_queries: Vec<(Vec<u8>, bool)>,
+    /// OSC 52 selections set by the application (selector, base64 data).
+    pub clipboard_sets: Vec<(Vec<u8>, Vec<u8>)>,
     pub passthrough: Vec<Vec<u8>>,
     /// State reported for formats (pane_path, cursor_colour, pane_pb_*, pane_command_*).
     pub osc: OscState,
@@ -263,6 +265,9 @@ fn decode_file_url(url: &str) -> Option<String> {
 impl vt100::Callbacks for PaneCb {
     fn clipboard_query(&mut self, _: &mut vt100::Screen, ty: &[u8], bel: bool) {
         self.clipboard_queries.push((ty.to_vec(), bel));
+    }
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
+        if self.clipboard_sets.len() < 16 { self.clipboard_sets.push((ty.to_vec(), data.to_vec())); }
     }
     fn dcs(&mut self, _: &mut vt100::Screen, payload: &[u8]) {
         if let Some(payload) = payload.strip_prefix(b"tmux;") {
@@ -510,6 +515,8 @@ pub struct Identity {
     pub term: String,
     pub pid: u32,
     pub ctx_pane: Option<PaneId>,
+    /// CLIENT_UTF8 as decided by the client (-u, locale or $TMUX)
+    pub utf8: bool,
     pub env: Vec<(String, String)>,
 }
 
@@ -528,7 +535,12 @@ pub struct Prompt {
     pub cursor: usize,
     pub template: String,
     pub history_pos: Option<usize>,
+    /// The history this prompt reads and adds to (command-prompt -T).
+    pub history_type: usize,
+    /// vi command mode (status-keys vi after Escape).
     pub command_mode: bool,
+    /// Text cut with C-w, pasted again by C-y.
+    pub copied: Option<Vec<char>>,
     pub pane: Option<PaneId>,
     pub numeric: bool,
     pub single_key: bool,
@@ -642,6 +654,12 @@ pub fn now_ms() -> u64 {
 }
 
 impl Client {
+    /// CLIENT_UTF8: set by the client, or by applying the utf8 terminal feature (never cleared
+    /// by utf8@).
+    pub fn utf8(&self) -> bool {
+        self.ident.as_ref().is_none_or(|i| i.utf8) || self.features.has("utf8")
+    }
+
     pub fn is_readonly(&self) -> bool {
         self.readonly || self.acl_readonly
     }
@@ -691,6 +709,10 @@ impl Client {
                 self.ctl.exiting.set(true);
                 return;
             }
+        }
+        if self.control == 0 && self.attached {
+            let reset = self.tty_stop_sequence();
+            if !reset.is_empty() { self.send(S_OUTPUT, reset.as_bytes()); }
         }
         self.send(S_EXIT, msg.as_bytes());
     }
@@ -783,7 +805,8 @@ pub struct Server {
     pub buffer_seq: u32,
     pub bindings: BTreeMap<String, BTreeMap<String, Binding>>,
     pub messages: VecDeque<(u64, String)>,
-    pub prompt_history: Vec<String>,
+    /// Prompt history per type (command, search).
+    pub prompt_history: [Vec<String>; 2],
     pub jobs: HashMap<u32, Parked>,
     pub waits: HashMap<String, (bool, Vec<Queue>)>,
     /// wait-for channels signalled while nobody waited (the next wait returns at once).
@@ -893,6 +916,7 @@ pub fn run(config: Option<String>) -> io::Result<()> {
         }
     }
     srv.shutdown();
+    srv.save_prompt_history();
     ipc::cleanup();
     log("server exiting");
     Ok(())
@@ -923,7 +947,7 @@ impl Server {
             buffer_seq: 0,
             bindings: input::default_bindings(),
             messages: VecDeque::new(),
-            prompt_history: Vec::new(),
+            prompt_history: Default::default(),
             jobs: HashMap::new(),
             waits: HashMap::new(),
             waits_woken: Default::default(),
@@ -1319,7 +1343,8 @@ impl Server {
                     term: get(4),
                     pid: get(5).parse().unwrap_or(0),
                     ctx_pane: get(6).strip_prefix('%').and_then(|s| s.parse().ok()),
-                    env: a.iter().skip(9).filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect(),
+                    utf8: get(9) != "0",
+                    env: a.iter().skip(10).filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect(),
                 };
                 let control = get(7).parse().unwrap_or(0);
                 let colorterm = ident.env.iter().find(|(k, _)| k == "COLORTERM").map(|(_, v)| v.as_str()).unwrap_or("");
@@ -1329,7 +1354,6 @@ impl Server {
                 let table = self.opts_server.array_items("terminal-overrides").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
                 let caps = features::overrides(&ident.term, &table, &mut features);
                 if let Some(c) = self.clients.get_mut(&cid) {
-                    c.input_state.terminal_extra = get(8);
                     c.term_caps = caps;
                     c.control = control;
                     c.features = features;
@@ -1433,13 +1457,14 @@ impl Server {
         let bell = std::mem::take(&mut cb.bell);
         let title = cb.title.take();
         let queries = std::mem::take(&mut cb.clipboard_queries);
+        let sets = std::mem::take(&mut cb.clipboard_sets);
         let passthrough = std::mem::take(&mut cb.passthrough);
         if let Some(cwd) = cb.cwd.take() {
             p.current_path = cwd;
             p.cwd_seq += 1;
         }
         p.send(replies);
-        self.pane_input_requests(id, queries, passthrough);
+        self.pane_input_requests(id, queries, sets, passthrough);
         if let Some(t) = title.filter(|_| options::is_on(&self.opt_pane(id, "allow-set-title"))) {
             self.panes.get_mut(&id).unwrap().title = t.clone();
             if options::is_on(&self.opt_pane(id, "allow-rename")) {
