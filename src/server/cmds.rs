@@ -638,7 +638,7 @@ impl Server {
             match order {
                 sort::Order::Index => a.id.cmp(&b.id),
                 sort::Order::Creation => (a.created, a.id).cmp(&(b.created, b.id)),
-                sort::Order::Activity => b.activity.cmp(&a.activity),
+                sort::Order::Activity => b.activity_us.cmp(&a.activity_us),
                 sort::Order::Name => a.name.cmp(&b.name),
                 _ => Ordering::Equal,
             }
@@ -654,7 +654,7 @@ impl Server {
             match order {
                 sort::Order::Index => a.1.cmp(&b.1),
                 sort::Order::Creation => (wa.created, wa.id).cmp(&(wb.created, wb.id)),
-                sort::Order::Activity => wb.activity.cmp(&wa.activity),
+                sort::Order::Activity => wb.activity_us.cmp(&wa.activity_us),
                 sort::Order::Name => wa.name.cmp(&wb.name),
                 sort::Order::Size => (wa.sx as u32 * wa.sy as u32).cmp(&(wb.sx as u32 * wb.sy as u32)),
                 _ => Ordering::Equal,
@@ -751,6 +751,7 @@ impl Server {
                 old_layout: None,
                 created: now,
                 activity: now,
+                activity_us: now_us(),
                 sx,
                 sy,
             },
@@ -836,6 +837,7 @@ impl Server {
                 hooks: BTreeMap::new(),
                 created: now,
                 activity: now,
+                activity_us: now_us(),
                 last_attached: 0,
                 alerts: BTreeMap::new(),
                 group: None,
@@ -876,6 +878,7 @@ impl Server {
         }
         s.alerts.remove(&idx);
         s.activity = now_secs();
+        s.activity_us = now_us();
         self.mark_session_dirty(sid);
         self.run_hook(Some(sid), "session-window-changed", Ctx::default());
     }
@@ -3562,6 +3565,7 @@ impl Server {
             hooks: BTreeMap::new(),
             created: now,
             activity: now,
+            activity_us: now_us(),
             last_attached: 0,
             alerts: BTreeMap::new(),
             group: Some(gid),

@@ -54,6 +54,11 @@ pub fn now_secs() -> u64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// Microseconds since the epoch, for activity times tmux keeps as a timeval.
+pub fn now_us() -> u64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(0)
+}
+
 pub enum Event {
     Conn(Stream),
     ClientMsg(ClientId, u8, Vec<u8>),
@@ -485,6 +490,8 @@ pub struct Window {
     pub old_layout: Option<String>,
     pub created: u64,
     pub activity: u64,
+    /// activity_time to the microsecond (sort orders).
+    pub activity_us: u64,
     /// Width/height the window is laid out at (follows the attached session size).
     pub sx: u16,
     pub sy: u16,
@@ -529,6 +536,8 @@ pub struct Session {
     pub hooks: BTreeMap<String, Vec<String>>,
     pub created: u64,
     pub activity: u64,
+    /// activity_time to the microsecond (sort orders).
+    pub activity_us: u64,
     pub last_attached: u64,
     pub alerts: BTreeMap<u32, u8>,
     /// Session group (new-session -t): members share one window list.
@@ -1476,6 +1485,7 @@ impl Server {
         };
         if let Some(w) = self.windows.get_mut(&wid) {
             w.activity = now_secs();
+            w.activity_us = now_us();
         }
         if bell && self.opt_window_on(Some(wid), "monitor-bell") {
             self.alert(wid, ALERT_BELL);
@@ -2247,6 +2257,7 @@ impl Server {
         if let Some(s) = self.sessions.get_mut(&sid) {
             s.last_attached = now;
             s.activity = now;
+            s.activity_us = now_us();
             for n in names.iter().filter(|_| writable) {
                 match env.iter().find(|(k, _)| k == n) {
                     Some((_, v)) => {

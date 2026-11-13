@@ -293,3 +293,26 @@ fn menus_belong_to_the_window_and_do_not_block() {
     assert!(ctx.fails(&["display-menu", "-c", &c1, "-b", "bogus", "a", "a", ""]).contains("menu-border-lines unknown value: bogus"));
     assert!(ctx.fails(&["display-menu", "-c", &c1, "-C", "9x", "a", "a", ""]).contains("starting choice invalid"));
 }
+
+#[test]
+fn choose_buffer_and_tree_sort_like_sort_c() {
+    let ctx = Ctx::new("mode-sort");
+    let t = start(&ctx, "so");
+    ctx.ok(&["setb", "-b", "zz", "short"]);
+    ctx.ok(&["setb", "-b", "aa", "a much longer buffer"]);
+    ctx.ok(&["setb", "-b", "mm", "mid size"]);
+    let order = |s: &str| -> Vec<String> { s.lines().filter_map(|l| l.split(") ").nth(1)).filter_map(|r| r.split(':').next()).map(String::from).take(3).collect() };
+    for (o, want) in [("size", ["zz", "mm", "aa"]), ("index", ["aa", "mm", "zz"]), ("order", ["mm", "aa", "zz"]), ("creation", ["mm", "aa", "zz"])] {
+        ctx.ok(&["choose-buffer", "-O", o, "-N", "-t", "so"]);
+        t.wait_screen(o, |s| order(s) == want);
+        t.send(b"q");
+        wait_for("left", || ctx.fmt("so", "#{pane_in_mode}") == "0");
+    }
+    // tree mode keeps -O creation, size, order and modifier
+    for o in ["creation", "size", "order", "modifier"] {
+        ctx.ok(&["choose-tree", "-O", o, "-t", "so"]);
+        t.wait_screen(o, |s| s.contains(&format!("(sort: {o})")));
+        t.send(b"q");
+        wait_for("left", || ctx.fmt("so", "#{pane_in_mode}") == "0");
+    }
+}

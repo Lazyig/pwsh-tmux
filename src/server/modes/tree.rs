@@ -48,6 +48,8 @@ pub enum Sort {
     Z,
     Creation,
     Size,
+    Modifier,
+    Order,
 }
 
 impl Sort {
@@ -59,9 +61,12 @@ impl Sort {
             Sort::Z => "z",
             Sort::Creation => "creation",
             Sort::Size => "size",
+            Sort::Modifier => "modifier",
+            Sort::Order => "order",
         }
     }
 
+    /// sort_order_from_string.
     pub fn parse(s: &str) -> Option<Sort> {
         Some(match s.to_ascii_lowercase().as_str() {
             "index" | "key" => Sort::Index,
@@ -70,9 +75,29 @@ impl Sort {
             "z" => Sort::Z,
             "creation" => Sort::Creation,
             "size" => Sort::Size,
+            "modifier" => Sort::Modifier,
+            "order" => Sort::Order,
             _ => return None,
         })
     }
+}
+
+/// sort_qsort: "order" keeps the natural order (reversed with -r), anything else sorts with
+/// `cmp`, whose ties the caller breaks by name.
+fn sort_by<T>(v: &mut [T], order: Sort, reversed: bool, cmp: impl Fn(&T, &T) -> std::cmp::Ordering) {
+    if v.len() < 2 {
+        return;
+    }
+    if order == Sort::Order {
+        if reversed {
+            v.reverse();
+        }
+        return;
+    }
+    v.sort_by(|a, b| {
+        let r = cmp(a, b);
+        if reversed { r.reverse() } else { r }
+    });
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -339,10 +364,12 @@ impl Tree {
         }
     }
 
+    /// The order in use: -O as given (any order, as mode_tree_start keeps it), else the
+    /// first of the mode's O cycle (window_*_sort).
     pub fn sort(&self) -> Option<Sort> {
         let seq = self.order_seq();
         seq.first()?;
-        Some(self.order.filter(|o| seq.contains(o)).unwrap_or(seq[0]))
+        Some(self.order.unwrap_or(seq[0]))
     }
 
     /// Called once the mode is set up: records what the first build expanded and selects
@@ -458,18 +485,20 @@ impl Tree {
         }
     }
 
+    /// sort_get_sessions: by name, then sort_session_cmp.
     fn sorted_sessions<'s>(&self, srv: &'s Server) -> Vec<&'s Session> {
         let mut v: Vec<&Session> = srv.sessions.values().collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
         let order = self.sort().unwrap_or(Sort::Index);
-        v.sort_by(|a, b| {
-            let r = match order {
+        sort_by(&mut v, order, self.reversed, |a, b| {
+            match order {
+                Sort::Index => a.id.cmp(&b.id),
+                Sort::Creation => (a.created, a.id).cmp(&(b.created, b.id)),
+                Sort::Activity => b.activity_us.cmp(&a.activity_us),
                 Sort::Name => a.name.cmp(&b.name),
-                Sort::Activity => b.activity.cmp(&a.activity),
-                Sort::Creation => a.created.cmp(&b.created),
-                _ => a.id.cmp(&b.id),
-            };
-            let r = r.then(a.name.cmp(&b.name));
-            if self.reversed { r.reverse() } else { r }
+                _ => std::cmp::Ordering::Equal,
+            }
+            .then(a.name.cmp(&b.name))
         });
         v
     }
@@ -491,16 +520,19 @@ impl Tree {
             let text = expand_as(srv, t, FmtType::Session, &self.format, HashMap::new());
             let expanded = if after || self.collapse != Collapse::Sessions { 1 } else { 0 };
             let si = b.add(None, format!("s{}", s.id), s.name.clone(), Some(text), ItemData::Session(s.id), expanded);
+            // sort_get_winlinks_session: by index, then sort_winlink_cmp
             let mut wls: Vec<(u32, WinId)> = s.links.iter().map(|(i, w)| (*i, *w)).collect();
-            wls.sort_by(|a, c| {
-                let (wa, wc) = (srv.windows.get(&a.1), srv.windows.get(&c.1));
-                let r = match order {
-                    Sort::Name => wa.map(|w| &w.name).cmp(&wc.map(|w| &w.name)),
-                    Sort::Activity => wc.map(|w| w.activity).cmp(&wa.map(|w| w.activity)),
-                    _ => a.0.cmp(&c.0),
-                };
-                let r = r.then(wa.map(|w| &w.name).cmp(&wc.map(|w| &w.name)));
-                if self.reversed { r.reverse() } else { r }
+            sort_by(&mut wls, order, self.reversed, |a, c| {
+                let (Some(wa), Some(wc)) = (srv.windows.get(&a.1), srv.windows.get(&c.1)) else { return a.0.cmp(&c.0) };
+                match order {
+                    Sort::Index => a.0.cmp(&c.0),
+                    Sort::Creation => (wa.created, wa.id).cmp(&(wc.created, wc.id)),
+                    Sort::Activity => wc.activity_us.cmp(&wa.activity_us),
+                    Sort::Name => wa.name.cmp(&wc.name),
+                    Sort::Size => (wa.sx as u32 * wa.sy as u32).cmp(&(wc.sx as u32 * wc.sy as u32)),
+                    _ => std::cmp::Ordering::Equal,
+                }
+                .then(wa.name.cmp(&wc.name))
             });
             let mut empty = 0;
             for (idx, wid) in &wls {
@@ -524,17 +556,22 @@ impl Tree {
         b.nodes[wi].align = true;
         let base = srv.opt_window_num(Some(wid), "pane-base-index").max(0) as usize;
         let mut panes: Vec<(usize, PaneId)> = w.panes().into_iter().enumerate().map(|(i, p)| (i + base, p)).collect();
-        // sort_pane_cmp: ties go by title and -r reverses the comparison
+        // sort_pane_cmp: ties go by title and -r reverses the comparison; activity is the
+        // active_point (focus order: never active, then the last active, then the active)
         let order = self.sort().unwrap_or(Sort::Index);
         let title = |p: PaneId| srv.panes.get(&p).map(|p| p.title.clone()).unwrap_or_default();
-        panes.sort_by(|a, c| {
-            let r = match order {
-                Sort::Name => std::cmp::Ordering::Equal,
-                Sort::Activity => srv.panes.get(&a.1).map(|p| p.last_output).cmp(&srv.panes.get(&c.1).map(|p| p.last_output)),
-                _ => a.0.cmp(&c.0),
-            };
-            let r = r.then_with(|| title(a.1).cmp(&title(c.1)));
-            if self.reversed { r.reverse() } else { r }
+        let point = |p: PaneId| if p == w.active { 2 } else if w.last_active == Some(p) { 1 } else { 0 };
+        let size = |p: PaneId| srv.panes.get(&p).map_or(0, |p| p.size.0 as u32 * p.size.1 as u32);
+        sort_by(&mut panes, order, self.reversed, |a, c| {
+            match order {
+                Sort::Activity => point(a.1).cmp(&point(c.1)),
+                Sort::Creation => a.1.cmp(&c.1),
+                Sort::Size => size(a.1).cmp(&size(c.1)),
+                Sort::Index | Sort::Z => a.0.cmp(&c.0),
+                Sort::Name => title(a.1).cmp(&title(c.1)),
+                _ => std::cmp::Ordering::Equal,
+            }
+            .then_with(|| title(a.1).cmp(&title(c.1)))
         });
         let mut found = 0;
         for (pi, p) in panes {
@@ -558,17 +595,18 @@ impl Tree {
     }
 
     fn build_buffers(&self, srv: &Server, b: &mut Builder, filter: Option<&str>) {
+        // sort_get_buffers: newest first (paste_walk), then sort_buffer_cmp
         let mut bufs: Vec<&Buffer> = srv.buffers.iter().collect();
         let order = self.sort().unwrap_or(Sort::Creation);
         let pos = |b: &Buffer| srv.buffers.iter().position(|x| x.name == b.name).unwrap_or(0);
-        bufs.sort_by(|a, c| {
-            let r = match order {
+        sort_by(&mut bufs, order, self.reversed, |a, c| {
+            match order {
                 Sort::Name => a.name.cmp(&c.name),
-                Sort::Size => c.data.len().cmp(&a.data.len()).then(a.name.cmp(&c.name)),
-                // the list is newest first already
-                _ => pos(a).cmp(&pos(c)),
-            };
-            if self.reversed { r.reverse() } else { r }
+                Sort::Creation => pos(a).cmp(&pos(c)),
+                Sort::Size => a.data.len().cmp(&c.data.len()),
+                _ => std::cmp::Ordering::Equal,
+            }
+            .then(a.name.cmp(&c.name))
         });
         let t = srv.target_for_pane(self.owner);
         for buf in bufs {
@@ -592,16 +630,20 @@ impl Tree {
     }
 
     fn build_clients(&self, srv: &Server, b: &mut Builder, filter: Option<&str>) {
+        // sort_get_clients: in the order they connected, then sort_client_cmp
         let mut cs: Vec<&Client> = srv.clients.values().filter(|c| c.attached && c.session.is_some()).collect();
-        match self.sort().unwrap_or(Sort::Name) {
-            Sort::Size => cs.sort_by(|a, c| (a.size.0 as u32 * a.size.1 as u32).cmp(&(c.size.0 as u32 * c.size.1 as u32)).then(a.name().cmp(&c.name()))),
-            Sort::Creation => cs.sort_by(|a, c| a.created.cmp(&c.created).then(a.name().cmp(&c.name()))),
-            Sort::Activity => cs.sort_by(|a, c| c.activity.cmp(&a.activity).then(a.name().cmp(&c.name()))),
-            _ => cs.sort_by_key(|c| c.name()),
-        }
-        if self.reversed {
-            cs.reverse();
-        }
+        cs.sort_by_key(|c| c.id);
+        let order = self.sort().unwrap_or(Sort::Name);
+        sort_by(&mut cs, order, self.reversed, |a, c| {
+            match order {
+                Sort::Name => a.name().cmp(&c.name()),
+                Sort::Size => a.size.0.cmp(&c.size.0).then(a.size.1.cmp(&c.size.1)),
+                Sort::Creation => a.created.cmp(&c.created),
+                Sort::Activity => c.activity.cmp(&a.activity),
+                _ => std::cmp::Ordering::Equal,
+            }
+            .then(a.name().cmp(&c.name()))
+        });
         for c in cs {
             let t = Tree::client_target(srv, c);
             let ctx = crate::server::vars::VarCtx { srv, t, client: Some(c.id), extra: HashMap::new() };
@@ -907,10 +949,11 @@ impl Tree {
                 }
             }
             "O" => {
+                // sort_next_order: an order outside the cycle starts it again
                 let seq = self.order_seq();
                 if let Some(cur) = self.sort() {
-                    let i = seq.iter().position(|o| *o == cur).unwrap_or(0);
-                    self.order = Some(seq[(i + 1) % seq.len()]);
+                    let i = seq.iter().position(|o| *o == cur).map_or(0, |i| (i + 1) % seq.len());
+                    self.order = Some(seq[i]);
                 }
             }
             "r" if !self.order_seq().is_empty() => self.reversed = !self.reversed,
@@ -973,7 +1016,7 @@ impl Tree {
     }
 
     fn swap(&mut self, srv: &Server, b: &Built, dir: i32) -> ModeAction {
-        if self.kind != TreeKind::Tree || self.sort() != Some(Sort::Index) || self.reversed {
+        if self.kind != TreeKind::Tree {
             return ModeAction::None;
         }
         let depth = b.lines[self.cur].depth;
@@ -994,6 +1037,21 @@ impl Tree {
         let (ItemData::Window(s1, i1), ItemData::Window(s2, i2)) = (&b.nodes[b.lines[self.cur].item].data, &b.nodes[b.lines[with].item].data) else { return ModeAction::None };
         if s1 != s2 || !srv.sessions.contains_key(s1) {
             return ModeAction::None;
+        }
+        // sort_would_window_tree_swap: only when the order would not put them back
+        if self.sort() != Some(Sort::Index) {
+            let w = |i: &u32| srv.sessions.get(s1).and_then(|s| s.links.get(i)).and_then(|w| srv.windows.get(w));
+            let (Some(a), Some(c)) = (w(i1), w(i2)) else { return ModeAction::None };
+            let same = match self.sort() {
+                Some(Sort::Creation) => (a.created, a.id) == (c.created, c.id),
+                Some(Sort::Activity) => a.activity_us == c.activity_us,
+                Some(Sort::Size) => a.sx as u32 * a.sy as u32 == c.sx as u32 * c.sy as u32,
+                Some(Sort::Name) | Some(Sort::Z) | Some(Sort::Modifier) | Some(Sort::Order) | None => true,
+                Some(Sort::Index) => true,
+            } && a.name == c.name;
+            if !same {
+                return ModeAction::None;
+            }
         }
         self.cur_tag = Some(format!("w{s1}:{i2}"));
         ModeAction::RunKeep(format!("swap-window -d -s '${s1}:{i1}' -t '${s1}:{i2}'"))
@@ -1797,6 +1855,17 @@ mod tests {
         assert_eq!(Tree::new(TreeKind::Clients, 0, Target::default()).sort(), Some(Sort::Name));
         assert_eq!(Tree::new(TreeKind::Options, 0, Target::default()).sort(), None);
         assert_eq!(Sort::parse("Z"), Some(Sort::Z));
+        assert_eq!(Sort::parse("modifier"), Some(Sort::Modifier));
+        assert_eq!(Sort::parse("Order"), Some(Sort::Order));
         assert_eq!(strip_styles("#[fg=red]a##b#[default]c"), "a#bc");
+        // -O outside the O cycle is kept, and O starts the cycle again from it
+        let mut t = Tree::new(TreeKind::Tree, 0, Target::default());
+        t.order = Some(Sort::Creation);
+        assert_eq!(t.sort(), Some(Sort::Creation));
+        let mut v = vec![3, 1, 2];
+        sort_by(&mut v, Sort::Order, true, |a, b| a.cmp(b));
+        assert_eq!(v, [2, 1, 3]);
+        sort_by(&mut v, Sort::Size, false, |a, b| a.cmp(b));
+        assert_eq!(v, [1, 2, 3]);
     }
 }
