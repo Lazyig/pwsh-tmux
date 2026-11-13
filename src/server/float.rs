@@ -642,14 +642,7 @@ impl Server {
             };
             let w = self.windows.get_mut(&wid).unwrap();
             w.layout.insert_float(Some(target), new, g);
-            if o.has('b') {
-                w.insert_pane(target, new, true);
-            } else {
-                let mut order = w.panes();
-                order.retain(|p| *p != new);
-                order.push(new);
-                w.pane_order = order;
-            }
+            w.add_pane_order(target, new, o.has('b'), o.has('f'), true);
             let mut z = w.zlist();
             z.retain(|p| *p != new);
             let at = w.modal.and_then(|m| z.iter().position(|p| *p == m)).map_or(0, |i| i + 1);
@@ -747,7 +740,7 @@ impl Server {
             self.mark_session_dirty(sid);
         }
         self.mark_window_dirty(wid);
-        self.run_hook(tt.sid, "window-layout-changed", Ctx::default());
+        self.layout_changed(tt.sid, wid, ctx);
         if o.has('P') {
             let fmt = o.get('F').unwrap_or("#{session_name}:#{window_index}.#{pane_index}");
             let line = self.expand_for_pane(new, fmt);
@@ -791,7 +784,7 @@ impl Server {
         }
         self.apply_layout(wid);
         self.mark_window_dirty(wid);
-        self.run_hook(t.sid, "window-layout-changed", Ctx::default());
+        self.layout_changed(t.sid, wid, &Ctx::default());
         Ok(Flow::Next)
     }
 
@@ -815,7 +808,7 @@ impl Server {
         }
         self.apply_layout(wid);
         self.mark_window_dirty(wid);
-        self.run_hook(t.sid, "window-layout-changed", Ctx::default());
+        self.layout_changed(t.sid, wid, &Ctx::default());
         Ok(Flow::Next)
     }
 
@@ -923,7 +916,7 @@ impl Server {
             (g.x, g.y) = (x, y);
         }
         self.mark_window_dirty(wid);
-        self.run_hook(t.sid, "window-layout-changed", Ctx::default());
+        self.layout_changed(t.sid, wid, &Ctx::default());
         Ok(Flow::Next)
     }
 
@@ -983,7 +976,7 @@ impl Server {
         }
         self.apply_layout(wid);
         self.mark_window_dirty(wid);
-        self.run_hook(t.sid, "window-layout-changed", Ctx::default());
+        self.layout_changed(t.sid, wid, &Ctx::default());
         Ok(Flow::Next)
     }
 
@@ -1239,7 +1232,7 @@ mod tests {
         assert_eq!(b["move"]["M-Right"].note, "Move pane to right and resize");
         assert_eq!(b["prefix"]["*"].cmd, "new-pane");
         assert!(b["prefix"]["M-Up"].repeat);
-        for k in ["C-MouseDrag1Pane", "C-MouseDrag1Empty", "M-MouseDrag1Pane", "M-MouseDrag1Border", "MouseDown1Control7", "MouseDown1Control8", "MouseDown1Control9", "MouseDown3Empty"] {
+        for k in ["C-MouseDrag1Pane", "C-MouseDrag1Empty", "M-MouseDrag1Pane", "M-MouseDrag1Border", "MouseDown1Control7", "MouseDown1Control8", "MouseDown1Control9", "MouseDown3Empty", "MouseDown1Border"] {
             assert!(b["root"].contains_key(k), "{k}");
         }
         for (table, keys) in &b {

@@ -941,7 +941,7 @@ impl Server {
         let cwd = cwd.or_else(|| self.panes.get(&target).map(|p| p.current_path.clone()));
         let new = self.spawn_pane(t.sid, w, h, cmd, cwd.as_deref(), env)?;
         let win = self.windows.get_mut(&wid).unwrap();
-        win.insert_pane(target, new, before);
+        win.add_pane_order(target, new, before, full, false);
         if full {
             let old = std::mem::replace(&mut win.layout, Node::Leaf(PaneId::MAX));
             let ratio_new = new_size as f32 / (total - 1) as f32;
@@ -1803,7 +1803,7 @@ impl Server {
                     w.layout.spread(wt.pane.unwrap_or(w.active), area);
                     self.apply_layout(wid);
                     self.mark_window_dirty(wid);
-                    self.run_hook(wt.sid, "window-layout-changed", Ctx::default());
+                    self.layout_changed(wt.sid, wid, ctx);
                     return Ok(Flow::Next);
                 } else {
                     o.rest.first().cloned().or_else(|| {
@@ -1826,7 +1826,7 @@ impl Server {
                 w.old_layout = Some(old_layout);
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
-                self.run_hook(wt.sid, "window-layout-changed", Ctx::default());
+                self.layout_changed(wt.sid, wid, ctx);
                 Ok(Flow::Next)
             }
             "resize-window" => {
@@ -2059,7 +2059,7 @@ impl Server {
                 }
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
-                self.run_hook(tt.sid, "window-layout-changed", Ctx::default());
+                self.layout_changed(tt.sid, wid, ctx);
                 Ok(Flow::Next)
             }
             "swap-pane" => {

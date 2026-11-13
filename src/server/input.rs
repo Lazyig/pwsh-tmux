@@ -177,6 +177,8 @@ pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
         ("MouseDown3StatusLeft", SESSION_MENU.to_string()),
         ("M-MouseDown3StatusLeft", SESSION_MENU.to_string()),
         ("MouseDrag1Pane", format!("if-shell -F '{IN_MODE}' {{ send-keys -M }} {{ copy-mode -M }}")),
+        // tmux 3.8: a click on a (floating) pane border selects and raises that pane
+        ("MouseDown1Border", "select-pane -t =".into()),
         ("MouseDrag1Border", "resize-pane -M".into()),
         ("WheelUpPane", "if-shell -F '#{||:#{alternate_on},#{pane_in_mode},#{mouse_any_flag}}' { send-keys -M } { copy-mode -e }".into()),
         ("WheelUpStatus", "previous-window".into()),
