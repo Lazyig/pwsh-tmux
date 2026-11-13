@@ -1346,3 +1346,22 @@ fn capture_pane_line_flags() {
     let out = ctx.ok(&["capture-pane", "-p", "-F", "-E", "6", "-t", "f"]);
     assert_eq!(out, format!("- plain\nP $ cmd\nO out\nX rgb\nW {}\n- 00000\n- end\n", "0".repeat(20)));
 }
+
+#[test]
+fn option_loop_hooks_and_session_default_size() {
+    let ctx = Ctx::new("p1fix-oloop");
+    // -x/-y set the session's default-size, its only local option here
+    ctx.ok(&["new-session", "-d", "-s", "m", "-x", "80", "-y", "24", "sleep 100"]);
+    assert_eq!(ctx.ok(&["show-options", "-t", "m"]), "default-size 80x24\n");
+    ctx.ok(&["set-hook", "-g", "after-new-window", "display a"]);
+    ctx.ok(&["set-hook", "-t", "m", "session-renamed", "display c"]);
+    // O loops over hooks too: a session's set ones, every global one of the scope
+    assert_eq!(ctx.fmt("m", "#{O:#{option_name}=#{option_value}|}"), "default-size=80x24|session-renamed=display-message c|");
+    let g = ctx.fmt("m", "#{O/g:#{option_name}[#{option_array_key}]#{option_is_hook}#{option_array_count}=#{option_value}|}");
+    assert!(g.starts_with("activity-action[]00=other|after-bind-key[]10=|"), "{g}");
+    assert!(g.contains("|after-new-window[0]11=display-message a|"), "{g}");
+    // an array with items is listed by its items only
+    assert!(g.contains("|update-environment[0]013=DISPLAY|") && !g.contains("update-environment[]"), "{g}");
+    let w = ctx.fmt("m", "#{O/gw:#{option_name}|}");
+    assert!(w.contains("|pane-activity|") && w.contains("|window-zoomed|") && !w.contains("after-bind-key"), "{w}");
+}

@@ -775,30 +775,62 @@ impl Vars for VarCtx<'_> {
         };
         let Some(opts) = opts else { return Vec::new() };
         // Array items (name[index]) follow their option in index order.
-        let mut items: Vec<(&str, Option<&str>, &String)> = opts.0.iter().map(|(key, value)| {
+        let mut items: Vec<(String, Option<String>, String)> = opts.0.iter().map(|(key, value)| {
             match key.split_once('[') {
-                Some((name, index)) => (name, Some(index.trim_end_matches(']')), value),
-                None => (key.as_str(), None, value),
+                Some((name, index)) => (name.to_string(), Some(index.trim_end_matches(']').to_string()), value.clone()),
+                None => (key.clone(), None, value.clone()),
             }
         }).collect();
-        let index_key = |i: Option<&str>| i.map(|i| (i.parse::<u64>().unwrap_or(u64::MAX), i.to_string()));
-        items.sort_by(|a, b| a.0.cmp(b.0).then_with(|| index_key(a.1).cmp(&index_key(b.1))));
-        items.iter().enumerate().map(|(i, &(name, index, value))| {
-            let is_array = index.is_some() || options::def(name).is_some_and(|d| d.kind == options::Kind::Array);
-            let count = items.iter().filter(|o| o.0 == name && o.1.is_some()).count();
-            let first = index.is_none() || i == 0 || items[i - 1].0 != name;
-            let last = index.is_none() || items.get(i + 1).is_none_or(|o| o.0 != name);
+        // Hooks are options too (kept apart here): global options hold every hook of
+        // their scope, a session's only those set there.
+        let hooks = if flags.contains('v') || flags.contains('p') {
+            None
+        } else if global {
+            Some((&srv.hooks, flags.contains('w')))
+        } else if flags.contains('s') {
+            self.t.sid.and_then(|s| srv.sessions.get(&s)).map(|s| (&s.hooks, false))
+        } else {
+            None
+        };
+        if let Some((map, window)) = hooks {
+            let aliases = srv.command_aliases();
+            for (name, scope) in options::HOOKS {
+                if (*scope == options::Scope::Session) == window {
+                    continue;
+                }
+                let cmds: Vec<(usize, &String)> = map.get(*name).map(|v| v.iter().enumerate().filter(|(_, c)| !c.is_empty()).collect()).unwrap_or_default();
+                if cmds.is_empty() {
+                    if global {
+                        items.push((name.to_string(), None, String::new()));
+                    }
+                    continue;
+                }
+                for (i, c) in cmds {
+                    items.push((name.to_string(), Some(i.to_string()), super::cmds::print_command_string(c, &aliases, false)));
+                }
+            }
+        }
+        // an array with items is shown by its items only
+        let with_items: std::collections::HashSet<String> = items.iter().filter(|o| o.1.is_some()).map(|o| o.0.clone()).collect();
+        items.retain(|o| o.1.is_some() || !with_items.contains(&o.0));
+        let index_key = |i: &Option<String>| i.as_ref().map(|i| (i.parse::<u64>().unwrap_or(u64::MAX), i.clone()));
+        items.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| index_key(&a.1).cmp(&index_key(&b.1))));
+        items.iter().enumerate().map(|(i, (name, index, value))| {
+            let is_hook = options::hook_scope(name).is_some();
+            let is_array = index.is_some() || is_hook || options::def(name).is_some_and(|d| d.kind == options::Kind::Array);
+            let count = items.iter().filter(|o| &o.0 == name && o.1.is_some()).count();
+            let first = index.is_none() || i == 0 || &items[i - 1].0 != name;
+            let last = index.is_none() || items.get(i + 1).is_none_or(|o| &o.0 != name);
             HashMap::from([
-                ("option_name".into(), name.to_string()),
+                ("option_name".into(), name.clone()),
                 ("option_value".into(), value.clone()),
                 ("option_is_array".into(), b(is_array)),
-                ("option_array_key".into(), index.unwrap_or("").to_string()),
-                ("option_array_index".into(), index.unwrap_or("").to_string()),
+                ("option_array_key".into(), index.clone().unwrap_or_default()),
+                ("option_array_index".into(), index.clone().unwrap_or_default()),
                 ("option_array_count".into(), count.to_string()),
                 ("option_array_first".into(), b(is_array && first)),
                 ("option_array_last".into(), b(is_array && last)),
-                // Hooks are not kept as options here.
-                ("option_is_hook".into(), "0".into()),
+                ("option_is_hook".into(), b(is_hook)),
                 ("option_is_user".into(), b(name.starts_with('@'))),
             ])
         }).collect()

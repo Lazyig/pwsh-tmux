@@ -1183,6 +1183,11 @@ impl Server {
                 // Detached/control dimensions describe the pane area; attached
                 // terminal dimensions also include the status line.
                 let (cols, rows) = (cols.min(MAX_SIZE), rows.min(MAX_SIZE));
+                // -x/-y also set the session's default-size (the pane area)
+                let default_size = (o.has('x') || o.has('y')).then(|| {
+                    let r = if detached || control { rows } else { rows.saturating_sub(self.status_lines(None)) };
+                    format!("{}x{}", cols.max(1), r.max(1))
+                });
                 let rows = if detached || control { rows.saturating_add(self.status_lines(None)) } else { rows };
                 if !detached {
                     // already attached clients switch, CLI clients attach
@@ -1194,6 +1199,9 @@ impl Server {
                 }
                 let cwd = o.get('c').map(|c| self.expand(self.current(ctx), ctx.client, c));
                 let sid = self.create_session(ctx, name, cols, rows, cwd, o.get('n').map(String::from), &o.rest, &env)?;
+                if let (Some(ds), Some(s)) = (default_size, self.sessions.get_mut(&sid)) {
+                    s.options.set("default-size", ds);
+                }
                 if o.has('E') {
                     // -E: no update-environment, only the -e variables
                     if let Some(s) = self.sessions.get_mut(&sid) {
@@ -3812,7 +3820,7 @@ impl Server {
         }
     }
 
-    fn command_aliases(&self) -> Vec<String> {
+    pub(crate) fn command_aliases(&self) -> Vec<String> {
         self.opts_server.array_items("command-alias").into_iter().map(|(_, v)| v).collect()
     }
 
