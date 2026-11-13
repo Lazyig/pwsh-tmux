@@ -197,7 +197,7 @@ const COMMANDS: &[(&str, bool, Clear)] = &[
     ("search-reverse", false, Clear::Always),
     ("select-line", false, Clear::Always),
     ("select-word", false, Clear::Always),
-    ("selection-mode", false, Clear::Never),
+    ("selection-mode", false, Clear::Always),
     ("set-mark", true, Clear::Always),
     ("start-of-line", true, Clear::EmacsOnly),
     ("stop-selection", false, Clear::Always),
@@ -485,6 +485,12 @@ pub struct CopyMode {
     anchor: Option<Pos>,
     frozen: Option<Pos>,
     line_mode: bool,
+    /// The cursor drags the selection's start (tmux's CURSORDRAG_SEL, after other-end or a
+    /// drag from near the start): selection_start_* is then the cursor's end.
+    ends_swapped: bool,
+    /// A line selection's cursor is on its end side (LINE_SEL_LEFT_RIGHT) rather than its
+    /// start side (LINE_SEL_RIGHT_LEFT).
+    line_lr: bool,
     rect: bool,
     sel_mode: SelMode,
     /// A mouse drag is in progress (tty.mouse_drag_flag).
@@ -552,6 +558,8 @@ impl CopyMode {
             anchor: None,
             frozen: None,
             line_mode: false,
+            ends_swapped: false,
+            line_lr: true,
             rect: false,
             sel_mode: SelMode::Char,
             dragging: false,
@@ -792,11 +800,23 @@ impl CopyMode {
         self.move_to_view(row, col);
         self.line_mode = false;
         self.frozen = None;
+        // keep the far end fixed, the near end follows the mouse; dragging the
+        // selection's start (CURSORDRAG_SEL) reports the mouse's end as its start
+        let anchor = self.anchor;
+        let near_anchor = |p: Pos| anchor == Some(p);
         self.anchor = Some(match (inside, bounds) {
-            // keep the far end fixed, the near end follows the mouse
-            (Some(true), Some((_, e))) => e,
-            (Some(false), Some((s, _))) => s,
-            _ => (self.cy, self.cx),
+            (Some(true), Some((s, e))) => {
+                self.ends_swapped ^= near_anchor(s);
+                e
+            }
+            (Some(false), Some((s, e))) => {
+                self.ends_swapped ^= near_anchor(e);
+                s
+            }
+            _ => {
+                self.ends_swapped = false;
+                (self.cy, self.cx)
+            }
         });
     }
 
@@ -1038,9 +1058,15 @@ impl CopyMode {
     /// selection_start_* / selection_end_*: the anchor and the other end as (x, y), y
     /// counted from the oldest history line.
     pub fn selection_ends(&self) -> Option<((usize, usize), (usize, usize))> {
-        let (ay, ax) = self.anchor?;
-        let (oy, ox) = self.sel_other();
-        Some(((ax, ay), (ox, oy)))
+        let a = self.anchor?;
+        let o = self.sel_other();
+        if self.line_mode && self.sel_mode == SelMode::Line {
+            // whole lines: from the start of the first to the end of the last
+            let (y0, y1) = (a.0.min(o.0), a.0.max(o.0));
+            return Some(((0, y0), (self.len(y1), y1)));
+        }
+        let ((sy, sx), (ey, ex)) = if self.ends_swapped { (o, a) } else { (a, o) };
+        Some(((sx, sy), (ex, ey)))
     }
 
     pub fn begin_incremental_search(&mut self) {
@@ -1338,6 +1364,7 @@ impl CopyMode {
             "scroll-exit-toggle" => self.exit_on_bottom = !self.exit_on_bottom,
             "begin-selection" => {
                 self.anchor = Some((self.cy, self.cx));
+                self.ends_swapped = false;
                 self.frozen = None;
                 self.line_mode = false;
                 self.sel_mode = SelMode::Char;
@@ -1352,6 +1379,8 @@ impl CopyMode {
                 let y = self.logical_start(self.cy);
                 self.line_mode = true;
                 self.frozen = None;
+                self.ends_swapped = false;
+                self.line_lr = true;
                 self.anchor = Some((y, 0));
                 self.cy = y;
                 self.end_of_line();
@@ -1374,6 +1403,7 @@ impl CopyMode {
                 let single = px < self.len(py) && self.in_set((ny, nx), WHITESPACE);
                 self.line_mode = false;
                 self.frozen = None;
+                self.ends_swapped = false;
                 self.anchor = Some(start);
                 // a single character word: the cursor stays on it
                 let end = if single {
@@ -1396,6 +1426,7 @@ impl CopyMode {
                         self.line_mode = true;
                         let (sy, ey) = (self.logical_start(s.0), self.logical_end(e.0));
                         let cursor_first = (self.cy, self.cx) <= s && self.frozen.is_none();
+                        self.line_lr = !cursor_first;
                         if self.frozen.is_some() {
                             self.anchor = Some((sy, 0));
                             self.frozen = Some((ey, self.max_x(ey)));
@@ -1423,6 +1454,8 @@ impl CopyMode {
                 }
             }
             "other-end" => {
+                // window_copy_cmd_other_end: the selection mode goes back to char
+                self.sel_mode = SelMode::Char;
                 if (n % 2) != 0 {
                     self.other_end();
                 }
@@ -1600,6 +1633,7 @@ impl CopyMode {
 
     fn clear_selection(&mut self) {
         self.anchor = None;
+        self.ends_swapped = false;
         self.frozen = None;
         self.line_mode = false;
         self.sel_mode = SelMode::Char;
@@ -1622,13 +1656,15 @@ impl CopyMode {
             self.cy = f.0;
             self.cx = f.1;
         } else {
+            self.ends_swapped = !self.ends_swapped;
             self.anchor = Some((self.cy, self.cx));
             if self.line_mode {
-                // Keep whole lines selected: anchor at the start of its line.
-                let (cy, _) = self.anchor.unwrap();
-                if a.0 < cy {
-                    self.anchor = Some((cy, self.max_x(cy)));
+                // whole lines: the cursor's side becomes the anchor, at the end of its line
+                // if the cursor was on the end side
+                if self.line_lr {
+                    self.anchor = Some((self.cy, self.max_x(self.cy)));
                 }
+                self.line_lr = !self.line_lr;
             }
             self.cy = a.0;
             self.cx = a.1;
@@ -2070,6 +2106,11 @@ impl CopyMode {
         let last = self.lines.len() - 1;
         for _ in 0..dy.unsigned_abs() {
             let norect = self.anchor.is_none() || !self.rect;
+            // a line selection turns round at its anchor line (window_copy_cursor_up/down)
+            let line_sel = self.anchor.filter(|_| self.line_mode && self.frozen.is_none());
+            if line_sel.is_some_and(|(ay, _)| self.cy == ay && (dy > 0) != self.line_lr) {
+                self.other_end();
+            }
             self.sticky_begin(norect);
             if dy < 0 {
                 self.cy = self.cy.saturating_sub(1);
@@ -2078,6 +2119,11 @@ impl CopyMode {
             }
             self.ensure_visible();
             self.sticky_end(norect);
+            // a line selection keeps the cursor at the end of the line below its first
+            // line and at the start above it (LINE_SEL_LEFT_RIGHT / RIGHT_LEFT)
+            if line_sel.is_some() {
+                self.cx = if self.line_lr { self.limit(self.cy, false) } else { 0 };
+            }
         }
         self.lastcx = self.cx;
     }
@@ -3865,4 +3911,124 @@ mod tests {
         assert_eq!(cm.cy - cm.top, 4);
     }
 
+    #[test]
+    fn search_counts_positions_and_wrapping() {
+        // checked against tmux 3.8: "ab ab", "xab", "zz" from the top
+        let mk = |vi: bool| CopyMode::new(lines(&["ab ab", "xab", "zz"]), W, 3, (0, 0), vi);
+        let mut cm = mk(false);
+        assert_eq!(cm.search_count(), Some(0), "0 before any search");
+        cm.run("search-forward", &["ab".into()]);
+        assert_eq!((pos(&cm), cm.search_count()), ((0, 2), Some(3)), "emacs: after the match");
+        assert_eq!(cm.search_match().as_deref(), Some("ab"), "one position after the match");
+        cm.run("search-again", &[]);
+        assert_eq!(pos(&cm), (0, 5));
+        cm.run("search-again", &[]);
+        assert_eq!(pos(&cm), (1, 3));
+        cm.run("search-again", &[]);
+        assert_eq!(pos(&cm), (0, 2), "wrapped");
+        cm.run("search-reverse", &[]);
+        assert_eq!(pos(&cm), (0, 0));
+        // the marks go with a motion, and searching for the same text again does not count
+        cm.run("cursor-right", &[]);
+        assert_eq!((cm.search_present(), cm.search_count()), (false, None));
+        cm.run("search-again", &[]);
+        assert_eq!((cm.search_present(), cm.search_count()), (true, None));
+        // a failed search for new text leaves no marks
+        cm.run("search-forward", &["zzz".into()]);
+        assert_eq!((cm.search_present(), cm.search_count()), (false, None));
+        // wrap-search off
+        cm.set_wrap_search(false);
+        cm.run("history-bottom", &[]);
+        cm.run("end-of-line", &[]);
+        let here = pos(&cm);
+        cm.run("search-forward", &["ab".into()]);
+        assert_eq!(pos(&cm), here);
+        // vi: the cursor stays at the start of the match, the next search starts after it
+        let mut cm = mk(true);
+        cm.run("search-forward", &["ab".into()]);
+        assert_eq!(pos(&cm), (0, 3));
+        cm.run("search-again", &[]);
+        assert_eq!(pos(&cm), (1, 1));
+        // the pane's last search is repeated upwards
+        let mut cm = mk(true);
+        cm.set_pane_search("zz");
+        cm.run("search-again", &[]);
+        assert_eq!(pos(&cm), (2, 0));
+        assert_eq!(cm.search_count(), Some(1), "the first search counts");
+    }
+
+    #[test]
+    fn selection_ends_follow_the_dragged_end() {
+        // checked against tmux 3.8 (selection_start_* / selection_end_*)
+        let text = ["one two three", "four five six", "seven"];
+        for vi in [false, true] {
+            let mut cm = CopyMode::new(lines(&text), W, 3, (0, 2), vi);
+            cm.run("begin-selection", &[]);
+            cm.set_count(3);
+            cm.run("cursor-right", &[]);
+            cm.run("cursor-down", &[]);
+            assert_eq!(cm.selection_ends(), Some(((2, 0), (5, 1))));
+            // other-end: the cursor drags the start, the ends stay put
+            cm.run("other-end", &[]);
+            assert_eq!(pos(&cm), (0, 2));
+            assert_eq!(cm.selection_ends(), Some(((2, 0), (5, 1))));
+            cm.run("cursor-left", &[]);
+            assert_eq!(cm.selection_ends(), Some(((1, 0), (5, 1))));
+            cm.run("other-end", &[]);
+            cm.run("cursor-up", &[]);
+            assert_eq!(cm.selection_ends(), Some(((1, 0), (5, 0))));
+            // a line selection runs from the start of its first line to the end of its last
+            cm.run("select-line", &[]);
+            assert_eq!(cm.selection_ends(), Some(((0, 0), (13, 0))));
+            assert_eq!(cm.cx, if vi { 12 } else { 13 });
+            cm.run("other-end", &[]);
+            assert_eq!((pos(&cm), cm.selection_mode()), ((0, 0), SelMode::Char));
+            assert_eq!(cm.selection_ends(), Some(((0, 0), (13, 0))));
+            // moving down turns round at the anchor line
+            cm.run("cursor-down", &[]);
+            let x = if vi { 12 } else { 13 };
+            assert_eq!(pos(&cm), (1, x));
+            assert_eq!(cm.selection_ends(), Some(((0, 0), (x, 1))));
+        }
+        // dragging the start of a selection reports the mouse's end as the start
+        let mut cm = CopyMode::new(lines(&text), W, 3, (0, 0), false);
+        cm.start_drag(0, 2);
+        cm.drag_to(0, 8);
+        cm.end_drag();
+        cm.start_drag(0, 3);
+        cm.drag_to(0, 1);
+        cm.end_drag();
+        assert_eq!(cm.selection_ends(), Some(((1, 0), (8, 0))));
+    }
+
+    #[test]
+    fn line_selection_cursor_sides() {
+        // checked against tmux 3.8: the cursor is at the end of lines below the anchor
+        // line and at the start above it
+        let text = ["l0 aaaa", "l1 bb", "l2 cccccc", "l3 d", "l4 eeeee", "l5"];
+        for vi in [false, true] {
+            let e = |x: usize| if vi { x - 1 } else { x };
+            let mut cm = CopyMode::new(lines(&text), W, 6, (2, 2), vi);
+            cm.run("select-line", &[]);
+            let mut seen = vec![(pos(&cm), cm.selection_ends())];
+            for c in ["cursor-down", "cursor-up", "cursor-up", "cursor-up", "cursor-down", "cursor-down", "cursor-down"] {
+                cm.run(c, &[]);
+                seen.push((pos(&cm), cm.selection_ends()));
+            }
+            let want = vec![
+                ((2, e(9)), Some(((0, 2), (9, 2)))),
+                ((3, e(4)), Some(((0, 2), (4, 3)))),
+                ((2, e(9)), Some(((0, 2), (9, 2)))),
+                ((1, 0), Some(((0, 1), (9, 2)))),
+                ((0, 0), Some(((0, 0), (9, 2)))),
+                ((1, 0), Some(((0, 1), (9, 2)))),
+                ((2, 0), Some(((0, 2), (9, 2)))),
+                ((3, e(4)), Some(((0, 2), (4, 3)))),
+            ];
+            assert_eq!(seen, want, "vi {vi}");
+            cm.run("other-end", &[]);
+            cm.run("cursor-up", &[]);
+            assert_eq!(copied(cm.run("copy-selection-no-clear", &[])), if vi { "l1 bb\nl2 cccccc\nl3 d\n" } else { "l1 bb\nl2 cccccc\nl3 d" });
+        }
+    }
 }
