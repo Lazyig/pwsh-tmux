@@ -1102,6 +1102,12 @@ fn pane_and_target_flags() {
     assert!(ctx.fails(&["select-window", "-t", "{current}"]).contains("no current client"));
     assert!(ctx.fails(&["kill-pane", "-t", "@"]).contains("no current client"));
     assert_eq!(ctx.ok(&["list-commands", "-F", "#{command_list_name}|#{command_list_alias}", "list-keys"]), "list-keys|lsk\n");
+    // tmux's usage strings, in its command table order
+    assert_eq!(ctx.ok(&["lscm", "display-message"]), "display-message (display) [-aCIjlNpv] [-c target-client] [-d delay] [-F format] [-t target-pane] [message]\n");
+    assert_eq!(ctx.ok(&["lscm", "-F", "#{command_list_usage}|", "kill-server"]), "|\n");
+    let names: Vec<String> = ctx.ok(&["lscm", "-F", "#{command_list_name}"]).lines().map(String::from).collect();
+    let pos = |n: &str| names.iter().position(|x| x == n).unwrap();
+    assert!(pos("display-popup") < pos("display-panes") && pos("attach-session") == 0, "{names:?}");
 }
 
 #[cfg(unix)]

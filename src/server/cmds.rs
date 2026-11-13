@@ -3498,13 +3498,18 @@ impl Server {
                 Err(format!("\0wait\0{ch}"))
             }
             "list-commands" => {
-                for (n, a, b, v) in COMMANDS {
+                let rank = |n: &str| USAGE.iter().position(|(u, _)| *u == n).unwrap_or(usize::MAX);
+                let mut cmds: Vec<_> = COMMANDS.iter().collect();
+                cmds.sort_by_key(|(n, ..)| rank(n));
+                for (n, a, b, v) in cmds {
                     if o.rest.first().is_some_and(|x| x != n && x != a) {
                         continue;
                     }
                     let alias = if a.is_empty() { String::new() } else { format!(" ({a})") };
-                    let flags = if b.is_empty() { String::new() } else { format!(" [-{b}]") };
-                    let vals: String = v.chars().map(|c| format!(" [-{c} arg]")).collect();
+                    let (flags, vals) = match USAGE.iter().find(|(u, _)| u == n) {
+                        Some((_, usage)) => (format!(" {usage}"), String::new()),
+                        None => (if b.is_empty() { String::new() } else { format!(" [-{b}]") }, v.chars().map(|c| format!(" [-{c} arg]")).collect()),
+                    };
                     match o.get('F') {
                         Some(f) => {
                             let vars = HashMap::from([
@@ -4168,6 +4173,102 @@ const READ_ONLY_OK: &[&str] = &[
     "attach-session", "detach-client", "has-session", "list-sessions", "list-windows", "list-panes", "list-clients", "list-buffers", "list-keys",
     "list-commands", "display-message", "show-options", "show-window-options", "show-environment", "show-hooks", "show-messages", "show-buffer",
     "capture-pane", "refresh-client", "switch-client", "server-access",
+];
+
+/// tmux 3.8's usage strings, in cmd_table order (list-commands prints them in this order).
+const USAGE: &[(&str, &str)] = &[
+    ("attach-session", "[-dErx] [-c working-directory] [-f flags] [-t target-session]"),
+    ("bind-key", "[-nr] [-T key-table] [-N note] key [command [argument ...]]"),
+    ("break-pane", "[-abdPW] [-F format] [-n window-name] [-s src-pane] [-t dst-window] [-x width] [-y height] [-X x-position] [-Y y-position]"),
+    ("capture-pane", "[-aCeFHIJLMNpPqRT] [-b buffer-name] [-E end-line] [-S start-line] [-t target-pane]"),
+    ("choose-buffer", "[-kNrZ] [-F format] [-f filter] [-K key-format] [-O sort-order] [-t target-pane] [template]"),
+    ("choose-client", "[-hikNrZ] [-F format] [-f filter] [-K key-format] [-O sort-order] [-t target-pane] [template]"),
+    ("choose-tree", "[-GhkNrswZ] [-F format] [-f filter] [-K key-format] [-O sort-order] [-t target-pane] [template]"),
+    ("clear-history", "[-H] [-t target-pane]"),
+    ("clear-prompt-history", "[-T prompt-type]"),
+    ("clock-mode", "[-t target-pane]"),
+    ("command-prompt", "[-1CbeFiklNP] [-I inputs] [-p prompts] [-t target-client] [-T prompt-type] [template]"),
+    ("confirm-before", "[-by] [-c confirm-key] [-p prompt] [-t target-client] command"),
+    ("copy-mode", "[-dekHMqSu] [-s src-pane] [-t target-pane]"),
+    ("customize-mode", "[-kNZ] [-F format] [-f filter] [-t target-pane]"),
+    ("delete-buffer", "[-b buffer-name]"),
+    ("detach-client", "[-aP] [-E shell-command] [-s target-session] [-t target-client]"),
+    ("display-menu", "[-MO] [-b border-lines] [-c target-client] [-C starting-choice] [-H selected-style] [-s style] [-S border-style] [-t target-pane] [-T title] [-x position] [-y position] name [key] [command] ..."),
+    ("display-message", "[-aCIjlNpv] [-c target-client] [-d delay] [-F format] [-t target-pane] [message]"),
+    ("display-popup", "[-BCEkN] [-b border-lines] [-c target-client] [-d start-directory] [-e environment] [-h height] [-s style] [-S border-style] [-t target-pane] [-T title] [-w width] [-x position] [-y position] [shell-command [argument ...]]"),
+    ("display-panes", "[-kNZ] [-d duration] [-s source-window] [-t target-pane] [template]"),
+    ("find-window", "[-CiNrTZ] [-t target-pane] match-string"),
+    ("has-session", "[-t target-session]"),
+    ("if-shell", "[-bF] [-t target-pane] shell-command command [command]"),
+    ("join-pane", "[-bdfhv] [-l size] [-s src-pane] [-t dst-pane]"),
+    ("kill-pane", "[-a] [-f filter] [-t target-pane]"),
+    ("kill-server", ""),
+    ("kill-session", "[-aCg] [-f filter] [-t target-session]"),
+    ("kill-window", "[-a] [-f filter] [-t target-window]"),
+    ("last-pane", "[-deZ] [-t target-window]"),
+    ("last-window", "[-t target-session]"),
+    ("link-window", "[-abdk] [-s src-window] [-t dst-window]"),
+    ("list-buffers", "[-F format] [-f filter] [-O order]"),
+    ("list-clients", "[-F format] [-f filter] [-O order][-t target-session]"),
+    ("list-commands", "[-F format] [command]"),
+    ("list-keys", "[-1aNr] [-F format] [-O order] [-P prefix-string][-T key-table] [key]"),
+    ("list-panes", "[-asr] [-F format] [-f filter] [-O order][-t target-window]"),
+    ("list-sessions", "[-r] [-F format] [-f filter] [-O order]"),
+    ("list-windows", "[-ar] [-F format] [-f filter] [-O order][-t target-session]"),
+    ("load-buffer", "[-b buffer-name] [-t target-client] path"),
+    ("lock-client", "[-t target-client]"),
+    ("lock-server", ""),
+    ("lock-session", "[-t target-session]"),
+    ("move-pane", "[-bdfhMv] [-D lines] [-l size] [-L columns] [-P position] [-R columns] [-s src-pane] [-t dst-pane] [-U lines] [-X x-position] [-Y y-position] [-z z-index]"),
+    ("move-window", "[-abdkr] [-s src-window] [-t dst-window]"),
+    ("new-pane", "[-AbCDefhIkKLMOPvWZ] [-B border-lines] [-c start-directory] [-e environment] [-F format] [-l size] [-m message] [-p percentage] [-s style] [-S active-border-style] [-R inactive-border-style] [-T title] [-x width] [-y height] [-X x-position] [-Y y-position] [-t target-pane] [shell-command [argument ...]]"),
+    ("new-session", "[-AdDEPX] [-c start-directory] [-e environment] [-F format] [-f flags] [-n window-name] [-s session-name] [-t target-session] [-x width] [-y height] [shell-command [argument ...]]"),
+    ("new-window", "[-abdEkPS] [-c start-directory] [-e environment] [-F format] [-n window-name] [-t target-window] [shell-command [argument ...]]"),
+    ("next-layout", "[-t target-window]"),
+    ("next-window", "[-a] [-t target-session]"),
+    ("paste-buffer", "[-dprS] [-s separator] [-b buffer-name] [-t target-pane]"),
+    ("pipe-pane", "[-IOo] [-t target-pane] [shell-command]"),
+    ("previous-layout", "[-t target-window]"),
+    ("previous-window", "[-a] [-t target-session]"),
+    ("refresh-client", "[-cDlLRSU] [-A pane:state] [-B name:what:format] [-C XxY] [-f flags] [-r pane:report] [-t target-client] [adjustment]"),
+    ("rename-session", "[-t target-session] new-name"),
+    ("rename-window", "[-t target-window] new-name"),
+    ("resize-pane", "[-MTZ] [-D lines] [-L columns] [-R columns] [-U lines] [-x width] [-y height] [-t target-pane]"),
+    ("resize-window", "[-aADLRU] [-x width] [-y height] [-t target-window] [adjustment]"),
+    ("respawn-pane", "[-Ek] [-c start-directory] [-e environment] [-t target-pane] [shell-command [argument ...]]"),
+    ("respawn-window", "[-Ek] [-c start-directory] [-e environment] [-t target-window] [shell-command [argument ...]]"),
+    ("rotate-window", "[-DUZ] [-t target-window]"),
+    ("run-shell", "[-bCE] [-c start-directory] [-d delay] [-t target-pane] [shell-command [argument ...]]"),
+    ("save-buffer", "[-a] [-b buffer-name] path"),
+    ("select-layout", "[-Enop] [-t target-pane] [layout-name]"),
+    ("select-pane", "[-DdeLlMmRUZ] [-T title] [-t target-pane]"),
+    ("select-window", "[-lnpT] [-t target-window]"),
+    ("send-keys", "[-FHKlMRX] [-c target-client] [-N repeat-count] [-t target-pane] [key ...]"),
+    ("send-prefix", "[-2] [-t target-pane]"),
+    ("server-access", "[-adglrw] [-t target-pane] [user|group]"),
+    ("set-buffer", "[-aw] [-b buffer-name] [-n new-buffer-name] [-t target-client] [data]"),
+    ("set-environment", "[-Fhgru] [-t target-session] variable [value]"),
+    ("set-hook", "[-agpERTuw] [-B name:what:format] [-t target-pane] [hook] [command]"),
+    ("set-option", "[-aFgopqsuUw] [-t target-pane] option [value]"),
+    ("set-window-option", "[-aFgoqu] [-t target-window] option [value]"),
+    ("show-buffer", "[-b buffer-name]"),
+    ("show-environment", "[-hgs] [-t target-session] [variable]"),
+    ("show-hooks", "[-Bgpw] [-F format] [-t target-pane] [hook]"),
+    ("show-messages", "[-JT] [-t target-client]"),
+    ("show-options", "[-AgHpqsvw] [-F format] [-t target-pane] [option]"),
+    ("show-prompt-history", "[-T prompt-type]"),
+    ("show-window-options", "[-gv] [-F format] [-t target-window] [option]"),
+    ("source-file", "[-Fnqv] [-t target-pane] path ..."),
+    ("split-window", "[-bdefhIklPvWZ] [-B border-lines] [-c start-directory] [-e environment] [-F format] [-l size] [-m message] [-p percentage] [-s style] [-S active-border-style] [-R inactive-border-style] [-T title] [-t target-pane] [shell-command [argument ...]]"),
+    ("start-server", ""),
+    ("suspend-client", "[-t target-client]"),
+    ("swap-pane", "[-dDUZ] [-s src-pane] [-t dst-pane]"),
+    ("swap-window", "[-d] [-s src-window] [-t dst-window]"),
+    ("switch-client", "[-ElnprZ] [-c target-client] [-t target-session] [-T key-table] [-O order]"),
+    ("switch-mode", "[-kswZ] [-F format] [-t target-pane] [command]"),
+    ("unbind-key", "[-anq] [-T key-table] key"),
+    ("unlink-window", "[-k] [-t target-window]"),
+    ("wait-for", "[-ELSUlv] [-F format] [-w waiter] name"),
 ];
 
 pub fn truthy(s: &str) -> bool {
