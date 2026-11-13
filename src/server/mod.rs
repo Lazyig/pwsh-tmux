@@ -315,6 +315,16 @@ impl PaneMode {
         }
     }
 
+    /// Set -k again when the mode is raised from the stack (window_pane_set_mode).
+    pub fn set_kill(&mut self, kill: bool) {
+        match self {
+            PaneMode::Tree(t) => t.kill = kill,
+            PaneMode::Switch(s) => s.kill = kill,
+            PaneMode::Panes(p) => p.kill = kill,
+            _ => {}
+        }
+    }
+
     /// -k: the pane is killed when the mode exits.
     pub fn kill_on_exit(&self) -> bool {
         match self {
@@ -349,7 +359,11 @@ pub struct Pane {
     pub start_path: String,
     pub title: String,
     pub dead: Option<(Option<i32>, u64)>,
+    /// The mode on top of the pane's mode stack (what is shown and gets keys).
     pub mode: Option<PaneMode>,
+    /// The modes under it (wp->modes after the first), the next one last: leaving the
+    /// top mode goes back to the one below.
+    pub mode_stack: Vec<PaneMode>,
     pub options: Options,
     pub pipe: Option<Sender<Vec<u8>>>,
     pub last_output: Instant,
@@ -392,8 +406,10 @@ impl Pane {
         self.size = (cols, rows);
         let _ = self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
         self.parser.set_size(nz(rows), nz(cols));
-        if let Some(PaneMode::Copy(cm)) = &mut self.mode {
-            cm.resize(cols, rows);
+        for m in self.mode.iter_mut().chain(self.mode_stack.iter_mut()) {
+            if let PaneMode::Copy(cm) = m {
+                cm.resize(cols, rows);
+            }
         }
     }
 
@@ -1632,11 +1648,14 @@ impl Server {
         let mut cm = CopyMode::new(lines, w, h, (0, 0), vi);
         // Start at the top of the output.
         cm.run("history-top", &[]);
-        if let Some(p) = self.panes.get_mut(&pane) {
+        // output replaces the view on top; any other mode stays under it
+        if let Some(p) = self.panes.get_mut(&pane).filter(|p| matches!(p.mode, Some(PaneMode::Copy(_)))) {
             p.mode = Some(PaneMode::Copy(Box::new(cm)));
-        }
-        if let Some(wid) = self.window_of(pane) {
-            self.mark_window_dirty(wid);
+            if let Some(wid) = self.window_of(pane) {
+                self.mark_window_dirty(wid);
+            }
+        } else {
+            self.set_pane_mode(pane, PaneMode::Copy(Box::new(cm)));
         }
     }
 
@@ -1985,6 +2004,7 @@ impl Server {
                 title,
                 dead: None,
                 mode: None,
+                mode_stack: Vec::new(),
                 options: existing_opts,
                 pipe: None,
                 last_output: Instant::now(),

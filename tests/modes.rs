@@ -220,3 +220,51 @@ fn customize_mode_empty_list_keeps_screen_and_any_key_exits() {
     t.send(b"j");
     wait_for("exited", || ctx.fmt("e", "#{pane_in_mode}") == "0");
 }
+
+#[test]
+fn modes_stack_and_leaving_one_restores_the_one_below() {
+    let ctx = Ctx::new("mode-stack");
+    let t = start(&ctx, "st");
+    ctx.ok(&["choose-tree", "-t", "st"]);
+    ctx.ok(&["setb", "hello"]);
+    ctx.ok(&["choose-buffer", "-t", "st"]);
+    assert_eq!(ctx.fmt("st", "#{pane_mode}"), "buffer-mode");
+    t.send(b"q");
+    wait_for("tree mode again", || ctx.fmt("st", "#{pane_mode}") == "tree-mode");
+    t.wait_screen("tree list", |s| s.contains("(0)") && s.contains("st:"));
+    // choose-tree with tree mode on top does nothing; panes mode stacks too
+    ctx.ok(&["choose-tree", "-t", "st"]);
+    ctx.ok(&["display-panes", "-d", "0", "-t", "st"]);
+    assert_eq!(ctx.fmt("st", "#{pane_mode}"), "panes-mode");
+    t.send(b"q");
+    wait_for("tree after panes", || ctx.fmt("st", "#{pane_mode}") == "tree-mode");
+    // panes mode does not stack under another mode (WINDOW_MODE_NO_STACK)
+    ctx.ok(&["display-panes", "-d", "0", "-t", "st"]);
+    ctx.ok(&["switch-mode", "-t", "st"]);
+    t.send(b"\x1b");
+    wait_for("tree after switch", || ctx.fmt("st", "#{pane_mode}") == "tree-mode");
+    // a mode already in the stack is raised instead of opened again
+    ctx.ok(&["clock-mode", "-t", "st"]);
+    ctx.ok(&["choose-tree", "-t", "st"]);
+    assert_eq!(ctx.fmt("st", "#{pane_mode}"), "tree-mode");
+    t.send(b"q");
+    wait_for("clock below", || ctx.fmt("st", "#{pane_mode}") == "clock-mode");
+    // copy-mode -q leaves all of them
+    ctx.ok(&["choose-tree", "-t", "st"]);
+    ctx.ok(&["copy-mode", "-q", "-t", "st"]);
+    assert_eq!(ctx.fmt("st", "#{pane_in_mode}"), "0");
+}
+
+#[test]
+fn send_keys_reach_tree_like_modes_only_with_a_client() {
+    let ctx = Ctx::new("mode-noclient");
+    ctx.ok(&["new-session", "-d", "-s", "b"]);
+    ctx.ok(&["switch-mode", "-t", "b"]);
+    ctx.ok(&["send-keys", "-t", "b", "Escape"]);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(ctx.fmt("b", "#{pane_mode}"), "switch-mode");
+    // copy mode has a key table, so its keys work without a client
+    ctx.ok(&["copy-mode", "-t", "b"]);
+    ctx.ok(&["send-keys", "-t", "b", "q"]);
+    wait_for("copy mode left", || ctx.fmt("b", "#{pane_mode}") == "switch-mode");
+}

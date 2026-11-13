@@ -498,15 +498,20 @@ impl Server {
         }
     }
 
-    /// The client a mode's commands run for: the one that opened it while it is attached.
+    /// The client a mode's commands run for: the one whose key or click it was (tmux passes
+    /// that client to mode_tree_run_command and friends), else the one that opened the mode.
     fn mode_client(&self, pane: PaneId, cid: Option<ClientId>) -> Option<ClientId> {
+        let attached = |c: &ClientId| self.clients.get(c).is_some_and(|c| c.attached);
+        if let Some(c) = cid.filter(attached) {
+            return Some(c);
+        }
         let opened = match self.panes.get(&pane).and_then(|p| p.mode.as_ref()) {
             Some(PaneMode::Tree(t)) => t.client,
             Some(PaneMode::Switch(s)) => s.client,
             Some(PaneMode::Panes(m)) => m.client,
             _ => None,
         };
-        opened.filter(|c| self.clients.get(c).is_some_and(|c| c.attached)).or(cid)
+        opened.filter(attached).or(cid)
     }
 
     fn run_mode_command(&mut self, client: Option<ClientId>, cmd: &str, pane: PaneId) {

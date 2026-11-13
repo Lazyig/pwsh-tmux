@@ -955,10 +955,10 @@ impl Server {
     }
 
     pub fn enter_copy_mode(&mut self, pane: PaneId) {
-        let Some(p) = self.panes.get(&pane) else { return };
-        if matches!(p.mode, Some(PaneMode::Copy(_))) {
+        if self.raise_mode(pane, "copy-mode", None) {
             return;
         }
+        let Some(p) = self.panes.get(&pane) else { return };
         let lines = p.snapshot();
         let (w, h) = p.size;
         let (cy, cx) = p.screen().cursor_position();
@@ -967,10 +967,7 @@ impl Server {
         let sid = self.session_of_pane(pane).map(|x| x.0);
         let mut cm = CopyMode::new(lines, w, h, (cy, cx), vi);
         cm.set_word_separators(&self.opt_session(sid, "word-separators"));
-        self.panes.get_mut(&pane).unwrap().mode = Some(PaneMode::Copy(Box::new(cm)));
-        if let Some(wid) = wid {
-            self.mark_window_dirty(wid);
-        }
+        self.set_pane_mode(pane, PaneMode::Copy(Box::new(cm)));
     }
 
     pub fn exit_mode(&mut self, pane: PaneId) {
@@ -981,10 +978,14 @@ impl Server {
                     p.track.search = s.to_string();
                 }
             }
-            p.track.unseen_changes = false;
             let Some(mode) = p.mode.take() else {
                 return;
             };
+            // window_pane_reset_mode: the next mode in the stack comes back
+            p.mode = p.mode_stack.pop();
+            if p.mode.is_none() {
+                p.track.unseen_changes = false;
+            }
             // window_pane_reset_mode: unzoom if the mode zoomed, kill the pane for -k
             if mode.zoomed_window() {
                 if let Some(wid) = self.window_of(pane) {
@@ -1002,6 +1003,13 @@ impl Server {
         }
         if let Some(wid) = self.window_of(pane) {
             self.mark_window_dirty(wid);
+        }
+    }
+
+    /// window_pane_reset_mode_all.
+    pub fn exit_all_modes(&mut self, pane: PaneId) {
+        while self.panes.get(&pane).is_some_and(|p| p.mode.is_some()) {
+            self.exit_mode(pane);
         }
     }
 
@@ -2457,7 +2465,7 @@ impl Server {
                 let tt = self.resolve_pane(ctx, t)?;
                 let mut pane = tt.pane.unwrap();
                 if o.has('q') {
-                    self.exit_mode(pane);
+                    self.exit_all_modes(pane);
                     return Ok(Flow::Next);
                 }
                 if o.has('M') {
@@ -2503,8 +2511,9 @@ impl Server {
             "clock-mode" => {
                 let tt = self.resolve_pane(ctx, t)?;
                 let pane = tt.pane.unwrap();
-                self.panes.get_mut(&pane).unwrap().mode = Some(PaneMode::Clock);
-                self.mark_window_dirty(tt.wid.unwrap());
+                if !self.raise_mode(pane, "clock-mode", None) {
+                    self.set_pane_mode(pane, PaneMode::Clock);
+                }
                 Ok(Flow::Next)
             }
             "choose-tree" | "choose-buffer" | "choose-client" | "customize-mode" => {
@@ -2524,7 +2533,13 @@ impl Server {
                 if (kind == TreeKind::Buffers && self.buffers.is_empty()) || (kind == TreeKind::Clients && !self.clients.values().any(|c| c.attached)) {
                     return Ok(Flow::Next);
                 }
-                if self.panes.get(&pane).and_then(|p| p.mode.as_ref()).is_some_and(|m| matches!(m, PaneMode::Tree(t) if t.kind == kind)) {
+                let name = match kind {
+                    TreeKind::Tree => "tree-mode",
+                    TreeKind::Buffers => "buffer-mode",
+                    TreeKind::Clients => "client-mode",
+                    TreeKind::Options => "options-mode",
+                };
+                if self.raise_mode(pane, name, Some(o.has('k'))) {
                     return Ok(Flow::Next);
                 }
                 let mut tree = Tree::new(kind, pane, tt);
@@ -2555,7 +2570,7 @@ impl Server {
             "switch-mode" => {
                 let tt = self.resolve_pane(ctx, t)?;
                 let pane = tt.pane.unwrap();
-                if matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Switch(_))) {
+                if self.raise_mode(pane, "switch-mode", Some(o.has('k'))) {
                     return Ok(Flow::Next);
                 }
                 let mut sw = Switch::new(pane, o.has('w'), o.get('F').map(String::from), o.rest.first().cloned());
@@ -2579,7 +2594,7 @@ impl Server {
                     Some(d) => options::strtonum(d, 0, u32::MAX as i64).map_err(|e| format!("delay {e}"))? as u64,
                     None => self.opt_window_num(tt.wid, "display-panes-time").max(0) as u64,
                 };
-                if matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Panes(_))) {
+                if self.raise_mode(pane, "panes-mode", Some(o.has('k'))) {
                     return Ok(Flow::Next);
                 }
                 let mut m = Panes {
@@ -3013,9 +3028,16 @@ impl Server {
                 // keys sent to a pane in copy mode are interpreted by the mode
                 let in_mode = self.panes.get(&pane).is_some_and(|p| p.mode.is_some());
                 if in_mode && !o.has('l') && !o.has('H') {
+                    // the target client (cmd_find_current_client) gets the keys: modes
+                    // without a key table see none when there is no client (window_pane_key)
+                    let tc = self.resolve_client(ctx, None).ok();
+                    let copy = matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(_)));
+                    if tc.is_none() && !copy {
+                        return Ok(Flow::Next);
+                    }
                     for k in &o.rest {
                         for _ in 0..n {
-                            self.mode_key(pane, ctx.client, k);
+                            self.mode_key(pane, tc.or(ctx.client), k);
                         }
                     }
                 } else if let Some(p) = self.panes.get(&pane) {
@@ -4005,10 +4027,35 @@ impl Server {
         false
     }
 
-    /// Put a pane into a mode (window_pane_set_mode), replacing any other.
+    /// The start of window_pane_set_mode for a mode named `name`: true when the pane is in
+    /// it already, on top (left alone) or further down the stack (raised to the top, with
+    /// `kill` as its new -k); a mode that does not stack (panes mode) on top is left first.
+    pub fn raise_mode(&mut self, pane: PaneId, name: &str, kill: Option<bool>) -> bool {
+        let Some(p) = self.panes.get(&pane) else { return true };
+        match &p.mode {
+            Some(m) if m.name() == name => return true,
+            Some(PaneMode::Panes(_)) => self.exit_mode(pane),
+            _ => {}
+        }
+        let Some(p) = self.panes.get_mut(&pane) else { return true };
+        let Some(i) = p.mode_stack.iter().position(|m| m.name() == name) else { return false };
+        let mut m = p.mode_stack.remove(i);
+        if let Some(k) = kill {
+            m.set_kill(k);
+        }
+        let old = std::mem::replace(&mut p.mode, Some(m));
+        p.mode_stack.extend(old);
+        if let Some(wid) = self.window_of(pane) {
+            self.mark_window_dirty(wid);
+        }
+        true
+    }
+
+    /// Put a pane into a new mode on top of any it is in (window_pane_set_mode).
     pub fn set_pane_mode(&mut self, pane: PaneId, mode: PaneMode) {
         if let Some(p) = self.panes.get_mut(&pane) {
-            p.mode = Some(mode);
+            let old = std::mem::replace(&mut p.mode, Some(mode));
+            p.mode_stack.extend(old);
         }
         if let Some(wid) = self.window_of(pane) {
             self.mark_window_dirty(wid);
