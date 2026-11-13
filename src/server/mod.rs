@@ -54,6 +54,13 @@ pub fn now_secs() -> u64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// A counter ordering session activity updates made within the same second (tmux
+/// compares the timevals, so the session used last is the current one).
+pub fn activity_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
 pub enum Event {
     Conn(Stream),
     ClientMsg(ClientId, u8, Vec<u8>),
@@ -472,6 +479,8 @@ pub struct Session {
     pub hooks: BTreeMap<String, Vec<String>>,
     pub created: u64,
     pub activity: u64,
+    /// activity_seq() at the last activity update.
+    pub activity_seq: u64,
     pub last_attached: u64,
     pub alerts: BTreeMap<u32, u8>,
     /// Session group (new-session -t): members share one window list.
@@ -1053,7 +1062,7 @@ impl Server {
     }
 
     pub fn current_session(&self) -> Option<SessId> {
-        self.sessions.values().max_by_key(|s| (s.activity, s.id)).map(|s| s.id)
+        self.sessions.values().max_by_key(|s| s.activity_seq).map(|s| s.id)
     }
 
     pub fn mark_session_dirty(&mut self, sid: SessId) {
@@ -1344,6 +1353,11 @@ impl Server {
             C_INPUT => {
                 if let Some(c) = self.clients.get_mut(&cid) {
                     c.activity = now_secs();
+                }
+                // so does the session's (server_client_handle_key)
+                if let Some(s) = self.clients.get(&cid).filter(|c| c.attached).and_then(|c| c.session).and_then(|s| self.sessions.get_mut(&s)) {
+                    s.activity = now_secs();
+                    s.activity_seq = activity_seq();
                 }
                 self.handle_input(cid, &payload);
             }
@@ -2199,6 +2213,7 @@ impl Server {
         if let Some(s) = self.sessions.get_mut(&sid) {
             s.last_attached = now;
             s.activity = now;
+            s.activity_seq = activity_seq();
             if writable && update_env {
                 s.env.extend(cmds::environ_update(&names, &env));
             }

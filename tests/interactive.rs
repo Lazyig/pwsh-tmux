@@ -486,3 +486,23 @@ fn menu_and_popup_lines_styles_and_closing_keys() {
         wait_for("waiting command", || w.try_wait().unwrap().is_some());
     }
 }
+
+#[test]
+fn attaching_and_typing_make_the_session_current() {
+    let ctx = Ctx::new("p1fix-attcur");
+    ctx.ok(&["new-session", "-d", "-s", "a", "sleep 100"]);
+    ctx.ok(&["new-session", "-d", "-s", "b", "sleep 100"]);
+    assert_eq!(ctx.ok(&["display-message", "-p", "#S"]), "b\n");
+    // attaching updates the session's activity: commands from outside now use it,
+    // with or without -c (cmd_find_best_session)
+    let t = Term::attach(&ctx, &["attach-session", "-t", "a"], 80, 24);
+    t.wait_screen("attach", |s| s.contains("[a]"));
+    assert_eq!(ctx.ok(&["display-message", "-p", "#S"]), "a\n");
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]);
+    assert_eq!(ctx.ok(&["display-message", "-p", "-c", client.trim(), "#S #{client_session}"]), "a a\n");
+    ctx.ok(&["new-session", "-d", "-s", "c", "sleep 100"]);
+    assert_eq!(ctx.ok(&["display-message", "-p", "-c", client.trim(), "#S #{client_session}"]), "c a\n");
+    // so do keys from its client
+    t.send(b"x");
+    wait_for("key activity", || ctx.ok(&["display-message", "-p", "#S"]) == "a\n");
+}

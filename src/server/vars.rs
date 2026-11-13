@@ -156,7 +156,7 @@ impl Vars for VarCtx<'_> {
             'S' => {
                 let mut sessions: Vec<_> = self.srv.sessions.values().collect();
                 if flags.contains('n') { sessions.sort_by(|a, b| a.name.cmp(&b.name)); }
-                else if flags.contains('t') { sessions.sort_by_key(|s| (std::cmp::Reverse(s.activity), s.id)); }
+                else if flags.contains('t') { sessions.sort_by_key(|s| std::cmp::Reverse(s.activity_seq)); }
                 for s in sessions {
                     let wid = s.links.get(&s.active).copied();
                     let pane = wid.and_then(|w| self.srv.windows.get(&w)).map(|w| w.active);

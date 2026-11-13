@@ -667,7 +667,7 @@ impl Server {
             match order {
                 sort::Order::Index => a.id.cmp(&b.id),
                 sort::Order::Creation => (a.created, a.id).cmp(&(b.created, b.id)),
-                sort::Order::Activity => b.activity.cmp(&a.activity),
+                sort::Order::Activity => b.activity_seq.cmp(&a.activity_seq),
                 sort::Order::Name => a.name.cmp(&b.name),
                 _ => Ordering::Equal,
             }
@@ -861,6 +861,7 @@ impl Server {
                 hooks: BTreeMap::new(),
                 created: now,
                 activity: now,
+                activity_seq: super::activity_seq(),
                 last_attached: 0,
                 alerts: BTreeMap::new(),
                 group: None,
@@ -899,8 +900,9 @@ impl Server {
             s.last.insert(0, a);
             s.active = idx;
         }
+        // session_set_current leaves the session's activity alone: only attaching and
+        // keys from its clients count
         s.alerts.remove(&idx);
-        s.activity = now_secs();
         self.mark_session_dirty(sid);
         self.run_hook(Some(sid), "session-window-changed", Ctx::default());
     }
@@ -3649,6 +3651,7 @@ impl Server {
             hooks: BTreeMap::new(),
             created: now,
             activity: now,
+            activity_seq: super::activity_seq(),
             last_attached: 0,
             alerts: BTreeMap::new(),
             group: Some(gid),

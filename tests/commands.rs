@@ -1302,3 +1302,16 @@ fn display_message_verbose() {
     assert!(out.starts_with(want), "{out}");
     assert!(out.ends_with("# result is: v y\nv y\n"), "{out}");
 }
+
+#[test]
+fn current_session_is_the_last_used() {
+    let ctx = Ctx::new("p1fix-cur");
+    ctx.ok(&["new-session", "-d", "-s", "a", "sleep 100"]);
+    ctx.ok(&["new-session", "-d", "-s", "b", "sleep 100"]);
+    // created in the same second: the newer session is the current one
+    assert_eq!(ctx.ok(&["display-message", "-p", "#S"]), "b\n");
+    // selecting a window is not activity (session_set_current)
+    ctx.ok(&["select-window", "-t", "a:0"]);
+    assert_eq!(ctx.ok(&["display-message", "-p", "#S"]), "b\n");
+    assert_eq!(ctx.ok(&["list-sessions", "-O", "activity", "-F", "#S"]), "b\na\n");
+}
