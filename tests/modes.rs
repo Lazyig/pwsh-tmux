@@ -316,3 +316,39 @@ fn choose_buffer_and_tree_sort_like_sort_c() {
         wait_for("left", || ctx.fmt("so", "#{pane_in_mode}") == "0");
     }
 }
+
+#[test]
+fn switch_mode_builds_the_list_again_as_keys_are_typed() {
+    let ctx = Ctx::new("switch-rebuild");
+    ctx.ok(&["new-session", "-d", "-s", "beta"]);
+    let t = start(&ctx, "alpha");
+    ctx.ok(&["switch-mode", "-t", "alpha"]);
+    t.wait_screen("list", |s| s.lines().any(|l| l.starts_with("beta ")));
+    ctx.ok(&["new-session", "-d", "-s", "gamma"]);
+    ctx.ok(&["rename-session", "-t", "beta", "delta"]);
+    t.send(b"a");
+    t.wait_screen("rebuilt", |s| s.lines().any(|l| l.starts_with("gamma ")) && s.lines().any(|l| l.starts_with("delta ")));
+    t.send(b"\x7fde\r");
+    wait_for("switched", || ctx.ok(&["list-clients", "-F", "#{client_session}"]).trim() == "delta");
+}
+
+#[test]
+fn mode_choices_apply_to_the_client_that_pressed_the_key() {
+    let ctx = Ctx::new("mode-presser");
+    ctx.ok(&["new-session", "-d", "-s", "beta"]);
+    let a = start(&ctx, "alpha");
+    let ca = client(&ctx);
+    let b = Term::attach(&ctx, &["attach", "-t", "alpha"], 100, 40);
+    b.wait_screen("second client", |s| s.contains("[alpha]"));
+    a.send(b"\x02s");
+    b.wait_screen("tree", |s| s.contains("(1)") && s.contains("beta"));
+    // the tree starts on alpha's window; Down goes to beta
+    b.send(b"\x1b[B");
+    std::thread::sleep(Duration::from_millis(200));
+    b.send(b"\r");
+    wait_for("b switched", || {
+        let l = ctx.ok(&["list-clients", "-F", "#{client_name} #{client_session}"]);
+        l.lines().any(|x| x == format!("{ca} alpha")) && l.lines().any(|x| !x.starts_with(&ca) && x.ends_with(" beta"))
+    });
+    let _ = a;
+}

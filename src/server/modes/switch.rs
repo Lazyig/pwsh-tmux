@@ -39,8 +39,8 @@ pub struct Switch {
     /// -k: kill the pane when the mode exits.
     pub kill: bool,
     pub client: Option<ClientId>,
-    /// The list as built (window_switch_build runs on entry, resize and typing, not when the
-    /// sessions change): the width and each item's target and text.
+    /// The list as built (window_switch_build runs on entry, resize and each key the prompt
+    /// handles, not when the sessions change): the width and each item's target and text.
     built: std::cell::RefCell<Option<(usize, Vec<(String, String)>)>>,
 }
 
@@ -166,12 +166,11 @@ impl Switch {
         }
         match self.prompt.key(name) {
             PromptKey::Handled => {
-                let text = self.prompt.text();
-                if text != self.filter {
-                    self.filter = text;
-                    self.current = 0;
-                    self.offset = 0;
-                }
+                // window_switch_prompt_callback: every handled key builds the list again
+                self.filter = self.prompt.text();
+                self.snapshot(srv, w);
+                self.current = 0;
+                self.offset = 0;
                 return ModeAction::None;
             }
             PromptKey::Done(_) | PromptKey::Cancel => return ModeAction::None,
