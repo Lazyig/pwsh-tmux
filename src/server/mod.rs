@@ -1363,6 +1363,7 @@ impl Server {
             C_RESUMED => {
                 if let Some(c) = self.clients.get_mut(&cid) {
                     c.suspended = false;
+                    c.terminal.query_started();
                     c.prev = None;
                     c.dirty = true;
                 }
@@ -2173,6 +2174,7 @@ impl Server {
         c.dirty = true;
         c.key_table = "root".into();
         if !was_attached {
+            if c.control == 0 { c.terminal.query_started(); }
             c.send(S_ATTACHED, b"");
         }
         let writable = !self.client_is_readonly(Some(cid));

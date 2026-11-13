@@ -4,7 +4,6 @@
 use super::*;
 use crate::cells::{Cell, Color, Line, Style, BOLD, INVERSE};
 use std::collections::HashSet;
-use unicode_width::UnicodeWidthChar;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TreeKind {
@@ -45,25 +44,10 @@ pub enum TreeAction {
     Run(String),
 }
 
-fn line_from(text: &str, width: usize, style: Style) -> Line {
-    let mut cells = Vec::with_capacity(width);
-    for ch in text.chars() {
-        let w = ch.width().unwrap_or(0);
-        if w == 0 {
-            if let Some(cell) = cells.iter_mut().rev().find(|c: &&mut Cell| !c.text.is_empty()) { cell.text.push(ch); }
-            continue;
-        }
-        if cells.len() + w > width {
-            break;
-        }
-        cells.push(Cell { text: ch.to_string(), style });
-        if w == 2 {
-            cells.push(Cell { text: String::new(), style });
-        }
-    }
-    while cells.len() < width {
-        cells.push(Cell { text: " ".into(), style });
-    }
+fn line_from(text: &str, width: usize, style: Style, ctx: &dyn crate::format::Vars, selected: bool) -> Line {
+    let mut cells = crate::format::layout_line(&crate::format::spans_with(text, style, Some(ctx)), width, style);
+    // mode-tree's selected line ignores embedded colours, including the padding.
+    if selected { for cell in &mut cells { cell.style = style; } }
     Line { cells, wrapped: false }
 }
 
@@ -322,14 +306,16 @@ impl Tree {
         if height < 10 || h.saturating_sub(height) < 2 { h } else { height }
     }
 
-    pub fn render(&self, srv: &Server, w: u16, h: u16) -> Vec<Line> {
+    pub fn render(&self, srv: &Server, cid: ClientId, w: u16, h: u16) -> Vec<Line> {
         use super::render::{Frame, draw_box};
         let list_h = self.list_height(h as usize);
         let mut f = Frame::new(w, h);
         let top = self.top.min(self.sel).max((self.sel + 1).saturating_sub(list_h));
         let pane = self.items.get(self.sel).and_then(|i| i.preview);
         let wid = srv.target_for_pane(self.owner).wid;
-        let selected = crate::format::parse_style(&srv.opt_window(wid, "mode-style"), Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() }).unwrap_or_default();
+        let ctx = super::vars::VarCtx { srv, t: srv.target_for_pane(self.owner), client: Some(cid), extra: HashMap::new() };
+        let border = crate::format::parse_style_with(&srv.opt_window(wid, "tree-mode-border-style"), Style::default(), Some(&ctx)).map(|p| p.style).unwrap_or_default();
+        let selected = crate::format::parse_style_with(&srv.opt_window(wid, "tree-mode-selection-style"), Style::default(), Some(&ctx)).map(|p| p.style).unwrap_or_default();
         for row in 0..list_h {
             let i = top + row;
             let Some(it) = self.items.get(i) else { continue };
@@ -339,15 +325,15 @@ impl Tree {
             let last = self.items.get(i + 1).is_none_or(|n| n.depth < it.depth) || !self.items[i+1..].iter().take_while(|n| n.depth >= it.depth).any(|n| n.depth == it.depth);
             let indent = if it.depth == 0 { String::new() } else { format!("{}{}", "    ".repeat(it.depth.saturating_sub(1) as usize), if last { "└─> " } else { "├─> " }) };
             let text = format!("{quick}{indent}{arrow}{}{}", it.label, if self.tagged.contains(&it.id) { "*" } else { "" });
-            let style = if i == self.sel { selected } else if self.tagged.contains(&it.id) { Style { attrs: BOLD, ..Style::default() } } else { Style::default() };
-            f.put_cells(0, row as u16, &line_from(&text, w as usize, style).cells);
+            let style = if i == self.sel { selected } else if self.tagged.contains(&it.id) { Style { fg: crate::format::parse_color_with("themecyan", Some(&ctx)).unwrap_or(Color::Default), attrs: BOLD, ..Style::default() } } else { Style::default() };
+            f.put_cells(0, row as u16, &line_from(&text, w as usize, style, &ctx, i == self.sel).cells);
         }
         let y = list_h as u16;
         if h.saturating_sub(y) > 4 && w > 4 {
             if let Some(it) = self.items.get(self.sel) {
-                draw_box(&mut f, 0, y, w, h-y, Style::default(), "");
+                draw_box(&mut f, 0, y, w, h-y, border, "");
                 let name = if self.kind == TreeKind::Buffers { it.target.clone() } else { it.target.rsplit(':').next().unwrap_or(&it.target).to_string() };
-                f.text(1, y, &format!(" {name} (sort: {}) ", if self.kind == TreeKind::Buffers { "time" } else { "index" }), Style::default(), w-1);
+                f.text(1, y, &format!(" {name} (sort: {}) ", if self.kind == TreeKind::Buffers { "time" } else { "index" }), border, w-1);
                 let (pw,ph) = (w-4,h-y-2);
                 if self.kind == TreeKind::Buffers {
                     if let Some(b) = srv.buffers.iter().find(|b| b.name == it.target) {
@@ -375,15 +361,15 @@ impl Tree {
                                 f.set(x+xx,y+1+yy,cell);
                             }
                         } }
-                        if i != start+visible-1 { for yy in 0..ph { f.text(x+width,y+1+yy,"│",Style::default(),w); } }
+                        if i != start+visible-1 { for yy in 0..ph { f.text(x+width,y+1+yy,"│",border,w); } }
                         let label = format!(" {i} ");
                         let len = label.len() as u16;
                         if len <= each && ph > 1 {
                             let ox = (each-len+1)/2;
                             let oy = (ph+1)/2;
-                            if ox>1 && ox+len<each-1 && ph>=3 { draw_box(&mut f,x+ox-1,y+oy,len+2,3,Style::default(),""); }
+                            if ox>1 && ox+len<each-1 && ph>=3 { draw_box(&mut f,x+ox-1,y+oy,len+2,3,border,""); }
                             let color = if *id==window.active { "display-panes-active-colour" } else { "display-panes-colour" };
-                            let style = Style { fg: crate::format::parse_color(&srv.opt_window(Some(window.id),color)).unwrap_or(Color::Default), ..Style::default() };
+                            let style = Style { fg: crate::format::parse_color_with(&crate::format::expand(&srv.opt_window(Some(window.id),color), &ctx), Some(&ctx)).unwrap_or(Color::Default), ..Style::default() };
                             f.text(x+ox,y+1+oy,&label,style,w-2);
                         }
                     }

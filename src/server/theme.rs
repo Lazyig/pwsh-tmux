@@ -16,6 +16,8 @@ pub struct Terminal {
 }
 
 impl Terminal {
+    pub fn query_started(&mut self) { self.pending = Some(Instant::now()); }
+    pub fn querying(self) -> bool { self.pending.is_some_and(|t| t.elapsed() < Duration::from_secs(5)) }
     pub fn detected(self) -> Option<Theme> {
         self.reported.or_else(|| self.bg.and_then(background_theme))
     }
@@ -172,12 +174,13 @@ impl Server {
         if c.denied { return true; }
         if let Some(t) = reported {
             c.terminal.reported = Some(t);
-            c.terminal.pending = Some(Instant::now());
+            c.terminal.query_started();
             // tmux waits for colour replies before forwarding the theme notification.
             c.send(S_OUTPUT, b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
         }
         if let Some((fg, colour)) = colour {
-            if fg { c.terminal.fg = Some(colour) } else { c.terminal.bg = Some(colour); c.terminal.pending = None; }
+            c.terminal.pending = None;
+            if fg { c.terminal.fg = Some(colour) } else { c.terminal.bg = Some(colour); }
         }
         c.prev = None;
         c.dirty = true;
@@ -191,7 +194,9 @@ impl Server {
 
     fn pane_clients(&self, pane: PaneId) -> impl Iterator<Item = &Client> {
         let wid = self.window_of(pane);
-        self.clients.values().filter(move |c| {
+        let mut clients: Vec<_> = self.clients.values().collect();
+        clients.sort_by_key(|c| c.id);
+        clients.into_iter().filter(move |c| {
             c.attached && c.control == 0 && (wid.is_some_and(|w| c.session.and_then(|s| self.sessions.get(&s)).is_some_and(|s| s.links.values().any(|id| *id == w)))
                 || matches!(&c.overlay, Some(Overlay::Popup(p)) if p.pane == pane))
         })
@@ -236,7 +241,7 @@ impl Server {
     pub(super) fn notify_pane_themes(&mut self) {
         let panes: Vec<_> = self.panes.keys().copied().collect();
         for id in panes {
-            if self.pane_clients(id).any(|c| c.terminal.pending.is_some_and(|t| t.elapsed() < Duration::from_secs(1))) { continue; }
+            if self.pane_clients(id).any(|c| c.terminal.querying()) { continue; }
             let terminal = self.pane_colours(id);
             let p = self.panes.get_mut(&id).unwrap();
             let enabled = p.screen().theme_updates();
@@ -378,9 +383,47 @@ mod tests {
     }
 
     #[test]
+    fn pane_theme_consensus_palette_and_control_reports() {
+        let mut srv = server();
+        srv.exec(vec!["new-session".into(), "-d".into(), "-s".into(), "theme".into(), "sleep 30".into()], &mut Ctx::default()).unwrap();
+        let sid = srv.sessions.values().find(|s| s.name == "theme").unwrap().id;
+        let wid = srv.sessions[&sid].active_window();
+        let pane = srv.windows[&wid].active;
+        let c = srv.clients.get_mut(&1).unwrap();
+        c.session = Some(sid);
+        c.terminal.reported = Some(Theme::Dark);
+        c.terminal.bg = Some(Color::Rgb(0, 0, 0));
+        let mut second = server().clients.remove(&1).unwrap();
+        second.id = 2;
+        second.session = Some(sid);
+        second.terminal.reported = Some(Theme::Light);
+        second.terminal.bg = Some(Color::Rgb(255, 255, 255));
+        srv.clients.insert(2, second);
+        let defaults = srv.pane_colours(pane);
+        assert_eq!(defaults.reported, None); // conflicting explicit themes: use pane background
+        assert_eq!(defaults.bg, Some(Color::Rgb(0, 0, 0))); // first attached client
+        let cb = srv.panes.get_mut(&pane).unwrap().parser.callbacks_mut();
+        cb.colours.bg = Some(Color::Rgb(255, 255, 255));
+        cb.colours.update(defaults);
+        assert_eq!(cb.colours.theme(), Some(Theme::Light));
+        srv.clients.get_mut(&2).unwrap().control = 1;
+        assert_eq!(srv.pane_colours(pane).reported, Some(Theme::Dark));
+        srv.clients.get_mut(&1).unwrap().terminal.reported = None;
+        srv.theme_control_report(&format!("%{pane}:\x1b]11;rgb:00/00/00\x07"));
+        let cb = srv.panes.get_mut(&pane).unwrap().parser.callbacks_mut();
+        assert_eq!(cb.colours.theme(), Some(Theme::Dark)); // control report wins over pane palette
+        let mut replies = Vec::new();
+        cb.colours.osc(&[b"11", b"?"], true, &mut replies);
+        assert_eq!(replies, b"\x1b]11;rgb:0000/0000/0000\x07");
+        srv.kill_session(sid, false);
+    }
+
+    #[test]
     fn pane_queries_and_notifications_preserve_terminal_theme() {
         let nz = |n| NonZeroU16::new(n).unwrap();
         let mut parser = vt100::Parser::new_with_callbacks(nz(24), nz(80), 10, PaneCb::default());
+        parser.process(b"\x1b[?996n\x1b]10;?\x07\x1b]11;?\x07");
+        assert!(parser.callbacks().replies.is_empty());
         parser.callbacks_mut().colours.update(Terminal { reported: Some(Theme::Light), fg: Some(Color::Rgb(1, 2, 3)), bg: Some(Color::Rgb(255, 255, 255)), ..Terminal::default() });
         parser.process(b"\x1b[?25;2031h");
         assert!(parser.callbacks().replies.is_empty());
