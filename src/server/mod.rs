@@ -754,11 +754,29 @@ pub struct Ctx {
     pub formats: Option<Arc<HashMap<String, String>>>,
     /// Typed by a control client (its reply's %begin flags are 1).
     pub control_line: bool,
+    /// A hook's current state (cmd_find_state): its session and winlink as well as
+    /// `pane`, used while `pane` is still that pane.
+    pub target: Option<vars::Target>,
+    /// A control client's reply blocks were written item by item.
+    pub control_done: bool,
+    /// The queue waits inside a control client's command: its block is not written yet.
+    pub control_open: bool,
 }
 
-/// Queue markers source-file puts around a file's commands (never typed: they start with NUL).
-pub const FILE_PUSH: &str = "\0file-push";
-pub const FILE_POP: &str = "\0file-pop";
+/// Queue markers source-file puts around a file's commands. A parsed command can hold any
+/// bytes (a NUL in a config file too), so each marker carries a nonce chosen at startup.
+pub fn internal_mark(name: &str) -> String {
+    use std::hash::{BuildHasher, Hasher};
+    static NONCE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+        h.write_u32(std::process::id());
+        h.finish()
+    });
+    format!("\0{name}\0{:016x}", *NONCE)
+}
+pub static FILE_PUSH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("file-push"));
+pub static FILE_POP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("file-pop"));
 
 /// The tmux release whose behaviour this server matches (`#{version}`).
 pub const TMUX_VERSION: &str = "3.8";
@@ -809,9 +827,7 @@ pub struct Server {
     pub messages: VecDeque<(u64, String)>,
     pub prompt_history: Vec<String>,
     pub jobs: HashMap<u32, Parked>,
-    pub waits: HashMap<String, (bool, Vec<Queue>)>,
-    /// wait-for channels signalled while nobody waited (the next wait returns at once).
-    pub waits_woken: std::collections::HashSet<String>,
+    pub waits: HashMap<String, events::Channel>,
     pub overlay_waits: Vec<(ClientId, u64, String, Queue)>,
     /// Copy-mode panes scrolling while a selection drag rests at an edge.
     pub copy_drag_timers: HashMap<PaneId, Instant>,
@@ -952,7 +968,6 @@ impl Server {
             prompt_history: Vec::new(),
             jobs: HashMap::new(),
             waits: HashMap::new(),
-            waits_woken: Default::default(),
             overlay_waits: Vec::new(),
             copy_drag_timers: HashMap::new(),
             pane_info_busy: false,
@@ -2459,23 +2474,64 @@ impl Server {
         self.drain_hooks();
     }
 
+    /// A control client's reply for the item just run (cmdq_guard): each command,
+    /// including those of hooks, gets its own %begin/%end (or %error) block, and the
+    /// notifications it caused are written before the next one.
+    fn control_item_done(&mut self, q: &mut Queue, err: Option<&str>) {
+        let (Some(seq), Some(cid)) = (q.ctx.control_seq, q.ctx.client) else { return };
+        q.ctx.control_open = false;
+        let out = std::mem::take(&mut q.ctx.out);
+        // hook commands run with a new state, without CMDQ_STATE_CONTROL
+        let typed = q.ctx.control_line && q.ctx.hook_depth == 0;
+        self.control_block(cid, seq, typed, &out, err);
+        self.control_flush(cid);
+        q.ctx.control_done = true;
+        if let Some(c) = self.clients.get_mut(&cid) {
+            c.control_seq += 1;
+            q.ctx.control_seq = Some(c.control_seq);
+        }
+    }
+
+    /// Drops the rest of the hook command list an error happened in (cmdq_remove_group
+    /// for the hook's item): up to and including its closing mark.
+    fn skip_hook_list(q: &mut Queue, saved: &mut events::HookSaved) {
+        let mut depth = 0usize;
+        while let Some(cmd) = q.cmds.pop_front() {
+            match events::hook_mark_kind(&cmd) {
+                Some(true) => depth += 1,
+                Some(false) if depth == 0 => {
+                    events::apply_hook_mark(&cmd, &mut q.ctx, saved);
+                    return;
+                }
+                Some(false) => depth -= 1,
+                None => q.soft = q.soft.saturating_sub(1),
+            }
+        }
+    }
+
     fn run_queue_inner(&mut self, mut q: Queue) {
         let mut hook_saved = Vec::new();
         // an error whose command-error hook runs first
         let mut failed: Option<String> = None;
+        // the first error of a hook's commands: it ends only that hook's list
+        let mut hook_failed: Option<String> = None;
+        if q.ctx.control_open {
+            // the command the queue waited in is done
+            self.control_item_done(&mut q, None);
+        }
         while let Some(cmd) = q.cmds.pop_front() {
             let name = cmd.first().cloned().unwrap_or_default();
-            if name == events::HOOK_MARK {
+            if events::hook_mark_kind(&cmd).is_some() {
                 events::apply_hook_mark(&cmd, &mut q.ctx, &mut hook_saved);
                 continue;
             }
             let soft = q.soft > 0;
             q.soft = q.soft.saturating_sub(1);
-            if name == FILE_PUSH {
+            if name == *FILE_PUSH {
                 q.ctx.files.push(cmd.get(1).cloned().unwrap_or_default());
                 continue;
             }
-            if name == FILE_POP {
+            if name == *FILE_POP {
                 q.ctx.files.pop();
                 continue;
             }
@@ -2491,9 +2547,36 @@ impl Server {
             let readonly = self.readonly_context.replace(q.ctx.readonly);
             self.detect_changes(cmds::canonical(&name));
             self.readonly_context.set(readonly);
+            if let Err(e) = &result && !e.starts_with('\0') && !soft && !hook_saved.is_empty() {
+                // a hook command: the error ends that hook's list, the rest goes on
+                self.cur_mouse = saved_mouse;
+                self.cur_file = saved_file;
+                self.ev.cur_formats = saved_formats;
+                self.ev.in_hook = saved_hook;
+                if q.ctx.control_seq.is_some() {
+                    self.control_item_done(&mut q, Some(e));
+                } else if hook_failed.is_none() {
+                    hook_failed = Some(e.clone());
+                }
+                Self::skip_hook_list(&mut q, &mut hook_saved);
+                continue;
+            }
             if let Err(e) = &result && !e.starts_with('\0') {
                 self.command_hook("command-error", &argv, &q.ctx);
                 let hooks = std::mem::take(&mut self.ev.inject);
+                if q.ctx.control_seq.is_some() && !soft {
+                    // %error first, then the hook as items of their own; the rest of
+                    // the command list is removed
+                    self.cur_mouse = saved_mouse;
+                    self.cur_file = saved_file;
+                    self.ev.cur_formats = saved_formats;
+                    self.ev.in_hook = saved_hook;
+                    self.control_item_done(&mut q, Some(e));
+                    q.cmds.clear();
+                    q.soft = 0;
+                    q.cmds.extend(hooks);
+                    continue;
+                }
                 if !hooks.is_empty() && failed.is_none() {
                     // the hook runs in place of the rest of the command list
                     if !soft {
@@ -2528,14 +2611,17 @@ impl Server {
                     for c in std::mem::take(&mut self.ev.inject).into_iter().rev() {
                         q.cmds.push_front(c);
                     }
+                    self.control_item_done(&mut q, None);
                 }
                 Err(e) if soft && !e.starts_with('\0') => {
                     log(&format!("{e}"));
                     self.add_message(&e);
                     q.ctx.out.push_str(&e);
                     q.ctx.out.push('\n');
+                    self.control_item_done(&mut q, None);
                 }
                 Ok(Flow::WaitOverlay(cid, epoch)) => {
+                    q.ctx.control_open = q.ctx.control_seq.is_some();
                     self.overlay_waits.push((cid, epoch, name, q));
                     return;
                 }
@@ -2546,19 +2632,24 @@ impl Server {
                     for c in std::mem::take(&mut self.ev.inject).into_iter().rev() {
                         q.cmds.push_front(c);
                     }
+                    self.control_item_done(&mut q, None);
                 }
                 Err(e) if e.starts_with('\0') => {
                     // async commands: park the rest of the queue
                     let parts: Vec<String> = e.split('\0').map(String::from).collect();
                     let get = |i: usize| parts.get(i).cloned().unwrap_or_default();
+                    // the reply of the command waited in is written when it is done
+                    let open = q.ctx.control_seq.is_some() && get(1) != "delay";
                     match get(1).as_str() {
                         "job-if" => {
                             let kind = JobKind::IfShell { then: get(3), otherwise: Some(get(4)).filter(|s| !s.is_empty()) };
                             if get(5) == "b" {
-                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: Default::default(), ..q.ctx.clone() }, soft: 0 };
+                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: Default::default(), control_seq: None, ..q.ctx.clone() }, soft: 0 };
                                 self.spawn_job(&get(2), None, kind, sub);
+                                self.control_item_done(&mut q, None);
                                 continue;
                             }
+                            q.ctx.control_open = open;
                             self.spawn_job(&get(2), None, kind, q);
                             return;
                         }
@@ -2568,18 +2659,27 @@ impl Server {
                             let cwd = Some(get(3)).filter(|s| !s.is_empty());
                             let kind = JobKind::RunShell { pane, background, stderr: get(4).contains('E') };
                             if background {
-                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: Default::default(), ..q.ctx.clone() }, soft: 0 };
+                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: Default::default(), control_seq: None, ..q.ctx.clone() }, soft: 0 };
                                 self.spawn_job(&get(2), cwd, kind, sub);
+                                self.control_item_done(&mut q, None);
                                 continue;
                             }
+                            q.ctx.control_open = open;
                             self.spawn_job(&get(2), cwd, kind, q);
                             return;
                         }
                         "wait" => {
-                            self.waits.entry(get(2)).or_insert((false, Vec::new())).1.push(q);
+                            q.ctx.control_open = open;
+                            self.waits.entry(get(2)).or_default().waiters.push(q);
+                            return;
+                        }
+                        "lock" => {
+                            q.ctx.control_open = open;
+                            self.waits.entry(get(2)).or_default().lockers.push(q);
                             return;
                         }
                         "wait-event" => {
+                            q.ctx.control_open = open;
                             self.park_event_waiter(get(2), get(3), get(4) == "v", q);
                             return;
                         }
@@ -2604,14 +2704,16 @@ impl Server {
                 }
             }
         }
-        self.finish_queue(q, failed);
+        self.finish_queue(q, failed.or(hook_failed));
     }
 
     pub fn finish_queue(&mut self, q: Queue, mut err: Option<String>) {
         let ctx = q.ctx;
         if ctx.out.overflowed() { err = Some("command output limit exceeded".into()); }
         if let (Some(seq), Some(cid)) = (ctx.control_seq, ctx.client) {
-            self.control_block(cid, seq, ctx.control_line, &ctx.out, err.as_deref());
+            if !ctx.control_done || !ctx.out.is_empty() || err.is_some() {
+                self.control_block(cid, seq, ctx.control_line && ctx.hook_depth == 0, &ctx.out, err.as_deref());
+            }
             self.control_flush(cid);
             if let Some(c) = self.clients.get(&cid) {
                 c.finish_exit();
@@ -2624,6 +2726,24 @@ impl Server {
             return;
         }
         let attached = ctx.client.and_then(|c| self.clients.get(&c)).is_some_and(|c| c.attached);
+        if ctx.reply.is_none() && ctx.client.is_some_and(|c| self.is_control(c)) {
+            // a control client outside a command block (a hook's best client): bare
+            // lines, after the notifications so far (server_client_print, cmdq_error)
+            let cid = ctx.client.unwrap();
+            self.control_flush(cid);
+            let mut text = ctx.out.to_string();
+            if let Some(e) = &err {
+                self.add_message(&format!("{} message: {e}", self.clients[&cid].name()));
+                text.push_str(e);
+            }
+            if !text.is_empty() {
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                self.control_write(cid, &text);
+            }
+            return;
+        }
         if let Some(rc) = ctx.reply {
             let Some(c) = self.clients.get(&rc) else { return };
             if c.attached {

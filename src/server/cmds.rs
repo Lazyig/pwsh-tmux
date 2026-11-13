@@ -292,6 +292,9 @@ impl Server {
 
     /// The default target for a command context.
     pub fn current(&self, ctx: &Ctx) -> Target {
+        if let Some(t) = ctx.target.filter(|t| t.pane == ctx.pane && self.target_is_valid(*t)) {
+            return t;
+        }
         if let Some(p) = ctx.pane.filter(|p| self.panes.contains_key(p) && self.window_of(*p).is_some()) {
             // A key binding or CLI from inside a pane: but prefer the client's current
             // window when the pane's window isn't the one shown.
@@ -2709,9 +2712,15 @@ impl Server {
                 let msg = if o.has('l') { fmt.to_string() } else { self.expand_time(tt, cid, fmt) };
                 let msg = if o.has('j') { json::normalize(&msg)? } else { msg };
                 let attached_client = cid.filter(|c| self.clients.get(c).is_some_and(|c| c.attached));
-                if o.has('p') || attached_client.is_none() {
+                if ctx.client.is_none() && ctx.reply.is_none() {
+                    // no client at all (a hook with nobody attached): cmdq_error
+                    self.add_message(&format!("message: {msg}"));
+                } else if o.has('p') || attached_client.is_none() {
                     ctx.out.push_str(&msg);
                     ctx.out.push('\n');
+                } else if attached_client.is_some_and(|c| self.is_control(c)) {
+                    // server_client_print to a control client: inside its block
+                    ctx.out.push_str(&format!("%message {msg}\n"));
                 } else {
                     let c = attached_client.unwrap();
                     self.set_message(c, &msg);
@@ -3489,7 +3498,7 @@ impl Server {
         self.opts_server.array_items("command-alias").into_iter().map(|(_, v)| v).collect()
     }
 
-    fn cmd_set_option(&mut self, window_cmd: bool, o: &Opts, ctx: &Ctx) -> Result<(), String> {
+    pub(super) fn cmd_set_option(&mut self, window_cmd: bool, o: &Opts, ctx: &Ctx) -> Result<(), String> {
         let Some((name, arg)) = self.option_name(o, ctx, o.rest.first().ok_or("missing argument")?)? else { return Ok(()) };
         let value = o.rest.get(1).map(|v| if o.has('F') { self.expand(self.current(ctx), ctx.client, v) } else { v.clone() });
         if options::hook_scope(&name).is_some() {
@@ -3603,7 +3612,7 @@ impl Server {
         }
     }
 
-    fn cmd_show_options(&mut self, window_cmd: bool, o: &Opts, ctx: &mut Ctx) -> Result<(), String> {
+    pub(super) fn cmd_show_options(&mut self, window_cmd: bool, o: &Opts, ctx: &mut Ctx) -> Result<(), String> {
         let named = match o.rest.first() {
             Some(arg) => match self.option_name(o, ctx, arg)? { Some(n) => Some(n), None => return Ok(()) },
             None => None,

@@ -151,6 +151,30 @@ pub struct Monitor {
     pub fire_time: u64,
 }
 
+/// A wait-for channel: its waiters and lockers are separate (wc->waiters, wc->lockers).
+#[derive(Default)]
+pub struct Channel {
+    pub locked: bool,
+    /// Signalled with nobody waiting: the next wait-for returns at once.
+    pub woken: bool,
+    pub waiters: Vec<Queue>,
+    pub lockers: Vec<Queue>,
+}
+
+impl Channel {
+    fn is_empty(&self) -> bool {
+        self.waiters.is_empty() && self.lockers.is_empty()
+    }
+    /// cmd_wait_for_remove_empty: unlocked, nobody waiting and not signalled.
+    fn removable(&self) -> bool {
+        !self.locked && self.is_empty() && !self.woken
+    }
+    /// cmd_wait_for_remove: unlocked, no waiters and signalled (the signal is used up).
+    fn spent(&self) -> bool {
+        !self.locked && self.waiters.is_empty() && self.woken
+    }
+}
+
 /// A wait-for -E client.
 pub struct Waiter {
     pub name: String,
@@ -445,14 +469,7 @@ impl Server {
     /// A target whose objects all still exist, else the best current one
     /// (event_payload_get_target, then cmd_find_from_nothing).
     fn valid_target(&self, t: Target) -> Target {
-        let sess_ok = t.sid.is_none_or(|s| self.sessions.contains_key(&s));
-        let win_ok = t.wid.is_none_or(|w| self.windows.contains_key(&w));
-        let pane_ok = t.pane.is_none_or(|p| t.wid.and_then(|w| self.windows.get(&w)).is_some_and(|w| w.panes().contains(&p)));
-        let link_ok = match (t.sid, t.idx) {
-            (Some(s), Some(i)) => self.sessions.get(&s).and_then(|s| s.links.get(&i)) == t.wid.as_ref(),
-            _ => true,
-        };
-        if t.sid.is_some() && sess_ok && win_ok && pane_ok && link_ok {
+        if self.target_is_valid(t) {
             return t;
         }
         if let Some(p) = t.pane.filter(|p| self.panes.contains_key(p) && self.window_of(*p).is_some()) {
@@ -468,6 +485,29 @@ impl Server {
             return self.target_for_session(s);
         }
         self.current(&Ctx::default())
+    }
+
+    /// cmd_find_valid_state: a session, and its winlink, window and pane all still there.
+    pub fn target_is_valid(&self, t: Target) -> bool {
+        let sess_ok = t.sid.is_some_and(|s| self.sessions.contains_key(&s));
+        let win_ok = t.wid.is_none_or(|w| self.windows.contains_key(&w));
+        let pane_ok = t.pane.is_none_or(|p| t.wid.and_then(|w| self.windows.get(&w)).is_some_and(|w| w.panes().contains(&p)));
+        let link_ok = match (t.sid, t.idx) {
+            (Some(s), Some(i)) => self.sessions.get(&s).and_then(|s| s.links.get(&i)) == t.wid.as_ref(),
+            _ => true,
+        };
+        sess_ok && win_ok && pane_ok && link_ok
+    }
+
+    /// cmd_find_current_client for an item without a client: the most recently
+    /// active client of the best session, else of any session. pwsh-tmux leaves out
+    /// read-only clients, which would make the hook read-only too.
+    pub fn best_client(&self) -> Option<ClientId> {
+        let ok = |c: &&Client| c.attached && c.session.is_some_and(|s| self.sessions.contains_key(&s)) && !c.denied && !c.is_readonly();
+        let best = |sid: Option<SessId>| self.clients.values().filter(ok).filter(|c| sid.is_none() || c.session == sid).max_by_key(|c| (c.activity, c.id)).map(|c| c.id);
+        let sid = self.current_session();
+        let attached = sid.is_some_and(|s| self.clients.values().any(|c| c.attached && c.session == Some(s)));
+        best(sid.filter(|_| attached)).or_else(|| best(None))
     }
 
     /// The level whose entry for a hook applies at a target (hooks_insert): the
@@ -524,29 +564,36 @@ impl Server {
             Some(Val::Client(c, _)) => Some(*c).filter(|c| self.clients.contains_key(c)),
             _ => None,
         };
-        let mut cmds = VecDeque::new();
+        // each member is its own command list (hooks_insert_one): an error stops
+        // only that one
+        let mut lists = Vec::new();
         for value in self.hook_commands(level, name) {
             let value = if expand { self.expand_extra(target, client, &value, formats.clone()) } else { value };
             match crate::cmdparse::parse(&value) {
-                Ok(v) => cmds.extend(v),
+                Ok(v) if !v.is_empty() => lists.push(VecDeque::from(v)),
+                Ok(_) => {}
                 Err(e) => log(&format!("hook {name}: {e}")),
             }
         }
-        if cmds.is_empty() {
-            return;
-        }
-        let ctx = Ctx {
-            client,
-            pane: target.pane,
-            hook_depth: 2,
-            formats: Some(Arc::new(formats)),
-            ..Ctx::default()
-        };
+        let formats = Arc::new(formats);
         if p.after {
             // inserted after the command, in its client's queue (cmdq_insert_after)
-            let f = ctx.formats.clone().unwrap_or_default();
-            self.ev.inject.extend(wrap_hook(cmds, target.pane, &f));
-        } else {
+            for cmds in lists {
+                self.ev.inject.extend(wrap_hook(cmds, target, &formats));
+            }
+            return;
+        }
+        // the global queue: the item has no client, so it runs as the best one
+        let best = self.best_client();
+        for cmds in lists {
+            let ctx = Ctx {
+                client: best,
+                pane: target.pane,
+                target: Some(target),
+                hook_depth: 2,
+                formats: Some(formats.clone()),
+                ..Ctx::default()
+            };
             self.ev.pending.push_back(Queue { cmds, ctx, soft: 0 });
         }
     }
@@ -562,15 +609,15 @@ impl Server {
         let fired = self.ev.fired.entry((level, name.to_string())).or_insert((0, 0));
         fired.0 += 1;
         fired.1 = now_secs();
-        let mut cmds = VecDeque::new();
+        let formats = HashMap::from([("hook".to_string(), name.to_string())]);
+        let mut out = Vec::new();
         for value in self.hook_commands(level, name) {
             match crate::cmdparse::parse(&value) {
-                Ok(v) => cmds.extend(v),
+                Ok(v) => out.extend(wrap_hook(v.into(), target, &formats)),
                 Err(e) => log(&format!("hook {name}: {e}")),
             }
         }
-        let formats = HashMap::from([("hook".to_string(), name.to_string())]);
-        wrap_hook(cmds, target.pane, &formats)
+        out
     }
 
     /// Runs hook command lists queued by events (the global command queue).
@@ -724,6 +771,9 @@ impl Server {
     /// wait-for: channels (-S/-L/-U, waiting, -l, -w) and events (-E).
     pub(super) fn cmd_wait_for(&mut self, o: &Opts, ctx: &mut Ctx) -> Result<Flow, String> {
         let name = o.rest.first().ok_or("command wait-for: too few arguments (need at least 1)")?.clone();
+        if o.rest.len() > 1 {
+            return Err("command wait-for: too many arguments (need at most 1)".into());
+        }
         // the client whose queue waits (none in hooks)
         let able = ctx.hook_depth < 2 && ctx.reply.or(ctx.client).is_some_and(|c| self.clients.contains_key(&c));
         if o.has('E') {
@@ -749,19 +799,25 @@ impl Server {
             return Err(format!("\0wait-event\0{name}\0{}\0{}", o.get('F').unwrap_or(""), if o.has('v') { "v" } else { "" }));
         }
         if o.has('l') {
-            if let Some((_, (_, queues))) = self.waits.get_key_value(&name) {
-                for q in queues {
+            if let Some(ch) = self.waits.get(&name) {
+                // waiters, then lockers
+                for q in ch.waiters.iter().chain(&ch.lockers) {
                     ctx.out.push_str(&format!("{}\n", self.waiter_name(&q.ctx)));
                 }
             }
             return Ok(Flow::Next);
         }
         if let Some(who) = o.get('w') {
+            // a waiter, else a locker (which goes on without the lock)
             let who = who.to_string();
-            let found = self.waits.get(&name).and_then(|e| e.1.iter().position(|q| self.waiter_name(&q.ctx) == who));
-            if let Some(i) = found {
-                let q = self.waits.get_mut(&name).unwrap().1.remove(i);
-                if self.waits.get(&name).is_some_and(|e| !e.0 && e.1.is_empty()) {
+            let Some(ch) = self.waits.get_mut(&name) else { return Ok(Flow::Next) };
+            let w = ch.waiters.iter().position(|q| q.ctx.reply.or(q.ctx.client).map(|c| format!("client-{c}")).unwrap_or_default() == who);
+            let q = match w {
+                Some(i) => Some(ch.waiters.remove(i)),
+                None => ch.lockers.iter().position(|q| q.ctx.reply.or(q.ctx.client).map(|c| format!("client-{c}")).unwrap_or_default() == who).map(|i| ch.lockers.remove(i)),
+            };
+            if let Some(q) = q {
+                if ch.is_empty() {
                     self.waits.remove(&name);
                 }
                 self.ev.pending.push_back(q);
@@ -769,19 +825,18 @@ impl Server {
             return Ok(Flow::Next);
         }
         if o.has('S') {
-            let locked = self.waits.get(&name).is_some_and(|e| e.0);
-            let waiters = self.waits.get_mut(&name).map(|e| std::mem::take(&mut e.1)).unwrap_or_default();
-            if !locked {
-                self.waits.remove(&name);
-            }
-            if waiters.is_empty() {
-                // like tmux: a signal nobody is waiting for is kept for the next wait-for
-                if !locked {
-                    self.waits_woken.insert(name);
-                }
+            let ch = self.waits.entry(name.clone()).or_default();
+            if ch.waiters.is_empty() && !ch.woken {
+                // a signal nobody is waiting for is kept for the next wait-for
+                ch.woken = true;
                 return Ok(Flow::Next);
             }
-            // cmdq_continue: the waiters go on once this command list is done
+            // only the waiters: lockers wait for -U. They go on once this command
+            // list is done (cmdq_continue).
+            let waiters = std::mem::take(&mut ch.waiters);
+            if ch.removable() {
+                self.waits.remove(&name);
+            }
             self.ev.pending.extend(waiters);
             return Ok(Flow::Next);
         }
@@ -789,23 +844,23 @@ impl Server {
             if !able {
                 return Err("not able to lock".into());
             }
-            let e = self.waits.entry(name.clone()).or_insert((false, Vec::new()));
-            if !e.0 {
-                e.0 = true;
+            let ch = self.waits.entry(name.clone()).or_default();
+            if !ch.locked {
+                ch.locked = true;
                 return Ok(Flow::Next);
             }
-            return Err(format!("\0wait\0{name}"));
+            return Err(format!("\0lock\0{name}"));
         }
         if o.has('U') {
-            let Some(e) = self.waits.get_mut(&name) else { return Err(format!("channel {name} not locked")) };
-            if !e.0 {
-                return Err(format!("channel {name} not locked"));
-            }
-            if e.1.is_empty() {
-                e.0 = false;
-                self.waits.remove(&name);
+            let Some(ch) = self.waits.get_mut(&name).filter(|c| c.locked) else { return Err(format!("channel {name} not locked")) };
+            if ch.lockers.is_empty() {
+                ch.locked = false;
+                if ch.spent() || ch.removable() {
+                    self.waits.remove(&name);
+                }
             } else {
-                let q = e.1.remove(0);
+                // the first locker gets the lock
+                let q = ch.lockers.remove(0);
                 self.ev.pending.push_back(q);
             }
             return Ok(Flow::Next);
@@ -813,8 +868,13 @@ impl Server {
         if !able {
             return Err("not able to wait".into());
         }
-        if self.waits_woken.remove(&name) {
-            return Ok(Flow::Next); // already signalled
+        let ch = self.waits.entry(name.clone()).or_default();
+        if ch.woken {
+            // already signalled (a locked channel stays signalled)
+            if ch.spent() {
+                self.waits.remove(&name);
+            }
+            return Ok(Flow::Next);
         }
         Err(format!("\0wait\0{name}"))
     }
@@ -830,10 +890,12 @@ impl Server {
     pub fn wait_for_client_lost(&mut self, cid: ClientId) {
         let mine = |q: &Queue| q.ctx.reply == Some(cid) || (q.ctx.reply.is_none() && q.ctx.client == Some(cid));
         self.ev.waiters.retain(|w| !mine(&w.queue));
-        for e in self.waits.values_mut() {
-            e.1.retain(|q| !mine(q));
+        for ch in self.waits.values_mut() {
+            ch.waiters.retain(|q| !mine(q));
+            ch.lockers.retain(|q| !mine(q));
         }
-        self.waits.retain(|_, e| e.0 || !e.1.is_empty());
+        // cmd_wait_for_remove_empty
+        self.waits.retain(|_, ch| ch.locked || ch.woken || !ch.is_empty());
     }
 
     // ---- set-hook / show-hooks -------------------------------------------------------------
@@ -974,12 +1036,18 @@ impl Server {
         if let Some(spec) = o.get('B') {
             return self.set_hook_monitor(o, ctx, spec.to_string());
         }
+        if o.rest.len() > 2 {
+            return Err("command set-hook: too many arguments (need at most 2)".into());
+        }
         let arg = o.rest.first().ok_or("missing argument")?;
         let cur = t.unwrap_or_else(|| self.current(ctx));
         let arg = self.expand(cur, ctx.client, arg);
         if o.has('R') {
-            let name = arg.split('[').next().unwrap_or(&arg).to_string();
-            let cmds = self.run_hook_now(&name, cur, ctx.client, ctx.readonly);
+            // hooks_run looks the name up as given: "hook[N]" is no option
+            if arg.contains('[') {
+                return Ok(Flow::Next);
+            }
+            let cmds = self.run_hook_now(&arg, cur, ctx.client, ctx.readonly);
             return Ok(if cmds.is_empty() { Flow::Next } else { Flow::Inject(cmds, false) });
         }
         let name = options::canonical_name(&arg)?;
@@ -1007,7 +1075,9 @@ impl Server {
             return Ok(Flow::Next);
         }
         if options::hook_scope(&name).is_none() {
-            return Err(format!("invalid option: {arg}"));
+            // set-hook is set-option (cmd_set_option_exec) for any other option
+            self.cmd_set_option(false, o, ctx)?;
+            return Ok(Flow::Next);
         }
         let value = o.rest.get(1).cloned();
         self.set_hook_option(o, ctx, &name, &arg, value, aliases)
@@ -1069,6 +1139,10 @@ impl Server {
 
     /// show-hooks: hook options at a level, -B the monitors.
     pub(super) fn cmd_show_hooks(&mut self, o: &Opts, ctx: &mut Ctx) -> Result<Flow, String> {
+        if o.rest.len() > 1 {
+            return Err("command show-hooks: too many arguments (need at most 1)".into());
+        }
+        self.prune_monitors();
         let ft = self.resolve_pane(ctx, o.get('t')).unwrap_or_else(|_| self.current(ctx));
         let named = match o.rest.first() {
             Some(a) => {
@@ -1077,6 +1151,12 @@ impl Server {
             }
             None => None,
         };
+        if let Some((n, _)) = named.as_ref().filter(|(n, _)| !n.starts_with('@') && options::hook_scope(n.split('[').next().unwrap_or(n)).is_none()) {
+            // any other option is shown as show-options shows it
+            let _ = n;
+            self.cmd_show_options(false, o, ctx)?;
+            return Ok(Flow::Next);
+        }
         let level = match &named {
             Some((n, _)) => self.hook_scope_level(o, ctx, n.split('[').next().unwrap_or(n))?,
             None => self.level_for(o, ctx, if o.has('p') { Scope::Pane } else if o.has('w') { Scope::Window } else { Scope::Session })?,
@@ -1084,7 +1164,12 @@ impl Server {
         let mut out = String::new();
         if o.has('B') {
             let mut names: Vec<String> = match &named {
-                Some((n, _)) => vec![n.clone()],
+                Some((n, arg)) => {
+                    if n.starts_with('@') && self.level_store(level).and_then(|s| s.get(n)).is_none() {
+                        return Err(format!("invalid option: {arg}"));
+                    }
+                    vec![n.clone()]
+                }
                 None => self.ev.monitors.keys().filter(|k| k.0 == level).map(|k| k.1.clone()).collect(),
             };
             names.sort();
@@ -1259,8 +1344,25 @@ impl Server {
 
     // ---- monitors ----------------------------------------------------------------------
 
+    /// Monitors live with their option (hooks_monitor_free): those whose option was
+    /// unset or whose session, window or pane went are dropped, and so is the fire
+    /// count of hooks on objects that went.
+    pub fn prune_monitors(&mut self) {
+        let keys: Vec<(Level, String)> = self.ev.monitors.keys().cloned().collect();
+        for key in keys {
+            if self.level_store(key.0).and_then(|s| s.get(&key.1)).is_none() {
+                self.ev.monitors.remove(&key);
+            }
+        }
+        let gone: Vec<(Level, String)> = self.ev.fired.keys().filter(|k| self.level_store(k.0).is_none()).cloned().collect();
+        for k in gone {
+            self.ev.fired.remove(&k);
+        }
+    }
+
     /// Checks every set-hook -B monitor (once a second, monitor_timer).
     pub fn check_monitors(&mut self) {
+        self.prune_monitors();
         let keys: Vec<(Level, String)> = self.ev.monitors.keys().cloned().collect();
         for key in keys {
             let Some(m) = self.ev.monitors.get(&key) else { continue };
@@ -1855,15 +1957,17 @@ impl Server {
     }
 }
 
-/// Marks hook commands run inside another queue: the first sets the hook's state
-/// (no hooks, its target pane and formats), the last clears it.
-pub const HOOK_MARK: &str = "\0hook";
+pub static HOOK_MARK: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("hook"));
 
-fn wrap_hook(cmds: VecDeque<Vec<String>>, pane: Option<PaneId>, formats: &HashMap<String, String>) -> Vec<Vec<String>> {
+/// Marks hook commands run inside another queue: the first sets the hook's state
+/// (no hooks, its target and formats), the last clears it. Each hook command list
+/// is wrapped on its own, so an error ends only that list.
+fn wrap_hook(cmds: VecDeque<Vec<String>>, t: Target, formats: &HashMap<String, String>) -> Vec<Vec<String>> {
     if cmds.is_empty() {
         return Vec::new();
     }
-    let mut push = vec![HOOK_MARK.to_string(), "1".into(), pane.map(|p| p.to_string()).unwrap_or_default()];
+    let n = |v: Option<u32>| v.map(|v| v.to_string()).unwrap_or_default();
+    let mut push = vec![HOOK_MARK.to_string(), "1".into(), n(t.pane), n(t.sid), n(t.idx), n(t.wid)];
     for (k, v) in formats {
         push.push(k.clone());
         push.push(v.clone());
@@ -1874,19 +1978,29 @@ fn wrap_hook(cmds: VecDeque<Vec<String>>, pane: Option<PaneId>, formats: &HashMa
     out
 }
 
+pub type HookSaved = Vec<(u8, Option<PaneId>, Option<Target>, Option<Arc<HashMap<String, String>>>)>;
+
+/// Whether a queue entry opens (Some(true)) or closes (Some(false)) a hook's commands.
+pub fn hook_mark_kind(cmd: &[String]) -> Option<bool> {
+    (cmd.first() == Some(&*HOOK_MARK)).then(|| cmd.get(1).map(String::as_str) == Some("1"))
+}
+
 /// Applies a hook mark to the queue's context, saving or restoring what it replaces.
-pub fn apply_hook_mark(mark: &[String], ctx: &mut Ctx, saved: &mut Vec<(u8, Option<PaneId>, Option<Arc<HashMap<String, String>>>)>) {
+pub fn apply_hook_mark(mark: &[String], ctx: &mut Ctx, saved: &mut HookSaved) {
     if mark.get(1).map(String::as_str) == Some("1") {
-        saved.push((ctx.hook_depth, ctx.pane, ctx.formats.clone()));
+        saved.push((ctx.hook_depth, ctx.pane, ctx.target, ctx.formats.clone()));
         ctx.hook_depth = ctx.hook_depth.max(1);
-        if let Some(p) = mark.get(2).and_then(|p| p.parse().ok()) {
+        let n = |i: usize| mark.get(i).and_then(|p| p.parse::<u32>().ok());
+        if let Some(p) = n(2) {
             ctx.pane = Some(p);
         }
-        let f: HashMap<String, String> = mark[3..].chunks(2).filter(|c| c.len() == 2).map(|c| (c[0].clone(), c[1].clone())).collect();
+        ctx.target = n(3).map(|sid| Target { sid: Some(sid), idx: n(4), wid: n(5), pane: n(2) });
+        let f: HashMap<String, String> = mark.get(6..).unwrap_or_default().chunks(2).filter(|c| c.len() == 2).map(|c| (c[0].clone(), c[1].clone())).collect();
         ctx.formats = Some(Arc::new(f));
-    } else if let Some((depth, pane, formats)) = saved.pop() {
+    } else if let Some((depth, pane, target, formats)) = saved.pop() {
         ctx.hook_depth = depth;
         ctx.pane = pane;
+        ctx.target = target;
         ctx.formats = formats;
     }
 }
@@ -1943,15 +2057,21 @@ mod tests {
     fn hook_marks_save_and_restore_the_queue_state() {
         let mut ctx = Ctx { pane: Some(3), ..Ctx::default() };
         let cmds = VecDeque::from([vec!["display".to_string()]]);
-        let wrapped = wrap_hook(cmds, Some(9), &HashMap::from([("hook".to_string(), "x".to_string())]));
+        let t = Target { sid: Some(1), idx: Some(4), wid: Some(2), pane: Some(9) };
+        let wrapped = wrap_hook(cmds, t, &HashMap::from([("hook".to_string(), "x".to_string())]));
         assert_eq!(wrapped.len(), 3);
         let mut saved = Vec::new();
         apply_hook_mark(&wrapped[0], &mut ctx, &mut saved);
         assert_eq!((ctx.hook_depth, ctx.pane), (1, Some(9)));
+        assert_eq!(ctx.target.and_then(|t| t.idx), Some(4));
         assert_eq!(ctx.formats.as_ref().unwrap()["hook"], "x");
         apply_hook_mark(&wrapped[2], &mut ctx, &mut saved);
         assert_eq!((ctx.hook_depth, ctx.pane), (0, Some(3)));
-        assert!(ctx.formats.is_none());
+        assert!(ctx.formats.is_none() && ctx.target.is_none());
+        // a forged mark (a parsed "\0hook" word) is not one, and a short one is no panic
+        assert_eq!(hook_mark_kind(&["\0hook".to_string(), "1".to_string()]), None);
+        apply_hook_mark(&[HOOK_MARK.to_string(), "1".to_string()], &mut ctx, &mut saved);
+        assert_eq!(ctx.hook_depth, 1);
     }
 
     #[test]
