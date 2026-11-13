@@ -272,6 +272,9 @@ impl vt100::Callbacks for PaneCb {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
         self.title = Some(String::from_utf8_lossy(title).into_owned());
     }
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
+        self.clipboard = Some((String::from_utf8_lossy(ty).into_owned(), String::from_utf8_lossy(data).into_owned()));
+    }
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
         self.osc.osc(params);
         match params {
@@ -285,9 +288,6 @@ impl vt100::Callbacks for PaneCb {
                 if let Some(name) = name.filter(|_| self.events.len() < 64) {
                     self.events.push((name, self.osc.clone()));
                 }
-            }
-            [b"52", sel, data, ..] => {
-                self.clipboard = Some((String::from_utf8_lossy(sel).into_owned(), String::from_utf8_lossy(data).into_owned()));
             }
             _ => {}
         }
@@ -2270,6 +2270,7 @@ impl Server {
         if let Some((_, wid)) = self.session_window(sid) {
             self.ev.latest.insert(wid, cid);
         }
+        self.update_focus();
         let mut p = self.payload_client(cid);
         p.set("new_session", p.get("session").cloned().unwrap_or(events::Val::Session(sid, String::new())));
         if let Some(old) = old_session.filter(|o| self.sessions.contains_key(o)) {

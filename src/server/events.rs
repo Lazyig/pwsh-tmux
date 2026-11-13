@@ -227,6 +227,9 @@ pub struct State {
     /// Panes that have focus (PANE_FOCUSED) and clients that lost it (~CLIENT_FOCUSED).
     pub focused: HashSet<PaneId>,
     pub unfocused: HashSet<ClientId>,
+    /// Focus needs checking; whether each client had an overlay.
+    pub focus_dirty: bool,
+    pub overlays: HashMap<ClientId, bool>,
     /// The latest client of each window (w->latest).
     pub latest: HashMap<WinId, ClientId>,
     /// Control mode notifications waiting until no %begin block is open.
@@ -1328,6 +1331,7 @@ impl Server {
                 if let Some(x) = self.ev.seen.sessions.get_mut(&sid) {
                     x.active = now;
                 }
+                self.ev.focus_dirty = true;
                 self.fire("session-window-changed", p);
             }
         }
@@ -1456,6 +1460,7 @@ impl Server {
             }
         }
         for (wid, old, now) in &changed {
+            self.ev.focus_dirty |= old.active != now.active;
             if old.active != now.active && self.windows.get(wid).is_some_and(|w| w.active == now.active) {
                 let mut p = Payload { target: self.target_for_pane(now.active), ..Payload::default() };
                 p.set("window", self.val_window(*wid)).set("pane", Val::Pane(now.active)).set("new_pane", Val::Pane(now.active)).set("old_pane", Val::Pane(old.active));
@@ -1530,7 +1535,16 @@ impl Server {
                 self.fire("pane-mode-changed", p);
             }
         }
-        self.update_focus();
+        // focus changes where tmux updates it: active panes and windows, overlays,
+        // attaching and focus reports (not when a client goes)
+        let overlays: HashMap<ClientId, bool> = self.clients.values().map(|c| (c.id, c.overlay.is_some())).collect();
+        for (c, o) in &overlays {
+            self.ev.focus_dirty |= self.ev.overlays.get(c) != Some(o) && (*o || self.ev.overlays.contains_key(c));
+        }
+        self.ev.overlays = overlays;
+        if std::mem::take(&mut self.ev.focus_dirty) {
+            self.update_focus();
+        }
         // session groups, oldest session first
         let mut by_age: Vec<(u64, SessId)> = self.sessions.values().map(|s| (s.created, s.id)).collect();
         by_age.sort_unstable();
@@ -1754,6 +1768,34 @@ mod tests {
         assert_eq!(MonitorWhat::parse("@a:zz:f"), None);
         assert_eq!(MonitorWhat::parse("@a:%-1:f"), None);
         assert_eq!(MonitorWhat::parse("bad"), None);
+    }
+
+    #[test]
+    fn osc_events_in_order() {
+        let mut p = vt100::Parser::new_with_callbacks(nz(24), nz(80), 0, PaneCb::default());
+        p.process(b"\x1b]133;A\x07\x1b]133;C\x07out\x1b]133;D;7\x07\x07\x1b]52;c;aGk=\x07");
+        let cb = p.callbacks_mut();
+        let names: Vec<&str> = cb.events.iter().map(|e| e.0).collect();
+        assert_eq!(names, ["pane-shell-prompt", "pane-command-started", "pane-command-finished", "pane-bell"]);
+        assert!(cb.events[1].1.cmd_running && cb.events[1].1.cmd_status.is_none());
+        assert_eq!(cb.events[2].1.cmd_status, Some(7));
+        assert!(!cb.events[2].1.cmd_running);
+        assert_eq!(cb.clipboard, Some(("c".into(), "aGk=".into())));
+    }
+
+    #[test]
+    fn hook_marks_save_and_restore_the_queue_state() {
+        let mut ctx = Ctx { pane: Some(3), ..Ctx::default() };
+        let cmds = VecDeque::from([vec!["display".to_string()]]);
+        let wrapped = wrap_hook(cmds, Some(9), &HashMap::from([("hook".to_string(), "x".to_string())]));
+        assert_eq!(wrapped.len(), 3);
+        let mut saved = Vec::new();
+        apply_hook_mark(&wrapped[0], &mut ctx, &mut saved);
+        assert_eq!((ctx.hook_depth, ctx.pane), (1, Some(9)));
+        assert_eq!(ctx.formats.as_ref().unwrap()["hook"], "x");
+        apply_hook_mark(&wrapped[2], &mut ctx, &mut saved);
+        assert_eq!((ctx.hook_depth, ctx.pane), (0, Some(3)));
+        assert!(ctx.formats.is_none());
     }
 
     #[test]

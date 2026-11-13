@@ -1140,3 +1140,213 @@ fn format_option_environment_and_window_loops() {
     assert_eq!(ctx.fmt("f", "[#{L:x}#{I/f:RGB}#{A:a,b}]"), "[]");
     assert_eq!(ctx.fmt("f", "#{c:red}#{c/f:themered}#{R:ab,2}"), "800000\x1b[31mabab");
 }
+
+/// tmux 3.8 hooks are events with a payload: hook_* formats, where each kind of hook
+/// runs, and set-hook -E / -R.
+#[test]
+fn tmux_38_hook_events_and_formats() {
+    let ctx = Ctx::new("hookev");
+    ctx.ok(&["new-session", "-d", "-s", "e", "-n", "first"]);
+    // event hooks run after the command list, with the payload as formats
+    ctx.ok(&["set-hook", "-g", "window-renamed", "set -gF @wr '#{hook}|#{hook_old_name}|#{hook_new_name}|#{hook_window_name}|#{hook_event}|#{window_name}'"]);
+    assert_eq!(ctx.ok(&["rename-window", "-t", "e:0", "second", ";", "show", "-gqv", "@wr"]), "");
+    assert_eq!(ctx.ok(&["show", "-gv", "@wr"]).trim(), "window-renamed|first|second|second|window-renamed|second");
+    assert_eq!(ctx.ok(&["show-hooks", "-gw", "-F", "#{hook_fire_count}", "window-renamed"]).trim(), "1");
+    // what a hook does fires no hooks itself
+    ctx.ok(&["set-hook", "-g", "window-renamed", "rename-window -t e:0 'x#{hook_new_name}'"]);
+    ctx.ok(&["rename-window", "-t", "e:0", "r"]);
+    assert_eq!(ctx.fmt("e:0", "#W"), "xr");
+    ctx.ok(&["set-hook", "-gu", "window-renamed"]);
+    // after hooks run straight after the command, for its client: output reaches it
+    ctx.ok(&["set-hook", "-g", "after-rename-window", "display -p 'after #{hook}|#{hook_arguments}|#{hook_argument_0}|#{hook_flag_t}'"]);
+    assert_eq!(ctx.ok(&["rename-window", "-t", "e:0", "y"]).trim(), "after after-rename-window|-t e:0 y|y|e:0");
+    ctx.ok(&["set-hook", "-gu", "after-rename-window"]);
+    // command-error runs in place of the rest of the command list
+    ctx.ok(&["set-hook", "-g", "command-error", "display -p 'failed #{hook_argument_0}'"]);
+    let out = ctx.fails(&["rename-window", "-t", "nosuch:0", "zz", ";", "set", "-g", "@not", "run"]);
+    assert!(out.contains("failed zz") && out.contains("can't find session: nosuch"), "{out}");
+    // (show of a missing option is a command error too)
+    assert!(ctx.fails(&["show", "-gv", "@not"]).contains("invalid option"));
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "-F", "#{hook_fire_count} #{?hook_fire_time,set,}", "command-error"]).trim(), "2 set");
+    ctx.ok(&["set-hook", "-gu", "command-error"]);
+    // set-hook -R runs a hook now
+    ctx.ok(&["set-hook", "-g", "session-renamed", "display -p 'R #{hook}'"]);
+    assert_eq!(ctx.ok(&["set-hook", "-R", "session-renamed"]).trim(), "R session-renamed");
+    // set-hook -E fires a user event; @ hooks are user options shown by show-hooks
+    ctx.ok(&["set-hook", "-g", "@ev", "set -gF @evo '#{hook}|#{hook_session_name}|#{hook_window_index}|#{hook_window_name}'"]);
+    ctx.ok(&["set-hook", "-E", "-t", "e:0", "@ev"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@evo"]).trim(), "@ev|e|0|y");
+    assert!(ctx.ok(&["show-hooks", "-g"]).starts_with("@ev \"set -gF @evo"));
+    assert!(!ctx.ok(&["show", "-g"]).contains("@ev "));
+    assert!(ctx.ok(&["show", "-gH"]).contains("@ev "));
+    assert_eq!(ctx.fails(&["set-hook", "-E", "ev"]).trim(), "event name must start with @");
+    assert_eq!(ctx.fails(&["set-hook", "-E"]).trim(), "missing argument");
+    // window and pane hooks live at their own levels
+    ctx.ok(&["new-window", "-d", "-t", "e:1", "-n", "other"]);
+    ctx.ok(&["set-hook", "-w", "-t", "e:0", "window-renamed", "set -gF @w0 '#{hook_new_name}'"]);
+    ctx.ok(&["rename-window", "-t", "e:1", "nope"]);
+    assert!(ctx.fails(&["show", "-gv", "@w0"]).contains("invalid option"));
+    ctx.ok(&["rename-window", "-t", "e:0", "yes"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@w0"]).trim(), "yes");
+    assert_eq!(ctx.ok(&["show-hooks", "-w", "-t", "e:0"]).trim(), "window-renamed[0] set-option -Fg @w0 \"#{hook_new_name}\"");
+    assert_eq!(ctx.ok(&["show-hooks", "-w", "-t", "e:1"]), "");
+    ctx.ok(&["set-hook", "-p", "-t", "e:1", "pane-title-changed", "set -gF @pt '#{hook_new_title}'"]);
+    ctx.ok(&["select-pane", "-t", "e:1", "-T", "titled"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@pt"]).trim(), "titled");
+    // marked-pane-changed, window-pane-changed and pane-moved
+    ctx.ok(&["set-hook", "-g", "marked-pane-changed", "set -gF @mk '#{hook_marked}#{?hook_new_pane,N,}#{?hook_old_pane,O,}'"]);
+    ctx.ok(&["select-pane", "-m", "-t", "e:0"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@mk"]).trim(), "1N");
+    ctx.ok(&["select-pane", "-M"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@mk"]).trim(), "0O");
+    ctx.ok(&["set-hook", "-g", "pane-moved", "set -gF @mv '#{hook_old_window_index}>#{hook_window_index}'"]);
+    ctx.ok(&["set-hook", "-g", "window-pane-changed", "set -gaF @wpc '#{?hook_old_pane,o,}#{?hook_new_pane,n,}'"]);
+    ctx.ok(&["split-window", "-t", "e:0"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@wpc"]).trim(), "on");
+    ctx.ok(&["break-pane", "-d", "-s", "e:0.1", "-t", "e:5"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@mv"]).trim(), "0>5");
+    // the names hooks accept as events
+    assert_eq!(ctx.fails(&["wait-for", "-E", "nosuch"]).trim(), "invalid event: nosuch");
+    assert_eq!(ctx.fails(&["wait-for", "-E", "after-has-session"]).trim(), "invalid event: after-has-session");
+}
+
+/// wait-for -E waits for events (-F a true format, -v prints the payload); -l lists
+/// waiters and -w wakes one, for channels too.
+#[test]
+fn tmux_38_wait_for_events() {
+    let ctx = Ctx::new("waitev");
+    ctx.ok(&["new-session", "-d", "-s", "w", "-n", "start"]);
+    let child = ctx.command().args(["wait-for", "-v", "-E", "-F", "#{==:#{new_name},yes}", "window-renamed"]).stdout(Stdio::piped()).spawn().unwrap();
+    wait_for("event waiter", || ctx.ok(&["wait-for", "-E", "-l", "window-renamed"]).starts_with("client-"));
+    ctx.ok(&["rename-window", "-t", "w:0", "no"]);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(ctx.ok(&["wait-for", "-E", "-l", "window-renamed"]).starts_with("client-"), "woken by a false format");
+    ctx.ok(&["rename-window", "-t", "w:0", "yes"]);
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let wid = ctx.fmt("w:0", "#{window_id}");
+    assert!(text.contains(&format!("event=window-renamed\nnew_name=no\nold_name=start\nwindow={wid}\n")), "{text}");
+    assert!(text.ends_with(&format!("event=window-renamed\nnew_name=yes\nold_name=no\nwindow={wid}\n")), "{text}");
+    // set-hook -E: the event carries the client and the target
+    let child = ctx.command().args(["wait-for", "-v", "-E", "@user"]).stdout(Stdio::piped()).spawn().unwrap();
+    wait_for("user event waiter", || !ctx.ok(&["wait-for", "-E", "-l", "@user"]).is_empty());
+    ctx.ok(&["set-hook", "-E", "-t", "w:0", "@user"]);
+    let text = String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).into_owned();
+    assert!(text.starts_with("client=client-") && text.contains("event=@user\n") && text.contains("window_index=0\n"), "{text}");
+    // -w wakes a waiter by name
+    let mut child = ctx.command().args(["wait-for", "-E", "@other"]).spawn().unwrap();
+    wait_for("waiter listed", || !ctx.ok(&["wait-for", "-E", "-l", "@other"]).is_empty());
+    let name = ctx.ok(&["wait-for", "-E", "-l", "@other"]).trim().to_string();
+    assert_eq!(ctx.fails(&["wait-for", "-E", "-w", "nobody", "@other"]).trim(), "waiter nobody not found");
+    ctx.ok(&["wait-for", "-E", "-w", &name, "@other"]);
+    wait_for("woken waiter", || child.try_wait().unwrap().is_some());
+    let mut child = ctx.command().args(["wait-for", "chan"]).spawn().unwrap();
+    wait_for("channel waiter", || !ctx.ok(&["wait-for", "-l", "chan"]).is_empty());
+    let name = ctx.ok(&["wait-for", "-l", "chan"]).trim().to_string();
+    ctx.ok(&["wait-for", "-w", "nobody", "chan"]);
+    ctx.ok(&["wait-for", "-w", &name, "chan"]);
+    wait_for("woken channel waiter", || child.try_wait().unwrap().is_some());
+    // a waiter that goes away does not run the rest of its commands
+    let mut child = ctx.command().args(["wait-for", "gone", ";", "set", "-g", "@ran", "yes"]).spawn().unwrap();
+    wait_for("waiter on gone", || !ctx.ok(&["wait-for", "-l", "gone"]).is_empty());
+    child.kill().unwrap();
+    let _ = child.wait();
+    wait_for("waiter dropped", || ctx.ok(&["wait-for", "-l", "gone"]).is_empty());
+    ctx.ok(&["wait-for", "-S", "gone"]);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(ctx.fails(&["show", "-gv", "@ran"]).contains("invalid option"));
+    // hooks run from the global queue cannot wait
+    ctx.ok(&["set-hook", "-g", "session-renamed", "wait-for -E @inner"]);
+    ctx.ok(&["rename-session", "-t", "w", "w2"]);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(ctx.ok(&["wait-for", "-E", "-l", "@inner"]), "");
+}
+
+/// set-hook -B: monitor hooks check a format every second and fire when it changes
+/// (-T: when it becomes true).
+#[test]
+fn tmux_38_monitor_hooks() {
+    let ctx = Ctx::new("monhook");
+    ctx.ok(&["new-session", "-d", "-s", "m"]);
+    ctx.ok(&["set", "-g", "@v", "1"]);
+    ctx.ok(&["set-hook", "-g", "-B", "@mon::#{@v}", "set -gF @got '#{hook}|#{hook_value}|#{hook_last}|#{hook_session_name}'"]);
+    ctx.ok(&["set-hook", "-g", "-T", "-B", "@t:@*:#{==:#{@v},3}", "set -gaF @true '[#{hook_value}|#{hook_window_index}]'"]);
+    assert_eq!(ctx.ok(&["show-hooks", "-gB"]), "@mon::#{@v}\n@t:@*:#{==:#{@v},3}\n");
+    assert!(ctx.ok(&["show", "-g", "@mon"]).starts_with("@mon \"set -gF @got"));
+    // the first value is only recorded
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(ctx.fails(&["show", "-gv", "@got"]).contains("invalid option"));
+    ctx.ok(&["set", "-g", "@v", "2"]);
+    wait_for("monitor fired", || ctx.cmd(&["show", "-gv", "@got"]).1.trim() == "@mon|2|1|m");
+    assert_eq!(ctx.ok(&["show-hooks", "-gB", "-F", "#{option_name}|#{hook_monitor_target}|#{hook_fire_count}|#{?hook_fire_time,set,}", "@mon"]).trim(), "@mon||1|set");
+    ctx.ok(&["set", "-g", "@v", "3"]);
+    wait_for("true monitor fired", || ctx.cmd(&["show", "-gv", "@true"]).1.trim() == "[1|0]");
+    ctx.ok(&["set", "-g", "@v", "4"]);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(ctx.ok(&["show", "-gv", "@true"]).trim(), "[1|0]");
+    assert_eq!(ctx.fails(&["set-hook", "-g", "-B", "mon::x"]).trim(), "monitor hook name must start with @");
+    assert_eq!(ctx.fails(&["set-hook", "-g", "-B", "bad"]).trim(), "invalid subscription: bad");
+    assert_eq!(ctx.fails(&["set-hook", "-g", "-B", "@x:zz:y"]).trim(), "invalid subscription: @x:zz:y");
+    ctx.ok(&["set-hook", "-gu", "-B", "@mon"]);
+    assert_eq!(ctx.ok(&["show-hooks", "-gB"]), "@t:@*:#{==:#{@v},3}\n");
+    // the option stays: unsetting it removes the monitor too
+    assert!(ctx.ok(&["show", "-g", "@mon"]).starts_with("@mon "));
+    ctx.ok(&["set-hook", "-gu", "@t"]);
+    assert_eq!(ctx.ok(&["show-hooks", "-gB"]), "");
+}
+
+/// Control mode notifications are events: other sessions' windows, paste buffers and
+/// clients are reported, after the reply of the command that caused them.
+#[test]
+fn tmux_38_control_notifications() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::{Arc, Mutex};
+    let ctx = Ctx::new("ctlnotify");
+    ctx.ok(&["new-session", "-d", "-s", "c"]);
+    ctx.ok(&["new-session", "-d", "-s", "other"]);
+    let mut child = ctx.command().args(["-C", "attach", "-t", "c"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let out = Arc::new(Mutex::new(String::new()));
+    {
+        let out = out.clone();
+        let stdout = child.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                out.lock().unwrap().push_str(&(line + "\n"));
+            }
+        });
+    }
+    let mut stdin = child.stdin.take().unwrap();
+    let mut send = |l: &str| {
+        stdin.write_all(format!("{l}\n").as_bytes()).unwrap();
+        stdin.flush().unwrap();
+    };
+    let text = || out.lock().unwrap().clone();
+    wait_for("attached", || text().contains("%session-changed"));
+    // the attach command came from the command line (flags 0), after its %end
+    let t = text();
+    let first = t.lines().next().unwrap_or("");
+    assert!(first.starts_with("%begin ") && first.ends_with(" 0"), "{t}");
+    assert!(t.find("%end ").unwrap() < t.find("%session-changed").unwrap(), "{t}");
+    send("new-window -n late");
+    wait_for("%window-add", || text().contains("%window-add @"));
+    let t = text();
+    let begin = t.rfind("%begin ").unwrap();
+    assert!(t[begin..].lines().next().unwrap().ends_with(" 1"), "{t}");
+    assert!(t.rfind("%window-add").unwrap() > begin + t[begin..].find("%end ").unwrap(), "{t}");
+    let other = ctx.fmt("other:", "#{session_id}");
+    ctx.ok(&["new-window", "-d", "-t", "other:", "-n", "elsewhere"]);
+    wait_for("%unlinked-window-add", || text().contains("%unlinked-window-add @"));
+    ctx.ok(&["rename-window", "-t", "other:0", "away"]);
+    wait_for("%unlinked-window-renamed", || text().contains(" away\n") && text().contains("%unlinked-window-renamed @"));
+    ctx.ok(&["rename-session", "-t", "other", "oth"]);
+    wait_for("%session-renamed", || text().contains(&format!("%session-renamed {other} oth\n")));
+    ctx.ok(&["set-buffer", "-b", "nb", "data"]);
+    wait_for("%paste-buffer-changed", || text().contains("%paste-buffer-changed nb\n"));
+    ctx.ok(&["delete-buffer", "-b", "nb"]);
+    wait_for("%paste-buffer-deleted", || text().contains("%paste-buffer-deleted nb\n"));
+    ctx.ok(&["select-window", "-t", "oth:1"]);
+    wait_for("%session-window-changed", || text().contains(&format!("%session-window-changed {other} @")));
+    send("refresh-client -f new-layouts");
+    send("");
+    wait_for("client exit", || child.try_wait().unwrap().is_some());
+}
