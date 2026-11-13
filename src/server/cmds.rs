@@ -2316,18 +2316,16 @@ impl Server {
                 } else {
                     let cols = p.size.0;
                     let mode_lines = match (&p.mode, o.has('M')) {
-                        (Some(PaneMode::Copy(cm)), true) => {
-                            let st = crate::copymode::RenderStyle { no_selection: true, ..self.copy_render_style(p.id, ctx.client) };
-                            Some(cm.render_with(&st).0)
-                        }
+                        // the mode's screen is its copy of the pane (window_copy_get_screen)
+                        (Some(PaneMode::Copy(cm)), true) => Some(cm.backing_screen()),
                         _ => None,
                     };
                     // the rows to read: the mode's screen (-M), the normal screen saved under
                     // the alternate screen (-a, no history) or the pane with its history
                     let (total, hist) = if o.has('a') {
                         (p.size.1 as i64, 0)
-                    } else if let Some(l) = &mode_lines {
-                        (l.len() as i64, 0)
+                    } else if let Some((l, h)) = &mode_lines {
+                        (l.len() as i64, *h as i64)
                     } else {
                         (screen.history_rows_len() as i64, screen.scrollback_len() as i64)
                     };
@@ -2347,7 +2345,7 @@ impl Server {
                         std::mem::swap(&mut a, &mut b);
                     }
                     let line_at = |i: usize| -> crate::cells::Line {
-                        if let Some(l) = &mode_lines {
+                        if let Some((l, _)) = &mode_lines {
                             return l.get(i).cloned().unwrap_or_default();
                         }
                         if o.has('a') {

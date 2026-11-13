@@ -450,9 +450,6 @@ pub struct RenderStyle {
     pub position: Style,
     /// The expanded copy-mode-position-format; None draws tmux's default "[oy/hsize]".
     pub position_text: Option<String>,
-    /// Leave the selection out (tmux draws it over the mode's screen, capture-pane -M
-    /// does not see it).
-    pub no_selection: bool,
 }
 
 impl Default for RenderStyle {
@@ -468,7 +465,6 @@ impl Default for RenderStyle {
             current_line_number: Style { fg: YELLOW, ..Style::default() },
             position: mode,
             position_text: None,
-            no_selection: false,
         }
     }
 }
@@ -757,6 +753,12 @@ impl CopyMode {
 
     pub fn line_count(&self) -> usize {
         self.lines.len()
+    }
+
+    /// The copied pane (window_copy_get_screen): its lines and how many are history,
+    /// whatever is in view.
+    pub fn backing_screen(&self) -> (&[Line], usize) {
+        (&self.lines, self.hsize())
     }
 
     /// Absolute index of the first line in view.
@@ -1734,7 +1736,7 @@ impl CopyMode {
                     }
                 }
             }
-            if let Some((x0, x1)) = self.sel_range(y).filter(|_| !st.no_selection) {
+            if let Some((x0, x1)) = self.sel_range(y) {
                 for c in line.cells.iter_mut().take(x1.min(content)).skip(x0) {
                     c.style = st.selection;
                 }
@@ -3383,4 +3385,401 @@ mod tests {
         assert_eq!(internal(vi[10].1), Some(Internal::Count(1)));
         assert_eq!(internal(vi[3].1), Some(Internal::CursorWord(false)));
     }
+
+    fn text_of(l: &Line) -> String {
+        l.cells.iter().map(|c| c.text.as_str()).collect()
+    }
+
+    #[test]
+    fn line_numbers_modes_and_offsets() {
+        // 10 history lines + 5 on screen, cursor on the bottom row, scrolled up 2
+        let mut cm = numbered();
+        cm.set_line_number_option(LineNumbers::Absolute);
+        keys(&mut cm, &["C-y", "C-y"]);
+        assert_eq!((cm.scroll_offset(), cm.cy - cm.top), (2, 4));
+        assert_eq!(cm.line_number_width(), 4, "3 digits at least, and a space");
+        let (view, cur) = cm.render();
+        assert!(text_of(&view[1]).starts_with(" 10 line9"), "{:?}", text_of(&view[1]));
+        assert_eq!(cur, (4, 4), "the cursor is offset past the numbers");
+        assert_eq!(cm.position(), (9, 15), "absolute: first line in view and line count");
+        cm.set_line_number_option(LineNumbers::Relative);
+        let (view, _) = cm.render();
+        assert!(text_of(&view[0]).starts_with("  4 line8"));
+        assert!(text_of(&view[4]).starts_with("  0 line12"));
+        cm.set_line_number_option(LineNumbers::Hybrid);
+        let (view, _) = cm.render();
+        assert!(text_of(&view[4]).starts_with(" 13 line12"));
+        assert!(text_of(&view[3]).starts_with("  1 line11"));
+        // default numbering counts from the scroll position
+        cm.set_line_number_option(LineNumbers::Default);
+        let (view, _) = cm.render();
+        assert!(text_of(&view[0]).starts_with("  2 line8"));
+        assert!(text_of(&view[2]).starts_with("  0 line10"));
+        assert_eq!(cm.position(), (2, 10));
+        // screen columns map back to text columns
+        assert_eq!((cm.cursor_offset(3), cm.cursor_unoffset(7), cm.cursor_unoffset(1)), (7, 3, 0));
+        // the indicator is drawn after the numbers
+        assert!(text_of(&cm.render().0[0]).ends_with("[2/10]"));
+        // copy-mode entered with the mouse: none, though the option is on
+        cm.set_line_numbers(false);
+        assert!(!cm.line_numbers_active());
+        assert_eq!(cm.render().1, (4, 0));
+        // line-numbers-toggle shows them (in the default style) even with the option off
+        cm.set_line_number_option(LineNumbers::Off);
+        cm.run("line-numbers-toggle", &[]);
+        assert_eq!(cm.line_number_mode(), LineNumbers::Default);
+        cm.run("line-numbers-toggle", &[]);
+        assert!(!cm.line_numbers_active());
+        cm.run("line-numbers-on", &[]);
+        assert!(cm.line_numbers_active());
+        cm.run("line-numbers-off", &[]);
+        assert!(!cm.line_numbers_active());
+    }
+
+    #[test]
+    fn goto_line_with_absolute_numbers() {
+        let mut cm = numbered();
+        cm.run("goto-line", &["3".into()]);
+        assert_eq!(cm.scroll_offset(), 3);
+        cm.set_line_number_option(LineNumbers::Absolute);
+        cm.run("goto-line", &["3".into()]);
+        assert_eq!(cm.top, 2, "absolute line 3 is the third line");
+        cm.run("goto-line", &["0".into()]);
+        assert_eq!(cm.top, 0);
+        cm.run("goto-line", &["999".into()]);
+        assert_eq!(cm.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn styles_for_current_line_mark_and_matches() {
+        let mut cm = CopyMode::new(lines(&["ab ab", "xab", "zz"]), W, 3, (2, 0), false);
+        let red = Style { bg: Color::Idx(1), ..Style::default() };
+        let mark = Style { fg: Color::Idx(2), bg: Color::Idx(3), attrs: 0 };
+        let st = RenderStyle { current_line: Some(red), mark, position_text: Some(String::new()), ..RenderStyle::default() };
+        let (view, _) = cm.render_with(&st);
+        assert!(view[2].cells.iter().all(|c| c.style.bg == red.bg), "current line");
+        assert!(view[1].cells.iter().all(|c| c.style.bg == Color::Default));
+        cm.run("cursor-up", &[]);
+        cm.run("set-mark", &[]);
+        cm.run("cursor-up", &[]);
+        let (view, _) = cm.render_with(&st);
+        // the mark line takes the mark style, its cell the reverse
+        let mx = cm.mark.1;
+        assert_eq!(mx, 0);
+        assert_eq!((view[1].cells[2].style.fg, view[1].cells[2].style.bg), (mark.fg, mark.bg));
+        assert_eq!((view[1].cells[mx].style.fg, view[1].cells[mx].style.bg), (mark.bg, mark.fg));
+        cm.run("search-forward", &["ab".into()]);
+        let (view, _) = cm.render_with(&st);
+        assert_eq!(view[0].cells[3].style.bg, MAGENTA, "the match at the cursor");
+        assert_eq!(view[0].cells[0].style.bg, CYAN);
+        assert_eq!(view[1].cells[1].style.bg, CYAN, "matches are drawn over the mark line");
+        assert_eq!(view[1].cells[0].style.bg, mark.fg, "the mark cell stays reversed");
+        // jump-to-mark swaps the mark and the cursor
+        let here = (cm.cy, cm.cx);
+        cm.run("jump-to-mark", &[]);
+        assert_eq!((cm.cy, cm.cx), (1, mx));
+        assert_eq!(cm.mark, here);
+    }
+
+    #[test]
+    fn position_format_overlays_only_its_cells() {
+        let cm = CopyMode::new(lines(&["hello world"]), W, 1, (0, 0), false);
+        let pos = Style { fg: Color::Idx(4), ..Style::default() };
+        let st = RenderStyle { position: pos, position_text: Some("#[align=right]<#[fg=red]x>".into()), ..RenderStyle::default() };
+        let (view, _) = cm.render_with(&st);
+        assert_eq!(text_of(&view[0]), "hello world      <x>");
+        assert_eq!(view[0].cells[17].style.fg, Color::Idx(4));
+        assert_eq!(view[0].cells[18].style.fg, Color::Idx(1));
+        assert_eq!(view[0].cells[16].style, Style::default());
+    }
+
+    #[test]
+    fn vi_cursor_stays_on_text_and_rectangles_go_past_it() {
+        let mut cm = CopyMode::new(lines(&["hello", "ab", "longer line"]), W, 3, (0, 0), true);
+        keys(&mut cm, &["$"]);
+        assert_eq!(cm.cx, 4);
+        keys(&mut cm, &["l"]);
+        assert_eq!(pos(&cm), (1, 0), "l at the last character wraps");
+        // virtualedit=block: a rectangle selection may go past the end of the line
+        let mut cm = CopyMode::new(lines(&["hello", "ab", "longer line"]), W, 3, (0, 0), true);
+        keys(&mut cm, &["v", "Space", "$"]);
+        assert_eq!(cm.cx, W as usize, "to the edge of the screen");
+        keys(&mut cm, &["j"]);
+        assert_eq!(pos(&cm), (1, W as usize), "kept past the end of a short line");
+        assert_eq!(copied(cm.run("copy-selection", &[])), "hello\nab");
+        // leaving rectangle mode brings the cursor back within the line
+        keys(&mut cm, &["v"]);
+        assert_eq!(cm.cx, 1);
+        // emacs may go one past the text
+        let mut cm = CopyMode::new(lines(&["hello"]), W, 1, (0, 0), false);
+        keys(&mut cm, &["C-e"]);
+        assert_eq!(cm.cx, 5);
+    }
+
+    #[test]
+    fn scrolling_with_a_selection_moves_only_the_view() {
+        let mut cm = numbered();
+        keys(&mut cm, &["k", "k", "Space", "k"]);
+        let ends = cm.selection_ends();
+        assert!(cm.selection_following());
+        keys(&mut cm, &["C-y", "C-y"]);
+        assert_eq!(cm.scroll_offset(), 2);
+        assert_eq!(cm.selection_ends(), ends, "the selection stays where it was");
+        assert!(!cm.selection_following(), "and no longer follows the cursor");
+        let row = cm.cy - cm.top;
+        keys(&mut cm, &["C-e"]);
+        assert_eq!(cm.cy - cm.top, row, "the cursor keeps its row");
+        // at the bottom with a selection, scrolling never leaves copy mode
+        cm.set_exit_on_bottom(true);
+        assert_eq!(keys(&mut cm, &["C-e", "C-e"]), Action::None);
+        assert_eq!(cm.run("page-down", &[]), Action::None);
+        assert_eq!(cm.run("scroll-down", &[]), Action::None);
+        // other-end on a stopped selection makes its end follow the cursor again
+        cm.run("other-end", &[]);
+        assert!(cm.selection_following());
+        assert_eq!(cm.selection_ends(), ends);
+        cm.run("clear-selection", &[]);
+        assert_eq!(cm.run("scroll-down", &[]), Action::Cancel, "nothing selected: -e exits");
+        // stop-selection
+        let mut cm = numbered();
+        keys(&mut cm, &["Space", "k"]);
+        cm.run("stop-selection", &[]);
+        let ends = cm.selection_ends();
+        keys(&mut cm, &["k", "k"]);
+        assert_eq!(cm.selection_ends(), ends);
+    }
+
+    #[test]
+    fn scroll_exit_commands() {
+        let mut cm = numbered();
+        cm.run("halfpage-up", &[]);
+        assert_eq!(cm.run("scroll-exit-on", &[]), Action::None);
+        assert_eq!(cm.run("halfpage-down", &[]), Action::Cancel);
+        let mut cm = numbered();
+        cm.set_exit_on_bottom(true);
+        cm.run("scroll-exit-toggle", &[]);
+        cm.run("page-up", &[]);
+        assert_eq!(cm.run("page-down", &[]), Action::None);
+        cm.run("scroll-exit-toggle", &[]);
+        cm.run("page-up", &[]);
+        assert_eq!(cm.run("page-down", &[]), Action::Cancel);
+        let mut cm = numbered();
+        cm.run("scroll-exit-on", &[]);
+        cm.run("scroll-exit-off", &[]);
+        cm.run("page-up", &[]);
+        assert_eq!(cm.run("page-down", &[]), Action::None);
+        assert_eq!(cm.run("page-down-and-cancel", &[]), Action::Cancel);
+        // scroll-down at the bottom: nothing, or leave with -e
+        let mut cm = numbered();
+        assert_eq!(cm.run("scroll-down", &[]), Action::None);
+        cm.set_exit_on_bottom(true);
+        assert_eq!(cm.run("scroll-down", &[]), Action::Cancel);
+        // copy-mode -d: a page down, leaving at the bottom with -e
+        let mut cm = numbered();
+        cm.run("page-up", &[]);
+        cm.run("page-up", &[]);
+        assert!(!cm.page_down_exit(true));
+        assert!(cm.page_down_exit(true));
+    }
+
+    #[test]
+    fn recentre_top_bottom_cycles() {
+        let mut cm = numbered();
+        keys(&mut cm, &["k", "k", "k", "k", "k", "k"]);
+        assert_eq!((cm.cy, cm.cy - cm.top), (8, 0));
+        cm.run("recentre-top-bottom", &[]);
+        assert_eq!((cm.cy, cm.cy - cm.top), (8, 2), "middle");
+        cm.run("recentre-top-bottom", &[]);
+        assert_eq!((cm.cy, cm.cy - cm.top), (8, 0), "top");
+        cm.run("recentre-top-bottom", &[]);
+        assert_eq!((cm.cy, cm.cy - cm.top), (8, 4), "bottom");
+        cm.run("recentre-top-bottom", &[]);
+        assert_eq!((cm.cy, cm.cy - cm.top), (8, 2), "middle again");
+        // a different line starts at the middle again
+        keys(&mut cm, &["k"]);
+        cm.run("recentre-top-bottom", &[]);
+        assert_eq!(cm.cy - cm.top, 2);
+        // emacs C-l
+        let v: Vec<String> = (0..15).map(|i| format!("l{i}")).collect();
+        let v: Vec<&str> = v.iter().map(String::as_str).collect();
+        let mut cm = CopyMode::new(lines(&v), W, 5, (4, 0), false);
+        cm.press("C-l");
+        assert_eq!(cm.cy - cm.top, 4, "the view cannot scroll past the bottom");
+        keys(&mut cm, &["Up", "Up", "Up", "Up", "Up", "Up"]);
+        cm.press("C-l");
+        assert_eq!(cm.cy - cm.top, 2);
+    }
+
+    #[test]
+    fn unicode_whitespace_in_words() {
+        // NBSP and EM SPACE separate words; a space in word-separators matches them
+        let mut cm = CopyMode::new(lines(&["a\u{a0}b c\u{2003}d e"]), W, 1, (0, 0), true);
+        cm.set_word_separators(" ");
+        let mut stops = Vec::new();
+        for _ in 0..4 {
+            cm.press("w");
+            stops.push(cm.cx);
+        }
+        assert_eq!(stops, vec![2, 4, 6, 8]);
+        cm.press("b");
+        assert_eq!(cm.cx, 6);
+        let mut cm = CopyMode::new(lines(&["x\u{3000}yy"]), W, 1, (0, 3), false);
+        cm.run("select-word", &[]);
+        assert_eq!(copied(cm.run("copy-selection", &[])), "yy");
+        assert!(cm.in_set((0, 1), " "));
+        assert!(!cm.in_set((0, 1), "-"));
+    }
+
+    #[test]
+    fn dragging_inside_a_selection_adjusts_it() {
+        let mut cm = CopyMode::new(lines(&["0123456789"]), W, 1, (0, 0), false);
+        cm.start_drag(0, 2);
+        cm.drag_to(0, 7);
+        cm.end_drag();
+        assert_eq!(cm.selection_ends(), Some(((2, 0), (7, 0))));
+        // near the end: the end follows, the start stays
+        cm.start_drag(0, 6);
+        cm.drag_to(0, 9);
+        assert_eq!(cm.sel_bounds(), Some(((0, 2), (0, 9))));
+        cm.end_drag();
+        // near the start: the start follows
+        cm.start_drag(0, 3);
+        cm.drag_to(0, 1);
+        assert_eq!(cm.sel_bounds(), Some(((0, 1), (0, 9))));
+        cm.end_drag();
+        // outside: a new selection
+        cm.start_drag(0, 0);
+        assert_eq!(cm.sel_bounds(), Some(((0, 0), (0, 0))));
+        assert_eq!(cm.selection_mode(), SelMode::Char);
+    }
+
+    #[test]
+    fn selection_modes() {
+        let mut cm = CopyMode::new(lines(&["one two", "three"]), W, 2, (0, 5), true);
+        assert_eq!(cm.selection_mode(), SelMode::Char);
+        cm.run("select-word", &[]);
+        assert_eq!(cm.selection_mode(), SelMode::Word);
+        cm.run("cursor-down", &[]);
+        cm.run("selection-mode", &["line".into()]);
+        assert_eq!(cm.selection_mode(), SelMode::Line);
+        assert_eq!(copied(cm.run("copy-selection", &[])), "one two\nthree\n");
+        assert_eq!(cm.selection_mode(), SelMode::Char, "copying clears the selection mode");
+        cm.run("selection-mode", &["w".into()]);
+        assert_eq!(cm.selection_mode().name(), "word");
+        cm.run("selection-mode", &[]);
+        assert_eq!(cm.selection_mode().name(), "char");
+    }
+
+    #[test]
+    fn counts_from_digits_and_meta_digits() {
+        let mut cm = numbered();
+        keys(&mut cm, &["1", "0", "k"]);
+        assert_eq!(cm.cy, 4);
+        // emacs: M-digit starts a count, plain digits extend it, M-digit starts again
+        let v: Vec<String> = (0..30).map(|i| format!("l{i}")).collect();
+        let v: Vec<&str> = v.iter().map(String::as_str).collect();
+        let mut cm = CopyMode::new(lines(&v), W, 5, (4, 0), false);
+        keys(&mut cm, &["M-1", "2", "Up"]);
+        assert_eq!(cm.cy, 17);
+        keys(&mut cm, &["M-3", "M-2", "Up"]);
+        assert_eq!(cm.cy, 15);
+        // send-keys -N
+        cm.set_count(4);
+        cm.run("cursor-up", &[]);
+        assert_eq!(cm.cy, 11);
+        cm.run("cursor-up", &[]);
+        assert_eq!(cm.cy, 10, "the count is used once");
+        // a jump waits for its character with the count
+        let mut cm = CopyMode::new(lines(&["a.b.c.d"]), W, 1, (0, 0), true);
+        keys(&mut cm, &["2", "f"]);
+        assert!(cm.waiting_for_key());
+        keys(&mut cm, &["."]);
+        assert_eq!(cm.cx, 3);
+    }
+
+    #[test]
+    fn escape_bracket_and_cursor_word_bindings() {
+        let mut cm = CopyMode::new(lines(&["foo.bar foo.bar"]), W, 1, (0, 0), true);
+        keys(&mut cm, &["Space", "l"]);
+        keys(&mut cm, &["C-["]);
+        assert!(!cm.selection_active(), "vi C-[ clears the selection like Escape");
+        let mut emacs = CopyMode::new(lines(&["x"]), W, 1, (0, 0), false);
+        assert_eq!(emacs.press("C-["), Action::Cancel);
+        // # and * search for the word under the cursor as a regex
+        assert_eq!(cm.key("*"), Action::Run("search-forward".into(), vec!["#{copy_cursor_word}".into()], true));
+        // refresh-now asks for the content again; r is bound to it
+        assert_eq!(cm.press("r"), Action::Refresh);
+        // tmux ignores unknown commands, refresh-from-pane is gone
+        assert_eq!(cm.run("refresh-from-pane", &[]), Action::None);
+        assert!(!is_command("refresh-from-pane"));
+        assert!(command_allowed_readonly("cursor-down") && command_allowed_readonly("refresh-now"));
+        assert!(!command_allowed_readonly("begin-selection") && !command_allowed_readonly("copy-selection"));
+        assert!(!command_allowed_readonly("scroll-exit-on"));
+    }
+
+    #[test]
+    fn refresh_follows_or_keeps_lines() {
+        let mk = |n: usize| -> Vec<Line> { (0..n).map(|i| line(&format!("l{i}"), false)).collect() };
+        let mut cm = CopyMode::new(mk(15), W, 5, (4, 0), true);
+        cm.run("refresh-on", &[]);
+        assert!(cm.refresh_active() && cm.refresh_ready());
+        // the cursor on the bottom line follows new output
+        cm.refresh(mk(18));
+        assert_eq!((cm.scroll_offset(), cm.cy), (0, 17));
+        // elsewhere the same lines stay in view
+        keys(&mut cm, &["k", "C-y"]);
+        let (top, row) = (cm.top, cm.cy - cm.top);
+        cm.refresh(mk(25));
+        assert_eq!((cm.top, cm.cy - cm.top), (top, row));
+        // paused while selecting
+        cm.run("begin-selection", &[]);
+        assert!(!cm.refresh_ready());
+        cm.run("refresh-toggle", &[]);
+        assert!(!cm.refresh_active());
+        // view mode and copies of other panes do not refresh
+        cm.from_other = true;
+        cm.run("refresh-on", &[]);
+        assert!(!cm.refresh_active());
+        assert_eq!(cm.run("refresh-now", &[]), Action::None);
+    }
+
+    #[test]
+    fn scrollbar_slider_drag() {
+        let mut cm = numbered();
+        assert_eq!(cm.slider(), (4, 1));
+        // dragging the slider to the top shows the top of the history
+        assert!(!cm.scroll_to_slider(0, 0, false));
+        assert_eq!(cm.scroll_offset(), 10);
+        assert_eq!(cm.slider(), (0, 1));
+        // and back to the bottom, leaving with -e
+        assert!(cm.scroll_to_slider(0, 4, true));
+        assert_eq!(cm.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn copy_variants() {
+        let mut cm = CopyMode::new(lines(&["abc def"]), W, 1, (0, 0), false);
+        keys(&mut cm, &["C-Space", "M-f"]);
+        assert_eq!(cm.run("append-selection", &[]), Action::Copy { text: "abc".into(), cancel: false, append: true });
+        keys(&mut cm, &["C-Space", "M-f"]);
+        assert_eq!(cm.run("pipe-no-clear", &[]), Action::Pipe { text: " def".into(), cancel: false });
+        assert!(cm.selection_active());
+        assert_eq!(cm.run("pipe-and-cancel", &[]), Action::Pipe { text: " def".into(), cancel: true });
+        assert!(!cm.selection_active());
+        // cursor-down-and-cancel leaves at the bottom
+        let mut cm = numbered();
+        assert_eq!(cm.run("cursor-down-and-cancel", &[]), Action::Cancel);
+        // cursor-centre-*
+        cm.run("cursor-centre-vertical", &[]);
+        assert_eq!(cm.cy - cm.top, 2);
+        cm.run("cursor-centre-horizontal", &[]);
+        assert_eq!(cm.cx, 5, "clamped to the line");
+        // scroll-top / scroll-bottom
+        cm.run("page-up", &[]);
+        cm.run("scroll-top", &[]);
+        assert_eq!(cm.cy - cm.top, 0);
+        cm.run("scroll-bottom", &[]);
+        assert_eq!(cm.cy - cm.top, 4);
+    }
+
 }

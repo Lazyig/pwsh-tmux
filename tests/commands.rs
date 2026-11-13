@@ -1060,6 +1060,9 @@ fn capture_details(ctx: &Ctx) {
     assert!(ctx.ok(&["capture-pane", "-p", "-R", "-t", "c"]).starts_with("G 20x4 (0/"));
     ctx.ok(&["copy-mode", "-t", "c"]);
     assert!(ctx.ok(&["capture-pane", "-p", "-M", "-t", "c"]).contains("long line"));
+    // -M reads the mode's copy of the pane, not its scrolled view, nor the selection
+    ctx.ok(&["send-keys", "-X", "-t", "c", "begin-selection"]);
+    assert_eq!(ctx.ok(&["capture-pane", "-p", "-M", "-S", "1", "-E", "1", "-t", "c"]), "long line wrapping a\n");
 }
 
 fn empty_panes(ctx: &Ctx) {

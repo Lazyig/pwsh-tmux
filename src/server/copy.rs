@@ -76,6 +76,8 @@ impl Server {
             }
             // an unbound key does nothing (unless a jump waits for its character)
             None if !pending => {}
+            // the default prompts (and repeat counts) need a client, as command-prompt does
+            Some(cmd) if !pending && cid.is_none() && cmd.starts_with("command-prompt") => {}
             _ => {
                 let action = match self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
                     Some(PaneMode::Copy(cm)) => cm.key(name),
@@ -323,7 +325,6 @@ impl Server {
             current_line_number: style("copy-mode-current-line-number-style"),
             position: style("copy-mode-position-style"),
             position_text,
-            no_selection: false,
         }
     }
 
