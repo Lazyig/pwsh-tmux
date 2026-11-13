@@ -217,6 +217,14 @@ impl Server {
         format::expand_status_time(template, &vars::VarCtx { srv: self, t, client: Some(cid), extra: HashMap::new() })
     }
 
+    /// A pane status line (tmux window_make_pane_status): pane-border-format drawn over the
+    /// border line in `width` cells; None cells keep the border. The ranges are what a click
+    /// on the line hits (window_pane_status_get_range).
+    pub fn pane_status_line(&self, id: PaneId, width: usize, base: Style) -> (Vec<Option<Cell>>, Vec<Option<format::Range>>) {
+        let text = self.expand_for_pane(id, &self.opt_pane(id, "pane-border-format"));
+        format::draw_line(&format::spans(&text, base), width, base)
+    }
+
     pub fn render_all(&mut self) {
         let ids: Vec<ClientId> = self.clients.iter().filter(|(_, c)| c.dirty && c.attached && !c.suspended && c.control == 0 && c.session.is_some()).map(|(id, _)| *id).collect();
         for id in ids {
@@ -300,13 +308,8 @@ impl Server {
                 cur_range = (start, wcells.len());
             }
             if k + 1 < n {
-                let sep_start = wcells.len();
                 wcells.extend(spans_cells(&format::spans(&sep, base), usize::MAX, base));
                 wtags.resize(wcells.len(), None);
-                // tmux's window range (closed by #[norange]) covers one cell more
-                if let Some(t) = wtags.get_mut(sep_start) {
-                    *t = Some(format::Range::Window(*idx));
-                }
             }
         }
         let avail = width.saturating_sub(lcells.len() + rcells.len());
@@ -511,11 +514,10 @@ impl Server {
                 let status = self.pane_status(wid, id);
                 if status != "off" {
                     let by = if status == "top" { top } else { bot };
-                    let text = self.expand_for_pane(id, &self.opt_pane(id, "pane-border-format"));
-                    let cells = spans_cells(&format::spans(&text, st), g.w.saturating_sub(2) as usize, st);
+                    let (cells, _) = self.pane_status_line(id, g.w.saturating_sub(2) as usize, st);
                     for (i, c) in cells.into_iter().enumerate() {
                         let x = g.x + 2 + i as i32;
-                        if x >= 0 && by >= 0 && x < clip.0 as i32 && by < clip.1 as i32 && x < r {
+                        if let Some(c) = c.filter(|_| x >= 0 && by >= 0 && x < clip.0 as i32 && by < clip.1 as i32 && x < r) {
                             f.set(x as u16, oy + by as u16, c);
                         }
                     }
@@ -621,9 +623,12 @@ impl Server {
                 for x in r.x..r.right() {
                     if x >= r.x + 2 || !at(x as i32, by as i32) { f.set(x, oy + by, Cell { text: bset[0].into(), style: st }); }
                 }
-                let text = self.expand_for_pane(*id, &self.opt_window(Some(wid), "pane-border-format"));
-                let cells = spans_cells(&format::spans(&text, st), r.w.saturating_sub(2) as usize, st);
-                f.put_cells(r.x + 2, oy + by, &cells);
+                let (cells, _) = self.pane_status_line(*id, r.w.saturating_sub(2) as usize, st);
+                for (i, c) in cells.into_iter().enumerate() {
+                    if let Some(c) = c.filter(|_| r.x as usize + 2 + i < cw as usize) {
+                        f.set(r.x + 2 + i as u16, oy + by, c);
+                    }
+                }
             }
         }
         if border_status != "off" {
