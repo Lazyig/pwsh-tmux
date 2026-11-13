@@ -2039,6 +2039,7 @@ impl Server {
         }
         if self.detach_pane(wid, id) {
             if !keep_zoom {
+                self.unzoom_z(wid);
                 let w = self.windows.get_mut(&wid).unwrap();
                 w.zoomed = false;
                 w.zoom_pane = None;

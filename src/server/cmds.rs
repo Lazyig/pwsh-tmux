@@ -933,7 +933,7 @@ impl Server {
         let (rects, _) = self.rects(wid);
         let r = if full { area } else { rects.iter().find(|(p, _)| *p == target).map(|(_, r)| *r).ok_or("pane not visible")? };
         if (horizontal && r.w < 3) || (!horizontal && r.h < 3) {
-            return err("no space for new pane");
+            return err("no space for a new pane");
         }
         let total = if horizontal { r.w } else { r.h };
         let new_size = size.unwrap_or((total - 1) / 2).clamp(1, total - 2);

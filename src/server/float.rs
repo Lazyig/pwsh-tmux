@@ -208,11 +208,14 @@ impl Server {
         if w.modal.is_some_and(|m| m != pane) || pane == w.active {
             return false;
         }
-        if w.is_floating(pane) {
-            self.raise(wid, pane);
-        }
         let zoomed = self.zoomed_pane(wid);
         let keep_zoom = zoomed.is_some() && self.pane_visible(wid, pane);
+        if zoomed.is_some() && !keep_zoom {
+            self.unzoom_z(wid);
+        }
+        if self.windows[&wid].is_floating(pane) {
+            self.raise(wid, pane);
+        }
         let w = self.windows.get_mut(&wid).unwrap();
         w.set_active(pane);
         if let Some(z) = zoomed {
@@ -239,11 +242,32 @@ impl Server {
         w.zorder = z;
     }
 
+    /// The z-order change of tmux `window_unzoom`: a zoomed floating pane goes back to the
+    /// front when it is active, else behind the other floating panes.
+    pub fn unzoom_z(&mut self, wid: WinId) {
+        let order = self.unzoomed_zlist(wid);
+        if let Some(w) = self.windows.get_mut(&wid) {
+            w.zorder = order;
+        }
+    }
+
+    /// The z-order the window will have once unzoomed (see [`Server::unzoom_z`]).
+    fn unzoomed_zlist(&self, wid: WinId) -> Vec<PaneId> {
+        let w = &self.windows[&wid];
+        let mut order = w.zlist();
+        let Some(z) = self.zoomed_pane(wid).filter(|z| w.is_floating(*z)) else { return order };
+        order.retain(|p| *p != z);
+        let at = if z == w.active { 0 } else { order.iter().position(|p| !w.layout.is_float(*p)).unwrap_or(order.len()) };
+        order.insert(at, z);
+        order
+    }
+
     pub fn unzoom(&mut self, wid: WinId) -> bool {
-        let Some(w) = self.windows.get_mut(&wid) else { return false };
-        if !w.zoomed {
+        if !self.windows.get(&wid).is_some_and(|w| w.zoomed) {
             return false;
         }
+        self.unzoom_z(wid);
+        let w = self.windows.get_mut(&wid).unwrap();
         w.zoomed = false;
         w.zoom_pane = None;
         self.apply_layout(wid);
@@ -384,7 +408,8 @@ impl Server {
         }
         let base = self.opt_window_num(Some(wid), "pane-base-index").max(0) as usize;
         let panes = w.panes();
-        let z = w.zlist();
+        // the saved layout of a zoomed window has its z-order once unzoomed (layout_cell_zindex)
+        let z = if visible { w.zlist() } else { self.unzoomed_zlist(wid) };
         let info = |p: PaneId| {
             let floating = node.is_float(p);
             LeafInfo {
@@ -1202,6 +1227,60 @@ mod tests {
         // closing it gives the pane active before it back
         ok(&mut srv, &["kill-pane", "-t", &m]);
         assert_eq!(fmt(&srv, &t, "#{pane_active} #{window_modal_pane}"), "1 ");
+        srv.shutdown();
+    }
+
+    #[test]
+    fn default_floating_bindings() {
+        let b = super::super::input::default_bindings();
+        // C-b g enters the move table of tmux 3.8 (19 keys)
+        assert_eq!(b["prefix"]["g"].cmd, "switch-client -T move");
+        assert_eq!(b["move"].len(), 19);
+        assert_eq!(b["move"]["M-Right"].note, "Move pane to right and resize");
+        assert_eq!(b["prefix"]["*"].cmd, "new-pane");
+        assert!(b["prefix"]["M-Up"].repeat);
+        for k in ["C-MouseDrag1Pane", "C-MouseDrag1Empty", "M-MouseDrag1Pane", "M-MouseDrag1Border", "MouseDown1Control7", "MouseDown1Control8", "MouseDown1Control9", "MouseDown3Empty"] {
+            assert!(b["root"].contains_key(k), "{k}");
+        }
+        for (table, keys) in &b {
+            for (k, bd) in keys {
+                assert!(crate::cmdparse::parse(&bd.cmd).is_ok(), "{table} {k}: {}", bd.cmd);
+            }
+        }
+        // the move menus run move-pane and resize-pane in the active floating pane
+        let (mut srv, _ev) = server();
+        ok(&mut srv, &["new-session", "-d", "-s", "m", "-x", "80", "-y", "24"]);
+        let f = ok(&mut srv, &["new-pane", "-P", "-F", "#{pane_id}", "-x", "20", "-y", "6"]).trim().to_string();
+        ok(&mut srv, &["resize-pane", "-x", "50%", "-y", "50%"]);
+        ok(&mut srv, &["move-pane", "-P", "bottom-right"]);
+        assert_eq!(fmt(&srv, &f, "#{pane_width}x#{pane_height} #{pane_x},#{pane_y}"), "38x10 41,13");
+        ok(&mut srv, &["resize-pane", "-x", "100%", "-y", "100%"]);
+        ok(&mut srv, &["move-pane", "-P", "top-left"]);
+        assert_eq!(fmt(&srv, &f, "#{pane_width}x#{pane_height} #{pane_x},#{pane_y}"), "78x22 1,1");
+        srv.shutdown();
+    }
+
+    #[test]
+    fn zoomed_floating_pane_z_order() {
+        // tmux 3.8: a zoomed floating pane goes back in front when it is active as the window
+        // is unzoomed (and the saved layout already shows it there), else behind the others
+        let (mut srv, _ev) = server();
+        ok(&mut srv, &["new-session", "-d", "-s", "z", "-x", "80", "-y", "24"]);
+        let a = ok(&mut srv, &["display", "-p", "-t", "z", "#{pane_id}"]).trim().to_string();
+        let b = ok(&mut srv, &["new-pane", "-P", "-F", "#{pane_id}"]).trim().to_string();
+        let c = ok(&mut srv, &["new-pane", "-d", "-P", "-F", "#{pane_id}"]).trim().to_string();
+        assert_eq!((fmt(&srv, &b, "#{pane_z}"), fmt(&srv, &c, "#{pane_z}")), ("1".into(), "0".into()));
+        ok(&mut srv, &["resize-pane", "-Z", "-t", &b]);
+        assert!(layout(&srv).contains(&format!(r#""a":true,"i":1,"z":0,"I":"{b}""#)), "{}", layout(&srv));
+        ok(&mut srv, &["select-pane", "-t", &a]);
+        assert_eq!((fmt(&srv, &b, "#{pane_z}"), fmt(&srv, &c, "#{pane_z}")), ("0".into(), "1".into()));
+        // unzoomed while another pane is active, it goes behind the floating panes
+        ok(&mut srv, &["resize-pane", "-Z", "-t", &b]);
+        ok(&mut srv, &["select-pane", "-t", &b]);
+        let d = ok(&mut srv, &["new-pane", "-A", "-P", "-F", "#{pane_id}"]).trim().to_string();
+        assert_eq!(fmt(&srv, &d, "#{window_zoomed_flag}"), "1");
+        ok(&mut srv, &["resize-pane", "-Z"]);
+        assert_eq!(panes(&srv).split(' ').map(|p| p.split(':').nth(3).unwrap()).collect::<Vec<_>>().join(","), "4,2,1,0");
         srv.shutdown();
     }
 
