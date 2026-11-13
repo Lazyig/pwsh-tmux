@@ -81,7 +81,7 @@ impl Payload {
     /// give a _name.
     pub fn formats(&self, prefix: &str) -> HashMap<String, String> {
         let mut f = HashMap::new();
-        for (k, v) in &self.items {
+        for (k, v) in self.items.iter().filter(|(k, _)| !k.starts_with('_')) {
             f.insert(format!("{prefix}{k}"), v.print());
             match v {
                 Val::Session(_, n) | Val::Window(_, n) => {
@@ -229,6 +229,9 @@ pub struct State {
     /// Windows whose command fires window-layout-changed itself: how many times in
     /// all, counting the change itself.
     pub layout_fired: Vec<(WinId, usize)>,
+    /// Clients told to exit while attached (their session went): client-detached
+    /// fires when they are lost.
+    pub lost_attached: HashSet<ClientId>,
     /// Panes with output since the last turn of the loop (PANE_ACTIVITY).
     pub activity: HashSet<PaneId>,
     /// Panes that have focus (PANE_FOCUSED) and clients that lost it (~CLIENT_FOCUSED).
@@ -668,8 +671,11 @@ impl Server {
             }
             let w = &self.ev.waiters[i];
             if let Some(f) = &w.filter {
-                let t = self.current(&w.queue.ctx);
-                let ok = cmds::truthy(&self.expand_extra(t, w.client, f, p.formats("")));
+                // the payload and the client, no target (no format_defaults); tmux's
+                // own variables (window_name, ...) come first and are empty
+                let mut extra = p.formats("");
+                extra.retain(|k, _| !cmds::VAR_NAMES.contains(&k.as_str()));
+                let ok = cmds::truthy(&self.expand_extra(Target::default(), w.client, f, extra));
                 if !ok {
                     i += 1;
                     continue;
@@ -700,7 +706,7 @@ impl Server {
 
     /// wait-for: channels (-S/-L/-U, waiting, -l, -w) and events (-E).
     pub(super) fn cmd_wait_for(&mut self, o: &Opts, ctx: &mut Ctx) -> Result<Flow, String> {
-        let name = o.rest.first().ok_or("wait-for needs a channel")?.clone();
+        let name = o.rest.first().ok_or("command wait-for: too few arguments (need at least 1)")?.clone();
         // the client whose queue waits (none in hooks)
         let able = ctx.hook_depth < 2 && ctx.reply.or(ctx.client).is_some_and(|c| self.clients.contains_key(&c));
         if o.has('E') {

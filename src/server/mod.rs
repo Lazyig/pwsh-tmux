@@ -1285,7 +1285,7 @@ impl Server {
     fn client_gone(&mut self, cid: ClientId) {
         let Some(c) = self.clients.get(&cid) else { return };
         // server_client_lost: client-detached if attached, client-closed for terminals
-        let detached = (c.attached && c.session.is_some()).then(|| self.payload_client(cid));
+        let detached = ((c.attached && c.session.is_some()) || self.ev.lost_attached.remove(&cid)).then(|| self.payload_client(cid));
         let closed = (c.control > 0 || c.ident.as_ref().is_some_and(|i| i.tty)).then(|| self.payload_client(cid));
         let Some(c) = self.clients.remove(&cid) else { return };
         c.closed.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2218,7 +2218,10 @@ impl Server {
                 None => {
                     if let Some(c) = self.clients.get_mut(&cid) {
                         c.session = None;
-                        c.attached = false;
+                        // still attached when it is lost: client-detached then
+                        if std::mem::replace(&mut c.attached, false) {
+                            self.ev.lost_attached.insert(cid);
+                        }
                         c.send_exit("[exited]");
                     }
                 }
@@ -2319,6 +2322,11 @@ impl Server {
         c.attached = false;
         c.session = None;
         c.send_exit(msg);
+        // a detached client answers MSG_EXITING, which takes its focus away; a
+        // control client's empty line just exits
+        if !msg.is_empty() {
+            self.update_focus();
+        }
         if let Some(sid) = sid {
             self.update_session_size(sid);
             self.fire("client-detached", events::Payload { readonly, ..detached });

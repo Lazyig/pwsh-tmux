@@ -1228,6 +1228,16 @@ fn tmux_38_wait_for_events() {
     let wid = ctx.fmt("w:0", "#{window_id}");
     assert!(text.contains(&format!("event=window-renamed\nnew_name=no\nold_name=start\nwindow={wid}\n")), "{text}");
     assert!(text.ends_with(&format!("event=window-renamed\nnew_name=yes\nold_name=no\nwindow={wid}\n")), "{text}");
+    // -F sees the payload but not tmux's own variables, which have no target there
+    let mut child = ctx.command().args(["wait-for", "-E", "-F", "#{==:#{window_name},again}", "window-renamed"]).spawn().unwrap();
+    wait_for("shadowed waiter", || !ctx.ok(&["wait-for", "-E", "-l", "window-renamed"]).is_empty());
+    ctx.ok(&["rename-window", "-t", "w:0", "again"]);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!ctx.ok(&["wait-for", "-E", "-l", "window-renamed"]).is_empty());
+    child.kill().unwrap();
+    let _ = child.wait();
+    wait_for("shadowed waiter gone", || ctx.ok(&["wait-for", "-E", "-l", "window-renamed"]).is_empty());
+    assert_eq!(ctx.fails(&["wait-for", "-l"]).trim(), "command wait-for: too few arguments (need at least 1)");
     // set-hook -E: the event carries the client and the target
     let child = ctx.command().args(["wait-for", "-v", "-E", "@user"]).stdout(Stdio::piped()).spawn().unwrap();
     wait_for("user event waiter", || !ctx.ok(&["wait-for", "-E", "-l", "@user"]).is_empty());
@@ -1427,4 +1437,33 @@ fn tmux_38_event_order() {
     ctx.ok(&["swap-pane", "-d", "-s", "a:0.0", "-t", "a:7.0"]);
     let out = log(&ctx);
     assert!(out.contains("pane-moved<:7>") && out.contains("pane-moved<:0>"), "{out}");
+}
+
+/// A client whose session is destroyed is detached as it goes (client-detached after
+/// session-closed); detaching takes the pane's focus first.
+#[test]
+fn tmux_38_client_detach_events() {
+    let ctx = Ctx::new("clidet");
+    ctx.ok(&["new-session", "-d", "-s", "k"]);
+    ctx.ok(&["new-session", "-d", "-s", "other"]);
+    ctx.ok(&["set", "-g", "focus-events", "on"]);
+    for e in ["client-detached", "session-closed", "pane-focus-in", "pane-focus-out"] {
+        ctx.ok(&["set-hook", "-g", e, "set -gaF @log '#{hook} '"]);
+    }
+    let attach = |ctx: &Ctx| {
+        let child = ctx.command().args(["-C", "attach", "-t", "k"]).stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+        wait_for("attached", || ctx.ok(&["list-clients"]).contains("k"));
+        child
+    };
+    let mut child = attach(&ctx);
+    ctx.ok(&["detach-client", "-s", "k"]);
+    wait_for("detached", || child.try_wait().unwrap().is_some());
+    wait_for("hooks", || ctx.cmd(&["show", "-gv", "@log"]).1.contains("client-detached"));
+    assert_eq!(ctx.ok(&["show", "-gv", "@log"]).trim(), "pane-focus-in pane-focus-out client-detached");
+    ctx.ok(&["set", "-gu", "@log"]);
+    let mut child = attach(&ctx);
+    ctx.ok(&["kill-session", "-t", "k"]);
+    wait_for("exited", || child.try_wait().unwrap().is_some());
+    wait_for("hooks", || ctx.cmd(&["show", "-gv", "@log"]).1.contains("client-detached"));
+    assert_eq!(ctx.ok(&["show", "-gv", "@log"]).trim(), "pane-focus-in session-closed client-detached");
 }
