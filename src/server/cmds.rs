@@ -146,6 +146,26 @@ fn command_list_string(v: &str, aliases: &[String]) -> Result<String, String> {
     Ok(out.join(" ; "))
 }
 
+/// A key binding's command as list-keys prints it (cmd_list_print with
+/// CMD_LIST_PRINT_ESCAPED): parsed and re-printed, top-level commands joined by
+/// " \; ". Text that does not parse is shown as stored.
+pub fn binding_command_string(v: &str, aliases: &[String]) -> String {
+    let print = || -> Result<String, String> {
+        let mut out = Vec::new();
+        for c in cmdparse::parse_blocks(v)? {
+            out.extend(print_parsed_command(c, aliases, true)?);
+        }
+        Ok(out.join(" \\; "))
+    };
+    print().unwrap_or_else(|_| v.to_string())
+}
+
+/// Flags whose value is optional ("D::" in the tmux template): without a value
+/// args_print shows them bare and ends the flags with "--".
+fn optional_value_flag(cmd: &str, c: char) -> bool {
+    matches!(cmd, "resize-pane" | "move-pane") && "DLRU".contains(c)
+}
+
 /// Whether positional argument `idx` of a command may be a { } block
 /// (ARGS_PARSE_COMMANDS_OR_STRING in the command's args_parse callback).
 fn takes_commands(cmd: &str, idx: usize, flags: &[char]) -> bool {
@@ -199,7 +219,21 @@ fn print_parsed_command(words: Vec<(String, bool)>, aliases: &[String], expand: 
         if a == "--" { break; }
         let chars: Vec<char> = a[1..].chars().collect();
         for (j, &c) in chars.iter().enumerate() {
-            if spec.2.contains(c) {
+            if optional_value_flag(full, c) {
+                // args_parse_flag_argument: the next word is the value unless it looks like a flag
+                let inline: String = chars[j + 1..].iter().collect();
+                let v = if !inline.is_empty() { Some(inline) } else {
+                    match args.get(i) {
+                        Some((v, false)) if !(v.starts_with('-') && v[1..].starts_with(|n: char| n == '-' || n.is_ascii_alphabetic())) => {
+                            i += 1;
+                            Some(v.clone())
+                        }
+                        _ => None,
+                    }
+                };
+                valued.push((c, v));
+                break;
+            } else if spec.2.contains(c) {
                 bare.push(c);
             } else if spec.3.contains(c) {
                 let inline: String = chars[j + 1..].iter().collect();
@@ -212,7 +246,7 @@ fn print_parsed_command(words: Vec<(String, bool)>, aliases: &[String], expand: 
                     i += 1;
                     v
                 };
-                valued.push((c, v));
+                valued.push((c, Some(v)));
                 break;
             } else {
                 return Err(fail(format!("unknown flag -{c}")));
@@ -224,7 +258,14 @@ fn print_parsed_command(words: Vec<(String, bool)>, aliases: &[String], expand: 
     valued.sort_by_key(|(c, _)| *c);
     let mut out = vec![full.to_string()];
     if !bare.is_empty() { out.push(format!("-{}", bare.iter().collect::<String>())); }
-    out.extend(valued.into_iter().map(|(c, v)| format!("-{c} {}", options::escape_arg(&v))));
+    let ends_optional = valued.last().is_some_and(|(_, v)| v.is_none());
+    out.extend(valued.into_iter().map(|(c, v)| match v {
+        Some(v) => format!("-{c} {}", options::escape_arg(&v)),
+        None => format!("-{c}"),
+    }));
+    if ends_optional {
+        out.push("--".into());
+    }
     for (k, (a, brace)) in args[i..].iter().enumerate() {
         if *brace && !takes_commands(full, k, &bare) {
             return Err(fail(format!("argument {} must be \"string\"", k + 1)));
@@ -2823,7 +2864,9 @@ impl Server {
                 let table_width = l.iter().map(|(t, _, _)| crate::format::width(t)).max().unwrap_or(0);
                 let pad = |s: &str, w: usize| format!("{s}{}", " ".repeat(w.saturating_sub(crate::format::width(s))));
                 let mut lines = Vec::new();
+                let aliases = self.command_aliases();
                 for (table, key, b) in &l {
+                    let cmd = binding_command_string(&b.cmd, &aliases);
                     let line = match o.get('F') {
                         Some(f) => {
                             let vars = HashMap::from([
@@ -2836,14 +2879,14 @@ impl Server {
                                 ("key_prefix".to_string(), prefix.clone()),
                                 ("key_table".to_string(), table.to_string()),
                                 ("key_string".to_string(), key.to_string()),
-                                ("key_command".to_string(), b.cmd.clone()),
+                                ("key_command".to_string(), cmd.clone()),
                             ]);
                             self.expand_extra(self.current(ctx), ctx.client, f, vars)
                         }
-                        None if notes_only => format!("{prefix} {} {}", pad(key, key_width), if b.note.is_empty() { &b.cmd } else { &b.note }),
+                        None if notes_only => format!("{prefix} {} {}", pad(key, key_width), if b.note.is_empty() { &cmd } else { &b.note }),
                         None => {
                             let r = if !has_repeat { "" } else if b.repeat { "-r" } else { "  " };
-                            format!("bind-key {r} -T {} {} {}", pad(table, table_width), pad(&vis::args_escape(key), key_width), b.cmd)
+                            format!("bind-key {r} -T {} {} {}", pad(table, table_width), pad(&vis::args_escape(key), key_width), cmd)
                         }
                     };
                     if !line.is_empty() {
