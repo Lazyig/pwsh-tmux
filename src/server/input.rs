@@ -194,7 +194,7 @@ impl Server {
         let inputs = c.keyp.feed(data);
         c.esc_deadline = if c.keyp.has_pending() {
             let ms = self.opts_server.get("escape-time").and_then(|v| v.parse().ok()).unwrap_or(10u64);
-            let ms = if c.terminal.querying() { ms.max(500) } else { ms };
+            let ms = if c.keyp.theme_reply_pending() { ms.max(500) } else { ms };
             Some(Instant::now() + Duration::from_millis(ms))
         } else {
             None

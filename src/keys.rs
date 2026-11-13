@@ -180,6 +180,12 @@ impl Parser {
         }
     }
 
+    /// A partial terminal theme/colour response needs a longer deadline than a bare Escape.
+    pub fn theme_reply_pending(&self) -> bool {
+        [b"\x1b]10;".as_slice(), b"\x1b]11;", b"\x1b[?997;"].iter()
+            .any(|prefix| self.buf.starts_with(prefix) || (self.buf.len() >= 3 && prefix.starts_with(&self.buf)))
+    }
+
     pub fn feed(&mut self, data: &[u8]) -> Vec<Input> {
         self.buf.extend_from_slice(data);
         self.run(false)
@@ -2209,5 +2215,23 @@ mod tests {
                 assert_eq!(key1(&bytes), key, "{n} app={app} {bytes:?}");
             }
         }
+    }
+}
+
+
+#[cfg(test)]
+mod terminal_reply_tests {
+    use super::*;
+
+    #[test]
+    fn query_delay_does_not_capture_a_prompt_cancel_escape() {
+        let mut parser = Parser::new();
+        parser.feed(b"\x1b");
+        assert!(!parser.theme_reply_pending());
+        parser.feed(b"]11;rgb:ff");
+        assert!(parser.theme_reply_pending());
+        let replies = parser.feed(b"/ff/ff\x1b\\");
+        assert_eq!(replies, vec![Input::Unknown(b"\x1b]11;rgb:ff/ff/ff\x1b\\".to_vec())]);
+        assert!(!parser.theme_reply_pending());
     }
 }
