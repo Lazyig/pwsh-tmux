@@ -197,6 +197,15 @@ impl Panes {
                     }
                 }
             }
+            // screen_write_preview marks the cursor with reverse (borders may cover it later)
+            if scaled && !scr.hide_cursor() && cx >= px && cy >= py {
+                if let Some(c) = grid.get_mut((y + cy - py) as usize).and_then(|r| r.get_mut((x + cx - px) as usize)) {
+                    if c.text.is_empty() {
+                        c.text = " ".into();
+                    }
+                    c.style.attrs |= crate::cells::INVERSE;
+                }
+            }
             // window_panes_draw_number
             let Some(number) = Panes::pane_index(srv, wid, p) else { continue };
             let t = Target { sid, idx, wid: Some(wid), pane: Some(p) };
