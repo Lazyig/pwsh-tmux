@@ -1365,3 +1365,16 @@ fn option_loop_hooks_and_session_default_size() {
     let w = ctx.fmt("m", "#{O/gw:#{option_name}|}");
     assert!(w.contains("|pane-activity|") && w.contains("|window-zoomed|") && !w.contains("after-bind-key"), "{w}");
 }
+
+#[test]
+fn argument_counts_and_parse_errors() {
+    let ctx = Ctx::new("p1fix-argc");
+    ctx.ok(&["new-session", "-d", "-s", "a", "sleep 100"]);
+    // args_parse limits, reported as cmd_parse does
+    assert_eq!(ctx.fails(&["show-options", "-g", "base-index", "status"]).trim(), "command show-options: too many arguments (need at most 1)");
+    assert_eq!(ctx.fails(&["set-environment"]).trim(), "command set-environment: too few arguments (need at least 1)");
+    assert_eq!(ctx.fails(&["if-shell", "true"]).trim(), "command if-shell: too few arguments (need at least 2)");
+    assert_eq!(ctx.fails(&["show-hooks", "-v"]).trim(), "command show-hooks: unknown flag -v");
+    assert_eq!(ctx.fails(&["display-message", "-t"]).trim(), "command display-message: -t expects an argument");
+    assert_eq!(ctx.ok(&["display-message", "-p", "-t", "a", "#S"]), "a\n");
+}

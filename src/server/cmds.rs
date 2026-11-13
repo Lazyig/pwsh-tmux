@@ -1115,7 +1115,16 @@ impl Server {
         if ctx.readonly && !READ_ONLY_OK.contains(&full) {
             return err("client is read-only");
         }
-        let o = getopt(&args, spec.2, spec.3).map_err(|e| format!("{full}: {e}"))?;
+        // args_parse errors, as cmd_parse reports them
+        let o = getopt(&args, spec.2, spec.3).map_err(|e| format!("command {full}: {e}"))?;
+        if let Some(&(_, min, max)) = ARG_COUNTS.iter().find(|a| a.0 == full) {
+            if (o.rest.len() as i32) < min {
+                return err(format!("command {full}: too few arguments (need at least {min})"));
+            }
+            if max != -1 && o.rest.len() as i32 > max {
+                return err(format!("command {full}: too many arguments (need at most {max})"));
+            }
+        }
         if ctx.readonly {
             self.check_readonly_command(full, &o, ctx)?;
         }
@@ -4205,6 +4214,102 @@ const READ_ONLY_OK: &[&str] = &[
     "attach-session", "detach-client", "has-session", "list-sessions", "list-windows", "list-panes", "list-clients", "list-buffers", "list-keys",
     "list-commands", "display-message", "show-options", "show-window-options", "show-environment", "show-hooks", "show-messages", "show-buffer",
     "capture-pane", "refresh-client", "switch-client", "server-access",
+];
+
+/// tmux 3.8's argument counts (args_parse's lower and upper; -1 is no limit).
+const ARG_COUNTS: &[(&str, i32, i32)] = &[
+    ("attach-session", 0, 0),
+    ("bind-key", 1, -1),
+    ("break-pane", 0, 0),
+    ("capture-pane", 0, 0),
+    ("choose-buffer", 0, 1),
+    ("choose-client", 0, 1),
+    ("choose-tree", 0, 1),
+    ("clear-history", 0, 0),
+    ("clear-prompt-history", 0, 0),
+    ("clock-mode", 0, 0),
+    ("command-prompt", 0, 1),
+    ("confirm-before", 1, 1),
+    ("copy-mode", 0, 0),
+    ("customize-mode", 0, 0),
+    ("delete-buffer", 0, 0),
+    ("detach-client", 0, 0),
+    ("display-menu", 1, -1),
+    ("display-message", 0, 1),
+    ("display-popup", 0, -1),
+    ("display-panes", 0, 1),
+    ("find-window", 1, 1),
+    ("has-session", 0, 0),
+    ("if-shell", 2, 3),
+    ("join-pane", 0, 0),
+    ("kill-pane", 0, 0),
+    ("kill-server", 0, 0),
+    ("kill-session", 0, 0),
+    ("kill-window", 0, 0),
+    ("last-pane", 0, 0),
+    ("last-window", 0, 0),
+    ("link-window", 0, 0),
+    ("list-buffers", 0, 0),
+    ("list-clients", 0, 0),
+    ("list-commands", 0, 1),
+    ("list-keys", 0, 1),
+    ("list-panes", 0, 0),
+    ("list-sessions", 0, 0),
+    ("list-windows", 0, 0),
+    ("load-buffer", 1, 1),
+    ("lock-client", 0, 0),
+    ("lock-server", 0, 0),
+    ("lock-session", 0, 0),
+    ("move-pane", 0, 0),
+    ("move-window", 0, 0),
+    ("new-pane", 0, -1),
+    ("new-session", 0, -1),
+    ("new-window", 0, -1),
+    ("next-layout", 0, 0),
+    ("next-window", 0, 0),
+    ("paste-buffer", 0, 0),
+    ("pipe-pane", 0, 1),
+    ("previous-layout", 0, 0),
+    ("previous-window", 0, 0),
+    ("refresh-client", 0, 1),
+    ("rename-session", 1, 1),
+    ("rename-window", 1, 1),
+    ("resize-pane", 0, 1),
+    ("resize-window", 0, 1),
+    ("respawn-pane", 0, -1),
+    ("respawn-window", 0, -1),
+    ("rotate-window", 0, 0),
+    ("run-shell", 0, -1),
+    ("save-buffer", 1, 1),
+    ("select-layout", 0, 1),
+    ("select-pane", 0, 0),
+    ("select-window", 0, 0),
+    ("send-keys", 0, -1),
+    ("send-prefix", 0, 0),
+    ("server-access", 0, 1),
+    ("set-buffer", 0, 1),
+    ("set-environment", 1, 2),
+    ("set-hook", 0, 2),
+    ("set-option", 1, 2),
+    ("set-window-option", 1, 2),
+    ("show-buffer", 0, 0),
+    ("show-environment", 0, 1),
+    ("show-hooks", 0, 1),
+    ("show-messages", 0, 0),
+    ("show-options", 0, 1),
+    ("show-prompt-history", 0, 0),
+    ("show-window-options", 0, 1),
+    ("source-file", 1, -1),
+    ("split-window", 0, -1),
+    ("start-server", 0, 0),
+    ("suspend-client", 0, 0),
+    ("swap-pane", 0, 0),
+    ("swap-window", 0, 0),
+    ("switch-client", 0, 0),
+    ("switch-mode", 0, 1),
+    ("unbind-key", 0, 1),
+    ("unlink-window", 0, 0),
+    ("wait-for", 1, 1),
 ];
 
 /// tmux 3.8's usage strings, in cmd_table order (list-commands prints them in this order).
