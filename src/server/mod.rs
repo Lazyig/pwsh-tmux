@@ -271,9 +271,17 @@ impl vt100::Callbacks for PaneCb {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
         self.title = Some(String::from_utf8_lossy(title).into_owned());
     }
-    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+    fn unhandled_osc(&mut self, screen: &mut vt100::Screen, params: &[&[u8]]) {
         self.osc.osc(params);
         match params {
+            // input_osc_133: the cursor's line starts a prompt (a continuation prompt,
+            // P;k=s, does not count) or command output; capture-pane -F shows them
+            [b"133", arg, rest @ ..] => match arg.first() {
+                Some(b'A' | b'N') => screen.mark_cursor_row(vt100::ROW_START_PROMPT),
+                Some(b'P') if !rest.contains(&&b"k=s"[..]) => screen.mark_cursor_row(vt100::ROW_START_PROMPT),
+                Some(b'C') => screen.mark_cursor_row(vt100::ROW_START_OUTPUT),
+                _ => {}
+            },
             [b"7", url, ..] => self.cwd = decode_file_url(&String::from_utf8_lossy(url)),
             [b"9", b"9", path, ..] => self.cwd = Some(String::from_utf8_lossy(path).trim_matches('"').to_string()),
             _ => {}

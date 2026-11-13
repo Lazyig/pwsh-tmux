@@ -2421,7 +2421,17 @@ impl Server {
                             out.push_str(&format!("{time} "));
                         }
                         if o.has('F') {
-                            out.push_str(if wrapped { "W " } else { "- " });
+                            // the line's marks: start of output (O) or prompt (P), wrapped (W)
+                            // and extended cells (X); hyperlinks (H) are not kept
+                            let (marks, extended) = if mode_lines.is_some() || o.has('a') { (0, false) } else { screen.history_row_flags(i as usize) };
+                            let mut f = String::new();
+                            if marks & vt100::ROW_START_OUTPUT != 0 { f.push('O'); }
+                            if marks & vt100::ROW_START_PROMPT != 0 { f.push('P'); }
+                            if wrapped { f.push('W'); }
+                            if extended { f.push('X'); }
+                            if f.is_empty() { f.push('-'); }
+                            out.push_str(&f);
+                            out.push(' ');
                         }
                         out.push_str(&text);
                         if !(o.has('J') && wrapped) {

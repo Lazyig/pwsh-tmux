@@ -1315,3 +1315,15 @@ fn current_session_is_the_last_used() {
     assert_eq!(ctx.ok(&["display-message", "-p", "#S"]), "b\n");
     assert_eq!(ctx.ok(&["list-sessions", "-O", "activity", "-F", "#S"]), "b\na\n");
 }
+
+#[cfg(unix)]
+#[test]
+fn capture_pane_line_flags() {
+    let ctx = Ctx::new("p1fix-capf");
+    ctx.ok(&["new-session", "-d", "-s", "f", "-x", "20", "-y", "8",
+        "printf 'plain\\n\\033]133;A\\033\\\\$ cmd\\n\\033]133;C\\033\\\\out\\n\\033[38;2;1;2;3mrgb\\033[m\\n%025d\\nend'; sleep 100"]);
+    wait_for("output", || ctx.capture("f").contains("end"));
+    // -F: start of prompt (P) and output (O) from OSC 133, wrapped (W), extended cells (X)
+    let out = ctx.ok(&["capture-pane", "-p", "-F", "-E", "6", "-t", "f"]);
+    assert_eq!(out, format!("- plain\nP $ cmd\nO out\nX rgb\nW {}\n- 00000\n- end\n", "0".repeat(20)));
+}

@@ -208,7 +208,7 @@ impl Grid {
             let wrapped = old.wrapped();
             if !wrapped { old.trim(); }
             // rewrapped rows keep the time their line entered the history
-            if col == 0 { row.set_time(old.time()); }
+            if col == 0 { row.set_time(old.time()); row.set_flags(old.flags()); }
             let mut x = 0u16;
             while let Some(cell) = old.get(x) {
                 if cell.is_wide_continuation() { x += 1; continue; }

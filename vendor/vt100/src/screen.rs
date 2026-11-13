@@ -161,6 +161,19 @@ impl Screen {
         self.alternate_grid.set_now(now);
     }
 
+    /// Marks the cursor's line (OSC 133 prompt and output starts).
+    pub fn mark_cursor_row(&mut self, flag: u8) {
+        let row = self.grid_mut().current_row_mut();
+        row.set_flags(row.flags() | flag);
+    }
+
+    /// The marks of row `index` (counted as for [`Screen::history_row`]) and
+    /// whether it holds extended cells.
+    #[must_use]
+    pub fn history_row_flags(&self, index: usize) -> (u8, bool) {
+        self.grid().absolute_row(index).map_or((0, false), |r| (r.flags(), r.extended()))
+    }
+
     /// When row `index` (counted as for [`Screen::history_row`]) entered the
     /// history, 0 if it has not or no time was set.
     #[must_use]
