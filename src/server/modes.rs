@@ -532,9 +532,10 @@ impl Menu {
         }
     }
 
-    pub fn draw(&self, f: &mut super::render::Frame, style: Style, border: Style, selected_style: Style) {
+    pub fn draw(&self, f: &mut super::render::Frame, style: Style, border: Style, selected_style: Style, lines_kind: &str) {
         let (x0, y0, w, h) = (self.x, self.y, self.w, self.h);
-        super::render::draw_box(f, x0, y0, w, h, border, &self.title);
+        let lines = super::render::box_lines(lines_kind);
+        super::render::draw_box_lines(f, x0, y0, w, h, border, &self.title, lines_kind);
         for (i, it) in self.items.iter().enumerate() {
             let y = y0 + 1 + i as u16;
             if y + 1 >= y0 + h {
@@ -547,10 +548,10 @@ impl Menu {
             }
             if it.name.is_empty() {
                 for x in x0 + 1..x0 + w - 1 {
-                    f.set(x, y, Cell { text: "─".into(), style: border });
+                    f.set(x, y, Cell { text: lines[0].into(), style: border });
                 }
-                f.set(x0, y, Cell { text: "├".into(), style: border });
-                f.set(x0 + w - 1, y, Cell { text: "┤".into(), style: border });
+                f.set(x0, y, Cell { text: lines[7].into(), style: border });
+                f.set(x0 + w - 1, y, Cell { text: lines[8].into(), style: border });
                 continue;
             }
             let dim = Style { attrs: style.attrs | crate::cells::DIM, ..st };
@@ -615,13 +616,15 @@ pub fn big_text(f: &mut super::render::Frame, r: Rect, text: &str, colour: Color
     }
     let x0 = r.x + (r.w - width) / 2;
     let y0 = r.y + (r.h - 5) / 2;
-    let block = Style { bg: colour, ..Style::default() };
+    // Matching foreground/background makes a solid block with colours; the
+    // glyph itself remains visible when a terminal ignores colour escapes.
+    let block = Style { fg: colour, bg: colour, ..Style::default() };
     for (i, ch) in text.chars().enumerate() {
         let Some((_, rows)) = FONT.iter().find(|(c, _)| *c == ch) else { continue };
         for (dy, row) in rows.iter().enumerate() {
             for (dx, b) in row.chars().enumerate() {
                 if b == '#' {
-                    f.set(x0 + i as u16 * 6 + dx as u16, y0 + dy as u16, Cell { text: " ".into(), style: block });
+                    f.set(x0 + i as u16 * 6 + dx as u16, y0 + dy as u16, Cell { text: "#".into(), style: block });
                 }
             }
         }
@@ -629,13 +632,33 @@ pub fn big_text(f: &mut super::render::Frame, r: Rect, text: &str, colour: Color
     true
 }
 
-pub fn clock_text(style24: bool) -> String {
+pub fn clock_text(style: &str) -> String {
+    clock_text_at(style, chrono::Local::now())
+}
+
+fn clock_text_at(style: &str, now: chrono::DateTime<chrono::Local>) -> String {
     use chrono::Timelike;
-    let now = chrono::Local::now();
-    if style24 {
-        format!("{:02}:{:02}", now.hour(), now.minute())
+    let seconds = if style.ends_with("-with-seconds") { format!(":{:02}", now.second()) } else { String::new() };
+    if style.starts_with("24") {
+        format!("{:02}:{:02}{seconds}", now.hour(), now.minute())
     } else {
         let (pm, h) = now.hour12();
-        format!("{:2}:{:02} {}", h, now.minute(), if pm { "PM" } else { "AM" }).trim_start().replace(' ', "")
+        format!("{h}:{:02}{seconds}{}", now.minute(), if pm { "PM" } else { "AM" })
+    }
+}
+
+#[cfg(test)]
+mod clock_display_tests {
+    use super::*;
+    use chrono::TimeZone;
+    #[test]
+    fn clock_seconds_and_monochrome() {
+        let now = chrono::Local.with_ymd_and_hms(2026, 11, 13, 13, 2, 3).unwrap();
+        for (style, text) in [("12", "1:02PM"), ("24", "13:02"), ("12-with-seconds", "1:02:03PM"), ("24-with-seconds", "13:02:03")] {
+            assert_eq!(clock_text_at(style, now), text);
+        }
+        let mut f = super::super::render::Frame::new(80, 10);
+        assert!(big_text(&mut f, Rect { x: 0, y: 0, w: 80, h: 10 }, "12:34", Color::Default));
+        assert!(f.cells.iter().any(|c| c.text == "#"));
     }
 }

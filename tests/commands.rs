@@ -1139,3 +1139,74 @@ fn format_option_environment_and_window_loops() {
     assert_eq!(ctx.fmt("f", "[#{L:x}#{I/f:RGB}#{A:a,b}]"), "[]");
     assert_eq!(ctx.fmt("f", "#{c:red}#{c/f:themered}#{R:ab,2}"), "800000\x1b[31mabab");
 }
+
+#[test]
+fn display_defaults_match_tmux_38_source() {
+    // This fixture is the C string array with DEFAULT_* macros expanded, with
+    // only the explicitly delegated floating/switch-mode bindings excluded.
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/display-defaults.conf");
+    #[cfg(unix)]
+    {
+        let reference = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ref/tmux-3.8/key-bindings.c");
+        if reference.exists() {
+            let generated = std::process::Command::new("python3").arg("tools/extract-display-defaults.py").arg(reference).output().unwrap();
+            assert!(generated.status.success());
+            assert_eq!(generated.stdout, std::fs::read(&fixture).unwrap(), "regenerate the fixture from tmux 3.8");
+        }
+    }
+    let ctx = Ctx::new("display-defaults");
+    ctx.ok(&["new-session", "-d", "-s", "s"]);
+    let dump = || ["prefix", "root"].map(|table| format!("{}{}", ctx.ok(&["list-keys", "-T", table]), ctx.ok(&["list-keys", "-N", "-T", table])));
+    let initial = dump();
+    assert!(initial[0].contains("select-pane -T '%%'"));
+    assert!(initial[1].contains("Paste #[underscore]"));
+    assert!(initial[1].contains("'Detach' 'd'"));
+    ctx.ok(&["unbind-key", "-a", "-T", "prefix"]);
+    ctx.ok(&["unbind-key", "-a", "-T", "root"]);
+    // Parse the source-derived defaults through source-file/bind-key, independently
+    // of the startup loader, and compare the complete list-keys dumps.
+    ctx.ok(&["source-file", fixture.to_str().unwrap()]);
+    assert_eq!(initial, dump());
+}
+
+#[test]
+fn display_layout_options_and_session_styles() {
+    let ctx = Ctx::new("display-layouts");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "120", "-y", "50"]);
+    for _ in 0..5 { ctx.ok(&["split-window", "-h", "-t", "s"]); ctx.ok(&["select-layout", "-t", "s", "tiled"]); }
+    ctx.ok(&["setw", "-t", "s", "tiled-layout-max-columns", "1"]);
+    ctx.ok(&["select-layout", "-t", "s", "tiled"]);
+    let rows = ctx.ok(&["list-panes", "-t", "s", "-F", "#{pane_left}:#{pane_width}"]);
+    assert!(rows.lines().all(|s| s == "0:120"), "{rows}");
+    ctx.ok(&["setw", "-t", "s", "main-pane-width", "30%"]);
+    ctx.ok(&["setw", "-t", "s", "other-pane-width", "25%"]);
+    ctx.ok(&["select-layout", "-t", "s", "main-vertical"]);
+    assert_eq!(ctx.fmt("s.0", "#{pane_width}"), "90");
+    ctx.ok(&["setw", "-t", "s", "main-pane-height", "10"]);
+    ctx.ok(&["setw", "-t", "s", "other-pane-height", "20%"]);
+    ctx.ok(&["select-layout", "-t", "s", "main-horizontal"]);
+    assert_eq!(ctx.fmt("s.0", "#{pane_height}"), "40");
+    ctx.ok(&["setw", "-t", "s", "session-status-style", "fg=red"]);
+    ctx.ok(&["setw", "-t", "s", "session-status-current-style", "bold"]);
+    assert_eq!(ctx.fmt("s", "#{E:session-status-style}/#{E:session-status-current-style}"), "fg=red/bold");
+}
+
+#[test]
+fn remain_on_exit_format_is_styled_on_bottom_line_and_empty_is_silent() {
+    let ctx = Ctx::new("display-dead");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "60", "-y", "10"]);
+    ctx.ok(&["set", "-p", "-t", "s", "remain-on-exit", "on"]);
+    ctx.ok(&["set", "-p", "-t", "s", "remain-on-exit-format", "#[fg=red]EXIT=#{pane_dead_status}"]);
+    ctx.ok(&["respawn-pane", "-k", "-t", "s", "sh", "-c", "exit 7"]);
+    wait_for("dead pane", || ctx.fmt("s", "#{pane_dead}") == "1");
+    let captured = ctx.ok(&["capture-pane", "-pe", "-t", "s"]);
+    assert!(captured.lines().last().unwrap().contains("EXIT=7"), "{captured:?}");
+    assert!(!captured.contains("#[fg="));
+    assert!(captured.contains("\x1b["));
+    ctx.ok(&["set", "-p", "-t", "s", "remain-on-exit-format", ""]);
+    ctx.ok(&["respawn-pane", "-k", "-t", "s", "sh", "-c", "printf marker; exit 0"]);
+    wait_for("empty dead format", || ctx.fmt("s", "#{pane_dead}") == "1");
+    let captured = ctx.capture("s");
+    assert!(captured.starts_with("marker"), "{captured:?}");
+    assert!(!captured.contains("Pane is dead"));
+}

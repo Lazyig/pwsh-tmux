@@ -46,6 +46,9 @@ pub struct MouseCtx {
 enum Where {
     Pane,
     Border,
+    ScrollbarUp,
+    ScrollbarDown,
+    ScrollbarSlider,
     Status,
     StatusLeft,
     StatusRight,
@@ -59,6 +62,9 @@ impl Where {
         match self {
             Where::Pane => "Pane",
             Where::Border => "Border",
+            Where::ScrollbarUp => "ScrollbarUp",
+            Where::ScrollbarDown => "ScrollbarDown",
+            Where::ScrollbarSlider => "ScrollbarSlider",
             Where::Status => "Status",
             Where::StatusLeft => "StatusLeft",
             Where::StatusRight => "StatusRight",
@@ -95,6 +101,19 @@ impl Server {
         }
         if self.clients.get(&cid).is_none_or(|c| c.prompt.is_some()) {
             return;
+        }
+        if let Some(sid) = self.client_session(cid) {
+            let wid = self.sessions[&sid].active_window();
+            let oy = if self.opt_session(Some(sid), "status-position") == "top" { self.status_lines(Some(sid)) } else { 0 };
+            for (pane, r) in self.rects(wid).0 {
+                let hover = self.scrollbar(wid, pane, r).is_some_and(|sb| m.x >= sb.x && m.x < sb.x + sb.width && m.y >= oy + sb.y && m.y < oy + sb.y + sb.height);
+                let was = self.panes[&pane].scrollbar_hover;
+                if was != hover {
+                    self.panes.get_mut(&pane).unwrap().scrollbar_hover = hover;
+                    self.show_scrollbar(pane);
+                }
+                if matches!(m.kind, MouseKind::WheelUp | MouseKind::WheelDown) && m.x >= r.x && m.x < r.right() && m.y >= oy + r.y && m.y < oy + r.bottom() { self.show_scrollbar(pane); }
+            }
         }
         self.mouse_event(cid, m, last, false);
     }
@@ -286,6 +305,16 @@ impl Server {
         if x > w.sx || py > w.sy {
             return None;
         }
+        for (pane, r) in self.rects(wid).0 {
+            if let Some(sb) = self.scrollbar(wid, pane, r) {
+                if x >= sb.x && x < sb.x + sb.width && py >= sb.y && py < sb.y + sb.height {
+                    ctx.pane = Some(pane);
+                    let y = py - sb.y;
+                    let where_ = if y < sb.slider_y { Where::ScrollbarUp } else if y >= sb.slider_y + sb.slider_h { Where::ScrollbarDown } else { Where::ScrollbarSlider };
+                    return Some((where_, ctx));
+                }
+            }
+        }
         let rects: Vec<(PaneId, Rect)> = self.rects(wid).0.into_iter().map(|(p, r)| (p, self.content_rect(wid, r))).collect();
         // window_get_active_at: the pane including its right and bottom border
         let (pane, r) = *rects.iter().find(|(_, r)| x >= r.x && x <= r.right() && py >= r.y && py <= r.bottom())?;
@@ -467,8 +496,12 @@ impl Server {
     }
 
     fn mouse_drag_update(&mut self, cid: ClientId, m: &MouseCtx) {
+        if let Some(Drag { kind: DragKind::Scrollbar { pane } }) = self.clients.get(&cid).and_then(|c| c.drag.as_ref()) {
+            self.scrollbar_to_mouse(*pane, m);
+            return;
+        }
         match self.clients.get(&cid).and_then(|c| c.drag.as_ref()).map(|d| match d.kind {
-            DragKind::Border => None,
+            DragKind::Border | DragKind::Scrollbar { .. } => None,
             DragKind::Copy { pane } => Some(pane),
         }) {
             Some(None) => self.border_drag_update(cid, m),
@@ -746,6 +779,7 @@ impl Server {
             if c.overlay.is_none() {
                 mode = if self.windows[&wid].panes().iter().any(|p| pane_mode(*p) == 1003) { 1003 } else { 0 };
             }
+            if c.overlay.is_none() && matches!(self.opt_window(Some(wid), "pane-scrollbars").as_str(), "auto-hide" | "modal") { mode = 1003; }
             if mode != 1003 {
                 mode = 1002;
             }

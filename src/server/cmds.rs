@@ -965,6 +965,7 @@ impl Server {
         let vi = self.opt_window(wid, "mode-keys") == "vi";
         let sid = self.session_of_pane(pane).map(|x| x.0);
         let mut cm = CopyMode::new(lines, w, h, (cy, cx), vi);
+        cm.wrap_search = self.opt_window_on(wid, "wrap-search");
         cm.set_word_separators(&self.opt_session(sid, "word-separators"));
         self.panes.get_mut(&pane).unwrap().mode = Some(PaneMode::Copy(Box::new(cm)));
         if let Some(wid) = wid {
@@ -2461,7 +2462,7 @@ impl Server {
                     self.exit_mode(pane);
                     return Ok(Flow::Next);
                 }
-                if o.has('M') {
+                if o.has('M') || o.has('S') {
                     // the pane under the mouse, for a client attached to that session
                     let Some(m) = ctx.mouse.clone() else { return Ok(Flow::Next) };
                     let Some(p) = self.mouse_pane(&m) else { return Ok(Flow::Next) };
@@ -2496,9 +2497,14 @@ impl Server {
                         }
                     }
                 }
-                if let Some(w) = tt.wid {
-                    self.mark_window_dirty(w);
+                if o.has('S') {
+                    if let (Some(cid), Some(m)) = (ctx.client, ctx.mouse.as_ref()) {
+                        self.clients.get_mut(&cid).unwrap().drag = Some(Drag { kind: DragKind::Scrollbar { pane } });
+                        self.scrollbar_to_mouse(pane, m);
+                    }
                 }
+                self.show_scrollbar(pane);
+                if let Some(w) = tt.wid { self.mark_window_dirty(w); }
                 Ok(Flow::Next)
             }
             "clock-mode" => {
@@ -2599,7 +2605,7 @@ impl Server {
                 let h = dim(o.get('h'), ch).clamp(3, ch);
                 let x = o.get('x').and_then(|v| v.parse().ok()).unwrap_or(((cw - 1) / 2).saturating_sub(w / 2)).min(cw - w);
                 let y = o.get('y').and_then(|v| v.parse().ok()).unwrap_or(((ch - 1) / 2).saturating_sub(h / 2)).min(ch - h);
-                let border = !o.has('B');
+                let border = !o.has('B') && self.opt_window(self.current(ctx).wid, "popup-border-lines") != "none";
                 let (iw, ih) = if border { (w - 2, h - 2) } else { (w, h) };
                 let tt = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
                 let cwd = o.get('d').map(|d| self.expand(tt, Some(cid), d)).or_else(|| tt.pane.and_then(|p| self.panes.get(&p)).map(|p| p.current_path.clone()));
@@ -3705,7 +3711,7 @@ impl Server {
         }
         // side effects
         match name.as_str() {
-            "status" | "status-position" | "pane-border-status" | "window-size" => {
+            "status" | "status-position" | "pane-border-status" | "window-size" | "pane-scrollbars" | "pane-scrollbars-style" | "pane-scrollbars-position" => {
                 let sids: Vec<SessId> = self.sessions.keys().copied().collect();
                 for s in sids {
                     self.update_session_size(s);
@@ -3923,7 +3929,7 @@ impl Server {
         let input: Vec<char> = init.chars().collect();
         let cursor = input.len();
         if let Some(c) = self.clients.get_mut(&cid) {
-            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false, confirm: ('y', false) });
+            c.prompt = Some(Prompt { vi_command: false, copied: Vec::new(), kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false, confirm: ('y', false) });
             c.dirty = true;
         }
     }

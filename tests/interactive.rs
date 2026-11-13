@@ -384,3 +384,102 @@ fn current_target_sorted_switch_and_prompt_flags() {
     std::thread::sleep(Duration::from_millis(300));
     assert!(ctx.ok(&["show-options", "-gqv", "@conf2"]).trim().is_empty());
 }
+
+#[test]
+fn display_message_line_partial_format_and_vi_prompt() {
+    let ctx = Ctx::new("display-messages");
+    let t = start(&ctx, "s");
+    ctx.ok(&["set", "-t", "s", "status", "2"]);
+    ctx.ok(&["set", "-t", "s", "status-format[0]", "FIRST"]);
+    ctx.ok(&["set", "-t", "s", "status-format[1]", "SECOND preserved"]);
+    ctx.ok(&["set", "-t", "s", "message-line", "4"]);
+    ctx.ok(&["set", "-t", "s", "message-style", "fg=red"]);
+    ctx.ok(&["set", "-t", "s", "message-format", "#[#{E:message-style}]#{message}"]);
+    ctx.ok(&["display-message", "-d", "5000", "Hi"]);
+    wait_for("partial message", || t.row(29).starts_with("HiCOND preserved"));
+    assert!(t.row(28).starts_with("FIRST"));
+    t.send(b"\x1b");
+    ctx.ok(&["set", "-t", "s", "message-style", "fg=red,fill=blue"]);
+    ctx.ok(&["display-message", "-d", "5000", "Hi"]);
+    wait_for("filled message", || t.row(29).trim_end() == "Hi");
+    t.send(b"\x1b");
+    ctx.ok(&["set", "-t", "s", "message-format", "#[#{?#{command_prompt},#{E:message-command-style},#{E:message-style}}]#{message}"]);
+    ctx.ok(&["set", "-t", "s", "message-command-style", "fg=green,fill=black"]);
+    ctx.ok(&["set", "-t", "s", "status-keys", "vi"]);
+    t.prefix(b"T");
+    t.send(b"\x15abc");
+    t.send(b"\x1b");
+    wait_for("vi command style", || t.screen.lock().unwrap().screen().cell(29, 0).unwrap().fgcolor() == vt100::Color::Idx(2));
+    // Escape moves left once: x removes c, then append replaces it with Z.
+    t.send(b"xaZ\r");
+    wait_for("vi title editing", || ctx.fmt("s", "#{pane_title}") == "abZ");
+    ctx.ok(&["set", "-t", "s", "status-keys", "emacs"]);
+    t.prefix(b"T"); t.send(b"\x15changed\x1b");
+    assert_eq!(ctx.fmt("s", "#{pane_title}"), "abZ");
+}
+
+#[test]
+fn display_scrollbars_reserve_overlay_timeout_hover_and_mouse() {
+    let ctx = Ctx::new("display-scrollbar");
+    let t = start(&ctx, "s");
+    ctx.ok(&["set", "-p", "-t", "s", "pane-scrollbars-style", "fg=red,bg=blue,width=2,pad=1"]);
+    ctx.ok(&["setw", "-t", "s", "pane-scrollbars", "on"]);
+    wait_for("reserved scrollbar", || ctx.fmt("s", "#{pane_width}") == "97");
+    wait_for("right scrollbar", || t.screen.lock().unwrap().screen().cell(27, 99).unwrap().bgcolor() == vt100::Color::Idx(1));
+    ctx.ok(&["setw", "-t", "s", "pane-scrollbars-position", "left"]);
+    wait_for("left scrollbar", || t.screen.lock().unwrap().screen().cell(27, 0).unwrap().bgcolor() == vt100::Color::Idx(1));
+    ctx.ok(&["setw", "-t", "s", "pane-scrollbars-timeout", "200"]);
+    ctx.ok(&["setw", "-t", "s", "pane-scrollbars", "auto-hide"]);
+    wait_for("overlay width", || ctx.fmt("s", "#{pane_width}") == "100");
+    t.send(b"\x1b[<35;1;2M");
+    wait_for("hover shows scrollbar", || t.screen.lock().unwrap().screen().cell(27, 0).unwrap().bgcolor() == vt100::Color::Idx(1));
+    t.send(b"\x1b[<35;50;2M");
+    wait_for("timeout hides scrollbar", || t.screen.lock().unwrap().screen().cell(27, 0).unwrap().bgcolor() != vt100::Color::Idx(1));
+    t.prefix(b"[");
+    ctx.ok(&["send-keys", "-t", "s", "-X", "page-up"]);
+    wait_for("scroll shows scrollbar", || matches!(t.screen.lock().unwrap().screen().cell(27, 0).unwrap().bgcolor(), vt100::Color::Idx(1 | 4)));
+    ctx.ok(&["copy-mode", "-q", "-t", "s"]);
+    ctx.ok(&["setw", "-t", "s", "pane-scrollbars", "modal"]);
+    t.send(b"\x1b[<35;1;2M");
+    assert_eq!(ctx.fmt("s", "#{pane_width}"), "100");
+    ctx.ok(&["setw", "-t", "s", "pane-scrollbars", "on"]);
+    t.send(b"printf 'line\\n%.0s' {1..120}\r");
+    wait_for("history for scrollbar click", || ctx.fmt("s", "#{history_size}").parse::<usize>().unwrap_or(0) > 30);
+    t.mouse(0, 0, 1, false);
+    t.mouse(0, 0, 1, true);
+    wait_for("scrollbar page-up binding", || ctx.fmt("s", "#{pane_in_mode}") == "1");
+    assert!(ctx.fmt("s", "#{scroll_position}").parse::<usize>().unwrap() > 0);
+}
+
+#[test]
+fn display_border_indicators_and_fill_inside_outside_window() {
+    let ctx = Ctx::new("display-fill");
+    let t = start(&ctx, "s");
+    ctx.ok(&["setw", "-t", "s", "window-size", "manual"]);
+    ctx.ok(&["resize-window", "-t", "s", "-x", "70", "-y", "20"]);
+    ctx.ok(&["setw", "-t", "s", "fill-character", "#{?is_inside,.,~}"]);
+    wait_for("outside fill", || t.row(22).starts_with("~~~~"));
+    ctx.ok(&["split-window", "-h", "-t", "s"]);
+    ctx.ok(&["setw", "-t", "s", "pane-border-indicators", "both"]);
+    t.wait_screen("border arrows with both", |s| s.contains('→'));
+    ctx.ok(&["setw", "-t", "s", "pane-border-indicators", "off"]);
+    wait_for("arrows off", || !t.contents().contains('→'));
+    ctx.ok(&["setw", "-t", "s", "pane-border-indicators", "arrows"]);
+    t.wait_screen("border arrows", |s| s.contains('→'));
+}
+
+#[test]
+fn display_menu_and_popup_use_configured_border_lines() {
+    let ctx = Ctx::new("display-boxes");
+    let t = start(&ctx, "s");
+    ctx.ok(&["setw", "-t", "s", "menu-border-lines", "double"]);
+    t.prefix(b">");
+    t.wait_screen("double menu border", |s| s.contains('╔') && s.contains("Horizontal Split"));
+    t.send(b"\x1b");
+    ctx.ok(&["setw", "-t", "s", "popup-border-lines", "rounded"]);
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    let mut popup = ctx.command().args(["display-popup", "-c", &client, "-w", "30", "-h", "8", "-E", "echo popup; sleep 10"]).spawn().unwrap();
+    t.wait_screen("rounded popup border", |s| s.contains('╭') && s.contains("popup"));
+    t.send(b"\x1b");
+    assert!(popup.wait().unwrap().success());
+}

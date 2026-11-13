@@ -11,6 +11,7 @@ mod input;
 mod modes;
 mod mouse;
 pub mod procinfo;
+mod display;
 mod render;
 mod vars;
 mod transport;
@@ -309,6 +310,8 @@ pub struct Pane {
     pub start_path: String,
     pub title: String,
     pub dead: Option<(Option<i32>, u64)>,
+    pub scrollbar_until: Option<Instant>,
+    pub scrollbar_hover: bool,
     pub mode: Option<PaneMode>,
     pub options: Options,
     pub pipe: Option<Sender<Vec<u8>>>,
@@ -504,6 +507,8 @@ pub enum PromptKind {
 }
 
 pub struct Prompt {
+    pub vi_command: bool,
+    pub copied: Vec<char>,
     pub kind: PromptKind,
     pub prompts: Vec<(String, String)>,
     pub answers: Vec<String>,
@@ -546,6 +551,7 @@ pub enum DragKind {
     Border,
     /// A copy-mode selection (copy-mode -M, begin-selection from the mouse).
     Copy { pane: PaneId },
+    Scrollbar { pane: PaneId },
 }
 
 /// Multi-click detection, as tmux's CLIENT_DOUBLECLICK / CLIENT_TRIPLECLICK and click timer.
@@ -1368,6 +1374,7 @@ impl Server {
         self.control_output(id, data);
         let scroll_on_clear = options::is_on(&self.opt_pane(id, "scroll-on-clear"));
         let p = self.panes.get_mut(&id).unwrap();
+        let was_alternate = p.screen().alternate_screen();
         p.parser.screen_mut().set_scroll_on_clear(scroll_on_clear);
         p.parser.process(data);
         p.last_output = Instant::now();
@@ -1415,6 +1422,9 @@ impl Server {
             }
             return;
         };
+        if was_alternate != self.panes[&id].screen().alternate_screen() && self.opt_window(Some(wid), "pane-scrollbars") == "on" {
+            self.apply_layout(wid);
+        }
         if let Some(w) = self.windows.get_mut(&wid) {
             w.activity = now_secs();
         }
@@ -1502,7 +1512,12 @@ impl Server {
             }
             let msg = self.expand_for_pane(id, &fmt);
             if let Some(p) = self.panes.get_mut(&id) {
-                p.parser.process(format!("\r\n\x1b[0m{msg}").as_bytes());
+                if !fmt.is_empty() {
+                    let cells = crate::format::layout_line(&crate::format::spans(&msg, Default::default()), p.size.0 as usize, Default::default());
+                    let line = render::line_with_escapes(&Line { cells, wrapped: false });
+                    p.parser.process(format!("\x1b[r\x1b[{};1H\r\n\x1b[0m{line}", p.size.1).as_bytes());
+                }
+                p.parser.process(b"\x1b[?25l");
             }
             if let Some(wid) = self.window_of(id) {
                 self.mark_window_dirty(wid);
@@ -1596,6 +1611,7 @@ impl Server {
     pub fn next_timeout(&self) -> Duration {
         let mut t = Duration::from_millis(1000);
         let now = Instant::now();
+        for d in self.panes.values().filter_map(|p| p.scrollbar_until) { t = t.min(d.saturating_duration_since(now)); }
         for d in self.copy_drag_timers.values().chain(self.delayed.iter().map(|(d, _)| d)) {
             t = t.min(d.saturating_duration_since(now));
         }
@@ -1615,6 +1631,10 @@ impl Server {
 
     fn timers(&mut self) {
         let now = Instant::now();
+        let expired: Vec<_> = self.panes.iter_mut().filter_map(|(id, p)| {
+            if p.scrollbar_until.is_some_and(|d| d <= now) { p.scrollbar_until = None; Some(*id) } else { None }
+        }).collect();
+        for id in expired { if let Some(w) = self.window_of(id) { self.mark_window_dirty(w); } }
         let cids: Vec<ClientId> = self.clients.keys().copied().collect();
         for cid in cids {
             let Some(c) = self.clients.get_mut(&cid) else { continue };
@@ -1932,6 +1952,8 @@ impl Server {
                 start_path: dir.clone(),
                 title,
                 dead: None,
+                scrollbar_until: None,
+                scrollbar_hover: false,
                 mode: None,
                 options: existing_opts,
                 pipe: None,
@@ -2253,11 +2275,22 @@ impl Server {
 
     /// Content rect of a pane (minus a pane-border-status line).
     pub fn content_rect(&self, wid: WinId, r: Rect) -> Rect {
-        match self.opt_window(Some(wid), "pane-border-status").as_str() {
+        let mut cr = match self.opt_window(Some(wid), "pane-border-status").as_str() {
             "top" if r.y == 0 && r.h > 1 => Rect { y: r.y + 1, h: r.h - 1, ..r },
             "bottom" if r.bottom() == self.windows[&wid].sy && r.h > 1 => Rect { h: r.h - 1, ..r },
             _ => r,
+        };
+        if self.opt_window(Some(wid), "pane-scrollbars") == "on" {
+            if let Some((id, _)) = self.rects(wid).0.into_iter().find(|(_, rect)| *rect == r) {
+                if let Some(sb) = self.scrollbar(wid, id, cr) {
+                    let pad = self.opt_pane(id, "pane-scrollbars-style").split(',').find_map(|s| s.strip_prefix("pad=").and_then(|p| p.parse::<u16>().ok())).unwrap_or(0);
+                    let width = sb.width.saturating_add(pad).min(cr.w.saturating_sub(1));
+                    cr.w -= width;
+                    if self.opt_window(Some(wid), "pane-scrollbars-position") == "left" { cr.x += width; }
+                }
+            }
         }
+        cr
     }
 
     pub fn apply_layout(&mut self, wid: WinId) {

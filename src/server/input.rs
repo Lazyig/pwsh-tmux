@@ -386,6 +386,8 @@ impl Server {
                 }
             }
             Some(PaneMode::Copy(_)) => {
+                self.show_scrollbar(pane);
+                let wrap = self.opt_window_on(self.window_of(pane), "wrap-search");
                 let vi = self.opt_window(self.window_of(pane), "mode-keys") == "vi";
                 let table = if vi { "copy-mode-vi" } else { "copy-mode" };
                 let binding = self.bindings.get(table).and_then(|t| t.get(name)).map(|b| (b.cmd.clone(), b.note == "default"));
@@ -398,7 +400,7 @@ impl Server {
                     }
                     _ => {
                         let action = match self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
-                            Some(PaneMode::Copy(cm)) => cm.key(name),
+                            Some(PaneMode::Copy(cm)) => { cm.wrap_search = wrap; cm.key(name) },
                             _ => return,
                         };
                         self.copy_action(pane, cid, action, None);
@@ -420,6 +422,17 @@ impl Server {
             Some(self.opt_server("copy-command")).filter(|c| !c.is_empty())
         };
         let run_args: Vec<String> = if piped && !args.is_empty() { args[1..].to_vec() } else { args.to_vec() };
+        self.show_scrollbar(pane);
+        let wrap = options::is_on(&self.opt_window(self.window_of(pane), "wrap-search"));
+        if name == "scroll-to-mouse" {
+            if let Some(cid) = cid {
+                if let Some(m) = self.cur_mouse.clone() {
+                    if let Some(c) = self.clients.get_mut(&cid) { c.drag = Some(Drag { kind: DragKind::Scrollbar { pane } }); }
+                    self.scrollbar_to_mouse(pane, &m);
+                }
+            }
+            return;
+        }
         let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) else {
             if let Some(PaneMode::Tree(_)) = self.panes.get(&pane).and_then(|p| p.mode.as_ref()) {
                 // tree mode understands a few -X commands
@@ -435,6 +448,7 @@ impl Server {
             }
             return;
         };
+        cm.wrap_search = wrap;
         let action = cm.run(name, &run_args);
         self.copy_action(pane, cid, action, pipe);
     }
@@ -486,6 +500,8 @@ impl Server {
     // ---- prompt ----------------------------------------------------------------------
 
     fn prompt_key(&mut self, cid: ClientId, k: &Key, name: &str) {
+        let vi = self.opt_session(self.client_session(cid), "status-keys") == "vi";
+        let paste = self.buffers.last().map(|b| String::from_utf8_lossy(&b.data).into_owned()).unwrap_or_default();
         let hist_len = self.prompt_history.len();
         let c = self.clients.get_mut(&cid).unwrap();
         c.dirty = true;
@@ -508,6 +524,59 @@ impl Server {
                 return;
             }
             PromptKind::Command => {}
+        }
+        if vi && !pr.single_key {
+            if k.code == KeyCode::Escape {
+                if !pr.vi_command { pr.cursor = pr.cursor.saturating_sub(1); }
+                pr.vi_command = true;
+                return;
+            }
+            if pr.vi_command {
+                let mapped = match name {
+                    "i" => { pr.vi_command = false; return; }
+                    "a" => { pr.vi_command = false; pr.cursor = (pr.cursor + 1).min(pr.input.len()); return; }
+                    "I" | "S" => {
+                        pr.vi_command = false; pr.cursor = 0;
+                        if name == "S" { pr.input.clear(); }
+                        return;
+                    }
+                    "A" => { pr.vi_command = false; pr.cursor = pr.input.len(); return; }
+                    "s" => { pr.vi_command = false; if pr.cursor < pr.input.len() { pr.input.remove(pr.cursor); } return; }
+                    "D" | "C" => { pr.input.truncate(pr.cursor); if name == "C" { pr.vi_command = false; } return; }
+                    "e" | "E" => {
+                        pr.cursor = (pr.cursor + 1).min(pr.input.len());
+                        while pr.cursor < pr.input.len() && pr.input[pr.cursor].is_whitespace() { pr.cursor += 1; }
+                        while pr.cursor + 1 < pr.input.len() && !pr.input[pr.cursor + 1].is_whitespace() { pr.cursor += 1; }
+                        return;
+                    }
+                    "w" | "W" => {
+                        while pr.cursor < pr.input.len() && !pr.input[pr.cursor].is_whitespace() { pr.cursor += 1; }
+                        while pr.cursor < pr.input.len() && pr.input[pr.cursor].is_whitespace() { pr.cursor += 1; }
+                        return;
+                    }
+                    "b" | "B" => {
+                        pr.cursor = pr.cursor.saturating_sub(1);
+                        while pr.cursor > 0 && pr.input[pr.cursor].is_whitespace() { pr.cursor -= 1; }
+                        while pr.cursor > 0 && !pr.input[pr.cursor - 1].is_whitespace() { pr.cursor -= 1; }
+                        return;
+                    }
+                    "h" => "Left", "l" => "Right", "j" => "Down", "k" => "Up",
+                    "0" | "^" => "Home", "$" => "End", "x" => "DC", "X" => "BSpace",
+                    "BSpace" => "Left", "DC" => "DC", "Left" => "Left", "Right" => "Right", "Up" => "Up", "Down" => "Down",
+                    "d" => "C-u", "p" => "C-y", "q" => "C-c",
+                    "Enter" => "Enter", "C-c" => "C-c", "C-h" => "C-h",
+                    _ => return,
+                };
+                if let Some(key) = keys::parse_key_name(mapped) {
+                    // Reuse the emacs editing operations, then restore command mode.
+                    pr.vi_command = false;
+                    self.prompt_key(cid, &key, mapped);
+                    if let Some(pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
+                        pr.vi_command = true;
+                    }
+                }
+                return;
+            }
         }
         let ctrl = |ch: char| k.mods.ctrl && k.code == KeyCode::Char(ch);
         match &k.code {
@@ -582,9 +651,30 @@ impl Server {
             _ if ctrl('a') => pr.cursor = 0,
             KeyCode::End => pr.cursor = pr.input.len(),
             _ if ctrl('e') => pr.cursor = pr.input.len(),
-            _ if ctrl('k') => pr.input.truncate(pr.cursor),
+            _ if ctrl('k') => { pr.copied = pr.input[pr.cursor..].to_vec(); pr.input.truncate(pr.cursor); }
+            _ if ctrl('y') => {
+                let value: Vec<_> = if pr.copied.is_empty() { paste.chars().take_while(|c| !c.is_control()).collect() } else { pr.copied.clone() };
+                let n = value.len(); pr.input.splice(pr.cursor..pr.cursor, value); pr.cursor += n;
+            }
+            _ if ctrl('t') => {
+                if pr.cursor > 0 && pr.input.len() > 1 {
+                    let at = pr.cursor.min(pr.input.len() - 1); pr.input.swap(at - 1, at); pr.cursor = (at + 1).min(pr.input.len());
+                }
+            }
+            _ if k.mods.meta && matches!(k.code, KeyCode::Char('b') | KeyCode::BSpace) => {
+                let old = pr.cursor;
+                while pr.cursor > 0 && pr.input[pr.cursor - 1].is_whitespace() { pr.cursor -= 1; }
+                while pr.cursor > 0 && !pr.input[pr.cursor - 1].is_whitespace() { pr.cursor -= 1; }
+                if k.code == KeyCode::BSpace { pr.copied = pr.input.drain(pr.cursor..old).collect(); }
+            }
+            _ if k.mods.meta && matches!(k.code, KeyCode::Char('f' | 'd')) => {
+                let old = pr.cursor;
+                while pr.cursor < pr.input.len() && pr.input[pr.cursor].is_whitespace() { pr.cursor += 1; }
+                while pr.cursor < pr.input.len() && !pr.input[pr.cursor].is_whitespace() { pr.cursor += 1; }
+                if k.code == KeyCode::Char('d') { pr.copied = pr.input.drain(old..pr.cursor).collect(); pr.cursor = old; }
+            }
             _ if ctrl('u') => {
-                pr.input.drain(..pr.cursor);
+                pr.copied = std::mem::take(&mut pr.input);
                 pr.cursor = 0;
             }
             _ if ctrl('w') => {
@@ -595,10 +685,10 @@ impl Server {
                 while i > 0 && pr.input[i - 1] != ' ' {
                     i -= 1;
                 }
-                pr.input.drain(i..pr.cursor);
+                pr.copied = pr.input.drain(i..pr.cursor).collect();
                 pr.cursor = i;
             }
-            KeyCode::Up => {
+            _ if k.code == KeyCode::Up || ctrl('p') => {
                 if hist_len > 0 {
                     let pos = pr.history_pos.map(|p| p.min(hist_len).saturating_sub(1)).unwrap_or(hist_len - 1);
                     pr.history_pos = Some(pos);
@@ -606,7 +696,7 @@ impl Server {
                     pr.cursor = pr.input.len();
                 }
             }
-            KeyCode::Down => {
+            _ if k.code == KeyCode::Down || ctrl('n') => {
                 if let Some(p) = pr.history_pos.map(|p| p.min(hist_len)) {
                     if p + 1 < hist_len {
                         pr.history_pos = Some(p + 1);
@@ -650,7 +740,9 @@ impl Server {
         }
         if let Some((pane, forward)) = incremental {
             let text = self.clients.get(&cid).and_then(|c| c.prompt.as_ref()).map(|pr| pr.input.iter().collect::<String>());
+            let wrap = self.opt_window_on(self.window_of(pane), "wrap-search");
             if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
+                cm.wrap_search = wrap;
                 match text {
                     Some(text) => cm.preview_search(&text, forward),
                     None => cm.finish_incremental_search(false),
