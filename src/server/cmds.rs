@@ -1771,9 +1771,11 @@ impl Server {
                 let wt = if cmd == "select-layout" { self.resolve_pane(ctx, t)? } else { self.resolve_window(ctx, t)? };
                 let wid = wt.wid.unwrap();
                 let area = self.window_area(wid);
-                let main_size = |s: &Server, name: &str| -> Option<u16> {
-                    let v = s.opt_window_num(Some(wid), if name.starts_with("main-horizontal") { "main-pane-height" } else { "main-pane-width" });
-                    (v > 0).then_some(v as u16)
+                let size_option = |s: &Server, name: &str, total: u16| -> Option<u16> {
+                    let v = s.opt_window(Some(wid), name);
+                    if let Some(pct) = v.strip_suffix('%') {
+                        pct.parse::<u32>().ok().filter(|p| *p <= 100).map(|p| (total as u32 * p / 100) as u16)
+                    } else { v.parse().ok() }
                 };
                 let w = &self.windows[&wid];
                 let panes = w.panes();
@@ -1798,7 +1800,13 @@ impl Server {
                 };
                 let node = if let Some(name) = name {
                     if let Some(preset) = layout::preset_name(&name).filter(|_| !o.has('o')) {
-                        let n = layout::preset(preset, &panes, area, main_size(self, preset)).unwrap();
+                        let horizontal = preset.starts_with("main-horizontal");
+                        let dimension = if horizontal { "height" } else { "width" };
+                        let total = if horizontal { area.h } else { area.w }.saturating_sub(1);
+                        let main = size_option(self, &format!("main-pane-{dimension}"), total);
+                        let other = size_option(self, &format!("other-pane-{dimension}"), total);
+                        let columns = self.opt_window_num(Some(wid), "tiled-layout-max-columns").max(0) as usize;
+                        let n = layout::preset_with_options(preset, &panes, area, main, other, columns).unwrap();
                         let w = self.windows.get_mut(&wid).unwrap();
                         w.layout_cycle = layout::PRESETS.iter().position(|p| *p == preset);
                         n
