@@ -34,6 +34,16 @@ pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
             cmd, repeat: o.has('r'), note: o.get('N').unwrap_or("").into(),
         });
     }
+    // Tiled-only forms of the floating-aware resize bindings (the fixture leaves
+    // the tmux 3.8 if-shell versions to the floating pane package).
+    for (key, cmd, note) in [
+        ("M-Up", "resize-pane -U 5", "Resize the pane up by 5"),
+        ("M-Left", "resize-pane -L 5", "Resize the pane left by 5"),
+        ("C-Up", "resize-pane -U", "Resize the pane up"),
+        ("C-Left", "resize-pane -L", "Resize the pane left"),
+    ] {
+        t.entry("prefix".into()).or_default().entry(key.into()).or_insert(Binding { cmd: cmd.into(), repeat: true, note: note.into() });
+    }
     for (table, vi) in [("copy-mode", false), ("copy-mode-vi", true)] {
         for (k, c) in CopyMode::default_bindings(vi) {
             t.entry(table.to_string()).or_default().insert(k.to_string(), Binding { cmd: format!("send-keys -X {c}"), repeat: false, note: "default".into() });

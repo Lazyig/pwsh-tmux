@@ -515,13 +515,19 @@ fn keys_config_and_capture() {
     let conf = std::env::temp_dir().join(format!("pt-conf-{}.conf", std::process::id()));
     std::fs::write(
         &conf,
-        "# comment\nset -g @conf loaded\nbind -n F5 { set -g @f5 pressed ; display done }\nset -g status-right '#[fg=yellow]%H:%M'\n%if #{==:#{host},#{host}}\nset -g @cond yes\n%endif\n",
+        "# comment\nset -g @conf loaded\nbind -n F5 { set -g @f5 pressed ; display done }\nbind -T mytab z if -F 1 { display a } 'display b'\nbind -T mytab y display-menu -T x A a {send -X history-top} B b { new-window }\nset -g status-right '#[fg=yellow]%H:%M'\n%if #{==:#{host},#{host}}\nset -g @cond yes\n%endif\n",
     )
     .unwrap();
     ctx.ok(&["source-file", &conf.to_string_lossy()]);
     let _ = std::fs::remove_file(&conf);
     assert_eq!(ctx.fmt("k", "#{@conf} #{@cond}"), "loaded yes");
-    assert!(ctx.ok(&["list-keys", "-T", "root", "F5"]).contains("set -g @f5 pressed"));
+    // list-keys prints the parsed command list: full names, " \; " between commands
+    assert!(ctx.ok(&["list-keys", "-T", "root", "F5"]).contains("set-option -g @f5 pressed \\; display-message done"));
+    // blocks among bind-key's arguments stay blocks
+    assert_eq!(
+        ctx.ok(&["list-keys", "-T", "mytab"]),
+        "bind-key  -T mytab y display-menu -T x A a { send-keys -X history-top } B b { new-window }\nbind-key  -T mytab z if-shell -F 1 { display-message a } \"display b\"\n"
+    );
     ctx.fails(&["source-file", "/no/such/file.conf"]);
     ctx.ok(&["source-file", "-q", "/no/such/file.conf"]);
     // #{current_file} and assignments used by the next lines, as theme plugins
@@ -974,14 +980,14 @@ fn list_keys_layout_format_and_order() {
     ctx.ok(&["bind-key", "-T", "mytab", "#", "display", "hash"]);
     ctx.ok(&["bind-key", "-N", "a note", "-T", "mytab", "\"", "display", "q"]);
     // tmux 3.8: padded table and key columns, keys in key-code order, quoted keys
-    assert_eq!(ctx.ok(&["list-keys", "-T", "mytab"]), "bind-key    -T mytab \\\" display q\nbind-key    -T mytab \\# display hash\nbind-key -r -T mytab x display hi\n");
-    assert_eq!(ctx.ok(&["lsk", "-T", "mytab", "-O", "name", "-r"]).lines().next(), Some("bind-key -r -T mytab x display hi"));
-    assert_eq!(ctx.ok(&["lsk", "-1", "-T", "mytab"]), "bind-key  -T mytab \\\" display q\n");
+    assert_eq!(ctx.ok(&["list-keys", "-T", "mytab"]), "bind-key    -T mytab \\\" display-message q\nbind-key    -T mytab \\# display-message hash\nbind-key -r -T mytab x display-message hi\n");
+    assert_eq!(ctx.ok(&["lsk", "-T", "mytab", "-O", "name", "-r"]).lines().next(), Some("bind-key -r -T mytab x display-message hi"));
+    assert_eq!(ctx.ok(&["lsk", "-1", "-T", "mytab"]), "bind-key  -T mytab \\\" display-message q\n");
     assert_eq!(
         ctx.ok(&["lsk", "-T", "mytab", "-F", "#{key_table}|#{key_string}|#{key_repeat}|#{key_note}|#{key_command}|#{key_string_width}|#{key_has_repeat}"]),
-        "mytab|\"|0|a note|display q|1|1\nmytab|#|0||display hash|1|1\nmytab|x|1||display hi|1|1\n"
+        "mytab|\"|0|a note|display-message q|1|1\nmytab|#|0||display-message hash|1|1\nmytab|x|1||display-message hi|1|1\n"
     );
-    assert_eq!(ctx.ok(&["lsk", "-T", "mytab", "x"]), "bind-key -r -T mytab x display hi\n");
+    assert_eq!(ctx.ok(&["lsk", "-T", "mytab", "x"]), "bind-key -r -T mytab x display-message hi\n");
     assert!(ctx.fails(&["lsk", "-T", "mytab", "y"]).contains("unknown key: y"));
     assert!(ctx.fails(&["lsk", "-T", "mytab", "zzz"]).contains("invalid key: zzz"));
     assert!(ctx.fails(&["lsk", "-T", "nosuch"]).contains("table nosuch doesn't exist"));
@@ -1142,31 +1148,51 @@ fn format_option_environment_and_window_loops() {
 
 #[test]
 fn display_defaults_match_tmux_38_source() {
-    // This fixture is the C string array with DEFAULT_* macros expanded, with
-    // only the explicitly delegated floating/switch-mode bindings excluded.
-    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/display-defaults.conf");
+    // The bindings fixture is the key-bindings.c string array with DEFAULT_* macros
+    // expanded, with only the delegated floating/switch-mode bindings excluded.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let fixture = root.join("src/server/display-defaults.conf");
     #[cfg(unix)]
     {
-        let reference = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ref/tmux-3.8/key-bindings.c");
+        let reference = root.join("../ref/tmux-3.8/key-bindings.c");
         if reference.exists() {
             let generated = std::process::Command::new("python3").arg("tools/extract-display-defaults.py").arg(reference).output().unwrap();
             assert!(generated.status.success());
             assert_eq!(generated.stdout, std::fs::read(&fixture).unwrap(), "regenerate the fixture from tmux 3.8");
         }
     }
+    // list-keys of a tmux 3.8 server started with -f /dev/null
+    let expected = std::fs::read_to_string(root.join("tests/fixtures/tmux38-default-keys.txt")).unwrap();
+    let mut sections: Vec<Vec<&str>> = Vec::new();
+    for l in expected.lines() {
+        if l.starts_with('#') { sections.push(Vec::new()) } else { sections.last_mut().unwrap().push(l) }
+    }
     let ctx = Ctx::new("display-defaults");
     ctx.ok(&["new-session", "-d", "-s", "s"]);
-    let dump = || ["prefix", "root"].map(|table| format!("{}{}", ctx.ok(&["list-keys", "-T", table]), ctx.ok(&["list-keys", "-N", "-T", table])));
-    let initial = dump();
-    assert!(initial[0].contains("select-pane -T '%%'"));
-    assert!(initial[1].contains("Paste #[underscore]"));
-    assert!(initial[1].contains("'Detach' 'd'"));
-    ctx.ok(&["unbind-key", "-a", "-T", "prefix"]);
-    ctx.ok(&["unbind-key", "-a", "-T", "root"]);
-    // Parse the source-derived defaults through source-file/bind-key, independently
-    // of the startup loader, and compare the complete list-keys dumps.
-    ctx.ok(&["source-file", fixture.to_str().unwrap()]);
-    assert_eq!(initial, dump());
+    let actual = [ctx.ok(&["list-keys", "-T", "prefix"]), ctx.ok(&["list-keys", "-T", "root"]), ctx.ok(&["list-keys", "-N"])];
+    // Bindings of the floating pane (and switch-mode) packages; the floating
+    // commands' flags are needed to print the default menus' floating items.
+    const DELEGATED: &[&str] = &["Tab", "BTab", "*", "@", "g", "M-Up", "M-Left", "C-Up", "C-Left", "MouseDown1Control7",
+        "M-MouseDrag1Pane", "M-MouseDrag1Border", "C-MouseDrag1Pane", "C-MouseDrag1Empty"];
+    let floating = !ctx.ok(&["list-commands", "new-pane"]).trim().is_empty();
+    let key = |l: &str| -> String {
+        let w: Vec<&str> = l.split_whitespace().collect();
+        if w[0] == "bind-key" { w[if w[1] == "-r" { 4 } else { 3 }].to_string() } else { w[1].to_string() }
+    };
+    for (want, got) in sections.iter().zip(&actual) {
+        let want: Vec<&str> = want.iter().copied().filter(|l| !DELEGATED.contains(&key(l).as_str())).collect();
+        let got: Vec<&str> = got.lines().filter(|l| !DELEGATED.contains(&key(l).as_str())).collect();
+        assert_eq!(want.iter().map(|l| key(l)).collect::<Vec<_>>(), got.iter().map(|l| key(l)).collect::<Vec<_>>());
+        for (w, g) in want.iter().zip(&got) {
+            if floating || !(w.contains("new-pane") || w.contains("move-pane -P")) {
+                assert_eq!(w, g);
+            }
+        }
+    }
+    let prefix = &actual[0];
+    assert!(prefix.contains("bind-key    -T prefix T       command-prompt -I \"#T\" { select-pane -T \"%%\" }"), "{prefix}");
+    assert!(actual[1].contains("'Detach' 'd' {detach-client}"));
+    assert!(ctx.ok(&["list-keys", "-T", "root", "MouseDown3Pane"]).contains("Paste #[underscore]#{=/9/...:buffer_sample},}"));
 }
 
 #[test]
@@ -1205,7 +1231,8 @@ fn remain_on_exit_format_is_styled_on_bottom_line_and_empty_is_silent() {
     assert!(captured.contains("\x1b["));
     ctx.ok(&["set", "-p", "-t", "s", "remain-on-exit-format", ""]);
     ctx.ok(&["respawn-pane", "-k", "-t", "s", "sh", "-c", "printf marker; exit 0"]);
-    wait_for("empty dead format", || ctx.fmt("s", "#{pane_dead}") == "1");
+    // the exit can be seen before the pane's last output is read
+    wait_for("empty dead format", || ctx.fmt("s", "#{pane_dead}") == "1" && ctx.capture("s").starts_with("marker"));
     let captured = ctx.capture("s");
     assert!(captured.starts_with("marker"), "{captured:?}");
     assert!(!captured.contains("Pane is dead"));

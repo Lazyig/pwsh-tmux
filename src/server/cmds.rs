@@ -2778,7 +2778,13 @@ impl Server {
                 let key = args.remove(0);
                 let kname = keys::parse_key_name(&key).map(|k| keys::key_name(&k)).unwrap_or(key.clone());
                 let table = if o.has('n') { "root".to_string() } else { o.get('T').unwrap_or("prefix").to_string() };
-                let command = if args.len() == 1 { args[0].clone() } else { args.iter().map(|a| if a == ";" { "\\;".into() } else { cmdparse::quote(a) }).collect::<Vec<_>>().join(" ") };
+                let command = if args.len() == 1 { args[0].trim_start_matches(cmdparse::BLOCK_MARK).to_string() } else {
+                    args.iter().map(|a| match a.strip_prefix(cmdparse::BLOCK_MARK) {
+                        Some(body) => format!("{{{body}}}"),
+                        None if a == ";" => "\\;".into(),
+                        None => cmdparse::quote(a),
+                    }).collect::<Vec<_>>().join(" ")
+                };
                 if command.is_empty() {
                     return err("bind-key needs a command");
                 }

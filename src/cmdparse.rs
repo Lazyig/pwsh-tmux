@@ -55,7 +55,11 @@ pub fn parse_blocks(input: &str) -> Result<Vec<Vec<(String, bool)>>, String> {
     let cmds = lx.run(&|c: &str| !c.is_empty() && c != "0")?;
     let mut out: Vec<Vec<(String, bool)>> = cmds.into_iter().map(|c| c.into_iter().map(|w| (w, false)).collect()).collect();
     for (c, w) in lx.braces {
-        out[c][w].1 = true;
+        let word = &mut out[c][w];
+        word.1 = true;
+        if let Some(body) = word.0.strip_prefix(BLOCK_MARK) {
+            word.0 = body.to_string();
+        }
     }
     Ok(out)
 }
@@ -706,7 +710,37 @@ fn finish(cmds: &mut Vec<Vec<String>>, cur: &mut Vec<(String, bool, bool)>, acti
         return;
     }
     braces.extend(words.iter().enumerate().filter(|(_, w)| w.2).map(|(i, _)| (cmds.len(), i)));
-    cmds.push(words.into_iter().map(|(w, _, _)| w).collect());
+    let blocks = bind_blocks(&words);
+    cmds.push(words.into_iter().enumerate().map(|(i, (w, _, _))| if blocks.contains(&i) { format!("{BLOCK_MARK}{w}") } else { w }).collect());
+}
+
+/// Prefix of a `{ ... }` block given to bind-key among other arguments, so the
+/// binding keeps it as a block (tmux stores the parsed command list, and
+/// list-keys prints `{ ... }` rather than a quoted string).
+pub const BLOCK_MARK: char = '\u{2}';
+
+/// Positions of the block arguments of a bind-key command after its key, when
+/// the command is more than a single argument (a lone block is the command).
+fn bind_blocks(words: &[(String, bool, bool)]) -> Vec<usize> {
+    let Some((name, _, false)) = words.first() else { return vec![] };
+    if !(name.len() >= 2 && "bind-key".starts_with(name.as_str())) {
+        return vec![];
+    }
+    let mut i = 1;
+    while let Some((w, _, false)) = words.get(i) {
+        if !w.starts_with('-') || w.len() < 2 { break; }
+        i += 1;
+        if w == "--" { break; }
+        // -T and -N take a value, inline or as the next word
+        if let Some(p) = w[1..].find(['T', 'N']) && p + 2 == w.len() {
+            i += 1;
+        }
+    }
+    let rest = i + 1;
+    if words.len() <= rest + 1 {
+        return vec![];
+    }
+    (rest..words.len()).filter(|&j| words[j].2).collect()
 }
 
 #[cfg(test)]
@@ -719,6 +753,18 @@ mod tests {
 
     fn p(s: &str) -> Vec<Vec<String>> {
         parse(s).unwrap_or_else(|e| panic!("parse failed for {s:?}: {e}"))
+    }
+
+    #[test]
+    fn bind_key_blocks_among_arguments_are_marked() {
+        let m = |s: &str| format!("{BLOCK_MARK}{s}");
+        assert_eq!(p("bind -n -T t x if -F 1 { a } 'b'"), vec![v(&["bind", "-n", "-T", "t", "x", "if", "-F", "1", &m("a"), "b"])]);
+        assert_eq!(p("bind -Nnote x menu {a}"), vec![v(&["bind", "-Nnote", "x", "menu", &m("a")])]);
+        // a lone block is the command itself; other commands are unchanged
+        assert_eq!(p("bind x { a }"), vec![v(&["bind", "x", "a"])]);
+        assert_eq!(p("if -F 1 { a } { b }"), vec![v(&["if", "-F", "1", "a", "b"])]);
+        let b = parse_blocks("bind x if 1 { a }").unwrap();
+        assert_eq!(b[0][4], ("a".to_string(), true));
     }
 
     #[test]
