@@ -463,6 +463,17 @@ impl Server {
         Some(node.to_json_layout(area, &info))
     }
 
+    /// What a %layout-change is about, the same in either layout format: the tiled layout,
+    /// the floating panes and the zoom. Not the active pane or the z-order it raises (tmux
+    /// tells control clients on window-layout-changed only).
+    pub fn layout_key(&self, wid: WinId) -> String {
+        let Some(w) = self.windows.get(&wid) else { return String::new() };
+        let area = self.window_area(wid);
+        let mut floats = w.layout.floats();
+        floats.sort_by_key(|f| f.0);
+        format!("{} {floats:?} {}", w.layout.to_layout_string(area), w.zoomed)
+    }
+
     /// Expand a size or position argument for a target (tmux
     /// args_percentage_and_expand).
     pub fn pct_expand(&self, v: &str, lo: i64, hi: i64, cur: i64, t: Target) -> Result<i64, String> {

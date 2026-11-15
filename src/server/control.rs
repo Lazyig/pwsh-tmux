@@ -13,6 +13,9 @@ pub struct Seen {
     pub sessions: BTreeMap<SessId, String>,
     /// window -> (name, layout) for windows in the client's session
     pub windows: BTreeMap<WinId, (String, String)>,
+    /// window -> what a layout change is, whichever format the client is shown (the old
+    /// format leaves out floating panes and zoom, the JSON one has the active pane)
+    pub layout_keys: BTreeMap<WinId, String>,
     pub active_window: Option<WinId>,
     pub active_pane: BTreeMap<WinId, PaneId>,
     pub pane_modes: BTreeMap<PaneId, bool>,
@@ -201,6 +204,7 @@ impl Server {
                     c.readonly = on || c.acl_readonly;
                 }
                 None if name == "ignore-size" => c.ctl.ignore_size = on,
+                // only how layouts are printed from now on: no layout change by itself
                 None if name == "new-layouts" => c.ctl.new_layouts = on,
                 None if matches!(name, "active-pane" | "no-detach-on-destroy") => {}
                 _ => return Err(format!("unknown flag: {name}")),
@@ -318,6 +322,7 @@ impl Server {
             // "#{window_layout} #{window_visible_layout}": old-format unless new-layouts
             let layouts = format!("{} {}", self.window_layout(*wid, false, Some(cid)).unwrap_or_default(), self.window_layout(*wid, true, Some(cid)).unwrap_or_default());
             seen.windows.insert(*wid, (w.name.clone(), layouts));
+            seen.layout_keys.insert(*wid, self.layout_key(*wid));
             seen.active_pane.insert(*wid, w.active);
             for p in w.panes() {
                 seen.pane_modes.insert(p, self.panes.get(&p).is_some_and(|x| x.mode.is_some()));
@@ -353,11 +358,11 @@ impl Server {
                 for (wid, (name, layout)) in &now.windows {
                     match before.windows.get(wid) {
                         None => out.push_str(&format!("%window-add @{wid}\n")),
-                        Some((old_name, old_layout)) => {
+                        Some((old_name, _)) => {
                             if old_name != name {
                                 out.push_str(&format!("%window-renamed @{wid} {name}\n"));
                             }
-                            if old_layout != layout {
+                            if now.layout_keys.get(wid) != before.layout_keys.get(wid) {
                                 let zoomed = self.windows.get(wid).is_some_and(|w| w.zoomed);
                                 out.push_str(&format!("%layout-change @{wid} {layout} {}\n", if zoomed { "*Z" } else { "*" }));
                             }

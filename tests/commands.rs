@@ -741,9 +741,27 @@ fn control_mode() {
     assert!(change.split(' ').nth(2).is_some_and(|l| l.as_bytes().get(4) == Some(&b',')) && !change.contains("\"V\":2"), "{change}");
     send("display-message -p 'L=#{window_layout}'");
     wait_for("old layout", || text().lines().any(|l| l.starts_with("L=") && l.as_bytes().get(6) == Some(&b',')));
+    // floating panes and zoom are layout changes too, though the old format leaves them out
+    let changes = || text().lines().filter(|l| l.starts_with("%layout-change @")).count();
+    let before = changes();
+    send("new-pane -d -x 10 -y 4");
+    wait_for("floating %layout-change", || changes() == before + 1);
+    send("resize-pane -Z");
+    wait_for("zoom %layout-change", || text().lines().any(|l| l.starts_with("%layout-change @") && l.ends_with(" *Z")));
+    send("resize-pane -Z");
+    wait_for("unzoom %layout-change", || changes() == before + 3);
+    send("kill-pane -t :.2");
+    wait_for("closed floating %layout-change", || changes() == before + 4);
     send("refresh-client -f new-layouts");
     send("display-message -p 'J=#{window_layout}'");
     wait_for("JSON layout", || text().contains("J={\"V\":2,\"L\":"));
+    // switching the format is no layout change of its own, nor is selecting a pane
+    let before = changes();
+    send("select-pane -t :.0");
+    send("refresh-client -f !new-layouts");
+    send("display-message -p 'O=#{window_layout}'");
+    wait_for("old layout again", || text().lines().any(|l| l.starts_with("O=") && l.as_bytes().get(6) == Some(&b',')));
+    assert_eq!(changes(), before, "{}", text());
     send("kill-window");
     wait_for("%window-close", || text().contains("%window-close @"));
     send("no-such-command");
