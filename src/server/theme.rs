@@ -18,6 +18,10 @@ pub struct Terminal {
     last_requests: Option<Instant>,
     /// A popup's pane: tmux runs it without a window pane, so it gets no theme or colour replies.
     popup: bool,
+    /// A pane's window-style / window-active-style colours (tty_default_colours): they win
+    /// over the pane's own OSC 10/11 colours, which win over the client's.
+    style_fg: StyleColour,
+    style_bg: StyleColour,
 }
 
 /// tmux TTY_REQUEST_LIMIT: colour requests are repeated (on resize) at most this often.
@@ -120,8 +124,9 @@ impl format::Vars for ThemeProbe<'_> {
 }
 
 /// A style's default foreground or background, with theme colours left unresolved.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum StyleColour {
+    #[default]
     Default,
     Theme(usize),
     Colour(Color),
@@ -137,9 +142,9 @@ impl StyleColour {
         }
     }
     /// The colour a pane reports for OSC 10/11 and its theme: None for a theme colour, which
-    /// has no RGB value (colour_force_rgb fails).
-    fn reported(self, fallback: Option<Color>) -> Option<Color> {
-        match self { StyleColour::Default => fallback, StyleColour::Theme(_) => None, StyleColour::Colour(c) => Some(c) }
+    /// has no RGB value (colour_force_rgb fails) and no theme (colour_totheme).
+    fn or_else(self, fallback: impl FnOnce() -> Option<Color>) -> Option<Color> {
+        match self { StyleColour::Default => fallback(), StyleColour::Theme(_) => None, StyleColour::Colour(c) => Some(c) }
     }
 }
 
@@ -232,8 +237,19 @@ pub struct PaneColours {
 
 impl PaneColours {
     pub fn update(&mut self, terminal: Terminal) { self.terminal = terminal; }
+    /// window_pane_get_fg/bg as OSC 10/11 queries see them: a control client's report, the
+    /// window styles, the pane's own colour, then the first attached client's.
+    fn colour(&self, fg: bool) -> Option<Color> {
+        let t = &self.terminal;
+        if fg {
+            t.control_fg.or_else(|| t.style_fg.or_else(|| self.fg.or(t.fg)))
+        } else {
+            t.control_bg.or_else(|| t.style_bg.or_else(|| self.bg.or(t.bg)))
+        }
+    }
+    /// window_pane_get_theme: the attached clients' agreed theme, else the background's.
     fn theme(&self) -> Option<Theme> {
-        self.terminal.reported.or_else(|| self.terminal.control_bg.or(self.bg).or(self.terminal.bg).and_then(background_theme))
+        self.terminal.reported.or_else(|| self.colour(false).and_then(background_theme))
     }
     pub fn subscribe(&mut self) { self.last = self.theme(); }
     pub fn report(&mut self, replies: &mut Vec<u8>) {
@@ -263,8 +279,7 @@ impl PaneColours {
         };
         if *value == b"?" {
             if self.terminal.popup { return; }
-            let colour = if fg { self.terminal.control_fg.or(self.fg).or(self.terminal.fg) } else { self.terminal.control_bg.or(self.bg).or(self.terminal.bg) };
-            if let Some((r, g, b)) = colour.and_then(rgb) {
+            if let Some((r, g, b)) = self.colour(fg).and_then(rgb) {
                 let n = if fg { 10 } else { 11 };
                 let end = if bel { "\x07" } else { "\x1b\\" };
                 replies.extend(format!("\x1b]{n};rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}{end}").bytes());
@@ -364,9 +379,7 @@ impl Server {
             (true, false) => Some(Theme::Light), (false, true) => Some(Theme::Dark), _ => None,
         };
         if self.panes.contains_key(&pane) {
-            let (fg, bg) = self.pane_style_colours(pane);
-            terminal.fg = fg.reported(terminal.fg);
-            terminal.bg = bg.reported(terminal.bg);
+            (terminal.style_fg, terminal.style_bg) = self.pane_style_colours(pane);
         }
         if let Some(p) = self.panes.get(&pane) {
             let control = p.parser.callbacks().colours.control;
@@ -461,7 +474,8 @@ mod tests {
         });
         let c = srv.clients.get_mut(&1).unwrap();
         c.attached = true;
-        c.features = features::compute("xterm-256color", "", &[], "");
+        // the 256 feature, as DA replies or -2 add it (terminfo colors#256 alone is 16)
+        c.features = features::compute("xterm-256color", "", &[], "256");
         srv
     }
     fn ctx(srv: &Server) -> VarCtx<'_> {
@@ -488,7 +502,7 @@ mod tests {
         assert_eq!(format::expand("#{c/f:themegreen}", &ctx(&srv)), "\x1b[32m");
         let spans = format::spans_with("#[fg=themegreen]x", crate::cells::Style::default(), Some(&ctx(&srv)));
         assert_eq!(spans[0].style.fg, Color::Idx(2));
-        for (term, extra, depth) in [("dumb", "", "2"), ("vt100", "", "8"), ("xterm-16color", "", "16"), ("xterm-256color", "", "256"), ("xterm", "RGB", "16777216")] {
+        for (term, extra, depth) in [("dumb", "", "2"), ("vt100", "", "2"), ("linux", "", "8"), ("xterm-16color", "", "16"), ("xterm-256color", "", "16"), ("xterm-256color", "256", "256"), ("xterm", "RGB", "16777216")] {
             srv.clients.get_mut(&1).unwrap().features = features::compute(term, "", &[], extra);
             assert_eq!(ctx(&srv).get("client_colours"), Some(depth.into()));
             srv.opts_server.set("theme", "dark".into());
@@ -519,7 +533,11 @@ mod tests {
         assert_eq!(srv.clients[&1].terminal.detected(), Some(Theme::Dark));
         assert!(srv.terminal_report(1, b"\x1b]10;rgb:12/34/56\x07"));
         assert_eq!(srv.clients[&1].terminal.fg, Some(Color::Rgb(18, 52, 86)));
-        assert!(!srv.terminal_report(1, b"\x1b]11;rgb:zz/ff/00\x07"));
+        // tty_keys_colours consumes a complete reply whose colour does not parse, unchanged
+        let bg = srv.clients[&1].terminal.bg;
+        assert!(srv.terminal_report(1, b"\x1b]11;rgb:zz/ff/00\x07"));
+        assert_eq!(srv.clients[&1].terminal.bg, bg);
+        assert!(!srv.terminal_report(1, b"\x1b]12;rgb:ff/ff/00\x07"));
     }
 
     #[test]

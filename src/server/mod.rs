@@ -1369,9 +1369,9 @@ impl Server {
                     c.suspended = false;
                     c.prev = None;
                     c.dirty = true;
-                    // tty_start_tty: subscribe to theme changes and ask for the theme again
+                    // tty_start_tty: subscribe to theme changes and ask for the theme again;
+                    // colours are asked for (and waited on) only once a theme report arrives
                     if c.control == 0 && c.terminal.vt100 {
-                        c.terminal.query_started();
                         c.send(S_OUTPUT, b"\x1b[?2031h\x1b[?996n");
                     }
                 }

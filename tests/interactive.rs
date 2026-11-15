@@ -275,7 +275,9 @@ fn terminal_features_and_extended_keys() {
     let t = Term::attach(&ctx, &["attach", "-t", "f"], 80, 24);
     t.wait_screen("status", |s| s.contains("[f]"));
     let feats = ctx.ok(&["list-clients", "-F", "#{client_termfeatures}"]);
-    assert!(feats.contains("256") && feats.contains("clipboard") && !feats.contains("RGB"), "{feats}");
+    // terminfo colors#256 is not the 256 feature (tmux adds that from DA replies or -2)
+    assert!(!feats.contains("256") && feats.contains("clipboard") && !feats.contains("RGB"), "{feats}");
+    assert_eq!(ctx.ok(&["list-clients", "-F", "#{client_colours}"]).trim(), "16");
     wait_for("256-colour status", || t.raw_text().contains("48;5;196"));
     assert!(!t.raw_text().contains("48;2;255;0;0"));
     drop(t);

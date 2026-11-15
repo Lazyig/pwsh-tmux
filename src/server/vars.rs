@@ -474,18 +474,14 @@ impl Vars for VarCtx<'_> {
                 _ => p.track.search.clone(),
             }),
             "pane_start_command_list" => pane.map(|p| p.track.argv.iter().map(|a| format!("'{}'", a.replace('\'', "'\\''"))).collect::<Vec<_>>().join(" ")),
-            "pane_fg" | "pane_bg" => win.zip(t.pane).map(|(w, p)| {
-                use super::theme::{style_colours, StyleColour};
-                // window-active-style colours win for the active pane, then the pane's
-                // OSC 10/11 colours, then window-style; theme colours print their names
-                let ctx = VarCtx { srv, t: srv.target_for_pane(p), client: None, extra: HashMap::new() };
-                let style = |o: &str| style_colours(&srv.opt_pane(p, o), &ctx);
-                let ((nfg, nbg), (afg, abg)) = (style("window-style"), style("window-active-style"));
+            "pane_fg" | "pane_bg" => win.and(t.pane).map(|p| {
+                use super::theme::StyleColour;
+                // tty_default_colours: window-active-style for the active pane, then
+                // window-style, then the pane's OSC 10/11 colours; theme colours print names
+                let (sfg, sbg) = srv.pane_style_colours(p);
                 let palette = srv.panes.get(&p).map(|pp| &pp.parser.callbacks().colours);
-                let pick = |n: StyleColour, a: StyleColour, own: Option<Color>| {
-                    if w.active == p && a != StyleColour::Default { a } else { own.map_or(n, StyleColour::Colour) }
-                };
-                if name == "pane_fg" { pick(nfg, afg, palette.and_then(|c| c.fg)) } else { pick(nbg, abg, palette.and_then(|c| c.bg)) }.name()
+                let pick = |st: StyleColour, own: Option<Color>| if st == StyleColour::Default { own.map_or(st, StyleColour::Colour) } else { st };
+                if name == "pane_fg" { pick(sfg, palette.and_then(|c| c.fg)) } else { pick(sbg, palette.and_then(|c| c.bg)) }.name()
             }),
             "pane_left" | "pane_top" | "pane_right" | "pane_bottom" | "pane_at_left" | "pane_at_right" | "pane_at_top" | "pane_at_bottom" | "pane_x" | "pane_y"
             | "pane_unzoomed_width" | "pane_unzoomed_height" => {
@@ -980,6 +976,13 @@ mod tests {
         run(&mut srv, &["set", "-g", "window-active-style", "bg=blue"]);
         assert_eq!(srv.expand_for_pane(active, "#{pane_fg} #{pane_bg}"), "colour100 blue");
         assert_eq!(srv.expand_for_pane(other, "#{pane_fg} #{pane_bg}"), "colour100 #102030");
+        // tty_default_colours: the window styles win over a pane's own OSC 10/11 colours
+        output(&mut srv, other, b"\x1b]10;#ff0000\x07\x1b]11;#00ff00\x07");
+        assert_eq!(srv.expand_for_pane(other, "#{pane_fg} #{pane_bg}"), "colour100 #102030");
+        run(&mut srv, &["set", "-g", "window-style", "bg=themecyan"]);
+        assert_eq!(srv.expand_for_pane(other, "#{pane_fg} #{pane_bg}"), "#ff0000 themecyan");
+        run(&mut srv, &["set", "-gu", "window-style"]);
+        assert_eq!(srv.expand_for_pane(other, "#{pane_fg} #{pane_bg}"), "#ff0000 #00ff00");
         srv.shutdown();
     }
 }

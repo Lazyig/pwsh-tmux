@@ -867,11 +867,15 @@ mod theme_tests {
         assert_eq!((style.fg, style.bg, style.attrs & BOLD), (Color::Idx(1), Color::Idx(7), BOLD));
         let style = fit_style(Style { fg: Color::Idx(196), bg: Color::Idx(231), ..Style::default() }, &f);
         assert_eq!((style.fg, style.bg, style.attrs & BOLD), (Color::Idx(1), Color::Idx(7), 0));
-        let style = fit_style(Style { fg: Color::Idx(244), bg: Color::Idx(0), ..Style::default() }, &f);
-        assert_eq!(style.fg, Color::Idx(7)); // don't map grey to black on black
+        // colour240 is bright black, so black: not on black, which would hide it
+        let style = fit_style(Style { fg: Color::Idx(240), bg: Color::Idx(0), ..Style::default() }, &f);
+        assert_eq!((style.fg, style.bg), (Color::Idx(7), Color::Idx(0)));
         // the swap looks at the bg before it is converted: colour233 is not black yet
-        let style = fit_style(Style { fg: Color::Idx(244), bg: Color::Idx(233), ..Style::default() }, &f);
+        let style = fit_style(Style { fg: Color::Idx(240), bg: Color::Idx(233), ..Style::default() }, &f);
         assert_eq!((style.fg, style.bg), (Color::Idx(0), Color::Idx(0)));
+        // colour244 is white in colour_256to16, so nothing is swapped
+        let style = fit_style(Style { fg: Color::Idx(244), bg: Color::Idx(7), ..Style::default() }, &f);
+        assert_eq!((style.fg, style.bg), (Color::Idx(7), Color::Idx(7)));
         let f = super::super::features::compute("xterm-16color", "", &[], "");
         let style = fit_style(Style { fg: Color::Idx(196), bg: Color::Idx(231), ..Style::default() }, &f);
         assert_eq!((style.fg, style.bg), (Color::Idx(9), Color::Idx(15)));
