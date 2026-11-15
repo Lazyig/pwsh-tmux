@@ -247,6 +247,16 @@ fn print_parsed_command(words: Vec<(String, bool)>, aliases: &[String], expand: 
         }
         out.push(if *brace { a.clone() } else { options::escape_arg(a) });
     }
+    // args_parse checks the argument counts last
+    if let Some(&(_, min, max)) = ARG_COUNTS.iter().find(|a| a.0 == full) {
+        let n = (args.len() - i) as i32;
+        if n < min {
+            return Err(fail(format!("too few arguments (need at least {min})")));
+        }
+        if max != -1 && n > max {
+            return Err(fail(format!("too many arguments (need at most {max})")));
+        }
+    }
     Ok(vec![out.join(" ")])
 }
 
@@ -1249,7 +1259,8 @@ impl Server {
         }
         // cmdq_add_message: commands from clients go in the message log (show-messages)
         if let Some(c) = ctx.client.or(ctx.reply).and_then(|c| self.clients.get(&c)) {
-            let words = std::iter::once(full.to_string()).chain(args.iter().cloned()).map(|a| (a, false)).collect();
+            let words = std::iter::once(full.to_string()).chain(args.iter().cloned())
+                .map(|a| match a.strip_prefix(cmdparse::BLOCK_MARK) { Some(b) => (b.to_string(), true), None => (a, false) }).collect();
             let printed = print_parsed_command(words, &[], false).ok().and_then(|v| v.into_iter().next())
                 .unwrap_or_else(|| std::iter::once(full).chain(args.iter().map(String::as_str)).collect::<Vec<_>>().join(" "));
             let msg = format!("{} command: {printed}", c.name());
@@ -3042,14 +3053,22 @@ impl Server {
                 let key = args.remove(0);
                 let kname = keys::parse_key_name(&key).map(|k| keys::key_name(&k)).unwrap_or(key.clone());
                 let table = if o.has('n') { "root".to_string() } else { o.get('T').unwrap_or("prefix").to_string() };
-                // separate arguments: ";" separates commands and "{" "}" delimit blocks, as
-                // cmd_parse_from_arguments treats them
-                let command = if args.len() == 1 { args[0].clone() } else {
-                    args.iter().map(|a| match a.as_str() { ";" => "\\;".into(), "{" | "}" => a.clone(), _ => cmdparse::quote(a) }).collect::<Vec<_>>().join(" ")
+                // separate arguments: ";" separates commands as cmd_parse_from_arguments
+                // does ("{" and "}" are plain strings there); { } blocks of a parsed
+                // command come marked and stay blocks
+                let block = |a: &str| a.strip_prefix(cmdparse::BLOCK_MARK).map(str::to_string);
+                let command = if args.len() == 1 { block(&args[0]).unwrap_or_else(|| args[0].clone()) } else {
+                    args.iter().map(|a| match a.as_str() {
+                        ";" => "\\;".into(),
+                        _ => block(a).map_or_else(|| cmdparse::quote(a), |b| format!("{{ {b} }}")),
+                    }).collect::<Vec<_>>().join(" ")
                 };
                 if command.is_empty() {
                     return err("bind-key needs a command");
                 }
+                // the command is parsed when it is bound (cmd_parse_from_*): unknown
+                // commands, flags and argument counts are errors here
+                command_list_string(&command, &self.command_aliases())?;
                 self.bindings.entry(table).or_default().insert(kname, Binding { cmd: command, repeat: o.has('r'), note: o.get('N').unwrap_or("").to_string() });
                 Ok(Flow::Next)
             }

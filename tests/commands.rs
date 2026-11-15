@@ -1187,12 +1187,21 @@ fn display_all_samples_and_printed_commands() {
     // list-keys and show-hooks print commands as tmux does
     ctx.ok(&["bind", "x", "display", "hi;there"]);
     ctx.ok(&["bind", "y", "display a ; display b"]);
-    ctx.ok(&["bind", "z", "if", "-F", "1", "{", "display", "a", "}", "{", "display", "b", "}"]);
+    // blocks of a parsed command stay blocks; "{" and "}" arguments are plain strings,
+    // and the command is checked when it is bound
+    ctx.ok(&["if", "-F", "1", "bind z if -F 1 { display a } { display b ; display c }"]);
+    assert_eq!(ctx.fails(&["bind", "v", "if", "-F", "1", "{", "display", "a", "}"]).trim(), "command if-shell: too many arguments (need at most 3)");
+    assert_eq!(ctx.fails(&["bind", "v", "nosuchcmd"]).trim(), "unknown command: nosuchcmd");
+    assert_eq!(ctx.fails(&["bind", "v", "splitw -Q"]).trim(), "command split-window: unknown flag -Q");
+    assert_eq!(ctx.fails(&["bind", "v", "kill-session", "-t", "x", "y"]).trim(), "command kill-session: too many arguments (need at most 0)");
+    assert!(ctx.fails(&["list-keys", "-T", "prefix", "v"]).contains("unknown key: v"));
+    ctx.ok(&["if", "-F", "1", "bind -n F3 { display x ; display y }"]);
+    assert_eq!(ctx.ok(&["list-keys", "-T", "root", "F3"]).trim_end(), "bind-key  -T root F3 display-message x \\; display-message y");
     ctx.ok(&["bind", "w", "send-keys", "-X", "copy-pipe", "cat >/dev/null"]);
     let keys = |k: &str| ctx.ok(&["list-keys", "-T", "prefix", k]).trim_end().to_string();
     assert_eq!(keys("x"), "bind-key  -T prefix x display-message \"hi;there\"");
     assert_eq!(keys("y"), "bind-key  -T prefix y display-message a \\; display-message b");
-    assert_eq!(keys("z"), "bind-key  -T prefix z if-shell -F 1 { display-message a } { display-message b }");
+    assert_eq!(keys("z"), "bind-key  -T prefix z if-shell -F 1 { display-message a } { display-message b ; display-message c }");
     assert_eq!(keys("w"), "bind-key  -T prefix w send-keys -X copy-pipe \"cat >/dev/null\"");
     assert_eq!(keys("$"), "bind-key  -T prefix \\$ command-prompt -I \"#S\" { rename-session \"%%\" }");
     assert_eq!(ctx.ok(&["list-keys", "-T", "prefix", "-F", "#{key_command}", "y"]).trim_end(), "display-message a \\; display-message b");

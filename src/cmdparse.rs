@@ -35,8 +35,20 @@ pub fn parse_with_env(input: &str, cond: &dyn Fn(&str) -> bool, env: &dyn Fn(&st
         assigned: std::collections::HashMap::new(),
         braces: Vec::new(),
     };
-    lx.run(cond)
+    let mut cmds = lx.run(cond)?;
+    // bind-key keeps its { } blocks as blocks (list-keys prints them so): they reach
+    // it with a mark in front
+    for (c, w) in lx.braces {
+        if matches!(cmds[c][0].as_str(), "bind-key" | "bind") {
+            cmds[c][w].insert_str(0, BLOCK_MARK);
+        }
+    }
+    Ok(cmds)
 }
+
+/// Put in front of a `{ ... }` block argument of bind-key by [`parse_with_env`]
+/// (never typed: it starts with NUL).
+pub const BLOCK_MARK: &str = "\0{";
 
 /// Like [`parse`], but each argument also says whether it was a `{ ... }`
 /// block (its text is then the block's body), as tmux keeps command blocks
@@ -902,13 +914,15 @@ mod tests {
     fn braces() {
         assert_eq!(
             p("bind x { split-window; select-pane -L }"),
-            vec![v(&["bind", "x", "split-window; select-pane -L"])]
+            vec![v(&["bind", "x", "\0{split-window; select-pane -L"])]
         );
+        // only bind-key's blocks are marked
+        assert_eq!(p("unbind x { y }"), vec![v(&["unbind", "x", "y"])]);
         let cmds = p("bind x {\n  split-window -h # comment }\n  select-pane -L\n}\nnext");
         assert_eq!(
             cmds,
             vec![
-                v(&["bind", "x", "split-window -h\n  select-pane -L"]),
+                v(&["bind", "x", "\0{split-window -h\n  select-pane -L"]),
                 v(&["next"])
             ]
         );
