@@ -2624,9 +2624,12 @@ impl Server {
                 let (w, h) = Menu::box_size(&title, &items);
                 let Some((x, y)) = self.overlay_position(cid, tt, ctx.mouse.as_ref(), o.get('x'), o.get('y'), w, h) else { return Ok(Flow::Next) };
                 let nomouse = ctx.mouse.is_none() && !o.has('M');
-                let menu = Menu::at(title, items, x, y, tt.pane, nomouse, o.has('O'), start);
-                let epoch = self.replace_overlay(cid, Some(Overlay::Menu(menu)))?;
-                Ok(Flow::WaitOverlay(cid, epoch))
+                let mut menu = Menu::at(title, items, x, y, tt.pane, nomouse, o.has('O'), start);
+                menu.lines = border_lines_flag(o.get('b'), "menu-border-lines")?;
+                menu.styles = [o.get('s'), o.get('S'), o.get('H')].map(|v| v.map(str::to_string));
+                // tmux 3.8 no longer waits for the menu to close (3.6 did)
+                self.replace_overlay(cid, Some(Overlay::Menu(menu)))?;
+                Ok(Flow::Next)
             }
             "display-popup" => {
                 let cid = self.resolve_client(ctx, o.get('c'))?;
@@ -2654,13 +2657,14 @@ impl Server {
                 let h = dim(o.get('h'), ch).clamp(3, ch);
                 let x = o.get('x').and_then(|v| v.parse().ok()).unwrap_or(((cw - 1) / 2).saturating_sub(w / 2)).min(cw - w);
                 let y = o.get('y').and_then(|v| v.parse().ok()).unwrap_or(((ch - 1) / 2).saturating_sub(h / 2)).min(ch - h);
-                let border = !o.has('B') && self.opt_window(self.current(ctx).wid, "popup-border-lines") != "none";
+                let lines = border_lines_flag(o.get('b'), "popup-border-lines")?;
+                let border = !o.has('B') && lines.clone().unwrap_or_else(|| self.opt_window(self.current(ctx).wid, "popup-border-lines")) != "none";
                 let (iw, ih) = if border { (w - 2, h - 2) } else { (w, h) };
                 let tt = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
                 let cwd = o.get('d').map(|d| self.expand(tt, Some(cid), d)).or_else(|| tt.pane.and_then(|p| self.panes.get(&p)).map(|p| p.current_path.clone()));
                 let pane = self.spawn_pane(tt.sid, iw.max(1), ih.max(1), &o.rest, cwd.as_deref(), &env)?;
                 let title = o.get('T').map(|s| self.expand(tt, Some(cid), s)).unwrap_or_default();
-                let epoch = self.replace_overlay(cid, Some(Overlay::Popup(Popup { pane, x, y, w, h, border, close_on_exit: o.has('E'), title })))?;
+                let epoch = self.replace_overlay(cid, Some(Overlay::Popup(Popup { pane, x, y, w, h, border, close_on_exit: o.has('E'), title, lines, styles: [o.get('s'), o.get('S')].map(|v| v.map(str::to_string)) })))?;
                 Ok(Flow::WaitOverlay(cid, epoch))
             }
             // ---------------------------------------------------------------- prompts & messages
@@ -2740,7 +2744,7 @@ impl Server {
                     None => "[#{session_name}] #{window_index}:#{window_name}, current pane #{pane_index} - (%H:%M %d-%b-%y)",
                 };
                 // -l: literal, -j: JSON printed back in tmux's form; -C (keep updating the
-                // pane) and -N (ignore keys) are how messages behave here anyway
+                // pane) is how messages behave here anyway; -N: keys don't clear it
                 let msg = if o.has('l') { fmt.to_string() } else { self.expand_time(tt, cid, fmt) };
                 let msg = if o.has('j') { json::normalize(&msg)? } else { msg };
                 let attached_client = cid.filter(|c| self.clients.get(c).is_some_and(|c| c.attached));
@@ -2749,14 +2753,8 @@ impl Server {
                     ctx.out.push('\n');
                 } else {
                     let c = attached_client.unwrap();
-                    self.set_message(c, &msg);
-                    if let Some(ms) = o.get('d').and_then(|v| v.parse::<u64>().ok()) {
-                        if let Some(cl) = self.clients.get_mut(&c) {
-                            if let Some(m) = &mut cl.message {
-                                m.1 = Instant::now() + Duration::from_millis(if ms == 0 { 86_400_000 } else { ms });
-                            }
-                        }
-                    }
+                    let delay = o.get('d').and_then(|v| v.parse::<u64>().ok());
+                    self.set_message_for(c, &msg, delay, o.has('N'));
                 }
                 Ok(Flow::Next)
             }
@@ -3986,7 +3984,7 @@ impl Server {
         let input: Vec<char> = init.chars().collect();
         let cursor = input.len();
         if let Some(c) = self.clients.get_mut(&cid) {
-            c.prompt = Some(Prompt { vi_command: false, copied: Vec::new(), kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false, confirm: ('y', false) });
+            c.prompt = Some(Prompt { vi_command: false, quote_next: false, copied: Vec::new(), kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false, confirm: ('y', false) });
             c.dirty = true;
         }
     }
@@ -4018,6 +4016,16 @@ pub fn base64(data: &[u8]) -> String {
         }
     }
     out
+}
+
+/// display-menu/display-popup -b: one of the border lines choices, checked like
+/// the option it stands in for.
+fn border_lines_flag(value: Option<&str>, option: &str) -> Result<Option<String>, String> {
+    match value {
+        None => Ok(None),
+        Some(v) if ["single", "double", "heavy", "simple", "rounded", "padded", "none"].contains(&v) => Ok(Some(v.to_string())),
+        Some(v) => Err(format!("{option} unknown value: {v}")),
+    }
 }
 
 pub fn buffer_vars(b: &Buffer) -> HashMap<String, String> {

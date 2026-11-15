@@ -571,3 +571,59 @@ fn display_auto_hide_scrollbar_shows_only_when_scrolling_and_draws_pad() {
     ctx.ok(&["setw", "-t", "s", "pane-scrollbars", "on"]);
     wait_for("default width", || ctx.fmt("s", "#{pane_width}") == "99" && bg(20, 99) != vt100::Color::Default);
 }
+
+#[test]
+fn display_message_keys_prompt_words_and_menu_flags() {
+    let ctx = Ctx::new("display-keys");
+    let t = start(&ctx, "s");
+    let cursor = || t.screen.lock().unwrap().screen().cursor_position();
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    // display-time 0: the message stays until a key, which is then handled
+    ctx.ok(&["set", "-t", "s", "display-time", "0"]);
+    ctx.ok(&["display-message", "-c", &client, "zero-time"]);
+    wait_for("message", || t.row(29).starts_with("zero-time"));
+    std::thread::sleep(Duration::from_millis(900));
+    assert!(t.row(29).starts_with("zero-time"));
+    t.send(b"echo keyed-1");
+    wait_for("key clears message and reaches the pane", || !t.row(29).starts_with("zero-time") && ctx.capture("s").contains("keyed-1"));
+    t.send(b"\x15");
+    // -N with a timer: keys are ignored while it shows
+    ctx.ok(&["display-message", "-c", &client, "-N", "-d", "3000", "ignoring"]);
+    wait_for("-N message", || t.row(29).starts_with("ignoring"));
+    t.send(b"echo dropped-2");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(t.row(29).starts_with("ignoring"));
+    assert!(!ctx.capture("s").contains("dropped-2"));
+    wait_for("-N message times out", || !t.row(29).starts_with("ignoring"));
+    // vi words: separators are words of their own; j is history down (empty)
+    ctx.ok(&["set", "-t", "s", "status-keys", "vi"]);
+    t.prefix(b":");
+    t.send(b"set foo-bar.baz qux");
+    std::thread::sleep(Duration::from_millis(100));
+    t.send(b"\x1b");
+    t.send(b"0w");
+    wait_for("w to the word", || cursor() == (29, 5));
+    t.send(b"w");
+    wait_for("w stops at a separator", || cursor() == (29, 8));
+    t.send(b"e");
+    wait_for("e to the end of bar", || cursor() == (29, 11));
+    t.send(b"j");
+    wait_for("j empties the line", || t.row(29).trim_end() == ":");
+    t.send(b"q");
+    // emacs: C-v quotes the next key, M-f stops at a separator
+    ctx.ok(&["set", "-t", "s", "status-keys", "emacs"]);
+    t.prefix(b":");
+    t.send(b"ab-cd\x01\x1bf");
+    wait_for("M-f to the end of ab", || cursor() == (29, 3));
+    t.send(b"\x05\x16\x01");
+    wait_for("quoted C-a", || t.row(29).starts_with(":ab-cd^A"));
+    t.send(b"\x03");
+    // display-menu -b and -S override the options
+    ctx.ok(&["display-menu", "-c", &client, "-b", "double", "-S", "fg=red", "-x", "0", "-y", "10", "Item", "i", ""]);
+    t.wait_screen("double menu", |s| s.contains('╔') && s.contains("Item"));
+    let top = t.contents().lines().position(|l| l.contains('╔')).unwrap() as u16;
+    assert_eq!(t.screen.lock().unwrap().screen().cell(top, 0).unwrap().fgcolor(), vt100::Color::Idx(1));
+    t.send(b"\x1b");
+    wait_for("menu closed", || !t.contents().contains('╔'));
+    assert!(ctx.command().args(["display-menu", "-b", "bad", "Item", "i", ""]).output().unwrap().stderr.starts_with(b"menu-border-lines unknown value: bad"));
+}

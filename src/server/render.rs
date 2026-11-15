@@ -161,6 +161,15 @@ fn prompt_char(ch: char) -> (String, usize) {
     }
 }
 
+/// A menu or popup -s/-S/-H style: parsed over the option's style, only its
+/// colours are taken (menu_reapply_styles, popup_reapply_styles).
+fn flag_colours(base: Style, flag: &Option<String>) -> Style {
+    match flag.as_deref().map(|v| format::parse_style(v, base)) {
+        Some(Ok(sy)) => Style { fg: sy.fg, bg: sy.bg, ..base },
+        _ => base,
+    }
+}
+
 fn message_area(width: u16, style: &str) -> (u16, u16) {
     let mut w = width;
     let mut align = "left";
@@ -511,7 +520,8 @@ impl Server {
                     Some((lines, Some((cur.1, cur.0))))
                 }
                 Some(PaneMode::Tree(t)) => Some((t.render(self, cr.w, cr.h), None)),
-                Some(PaneMode::Clock) => Some((Vec::new(), None)),
+                // the clock's screen is cleared before the time is drawn
+                Some(PaneMode::Clock) => Some((vec![Line { cells: vec![Cell { text: " ".into(), style: Style::default() }; cr.w as usize], wrapped: false }; cr.h as usize], None)),
                 None => None,
             };
             match &mode_lines {
@@ -543,8 +553,10 @@ impl Server {
                 let colour = self.style_option(&format!("fg={}", self.opt_window(Some(wid), "clock-mode-colour")), Style::default(), pane_target, Some(cid)).unwrap_or_default().fg;
                 let text = clock_text(&self.opt_window(Some(wid), "clock-mode-style"));
                 let rr = Rect { y: oy + cr.y, h: cr.h.saturating_sub(1), ..cr };
-                if cr.h < 6 || !big_text(&mut f, rr, &text, colour) {
-                    f.text(cr.x, oy + cr.y + cr.h / 2, &text, Style { fg: colour, ..Style::default() }, cr.x + cr.w);
+                // too small for the big digits: the plain text, centred, if it fits
+                let len = text.chars().count() as u16;
+                if (cr.h < 6 || !big_text(&mut f, rr, &text, colour)) && cr.w >= len && cr.h > 0 {
+                    f.text(cr.x + cr.w / 2 - len / 2, oy + cr.y + cr.h / 2, &text, Style { fg: colour, ..Style::default() }, cr.x + cr.w);
                 }
             }
             if is_active {
@@ -714,22 +726,25 @@ impl Server {
                     let ost = |name: &str, base: Style| self.style_option(&self.opt_window(Some(wid), name), base, active_target, Some(cid)).unwrap_or(base);
                     let st = ost("popup-style", Style::default());
                     let bst = ost("popup-border-style", Style::default());
-                    let st = ost("menu-style", st);
-                    let bst = ost("menu-border-style", bst);
-                    let selected = ost("menu-selected-style", Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() });
-                    m.draw(&mut f, st, bst, selected, &self.opt_window(Some(wid), "menu-border-lines"));
+                    let st = flag_colours(ost("menu-style", st), &m.styles[0]);
+                    let bst = flag_colours(ost("menu-border-style", bst), &m.styles[1]);
+                    let selected = flag_colours(ost("menu-selected-style", Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() }), &m.styles[2]);
+                    let lines = m.lines.clone().unwrap_or_else(|| self.opt_window(Some(wid), "menu-border-lines"));
+                    m.draw(&mut f, st, bst, selected, &lines);
                     cursor = None;
                 }
                 Overlay::Popup(pp) => {
                     let st = self.style_option(&self.opt_window(Some(wid), "popup-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
                     let bst = self.style_option(&self.opt_window(Some(wid), "popup-border-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
+                    let (st, bst) = (flag_colours(st, &pp.styles[0]), flag_colours(bst, &pp.styles[1]));
                     for y in pp.y..pp.y + pp.h {
                         for x in pp.x..pp.x + pp.w {
                             f.set(x, y, Cell { text: " ".into(), style: st });
                         }
                     }
                     if pp.border {
-                        draw_box_lines(&mut f, pp.x, pp.y, pp.w, pp.h, bst, &pp.title, &self.opt_window(Some(wid), "popup-border-lines"));
+                        let lines = pp.lines.clone().unwrap_or_else(|| self.opt_window(Some(wid), "popup-border-lines"));
+                        draw_box_lines(&mut f, pp.x, pp.y, pp.w, pp.h, bst, &pp.title, &lines);
                     }
                     let (ix, iy, iw, ih) = pp.inner();
                     cursor = None;
@@ -824,8 +839,12 @@ impl Server {
                 f.put_cells(content_x as u16, my, &format::layout_line(&spans, label_width, sy));
             }
             // input from offset, control characters as ^X
+            // and a '^' at the cursor while C-v waits for the key to quote
             let (mut width, mut x) = (0, content_x + label_width);
-            for ch in &pr.input {
+            let quote = pr.quote_next.then_some(pr.cursor.min(pr.input.len()));
+            let mut shown: Vec<char> = pr.input.clone();
+            if let Some(at) = quote { shown.insert(at, '^'); }
+            for ch in &shown {
                 let (text, w) = prompt_char(*ch);
                 if width < offset { width += w; continue; }
                 if width + w > offset + input_width { break; }

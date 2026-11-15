@@ -415,6 +415,11 @@ pub struct Menu {
     pub nomouse: bool,
     /// -O: releasing the button does not close the menu (MENU_STAYOPEN).
     pub stayopen: bool,
+    /// display-menu -b: border lines instead of menu-border-lines.
+    pub lines: Option<String>,
+    /// display-menu -s, -S and -H: their fg and bg replace those of menu-style,
+    /// menu-border-style and menu-selected-style.
+    pub styles: [Option<String>; 3],
 }
 
 pub enum MenuAction {
@@ -456,7 +461,7 @@ impl Menu {
                 }
             })
         };
-        Menu { title, items, sel, x, y, w, h, pane, nomouse, stayopen }
+        Menu { title, items, sel, x, y, w, h, pane, nomouse, stayopen, lines: None, styles: [None, None, None] }
     }
 
     /// Run the selected item (tmux menu_key_cb "chosen").
@@ -495,7 +500,7 @@ impl Menu {
         let mx = pos(x, cw, w, mouse.map(|m| m.0));
         let my = if y == Some("C") { ((ch.saturating_sub(1)) / 2).saturating_sub(h.div_ceil(2)) } else { pos(y, ch, h, mouse.map(|m| m.1)) };
         let sel = items.iter().position(|i| !i.cmd.is_empty());
-        Menu { title, items, sel, x: mx, y: my, w, h, pane, nomouse: true, stayopen: false }
+        Menu { title, items, sel, x: mx, y: my, w, h, pane, nomouse: true, stayopen: false, lines: None, styles: [None, None, None] }
     }
 
     fn step(&mut self, dir: isize) {
@@ -576,6 +581,11 @@ pub struct Popup {
     pub border: bool,
     pub close_on_exit: bool,
     pub title: String,
+    /// display-popup -b: border lines instead of popup-border-lines.
+    pub lines: Option<String>,
+    /// display-popup -s and -S: their fg and bg replace those of popup-style and
+    /// popup-border-style.
+    pub styles: [Option<String>; 2],
 }
 
 impl Popup {
@@ -642,8 +652,9 @@ fn clock_text_at(style: &str, now: chrono::DateTime<chrono::Local>) -> String {
     if style.starts_with("24") {
         format!("{:02}:{:02}{seconds}", now.hour(), now.minute())
     } else {
+        // strftime "%l:%M " (or "%l:%M:%S ") then AM or PM
         let (pm, h) = now.hour12();
-        format!("{h}:{:02}{seconds}{}", now.minute(), if pm { "PM" } else { "AM" })
+        format!("{h:>2}:{:02}{seconds} {}", now.minute(), if pm { "PM" } else { "AM" })
     }
 }
 
@@ -654,7 +665,7 @@ mod clock_display_tests {
     #[test]
     fn clock_seconds_and_monochrome() {
         let now = chrono::Local.with_ymd_and_hms(2026, 11, 13, 13, 2, 3).unwrap();
-        for (style, text) in [("12", "1:02PM"), ("24", "13:02"), ("12-with-seconds", "1:02:03PM"), ("24-with-seconds", "13:02:03")] {
+        for (style, text) in [("12", " 1:02 PM"), ("24", "13:02"), ("12-with-seconds", " 1:02:03 PM"), ("24-with-seconds", "13:02:03")] {
             assert_eq!(clock_text_at(style, now), text);
         }
         let mut f = super::super::render::Frame::new(80, 10);

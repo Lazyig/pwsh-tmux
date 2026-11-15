@@ -37,6 +37,8 @@ use std::time::{Duration, Instant, SystemTime};
 /// Largest window/client dimension accepted. tmux allows 10000, but vt100 allocates
 /// every cell up front, so a smaller bound keeps a hostile size from exhausting memory.
 pub const MAX_SIZE: u16 = 1000;
+/// A message without a timer (delay 0) stays until a key press.
+pub const MESSAGE_FOREVER: Duration = Duration::from_secs(86_400 * 365);
 
 pub type PaneId = u32;
 pub type WinId = u32;
@@ -507,6 +509,8 @@ pub enum PromptKind {
 
 pub struct Prompt {
     pub vi_command: bool,
+    /// C-v: the next key is inserted as it is
+    pub quote_next: bool,
     pub copied: Vec<char>,
     pub kind: PromptKind,
     pub prompts: Vec<(String, String)>,
@@ -579,6 +583,8 @@ pub struct Client {
     pub overlay: Option<Overlay>,
     pub overlay_epoch: u64,
     pub message: Option<(String, Instant)>,
+    /// display-message -N: keys do not clear the message (only with a timer)
+    pub message_ignore_keys: bool,
     pub prev: Option<RenderState>,
     pub dirty: bool,
     pub last_session: Option<SessId>,
@@ -1071,10 +1077,21 @@ impl Server {
     }
 
     pub fn set_message(&mut self, cid: ClientId, msg: &str) {
-        let ms = self.client_session(cid).map(|s| self.opt_session_num(Some(s), "display-time")).unwrap_or(750).max(1) as u64;
+        self.set_message_for(cid, msg, None, false);
+    }
+
+    /// tmux status_message_set: `delay` None uses display-time; zero waits for a
+    /// key press (which clears any message unless `ignore_keys` and a timer is set).
+    pub fn set_message_for(&mut self, cid: ClientId, msg: &str, delay: Option<u64>, ignore_keys: bool) {
+        let ms = delay.unwrap_or_else(|| self.client_session(cid).map(|s| self.opt_session_num(Some(s), "display-time")).unwrap_or(750).max(0) as u64);
         self.add_message(msg);
         if let Some(c) = self.clients.get_mut(&cid) {
-            c.message = Some((msg.to_string(), Instant::now() + Duration::from_millis(ms)));
+            let until = if ms == 0 { MESSAGE_FOREVER } else { Duration::from_millis(ms) };
+            c.message = Some((msg.to_string(), Instant::now() + until));
+            // as tmux, a message without a timer keeps the previous setting
+            if ms != 0 {
+                c.message_ignore_keys = ignore_keys;
+            }
             c.dirty = true;
         }
     }
@@ -1208,6 +1225,7 @@ impl Server {
                 overlay: None,
                 overlay_epoch: 0,
                 message: None,
+                message_ignore_keys: false,
                 prev: None,
                 dirty: false,
                 last_session: None,
@@ -1514,7 +1532,8 @@ impl Server {
                 if !fmt.is_empty() {
                     let cells = crate::format::layout_line(&crate::format::spans(&msg, Default::default()), p.size.0 as usize, Default::default());
                     let line = render::line_with_escapes(&Line { cells, wrapped: false });
-                    p.parser.process(format!("\x1b[r\x1b[{};1H\r\n\x1b[0m{line}", p.size.1).as_bytes());
+                    // format_draw leaves the cursor where it started, at the line's start
+                    p.parser.process(format!("\x1b[r\x1b[{};1H\r\n\x1b[0m{line}\x1b[0m\r", p.size.1).as_bytes());
                 }
                 p.parser.process(b"\x1b[?25l");
             }

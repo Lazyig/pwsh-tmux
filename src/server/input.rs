@@ -202,6 +202,14 @@ impl Server {
         let name = keys::key_name(&k);
         let Some(c) = self.clients.get(&cid) else { return };
         if c.is_readonly() && (c.prompt.is_some() || c.overlay.is_some()) { return; }
+        // a key clears a message (and is then handled), unless display -N
+        if c.message.is_some() && !c.is_readonly() {
+            if c.message_ignore_keys { return; }
+            let c = self.clients.get_mut(&cid).unwrap();
+            c.message = None;
+            c.dirty = true;
+        }
+        let c = &self.clients[&cid];
         if c.prompt.is_some() {
             self.prompt_key(cid, &k, &name);
             return;
@@ -520,7 +528,9 @@ impl Server {
 
     fn prompt_key(&mut self, cid: ClientId, k: &Key, name: &str) {
         let vi = self.opt_session(self.client_session(cid), "status-keys") == "vi";
-        let paste = self.buffers.last().map(|b| String::from_utf8_lossy(&b.data).into_owned()).unwrap_or_default();
+        let seps: Vec<char> = self.opt_session(self.client_session(cid), "word-separators").chars().collect();
+        // C-y without a C-w text inserts the top buffer up to a control character
+        let paste = self.buffers.iter().find(|b| b.automatic).map(|b| String::from_utf8_lossy(&b.data).into_owned()).unwrap_or_default();
         let hist_len = self.prompt_history.len();
         let c = self.clients.get_mut(&cid).unwrap();
         c.dirty = true;
@@ -544,62 +554,30 @@ impl Server {
             }
             PromptKind::Command => {}
         }
-        if vi && !pr.single_key {
-            if k.code == KeyCode::Escape {
-                if !pr.vi_command { pr.cursor = pr.cursor.saturating_sub(1); }
-                pr.vi_command = true;
-                return;
+        // tmux prompt_key: a quoted key (C-v) is inserted as its character
+        if pr.quote_next {
+            pr.quote_next = false;
+            let ch = match &k.code {
+                KeyCode::BSpace => Some('\x7f'),
+                KeyCode::Char(ch) if k.mods.ctrl => Some(((*ch as u8) & 0x1f) as char),
+                KeyCode::Char(ch) if !k.mods.meta => Some(*ch),
+                KeyCode::Space => Some(' '),
+                KeyCode::Tab => Some('\t'),
+                KeyCode::Enter => Some('\r'),
+                KeyCode::Escape => Some('\x1b'),
+                _ => None,
+            };
+            if let Some(ch) = ch {
+                pr.input.insert(pr.cursor, ch);
+                pr.cursor += 1;
             }
-            if pr.vi_command {
-                let mapped = match name {
-                    "i" => { pr.vi_command = false; return; }
-                    "a" => { pr.vi_command = false; pr.cursor = (pr.cursor + 1).min(pr.input.len()); return; }
-                    "I" | "S" => {
-                        pr.vi_command = false; pr.cursor = 0;
-                        if name == "S" { pr.input.clear(); }
-                        return;
-                    }
-                    "A" => { pr.vi_command = false; pr.cursor = pr.input.len(); return; }
-                    "s" => { pr.vi_command = false; if pr.cursor < pr.input.len() { pr.input.remove(pr.cursor); } return; }
-                    "D" | "C" => { pr.input.truncate(pr.cursor); if name == "C" { pr.vi_command = false; } return; }
-                    "e" | "E" => {
-                        pr.cursor = (pr.cursor + 1).min(pr.input.len());
-                        while pr.cursor < pr.input.len() && pr.input[pr.cursor].is_whitespace() { pr.cursor += 1; }
-                        while pr.cursor + 1 < pr.input.len() && !pr.input[pr.cursor + 1].is_whitespace() { pr.cursor += 1; }
-                        return;
-                    }
-                    "w" | "W" => {
-                        while pr.cursor < pr.input.len() && !pr.input[pr.cursor].is_whitespace() { pr.cursor += 1; }
-                        while pr.cursor < pr.input.len() && pr.input[pr.cursor].is_whitespace() { pr.cursor += 1; }
-                        return;
-                    }
-                    "b" | "B" => {
-                        pr.cursor = pr.cursor.saturating_sub(1);
-                        while pr.cursor > 0 && pr.input[pr.cursor].is_whitespace() { pr.cursor -= 1; }
-                        while pr.cursor > 0 && !pr.input[pr.cursor - 1].is_whitespace() { pr.cursor -= 1; }
-                        return;
-                    }
-                    "h" => "Left", "l" => "Right", "j" => "Down", "k" => "Up",
-                    "0" | "^" => "Home", "$" => "End", "x" => "DC", "X" => "BSpace",
-                    "BSpace" => "Left", "DC" => "DC", "Left" => "Left", "Right" => "Right", "Up" => "Up", "Down" => "Down",
-                    "d" => "C-u", "p" => "C-y", "q" => "C-c",
-                    "Enter" => "Enter", "C-c" => "C-c", "C-h" => "C-h",
-                    _ => return,
-                };
-                if let Some(key) = keys::parse_key_name(mapped) {
-                    // Reuse the emacs editing operations, then restore command mode.
-                    pr.vi_command = false;
-                    self.prompt_key(cid, &key, mapped);
-                    if let Some(pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
-                        pr.vi_command = true;
-                    }
-                }
-                return;
-            }
+            return;
         }
-        let ctrl = |ch: char| k.mods.ctrl && k.code == KeyCode::Char(ch);
-        match &k.code {
-            KeyCode::Enter => {
+        let op = if vi && !pr.single_key { prompt_vi_op(pr, k) } else { prompt_emacs_op(k) };
+        let n = pr.input.len();
+        match op {
+            PromptOp::None => {}
+            PromptOp::Enter => {
                 let mut pr = c.prompt.take().unwrap();
                 if let Some((pane, _)) = incremental {
                     if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
@@ -631,103 +609,75 @@ impl Server {
                 let cmd = fill_template(&pr.template, &pr.answers);
                 self.run_string(cid, &cmd, pr.pane);
             }
-            KeyCode::Escape => {
-                c.prompt = None;
-            }
-            _ if ctrl('c') || ctrl('g') => {
-                c.prompt = None;
-            }
-            KeyCode::BSpace | KeyCode::Char('h') if pr.bspace_exit && pr.input.is_empty() && (k.code == KeyCode::BSpace || ctrl('h')) => {
-                c.prompt = None;
-            }
-            KeyCode::BSpace => {
+            PromptOp::Cancel => c.prompt = None,
+            PromptOp::BSpace if pr.bspace_exit && n == 0 => c.prompt = None,
+            PromptOp::BSpace => {
                 if pr.cursor > 0 {
                     pr.cursor -= 1;
                     pr.input.remove(pr.cursor);
                 }
             }
-            _ if ctrl('h') => {
-                if pr.cursor > 0 {
-                    pr.cursor -= 1;
+            PromptOp::Delete => {
+                if pr.cursor < n {
                     pr.input.remove(pr.cursor);
                 }
             }
-            KeyCode::Delete => {
-                if pr.cursor < pr.input.len() {
-                    pr.input.remove(pr.cursor);
-                }
-            }
-            _ if ctrl('d') => {
-                if pr.cursor < pr.input.len() {
-                    pr.input.remove(pr.cursor);
-                }
-            }
-            KeyCode::Left => pr.cursor = pr.cursor.saturating_sub(1),
-            _ if ctrl('b') => pr.cursor = pr.cursor.saturating_sub(1),
-            KeyCode::Right => pr.cursor = (pr.cursor + 1).min(pr.input.len()),
-            _ if ctrl('f') => pr.cursor = (pr.cursor + 1).min(pr.input.len()),
-            KeyCode::Home => pr.cursor = 0,
-            _ if ctrl('a') => pr.cursor = 0,
-            KeyCode::End => pr.cursor = pr.input.len(),
-            _ if ctrl('e') => pr.cursor = pr.input.len(),
-            _ if ctrl('k') => { pr.copied = pr.input[pr.cursor..].to_vec(); pr.input.truncate(pr.cursor); }
-            _ if ctrl('y') => {
-                let value: Vec<_> = if pr.copied.is_empty() { paste.chars().take_while(|c| !c.is_control()).collect() } else { pr.copied.clone() };
-                let n = value.len(); pr.input.splice(pr.cursor..pr.cursor, value); pr.cursor += n;
-            }
-            _ if ctrl('t') => {
-                if pr.cursor > 0 && pr.input.len() > 1 {
-                    let at = pr.cursor.min(pr.input.len() - 1); pr.input.swap(at - 1, at); pr.cursor = (at + 1).min(pr.input.len());
-                }
-            }
-            _ if k.mods.meta && matches!(k.code, KeyCode::Char('b') | KeyCode::BSpace) => {
-                let old = pr.cursor;
-                while pr.cursor > 0 && pr.input[pr.cursor - 1].is_whitespace() { pr.cursor -= 1; }
-                while pr.cursor > 0 && !pr.input[pr.cursor - 1].is_whitespace() { pr.cursor -= 1; }
-                if k.code == KeyCode::BSpace { pr.copied = pr.input.drain(pr.cursor..old).collect(); }
-            }
-            _ if k.mods.meta && matches!(k.code, KeyCode::Char('f' | 'd')) => {
-                let old = pr.cursor;
-                while pr.cursor < pr.input.len() && pr.input[pr.cursor].is_whitespace() { pr.cursor += 1; }
-                while pr.cursor < pr.input.len() && !pr.input[pr.cursor].is_whitespace() { pr.cursor += 1; }
-                if k.code == KeyCode::Char('d') { pr.copied = pr.input.drain(old..pr.cursor).collect(); pr.cursor = old; }
-            }
-            _ if ctrl('u') => {
-                pr.copied = std::mem::take(&mut pr.input);
+            PromptOp::Left => pr.cursor = pr.cursor.saturating_sub(1),
+            PromptOp::Right => pr.cursor = (pr.cursor + 1).min(n),
+            PromptOp::Home => pr.cursor = 0,
+            PromptOp::End => pr.cursor = n,
+            // C-u and C-k don't fill the C-y buffer in tmux; only C-w does
+            PromptOp::ClearLine => {
+                pr.input.clear();
                 pr.cursor = 0;
             }
-            _ if ctrl('w') => {
-                let mut i = pr.cursor;
-                while i > 0 && pr.input[i - 1] == ' ' {
-                    i -= 1;
-                }
-                while i > 0 && pr.input[i - 1] != ' ' {
-                    i -= 1;
-                }
+            PromptOp::KillLine => pr.input.truncate(pr.cursor),
+            PromptOp::DeleteWord => {
+                let i = prompt_backward_word(&pr.input, pr.cursor, &seps);
                 pr.copied = pr.input.drain(i..pr.cursor).collect();
                 pr.cursor = i;
             }
-            _ if k.code == KeyCode::Up || ctrl('p') => {
-                if hist_len > 0 {
+            PromptOp::ForwardWord => pr.cursor = prompt_forward_word(&pr.input, pr.cursor, false, &seps),
+            PromptOp::ViForward(big) => pr.cursor = prompt_forward_word(&pr.input, pr.cursor, true, if big { &[] } else { &seps }),
+            PromptOp::ViEnd(big) => pr.cursor = prompt_end_word(&pr.input, pr.cursor, if big { &[] } else { &seps }),
+            PromptOp::BackWord(big) => pr.cursor = prompt_backward_word(&pr.input, pr.cursor, if big { &[] } else { &seps }),
+            PromptOp::Up => {
+                if hist_len > 0 && pr.history_pos != Some(0) {
                     let pos = pr.history_pos.map(|p| p.min(hist_len).saturating_sub(1)).unwrap_or(hist_len - 1);
                     pr.history_pos = Some(pos);
                     pr.input = self.prompt_history[pos].chars().collect();
                     pr.cursor = pr.input.len();
                 }
             }
-            _ if k.code == KeyCode::Down || ctrl('n') => {
-                if let Some(p) = pr.history_pos.map(|p| p.min(hist_len)) {
-                    if p + 1 < hist_len {
+            PromptOp::Down => {
+                // past the newest entry the line is empty (prompt_down_history)
+                match pr.history_pos.map(|p| p.min(hist_len)) {
+                    Some(p) if p + 1 < hist_len => {
                         pr.history_pos = Some(p + 1);
                         pr.input = self.prompt_history[p + 1].chars().collect();
-                    } else {
+                    }
+                    _ => {
                         pr.history_pos = None;
                         pr.input.clear();
                     }
-                    pr.cursor = pr.input.len();
+                }
+                pr.cursor = pr.input.len();
+            }
+            PromptOp::Yank => {
+                let value: Vec<_> = if pr.copied.is_empty() { paste.chars().take_while(|c| !c.is_control()).collect() } else { pr.copied.clone() };
+                let len = value.len();
+                pr.input.splice(pr.cursor..pr.cursor, value);
+                pr.cursor += len;
+            }
+            PromptOp::Transpose => {
+                let i = if pr.cursor < n { pr.cursor + 1 } else { pr.cursor };
+                if i >= 2 {
+                    pr.input.swap(i - 2, i - 1);
+                    pr.cursor = i;
                 }
             }
-            KeyCode::Tab => {
+            PromptOp::QuoteNext => pr.quote_next = true,
+            PromptOp::Tab => {
                 // complete a command name at the start
                 let text: String = pr.input.iter().collect();
                 if !text.contains(' ') {
@@ -738,15 +688,11 @@ impl Server {
                     }
                 }
             }
-            KeyCode::Space => {
-                pr.input.insert(pr.cursor, ' ');
-                pr.cursor += 1;
-            }
-            KeyCode::Char(ch) if !k.mods.ctrl && !k.mods.meta => {
+            PromptOp::Insert(ch) => {
                 if pr.numeric && !ch.is_ascii_digit() {
                     return;
                 }
-                pr.input.insert(pr.cursor, *ch);
+                pr.input.insert(pr.cursor, ch);
                 pr.cursor += 1;
                 if pr.single_key {
                     let mut pr = c.prompt.take().unwrap();
@@ -755,7 +701,6 @@ impl Server {
                     self.run_string(cid, &cmd, pr.pane);
                 }
             }
-            _ => {}
         }
         if let Some((pane, forward)) = incremental {
             let text = self.clients.get(&cid).and_then(|c| c.prompt.as_ref()).map(|pr| pr.input.iter().collect::<String>());
@@ -773,6 +718,202 @@ impl Server {
 
 }
 
+/// A command prompt editing operation (the emacs keys of tmux prompt_key).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PromptOp {
+    None, Left, Right, Home, End, Tab, BSpace, Delete, ClearLine, KillLine, DeleteWord,
+    ForwardWord, ViForward(bool), ViEnd(bool), BackWord(bool), Up, Down, Yank, Transpose,
+    Enter, Cancel, QuoteNext, Insert(char),
+}
+
+fn prompt_emacs_op(k: &Key) -> PromptOp {
+    let m = k.mods;
+    let plain = !m.ctrl && !m.meta;
+    match &k.code {
+        KeyCode::Char(c) if m.ctrl && !m.meta => match c {
+            'b' => PromptOp::Left,
+            'f' => PromptOp::Right,
+            'a' => PromptOp::Home,
+            'e' => PromptOp::End,
+            'h' => PromptOp::BSpace,
+            'd' => PromptOp::Delete,
+            'u' => PromptOp::ClearLine,
+            'k' => PromptOp::KillLine,
+            'w' => PromptOp::DeleteWord,
+            'p' => PromptOp::Up,
+            'n' => PromptOp::Down,
+            'y' => PromptOp::Yank,
+            't' => PromptOp::Transpose,
+            'm' | 'j' => PromptOp::Enter,
+            'c' | 'g' | '[' => PromptOp::Cancel,
+            'v' => PromptOp::QuoteNext,
+            'i' => PromptOp::Tab,
+            _ => PromptOp::None,
+        },
+        KeyCode::Char('f') if m.meta && !m.ctrl => PromptOp::ForwardWord,
+        KeyCode::Char('b') if m.meta && !m.ctrl => PromptOp::BackWord(false),
+        KeyCode::Right if m.ctrl && !m.meta => PromptOp::ForwardWord,
+        KeyCode::Left if m.ctrl && !m.meta => PromptOp::BackWord(false),
+        _ if !plain || m.shift && !matches!(k.code, KeyCode::Char(_)) => PromptOp::None,
+        KeyCode::Char(c) => PromptOp::Insert(*c),
+        KeyCode::KP('\r') | KeyCode::Enter => PromptOp::Enter,
+        KeyCode::KP(c) => PromptOp::Insert(*c),
+        KeyCode::Space => PromptOp::Insert(' '),
+        KeyCode::Left => PromptOp::Left,
+        KeyCode::Right => PromptOp::Right,
+        KeyCode::Home => PromptOp::Home,
+        KeyCode::End => PromptOp::End,
+        KeyCode::Tab => PromptOp::Tab,
+        KeyCode::BSpace => PromptOp::BSpace,
+        KeyCode::Delete => PromptOp::Delete,
+        KeyCode::Up => PromptOp::Up,
+        KeyCode::Down => PromptOp::Down,
+        KeyCode::Escape => PromptOp::Cancel,
+        _ => PromptOp::None,
+    }
+}
+
+/// tmux prompt_translate_key: vi keys as emacs operations, switching between
+/// insert and command mode. Escape in insert mode moves the cursor left.
+fn prompt_vi_op(pr: &mut Prompt, k: &Key) -> PromptOp {
+    let name = keys::key_name(k);
+    if !pr.vi_command {
+        return match name.as_str() {
+            "C-a" | "C-c" | "C-e" | "C-g" | "C-h" | "Tab" | "C-k" | "C-n" | "C-p" | "C-t" | "C-u" | "C-v" | "C-w" | "C-y" | "Enter" | "KPEnter"
+            | "C-m" | "C-j" | "C-Left" | "C-Right" | "BSpace" | "DC" | "Down" | "End" | "Home" | "Left" | "Right" | "Up" => prompt_emacs_op(k),
+            "Escape" | "C-[" => {
+                pr.vi_command = true;
+                pr.cursor = pr.cursor.saturating_sub(1);
+                PromptOp::None
+            }
+            // anything else is typed (only plain characters insert anything)
+            _ => match prompt_emacs_op(k) {
+                op @ PromptOp::Insert(_) => op,
+                _ => PromptOp::None,
+            },
+        };
+    }
+    match name.as_str() {
+        "BSpace" => return PromptOp::Left,
+        "A" | "I" | "C" | "s" | "a" => pr.vi_command = false,
+        "S" => {
+            pr.vi_command = false;
+            return PromptOp::ClearLine;
+        }
+        "i" => {
+            pr.vi_command = false;
+            return PromptOp::None;
+        }
+        _ => {}
+    }
+    match name.as_str() {
+        "A" | "$" => PromptOp::End,
+        "I" | "0" | "^" => PromptOp::Home,
+        "C" | "D" => PromptOp::KillLine,
+        "X" => PromptOp::BSpace,
+        "b" => PromptOp::BackWord(false),
+        "B" => PromptOp::BackWord(true),
+        "d" => PromptOp::ClearLine,
+        "e" => PromptOp::ViEnd(false),
+        "E" => PromptOp::ViEnd(true),
+        "w" => PromptOp::ViForward(false),
+        "W" => PromptOp::ViForward(true),
+        "p" => PromptOp::Yank,
+        "q" | "C-c" => PromptOp::Cancel,
+        "s" | "DC" | "x" => PromptOp::Delete,
+        "Down" | "j" => PromptOp::Down,
+        "Left" | "h" => PromptOp::Left,
+        "a" | "Right" | "l" => PromptOp::Right,
+        "Up" | "k" => PromptOp::Up,
+        "C-h" => PromptOp::BSpace,
+        "Enter" | "KPEnter" | "C-m" | "C-j" => PromptOp::Enter,
+        _ => PromptOp::None,
+    }
+}
+
+// Word movement over the prompt input as tmux prompt.c: separators (single
+// characters from word-separators) form words of their own, spaces end words.
+fn prompt_space(s: &[char], i: usize) -> bool {
+    s.get(i) == Some(&' ')
+}
+
+fn prompt_in_list(s: &[char], i: usize, seps: &[char]) -> bool {
+    s.get(i).is_some_and(|c| c.is_ascii() && seps.contains(c))
+}
+
+/// prompt_forward_word: vi stops at the start of the next word, emacs at the end.
+fn prompt_forward_word(s: &[char], mut i: usize, vi: bool, seps: &[char]) -> usize {
+    let n = s.len();
+    if !vi {
+        while i < n && prompt_space(s, i) {
+            i += 1;
+        }
+    }
+    if i >= n {
+        return n;
+    }
+    let class = prompt_in_list(s, i, seps) && !prompt_space(s, i);
+    loop {
+        i += 1;
+        if prompt_space(s, i) {
+            if vi {
+                while i < n && prompt_space(s, i) {
+                    i += 1;
+                }
+            }
+            break;
+        }
+        if i >= n || class != prompt_in_list(s, i, seps) {
+            break;
+        }
+    }
+    i
+}
+
+/// prompt_end_word: to the last character of this or the next word.
+fn prompt_end_word(s: &[char], mut i: usize, seps: &[char]) -> usize {
+    let n = s.len();
+    if i >= n {
+        return i;
+    }
+    loop {
+        i += 1;
+        if i >= n {
+            return n;
+        }
+        if !prompt_space(s, i) {
+            break;
+        }
+    }
+    let class = prompt_in_list(s, i, seps);
+    loop {
+        i += 1;
+        if i >= n || prompt_space(s, i) || class != prompt_in_list(s, i, seps) {
+            break;
+        }
+    }
+    i - 1
+}
+
+/// prompt_backward_word (and the start of the word C-w deletes).
+fn prompt_backward_word(s: &[char], mut i: usize, seps: &[char]) -> usize {
+    while i != 0 {
+        i -= 1;
+        if !prompt_space(s, i) {
+            break;
+        }
+    }
+    let class = prompt_in_list(s, i, seps);
+    while i != 0 {
+        i -= 1;
+        if prompt_space(s, i) || class != prompt_in_list(s, i, seps) {
+            i += 1;
+            break;
+        }
+    }
+    i
+}
+
 pub const COMMAND_NAMES: &[&str] = &[
     "attach-session", "bind-key", "break-pane", "capture-pane", "choose-buffer", "choose-client", "choose-tree", "clear-history", "clock-mode", "command-prompt",
     "confirm-before", "copy-mode", "customize-mode", "delete-buffer", "detach-client", "display-menu", "display-message", "display-panes", "display-popup", "find-window",
@@ -788,6 +929,52 @@ pub const COMMAND_NAMES: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_words_like_tmux() {
+        // positions from tmux 3.8 with the default word-separators
+        let seps: Vec<char> = "!\"#$%&'()*+,-./:;<=>?@[\\]^`{|}~".chars().collect();
+        let s: Vec<char> = "set foo-bar.baz qux/quux end".chars().collect();
+        assert_eq!(prompt_forward_word(&s, 4, true, &seps), 7);
+        assert_eq!(prompt_forward_word(&s, 7, true, &seps), 8);
+        assert_eq!(prompt_forward_word(&s, 4, true, &[]), 16);
+        assert_eq!(prompt_end_word(&s, 4, &seps), 6);
+        assert_eq!(prompt_end_word(&s, 6, &seps), 7);
+        assert_eq!(prompt_end_word(&s, 4, &[]), 14);
+        assert_eq!(prompt_backward_word(&s, 27, &seps), 25);
+        assert_eq!(prompt_backward_word(&s, 25, &seps), 20);
+        assert_eq!(prompt_backward_word(&s, 20, &seps), 19);
+        assert_eq!(prompt_backward_word(&s, 25, &[]), 16);
+        // emacs M-f goes to the end of the word
+        assert_eq!(prompt_forward_word(&s, 0, false, &seps), 3);
+        assert_eq!(prompt_forward_word(&s, 3, false, &seps), 7);
+        assert_eq!(prompt_forward_word(&s, 28, false, &seps), 28);
+        assert_eq!(prompt_backward_word(&[], 0, &seps), 0);
+    }
+
+    #[test]
+    fn prompt_vi_translation() {
+        let mut pr = Prompt {
+            vi_command: false, quote_next: false, copied: Vec::new(), kind: PromptKind::Command, prompts: Vec::new(), answers: Vec::new(),
+            label: String::new(), input: "ab".chars().collect(), cursor: 2, template: String::new(), history_pos: None, pane: None,
+            numeric: false, single_key: false, copy_incremental: None, bspace_exit: false, confirm: ('y', false),
+        };
+        let key = |n: &str| keys::parse_key_name(n).unwrap();
+        // insert mode: Escape is command mode and one to the left; M-f is dropped
+        assert_eq!(prompt_vi_op(&mut pr, &key("M-f")), PromptOp::None);
+        assert_eq!(prompt_vi_op(&mut pr, &key("Escape")), PromptOp::None);
+        assert!(pr.vi_command && pr.cursor == 1);
+        // command mode: Escape does nothing, BSpace is left, S clears and inserts
+        assert_eq!(prompt_vi_op(&mut pr, &key("Escape")), PromptOp::None);
+        assert_eq!(prompt_vi_op(&mut pr, &key("BSpace")), PromptOp::Left);
+        assert_eq!(prompt_vi_op(&mut pr, &key("j")), PromptOp::Down);
+        assert_eq!(prompt_vi_op(&mut pr, &key("C-a")), PromptOp::None);
+        assert_eq!(prompt_vi_op(&mut pr, &key("S")), PromptOp::ClearLine);
+        assert!(!pr.vi_command);
+        assert_eq!(prompt_vi_op(&mut pr, &key("C-a")), PromptOp::Home);
+        assert_eq!(prompt_emacs_op(&key("M-BSpace")), PromptOp::None);
+        assert_eq!(prompt_emacs_op(&key("C-Left")), PromptOp::BackWord(false));
+    }
 
     #[test]
     fn templates() {

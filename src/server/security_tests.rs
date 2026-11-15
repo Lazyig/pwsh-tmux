@@ -28,6 +28,7 @@ fn fixture() -> (Server, mpsc::Receiver<Event>) {
             overlay: None,
             overlay_epoch: 0,
             message: None,
+            message_ignore_keys: false,
             prev: None,
             dirty: false,
             last_session: None,
@@ -366,7 +367,7 @@ fn replacing_popup_with_other_overlays_releases_its_pane() {
         c.acl_readonly = false;
         c.attached = true;
         let pane = srv.spawn_pane(None, 20, 6, &[], None, &[]).unwrap();
-        srv.replace_overlay(1, Some(Overlay::Popup(Popup { pane, x: 0, y: 0, w: 22, h: 8, border: true, close_on_exit: false, title: String::new() }))).unwrap();
+        srv.replace_overlay(1, Some(Overlay::Popup(Popup { pane, x: 0, y: 0, w: 22, h: 8, border: true, close_on_exit: false, title: String::new(), lines: None, styles: [None, None] }))).unwrap();
         pane
     };
     // like tmux, other overlays are not shown over a popup: it and its pane stay
