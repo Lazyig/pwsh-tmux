@@ -410,10 +410,13 @@ impl Server {
             if g.h as i32 > avail {
                 g.h = avail.max(PANE_MIN as i32) as u16;
             }
-            if g.x + g.w as i32 + pad > sx {
+            // tmux compares in unsigned arithmetic: a pane far enough off the left or top
+            // edge wraps round and is pulled back to the padding
+            let past = |off: i32, size: u16, s: i32| (off as u32).wrapping_add(size as u32 + pad as u32) > s as u32;
+            if past(g.x, g.w, sx) {
                 g.x = if g.w as i32 + 2 * pad >= sx { pad } else { sx - g.w as i32 - pad };
             }
-            if g.y + g.h as i32 + pad > sy {
+            if past(g.y, g.h, sy) {
                 g.y = if g.h as i32 + 2 * pad >= sy { pad } else { sy - g.h as i32 - pad };
             }
         }
@@ -979,12 +982,23 @@ impl Server {
             }
         }
         if let Some(v) = o.get('y') {
-            let y = percentage(v, 0, PANE_MAX, wsy).map_err(|e| format!("height {e}"))?;
+            let mut y = percentage(v, 0, PANE_MAX, wsy).map_err(|e| format!("height {e}"))?;
+            // tmux counts a window pane status line next to the pane (window_get_pane_status:
+            // only top and bottom, not the -floating values)
+            let g = self.windows[&wid].layout.geom(pane).unwrap_or_default();
+            match self.opt_window(Some(wid), "pane-border-status").as_str() {
+                "top" if g.y == 1 => y += 1,
+                "bottom" if g.y + g.h as i32 == wsy as i32 - 1 => y += 1,
+                _ => {}
+            }
             let y = to(y)?;
             if let Some(g) = self.windows.get_mut(&wid).unwrap().layout.geom_mut(pane) {
                 g.h = y;
             }
         }
+        // once -U or -L is seen, later flags move the offset too (tmux sets `opposite`
+        // and never clears it)
+        let mut opposite = false;
         for c in ['U', 'D', 'L', 'R'] {
             let Some(v) = o.get(c) else { continue };
             let v = if !v.is_empty() { v.to_string() } else { o.rest.first().cloned().unwrap_or_else(|| "1".into()) };
@@ -993,9 +1007,10 @@ impl Server {
                 continue;
             }
             let g = self.windows.get_mut(&wid).unwrap().layout.geom_mut(pane).unwrap();
-            let (size, opposite) = match c {
-                'U' | 'D' => (g.h as i32 + n, c == 'U'),
-                _ => (g.w as i32 + n, c == 'L'),
+            opposite |= matches!(c, 'U' | 'L');
+            let size = match c {
+                'U' | 'D' => g.h as i32 + n,
+                _ => g.w as i32 + n,
             };
             if !(PANE_MIN as i32..=PANE_MAX as i32).contains(&size) {
                 return err("adjustment change is too big or too small");
@@ -1473,6 +1488,59 @@ mod tests {
         assert_eq!((wait_status(0), wait_status(7), wait_status(255)), (0, 7, 255));
         assert_eq!(wait_status(0xC000013Au32 as i32), 0x3A);
         assert_eq!((wait_status(256), wait_status(-1)), (1, 255));
+        srv.shutdown();
+    }
+
+    #[test]
+    fn resize_float_like_tmux() {
+        let (mut srv, _ev) = server();
+        ok(&mut srv, &["new-session", "-d", "-s", "r", "-x", "80", "-y", "24"]);
+        let g = "#{pane_left},#{pane_top} #{pane_width}x#{pane_height}";
+        ok(&mut srv, &["set", "-g", "pane-border-status", "top"]);
+        let p = ok(&mut srv, &["new-pane", "-P", "-F", "#{pane_id}", "-x", "30", "-y", "10", "-X", "20", "-Y", "0"]).trim().to_string();
+        // -y counts the top status line of a pane at row 1
+        ok(&mut srv, &["resize-pane", "-t", &p, "-y", "10"]);
+        assert_eq!(fmt(&srv, &p, g), "21,1 28x9");
+        ok(&mut srv, &["set", "-g", "pane-border-status", "bottom"]);
+        ok(&mut srv, &["resize-pane", "-t", &p, "-y", "10"]);
+        ok(&mut srv, &["move-pane", "-t", &p, "-X", "20", "-Y", "14"]);
+        assert_eq!(fmt(&srv, &p, g), "21,15 28x8");
+        // ... and the bottom status line of a pane ending at the last row but one
+        ok(&mut srv, &["resize-pane", "-t", &p, "-y", "10"]);
+        assert_eq!(fmt(&srv, &p, g), "21,15 28x9");
+        ok(&mut srv, &["resize-pane", "-t", &p, "-y", "10"]);
+        assert_eq!(fmt(&srv, &p, g), "21,15 28x8");
+        // top-floating is not a window pane status
+        ok(&mut srv, &["set", "-g", "pane-border-status", "top-floating"]);
+        ok(&mut srv, &["move-pane", "-t", &p, "-X", "20", "-Y", "0"]);
+        ok(&mut srv, &["resize-pane", "-t", &p, "-y", "10"]);
+        assert_eq!(fmt(&srv, &p, g), "21,1 28x8");
+        // -U makes every later flag move the offset as well
+        ok(&mut srv, &["set", "-g", "pane-border-status", "off"]);
+        ok(&mut srv, &["move-pane", "-t", &p, "-X", "44", "-Y", "13"]);
+        ok(&mut srv, &["resize-pane", "-t", &p, "-U", "3", "-D", "2"]);
+        assert_eq!(fmt(&srv, &p, g), "45,9 28x13");
+        ok(&mut srv, &["resize-pane", "-t", &p, "-L", "3", "-R", "2"]);
+        assert_eq!(fmt(&srv, &p, g), "40,9 33x13");
+        ok(&mut srv, &["resize-pane", "-t", &p, "-D", "2", "-U", "1"]);
+        assert_eq!(fmt(&srv, &p, g), "40,6 33x16");
+        srv.shutdown();
+    }
+
+    #[test]
+    fn clamp_floats_off_the_top_left() {
+        let (mut srv, _ev) = server();
+        ok(&mut srv, &["new-session", "-d", "-s", "c", "-x", "80", "-y", "24"]);
+        let g = "#{pane_left},#{pane_top} #{pane_width}x#{pane_height}";
+        let p = ok(&mut srv, &["new-pane", "-P", "-F", "#{pane_id}", "-x", "20", "-y", "5", "-X", "-5", "-Y", "-2"]).trim().to_string();
+        assert_eq!(fmt(&srv, &p, g), "-4,-1 18x3");
+        ok(&mut srv, &["resize-window", "-x", "20", "-y", "6"]);
+        assert_eq!(fmt(&srv, &p, g), "-4,-1 18x3");
+        // xoff + sx + pad < 0 wraps round in tmux and pulls the pane back to the padding
+        ok(&mut srv, &["resize-window", "-x", "3", "-y", "3"]);
+        assert_eq!(fmt(&srv, &p, g), "1,-1 1x1");
+        ok(&mut srv, &["resize-window", "-x", "80", "-y", "24"]);
+        assert_eq!(fmt(&srv, &p, g), "1,-1 1x1");
         srv.shutdown();
     }
 
