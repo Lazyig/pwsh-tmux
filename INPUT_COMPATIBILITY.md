@@ -11,6 +11,9 @@ mode 1 (`CSI > 4;1 m`, or `extended-keys always`) keeps Meta keys and Ctrl with
 Space, `/`, `2`-`8` or `@`-`~` in their standard form. A key with no standard form
 (C-BSpace with extended keys off) is sent by `send-keys` as its name. Only
 `ESC ] 5 2 ;` is held back as an OSC 52 reply; any other `ESC ]` is M-].
+C-[ is the same key as Escape here (an extended-keys `CSI 91;5u` decodes to Escape and
+`bind C-[` binds Escape), which gives tmux 3.8's "C-[ has the bindings of Escape" everywhere;
+unlike tmux, `list-keys` shows such a binding as Escape.
 Bracketed-paste terminals do not
 use paste guessing. Unterminated pastes recover after five seconds, and partial
 paste end markers receive at least 500ms before their escape timer expires.
@@ -79,7 +82,8 @@ server exits. Lines without a known type load as command history, and a
 `history-file` that is neither absolute nor under `~/` is ignored. Empty client
 invocations use `default-client-command`. Command aliases expand once, with caller
 arguments appended to the last command; key bindings are parsed when bound, so
-their aliases expand then and unknown commands are rejected. `remain-on-exit key`
+their aliases expand then and unknown commands or flags are rejected (argument counts
+are checked when the command runs, not when it is bound). `remain-on-exit key`
 and `failed-key` keep qualifying panes until a key that no binding takes dismisses
 them (read-only clients included); paste and mouse reports do not dismiss them.
 
