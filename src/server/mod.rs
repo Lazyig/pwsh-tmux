@@ -311,7 +311,6 @@ pub struct Pane {
     pub title: String,
     pub dead: Option<(Option<i32>, u64)>,
     pub scrollbar_until: Option<Instant>,
-    pub scrollbar_hover: bool,
     pub mode: Option<PaneMode>,
     pub options: Options,
     pub pipe: Option<Sender<Vec<u8>>>,
@@ -1953,7 +1952,6 @@ impl Server {
                 title,
                 dead: None,
                 scrollbar_until: None,
-                scrollbar_hover: false,
                 mode: None,
                 options: existing_opts,
                 pipe: None,
@@ -2283,8 +2281,7 @@ impl Server {
         if self.opt_window(Some(wid), "pane-scrollbars") == "on" {
             if let Some((id, _)) = self.rects(wid).0.into_iter().find(|(_, rect)| *rect == r) {
                 if let Some(sb) = self.scrollbar(wid, id, cr) {
-                    let pad = self.opt_pane(id, "pane-scrollbars-style").split(',').find_map(|s| s.strip_prefix("pad=").and_then(|p| p.parse::<u16>().ok())).unwrap_or(0);
-                    let width = sb.width.saturating_add(pad).min(cr.w.saturating_sub(1));
+                    let width = sb.width.saturating_add(sb.pad).min(cr.w.saturating_sub(1));
                     cr.w -= width;
                     if self.opt_window(Some(wid), "pane-scrollbars-position") == "left" { cr.x += width; }
                 }

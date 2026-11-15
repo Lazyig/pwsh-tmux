@@ -542,3 +542,32 @@ fn display_window_edges_fill_style_and_arrows_of_every_pane() {
     ctx.ok(&["select-pane", "-t", "s.0"]);
     t.wait_screen("two arrows at the left pane", |s| s.matches('←').count() == 2 && !s.contains('↓'));
 }
+
+#[test]
+fn display_auto_hide_scrollbar_shows_only_when_scrolling_and_draws_pad() {
+    let ctx = Ctx::new("display-autohide");
+    let t = start(&ctx, "s");
+    let bg = |y: u16, x: u16| t.screen.lock().unwrap().screen().cell(y, x).unwrap().bgcolor();
+    t.send(b"printf 'line\\n%.0s' {1..120}\r");
+    wait_for("history", || ctx.fmt("s", "#{history_size}").parse::<usize>().unwrap_or(0) > 30);
+    ctx.ok(&["setw", "-t", "s", "pane-scrollbars-style", "fg=red,bg=blue,width=2,pad=2"]);
+    ctx.ok(&["setw", "-t", "s", "pane-scrollbars-timeout", "300"]);
+    ctx.ok(&["setw", "-t", "s", "pane-scrollbars", "auto-hide"]);
+    // entering copy mode or moving without scrolling does not show it
+    ctx.ok(&["copy-mode", "-t", "s"]);
+    ctx.ok(&["send-keys", "-t", "s", "-X", "cursor-up"]);
+    std::thread::sleep(Duration::from_millis(150));
+    assert_ne!(bg(20, 99), vt100::Color::Idx(4));
+    // scrolling shows it over the pane: the bar, then the pad in pane colours
+    ctx.ok(&["send-keys", "-t", "s", "-X", "history-top"]);
+    wait_for("scrolled scrollbar", || bg(20, 99) == vt100::Color::Idx(4) && bg(20, 98) == vt100::Color::Idx(4));
+    assert_eq!(bg(20, 97), vt100::Color::Default);
+    assert_eq!(t.row(20).chars().nth(96), Some(' '));
+    assert_eq!(bg(0, 99), vt100::Color::Idx(1));
+    wait_for("hidden after the timeout", || bg(20, 99) != vt100::Color::Idx(4));
+    ctx.ok(&["send-keys", "-t", "s", "-X", "cancel"]);
+    // width below 1 is 1, colours from the default style
+    ctx.ok(&["setw", "-t", "s", "pane-scrollbars-style", "width=0"]);
+    ctx.ok(&["setw", "-t", "s", "pane-scrollbars", "on"]);
+    wait_for("default width", || ctx.fmt("s", "#{pane_width}") == "99" && bg(20, 99) != vt100::Color::Default);
+}

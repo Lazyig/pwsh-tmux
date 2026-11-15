@@ -2544,7 +2544,11 @@ impl Server {
                         self.scrollbar_to_mouse(pane, m);
                     }
                 }
-                self.show_scrollbar(pane);
+                // window_copy_pageup/pagedown and the scrollbar drag show an
+                // auto-hide scrollbar; just entering copy mode does not
+                if o.has('u') || o.has('d') || o.has('S') {
+                    self.show_scrollbar(pane);
+                }
                 if let Some(w) = tt.wid { self.mark_window_dirty(w); }
                 Ok(Flow::Next)
             }

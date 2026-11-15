@@ -396,7 +396,6 @@ impl Server {
                 }
             }
             Some(PaneMode::Copy(_)) => {
-                self.show_scrollbar(pane);
                 let wrap = self.opt_window_on(self.window_of(pane), "wrap-search");
                 let vi = self.opt_window(self.window_of(pane), "mode-keys") == "vi";
                 let table = if vi { "copy-mode-vi" } else { "copy-mode" };
@@ -409,11 +408,13 @@ impl Server {
                         }
                     }
                     _ => {
+                        let before = self.copy_scroll_offset(pane);
                         let action = match self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
                             Some(PaneMode::Copy(cm)) => { cm.wrap_search = wrap; cm.key(name) },
                             _ => return,
                         };
                         self.copy_action(pane, cid, action, None);
+                        self.show_scrollbar_if_scrolled(pane, before, false);
                     }
                 }
             }
@@ -432,7 +433,15 @@ impl Server {
             Some(self.opt_server("copy-command")).filter(|c| !c.is_empty())
         };
         let run_args: Vec<String> = if piped && !args.is_empty() { args[1..].to_vec() } else { args.to_vec() };
-        self.show_scrollbar(pane);
+        // these always show an auto-hide scrollbar; others when the view scrolled
+        let always = matches!(name, "page-up" | "page-down" | "page-down-and-cancel" | "halfpage-up" | "halfpage-down"
+            | "halfpage-down-and-cancel" | "history-top" | "history-bottom" | "scroll-to-mouse");
+        let before = self.copy_scroll_offset(pane);
+        self.copy_mode_command_inner(pane, cid, name, pipe, run_args);
+        self.show_scrollbar_if_scrolled(pane, before, always);
+    }
+
+    fn copy_mode_command_inner(&mut self, pane: PaneId, cid: Option<ClientId>, name: &str, pipe: Option<String>, run_args: Vec<String>) {
         let wrap = options::is_on(&self.opt_window(self.window_of(pane), "wrap-search"));
         if name == "scroll-to-mouse" {
             if let Some(cid) = cid {

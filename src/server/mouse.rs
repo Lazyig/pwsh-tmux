@@ -105,14 +105,18 @@ impl Server {
         if let Some(sid) = self.client_session(cid) {
             let wid = self.sessions[&sid].active_window();
             let oy = if self.opt_session(Some(sid), "status-position") == "top" { self.status_lines(Some(sid)) } else { 0 };
+            // server_client_update_scrollbar_hover: moving over the scrollbar
+            // area (width + pad) shows it, any other movement restarts the timer
+            // of a visible one; it hides on the timer even while hovered
             for (pane, r) in self.rects(wid).0 {
-                let hover = self.scrollbar(wid, pane, r).is_some_and(|sb| m.x >= sb.x && m.x < sb.x + sb.width && m.y >= oy + sb.y && m.y < oy + sb.y + sb.height);
-                let was = self.panes[&pane].scrollbar_hover;
-                if was != hover {
-                    self.panes.get_mut(&pane).unwrap().scrollbar_hover = hover;
+                if m.kind != MouseKind::Move { break; }
+                let Some(sb) = self.scrollbar(wid, pane, r) else { continue };
+                let total = (sb.width + sb.pad).min(r.w);
+                let x0 = if sb.left { r.x } else { r.right() - total };
+                let hover = m.x >= x0 && m.x < x0 + total && m.y >= oy + r.y && m.y < oy + r.bottom();
+                if hover || self.panes[&pane].scrollbar_until.is_some() {
                     self.show_scrollbar(pane);
                 }
-                if matches!(m.kind, MouseKind::WheelUp | MouseKind::WheelDown) && m.x >= r.x && m.x < r.right() && m.y >= oy + r.y && m.y < oy + r.bottom() { self.show_scrollbar(pane); }
             }
         }
         self.mouse_event(cid, m, last, false);
