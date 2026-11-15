@@ -1813,11 +1813,15 @@ impl Server {
                 let wt = if cmd == "select-layout" { self.resolve_pane(ctx, t)? } else { self.resolve_window(ctx, t)? };
                 let wid = wt.wid.unwrap();
                 let area = self.window_area(wid);
+                // args_string_percentage(value, 0, total, total): anything over the
+                // available size is an error, and the layout uses its default
                 let size_option = |s: &Server, name: &str, total: u16| -> Option<u16> {
                     let v = s.opt_window(Some(wid), name);
-                    if let Some(pct) = v.strip_suffix('%') {
-                        pct.parse::<u32>().ok().filter(|p| *p <= 100).map(|p| (total as u32 * p / 100) as u16)
-                    } else { v.parse().ok() }
+                    let n = match v.strip_suffix('%') {
+                        Some(pct) => pct.parse::<u32>().ok().filter(|p| *p <= 1000).map(|p| total as u32 * p / 100),
+                        None => v.parse::<u32>().ok(),
+                    };
+                    n.filter(|n| *n <= total as u32).map(|n| n as u16)
                 };
                 let w = &self.windows[&wid];
                 let panes = w.panes();

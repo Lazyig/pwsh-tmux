@@ -1212,6 +1212,11 @@ fn display_layout_options_and_session_styles() {
     ctx.ok(&["setw", "-t", "s", "other-pane-height", "20%"]);
     ctx.ok(&["select-layout", "-t", "s", "main-horizontal"]);
     assert_eq!(ctx.fmt("s.0", "#{pane_height}"), "40");
+    // a size over the available space is invalid and the default 24 is used
+    ctx.ok(&["setw", "-t", "s", "main-pane-height", "100"]);
+    ctx.ok(&["setw", "-t", "s", "other-pane-height", "0"]);
+    ctx.ok(&["select-layout", "-t", "s", "main-horizontal"]);
+    assert_eq!(ctx.fmt("s.0", "#{pane_height}"), "24");
     ctx.ok(&["setw", "-t", "s", "session-status-style", "fg=red"]);
     ctx.ok(&["setw", "-t", "s", "session-status-current-style", "bold"]);
     assert_eq!(ctx.fmt("s", "#{E:session-status-style}/#{E:session-status-current-style}"), "fg=red/bold");
