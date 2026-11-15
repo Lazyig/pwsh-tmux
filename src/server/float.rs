@@ -33,6 +33,19 @@ fn drag_row(m: &super::input::MouseCtx, v: u16) -> i32 {
 }
 
 /// tmux strtonum.
+/// The exit status new-pane -W returns: tmux's WEXITSTATUS (the low 8 bits) for a command
+/// that exited; an out-of-range code (a Windows NTSTATUS such as 0xC000013A) whose low bits
+/// are 0 still fails.
+fn wait_status(s: i32) -> u8 {
+    match s {
+        0..=255 => s as u8,
+        _ => match (s as u32 & 0xff) as u8 {
+            0 => 1,
+            b => b,
+        },
+    }
+}
+
 fn strtonum(v: &str, lo: i64, hi: i64) -> Result<i64, String> {
     let n: i64 = v.trim().parse().map_err(|_| "invalid".to_string())?;
     if n < lo {
@@ -354,10 +367,18 @@ impl Server {
     /// Continue the queues of new-pane -W once the pane's command has exited (or the pane
     /// is gone: 128 + SIGHUP).
     pub fn finish_pane_waits(&mut self, id: PaneId, status: Option<i32>) {
-        let Some(queues) = self.pane_waits.remove(&id) else { return };
-        let code = status.map_or(129, |s| s.clamp(0, 255) as u8);
+        if let Some(queues) = self.pane_waits.remove(&id) {
+            self.resume_pane_waits(queues, status);
+        }
+    }
+
+    /// Continue parked new-pane -W queues: split-window's after hook (tmux inserts it
+    /// before blocking, so it runs once the item continues), then the rest of the queue.
+    pub fn resume_pane_waits(&mut self, queues: Vec<Queue>, status: Option<i32>) {
+        let code = status.map_or(129, wait_status);
         for mut q in queues {
             q.ctx.retval = Some(code);
+            self.after_command("new-pane", &q.ctx);
             self.run_queue(q);
         }
     }
@@ -1440,6 +1461,18 @@ mod tests {
         srv.pane_waits.entry(id).or_default().push(Queue { cmds: VecDeque::new(), ctx: Ctx::default(), soft: 0 });
         srv.finish_pane_waits(id, Some(3));
         assert!(srv.pane_waits.is_empty());
+        // after-split-window runs when the -W item continues, not before
+        ok(&mut srv, &["set-hook", "-g", "after-split-window", "set -ga @c S"]);
+        let r = srv.exec(["new-pane", "-W", "-E", "-P", "-F", "#{pane_id}"].iter().map(|s| s.to_string()).collect(), &mut Ctx::default());
+        let id: PaneId = r.err().unwrap().rsplit('\0').next().unwrap().parse().unwrap();
+        assert_eq!(ok(&mut srv, &["show", "-gqv", "@c"]), "");
+        srv.pane_waits.entry(id).or_default().push(Queue { cmds: VecDeque::new(), ctx: Ctx::default(), soft: 0 });
+        srv.finish_pane_waits(id, Some(0));
+        assert_eq!(ok(&mut srv, &["show", "-gqv", "@c"]), "S\n");
+        // WEXITSTATUS; a failing Windows status never looks like success
+        assert_eq!((wait_status(0), wait_status(7), wait_status(255)), (0, 7, 255));
+        assert_eq!(wait_status(0xC000013Au32 as i32), 0x3A);
+        assert_eq!((wait_status(256), wait_status(-1)), (1, 255));
         srv.shutdown();
     }
 

@@ -300,7 +300,8 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                 }
                 if code == 0 {
                     print!("{text}");
-                } else {
+                } else if !text.is_empty() {
+                    // a bare exit status (new-pane -W) prints nothing
                     eprint!("{text}{}", if text.ends_with('\n') { "" } else { "\n" });
                 }
                 let _ = std::io::stdout().flush();

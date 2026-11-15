@@ -1181,7 +1181,9 @@ fn floating_panes_from_the_cli() {
     // new-pane -W returns the command's exit status
     #[cfg(unix)]
     {
-        let status = ctx.command().args(["new-pane", "-W", "-t", "f", "exit 3"]).status().unwrap();
-        assert_eq!(status.code(), Some(3));
+        let out = ctx.command().args(["new-pane", "-W", "-t", "f", "exit 3"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        // it waits silently: no (empty) error line on stderr
+        assert!(out.stderr.is_empty(), "{:?}", String::from_utf8_lossy(&out.stderr));
     }
 }

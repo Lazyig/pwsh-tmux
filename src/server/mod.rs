@@ -1554,7 +1554,16 @@ impl Server {
 
     fn pane_exited(&mut self, id: PaneId, status: Option<i32>) {
         log(&format!("pane %{id} exited with {status:?}"));
-        self.finish_pane_waits(id, Some(status.unwrap_or(129)));
+        // new-pane -W continues after the pane is handled: tmux's cmdq_continue only wakes
+        // the client queue, which runs after the global queue (pane-exited, the layout hooks)
+        let waits = self.pane_waits.remove(&id);
+        self.pane_exited_now(id, status);
+        if let Some(q) = waits {
+            self.resume_pane_waits(q, Some(status.unwrap_or(129)));
+        }
+    }
+
+    fn pane_exited_now(&mut self, id: PaneId, status: Option<i32>) {
         // popup?
         let popup_owner = self.clients.values().find(|c| matches!(&c.overlay, Some(Overlay::Popup(p)) if p.pane == id)).map(|c| c.id);
         if let Some(cid) = popup_owner {
