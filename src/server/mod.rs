@@ -761,6 +761,8 @@ pub struct Ctx {
     pub control_done: bool,
     /// The queue waits inside a control client's command: its block is not written yet.
     pub control_open: bool,
+    /// Hook context stack survives async commands that park the queue.
+    pub hook_saved: events::HookSaved,
 }
 
 /// Queue markers source-file puts around a file's commands. A parsed command can hold any
@@ -2510,7 +2512,7 @@ impl Server {
     }
 
     fn run_queue_inner(&mut self, mut q: Queue) {
-        let mut hook_saved = Vec::new();
+        let mut hook_saved = std::mem::take(&mut q.ctx.hook_saved);
         // an error whose command-error hook runs first
         let mut failed: Option<String> = None;
         // the first error of a hook's commands: it ends only that hook's list
@@ -2622,6 +2624,7 @@ impl Server {
                 }
                 Ok(Flow::WaitOverlay(cid, epoch)) => {
                     q.ctx.control_open = q.ctx.control_seq.is_some();
+                    q.ctx.hook_saved = hook_saved;
                     self.overlay_waits.push((cid, epoch, name, q));
                     return;
                 }
@@ -2650,6 +2653,7 @@ impl Server {
                                 continue;
                             }
                             q.ctx.control_open = open;
+                            q.ctx.hook_saved = hook_saved;
                             self.spawn_job(&get(2), None, kind, q);
                             return;
                         }
@@ -2665,26 +2669,31 @@ impl Server {
                                 continue;
                             }
                             q.ctx.control_open = open;
+                            q.ctx.hook_saved = hook_saved;
                             self.spawn_job(&get(2), cwd, kind, q);
                             return;
                         }
                         "wait" => {
                             q.ctx.control_open = open;
+                            q.ctx.hook_saved = hook_saved;
                             self.waits.entry(get(2)).or_default().waiters.push(q);
                             return;
                         }
                         "lock" => {
                             q.ctx.control_open = open;
+                            q.ctx.hook_saved = hook_saved;
                             self.waits.entry(get(2)).or_default().lockers.push(q);
                             return;
                         }
                         "wait-event" => {
                             q.ctx.control_open = open;
-                            self.park_event_waiter(get(2), get(3), get(4) == "v", q);
+                            q.ctx.hook_saved = hook_saved;
+                            self.park_event_waiter(get(2), (get(5) == "F").then(|| get(3)), get(4) == "v", q);
                             return;
                         }
                         "delay" => {
                             // run-shell -d: the rest of the queue (and the command) runs later
+                            q.ctx.hook_saved = hook_saved;
                             let ms: u64 = get(2).parse().unwrap_or(0);
                             if let Some(c) = delay_cmd.as_ref().map(|c| strip_delay(c)) {
                                 q.cmds.push_front(c);

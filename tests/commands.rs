@@ -863,11 +863,12 @@ fn readonly_control_client_cannot_execute_or_remove_restriction() {
     writeln!(stdin, "display-message -p 'READONLY=#{{client_readonly}}'").unwrap();
     stdin.flush().unwrap();
     wait_for("readonly flag retained", || text().contains("READONLY=1"));
-    // About 1MB per reply; tmux limits each padding to 10000 columns.
-    let oversized = vec![format!("display-message -p '{}'", "#{p10000:#{l:x}}".repeat(100)); 16].join(" ; ");
+    // Each command has its own reply block. Bound a single oversized reply;
+    // separate replies in a command list no longer accumulate in one buffer.
+    let oversized = format!("display-message -p '{}'", "#{p10000:#{l:x}}".repeat(500));
     writeln!(stdin, "{oversized}").unwrap();
     stdin.flush().unwrap();
-    wait_for("combined reply rejected", || text().contains("command output limit exceeded"));
+    wait_for("oversized reply rejected", || text().contains("command output limit exceeded"));
     assert_eq!(ctx.ok(&["show-environment", "-t", "ro", "READONLY_ENV_PROOF"]).trim(), "READONLY_ENV_PROOF=original");
     // A writable connection still works and the forbidden command made no window.
     assert_eq!(ctx.fmt("ro", "#{session_windows}"), "1");
@@ -1344,6 +1345,14 @@ fn tmux_38_control_notifications() {
     let begin = t.rfind("%begin ").unwrap();
     assert!(t[begin..].lines().next().unwrap().ends_with(" 1"), "{t}");
     assert!(t.rfind("%window-add").unwrap() > begin + t[begin..].find("%end ").unwrap(), "{t}");
+    send("display -p first-item; display -p second-item");
+    wait_for("individual command replies", || text().contains("second-item\n%end "));
+    let t = text();
+    let first = t.find("first-item\n").unwrap();
+    let second = t.find("second-item\n").unwrap();
+    assert!(t[first..second].contains("%end ") && t[first..second].contains("%begin "), "{t}");
+    send("display-message hello");
+    wait_for("control message", || text().contains("%message hello\n%end "));
     let other = ctx.fmt("other:", "#{session_id}");
     ctx.ok(&["new-window", "-d", "-t", "other:", "-n", "elsewhere"]);
     wait_for("%unlinked-window-add", || text().contains("%unlinked-window-add @"));
@@ -1495,4 +1504,65 @@ fn tmux_38_focus_then_pane_changed() {
     assert_eq!(ctx.ok(&["show", "-gv", "@log"]).trim(), "pane-focus-out pane-focus-in window-pane-changed");
     child.kill().unwrap();
     let _ = child.wait();
+}
+
+/// A channel's waiters and lockers are independent; -w does not release a lock.
+#[test]
+fn tmux_38_wait_channel_lockers() {
+    let ctx = Ctx::new("waitlock38");
+    ctx.ok(&["new-session", "-d", "-s", "w"]);
+    ctx.ok(&["wait", "-L", "mixed"]);
+    let mut locker = ctx.command().args(["wait", "-L", "mixed"]).spawn().unwrap();
+    wait_for("locker", || !ctx.ok(&["wait", "-l", "mixed"]).is_empty());
+    let mut waiter = ctx.command().args(["wait", "mixed"]).spawn().unwrap();
+    wait_for("both channel queues", || ctx.ok(&["wait", "-l", "mixed"]).lines().count() == 2);
+    // -l prints waiters first, even though the locker arrived first.
+    let names = ctx.ok(&["wait", "-l", "mixed"]);
+    ctx.ok(&["wait", "-S", "mixed"]);
+    wait_for("signal wakes waiter", || waiter.try_wait().unwrap().is_some());
+    assert!(locker.try_wait().unwrap().is_none());
+    assert_eq!(ctx.ok(&["wait", "-l", "mixed"]).trim(), names.lines().nth(1).unwrap());
+    ctx.ok(&["wait", "-w", names.lines().nth(1).unwrap(), "mixed"]);
+    wait_for("explicitly woken locker", || locker.try_wait().unwrap().is_some());
+    ctx.ok(&["wait", "-U", "mixed"]);
+    assert_eq!(ctx.fails(&["wait", "-U", "mixed"]).trim(), "channel mixed not locked");
+    ctx.ok(&["wait", "-w", "missing", "mixed"]);
+}
+
+#[test]
+fn tmux_38_empty_event_filter_and_closed_window() {
+    let ctx = Ctx::new("eventedge38");
+    ctx.ok(&["new-session", "-d", "-s", "e"]);
+    assert_eq!(ctx.fails(&["wait", "-El", "pane-exited[0]"]).trim(), "invalid event: pane-exited[0]");
+    let mut waiter = ctx.command().args(["wait", "-EF", "", "@empty"]).spawn().unwrap();
+    wait_for("empty-filter waiter", || !ctx.ok(&["wait", "-El", "@empty"]).is_empty());
+    ctx.ok(&["set-hook", "-E", "@empty"]);
+    let name = ctx.ok(&["wait", "-El", "@empty"]);
+    assert!(!name.is_empty());
+    assert!(waiter.try_wait().unwrap().is_none());
+    ctx.ok(&["wait", "-Ew", name.trim(), "@empty"]);
+    wait_for("wake filtered waiter", || waiter.try_wait().unwrap().is_some());
+    ctx.ok(&["set-hook", "-g", "window-closed", "set -gF @closed '#{hook_window_name}'"]);
+    ctx.ok(&["new-window", "-d", "-t", "e:1", "-n", "gone"]);
+    ctx.ok(&["kill-window", "-t", "e:1"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@closed"]).trim(), "gone");
+}
+
+#[test]
+fn tmux_38_hook_groups_and_suspended_context() {
+    let ctx = Ctx::new("hookgroups38");
+    ctx.ok(&["new-session", "-d", "-s", "h"]);
+    ctx.ok(&["set-hook", "-g", "after-new-window[0]", "display -p first; has-session -t absent; display -p skipped"]);
+    ctx.ok(&["set-hook", "-g", "after-new-window[1]", "display -p second"]);
+    let out = ctx.fails(&["new-window", "-d"]);
+    assert!(out.contains("first\nsecond\n") && out.contains("can't find session: absent") && !out.contains("skipped"), "{out}");
+    ctx.ok(&["set-hook", "-gu", "after-new-window"]);
+    ctx.ok(&["set-hook", "-g", "after-rename-window", "wait-for paused; display -p 'hook:#{hook}'"]);
+    let child = ctx.command().args(["rename-window", "-t", "h:0", "changed", ";", "display", "-p", "after:#{hook}"])
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    wait_for("hook waiting", || !ctx.ok(&["wait", "-l", "paused"]).is_empty());
+    ctx.ok(&["wait", "-S", "paused"]);
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hook:after-rename-window\nafter:\n");
 }

@@ -272,7 +272,7 @@ pub struct State {
 
 /// Hook names (tmux's hooks_valid_event_name): table hooks and @ names.
 pub fn valid_event_name(name: &str) -> bool {
-    name.starts_with('@') || options::hook_scope(name).is_some()
+    name.starts_with('@') || options::HOOKS.iter().any(|h| h.0 == name)
 }
 
 /// tmux's cmd_stringify_argv: arguments with spaces and other specials quoted.
@@ -796,7 +796,7 @@ impl Server {
             if !able {
                 return Err("not able to wait".into());
             }
-            return Err(format!("\0wait-event\0{name}\0{}\0{}", o.get('F').unwrap_or(""), if o.has('v') { "v" } else { "" }));
+            return Err(format!("\0wait-event\0{name}\0{}\0{}\0{}", o.get('F').unwrap_or(""), if o.has('v') { "v" } else { "" }, if o.get('F').is_some() { "F" } else { "" }));
         }
         if o.has('l') {
             if let Some(ch) = self.waits.get(&name) {
@@ -817,7 +817,7 @@ impl Server {
                 None => ch.lockers.iter().position(|q| q.ctx.reply.or(q.ctx.client).map(|c| format!("client-{c}")).unwrap_or_default() == who).map(|i| ch.lockers.remove(i)),
             };
             if let Some(q) = q {
-                if ch.is_empty() {
+                if ch.removable() {
                     self.waits.remove(&name);
                 }
                 self.ev.pending.push_back(q);
@@ -880,9 +880,9 @@ impl Server {
     }
 
     /// Parks a queue on wait-for -E (from run_queue).
-    pub fn park_event_waiter(&mut self, name: String, filter: String, verbose: bool, q: Queue) {
+    pub fn park_event_waiter(&mut self, name: String, filter: Option<String>, verbose: bool, q: Queue) {
         let client = q.ctx.reply.or(q.ctx.client);
-        self.ev.waiters.push(Waiter { name, filter: Some(filter).filter(|f| !f.is_empty()), verbose, queue: q, client });
+        self.ev.waiters.push(Waiter { name, filter, verbose, queue: q, client });
     }
 
     /// cmd_wait_for_client_lost: a client that goes away stops waiting, and the rest of
@@ -1485,10 +1485,11 @@ impl Server {
     pub(crate) fn fire_unlinked(&mut self, p: Payload, wid: WinId) {
         self.fire("window-unlinked", p);
         let linked = self.ev.seen.sessions.values().any(|s| s.links.values().any(|w| *w == wid));
-        if !linked && !self.windows.contains_key(&wid) && self.ev.seen.windows.remove(&wid).is_some() {
+        if !linked && !self.windows.contains_key(&wid) && self.ev.seen.windows.contains_key(&wid) {
             let mut p = Payload::default();
             p.set("window", self.val_window(wid));
             self.fire("window-closed", p);
+            self.ev.seen.windows.remove(&wid);
             self.ev.seen.panes.retain(|_, s| s.wid != wid);
             self.ev.latest.remove(&wid);
         }
