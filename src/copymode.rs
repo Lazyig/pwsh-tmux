@@ -493,6 +493,8 @@ pub struct CopyMode {
     lineflag: Option<bool>,
     /// A word selection (SEL_WORD): the word select-word chose and where the cursor was.
     word_origin: Option<(Pos, Pos, Pos)>,
+    /// Reset endpoints and direction origin survive selection-mode changes (selr/endselr/d).
+    selection_reset: (Pos, Pos, Pos),
     /// The selection's ends as tmux last set them, while the cursor stays at a position
     /// (moves that do not update the selection, or update it with no_reset).
     pinned: Option<(Pos, Pos, Pos)>,
@@ -566,6 +568,7 @@ impl CopyMode {
             ends_swapped: false,
             lineflag: None,
             word_origin: None,
+            selection_reset: ((0, 0), (0, 0), (0, 0)),
             pinned: None,
             rect: false,
             sel_mode: SelMode::Char,
@@ -1436,6 +1439,7 @@ impl CopyMode {
                 self.sel_mode = SelMode::Char;
             }
             "select-line" => {
+                let origin = (self.cy, self.cx);
                 self.rect = false;
                 let y = self.logical_start(self.cy);
                 self.line_mode = true;
@@ -1452,6 +1456,7 @@ impl CopyMode {
                     self.end_of_line();
                 }
                 self.sel_mode = SelMode::Line;
+                self.selection_reset = ((y, 0), (self.cy, self.len(self.cy)), origin);
             }
             "select-word" => {
                 // window_copy_cmd_select_word: back to the start of the word, then to its end
@@ -1481,7 +1486,8 @@ impl CopyMode {
                 } else {
                     (before.0, before.1.min(end.1))
                 };
-                self.word_origin = Some((start, end, d));
+                self.selection_reset = (start, end, d);
+                self.word_origin = Some(self.selection_reset);
                 self.pinned = Some((end, start, end));
             }
             "selection-mode" => match arg.map(str::to_ascii_lowercase).as_deref() {
@@ -1489,7 +1495,13 @@ impl CopyMode {
                     self.materialize();
                     self.sel_mode = SelMode::Char;
                 }
-                Some("word") | Some("w") => self.sel_mode = SelMode::Word,
+                Some("word") | Some("w") => {
+                    let slots = self.slots();
+                    self.materialize();
+                    self.sel_mode = SelMode::Word;
+                    self.word_origin = Some(self.selection_reset);
+                    self.pinned = slots.map(|(s, e)| ((self.cy, self.cx), s, e));
+                },
                 Some("line") | Some("l") => {
                     self.materialize_word();
                     self.sel_mode = SelMode::Line;
@@ -1498,18 +1510,20 @@ impl CopyMode {
                         self.rect = false;
                         self.line_mode = true;
                         let (sy, ey) = (self.logical_start(s.0), self.logical_end(e.0));
-                        let cursor_first = (self.cy, self.cx) <= s && self.frozen.is_none();
+                        let fixed = if self.ends_swapped { e } else { s };
+                        let cursor_first = (self.cy, self.cx) < fixed && self.frozen.is_none();
+                        self.selection_reset = ((sy, 0), (ey, self.len(ey)), fixed);
                         self.lineflag = Some(!cursor_first);
                         if self.frozen.is_some() {
                             self.anchor = Some((sy, 0));
                             self.frozen = Some((ey, self.max_x(ey)));
                         } else if cursor_first {
-                            self.anchor = Some((ey, self.max_x(ey)));
+                            self.anchor = Some((ey, self.len(ey)));
                             self.set_cursor(sy, 0);
                         } else {
                             self.anchor = Some((sy, 0));
                             self.cy = ey;
-                            self.cx = self.max_x(ey);
+                            self.cx = self.limit(ey, false);
                             self.ensure_visible();
                         }
                         self.word_origin = None;
@@ -1530,12 +1544,12 @@ impl CopyMode {
             }
             "other-end" => {
                 // window_copy_cmd_other_end: the selection mode goes back to char
-                if (n % 2) != 0 {
-                    self.other_end();
-                }
                 self.materialize();
                 self.word_origin = None;
                 self.sel_mode = SelMode::Char;
+                if (n % 2) != 0 {
+                    self.other_end();
+                }
             }
             "copy-selection" | "copy-pipe" => return self.copy_selection(true, false, false),
             "copy-selection-no-clear" | "copy-pipe-no-clear" => return self.copy_selection(false, false, false),
@@ -1785,52 +1799,25 @@ impl CopyMode {
 
     /// window_copy_other_end: the cursor goes to the other end of the selection.
     fn other_end(&mut self) {
-        if self.anchor.is_none() {
-            return;
-        }
-        let word = self.word_sel().map(|w| self.pinned_slots().unwrap_or(w));
-        if word.is_none() {
-            self.materialize_word();
-            self.pinned = None;
-        }
-        let Some(a) = self.anchor else { return };
-        if let Some((s, e)) = word {
-            // a word selection keeps its ends; the cursor goes to the other one
-            self.ends_swapped = !self.ends_swapped;
-            let p = if self.ends_swapped { s } else { e };
-            self.cy = p.0;
-            self.cx = p.1;
-            self.pinned = Some((p, s, e));
-            if let Some(lr) = self.lineflag.as_mut() {
-                *lr = !*lr;
-            }
-        } else if let Some(f) = self.frozen.take() {
-            // a stopped selection: its end follows the cursor again
-            self.cy = f.0;
-            self.cx = f.1;
+        let Some((mut s, mut e)) = self.slots() else { return };
+        // window_copy_cmd_other_end switches to char before synchronizing the cursor.
+        self.ends_swapped = self.frozen.is_none() && !self.ends_swapped;
+        let p = if self.ends_swapped { s } else { e };
+        self.cy = p.0;
+        self.cx = p.1.min(self.limit(p.0, self.rect));
+        if self.ends_swapped {
+            s = (self.cy, self.cx);
+            self.anchor = Some(e);
         } else {
-            // the cursor goes to the other end as tmux keeps it (a line selection's ends
-            // are at the start and end of its lines)
-            let (s, e) = self.slots().unwrap_or((a, (self.cy, self.cx)));
-            self.ends_swapped = !self.ends_swapped;
-            let (cursor, anchor) = if self.ends_swapped { (s, e) } else { (e, s) };
-            self.anchor = Some(anchor);
-            self.cy = cursor.0;
-            self.cx = cursor.1;
-            if let Some(lr) = self.lineflag.as_mut() {
-                *lr = !*lr;
-            }
+            e = (self.cy, self.cx);
+            self.anchor = Some(s);
         }
-        let hsize = self.hsize();
-        if self.cy < self.top {
-            self.top = self.cy;
-        } else if self.cy >= self.top + self.height {
-            self.top = (self.cy + 1 - self.height).min(hsize);
+        self.frozen = None;
+        self.pinned = Some(((self.cy, self.cx), s, e));
+        if let Some(lr) = self.lineflag.as_mut() {
+            *lr = !*lr;
         }
-        let px = self.limit(self.cy, self.rect);
-        if self.cx > px {
-            self.cx = px;
-        }
+        self.ensure_visible();
         self.lastcx = self.cx;
     }
 
@@ -4169,6 +4156,58 @@ mod tests {
         assert_eq!(cm.selection_mode().name(), "word");
         cm.run("selection-mode", &[]);
         assert_eq!(cm.selection_mode().name(), "char");
+    }
+
+    #[test]
+    fn selection_mode_line_keeps_vi_cursor_on_text() {
+        for vi in [true, false] {
+            let mut cm = CopyMode::new(lines(&["one two three", "ab"]), W, 2, (0, 1), vi);
+            cm.run("begin-selection", &[]);
+            cm.run("selection-mode", &["line".into()]);
+            assert_eq!(cm.cx, if vi { 12 } else { 13 });
+            assert_eq!(cm.selection_ends(), Some(((0, 0), (13, 0))));
+            cm.run("stop-selection", &[]);
+            assert_eq!(cm.selection_ends(), Some(((0, 0), (13, 0))));
+            assert_eq!(copied(cm.run("copy-selection", &[])), if vi { "one two three\n" } else { "one two three" });
+        }
+    }
+
+    #[test]
+    fn other_end_preserves_the_fixed_line_endpoint() {
+        let mut cm = CopyMode::new(lines(&["one two three", "ab"]), W, 2, (0, 1), true);
+        cm.run("select-line", &[]);
+        cm.run("selection-mode", &["char".into()]);
+        cm.run("other-end", &[]);
+        assert_eq!(pos(&cm), (0, 0));
+        assert_eq!(cm.selection_ends(), Some(((0, 0), (13, 0))));
+        assert_eq!(copied(cm.run("copy-selection-no-clear", &[])), "one two three\n");
+        cm.run("stop-selection", &[]);
+        cm.run("other-end", &[]);
+        assert_eq!(pos(&cm), (0, 12));
+        assert_eq!(cm.selection_ends(), Some(((0, 0), (12, 0))));
+        assert_eq!(copied(cm.run("copy-selection", &[])), "one two three");
+    }
+
+    #[test]
+    fn selection_mode_word_uses_reset_positions_on_motion() {
+        for vi in [true, false] {
+            let mut cm = CopyMode::new(lines(&["one two three", "ab", "longer fourth"]), W, 3, (0, 1), vi);
+            cm.run("begin-selection", &[]);
+            cm.run("selection-mode", &["word".into()]);
+            assert_eq!(cm.selection_ends(), Some(((1, 0), (1, 0))), "changing mode leaves endpoints alone");
+            cm.run("cursor-down", &[]);
+            assert_eq!(cm.selection_ends(), Some(((0, 0), (1, 1))), "motion uses reset endpoints");
+        }
+    }
+
+    #[test]
+    fn copy_without_selection_copies_the_search_match() {
+        for vi in [true, false] {
+            let mut cm = CopyMode::new(lines(&["one two three"]), W, 1, (0, 0), vi);
+            cm.run("search-forward", &["two".into()]);
+            assert_eq!(copied(cm.run("copy-selection", &[])), "two");
+            assert_eq!(cm.run("copy-selection", &[]), Action::None, "copy clears search marks");
+        }
     }
 
     #[test]
