@@ -2979,6 +2979,10 @@ impl Server {
                     return Ok(Flow::Next);
                 }
                 if o.has('X') {
+                    // cmd_send_keys_exec: only copy and view mode take commands
+                    if !matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(_))) {
+                        return err("not in a mode");
+                    }
                     let name = o.rest.first().ok_or("send-keys -X needs a command")?.clone();
                     let rest: Vec<String> = o.rest[1..].iter().map(|a| if o.has('F') { self.expand(tt, ctx.client, a) } else { a.clone() }).collect();
                     let n: usize = o.get('N').and_then(|v| v.parse().ok()).unwrap_or(1);

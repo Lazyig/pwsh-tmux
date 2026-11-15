@@ -443,3 +443,21 @@ fn find_window_opens_a_filtered_tree() {
     ctx.ok(&["find-window", "-N", "-t", "fw:0", "nosuch"]);
     t.wait_screen("unfiltered", |s| s.contains("2: other"));
 }
+
+#[test]
+fn pane_in_mode_counts_the_mode_stack_and_only_copy_mode_takes_commands() {
+    let ctx = Ctx::new("mode-count");
+    ctx.ok(&["new-session", "-d", "-s", "n"]);
+    ctx.ok(&["clock-mode", "-t", "n"]);
+    ctx.ok(&["choose-tree", "-t", "n"]);
+    // format_cb_pane_in_mode: one for each mode on the stack
+    assert_eq!(ctx.fmt("n", "#{pane_in_mode} #{pane_mode}"), "2 tree-mode");
+    // cmd_send_keys_exec: tree and clock mode have no command callback
+    assert!(ctx.fails(&["send-keys", "-t", "n", "-X", "cancel"]).contains("not in a mode"));
+    assert_eq!(ctx.fmt("n", "#{pane_in_mode}"), "2");
+    ctx.ok(&["copy-mode", "-q", "-t", "n"]);
+    assert!(ctx.fails(&["send-keys", "-t", "n", "-X", "cancel"]).contains("not in a mode"));
+    ctx.ok(&["copy-mode", "-t", "n"]);
+    ctx.ok(&["send-keys", "-t", "n", "-X", "cancel"]);
+    assert_eq!(ctx.fmt("n", "#{pane_in_mode}"), "0");
+}

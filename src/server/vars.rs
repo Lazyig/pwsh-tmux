@@ -420,7 +420,8 @@ impl Vars for VarCtx<'_> {
             "pane_dead_status" => pane.and_then(|p| p.dead).and_then(|d| d.0).map(|s| s.to_string()),
             "pane_dead_time" => pane.and_then(|p| p.dead).map(|d| d.1.to_string()),
             "pane_dead_signal" => Some(String::new()),
-            "pane_in_mode" => pane.map(|p| b(p.mode.is_some())),
+            // format_cb_pane_in_mode: the number of modes on the pane's stack
+            "pane_in_mode" => pane.map(|p| (p.mode.iter().count() + p.mode_stack.len()).to_string()),
             "pane_mode" => pane.map(|p| p.mode.as_ref().map(|m| m.name()).unwrap_or("").to_string()),
             "pane_synchronized" => t.pane.map(|p| b(options::is_on(&srv.opt_pane(p, "synchronize-panes")))),
             "pane_format" => Some(b(pane.is_some())),

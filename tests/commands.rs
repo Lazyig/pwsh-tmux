@@ -309,7 +309,12 @@ fn copy_mode_commands() {
     // view mode for command output from clock / clear-history
     ctx.ok(&["clock-mode", "-t", "c"]);
     assert_eq!(ctx.fmt("c", "#{pane_mode}"), "clock-mode");
+    // without a client the key does not reach the mode (window_pane_key), and clock mode
+    // takes no -X commands
     ctx.ok(&["send-keys", "-t", "c", "q"]);
+    assert_eq!(ctx.fmt("c", "#{pane_in_mode}"), "1");
+    assert!(ctx.fails(&["send-keys", "-t", "c", "-X", "cancel"]).contains("not in a mode"));
+    ctx.ok(&["copy-mode", "-q", "-t", "c"]);
     assert_eq!(ctx.fmt("c", "#{pane_in_mode}"), "0");
     ctx.ok(&["clear-history", "-t", "c"]);
     assert_eq!(ctx.fmt("c", "#{history_size}"), "0");
