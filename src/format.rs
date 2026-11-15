@@ -1901,6 +1901,9 @@ pub fn spans(text: &str, base: Style) -> Vec<Span> {
     let mut range: Option<Range> = None;
     let mut range_start = 0;
     let mut buf = String::new();
+    // list=left-marker/right-marker text is only shown by tmux when the list is
+    // cut; lists are never cut here, so it is dropped
+    let mut in_marker = false;
 
     fn flush(out: &mut Vec<Span>, buf: &mut String, style: Style, align: Align, range: &Option<Range>, link: &Option<String>) {
         if buf.is_empty() {
@@ -1924,7 +1927,9 @@ pub fn spans(text: &str, base: Style) -> Vec<Span> {
     while i < text.len() {
         let rest = &text[i..];
         if rest.starts_with("##") {
-            buf.push('#');
+            if !in_marker {
+                buf.push('#');
+            }
             i += 2;
         } else if rest.starts_with("#[")
             && let Some(e) = rest.find(']')
@@ -1955,6 +1960,8 @@ pub fn spans(text: &str, base: Style) -> Vec<Span> {
                     }
                     "pop-default" => default = defaults.pop().unwrap_or(base),
                     "norange" => range = None,
+                    "list=left-marker" | "list=right-marker" => in_marker = true,
+                    "list=on" | "list=focus" | "nolist" => in_marker = false,
                     _ if lower.starts_with("range=") => {
                         if let Ok(r) = Range::parse(&w[6..]) {
                             range = r;
@@ -1984,7 +1991,9 @@ pub fn spans(text: &str, base: Style) -> Vec<Span> {
             i += e + 1;
         } else {
             let c = rest.chars().next().unwrap();
-            buf.push(c);
+            if !in_marker {
+                buf.push(c);
+            }
             i += c.len_utf8();
         }
     }
@@ -2834,6 +2843,13 @@ mod tests {
         // Unterminated directive is text.
         assert_eq!(spans("#[fg=red", base)[0].text, "#[fg=red");
         assert!(spans("", base).is_empty());
+    }
+
+    #[test]
+    fn list_markers_are_not_drawn() {
+        let base = Style::default();
+        let text: String = spans("P: #[list=on]#[list=left-marker]<#[list=right-marker]>#[list=on]a b#[nolist] R", base).iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(text, "P: a b R");
     }
 
     #[test]

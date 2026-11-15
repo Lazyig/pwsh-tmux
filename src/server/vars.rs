@@ -269,7 +269,15 @@ impl Vars for VarCtx<'_> {
             "buffer_mode_format" => Some("#{t/p:buffer_created}: #{buffer_sample}".into()),
             "client_mode_format" => Some("#[fg=themelightgrey]#{t/p:client_activity}: session #[default]#{session_name}".into()),
             "tree_mode_format" => Some(TREE_MODE_FORMAT.into()),
-            "buffer_full" => self.extra.get("buffer_name").and_then(|n| srv.buffers.iter().find(|b| &b.name == n)).map(|b| String::from_utf8_lossy(&b.data).into_owned()),
+            // outside a buffer list, buffer_* describe the most recent automatic
+            // buffer (format_defaults: paste_get_top)
+            "buffer_name" | "buffer_size" | "buffer_sample" | "buffer_created" => {
+                srv.buffers.iter().find(|b| b.automatic).and_then(|b| super::cmds::buffer_vars(b).remove(name))
+            }
+            "buffer_full" => match self.extra.get("buffer_name") {
+                Some(n) => srv.buffers.iter().find(|b| &b.name == n),
+                None => srv.buffers.iter().find(|b| b.automatic),
+            }.map(|b| String::from_utf8_lossy(&b.data).into_owned()),
             // session
             "session_name" => sess.map(|s| s.name.clone()),
             "session_id" => sess.map(|s| format!("${}", s.id)),

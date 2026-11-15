@@ -1196,6 +1196,18 @@ fn display_defaults_match_tmux_38_source() {
 }
 
 #[test]
+fn display_formats_see_the_top_buffer_and_drop_list_markers() {
+    let ctx = Ctx::new("display-buffer-vars");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "80", "-y", "24"]);
+    assert_eq!(ctx.fmt("s", "[#{buffer_size}]"), "[]");
+    // format_defaults: buffer_* describe the most recent automatic buffer
+    ctx.ok(&["set-buffer", "hello buffer"]);
+    ctx.ok(&["set-buffer", "-b", "named", "not automatic"]);
+    assert_eq!(ctx.fmt("s", "#{buffer_size}:#{buffer_sample}:#{buffer_name}"), "12:hello buffer:buffer0");
+    assert_eq!(ctx.fmt("s", "#{?#{&&:#{buffer_size},#{!:#{pane_in_mode}}},Paste,}"), "Paste");
+}
+
+#[test]
 fn display_layout_options_and_session_styles() {
     let ctx = Ctx::new("display-layouts");
     ctx.ok(&["new-session", "-d", "-s", "s", "-x", "120", "-y", "50"]);
