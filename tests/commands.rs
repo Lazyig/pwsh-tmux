@@ -1037,6 +1037,17 @@ fn run_shell_paste_and_display_flags() {
         assert_eq!(ctx.ok(&["run-shell", both]).trim(), "out");
         let shown = ctx.ok(&["run-shell", "-E", both]);
         assert!(shown.contains("out") && shown.contains("err"), "{shown}");
+        // the shell is "sh"; a failure is printed after the output and the client
+        // exits with the command's status (signals as 128 + the signal)
+        assert_eq!(ctx.ok(&["run-shell", "echo $0"]).trim(), "sh");
+        let out = ctx.command().args(["run-shell", "echo out; exit 3", ";", "display", "-p", "after"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "out\n'echo out; exit 3' returned 3\nafter\n");
+        assert!(out.stderr.is_empty(), "{out:?}");
+        let out = ctx.command().args(["run-shell", "kill -9 $$"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(137));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "'kill -9 $$' terminated by signal 9\n");
+        assert_eq!(ctx.command().args(["run-shell", "-b", "exit 4"]).output().unwrap().status.code(), Some(0));
     }
     assert_eq!(ctx.ok(&["run", "-d", "0.1", "-s", "x", "echo delayed"]).trim(), "delayed");
     // display-message -l/-F/-j

@@ -644,6 +644,16 @@ pub struct ClientIo {
     pub discarded: std::sync::atomic::AtomicU64,
 }
 
+#[cfg(unix)]
+fn exit_signal(s: &std::process::ExitStatus) -> Option<i32> {
+    std::os::unix::process::ExitStatusExt::signal(s)
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
@@ -738,6 +748,8 @@ pub struct Ctx {
     pub readonly: bool,
     /// Files being sourced (innermost last), for #{current_file}.
     pub files: Vec<String>,
+    /// The exit status for the command-line client (c->retval: run-shell sets it).
+    pub retval: i32,
 }
 
 /// Queue markers source-file puts around a file's commands (never typed: they start with NUL).
@@ -1567,17 +1579,23 @@ impl Server {
         let mut queue = parked.queue;
         match parked.kind {
             JobKind::RunShell { pane, background, .. } => {
+                // cmd_run_shell_callback: a failure is printed after the output, and
+                // a command-line client exits with the status
+                let mut output = output;
+                if status != 0 && !background {
+                    let msg = if status < 0 { format!("'{}' terminated by signal {}", parked.cmd, -status) } else { format!("'{}' returned {status}", parked.cmd) };
+                    if !output.is_empty() && !output.ends_with('\n') {
+                        output.push('\n');
+                    }
+                    output.push_str(&msg);
+                    output.push('\n');
+                    queue.ctx.retval = if status < 0 { 128 - status } else { status };
+                }
                 if !output.is_empty() && !background {
                     if queue.ctx.reply.is_some_and(|c| !self.clients.get(&c).is_some_and(|c| c.attached)) {
                         queue.ctx.out.push_str(&output);
                     } else if let Some(p) = pane.or(queue.ctx.pane) {
                         self.view_output(p, &output);
-                    }
-                }
-                if status != 0 && !background {
-                    let msg = format!("'{}' returned {status}", "run-shell");
-                    if let Some(cid) = queue.ctx.client.filter(|c| self.clients.get(c).is_some_and(|c| c.attached)) {
-                        self.set_message(cid, &msg);
                     }
                 }
             }
@@ -2552,6 +2570,11 @@ impl Server {
             }
             match err {
                 Some(e) => c.send(S_REPLY, &encode_reply(1, &format!("{}{e}", &*ctx.out))),
+                // the output goes to stdout even when the exit status is not 0
+                None if ctx.retval != 0 => {
+                    c.send(S_STDOUT, ctx.out.as_bytes());
+                    c.send(S_REPLY, &encode_reply(ctx.retval as u8, ""));
+                }
                 None => c.send(S_REPLY, &encode_reply(0, &ctx.out)),
             }
             return;
@@ -2599,7 +2622,8 @@ impl Server {
         let pid = child.as_ref().ok().map(|c| c.id());
         thread::spawn(move || {
             let (status, out) = match child.and_then(|c| c.wait_with_output()) {
-                Ok(o) => (o.status.code().unwrap_or(1), String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr)),
+                // a signal is passed on as its negated number
+                Ok(o) => (o.status.code().or_else(|| exit_signal(&o.status).map(|s| -s)).unwrap_or(1), String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr)),
                 Err(e) => (127, format!("{e}\n")),
             };
             let _ = tx.send(Event::Job(id, status, out));
