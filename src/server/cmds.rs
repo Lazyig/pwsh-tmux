@@ -1387,10 +1387,15 @@ impl Server {
                 // -r toggles read-only and also reverses the -n/-p order; -F is accepted and
                 // unused, as in tmux
                 if o.has('r') {
+                    // only the server's own user may make a read-only client writable
+                    let own_user = ctx.client.or(ctx.reply).and_then(|c| self.clients.get(&c))
+                        .is_some_and(|c| c.user.as_ref().is_none_or(|u| *u == self.owner));
                     let c = self.clients.get_mut(&cid).unwrap();
-                    if c.is_readonly() { return err("client is read-only"); }
-                    // read-only and ignore-size together
-                    c.readonly = !c.readonly;
+                    if c.is_readonly() && !own_user { return err("client is read-only"); }
+                    // read-only and ignore-size together (also the read-only of server-access -r)
+                    let ro = c.is_readonly();
+                    c.readonly = !ro;
+                    c.acl_readonly &= !ro;
                     c.ctl.ignore_size = c.readonly;
                     if t.is_none() && !o.has('n') && !o.has('p') && !o.has('l') {
                         return Ok(Flow::Next);

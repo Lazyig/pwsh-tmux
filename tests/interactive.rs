@@ -413,6 +413,11 @@ fn attach_flags_environment_and_destroy() {
     wait_for("moved to a1", || ctx.ok(&["list-clients", "-F", "#{session_name}"]).trim() == "a1");
     ctx.ok(&["refresh-client", "-t", &client, "-f", "!ignore-size,!no-detach-on-destroy"]);
     assert_eq!(ctx.ok(&["list-clients", "-F", "#{client_flags}"]).trim_end(), "attached,focused,UTF-8");
+    // switch-client -r toggles read-only and ignore-size; the server's user may turn it off
+    ctx.ok(&["switch-client", "-c", &client, "-r"]);
+    assert_eq!(ctx.ok(&["list-clients", "-F", "#{client_flags}"]).trim_end(), "attached,focused,ignore-size,read-only,UTF-8");
+    ctx.ok(&["switch-client", "-c", &client, "-r"]);
+    assert_eq!(ctx.ok(&["list-clients", "-F", "#{client_flags}"]).trim_end(), "attached,focused,UTF-8");
 }
 
 #[test]
