@@ -854,6 +854,7 @@ impl Server {
                 c.input_state.tty_cstyle = m.cursor_style;
             }
             if pm.is_none_or(|p| p.appesc != m.appesc) && (m.appesc || pm.is_some_and(|p| p.appesc)) { out.push_str(&features::string_capability(&c.term_caps, if m.appesc { "Enesc" } else { "Dsesc" }, if m.appesc { "\x1b[?7727h" } else { "\x1b[?7727l" }, &[])); }
+            c.input_state.tty_appesc = m.appesc;
             if pm.map_or(0, |p| p.extkeys) != m.extkeys {
                 // modifyOtherKeys: have the terminal report keys like C-Enter distinctly
                 out.push_str(match m.extkeys {

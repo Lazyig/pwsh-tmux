@@ -23,7 +23,7 @@ impl Client {
         if self.input_state.tty_ccolour.is_some() {
             out.push_str(&features::string_capability(&self.term_caps, "Cr", "\x1b]112\x07", &[]));
         }
-        if self.features.has("appesc") {
+        if self.input_state.tty_appesc {
             out.push_str(&features::string_capability(&self.term_caps, "Dsesc", "\x1b[?7727l", &[]));
         }
         out
@@ -32,11 +32,12 @@ impl Client {
     /// Before the client gives up the terminal (exit, suspend, lock): reset it and forget what
     /// it was given, so a later redraw sends it again.
     pub(super) fn tty_stop(&mut self) {
-        if self.control != 0 || !self.attached { return; }
+        if self.control != 0 { return; }
         let out = self.tty_stop_sequence();
         if !out.is_empty() { self.send(S_OUTPUT, out.as_bytes()); }
         self.input_state.tty_cstyle = 0;
         self.input_state.tty_ccolour = None;
+        self.input_state.tty_appesc = false;
     }
 }
 
@@ -53,6 +54,8 @@ pub struct InputState {
     /// What the outer terminal was last given (tty->cstyle, tty->ccolour).
     pub(super) tty_cstyle: u8,
     pub(super) tty_ccolour: Option<(u8, u8, u8)>,
+    /// Application escape mode was turned on (Enesc).
+    pub(super) tty_appesc: bool,
 }
 
 // The default mouse menus of tmux 3.6a (key-bindings.c).

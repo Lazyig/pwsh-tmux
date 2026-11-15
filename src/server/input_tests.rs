@@ -430,6 +430,25 @@ fn input_cursor_colour_and_terminal_reset_on_exit() {
 }
 
 #[test]
+fn input_detach_resets_cursor_and_application_escape() {
+    // detach_client clears `attached` before the exit message; the reset must still be sent
+    let mut f = fixture(); let pane = f.pane;
+    f.clients.get_mut(&1).unwrap().features.parse("appesc", &[',']);
+    f.panes.get_mut(&pane).unwrap().options.set("cursor-style", "block".into());
+    f.clients.get_mut(&1).unwrap().prev = None; f.render(1);
+    assert!(frames(&f, S_OUTPUT).windows(8).any(|w| w == b"\x1b[?7727h"));
+    f.detach_client(1, "[detached]");
+    let out = frames(&f, S_OUTPUT);
+    assert_eq!(out, b"\x1b[0 q\x1b[?7727l", "{:?}", String::from_utf8_lossy(&out));
+    // nothing for a client whose terminal was never given anything
+    let mut f = fixture();
+    f.clients.get_mut(&1).unwrap().features.parse("appesc", &[',']);
+    f.output.try_iter().for_each(drop);
+    f.detach_client(1, "[detached]");
+    assert!(frames(&f, S_OUTPUT).is_empty());
+}
+
+#[test]
 fn input_prompt_history_types_paths_and_save_at_exit() {
     let mut f = fixture();
     let path = std::env::temp_dir().join(format!("pwsh-input-typed-{}-{}", std::process::id(), now_ms()));

@@ -710,7 +710,9 @@ impl Client {
                 return;
             }
         }
-        if self.control == 0 && self.attached {
+        // detach and session exit clear `attached` first; the reset depends only on what the
+        // terminal was given, which is nothing for a command client
+        if self.control == 0 {
             let reset = self.tty_stop_sequence();
             if !reset.is_empty() { self.send(S_OUTPUT, reset.as_bytes()); }
         }
