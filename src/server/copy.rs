@@ -375,9 +375,9 @@ impl Server {
             "selection_present" => b(cm.selection_present()),
             "selection_mode" => cm.selection_mode().name().to_string(),
             "search_present" => b(cm.search_present()),
-            "search_timed_out" => "0".into(),
+            "search_timed_out" => b(cm.search_timed_out()),
             "search_count" => cm.search_count()?.to_string(),
-            "search_count_partial" => cm.search_count().map(|_| "0".to_string())?,
+            "search_count_partial" => cm.search_count().map(|_| b(cm.search_count_partial()))?,
             "search_match" => cm.search_match()?,
             // the time lines entered the history is not kept
             "top_line_time" => "0".into(),
