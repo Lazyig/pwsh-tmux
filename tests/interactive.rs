@@ -445,6 +445,37 @@ fn floating_panes_follow_mouse_drags() {
 }
 
 #[test]
+fn modal_panes_keep_their_drags_and_status_clicks() {
+    let ctx = Ctx::new("float-modal-mouse");
+    let t = start(&ctx, "mm");
+    ctx.ok(&["set", "-g", "mouse", "on"]);
+    t.wait_screen("mouse mode on", |_| t.raw_text().contains("\x1b[?1006h"));
+    ctx.ok(&["new-window", "-d", "-t", "mm:1", "-n", "other", "cat"]);
+    let m = ctx.ok(&["new-pane", "-O", "-C", "-P", "-F", "#{pane_id}", "-t", "mm:0", "-x", "30", "-y", "8", "-X", "20", "-Y", "6", "cat"]).trim().to_string();
+    t.wait_screen("modal pane", |s| s.contains('┌'));
+    // a fast drag of the top border leaves the modal pane but still moves it (modal_drag)
+    t.mouse(0, 29, 6, false);
+    t.mouse(32, 30, 6, false);
+    t.mouse(32, 59, 17, false);
+    t.mouse(0, 59, 17, true);
+    wait_for("modal pane dragged", || ctx.fmt(&m, "#{pane_width}x#{pane_height} #{pane_x},#{pane_y}") == "28x6 51,18");
+    // a status line click is no click outside the modal pane: it selects the window
+    std::thread::sleep(Duration::from_millis(400));
+    let status = t.row(29);
+    let col = status.find("1:other").unwrap_or_else(|| panic!("{status:?}")) as u16;
+    t.mouse(0, col, 29, false);
+    t.mouse(0, col, 29, true);
+    wait_for("window selected from the status line", || ctx.fmt("mm", "#{window_index}") == "1");
+    assert_eq!(ctx.fmt("mm:0", "#{window_modal_pane}"), m);
+    // a press in the window outside closes the -C pane
+    ctx.ok(&["select-window", "-t", "mm:0"]);
+    std::thread::sleep(Duration::from_millis(400));
+    t.mouse(0, 5, 5, false);
+    t.mouse(0, 5, 5, true);
+    wait_for("modal pane closed by the click", || ctx.fmt("mm:0", "#{window_modal_pane}").is_empty());
+}
+
+#[test]
 fn floating_pane_default_mouse_bindings_and_pane_list() {
     let ctx = Ctx::new("float-bind");
     let t = start(&ctx, "fb");

@@ -199,16 +199,30 @@ impl Server {
                 }
             }
         };
-        // a press outside a modal pane closes it with new-pane -C
-        if matches!(ty, Type::Down | Type::Second | Type::Triple) {
-            if let Some(modal) = self.modal_outside(cid, x, y) {
-                if self.panes.get(&modal).is_some_and(|p| p.fflags & super::float::CLOSE_ON_CLICK != 0) {
-                    self.kill_pane(modal);
-                    return;
+        // the window area outside a modal pane (not the status line): a drag of the modal
+        // pane goes on with it, anything else ends the drag and is dropped, and a press
+        // closes a new-pane -C pane
+        let mut held = None;
+        if let Some(modal) = self.modal_outside(cid, x, y) {
+            let c = self.clients.get_mut(&cid).unwrap();
+            let drag_pane = c.drag.as_ref().and_then(|d| match d.kind {
+                DragKind::Copy { pane } | DragKind::Float { pane, .. } | DragKind::NewFloat { pane, .. } => Some(pane),
+                DragKind::Border => None,
+            });
+            if c.mouse_drag_flag != 0 && matches!(ty, Type::Drag | Type::Up) && drag_pane == Some(modal) {
+                held = Some(modal);
+            } else {
+                c.mouse_drag_flag = 0;
+                if let Some(Drag { kind: DragKind::Copy { pane } }) = c.drag.take() {
+                    self.copy_drag_timers.remove(&pane);
                 }
+                if matches!(ty, Type::Down | Type::Second | Type::Triple) && self.panes.get(&modal).is_some_and(|p| p.fflags & super::float::CLOSE_ON_CLICK != 0) {
+                    self.kill_pane(modal);
+                }
+                return;
             }
         }
-        let Some((wh, mut ctx)) = self.mouse_where(cid, x, y) else { return };
+        let Some((wh, mut ctx)) = self.mouse_where(cid, x, y, held) else { return };
         ctx.x = m.x;
         ctx.y = m.y;
         ctx.lx = lx;
@@ -250,7 +264,7 @@ impl Server {
     }
 
     /// What is at client position (x, y): a status line range, a pane or a border.
-    fn mouse_where(&self, cid: ClientId, x: u16, y: u16) -> Option<(Where, MouseCtx)> {
+    fn mouse_where(&self, cid: ClientId, x: u16, y: u16, held: Option<PaneId>) -> Option<(Where, MouseCtx)> {
         let sid = self.client_session(cid)?;
         let s = &self.sessions[&sid];
         let c = &self.clients[&cid];
@@ -301,6 +315,11 @@ impl Server {
         // floating panes are above the tiled ones and their status lines; nothing outside a
         // modal pane can be reached (tmux window_get_active_at)
         match self.float_at(wid, x as i32, py as i32) {
+            // a drag held by the modal pane outside it (tmux modal_drag)
+            Some(None) if held.is_some() => {
+                ctx.pane = held;
+                return Some((Where::Pane, ctx));
+            }
             Some(None) => return None,
             Some(Some(p)) => {
                 ctx.pane = Some(p);
@@ -461,9 +480,22 @@ impl Server {
     fn modal_outside(&self, cid: ClientId, x: u16, y: u16) -> Option<PaneId> {
         let sid = self.client_session(cid)?;
         let wid = self.sessions[&sid].active_window();
-        let modal = self.windows[&wid].modal?;
-        let nstatus = self.status_lines(Some(sid)).min(self.clients[&cid].size.1.saturating_sub(1));
-        let py = if self.opt_session(Some(sid), "status-position") == "top" { y.checked_sub(nstatus)? } else { y };
+        let w = &self.windows[&wid];
+        let modal = w.modal?;
+        // only the window area: tmux checks the modal pane where the event is on no status
+        // line, and drops events past the window first
+        let ch = self.clients[&cid].size.1;
+        let nstatus = self.status_lines(Some(sid)).min(ch.saturating_sub(1));
+        let top = self.opt_session(Some(sid), "status-position") == "top";
+        let py = match (nstatus, top) {
+            (0, _) => y,
+            (n, true) => y.checked_sub(n)?,
+            (n, false) if y >= ch - n => return None,
+            _ => y,
+        };
+        if x > w.sx || py > w.sy {
+            return None;
+        }
         (!self.float_contains(wid, modal, x as i32, py as i32)).then_some(modal)
     }
 
