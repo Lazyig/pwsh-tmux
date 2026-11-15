@@ -596,6 +596,16 @@ const FONT: [(char, [&str; 5]); 14] = [
 
 /// Draws `text` in 5x5 block digits centred in the rect; returns false if it doesn't fit.
 pub fn big_text(f: &mut super::render::Frame, r: Rect, text: &str, colour: Color) -> bool {
+    big_text_cells(f, r, text, Cell { text: " ".into(), style: Style { bg: colour, ..Style::default() } })
+}
+
+/// window_clock_draw: the clock's blocks are '#' in its colour on its colour, so they still
+/// show on terminals without colours.
+pub fn big_clock(f: &mut super::render::Frame, r: Rect, text: &str, colour: Color) -> bool {
+    big_text_cells(f, r, text, Cell { text: "#".into(), style: Style { fg: colour, bg: colour, ..Style::default() } })
+}
+
+fn big_text_cells(f: &mut super::render::Frame, r: Rect, text: &str, block: Cell) -> bool {
     let n = text.chars().count() as u16;
     let width = n * 6;
     if r.w < width || r.h < 5 {
@@ -603,13 +613,12 @@ pub fn big_text(f: &mut super::render::Frame, r: Rect, text: &str, colour: Color
     }
     let x0 = r.x + (r.w - width) / 2;
     let y0 = r.y + (r.h - 5) / 2;
-    let block = Style { bg: colour, ..Style::default() };
     for (i, ch) in text.chars().enumerate() {
         let Some((_, rows)) = FONT.iter().find(|(c, _)| *c == ch) else { continue };
         for (dy, row) in rows.iter().enumerate() {
             for (dx, b) in row.chars().enumerate() {
                 if b == '#' {
-                    f.set(x0 + i as u16 * 6 + dx as u16, y0 + dy as u16, Cell { text: " ".into(), style: block });
+                    f.set(x0 + i as u16 * 6 + dx as u16, y0 + dy as u16, block.clone());
                 }
             }
         }

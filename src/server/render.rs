@@ -461,7 +461,7 @@ impl Server {
                 let colour = format::parse_color_with(&value, Some(&ctx)).unwrap_or(Color::Idx(4));
                 let text = clock_text(self.opt_window(Some(wid), "clock-mode-style") != "12");
                 let rr = Rect { y: oy + cr.y, h: cr.h.saturating_sub(1), ..cr };
-                if cr.h < 6 || !big_text(&mut f, rr, &text, colour) {
+                if cr.h < 6 || !super::modes::big_clock(&mut f, rr, &text, colour) {
                     f.text(cr.x, oy + cr.y + cr.h / 2, &text, Style { fg: colour, ..Style::default() }, cr.x + cr.w);
                 }
             }
