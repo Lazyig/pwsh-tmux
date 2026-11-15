@@ -570,7 +570,8 @@ impl Server {
                 let status = self.pane_status(wid, id);
                 if status != "off" {
                     let by = if status == "top" { top } else { bot };
-                    let (cells, _) = self.pane_status_line(id, g.w.saturating_sub(2) as usize, st);
+                    let width = self.pane_status_width(wid, id, (g.x + 2, by), g.w.saturating_sub(2) as usize, clip);
+                    let (cells, _) = if width > 0 { self.pane_status_line(id, width, st) } else { Default::default() };
                     for (i, c) in cells.into_iter().enumerate() {
                         let x = g.x + 2 + i as i32;
                         if let Some(c) = c.filter(|_| x >= 0 && by >= 0 && x < clip.0 as i32 && by < clip.1 as i32 && x < r) {
@@ -684,7 +685,9 @@ impl Server {
                 for x in r.x..r.right() {
                     if x >= r.x + 2 || !at(x as i32, by as i32) { f.set(x, oy + by, Cell { text: bset[0].into(), style: st }); }
                 }
-                let (cells, _) = self.pane_status_line(*id, r.w.saturating_sub(2) as usize, st);
+                let clip = (cw.min(win.sx), area_h.min(win.sy));
+                let width = self.pane_status_width(wid, *id, (r.x as i32 + 2, by as i32), r.w.saturating_sub(2) as usize, clip);
+                let (cells, _) = if width > 0 { self.pane_status_line(*id, width, st) } else { Default::default() };
                 for (i, c) in cells.into_iter().enumerate() {
                     if let Some(c) = c.filter(|_| r.x as usize + 2 + i < cw as usize) {
                         f.set(r.x + 2 + i as u16, oy + by, c);

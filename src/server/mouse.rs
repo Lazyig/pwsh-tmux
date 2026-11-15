@@ -312,6 +312,8 @@ impl Server {
         if x > w.sx || py > w.sy {
             return None;
         }
+        // the window columns and rows shown on the client
+        let clip = (c.size.0.min(w.sx), (ch - nstatus).min(w.sy));
         // floating panes are above the tiled ones and their status lines; nothing outside a
         // modal pane can be reached (tmux window_get_active_at)
         match self.float_at(wid, x as i32, py as i32) {
@@ -329,7 +331,7 @@ impl Server {
                 if inside {
                     return Some((Where::Pane, ctx));
                 }
-                let wh = self.status_control(wid, p, xi, yi, (g.x, g.y, g.w, g.h)).map_or(Where::Border, Where::Control);
+                let wh = self.status_control(clip, wid, p, xi, yi, (g.x, g.y, g.w, g.h)).map_or(Where::Border, Where::Control);
                 return Some((wh, ctx));
             }
             None => {}
@@ -339,7 +341,7 @@ impl Server {
         if self.opt_window(Some(wid), "pane-border-status") == "top" {
             if let Some((pane, r)) = rects.iter().find(|(_, r)| r.y > 0 && py == r.y - 1 && x >= r.x && x <= r.right()) {
                 ctx.pane = Some(*pane);
-                let wh = self.status_control(wid, *pane, x as i32, py as i32, (r.x as i32, r.y as i32, r.w, r.h)).map_or(Where::Border, Where::Control);
+                let wh = self.status_control(clip, wid, *pane, x as i32, py as i32, (r.x as i32, r.y as i32, r.w, r.h)).map_or(Where::Border, Where::Control);
                 return Some((wh, ctx));
             }
         }
@@ -352,7 +354,7 @@ impl Server {
         if x < r.right() && py < r.bottom() {
             return Some((Where::Pane, ctx));
         }
-        if let Some(n) = self.status_control(wid, pane, x as i32, py as i32, (r.x as i32, r.y as i32, r.w, r.h)) {
+        if let Some(n) = self.status_control(clip, wid, pane, x as i32, py as i32, (r.x as i32, r.y as i32, r.w, r.h)) {
             return Some((Where::Control(n), ctx));
         }
         if !w.zoomed {
@@ -462,15 +464,16 @@ impl Server {
 
     /// The control range (`range=control|N`) of a pane's status line at window position
     /// (x, y), for a pane with content at `g` (tmux window_pane_status_get_range).
-    fn status_control(&self, wid: WinId, pane: PaneId, x: i32, y: i32, (gx, gy, gw, gh): (i32, i32, u16, u16)) -> Option<u32> {
+    fn status_control(&self, clip: (u16, u16), wid: WinId, pane: PaneId, x: i32, y: i32, (gx, gy, gw, gh): (i32, i32, u16, u16)) -> Option<u32> {
         let line = match self.pane_status(wid, pane) {
             "top" => gy - 1,
             "bottom" => gy + gh as i32,
             _ => return None,
         };
-        // the line starts two cells in
+        // the line starts two cells in, as wide as it is drawn
         let i = usize::try_from(x - gx - 2).ok().filter(|_| y == line)?;
-        match self.pane_status_line(pane, gw.saturating_sub(2) as usize, crate::cells::Style::default()).1.get(i)? {
+        let width = self.pane_status_width(wid, pane, (gx + 2, line), gw.saturating_sub(2) as usize, clip);
+        match self.pane_status_line(pane, width, crate::cells::Style::default()).1.get(i)? {
             Some(Range::Control(n)) => Some(*n),
             _ => None,
         }

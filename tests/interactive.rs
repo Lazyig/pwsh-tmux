@@ -461,6 +461,33 @@ fn floating_pane_above_the_active_floating_pane_hides_its_cursor() {
 }
 
 #[test]
+fn pane_status_lines_fit_what_floating_panes_leave_visible() {
+    let ctx = Ctx::new("float-status-width");
+    let t = start(&ctx, "sw");
+    ctx.ok(&["set", "-g", "status", "off"]);
+    ctx.ok(&["set", "-g", "pane-border-status", "top"]);
+    ctx.ok(&["set", "-g", "pane-border-format", "#[align=left]L#{pane_index}#[align=right]R#{pane_index}"]);
+    // clipped by the window edge: formatted to the last column but one (its border)
+    ctx.ok(&["new-pane", "-t", "sw", "-x", "16", "-y", "4", "-X", "90", "-Y", "4", "cat"]);
+    t.wait_screen("clipped floating status", |_| t.row(4).ends_with("┌──L1──R1─"));
+    // covering the right end of the tiled status line: R0 moves left of it
+    ctx.ok(&["move-pane", "-t", "sw", "-X", "90", "-Y", "0"]);
+    t.wait_screen("covered tiled status", |_| t.row(0).ends_with("──R0┌──L1──R1─"));
+    assert!(t.row(0).starts_with("──L0──"), "{:?}", t.row(0));
+    // the default format's controls are clicked where they are drawn
+    ctx.ok(&["set", "-gu", "pane-border-format"]);
+    ctx.ok(&["set", "-g", "mouse", "on"]);
+    ctx.ok(&["bind", "-n", "MouseDown1Control8", "set -gF @hit '8 #{pane_index}'"]);
+    t.wait_screen("controls left of the floating pane", |_| t.row(0).contains("[f][z][x]┌"));
+    t.wait_screen("mouse mode on", |_| t.raw_text().contains("\x1b[?1006h"));
+    let row = t.row(0);
+    let col = row[..row.find("[z]").unwrap()].chars().count() as u16;
+    t.mouse(0, col + 1, 0, false);
+    t.mouse(0, col + 1, 0, true);
+    wait_for("[z] hit", || ctx.ok(&["show", "-gqv", "@hit"]).trim() == "8 0");
+}
+
+#[test]
 fn modal_panes_keep_their_drags_and_status_clicks() {
     let ctx = Ctx::new("float-modal-mouse");
     let t = start(&ctx, "mm");

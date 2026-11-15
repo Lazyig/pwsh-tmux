@@ -463,6 +463,32 @@ impl Server {
         Some(node.to_json_layout(area, &info))
     }
 
+    /// tmux redraw_pane_status_width: how wide a pane status line is formatted. Its cells
+    /// start two in from the pane (`x0`) on row `by` of the window; only those on the client
+    /// (`clip`, window columns and rows shown), inside the window for a floating pane and not
+    /// under a floating pane above it count, and the line ends with the last of them. 0 when
+    /// none is shown.
+    pub fn pane_status_width(&self, wid: WinId, pane: PaneId, (x0, by): (i32, i32), full: usize, clip: (u16, u16)) -> usize {
+        let Some(w) = self.windows.get(&wid) else { return 0 };
+        if by < 0 || by >= clip.1 as i32 {
+            return 0;
+        }
+        let floats = self.float_rects(wid);
+        let floating = floats.iter().any(|(p, _)| *p == pane);
+        // a floating pane clipped by the window edge has its right border on the last column
+        let mut end = x0 + full as i32;
+        if floating {
+            end = end.min(w.sx as i32 - 1);
+        }
+        end = end.min(clip.0 as i32);
+        let above: Vec<PaneId> = if floating {
+            floats.iter().skip_while(|(p, _)| *p != pane).skip(1).map(|(p, _)| *p).collect()
+        } else {
+            floats.iter().map(|(p, _)| *p).collect()
+        };
+        (x0.max(0)..end).rev().find(|x| !above.iter().any(|p| self.float_contains(wid, *p, *x, by))).map_or(0, |x| (x - x0 + 1) as usize)
+    }
+
     /// What a %layout-change is about, the same in either layout format: the tiled layout,
     /// the floating panes and the zoom. Not the active pane or the z-order it raises (tmux
     /// tells control clients on window-layout-changed only).
@@ -1551,6 +1577,28 @@ mod tests {
         assert_eq!(cur(&mut srv), "3\n");
         ok(&mut srv, &["join-pane", "-s", "j:2.0", "-t", "j:0.0"]);
         assert_eq!(cur(&mut srv), "0\n");
+        srv.shutdown();
+    }
+
+    #[test]
+    fn pane_status_width_is_the_visible_part() {
+        let (mut srv, _ev) = server();
+        ok(&mut srv, &["new-session", "-d", "-s", "s", "-x", "40", "-y", "10"]);
+        ok(&mut srv, &["set", "-g", "pane-border-status", "top"]);
+        let wid = win(&srv);
+        let tiled = srv.windows[&wid].active;
+        let p: PaneId = ok(&mut srv, &["new-pane", "-P", "-F", "#{pane_id}", "-x", "16", "-y", "4", "-X", "30", "-Y", "4"]).trim().trim_start_matches('%').parse().unwrap();
+        // the floating pane's right border is clamped to the last column
+        assert_eq!(srv.pane_status_width(wid, p, (33, 4), 12, (40, 10)), 6);
+        assert_eq!(srv.pane_status_width(wid, p, (33, 4), 12, (36, 10)), 3);
+        assert_eq!(srv.pane_status_width(wid, p, (33, 4), 12, (40, 4)), 0);
+        // the tiled status ends left of the floating pane covering its right end, but a
+        // floating pane in the middle leaves the end visible
+        assert_eq!(srv.pane_status_width(wid, tiled, (2, 0), 38, (40, 10)), 38);
+        ok(&mut srv, &["move-pane", "-t", &format!("%{p}"), "-X", "30", "-Y", "0"]);
+        assert_eq!(srv.pane_status_width(wid, tiled, (2, 0), 38, (40, 10)), 28);
+        ok(&mut srv, &["move-pane", "-t", &format!("%{p}"), "-X", "10", "-Y", "0"]);
+        assert_eq!(srv.pane_status_width(wid, tiled, (2, 0), 38, (40, 10)), 38);
         srv.shutdown();
     }
 
