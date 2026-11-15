@@ -483,3 +483,62 @@ fn display_menu_and_popup_use_configured_border_lines() {
     t.send(b"\x1b");
     assert!(popup.wait().unwrap().success());
 }
+
+#[test]
+fn display_prompt_label_then_input_and_command_mode_base_style() {
+    let ctx = Ctx::new("display-prompt");
+    let t = start(&ctx, "s");
+    let cursor = || t.screen.lock().unwrap().screen().cursor_position();
+    // tmux 3.8 prompt_layout: message-format is the label, the input follows it
+    ctx.ok(&["set", "-t", "s", "message-format", "[#{message}]"]);
+    t.prefix(b":");
+    t.send(b"abc");
+    wait_for("label then input", || t.row(29).starts_with("[:]abc") && cursor() == (29, 6));
+    t.send(b"\x03");
+    // aligned in the message-style area, the rest of the area filled
+    ctx.ok(&["set", "-t", "s", "message-style", "bg=red,width=30,align=right,fill=blue"]);
+    t.prefix(b":");
+    t.send(b"abc");
+    wait_for("right aligned prompt", || t.row(29).ends_with("[:]abc") && cursor() == (29, 99));
+    assert_eq!(t.screen.lock().unwrap().screen().cell(29, 70).unwrap().bgcolor(), vt100::Color::Idx(4));
+    assert!(t.row(29).starts_with("[s]"));
+    t.send(b"\x03");
+    // long input scrolls so the cursor stays in the area
+    ctx.ok(&["set", "-u", "-t", "s", "message-style"]);
+    ctx.ok(&["set", "-u", "-t", "s", "message-format"]);
+    t.prefix(b":");
+    t.send(&[b'x'; 120]);
+    wait_for("scrolled input", || cursor() == (29, 99) && t.row(29).starts_with(":xxx"));
+    t.send(b"\x03");
+    // vi command mode: message-command-style is the base, not message-style
+    ctx.ok(&["set", "-t", "s", "status-keys", "vi"]);
+    ctx.ok(&["set", "-t", "s", "message-command-style", "bg=green"]);
+    t.prefix(b":");
+    t.send(b"abc");
+    std::thread::sleep(Duration::from_millis(100));
+    t.send(b"\x1b");
+    wait_for("command mode", || t.screen.lock().unwrap().screen().cell(29, 0).unwrap().bgcolor() == vt100::Color::Idx(2) && cursor() == (29, 3));
+    assert_eq!(t.screen.lock().unwrap().screen().cell(29, 0).unwrap().fgcolor(), vt100::Color::Default);
+}
+
+#[test]
+fn display_window_edges_fill_style_and_arrows_of_every_pane() {
+    let ctx = Ctx::new("display-edges");
+    let t = start(&ctx, "s");
+    ctx.ok(&["setw", "-t", "s", "window-size", "manual"]);
+    ctx.ok(&["resize-window", "-t", "s", "-x", "70", "-y", "20"]);
+    // the window's right and bottom edges are borders, ┘ at the corner
+    wait_for("window edges", || t.row(20).starts_with("──") && t.row(20).chars().nth(70) == Some('┘') && t.row(0).chars().nth(70) == Some('│'));
+    // fill colours go over pane-border-style
+    ctx.ok(&["setw", "-t", "s", "pane-border-style", "fg=red"]);
+    ctx.ok(&["setw", "-t", "s", "fill-character", "a"]);
+    wait_for("fill over border style", || t.row(25).starts_with("aaa"));
+    assert_eq!(t.screen.lock().unwrap().screen().cell(25, 0).unwrap().fgcolor(), vt100::Color::Idx(1));
+    ctx.ok(&["setw", "-t", "s", "window-size", "latest"]);
+    // every pane marks arrow cells; those next to the active pane point at it
+    ctx.ok(&["setw", "-t", "s", "pane-border-indicators", "arrows"]);
+    ctx.ok(&["split-window", "-h", "-t", "s"]);
+    ctx.ok(&["split-window", "-v", "-t", "s"]);
+    ctx.ok(&["select-pane", "-t", "s.0"]);
+    t.wait_screen("two arrows at the left pane", |s| s.matches('←').count() == 2 && !s.contains('↓'));
+}
