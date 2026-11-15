@@ -1803,7 +1803,7 @@ impl Server {
                     w.layout.spread(wt.pane.unwrap_or(w.active), area);
                     self.apply_layout(wid);
                     self.mark_window_dirty(wid);
-                    self.layout_changed(wt.sid, wid, ctx);
+                    self.run_hook(wt.sid, "window-layout-changed", Ctx::default());
                     return Ok(Flow::Next);
                 } else {
                     o.rest.first().cloned().or_else(|| {
@@ -1826,7 +1826,7 @@ impl Server {
                 w.old_layout = Some(old_layout);
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
-                self.layout_changed(wt.sid, wid, ctx);
+                self.run_hook(wt.sid, "window-layout-changed", Ctx::default());
                 Ok(Flow::Next)
             }
             "resize-window" => {
@@ -2059,7 +2059,7 @@ impl Server {
                 }
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
-                self.layout_changed(tt.sid, wid, ctx);
+                self.run_hook(tt.sid, "window-layout-changed", Ctx::default());
                 Ok(Flow::Next)
             }
             "swap-pane" => {

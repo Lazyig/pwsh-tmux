@@ -740,7 +740,7 @@ impl Server {
             self.mark_session_dirty(sid);
         }
         self.mark_window_dirty(wid);
-        self.layout_changed(tt.sid, wid, ctx);
+        self.run_hook(tt.sid, "window-layout-changed", Ctx::default());
         if o.has('P') {
             let fmt = o.get('F').unwrap_or("#{session_name}:#{window_index}.#{pane_index}");
             let line = self.expand_for_pane(new, fmt);
@@ -784,7 +784,7 @@ impl Server {
         }
         self.apply_layout(wid);
         self.mark_window_dirty(wid);
-        self.layout_changed(t.sid, wid, &Ctx::default());
+        self.run_hook(t.sid, "window-layout-changed", Ctx::default());
         Ok(Flow::Next)
     }
 
@@ -808,7 +808,7 @@ impl Server {
         }
         self.apply_layout(wid);
         self.mark_window_dirty(wid);
-        self.layout_changed(t.sid, wid, &Ctx::default());
+        self.run_hook(t.sid, "window-layout-changed", Ctx::default());
         Ok(Flow::Next)
     }
 
@@ -916,7 +916,7 @@ impl Server {
             (g.x, g.y) = (x, y);
         }
         self.mark_window_dirty(wid);
-        self.layout_changed(t.sid, wid, &Ctx::default());
+        self.run_hook(t.sid, "window-layout-changed", Ctx::default());
         Ok(Flow::Next)
     }
 
@@ -976,7 +976,7 @@ impl Server {
         }
         self.apply_layout(wid);
         self.mark_window_dirty(wid);
-        self.layout_changed(t.sid, wid, &Ctx::default());
+        self.run_hook(t.sid, "window-layout-changed", Ctx::default());
         Ok(Flow::Next)
     }
 

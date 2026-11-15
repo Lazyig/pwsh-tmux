@@ -855,10 +855,6 @@ pub struct Server {
     /// The file the running command came from (#{current_file}).
     pub cur_file: Option<String>,
     pub marked: Option<PaneId>,
-    /// window-layout-changed events not yet sent to control clients (tmux fires one per event)
-    pub layout_events: Vec<WinId>,
-    /// window-layout-changed hooks waiting for the command (and its after- hook) to finish
-    pub layout_hooks: Vec<(Option<SessId>, u8)>,
     pub start_time: u64,
     pub host: String,
     pub quit: bool,
@@ -941,7 +937,6 @@ pub fn run(config: Option<String>) -> io::Result<()> {
         }
         srv.sync_groups();
         srv.timers();
-        srv.run_layout_hooks();
         srv.control_notify();
         srv.render_all();
         let exit_empty = options::is_on(srv.opts_server.get("exit-empty").unwrap_or("on"));
@@ -995,8 +990,6 @@ impl Server {
             cur_mouse: None,
             cur_file: None,
             marked: None,
-            layout_events: Vec::new(),
-            layout_hooks: Vec::new(),
             start_time: now_secs(),
             host: procinfo::hostname(),
             quit: false,
@@ -2069,8 +2062,7 @@ impl Server {
             }
             self.apply_layout(wid);
             self.mark_window_dirty(wid);
-            let sid = self.links_of(wid).first().map(|(s, _)| *s);
-            self.layout_changed(sid, wid, &Ctx::default());
+            self.run_hook(None, "window-layout-changed", Ctx::default());
         } else {
             self.kill_window(wid);
         }
@@ -2443,19 +2435,6 @@ impl Server {
         self.run_queue(Queue { cmds: list, ctx , soft: 0 });
     }
 
-    /// tmux events_fire_window("window-layout-changed"): a %layout-change for control clients
-    /// and the hook, which (queued like tmux) runs after the command's own after- hook.
-    pub fn layout_changed(&mut self, sid: Option<SessId>, wid: WinId, ctx: &Ctx) {
-        self.layout_events.push(wid);
-        self.layout_hooks.push((sid, ctx.hook_depth));
-    }
-
-    pub fn run_layout_hooks(&mut self) {
-        for (sid, depth) in std::mem::take(&mut self.layout_hooks) {
-            self.run_hook(sid, "window-layout-changed", Ctx { hook_depth: depth, ..Ctx::default() });
-        }
-    }
-
     fn after_command(&mut self, name: &str, ctx: &Ctx) {
         self.sync_groups();
         if ctx.hook_depth == 0 {
@@ -2469,7 +2448,6 @@ impl Server {
                 });
             }
         }
-        self.run_layout_hooks();
     }
 
     pub fn run_queue(&mut self, mut q: Queue) {
