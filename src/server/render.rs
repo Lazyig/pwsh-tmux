@@ -126,6 +126,35 @@ pub fn draw_box(f: &mut Frame, x: u16, y: u16, w: u16, h: u16, style: Style, tit
     }
 }
 
+/// One prompt line (label, then the input scrolled to keep the cursor in view) from `x` up to
+/// `right`; returns where the cursor goes.
+fn draw_prompt_line(f: &mut Frame, pr: &Prompt, x0: u16, y: u16, right: u16, st: Style) -> (u16, u16) {
+    for x in x0..right {
+        f.set(x, y, Cell { text: " ".into(), style: st });
+    }
+    let label = pr.label.clone() + if matches!(pr.kind, PromptKind::Confirm) || pr.label == ":" || pr.label.ends_with(' ') || pr.label.is_empty() { "" } else { " " };
+    let lx = f.text(x0, y, &label, st, right);
+    let before: String = pr.input[..pr.cursor].iter().collect();
+    let bw = format::width(&before) as u16;
+    let skip = bw.saturating_sub(right.saturating_sub(lx + 1));
+    let (mut x, mut col) = (lx, 0u16);
+    for ch in pr.input.iter() {
+        let w = ch.width().unwrap_or(0) as u16;
+        if col >= skip {
+            if x + w > right {
+                break;
+            }
+            f.set(x, y, Cell { text: ch.to_string(), style: st });
+            if w == 2 {
+                f.set(x + 1, y, Cell { text: String::new(), style: st });
+            }
+            x += w;
+        }
+        col += w;
+    }
+    ((lx + bw - skip).min(right.saturating_sub(1)), y)
+}
+
 fn push_color(out: &mut String, c: Color, base: u8) {
     match c {
         Color::Default => {}
@@ -569,6 +598,24 @@ impl Server {
                 if x >= win.sx || y >= win.sy {
                     f.set(x, oy + y, Cell { text: "·".into(), style: Style { attrs: DIM, ..Style::default() } });
                 }
+            }
+        }
+
+        // pane prompts (command-prompt -P) over the last line of their pane, or the first with
+        // the status line at the top (redraw_draw_pane_prompt), on every client; the cursor goes
+        // to the active pane's (server_client_prompt_cursor)
+        for (id, r) in &rects {
+            let Some(pr) = self.panes.get(id).and_then(|p| p.prompt.as_ref()) else { continue };
+            let cr = self.content_rect(wid, *r);
+            if cr.w == 0 || cr.h == 0 || (win.zoomed && *id != win.active) {
+                continue;
+            }
+            let st = self.style_option(&self.opt_session(Some(sid), "message-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
+            let y = oy + if top { cr.y } else { cr.y + cr.h - 1 };
+            let right = (cr.x + cr.w).min(cw);
+            let at = draw_prompt_line(&mut f, pr, cr.x, y, right, st);
+            if *id == win.active {
+                cursor = Some(at);
             }
         }
 

@@ -445,6 +445,33 @@ fn find_window_opens_a_filtered_tree() {
 }
 
 #[test]
+fn pane_prompt_belongs_to_the_pane_not_the_client() {
+    let ctx = Ctx::new("pane-prompt");
+    let t = start(&ctx, "pp");
+    let c1 = client(&ctx);
+    let t2 = Term::attach(&ctx, &["attach", "-t", "pp"], 100, 40);
+    t2.wait_screen("second client", |s| s.contains("[pp]"));
+    // a status prompt and a pane prompt are separate (window_pane_set_prompt)
+    ctx.ok(&["command-prompt", "-b", "-t", &c1, "-p", "STATUSP", "set -g @s '%%'"]);
+    ctx.ok(&["command-prompt", "-b", "-P", "-t", &c1, "-p", "PANEP", "set -g @p '%%'"]);
+    t.wait_screen("both prompts", |_| t.row(38).starts_with("PANEP") && t.row(39).starts_with("STATUSP"));
+    // the other client shows the pane prompt but not the first client's status prompt
+    t2.wait_screen("pane prompt on the other client", |_| t2.row(38).starts_with("PANEP") && t2.row(39).starts_with("[pp]"));
+    // one prompt per pane: another -P does nothing
+    ctx.ok(&["command-prompt", "-b", "-P", "-t", &c1, "-p", "OTHER", "set -g @o 1"]);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(t2.row(38).starts_with("PANEP"), "{}", t2.row(38));
+    // keys from a client without a status prompt go to the pane prompt
+    t2.send(b"xyz\r");
+    wait_for("pane prompt answered", || ctx.cmd(&["show", "-gv", "@p"]).1.trim() == "xyz");
+    t2.wait_screen("pane prompt closed", |_| !t2.row(38).starts_with("PANEP"));
+    assert!(ctx.fails(&["show", "-gv", "@s"]).contains("invalid option"));
+    // the first client's status prompt is still open
+    t.send(b"abc\r");
+    wait_for("status prompt answered", || ctx.cmd(&["show", "-gv", "@s"]).1.trim() == "abc");
+}
+
+#[test]
 fn pane_in_mode_counts_the_mode_stack_and_only_copy_mode_takes_commands() {
     let ctx = Ctx::new("mode-count");
     ctx.ok(&["new-session", "-d", "-s", "n"]);

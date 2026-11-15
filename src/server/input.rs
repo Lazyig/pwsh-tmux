@@ -312,6 +312,29 @@ impl Server {
             self.prompt_key(cid, &k, &name);
             return;
         }
+        // then a pane prompt (command-prompt -P) in the client's window: the key edits it as
+        // this client's, and it goes back to the pane while it stays open
+        if c.overlay.is_none() {
+            if let Some(pane) = self.key_pane_prompt(cid) {
+                if self.clients.get(&cid).is_some_and(|c| c.is_readonly()) {
+                    return;
+                }
+                let pr = self.panes.get_mut(&pane).and_then(|p| p.prompt.take());
+                self.clients.get_mut(&cid).unwrap().prompt = pr;
+                self.prompt_key(cid, &k, &name);
+                let Some(c) = self.clients.get_mut(&cid) else { return };
+                c.dirty = true;
+                if c.prompt.as_ref().is_some_and(|p| p.in_pane && p.pane == Some(pane)) {
+                    let pr = c.prompt.take();
+                    if self.panes.get(&pane).is_some_and(|p| p.prompt.is_none()) {
+                        self.set_pane_prompt(pane, pr);
+                    }
+                } else if let Some(wid) = self.window_of(pane) {
+                    self.mark_window_dirty(wid);
+                }
+                return;
+            }
+        }
         match &c.overlay {
             Some(Overlay::Popup(p)) => {
                 let pane = p.pane;

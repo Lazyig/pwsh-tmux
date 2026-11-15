@@ -2724,22 +2724,30 @@ impl Server {
                 let prompts: Vec<(String, String)> = labels.into_iter().enumerate().map(|(i, l)| (l, inits.get(i).cloned().unwrap_or_default())).collect();
                 let kind = if o.has('k') { PromptKind::Key } else { PromptKind::Command };
                 // -P: the prompt belongs to the pane and is drawn over its last line; a pane
-                // has one prompt at a time
+                // has one prompt at a time, as a client has one status prompt; the two are
+                // separate (window_pane_set_prompt), so both can be open
                 let in_pane = if o.has('P') {
                     let Some(pane) = tt.pane else { return Ok(Flow::Next) };
-                    if self.clients.values().any(|c| c.prompt.as_ref().is_some_and(|p| p.in_pane && p.pane == Some(pane))) {
+                    if self.panes.get(&pane).is_none_or(|p| p.prompt.is_some()) {
                         return Ok(Flow::Next);
                     }
                     Some(pane)
                 } else {
                     None
                 };
+                let saved = if in_pane.is_some() { self.clients.get_mut(&cid).and_then(|c| c.prompt.take()) } else { None };
                 self.open_prompt(cid, kind, prompts, template, in_pane.or(ctx.pane), o.has('N'), o.has('1'));
+                let Some(c) = self.clients.get_mut(&cid) else { return Ok(Flow::Next) };
                 // -e: backspace on empty input closes the prompt; -C (keep updating panes) is
                 // how prompts behave here anyway
-                if let Some(pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
+                if let Some(pr) = c.prompt.as_mut() {
                     pr.bspace_exit = o.has('e') && !o.has('1') && !o.has('N') && !o.has('i') && !o.has('k');
                     pr.in_pane = in_pane.is_some();
+                }
+                if let Some(pane) = in_pane {
+                    let pr = std::mem::replace(&mut c.prompt, saved);
+                    c.dirty = true;
+                    self.set_pane_prompt(pane, pr);
                 }
                 Ok(Flow::Next)
             }
@@ -4083,6 +4091,26 @@ impl Server {
         }
         tree.start(self);
         self.set_pane_mode(pane, PaneMode::Tree(Box::new(tree)));
+    }
+
+    /// Open or close a pane's own prompt (window_pane_set_prompt, window_pane_clear_prompt).
+    pub fn set_pane_prompt(&mut self, pane: PaneId, prompt: Option<Prompt>) {
+        let Some(p) = self.panes.get_mut(&pane) else { return };
+        p.prompt = prompt;
+        if let Some(wid) = self.window_of(pane) {
+            self.mark_window_dirty(wid);
+        }
+    }
+
+    /// The pane prompt a client's keys go to (server_client_handle_key): the active pane's,
+    /// else that of the first visible pane in the client's window that has one.
+    pub fn key_pane_prompt(&self, cid: ClientId) -> Option<PaneId> {
+        let w = self.windows.get(&self.client_window(cid)?)?;
+        let has = |p: PaneId| self.panes.get(&p).is_some_and(|p| p.prompt.is_some());
+        if has(w.active) {
+            return Some(w.active);
+        }
+        w.panes().into_iter().find(|p| has(*p) && (!w.zoomed || *p == w.active))
     }
 
     pub fn open_prompt(&mut self, cid: ClientId, kind: PromptKind, prompts: Vec<(String, String)>, template: String, pane: Option<PaneId>, numeric: bool, single: bool) {

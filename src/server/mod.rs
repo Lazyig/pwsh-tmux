@@ -369,6 +369,9 @@ pub struct Pane {
     /// The modes under it (wp->modes after the first), the next one last: leaving the
     /// top mode goes back to the one below.
     pub mode_stack: Vec<PaneMode>,
+    /// command-prompt -P: a prompt owned by the pane (wp->prompt), drawn over its last line
+    /// on every client showing it; keys from any of them go to it.
+    pub prompt: Option<Prompt>,
     pub options: Options,
     pub pipe: Option<Sender<Vec<u8>>>,
     pub last_output: Instant,
@@ -2021,6 +2024,7 @@ impl Server {
                 dead: None,
                 mode: None,
                 mode_stack: Vec::new(),
+                prompt: None,
                 options: existing_opts,
                 pipe: None,
                 last_output: Instant::now(),
