@@ -418,8 +418,17 @@ impl Server {
             let is_active = *id == win.active;
             let pane_target = self.target_for_pane(*id);
             let pst = |name: &str| self.style_option(&self.opt_pane(*id, name), Style::default(), pane_target, Some(cid)).unwrap_or_default();
-            let wstyle = pst(if is_active { "window-active-style" } else { "window-style" });
-            let wstyle = if is_active && wstyle == Style::default() { pst("window-style") } else { wstyle };
+            // tty_default_colours: each of window-active-style's colours (active pane) wins
+            // over window-style's, which wins over the pane's own OSC 10/11 colour
+            let mut wstyle = pst("window-style");
+            if is_active {
+                let active = pst("window-active-style");
+                if active.fg != Color::Default { wstyle.fg = active.fg; }
+                if active.bg != Color::Default { wstyle.bg = active.bg; }
+            }
+            let own = &p.parser.callbacks().colours;
+            if wstyle.fg == Color::Default { wstyle.fg = own.fg.unwrap_or(Color::Default); }
+            if wstyle.bg == Color::Default { wstyle.bg = own.bg.unwrap_or(Color::Default); }
             let mode_lines: Option<(Vec<Line>, Option<(u16, u16)>)> = match &p.mode {
                 Some(PaneMode::Copy(cm)) => {
                     let style = self.style_option(&self.opt_window(Some(wid), "mode-style"), Style::default(), pane_target, Some(cid)).unwrap_or_default();
