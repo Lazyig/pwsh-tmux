@@ -4015,7 +4015,7 @@ fn capture_grid(screen: &vt100::Screen, limit: usize) -> String {
             vt100::Color::Default => ("default".into(), 8),
             vt100::Color::Idx(n) if n < 8 => (NAMES[n as usize].into(), n as u32),
             vt100::Color::Idx(n) if n < 16 => (format!("bright{}", NAMES[n as usize - 8]), 90 + n as u32 - 8),
-            vt100::Color::Idx(n) => (format!("colour{n}"), 0x0100_0000 | n as u32),
+            vt100::Color::Idx(n) | vt100::Color::Palette(n) => (format!("colour{n}"), 0x0100_0000 | n as u32),
             vt100::Color::Rgb(r, g, b) => (format!("#{r:02x}{g:02x}{b:02x}"), 0x0200_0000 | (r as u32) << 16 | (g as u32) << 8 | b as u32),
         }
     };

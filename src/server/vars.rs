@@ -477,7 +477,7 @@ impl Vars for VarCtx<'_> {
             "pane_fg" | "pane_bg" => win.and(t.pane).map(|p| {
                 use super::theme::StyleColour;
                 // tty_default_colours: window-active-style for the active pane, then
-                // window-style, then the pane's OSC 10/11 colours; theme colours print names
+                // pane palette, then window-style; inactive panes prefer window-style.
                 let (sfg, sbg) = srv.pane_style_colours(p);
                 let palette = srv.panes.get(&p).map(|pp| &pp.parser.callbacks().colours);
                 let pick = |st: StyleColour, own: Option<Color>| if st == StyleColour::Default { own.map_or(st, StyleColour::Colour) } else { st };
@@ -584,7 +584,7 @@ impl Vars for VarCtx<'_> {
                     // the cursor-colour option, "none" when unset
                     let o = srv.opt_pane(p.id, "cursor-colour");
                     if let Some(i) = crate::format::theme_index(&o) { return crate::format::theme_name(i).into(); }
-                    crate::format::parse_color(&o).filter(|_| !o.is_empty() && o != "none").map_or("none".into(), colour_name)
+                    if o.is_empty() || o == "none" { "none".into() } else { super::theme::style_colours(&format!("fg={o}"), self).0.name() }
                 }
             }),
             "cursor_character" => pane.and_then(|p| {

@@ -869,12 +869,11 @@ fn palette_rgb(n: u8) -> (u8, u8, u8) {
 
 /// Dim a colour by a percentage (colour_dim), for styles with dim=. Default colours are
 /// left alone.
-#[allow(dead_code)] // for the renderer of window-style dim=
 pub fn dim_color(color: Color, dim: u8) -> Color {
     let (r, g, b) = match color {
         _ if dim == 0 => return color,
         Color::Default => return color,
-        Color::Idx(n) => palette_rgb(n),
+        Color::Idx(n) | Color::Palette(n) => palette_rgb(n),
         Color::Rgb(r, g, b) => (r, g, b),
     };
     let scale = |v: u8| (v as u32 * (100 - dim.min(100) as u32) / 100) as u8;
@@ -891,7 +890,7 @@ fn colour_format(s: &str, flags: &str, vars: &dyn Vars) -> String {
     if !fg && !bg {
         let rgb = match theme.map_or_else(|| parse_color(s), |_| None) {
             Some(Color::Rgb(r, g, b)) => (r, g, b),
-            Some(Color::Idx(n)) => palette_rgb(n),
+            Some(Color::Idx(n) | Color::Palette(n)) => palette_rgb(n),
             _ => return String::new(),
         };
         return format!("{:02x}{:02x}{:02x}", rgb.0, rgb.1, rgb.2);
@@ -914,6 +913,7 @@ fn colour_format(s: &str, flags: &str, vars: &dyn Vars) -> String {
     match color {
         Color::Default => format!("\x1b[{}m", base + 9),
         Color::Rgb(r, g, b) => format!("\x1b[{};2;{r};{g};{b}m", base + 8),
+        Color::Palette(n) => format!("\x1b[{};5;{n}m", base + 8),
         Color::Idx(n) if is256 => format!("\x1b[{};5;{n}m", base + 8),
         Color::Idx(n) if n < 8 => format!("\x1b[{}m", base + n as u32),
         Color::Idx(n) => format!("\x1b[{}m", base + 60 + n as u32 - 8),
@@ -1675,7 +1675,7 @@ pub fn parse_color(s: &str) -> Option<Color> {
         return Some(Color::Rgb((v >> 16) as u8, (v >> 8) as u8, v as u8));
     }
     if let Some(num) = s.strip_prefix("colour").or_else(|| s.strip_prefix("color")) {
-        return strtonum(num).filter(|n| (0..=255).contains(n)).map(|n| Color::Idx(n as u8));
+        return strtonum(num).filter(|n| (0..=255).contains(n)).map(|n| Color::palette(n as u8));
     }
     match s.as_str() {
         "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" => return s.parse().ok().map(Color::Idx),
@@ -2562,7 +2562,7 @@ mod tests {
         assert_eq!(parse_color("brightred"), Some(Color::Idx(9)));
         assert_eq!(parse_color("brightwhite"), Some(Color::Idx(15)));
         assert_eq!(parse_color("colour235"), Some(Color::Idx(235)));
-        assert_eq!(parse_color("color0"), Some(Color::Idx(0)));
+        assert_eq!(parse_color("color0"), Some(Color::Palette(0)));
         assert_eq!(parse_color("colour256"), None);
         assert_eq!(parse_color("#ff8000"), Some(Color::Rgb(255, 128, 0)));
         assert_eq!(parse_color("#ff80"), None);

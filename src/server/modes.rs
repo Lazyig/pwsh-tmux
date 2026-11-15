@@ -36,6 +36,7 @@ pub struct Tree {
     pub filter: Option<Vec<WinId>>,
     pub client: Option<ClientId>,
     pub tagged: HashSet<String>,
+    info: bool,
 }
 
 pub enum TreeAction {
@@ -68,7 +69,7 @@ impl Tree {
                 expanded.insert(format!("s{}", s.id));
             }
         }
-        let mut t = Tree { kind, owner: pane, template, items: Vec::new(), expanded, sel: 0, top: 0, filter, client: None, tagged: HashSet::new() };
+        let mut t = Tree { kind, owner: pane, template, items: Vec::new(), expanded, sel: 0, top: 0, filter, client: None, tagged: HashSet::new(), info: false };
         t.rebuild(srv);
         // select the current session / window
         let cur = srv.target_for_pane(pane);
@@ -99,7 +100,7 @@ impl Tree {
                     items.push(TreeItem {
                         id: sid.clone(),
                         depth: 0,
-                        label: format!("{}: {} windows{}", s.name, s.links.len(), if attached { " (attached)" } else { "" }),
+                        label: format!("{}: #[fg=themelightgrey]{} windows{}", s.name, s.links.len(), if attached { " (attached)" } else { "" }),
                         target: format!("${}", s.id),
                         kill: format!("kill-session -t '${}'", s.id),
                         expandable: true,
@@ -116,7 +117,7 @@ impl Tree {
                         items.push(TreeItem {
                             id: wkey.clone(),
                             depth: 1,
-                            label: format!("{idx}: {}{flags}{}", w.name, if np == 1 { format!(": \"{}\"", srv.panes.get(&w.active).map(|p| p.title.as_str()).unwrap_or("")) } else { String::new() }),
+                            label: format!("{idx}: {}#[fg=themelightgrey]{flags}{}", w.name, if np == 1 { format!(": \"{}\"", srv.panes.get(&w.active).map(|p| p.title.as_str()).unwrap_or("")) } else { String::new() }),
                             target: format!("${}:{idx}", s.id),
                             kill: format!("kill-window -t '@{wid}'"),
                             expandable: np > 0,
@@ -128,7 +129,7 @@ impl Tree {
                                 items.push(TreeItem {
                                     id: format!("p{p}"),
                                     depth: 2,
-                                    label: format!("{pi}: {}{} \"{}\"", pp.map(|x| x.current_cmd.as_str()).unwrap_or(""), if *p == w.active { "*" } else { "" }, pp.map(|x| x.title.as_str()).unwrap_or("")),
+                                    label: format!("{pi}: {}#[fg=themelightgrey]{} \"{}\"", pp.map(|x| x.current_cmd.as_str()).unwrap_or(""), if *p == w.active { "*" } else { "" }, pp.map(|x| x.title.as_str()).unwrap_or("")),
                                     target: format!("%{p}"),
                                     kill: format!("kill-pane -t '%{p}'"),
                                     expandable: false,
@@ -254,6 +255,7 @@ impl Tree {
                 }
                 self.sel = (self.sel + 1).min(n - 1);
             }
+            "i" if matches!(self.kind, TreeKind::Sessions | TreeKind::Windows) => self.info = !self.info,
             "T" => self.tagged.clear(),
             "C-t" => {
                 self.tagged = self.items.iter().map(|i| i.id.clone()).collect();
@@ -321,14 +323,14 @@ impl Tree {
             let Some(it) = self.items.get(i) else { continue };
             let quick = if i < 10 { format!("({i}) ") } else if i < 36 { format!("(M-{}) ", (b'a' + (i - 10) as u8) as char) } else { "     ".into() };
             let flat = !matches!(self.kind, TreeKind::Windows | TreeKind::Sessions);
-            let arrow = if flat { "" } else if it.expandable { if self.expanded.contains(&it.id) { "- " } else { "+ " } } else { "  " };
+            let arrow = if flat { "" } else if it.expandable { if self.expanded.contains(&it.id) { "#[fg=themered]-#[fg=themelightgrey] " } else { "#[fg=themegreen]+#[fg=themelightgrey] " } } else { "  " };
             let last = self.items.get(i + 1).is_none_or(|n| n.depth < it.depth) || !self.items[i+1..].iter().take_while(|n| n.depth >= it.depth).any(|n| n.depth == it.depth);
             let indent = if it.depth == 0 { String::new() } else { format!("{}{}", "    ".repeat(it.depth.saturating_sub(1) as usize), if last { "└─> " } else { "├─> " }) };
-            let text = format!("{quick}{indent}{arrow}{}{}", it.label, if self.tagged.contains(&it.id) { "*" } else { "" });
+            let text = format!("#[fg=themelightgrey]{quick}{indent}{arrow}#[default]{}{}", it.label, if self.tagged.contains(&it.id) { "*" } else { "" });
             let mut style = if i == self.sel { selected } else { Style::default() };
             // mode_tree_draw: tagged items are themecyan, selected or not
             if self.tagged.contains(&it.id) { style.fg = crate::format::parse_color_with("themecyan", Some(&ctx)).unwrap_or(Color::Default); }
-            f.put_cells(0, row as u16, &line_from(&text, w as usize, style, &ctx, i == self.sel).cells);
+            f.put_cells(0, row as u16, &line_from(&text, w as usize, style, &ctx, i == self.sel || self.tagged.contains(&it.id)).cells);
         }
         let y = list_h as u16;
         if h.saturating_sub(y) > 4 && w > 4 {
@@ -337,7 +339,14 @@ impl Tree {
                 let name = if self.kind == TreeKind::Buffers { it.target.clone() } else { it.target.rsplit(':').next().unwrap_or(&it.target).to_string() };
                 f.text(1, y, &format!(" {name} (sort: {}) ", if self.kind == TreeKind::Buffers { "time" } else { "index" }), border, w-1);
                 let (pw,ph) = (w-4,h-y-2);
-                if self.kind == TreeKind::Buffers {
+                if self.info {
+                    let target = it.preview.map(|p| srv.target_for_pane(p)).unwrap_or_default();
+                    let info_ctx = super::vars::VarCtx { srv, t: target, client: Some(cid), extra: HashMap::new() };
+                    let lines = if it.id.starts_with('p') { PANE_INFO } else if it.depth == 1 { WINDOW_INFO } else { SESSION_INFO };
+                    for (row, line) in lines.iter().take(ph as usize).enumerate() {
+                        f.put_cells(2, y + 1 + row as u16, &line_from(line, pw as usize, Style::default(), &info_ctx, false).cells);
+                    }
+                } else if self.kind == TreeKind::Buffers {
                     if let Some(b) = srv.buffers.iter().find(|b| b.name == it.target) {
                         for (row,line) in String::from_utf8_lossy(&b.data).lines().take(ph as usize).enumerate() { f.text(2, y+1+row as u16, line, Style::default(), w-2); }
                     }
@@ -381,6 +390,38 @@ impl Tree {
         f.cells.chunks(w as usize).map(|c| Line { cells:c.to_vec(),wrapped:false }).collect()
     }
 }
+
+const PANE_INFO: &[&str] = &[
+    "#[fg=themelightgrey]Pane          #[#{E:tree-mode-border-style}]│#[default] #{pane_index} #[fg=themelightgrey](#{pane_id})#[default]",
+    "#[fg=themelightgrey]Title         #[#{E:tree-mode-border-style}]│#[default] #{pane_title}",
+    "#[fg=themelightgrey]Command       #[#{E:tree-mode-border-style}]│#[default] #{pane_current_command} #[fg=themelightgrey](PID #{pane_pid})#[default]",
+    "#[fg=themelightgrey]Path          #[#{E:tree-mode-border-style}]│#[default] #{pane_current_path}",
+    "#[fg=themelightgrey]TTY           #[#{E:tree-mode-border-style}]│#[default] #{pane_tty}",
+    "#[fg=themelightgrey]Position      #[#{E:tree-mode-border-style}]│#[default] #{pane_x},#{pane_y} #{pane_width}x#{pane_height}",
+    "#[fg=themelightgrey]Mode          #[#{E:tree-mode-border-style}]│#[default] #{?pane_in_mode,#{pane_mode},none}",
+    "#[fg=themelightgrey]Flags         #[#{E:tree-mode-border-style}]│#[default] #{?pane_active,#[fg=themegreen],#[fg=themelightgrey]}active#[default] #{?window_zoomed_flag,#[fg=themegreen],#[fg=themelightgrey]}zoomed#[default] #{?pane_marked,#[fg=themegreen],#[fg=themelightgrey]}marked#[default] #{?pane_synchronized,#[fg=themegreen],#[fg=themelightgrey]}sync#[default] #{?pane_dead,#[fg=themegreen],#[fg=themelightgrey]}dead#[default] #{?pane_pipe,#[fg=themegreen],#[fg=themelightgrey]}piped#[default]",
+];
+
+const WINDOW_INFO: &[&str] = &[
+    "#[fg=themelightgrey]Window        #[#{E:tree-mode-border-style}]│#[default] #{window_index}: #{window_name} #[fg=themelightgrey](#{window_id})#[default]",
+    "#[fg=themelightgrey]Size          #[#{E:tree-mode-border-style}]│#[default] #{window_width}x#{window_height}",
+    "#[fg=themelightgrey]Panes         #[#{E:tree-mode-border-style}]│#[default] #{window_panes}",
+    "#[fg=themelightgrey]Activity Time #[#{E:tree-mode-border-style}]│#[default] #{t:window_activity} #[fg=themelightgrey](#{t/r:window_activity})#[default]",
+    "#[fg=themelightgrey]Sessions      #[#{E:tree-mode-border-style}]│#[default] #{s/,/ /:window_linked_sessions_list}",
+    "#[fg=themelightgrey]Flags         #[#{E:tree-mode-border-style}]│#[default] #{?window_active,#[fg=themegreen],#[fg=themelightgrey]}active#[default] #{?window_last_flag,#[fg=themegreen],#[fg=themelightgrey]}last#[default] #{?window_bell_flag,#[fg=themegreen],#[fg=themelightgrey]}bell#[default] #{?window_activity_flag,#[fg=themegreen],#[fg=themelightgrey]}activity#[default] #{?window_silence_flag,#[fg=themegreen],#[fg=themelightgrey]}silence#[default] #{?window_zoomed_flag,#[fg=themegreen],#[fg=themelightgrey]}zoomed#[default] #{?window_marked_flag,#[fg=themegreen],#[fg=themelightgrey]}marked#[default]",
+];
+
+const SESSION_INFO: &[&str] = &[
+    "#[fg=themelightgrey]Session       #[#{E:tree-mode-border-style}]│#[default] #{session_name} #[fg=themelightgrey](#{session_id})#[default]",
+    "#[fg=themelightgrey]Created Time  #[#{E:tree-mode-border-style}]│#[default] #{t:session_created} #[fg=themelightgrey](#{t/r:session_created})#[default]",
+    "#[fg=themelightgrey]Activity Time #[#{E:tree-mode-border-style}]│#[default] #{t:session_activity} #[fg=themelightgrey](#{t/r:session_activity})#[default]",
+    "#[fg=themelightgrey]Attached Time #[#{E:tree-mode-border-style}]│#[default] #{?#{t:session_last_attached},#{t:session_last_attached} #[fg=themelightgrey](#{t/r:session_last_attached})#[default],never}",
+    "#[fg=themelightgrey]Clients       #[#{E:tree-mode-border-style}]│#[default] #{s/,/ /:session_attached_list}",
+    "#[fg=themelightgrey]Windows       #[#{E:tree-mode-border-style}]│#[default] #{session_windows}",
+    "#[fg=themelightgrey]Path          #[#{E:tree-mode-border-style}]│#[default] #{session_path}",
+    "#[fg=themelightgrey]Group         #[#{E:tree-mode-border-style}]│#[default] #{?session_grouped,#{session_group} (#{session_group_size}),none}",
+    "#[fg=themelightgrey]Flags         #[#{E:tree-mode-border-style}]│#[default] #{?session_attached,#[fg=themegreen],#[fg=themelightgrey]}attached#[default] #{?session_grouped,#[fg=themegreen],#[fg=themelightgrey]}grouped#[default] #{?session_marked,#[fg=themegreen],#[fg=themelightgrey]}marked#[default] #{?session_bell_flag,#[fg=themegreen],#[fg=themelightgrey]}bell#[default] #{?session_activity_flag,#[fg=themegreen],#[fg=themelightgrey]}activity#[default] #{?session_silence_flag,#[fg=themegreen],#[fg=themelightgrey]}silence#[default]",
+];
 
 // ---- menu ------------------------------------------------------------------------
 

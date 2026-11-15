@@ -218,7 +218,7 @@ pub fn colour_name(c: vt100::Color) -> String {
         vt100::Color::Default => "default".into(),
         vt100::Color::Idx(i) if i < 8 => NAMES[i as usize].into(),
         vt100::Color::Idx(i) if i < 16 => format!("bright{}", NAMES[i as usize - 8]),
-        vt100::Color::Idx(i) => format!("colour{i}"),
+        vt100::Color::Idx(i) | vt100::Color::Palette(i) => format!("colour{i}"),
         vt100::Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
     }
 }
@@ -260,6 +260,7 @@ fn decode_file_url(url: &str) -> Option<String> {
 }
 
 impl vt100::Callbacks for PaneCb {
+    fn reset(&mut self, _: &mut vt100::Screen) { self.colours.reset(); }
     fn theme_subscription(&mut self, _: &mut vt100::Screen) { self.colours.subscribe(); }
     fn audible_bell(&mut self, _: &mut vt100::Screen) {
         self.bell = true;
@@ -1387,8 +1388,6 @@ impl Server {
         self.control_output(id, data);
         let scroll_on_clear = options::is_on(&self.opt_pane(id, "scroll-on-clear"));
         let colours = self.pane_colours(id);
-        // like notify_pane_themes, wait for the colour replies a theme report asked for
-        let discovering = self.pane_clients(id).any(|c| c.terminal.querying());
         let p = self.panes.get_mut(&id).unwrap();
         p.parser.callbacks_mut().colours.update(colours);
         p.parser.screen_mut().set_scroll_on_clear(scroll_on_clear);
@@ -1409,7 +1408,7 @@ impl Server {
                 p.track.pipe_pid = None;
             }
         }
-        let enabled = p.screen().theme_updates() && !discovering;
+        let enabled = p.screen().theme_updates();
         let cb = p.parser.callbacks_mut();
         cb.colours.notify(enabled, &mut cb.replies);
         let replies = std::mem::take(&mut cb.replies);

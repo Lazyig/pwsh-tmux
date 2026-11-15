@@ -4,6 +4,8 @@
 /// don't have an impact on the terminal screen directly, as well as to emit
 /// other events like [`on_scroll`](Self::on_scroll).
 pub trait Callbacks {
+    /// The terminal was reset with RIS.
+    fn reset(&mut self, _: &mut crate::Screen) {}
     /// This callback is called when the terminal requests an audible bell
     /// (typically with `^G`).
     fn audible_bell(&mut self, _: &mut crate::Screen) {}

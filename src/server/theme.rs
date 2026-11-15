@@ -10,7 +10,6 @@ pub struct Terminal {
     pub reported: Option<Theme>,
     pub fg: Option<Color>,
     pub bg: Option<Color>,
-    pending: Option<Instant>,
     control_fg: Option<Color>,
     control_bg: Option<Color>,
     /// TERM_VT100LIKE: only these terminals are asked for their theme and colours.
@@ -18,25 +17,23 @@ pub struct Terminal {
     last_requests: Option<Instant>,
     /// A popup's pane: tmux runs it without a window pane, so it gets no theme or colour replies.
     popup: bool,
-    /// A pane's window-style / window-active-style colours (tty_default_colours): they win
-    /// over the pane's own OSC 10/11 colours, which win over the client's.
+    /// Effective pane defaults, including active-style and pane palette precedence.
     style_fg: StyleColour,
     style_bg: StyleColour,
+    active_style: Option<(StyleColour, StyleColour)>,
 }
 
 /// tmux TTY_REQUEST_LIMIT: colour requests are repeated (on resize) at most this often.
 const REQUEST_LIMIT: Duration = Duration::from_secs(30);
 
 impl Terminal {
-    pub fn query_started(&mut self) { self.pending = Some(Instant::now()); }
-    pub fn querying(self) -> bool { self.pending.is_some_and(|t| t.elapsed() < Duration::from_secs(5)) }
     pub fn detected(self) -> Option<Theme> {
         self.reported.or_else(|| self.bg.and_then(background_theme))
     }
     /// tty_start_tty + tty_send_requests: subscribe to theme changes and ask for the theme
     /// and colours (VT100-like terminals only).
     pub fn start(&mut self) -> Option<Vec<u8>> {
-        let mut out = self.vt100.then(|| b"\x1b[?2031h\x1b[?996n".to_vec())?;
+        let mut out = self.vt100.then(|| b"\x1b[>q\x1b[>c\x1b[?2031h\x1b[?996n".to_vec())?;
         out.extend(self.requests(true)?);
         Some(out)
     }
@@ -46,7 +43,6 @@ impl Terminal {
             return None;
         }
         self.last_requests = Some(Instant::now());
-        self.query_started();
         Some(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\")
     }
 }
@@ -91,7 +87,7 @@ fn rgb(c: Color) -> Option<(u8, u8, u8)> {
     match c {
         Color::Default => None,
         Color::Rgb(r, g, b) => Some((r, g, b)),
-        Color::Idx(i) => Some(features::idx_to_rgb(i)),
+        Color::Idx(i) | Color::Palette(i) => Some(features::idx_to_rgb(i)),
     }
 }
 
@@ -129,6 +125,7 @@ pub enum StyleColour {
     #[default]
     Default,
     Theme(usize),
+    Terminal,
     Colour(Color),
 }
 
@@ -137,6 +134,7 @@ impl StyleColour {
     pub fn name(self) -> String {
         match self {
             StyleColour::Default => "default".into(),
+            StyleColour::Terminal => "terminal".into(),
             StyleColour::Theme(i) => format::theme_name(i).into(),
             StyleColour::Colour(c) => colour_name(c),
         }
@@ -144,20 +142,32 @@ impl StyleColour {
     /// The colour a pane reports for OSC 10/11 and its theme: None for a theme colour, which
     /// has no RGB value (colour_force_rgb fails) and no theme (colour_totheme).
     fn or_else(self, fallback: impl FnOnce() -> Option<Color>) -> Option<Color> {
-        match self { StyleColour::Default => fallback(), StyleColour::Theme(_) => None, StyleColour::Colour(c) => Some(c) }
+        match self { StyleColour::Default => fallback(), StyleColour::Theme(_) => None, StyleColour::Terminal => fallback(), StyleColour::Colour(c) => Some(c) }
     }
 }
 
 /// The fg and bg of a style option value, parsed as tmux does without a client.
 pub fn style_colours(value: &str, vars: &dyn format::Vars) -> (StyleColour, StyleColour) {
-    let parse = |salt| format::parse_style_with(value, crate::cells::Style::default(), Some(&ThemeProbe(vars, salt))).map(|p| p.style).unwrap_or_default();
+    let value = format::expand(value, vars);
+    let mut fg_name = None;
+    let mut bg_name = None;
+    for word in value.split([',', ' ']) {
+        if word.eq_ignore_ascii_case("default") { fg_name = None; bg_name = None; }
+        if let Some((key, val)) = word.split_once('=') {
+            let val = val.to_ascii_lowercase();
+            let identity = (val == "terminal").then_some(StyleColour::Terminal);
+            if key == "fg" { fg_name = identity; }
+            if key == "bg" { bg_name = identity; }
+        }
+    }
+    let parse = |salt| format::parse_style_with(&value, crate::cells::Style::default(), Some(&ThemeProbe(vars, salt))).map(|p| p.style).unwrap_or_default();
     let (a, b) = (parse(1), parse(2));
     let one = |x: Color, y: Color| match (x, y) {
         (Color::Rgb(1, 0xa5, i), Color::Rgb(2, 0xa5, j)) if i == j => StyleColour::Theme(i as usize),
         (Color::Default, _) => StyleColour::Default,
         _ => StyleColour::Colour(x),
     };
-    (one(a.fg, b.fg), one(a.bg, b.bg))
+    (fg_name.unwrap_or_else(|| one(a.fg, b.fg)), bg_name.unwrap_or_else(|| one(a.bg, b.bg)))
 }
 
 impl VarCtx<'_> {
@@ -178,6 +188,7 @@ impl VarCtx<'_> {
         Some(match c {
             Color::Default => format!("\x1b[{}m", base + 9),
             Color::Rgb(r, g, b) => format!("\x1b[{};2;{r};{g};{b}m", base + 8),
+            Color::Palette(n) => format!("\x1b[{};5;{n}m", base + 8),
             Color::Idx(n) if palette || n >= 16 => format!("\x1b[{};5;{n}m", base + 8),
             Color::Idx(n) if n < 8 => format!("\x1b[{}m", base + n as u32),
             Color::Idx(n) => format!("\x1b[{}m", base + 60 + n as u32 - 8),
@@ -214,7 +225,8 @@ impl VarCtx<'_> {
         };
         let option = format!("{}-theme-{suffix}", if theme == Theme::Light { "light" } else { "dark" });
         // Palette values expand with jobs disabled and cannot recurse via colour modifiers.
-        Some(format::expand(&self.srv.opt_server(&option), &PaletteVars(self)))
+        let client_only = VarCtx { srv: self.srv, t: Default::default(), client: self.client, extra: HashMap::new() };
+        Some(format::expand(&self.srv.opt_server(&option), &PaletteVars(&client_only)))
     }
 }
 
@@ -236,16 +248,21 @@ pub struct PaneColours {
 }
 
 impl PaneColours {
+    pub fn reset(&mut self) { self.fg = None; self.bg = None; }
     pub fn update(&mut self, terminal: Terminal) { self.terminal = terminal; }
-    /// window_pane_get_fg/bg as OSC 10/11 queries see them: a control client's report, the
-    /// window styles, the pane's own colour, then the first attached client's.
+    /// window_pane_get_fg/bg: control report, effective pane defaults, then client colours.
     fn colour(&self, fg: bool) -> Option<Color> {
         let t = &self.terminal;
-        if fg {
-            t.control_fg.or_else(|| t.style_fg.or_else(|| self.fg.or(t.fg)))
-        } else {
-            t.control_bg.or_else(|| t.style_bg.or_else(|| self.bg.or(t.bg)))
-        }
+        let (control, style, own, client) = if fg { (t.control_fg, t.style_fg, self.fg, t.fg) }
+            else { (t.control_bg, t.style_bg, self.bg, t.bg) };
+        let resolve = |style: StyleColour, fallback: Option<Color>| {
+            if style == StyleColour::Terminal { client } else { style.or_else(|| fallback) }
+        };
+        let base = || resolve(style, own.or(client));
+        control.or_else(|| match t.active_style {
+            Some((afg, abg)) => resolve(if fg { afg } else { abg }, own.or_else(base)),
+            None => base(),
+        })
     }
     /// window_pane_get_theme: the attached clients' agreed theme, else the background's.
     fn theme(&self) -> Option<Theme> {
@@ -266,11 +283,12 @@ impl PaneColours {
     }
     pub fn osc(&mut self, params: &[&[u8]], bel: bool, replies: &mut Vec<u8>) {
         match params {
+            [b"104"] | [b"104", b""] => { self.reset(); return },
             [b"110"] | [b"110", b""] => { self.fg = None; return },
             [b"111"] | [b"111", b""] => { self.bg = None; return },
             _ => {}
         }
-        let [n, value, ..] = params else { return };
+        let [n, value] = params else { return };
         let fg = match *n {
             b"10" => true, b"11" => false,
             b"110" if value.is_empty() => { self.fg = None; return },
@@ -294,6 +312,13 @@ impl PaneColours {
 
 impl Server {
     pub(super) fn terminal_report(&mut self, cid: ClientId, raw: &[u8]) -> bool {
+        if let Some(c) = self.clients.get_mut(&cid) {
+            if !c.denied && c.features.device_report(raw) {
+                c.prev = None;
+                c.dirty = true;
+                return true;
+            }
+        }
         let reported = match raw {
             b"\x1b[?997;1n" => Some(Theme::Dark),
             b"\x1b[?997;2n" => Some(Theme::Light),
@@ -306,11 +331,10 @@ impl Server {
         if c.denied { return true; }
         if let Some(t) = reported {
             c.terminal.reported = Some(t);
-            // tmux asks for the colours again and waits for them before notifying panes.
+            // Requery colours, but explicit theme reports notify panes immediately.
             if let Some(q) = c.terminal.requests(true) { c.send(S_OUTPUT, q); }
         }
         if let Some((fg, colour)) = colour {
-            c.terminal.pending = None;
             if fg { c.terminal.fg = Some(colour) } else { c.terminal.bg = Some(colour); }
         }
         c.prev = None;
@@ -319,7 +343,7 @@ impl Server {
         if let Some(t) = reported {
             self.run_hook(sid, if t == Theme::Light { "client-light-theme" } else { "client-dark-theme" }, Ctx { client: Some(cid), ..Ctx::default() });
         }
-        if colour.is_some() { self.notify_pane_themes(); }
+        if colour.is_some() || reported.is_some() { self.notify_pane_themes(); }
         true
     }
 
@@ -354,6 +378,11 @@ impl Server {
         let ctx = VarCtx { srv: self, t: self.target_for_pane(pane), client: None, extra: HashMap::new() };
         let (mut fg, mut bg) = style_colours(&self.opt_pane(pane, "window-style"), &ctx);
         if self.window_of(pane).is_some_and(|w| self.windows[&w].active == pane) {
+            if let Some(p) = self.panes.get(&pane) {
+                let own = &p.parser.callbacks().colours;
+                if let Some(c) = own.fg { fg = StyleColour::Colour(c); }
+                if let Some(c) = own.bg { bg = StyleColour::Colour(c); }
+            }
             let (afg, abg) = style_colours(&self.opt_pane(pane, "window-active-style"), &ctx);
             if afg != StyleColour::Default { fg = afg; }
             if abg != StyleColour::Default { bg = abg; }
@@ -379,7 +408,11 @@ impl Server {
             (true, false) => Some(Theme::Light), (false, true) => Some(Theme::Dark), _ => None,
         };
         if self.panes.contains_key(&pane) {
-            (terminal.style_fg, terminal.style_bg) = self.pane_style_colours(pane);
+            let ctx = VarCtx { srv: self, t: self.target_for_pane(pane), client: None, extra: HashMap::new() };
+            (terminal.style_fg, terminal.style_bg) = style_colours(&self.opt_pane(pane, "window-style"), &ctx);
+            if self.window_of(pane).is_some_and(|w| self.windows[&w].active == pane) {
+                terminal.active_style = Some(style_colours(&self.opt_pane(pane, "window-active-style"), &ctx));
+            }
         }
         if let Some(p) = self.panes.get(&pane) {
             let control = p.parser.callbacks().colours.control;
@@ -394,7 +427,6 @@ impl Server {
     pub(super) fn notify_pane_themes(&mut self) {
         let panes: Vec<_> = self.panes.keys().copied().collect();
         for id in panes {
-            if self.pane_clients(id).any(|c| c.terminal.querying()) { continue; }
             let terminal = self.pane_colours(id);
             let p = self.panes.get_mut(&id).unwrap();
             let enabled = p.screen().theme_updates();
@@ -480,6 +512,198 @@ mod tests {
     }
     fn ctx(srv: &Server) -> VarCtx<'_> {
         VarCtx { srv, t: Target::default(), client: Some(1), extra: HashMap::new() }
+    }
+
+    fn with_pane() -> (Server, PaneId) {
+        let mut srv = server();
+        srv.exec(["new-session", "-d", "-s", "a", "sleep 30"].map(String::from).to_vec(), &mut Ctx::default()).unwrap();
+        let sid = srv.sessions.values().find(|s| s.name == "a").unwrap().id;
+        let pane = srv.windows[&srv.sessions[&sid].active_window()].active;
+        srv.clients.get_mut(&1).unwrap().session = Some(sid);
+        (srv, pane)
+    }
+    fn command(srv: &mut Server, args: &[&str]) {
+        srv.exec(args.iter().map(|s| s.to_string()).collect(), &mut Ctx { client: Some(1), ..Ctx::default() }).unwrap();
+    }
+
+    #[test]
+    fn osc_colours_reset_and_reject_extra_arguments() {
+        let nz = |n| NonZeroU16::new(n).unwrap();
+        let mut parser = vt100::Parser::new_with_callbacks(nz(24), nz(80), 10, PaneCb::default());
+        for reset in [b"\x1bc".as_slice(), b"\x1b]104\x07", b"\x1b]104;\x07"] {
+            parser.process(b"\x1b]10;#ff0000\x07\x1b]11;#00ff00\x07");
+            assert!(parser.callbacks().colours.fg.is_some());
+            parser.process(reset);
+            assert_eq!((parser.callbacks().colours.fg, parser.callbacks().colours.bg), (None, None));
+        }
+        parser.process(b"\x1b]10;#ff0000;#00ff00\x07\x1b]11;?;?\x07");
+        assert_eq!(parser.callbacks().colours.fg, None);
+        assert!(parser.callbacks().replies.is_empty());
+        let (mut srv, pane) = with_pane();
+        srv.panes.get_mut(&pane).unwrap().parser.process(b"\x1b]10;#ff0000\x07");
+        command(&mut srv, &["send-keys", "-R"]);
+        assert_eq!(srv.expand_for_pane(pane, "#{pane_fg}"), "default");
+        srv.shutdown();
+    }
+
+    #[test]
+    fn active_palette_precedes_window_style_in_formats_replies_and_clock() {
+        let (mut srv, pane) = with_pane();
+        command(&mut srv, &["set", "-g", "window-style", "fg=colour100,bg=#102030"]);
+        srv.panes.get_mut(&pane).unwrap().parser.process(b"\x1b]10;#ff0000\x07\x1b]11;#00ff00\x07");
+        assert_eq!(srv.expand_for_pane(pane, "#{pane_fg} #{pane_bg}"), "#ff0000 #00ff00");
+        let defaults = srv.pane_colours(pane);
+        let cb = srv.panes.get_mut(&pane).unwrap().parser.callbacks_mut();
+        cb.colours.update(defaults);
+        cb.colours.osc(&[b"11", b"?"], true, &mut cb.replies);
+        assert_eq!(cb.replies, b"\x1b]11;rgb:0000/ffff/0000\x07");
+        assert_eq!(srv.compose(1).unwrap().frame.get(0, 0).unwrap().style.bg, Color::Rgb(0, 255, 0));
+        command(&mut srv, &["clock-mode"]);
+        assert_eq!(srv.compose(1).unwrap().frame.get(0, 0).unwrap().style.bg, Color::Rgb(0, 255, 0));
+        command(&mut srv, &["set", "-g", "window-active-style", "bg=blue"]);
+        assert_eq!(srv.expand_for_pane(pane, "#{pane_bg}"), "blue");
+        srv.shutdown();
+    }
+
+    #[test]
+    fn palette_values_use_only_client_context() {
+        let (mut srv, pane) = with_pane();
+        srv.opts_server.set("dark-theme-green", "#{?session_name,red,#{?window_name,green,#{?pane_index,white,#123456}}}".into());
+        let vars = VarCtx { srv: &srv, t: srv.target_for_pane(pane), client: Some(1), extra: HashMap::new() };
+        assert_eq!(vars.theme_color("themegreen"), Some(Color::Rgb(18, 52, 86)));
+        assert_eq!(format::expand("#{c/f:themegreen}", &vars), "\x1b[38;2;18;52;86m");
+        srv.shutdown();
+    }
+
+
+    #[test]
+    fn pane_dimming_and_colour_names() {
+        let (mut srv, pane) = with_pane();
+        command(&mut srv, &["set", "-g", "window-style", "fg=#804020,bg=#204080,dim=50"]);
+        command(&mut srv, &["set", "-g", "window-active-style", "dim=50"]);
+        srv.panes.get_mut(&pane).unwrap().parser.process(b"x");
+        let frame = srv.compose(1).unwrap().frame;
+        assert_eq!((frame.get(0, 0).unwrap().style.fg, frame.get(0, 0).unwrap().style.bg), (Color::Rgb(64, 32, 16), Color::Rgb(16, 32, 64)));
+        command(&mut srv, &["set", "-g", "window-active-style", "dim=100"]);
+        assert_eq!(srv.compose(1).unwrap().frame.get(0, 0).unwrap().style.fg, Color::Rgb(0, 0, 0));
+        for (value, expected) in [("colour3", "colour3"), ("color3", "colour3"), ("colour15", "colour15"), ("terminal", "terminal")] {
+            command(&mut srv, &["set", "-g", "window-style", &format!("fg={value}")]);
+            command(&mut srv, &["set", "-g", "cursor-colour", value]);
+            assert_eq!(srv.expand_for_pane(pane, "#{pane_fg}"), expected);
+            assert_eq!(srv.expand_for_pane(pane, "#{cursor_colour}"), expected);
+        }
+        srv.shutdown();
+    }
+
+    #[test]
+    fn device_reports_are_reassembled_and_update_client_palette_depth() {
+        let mut srv = server();
+        for byte in b"\x1bP>|XTerm(400)\x1b\\" { srv.handle_input(1, &[*byte]); }
+        assert_eq!(srv.clients[&1].features.colours(), 16777216);
+        for (raw, depth) in [(b"\x1b[>85;1;0c".as_slice(), 256), (b"\x1b[>84;1;0c", 16777216), (b"\x1bP>|foot(1.0)\x1b\\", 16777216)] {
+            let mut f = features::Features::default();
+            assert!(f.device_report(raw));
+            assert_eq!(f.colours(), depth);
+        }
+    }
+
+    #[test]
+    fn tree_prefixes_use_theme_colours() {
+        let (mut srv, pane) = with_pane();
+        command(&mut srv, &["new-window", "-d", "sleep 30"]);
+        let mut tree = modes::Tree::new(modes::TreeKind::Windows, None, None, &srv, pane);
+        let lines = tree.render(&srv, 1, 80, 24);
+        let grey = ctx(&srv).theme_color("themelightgrey").unwrap();
+        assert!(lines.iter().skip(1).flat_map(|l| &l.cells).any(|c| c.style.fg == grey));
+        tree.tagged.insert(tree.items[0].id.clone());
+        tree.sel = 1;
+        let tagged = tree.render(&srv, 1, 80, 24);
+        let cyan = ctx(&srv).theme_color("themecyan").unwrap();
+        assert!(tagged[0].cells.iter().all(|c| c.style.fg == cyan));
+        tree.key("i", 10, &srv);
+        let lines = tree.render(&srv, 1, 80, 40);
+        assert!(lines.iter().any(|l| l.text().contains("Window") && l.cells.iter().any(|c| c.text == "W" && c.style.fg == grey)));
+        srv.shutdown();
+    }
+    #[test]
+    fn queries_obey_overrides_and_resize_request_limit() {
+        assert!(!vt100_like("dumb", &[]));
+        assert!(!vt100_like("xterm", &["xterm*:XT@:clear@".into()]));
+        assert!(vt100_like("dumb", &["dumb:XT".into()]));
+        assert!(vt100_like("xterm", &["xterm:XT@:clear=\\E[H".into()]));
+        let mut t = Terminal { vt100: false, ..Default::default() };
+        assert!(t.start().is_none());
+        assert!(t.requests(true).is_none());
+        t.vt100 = true;
+        assert!(t.start().is_some());
+        assert!(t.requests(false).is_none());
+        t.last_requests = Some(Instant::now() - REQUEST_LIMIT - Duration::from_secs(1));
+        assert!(t.requests(false).is_some());
+        assert!(t.requests(false).is_none());
+        assert!(t.requests(true).is_some());
+    }
+
+
+    #[test]
+    fn resize_path_does_not_repeat_queries_inside_thirty_seconds() {
+        let mut srv = server();
+        let (tx, rx) = mpsc::channel();
+        srv.clients.get_mut(&1).unwrap().tx = tx;
+        srv.clients.get_mut(&1).unwrap().terminal.vt100 = true;
+        srv.start_terminal_queries(1);
+        assert!(rx.try_recv().is_ok());
+        srv.repeat_terminal_queries(1);
+        assert!(rx.try_recv().is_err());
+        srv.clients.get_mut(&1).unwrap().terminal.last_requests = Some(Instant::now() - REQUEST_LIMIT - Duration::from_secs(1));
+        srv.repeat_terminal_queries(1);
+        assert!(rx.try_recv().is_ok());
+        srv.repeat_terminal_queries(1);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn osc_changes_and_queries_in_one_chunk_use_current_active_palette() {
+        let (mut srv, pane) = with_pane();
+        command(&mut srv, &["set", "-g", "window-style", "bg=#102030"]);
+        let defaults = srv.pane_colours(pane);
+        let parser = &mut srv.panes.get_mut(&pane).unwrap().parser;
+        parser.callbacks_mut().colours.update(defaults);
+        parser.process(b"\x1b]11;#00ff00\x07\x1b]11;?\x07");
+        assert_eq!(parser.callbacks().replies, b"\x1b]11;rgb:0000/ffff/0000\x07");
+        parser.callbacks_mut().replies.clear();
+        parser.process(b"\x1bc\x1b]11;?\x07");
+        assert_eq!(parser.callbacks().replies, b"\x1b]11;rgb:1010/2020/3030\x07");
+        srv.shutdown();
+    }
+    #[test]
+    fn theme_notifications_do_not_wait_for_colour_queries() {
+        let (mut srv, pane) = with_pane();
+        let defaults = srv.pane_colours(pane);
+        let p = srv.panes.get_mut(&pane).unwrap();
+        p.parser.callbacks_mut().colours.update(defaults);
+        p.parser.process(b"\x1b[?2031h");
+        srv.clients.get_mut(&1).unwrap().terminal.vt100 = true;
+        srv.terminal_report(1, b"\x1b[?997;2n");
+        assert_eq!(srv.panes[&pane].parser.callbacks().colours.last, Some(Theme::Light));
+        srv.terminal_report(1, b"\x1b[?997;1n");
+        assert_eq!(srv.panes[&pane].parser.callbacks().colours.last, Some(Theme::Dark));
+        srv.shutdown();
+    }
+
+    #[test]
+    fn refresh_report_and_flags_precede_early_return_actions() {
+        let (mut srv, pane) = with_pane();
+        srv.clients.get_mut(&1).unwrap().control = 1;
+        for action in [("-A", format!("%{pane}:on")), ("-B", "test::#{pane_bg}".into()), ("-C", "80x24".into())] {
+            let report = format!("%{pane}:\x1b]11;rgb:ff/ff/ff\x07");
+            command(&mut srv, &["refresh-client", "-F", "no-output", "-f", "wait-exit", "-r", &report, action.0, &action.1]);
+            assert!(srv.clients[&1].ctl.no_output && srv.clients[&1].ctl.wait_exit);
+            assert_eq!(srv.panes[&pane].parser.callbacks().colours.control.bg, Some(Color::Rgb(255, 255, 255)));
+            srv.panes.get_mut(&pane).unwrap().parser.callbacks_mut().colours.control.bg = None;
+            srv.clients.get_mut(&1).unwrap().ctl.no_output = false;
+            srv.clients.get_mut(&1).unwrap().ctl.wait_exit = false;
+        }
+        srv.shutdown();
     }
     #[test]
     fn theme_resolution_options_and_client_depth() {

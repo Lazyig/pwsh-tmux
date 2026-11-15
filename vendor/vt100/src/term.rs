@@ -234,6 +234,11 @@ impl BufWrite for Attrs {
                         write_param!(i);
                     }
                 }
+                crate::Color::Palette(i) => {
+                    write_param!(38);
+                    write_param!(5);
+                    write_param!(i);
+                }
                 crate::Color::Rgb(r, g, b) => {
                     write_param!(38);
                     write_param!(2);
@@ -259,6 +264,11 @@ impl BufWrite for Attrs {
                         write_param!(5);
                         write_param!(i);
                     }
+                }
+                crate::Color::Palette(i) => {
+                    write_param!(48);
+                    write_param!(5);
+                    write_param!(i);
                 }
                 crate::Color::Rgb(r, g, b) => {
                     write_param!(48);

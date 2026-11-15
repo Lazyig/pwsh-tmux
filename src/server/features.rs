@@ -17,7 +17,7 @@ impl Features {
         self.0.contains(f)
     }
 
-    fn add(&mut self, list: &str) {
+    pub(super) fn add(&mut self, list: &str) {
         for f in list.split([',', ':']).map(str::trim).filter(|f| !f.is_empty()) {
             // tmux aliases
             let f = match f {
@@ -30,6 +30,38 @@ impl Features {
             }
             self.0.insert(f.to_string());
         }
+    }
+
+    /// tty_keys_device_attributes2 / tty_keys_extended_device_attributes.
+    pub fn device_report(&mut self, raw: &[u8]) -> bool {
+        let name = if let Some(body) = raw.strip_prefix(b"\x1bP>|").and_then(|s| s.strip_suffix(b"\x1b\\")) {
+            let body = String::from_utf8_lossy(body);
+            [("iTerm2 ", "iTerm2"), ("tmux ", "tmux"), ("XTerm(", "XTerm"), ("mintty ", "mintty"),
+                ("foot(", "foot"), ("WezTerm ", "WezTerm"), ("ghostty ", "ghostty"), ("Rio ", "Rio")]
+                .into_iter().find(|(prefix, _)| body.starts_with(prefix)).map(|(_, name)| name)
+        } else if let Some(body) = raw.strip_prefix(b"\x1b[>").and_then(|s| s.strip_suffix(b"c")) {
+            match body.split(|b| *b == b';').next() {
+                Some(b"77") => Some("mintty"), Some(b"84") => Some("tmux"), Some(b"85") => Some("rxvt-unicode"), _ => None,
+            }
+        } else { return false };
+        if let Some(name) = name {
+            if name == "rxvt-unicode" { self.add("256,bpaste,ccolour,cstyle,mouse,title,ignorefkeys"); }
+            else {
+                self.add("256,RGB,bpaste,clipboard,mouse,strikethrough,title");
+                let extra = match name {
+                    "XTerm" => "ccolour,cstyle,extkeys,focus",
+                    "tmux" => "ccolour,cstyle,extkeys,focus,overline,usstyle,hyperlinks,progressbar",
+                    "mintty" => "appesc,ccolour,cstyle,extkeys,margins,overline,usstyle",
+                    "iTerm2" => "cstyle,extkeys,margins,usstyle,sync,osc7,hyperlinks,progressbar",
+                    "foot" => "ccolour,cstyle,extkeys,usstyle,sync,osc7,hyperlinks",
+                    "WezTerm" => "ccolour,cstyle,extkeys,focus,hyperlinks,margins,usstyle",
+                    "ghostty" => "ccolour,cstyle,extkeys,focus,margins,overline,hyperlinks,osc7,sync,usstyle,progressbar",
+                    _ => "ccolour,cstyle,focus,overline,hyperlinks,osc7,sync,usstyle,progressbar",
+                };
+                self.add(extra);
+            }
+        }
+        true
     }
 
     /// client_colours (format_cb_client_colours): only the RGB and 256 features count as
@@ -71,7 +103,7 @@ pub fn compute(term: &str, colorterm: &str, table: &[String], extra: &str) -> Fe
     let mut f = Features::default();
     let vt = term.strip_prefix("vt").is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()));
     if term == "dumb" || (vt && !term.contains("color")) { f.add("mono"); }
-    if term.contains("16color") || term.contains("88color") || term == "rxvt-unicode" { f.add("16"); }
+    if term.contains("16color") || term.contains("88color") || term == "rxvt-unicode" || term == "xterm" { f.add("16"); }
     if term.is_empty() {
         // Windows console / Windows Terminal: a modern VT implementation
         f.add("RGB,mouse,bpaste,title,ccolour,cstyle,focus,clipboard,strikethrough,sync,usstyle,overline,hyperlinks");
@@ -79,7 +111,7 @@ pub fn compute(term: &str, colorterm: &str, table: &[String], extra: &str) -> Fe
         if term != "linux" && !term.starts_with("vt1") {
             f.add("mouse,bpaste,strikethrough");
         }
-        if term.contains("256col") || term.contains("direct") || term.starts_with("tmux") || term.starts_with("alacritty") || term.starts_with("xterm-kitty") {
+        if term.contains("256col") || term.contains("direct") || term.starts_with("tmux") || term.starts_with("alacritty") || term.starts_with("xterm-kitty") || term.starts_with("foot") || term.starts_with("wezterm") || term.starts_with("xterm-ghostty") {
             f.add("t256");
         }
         if term.contains("direct") {
@@ -180,6 +212,7 @@ pub fn fit_color(c: vt100::Color, f: &Features) -> vt100::Color {
                 Idx(idx_to_16(rgb_to_256(r, g, b)))
             }
         }
+        Palette(i) if !f.render_256() => Idx(idx_to_16(i)),
         Idx(i) if i >= 16 && !f.render_256() => {
             Idx(idx_to_16(i))
         }

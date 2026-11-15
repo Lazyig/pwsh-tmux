@@ -182,7 +182,7 @@ impl Parser {
 
     /// A partial terminal theme/colour response needs a longer deadline than a bare Escape.
     pub fn theme_reply_pending(&self) -> bool {
-        [b"\x1b]10;".as_slice(), b"\x1b]11;", b"\x1b[?997;"].iter()
+        [b"\x1b]10;".as_slice(), b"\x1b]11;", b"\x1b[?997;", b"\x1bP>|", b"\x1b[>"].iter()
             .any(|prefix| self.buf.starts_with(prefix) || (self.buf.len() >= 3 && prefix.starts_with(&self.buf)))
     }
 
@@ -362,6 +362,13 @@ fn parse_esc(buf: &[u8], force: bool) -> Res {
             match end {
                 Some(n) => Res::Done(unknown_tok(&buf[..n]), n),
                 None if !force && buf.len() < 5 + 127 => Res::Incomplete,
+                None => meta_fallback(buf),
+            }
+        }
+        b'P' if buf.starts_with(b"\x1bP>|") || b"\x1bP>|".starts_with(buf) => {
+            match buf.windows(2).position(|w| w == b"\x1b\\") {
+                Some(i) => Res::Done(unknown_tok(&buf[..i + 2]), i + 2),
+                None if !force && buf.len() < 256 => Res::Incomplete,
                 None => meta_fallback(buf),
             }
         }
