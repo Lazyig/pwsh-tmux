@@ -313,12 +313,10 @@ impl Server {
             return;
         }
         // then a pane prompt (command-prompt -P) in the client's window: the key edits it as
-        // this client's, and it goes back to the pane while it stays open
-        if c.overlay.is_none() {
+        // this client's, and it goes back to the pane while it stays open; read-only clients
+        // skip it like the other special cases of server_client_handle_key
+        if c.overlay.is_none() && !c.is_readonly() {
             if let Some(pane) = self.key_pane_prompt(cid) {
-                if self.clients.get(&cid).is_some_and(|c| c.is_readonly()) {
-                    return;
-                }
                 let pr = self.panes.get_mut(&pane).and_then(|p| p.prompt.take());
                 self.clients.get_mut(&cid).unwrap().prompt = pr;
                 self.prompt_key(cid, &k, &name);

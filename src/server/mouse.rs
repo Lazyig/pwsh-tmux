@@ -96,6 +96,11 @@ impl Server {
         if self.clients.get(&cid).is_none_or(|c| c.prompt.is_some()) {
             return;
         }
+        // a pane prompt in the window takes no mouse input here, and the event goes no further
+        // (PROMPT_KEY_NOT_HANDLED for a mouse key in server_client_handle_key)
+        if self.key_pane_prompt(cid).is_some() {
+            return;
+        }
         self.mouse_event(cid, m, last, false);
     }
 
