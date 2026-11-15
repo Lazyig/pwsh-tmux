@@ -492,3 +492,26 @@ fn floating_pane_default_mouse_bindings_and_pane_list() {
     t.mouse(0, col + 1, 29, true);
     wait_for("pane selected from the status line", || ctx.fmt("fb", "#P") == other);
 }
+
+#[test]
+fn kept_dead_panes_close_on_a_key() {
+    let ctx = Ctx::new("float-dead-key");
+    let t = start(&ctx, "dk");
+    // new-pane -k keeps the pane once its command exits, until a key is pressed (tmux
+    // remain-on-exit key and server_client_handle_dead_key); the key goes nowhere else
+    let f = ctx.ok(&["new-pane", "-k", "-P", "-F", "#{pane_id}", "-t", "dk", "-x", "40", "-y", "8", "true"]).trim().to_string();
+    wait_for("dead floating pane", || ctx.fmt(&f, "#{pane_dead}") == "1");
+    assert_eq!(ctx.fmt(&f, "#{remain-on-exit} #{pane_floating_flag}"), "key 1");
+    t.send(b"x");
+    wait_for("closed by a key", || ctx.fmt("dk", "#{window_panes}") == "1");
+    // -m sets the message, drawn on the last line of the pane like server_destroy_pane
+    let f = ctx.ok(&["new-pane", "-m", "bye #{pane_dead_status}", "-P", "-F", "#{pane_id}", "-t", "dk", "-x", "40", "-y", "8", "-X", "2", "-Y", "2", "exit 3"]).trim().to_string();
+    wait_for("dead pane with a message", || ctx.fmt(&f, "#{pane_dead}") == "1");
+    t.wait_screen("message on the last line", |_| t.row(8).contains("│bye 3"));
+    // the prefix key closes it too, without starting the prefix table
+    t.send(b"\x02");
+    wait_for("closed by the prefix", || ctx.fmt("dk", "#{window_panes}") == "1");
+    t.send(b"c");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(ctx.fmt("dk", "#{session_windows}"), "1");
+}

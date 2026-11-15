@@ -663,15 +663,22 @@ impl Server {
         });
     }
 
-    /// The panes of a window sorted by the -O order. Activity approximates tmux's
-    /// active_point: panes never active, then the last active, then the active pane.
+    /// The panes of a window sorted by the -O order. Activity is tmux's active_point
+    /// (the order panes were last made active, never-active panes first), which the
+    /// last-panes stack holds most recent first.
     fn sorted_panes(&self, wid: WinId, crit: sort::Criteria) -> Vec<PaneId> {
         let w = &self.windows[&wid];
         let order_of = w.panes();
         let mut v = order_of.clone();
         let title = |p: &PaneId| self.panes.get(p).map(|x| x.title.as_str()).unwrap_or("");
         let index = |p: &PaneId| order_of.iter().position(|x| x == p).unwrap_or(0);
-        let point = |p: &PaneId| if *p == w.active { 2 } else if w.last() == Some(*p) { 1 } else { 0 };
+        let point = |p: &PaneId| {
+            if *p == w.active {
+                usize::MAX
+            } else {
+                w.last_panes.iter().position(|x| x == p).map_or(0, |i| w.last_panes.len() - i)
+            }
+        };
         let size = |p: &PaneId| self.panes.get(p).map(|x| x.size.0 as u32 * x.size.1 as u32).unwrap_or(0);
         crit.sort(&mut v, |a, b, order| {
             match order {
@@ -1772,6 +1779,15 @@ impl Server {
                 // Replace via temporary ids so cycles do not overwrite one another.
                 for (i, p) in order.iter().enumerate() { w.layout.replace(*p, PaneId::MAX - i as u32); }
                 for (i, p) in rotated.iter().enumerate() { w.layout.replace(PaneId::MAX - i as u32, *p); }
+                // the pane after (with -D before) the active one becomes active: it took
+                // the active pane's place (tmux window_set_active_pane, no raise)
+                if let Some(i) = rotated.iter().position(|p| *p == w.active) {
+                    let n = rotated.len();
+                    let next = rotated[if o.has('D') { (i + n - 1) % n } else { (i + 1) % n }];
+                    if w.modal.is_none_or(|m| m == next) {
+                        w.set_active(next);
+                    }
+                }
                 w.pane_order = rotated;
                 // -Z keeps a zoomed window zoomed
                 w.zoomed = w.zoomed && o.has('Z');

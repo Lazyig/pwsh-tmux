@@ -290,6 +290,13 @@ impl Server {
                 if c.is_readonly() {
                     return;
                 }
+                // the first pasted key closes a pane waiting for one (tmux only skips the
+                // paste start and end markers)
+                if let Some(pane) = self.client_active_pane(cid).filter(|_| !data.is_empty()) {
+                    if self.dead_key(cid, pane) {
+                        return;
+                    }
+                }
                 if let Some(target) = self.input_target(cid) {
                     self.paste(target, &data, true, true, None);
                 }
@@ -415,6 +422,9 @@ impl Server {
         // a modal pane closes on Escape or C-c with -D; with -K it gets every key, the
         // prefix included, unless it is in a mode (tmux server_client_handle_key)
         if let Some(pane) = self.client_active_pane(cid) {
+            if self.dead_key(cid, pane) {
+                return;
+            }
             let fl = self.panes.get(&pane).map_or(0, |p| p.fflags);
             let modal = self.window_of(pane).is_some_and(|w| self.windows[&w].modal == Some(pane));
             if modal && fl & super::float::CLOSE_ON_CANCEL != 0 && (name == "Escape" || name == "C-c") {

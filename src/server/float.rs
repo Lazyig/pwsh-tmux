@@ -203,6 +203,23 @@ impl Server {
     /// tmux `window_set_active_pane` (with `window_redraw_active_switch` raising a floating
     /// pane to the front): nothing but the modal pane can become active while there is one,
     /// and a zoomed window is unzoomed unless the pane is shown above the zoom.
+    /// tmux server_client_handle_dead_key: a key pressed in a dead pane kept by
+    /// remain-on-exit key or failed-key (split-window/new-pane -k and -m) closes it, before
+    /// any binding is looked up. False when the key goes on as usual.
+    pub fn dead_key(&mut self, cid: ClientId, pane: PaneId) -> bool {
+        if self.clients.get(&cid).is_none_or(|c| c.is_readonly()) || self.panes.get(&pane).is_none_or(|p| p.dead.is_none()) {
+            return false;
+        }
+        if !matches!(self.opt_pane(pane, "remain-on-exit").as_str(), "key" | "failed-key") {
+            return false;
+        }
+        if let Some(p) = self.panes.get_mut(&pane) {
+            p.options.set("remain-on-exit", "off".into());
+        }
+        self.kill_pane(pane);
+        true
+    }
+
     pub fn set_active_pane(&mut self, wid: WinId, pane: PaneId) -> bool {
         let Some(w) = self.windows.get(&wid) else { return false };
         if w.modal.is_some_and(|m| m != pane) || pane == w.active {
@@ -1423,6 +1440,59 @@ mod tests {
         srv.pane_waits.entry(id).or_default().push(Queue { cmds: VecDeque::new(), ctx: Ctx::default(), soft: 0 });
         srv.finish_pane_waits(id, Some(3));
         assert!(srv.pane_waits.is_empty());
+        srv.shutdown();
+    }
+
+    #[test]
+    fn pane_order_rotate_and_activity() {
+        let (mut srv, _ev) = server();
+        ok(&mut srv, &["new-session", "-d", "-s", "o", "-x", "80", "-y", "40"]);
+        let cmd = |srv: &Server, p: &PaneId| srv.panes[p].title.clone();
+        let titles = |srv: &Server| srv.windows[&win(srv)].panes().iter().map(|p| cmd(srv, p)).collect::<Vec<_>>().join(" ");
+        ok(&mut srv, &["select-pane", "-T", "a"]);
+        // tmux window_add_pane: after the target, -f at the tail, -f -b at the head, a
+        // floating pane at the tail and -b before the target
+        for (args, t) in [(&["split-window", "-d"][..], "b"), (&["split-window", "-d", "-f"][..], "c"), (&["split-window", "-d", "-f", "-b"][..], "d"), (&["new-pane", "-d"][..], "e"), (&["new-pane", "-d", "-b"][..], "f")] {
+            let mut a = args.to_vec();
+            a.extend(["-P", "-F", "#{pane_id}"]);
+            let id = ok(&mut srv, &a).trim().to_string();
+            ok(&mut srv, &["select-pane", "-t", &id, "-T", t]);
+        }
+        assert_eq!(titles(&srv), "d f a b c e");
+        // list-panes -O activity: never-active panes first, then in the order they were last
+        // made active (select-pane -T alone does not select)
+        ok(&mut srv, &["select-pane", "-t", "o.4"]);
+        ok(&mut srv, &["select-pane", "-t", "o.0"]);
+        ok(&mut srv, &["select-pane", "-t", "o.2"]);
+        let order = ok(&mut srv, &["list-panes", "-t", "o", "-O", "activity", "-F", "#{pane_title}"]);
+        assert_eq!(order.split_whitespace().collect::<Vec<_>>(), ["b", "e", "f", "c", "d", "a"]);
+        // rotate-window: the pane taking the active pane's place becomes active, without
+        // being raised (tmux window_set_active_pane)
+        // (f takes d's tiled cell)
+        ok(&mut srv, &["select-pane", "-t", "o.0"]);
+        ok(&mut srv, &["rotate-window", "-t", "o"]);
+        assert_eq!(ok(&mut srv, &["display", "-p", "-t", "o", "#{pane_index} #{pane_title} #{pane_floating_flag}"]).trim(), "0 f 0");
+        ok(&mut srv, &["rotate-window", "-D", "-t", "o"]);
+        assert_eq!(ok(&mut srv, &["display", "-p", "-t", "o", "#{pane_index} #{pane_title}"]).trim(), "0 d");
+        srv.shutdown();
+    }
+
+    #[test]
+    fn kept_dead_pane_and_message() {
+        let (mut srv, _ev) = server();
+        ok(&mut srv, &["new-session", "-d", "-s", "k", "-x", "80", "-y", "24"]);
+        let id: PaneId = ok(&mut srv, &["new-pane", "-d", "-m", "bye #{pane_dead_status}", "-y", "8", "-P", "-F", "#{pane_id}", "-E"]).trim().trim_start_matches('%').parse().unwrap();
+        srv.pane_exited(id, Some(3));
+        assert!(srv.panes[&id].dead.is_some());
+        // the message is on the last line after a line feed, and the cursor is hidden
+        let screen = srv.panes[&id].screen();
+        assert_eq!(screen.contents().lines().last().unwrap_or(""), "bye 3");
+        assert!(screen.hide_cursor());
+        // failed-key keeps a pane only when its command failed
+        let id2: PaneId = ok(&mut srv, &["new-pane", "-d", "-P", "-F", "#{pane_id}", "-E"]).trim().trim_start_matches('%').parse().unwrap();
+        srv.panes.get_mut(&id2).unwrap().options.set("remain-on-exit", "failed-key".into());
+        srv.pane_exited(id2, Some(0));
+        assert!(!srv.panes.contains_key(&id2));
         srv.shutdown();
     }
 }

@@ -1572,7 +1572,8 @@ impl Server {
             return;
         }
         let remain = self.opt_pane(id, "remain-on-exit");
-        let keep = remain == "on" || (remain == "failed" && status.unwrap_or(0) != 0);
+        // "key" and "failed-key" keep it until a key is pressed (see Server::dead_key)
+        let keep = matches!(remain.as_str(), "on" | "key") || (matches!(remain.as_str(), "failed" | "failed-key") && status.unwrap_or(0) != 0);
         if keep {
             let fmt = self.opt_pane(id, "remain-on-exit-format");
             if let Some(p) = self.panes.get_mut(&id) {
@@ -1580,7 +1581,13 @@ impl Server {
             }
             let msg = self.expand_for_pane(id, &fmt);
             if let Some(p) = self.panes.get_mut(&id) {
-                p.parser.process(format!("\r\n\x1b[0m{msg}").as_bytes());
+                // tmux server_destroy_pane: a line feed at the bottom line, the message in
+                // the new last line and no cursor
+                if !fmt.is_empty() {
+                    let rows = p.size.1.max(1);
+                    p.parser.process(format!("\x1b[r\x1b[{rows};1H\n\x1b[0m{msg}").as_bytes());
+                }
+                p.parser.process(b"\x1b[?25l");
             }
             if let Some(wid) = self.window_of(id) {
                 self.mark_window_dirty(wid);
