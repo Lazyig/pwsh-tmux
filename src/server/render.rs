@@ -518,7 +518,7 @@ impl Server {
         let panes = win.panes();
         let base_index = self.opt_window_num(Some(wid), "pane-base-index").max(0) as usize;
         let arrows = matches!(self.opt_window(Some(wid), "pane-border-indicators").as_str(), "arrows" | "both");
-        for (id, g) in floats {
+        for &(id, g) in &floats {
             if win.is_floating(win.active) && id == win.active {
                 *cursor = None;
             }
@@ -580,6 +580,14 @@ impl Server {
                 }
             }
             self.draw_pane_body(f, cid, wid, id, (g.x, g.y, g.w, g.h), clip, oy, modes, cursor);
+        }
+        // ... and so does one above an active floating pane
+        if let (Some((cx, cy)), true) = (*cursor, win.is_floating(win.active)) {
+            let (wx, wy) = (cx as i32, cy as i32 - oy as i32);
+            let above = floats.iter().skip_while(|(p, _)| *p != win.active).skip(1);
+            if above.into_iter().any(|(p, _)| self.float_contains(wid, *p, wx, wy)) {
+                *cursor = None;
+            }
         }
     }
 

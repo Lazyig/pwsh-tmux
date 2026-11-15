@@ -445,6 +445,22 @@ fn floating_panes_follow_mouse_drags() {
 }
 
 #[test]
+fn floating_pane_above_the_active_floating_pane_hides_its_cursor() {
+    let ctx = Ctx::new("float-cursor");
+    let t = start(&ctx, "fc");
+    let hidden = || t.screen.lock().unwrap().screen().hide_cursor();
+    ctx.ok(&["new-pane", "-t", "fc", "-x", "20", "-y", "5", "-X", "10", "-Y", "4", "printf xy; exec cat"]);
+    t.wait_screen("active floating pane", |s| s.contains("xy"));
+    wait_for("cursor shown", || !hidden() && t.screen.lock().unwrap().screen().cursor_position() == (5, 13));
+    // a pane stacked above (new-pane -d) covers the cursor cell
+    let d = ctx.ok(&["new-pane", "-d", "-P", "-F", "#{pane_id}", "-t", "fc", "-x", "20", "-y", "5", "-X", "8", "-Y", "3", "cat"]).trim().to_string();
+    assert_eq!(ctx.fmt(&d, "#{pane_z} #{pane_active}"), "0 0");
+    wait_for("cursor hidden under the floating pane", hidden);
+    ctx.ok(&["kill-pane", "-t", &d]);
+    wait_for("cursor shown again", || !hidden());
+}
+
+#[test]
 fn modal_panes_keep_their_drags_and_status_clicks() {
     let ctx = Ctx::new("float-modal-mouse");
     let t = start(&ctx, "mm");
