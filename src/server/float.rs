@@ -1528,6 +1528,22 @@ mod tests {
     }
 
     #[test]
+    fn join_pane_selects_the_destination_window() {
+        let (mut srv, _ev) = server();
+        ok(&mut srv, &["new-session", "-d", "-s", "j", "-x", "80", "-y", "24"]);
+        ok(&mut srv, &["new-window", "-t", "j"]);
+        ok(&mut srv, &["new-window", "-t", "j"]);
+        ok(&mut srv, &["new-window", "-t", "j"]);
+        let cur = |srv: &mut Server| ok(srv, &["display", "-p", "-t", "j", "#{window_index}"]);
+        assert_eq!(cur(&mut srv), "3\n");
+        ok(&mut srv, &["join-pane", "-d", "-s", "j:1.0", "-t", "j:0.0"]);
+        assert_eq!(cur(&mut srv), "3\n");
+        ok(&mut srv, &["join-pane", "-s", "j:2.0", "-t", "j:0.0"]);
+        assert_eq!(cur(&mut srv), "0\n");
+        srv.shutdown();
+    }
+
+    #[test]
     fn clamp_floats_off_the_top_left() {
         let (mut srv, _ev) = server();
         ok(&mut srv, &["new-session", "-d", "-s", "c", "-x", "80", "-y", "24"]);

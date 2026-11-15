@@ -2304,6 +2304,12 @@ impl Server {
                     dw.set_active(spane);
                 }
                 self.apply_layout(dwid);
+                // without -d the destination window becomes current too (session_select)
+                if let (false, Some(sid), Some(idx)) = (o.has('d'), dst.sid, dst.idx) {
+                    if self.sessions.contains_key(&sid) {
+                        self.select_window(sid, idx);
+                    }
+                }
                 self.mark_all_dirty();
                 Ok(Flow::Next)
             }
