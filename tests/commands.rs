@@ -1142,3 +1142,56 @@ fn format_option_environment_and_window_loops() {
     assert_eq!(ctx.fmt("f", "[#{L:x}#{I/f:RGB}#{A:a,b}]"), "[]");
     assert_eq!(ctx.fmt("f", "#{c:red}#{c/f:themered}#{R:ab,2}"), "800000\x1b[31mabab");
 }
+
+#[test]
+#[cfg(unix)]
+fn copy_mode_live_word_separators_and_kill_flag() {
+    let ctx = Ctx::new("copyopts");
+    ctx.ok(&["new", "-d", "-s", "c", "-x", "40", "-y", "8", "printf 'one-two three\n'; sleep 100"]);
+    wait_for("copy text", || ctx.capture("c").contains("one-two"));
+    ctx.ok(&["set", "-w", "-t", "c", "mode-keys", "vi"]);
+    ctx.ok(&["set", "-t", "c", "word-separators", " "]);
+    ctx.ok(&["copy-mode", "-t", "c"]);
+    ctx.ok(&["send", "-t", "c", "-X", "history-top"]);
+    ctx.ok(&["send", "-t", "c", "-X", "next-word"]);
+    assert_eq!(ctx.fmt("c", "#{copy_cursor_x}"), "8");
+    ctx.ok(&["send", "-t", "c", "-X", "history-top"]);
+    ctx.ok(&["set", "-t", "c", "word-separators", " -"]);
+    ctx.ok(&["send", "-t", "c", "-X", "next-word"]);
+    assert_eq!(ctx.fmt("c", "#{copy_cursor_x} #{copy_cursor_word}"), "3 two");
+    ctx.ok(&["splitw", "-d", "-t", "c", "sleep 100"]);
+    ctx.ok(&["copy-mode", "-q", "-t", "c:0.0"]);
+    ctx.ok(&["copy-mode", "-k", "-t", "c:0.0"]);
+    ctx.ok(&["copy-mode", "-q", "-t", "c:0.0"]);
+    assert_eq!(ctx.fmt("c", "#{window_panes}"), "1");
+}
+
+#[test]
+#[cfg(unix)]
+fn copy_mode_automatic_refresh_waits_for_selection() {
+    let ctx = Ctx::new("copyrefresh");
+    let marker = std::env::temp_dir().join(&ctx.socket);
+    let command = format!("printf 'ready\n'; for item in first second; do while [ ! -f '{}'.$item ]; do sleep 0.02; done; printf 'out:%s\n' \"$item\"; done; sleep 100", marker.display());
+    ctx.ok(&["new", "-d", "-s", "c", "-x", "40", "-y", "8", &command]);
+    wait_for("ready", || ctx.capture("c").contains("ready"));
+    ctx.ok(&["copy-mode", "-t", "c"]);
+    assert_eq!(ctx.fmt("c", "#{refresh_active}"), "0");
+    std::fs::write(marker.with_extension("first"), "").unwrap();
+    wait_for("first output", || ctx.capture("c").contains("out:first"));
+    assert!(!ctx.ok(&["capturep", "-p", "-M", "-t", "c"]).contains("out:first"));
+    ctx.ok(&["send", "-t", "c", "-X", "refresh-now"]);
+    assert!(ctx.ok(&["capturep", "-p", "-M", "-t", "c"]).contains("out:first"));
+    ctx.ok(&["send", "-t", "c", "-X", "refresh-on"]);
+    assert_eq!(ctx.fmt("c", "#{refresh_active}"), "1");
+    ctx.ok(&["send", "-t", "c", "-X", "begin-selection"]);
+    std::fs::write(marker.with_extension("second"), "").unwrap();
+    wait_for("second output", || ctx.capture("c").contains("out:second"));
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(!ctx.ok(&["capturep", "-p", "-M", "-t", "c"]).contains("out:second"));
+    ctx.ok(&["send", "-t", "c", "-X", "clear-selection"]);
+    wait_for("automatic refresh", || ctx.ok(&["capturep", "-p", "-M", "-t", "c"]).contains("out:second"));
+    ctx.ok(&["send", "-t", "c", "-X", "refresh-toggle"]);
+    assert_eq!(ctx.fmt("c", "#{refresh_active}"), "0");
+    let _ = std::fs::remove_file(marker.with_extension("first"));
+    let _ = std::fs::remove_file(marker.with_extension("second"));
+}

@@ -55,10 +55,13 @@ impl Server {
         let ln = self.copy_line_numbers_option(pane);
         let wrap = self.opt_window(self.window_of(pane), "wrap-search") == "on";
         let vi = self.opt_window(self.window_of(pane), "mode-keys") == "vi";
+        let sid = self.session_of_pane(pane).map(|s| s.0);
+        let separators = self.opt_session(sid, "word-separators");
         if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
             cm.set_line_number_option(ln);
             cm.set_wrap_search(wrap);
             cm.set_vi(vi);
+            cm.set_word_separators(&separators);
         }
     }
 
@@ -379,7 +382,7 @@ impl Server {
             // the time lines entered the history is not kept
             "top_line_time" => "0".into(),
             "copy_cursor_word" => {
-                let ws = self.opt_session(None, "word-separators");
+                let ws = self.opt_session(self.session_of_pane(pane).map(|s| s.0), "word-separators");
                 super::mouse::grid_word(|i| cm.line(i).cloned(), cm.line_count(), cx, cm.view_top() + cy, &ws)?
             }
             "copy_cursor_line" => Some(cm.cursor_line()).filter(|l| !l.is_empty())?,
