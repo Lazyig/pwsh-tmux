@@ -690,7 +690,7 @@ fn session_groups() {
     // killing one member keeps the windows for the other
     ctx.ok(&["kill-session", "-t", "g1"]);
     assert_eq!(names("g2"), vec!["uno", "two"]);
-    assert_eq!(ctx.fmt("g2", "#{session_grouped}"), "0");
+    assert_eq!(ctx.fmt("g2", "#{session_grouped} #{session_group} #{session_group_size}"), "1 g1 1");
 }
 
 #[test]
@@ -863,9 +863,9 @@ fn readonly_control_client_cannot_execute_or_remove_restriction() {
     writeln!(stdin, "display-message -p 'READONLY=#{{client_readonly}}'").unwrap();
     stdin.flush().unwrap();
     wait_for("readonly flag retained", || text().contains("READONLY=1"));
-    // Each command has its own reply block. Bound a single oversized reply;
-    // separate replies in a command list no longer accumulate in one buffer.
-    let oversized = format!("display-message -p '{}'", "#{p10000:#{l:x}}".repeat(500));
+    // Each command has its own reply block. Each key row expands separately,
+    // so this exceeds the reply limit without exceeding the format limit.
+    let oversized = format!("list-keys -F '{}'", "#{p10000:#{l:x}}".repeat(100));
     writeln!(stdin, "{oversized}").unwrap();
     stdin.flush().unwrap();
     wait_for("oversized reply rejected", || text().contains("command output limit exceeded"));
@@ -1207,6 +1207,14 @@ fn tmux_38_hook_events_and_formats() {
     assert_eq!(ctx.ok(&["show", "-gv", "@wpc"]).trim(), "on");
     ctx.ok(&["break-pane", "-d", "-s", "e:0.1", "-t", "e:5"]);
     assert_eq!(ctx.ok(&["show", "-gv", "@mv"]).trim(), "0>5");
+    // Cross-window swaps report source before destination, independent of window order.
+    ctx.ok(&["new-window", "-d", "-t", "e:6"]);
+    ctx.ok(&["new-window", "-d", "-t", "e:7"]);
+    let source = ctx.fmt("e:7", "#{pane_id}");
+    let destination = ctx.fmt("e:6", "#{pane_id}");
+    ctx.ok(&["set-hook", "-g", "pane-moved", "set -gaF @swap '[#{hook_pane}]'"]);
+    ctx.ok(&["swap-pane", "-d", "-s", &source, "-t", &destination]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@swap"]).trim(), format!("[{source}][{destination}]"));
     // the names hooks accept as events
     assert_eq!(ctx.fails(&["wait-for", "-E", "nosuch"]).trim(), "invalid event: nosuch");
     assert_eq!(ctx.fails(&["wait-for", "-E", "after-has-session"]).trim(), "invalid event: after-has-session");
@@ -1353,6 +1361,21 @@ fn tmux_38_control_notifications() {
     assert!(t[first..second].contains("%end ") && t[first..second].contains("%begin "), "{t}");
     send("display-message hello");
     wait_for("control message", || text().contains("%message hello\n%end "));
+    let pane = ctx.fmt("c:", "#{pane_id}");
+    send(&format!("refresh-client -A '{pane}:pause'"));
+    wait_for("pause notification", || text().contains(&format!("%pause {pane}\n")));
+    let t = text();
+    assert!(t.rfind("%end ").unwrap() < t.rfind("%pause ").unwrap(), "{t}");
+    send(&format!("refresh-client -A '{pane}:continue'"));
+    wait_for("continue notification", || text().contains(&format!("%continue {pane}\n")));
+    let t = text();
+    assert!(t.rfind("%end ").unwrap() < t.rfind("%continue ").unwrap(), "{t}");
+    send("wait-for control-paused");
+    send("display -p after-control-wait");
+    wait_for("control waiter registered", || !ctx.ok(&["wait", "-l", "control-paused"]).is_empty());
+    assert!(!text().contains("after-control-wait"));
+    ctx.ok(&["wait", "-S", "control-paused"]);
+    wait_for("ordered control continuation", || text().contains("after-control-wait\n%end "));
     let other = ctx.fmt("other:", "#{session_id}");
     ctx.ok(&["new-window", "-d", "-t", "other:", "-n", "elsewhere"]);
     wait_for("%unlinked-window-add", || text().contains("%unlinked-window-add @"));
@@ -1518,6 +1541,7 @@ fn tmux_38_wait_channel_lockers() {
     wait_for("both channel queues", || ctx.ok(&["wait", "-l", "mixed"]).lines().count() == 2);
     // -l prints waiters first, even though the locker arrived first.
     let names = ctx.ok(&["wait", "-l", "mixed"]);
+    assert_eq!(names.lines().nth(1).unwrap(), format!("client-{}", locker.id()));
     ctx.ok(&["wait", "-S", "mixed"]);
     wait_for("signal wakes waiter", || waiter.try_wait().unwrap().is_some());
     assert!(locker.try_wait().unwrap().is_none());
@@ -1565,4 +1589,75 @@ fn tmux_38_hook_groups_and_suspended_context() {
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hook:after-rename-window\nafter:\n");
+}
+
+/// A read can contain several titles and OSC commands; their payloads keep parsing order.
+#[cfg(unix)]
+#[test]
+fn tmux_38_interleaved_pane_output_events() {
+    let ctx = Ctx::new("outputevents38");
+    ctx.ok(&["new-session", "-d", "-s", "h", "sleep 100"]);
+    for event in ["pane-title-changed", "pane-bell", "pane-shell-prompt", "pane-command-started", "pane-command-finished"] {
+        ctx.ok(&["set-hook", "-g", event, "set -gaF @out '#{hook}:#{hook_new_title}:#{hook_command_status} '"]);
+    }
+    ctx.ok(&["new-window", "-d", "-t", "h:1", "sh", "-c",
+        r"sleep .3; printf '\033]2;one\007\033]133;A\007\033]133;C\007\007\033]2;two\007\033]133;D;7\007'; sleep 100"]);
+    wait_for("command finish event", || ctx.cmd(&["show", "-gv", "@out"]).1.contains("pane-command-finished"));
+    assert_eq!(ctx.ok(&["show", "-gv", "@out"]).trim(),
+        "pane-title-changed:one: pane-shell-prompt:: pane-command-started:: pane-bell:: pane-title-changed:two: pane-command-finished::7");
+    ctx.ok(&["set", "-p", "-t", "h:1", "allow-set-title", "off"]);
+    ctx.ok(&["set", "-g", "@out", ""]);
+    ctx.ok(&["respawn-pane", "-k", "-t", "h:1", "sh", "-c", r"sleep .3; printf '\033]2;ignored\007\007'; sleep 100"]);
+    wait_for("bell after suppressed title", || ctx.cmd(&["show", "-gv", "@out"]).1.contains("pane-bell"));
+    assert_eq!(ctx.ok(&["show", "-gv", "@out"]).trim(), "pane-bell::");
+}
+
+#[cfg(unix)]
+#[test]
+fn tmux_38_split_title_and_title_stack_events() {
+    let ctx = Ctx::new("titlestack38");
+    ctx.ok(&["new-session", "-d", "-s", "h", "sleep 100"]);
+    ctx.ok(&["set-hook", "-g", "pane-title-changed", "set -gaF @titles '|#{hook_new_title}'"]);
+    ctx.ok(&["split-window", "-d", "-T", "explicit", "sh", "-c",
+        r"sleep .3; printf '\033]2;base\007\033[22;0t\033]2;temp\007\033[23;0t\033]2;base\007'; sleep 100"]);
+    wait_for("title stack events", || ctx.cmd(&["show", "-gv", "@titles"]).1.trim() == "|explicit|base|temp|base|base");
+}
+
+#[test]
+fn tmux_38_group_removal_and_monitor_session_payload() {
+    let ctx = Ctx::new("groupmonitor38");
+    ctx.ok(&["new-session", "-d", "-s", "a"]);
+    ctx.ok(&["new-session", "-d", "-s", "b", "-t", "a"]);
+    ctx.ok(&["set-hook", "-g", "session-removed-from-group", "set -gF @removed '#{hook_session_name}|#{hook_group}|#{hook_group_size}'"]);
+    ctx.ok(&["kill-session", "-t", "a"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@removed"]).trim(), "a|a|2");
+    assert_eq!(ctx.fmt("b", "#{session_grouped}|#{session_group}|#{session_group_size}"), "1|a|1");
+    ctx.ok(&["set", "-g", "@v", "initial"]);
+    ctx.ok(&["set-hook", "-gB", "@pane:%*:#{@v}", "set -g @mon \"#{hook_session}|#{hook_window}|#{hook_pane}|#{hook_value}\""]);
+    // The monitor records its first value, then expands the hook before parsing it.
+    std::thread::sleep(Duration::from_millis(2100));
+    ctx.ok(&["set", "-g", "@v", "changed"]);
+    let expected = ctx.fmt("b", "#{session_id}|#{window_id}|#{pane_id}|changed");
+    wait_for("monitor session ID survives parsing", || ctx.cmd(&["show", "-gv", "@mon"]).1.trim() == expected);
+}
+
+#[test]
+fn tmux_38_selection_after_hooks() {
+    let ctx = Ctx::new("selectafter38");
+    ctx.ok(&["new-session", "-d", "-s", "h", "sleep 100"]);
+    ctx.ok(&["split-window", "-d", "-t", "h:0"]);
+    ctx.ok(&["set-hook", "-g", "after-select-pane", "set -ga @sel P"]);
+    ctx.ok(&["set-hook", "-g", "after-select-window", "set -ga @sel W"]);
+    ctx.ok(&["set-hook", "-g", "pane-title-changed", "set -ga @title T"]);
+    ctx.ok(&["select-pane", "-t", "h:0.0"]);
+    ctx.ok(&["select-pane", "-t", "h:0.0", "-T", "same"]);
+    ctx.ok(&["select-pane", "-t", "h:0.0", "-T", "same"]);
+    ctx.ok(&["select-pane", "-t", "h:0.1"]);
+    ctx.ok(&["last-pane", "-t", "h:0"]);
+    ctx.ok(&["new-window", "-d", "-t", "h:1", "sleep 100"]);
+    ctx.ok(&["next-window", "-t", "h"]);
+    ctx.ok(&["previous-window", "-t", "h"]);
+    ctx.ok(&["last-window", "-t", "h"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@sel"]).trim(), "PWWW");
+    assert_eq!(ctx.ok(&["show", "-gv", "@title"]).trim(), "TT");
 }

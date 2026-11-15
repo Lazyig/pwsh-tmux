@@ -488,6 +488,11 @@ impl Lexer<'_> {
             out.push('$');
             return;
         }
+        // A session ID ($N) is literal text, including in expanded monitor hooks.
+        if self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            out.push('$');
+            return;
+        }
         let mut name = String::new();
         while let Some(c) = self.peek() {
             if !is_name_char(c) {
@@ -791,6 +796,7 @@ mod tests {
 
     #[test]
     fn env_expansion() {
+        assert_eq!(p(r#"display "$2:@4:%3" $12"#), vec![v(&["display", "$2:@4:%3", "$12"])]);
         unsafe {
             std::env::set_var("CMDPARSE_T1", "val one");
             std::env::remove_var("CMDPARSE_UNSET");

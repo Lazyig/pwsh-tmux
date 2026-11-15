@@ -87,13 +87,16 @@ pub struct PaneCb {
     pub replies: Vec<u8>,
     pub bell: bool,
     pub title: Option<String>,
+    pub current_title: String,
+    pub title_stack: VecDeque<String>,
+    pub suppress_title: bool,
     pub cwd: Option<String>,
     /// modifyOtherKeys level the application asked for (CSI > 4 ; n m).
     pub ext_keys: u8,
     /// State reported for formats (pane_path, cursor_colour, pane_pb_*, pane_command_*).
     pub osc: OscState,
-    /// OSC 133 events and bells in order, with the OSC state each left behind.
-    pub events: Vec<(&'static str, OscState)>,
+    /// Output events in parsing order, with the state or data each carried.
+    pub events: Vec<events::OutputEvent>,
     /// OSC 52: (selection, base64 data) of the last clipboard set.
     pub clipboard: Option<(String, String)>,
 }
@@ -265,15 +268,21 @@ fn decode_file_url(url: &str) -> Option<String> {
 impl vt100::Callbacks for PaneCb {
     fn audible_bell(&mut self, _: &mut vt100::Screen) {
         self.bell = true;
-        if self.events.len() < 64 {
-            self.events.push(("pane-bell", self.osc.clone()));
-        }
+        self.events.push(events::OutputEvent::Osc("pane-bell", self.osc.clone()));
     }
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
-        self.title = Some(String::from_utf8_lossy(title).into_owned());
+        if self.suppress_title {
+            return;
+        }
+        let title = String::from_utf8_lossy(title).into_owned();
+        self.current_title = title.clone();
+        self.events.push(events::OutputEvent::Title(title.clone()));
+        self.title = Some(title);
     }
     fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
-        self.clipboard = Some((String::from_utf8_lossy(ty).into_owned(), String::from_utf8_lossy(data).into_owned()));
+        let data = (String::from_utf8_lossy(ty).into_owned(), String::from_utf8_lossy(data).into_owned());
+        self.events.push(events::OutputEvent::Clipboard(data.clone()));
+        self.clipboard = Some(data);
     }
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
         self.osc.osc(params);
@@ -285,8 +294,8 @@ impl vt100::Callbacks for PaneCb {
                     Some(b'D') => Some("pane-command-finished"),
                     _ => None,
                 };
-                if let Some(name) = name.filter(|_| self.events.len() < 64) {
-                    self.events.push((name, self.osc.clone()));
+                if let Some(name) = name {
+                    self.events.push(events::OutputEvent::Osc(name, self.osc.clone()));
                 }
             }
             _ => {}
@@ -300,6 +309,20 @@ impl vt100::Callbacks for PaneCb {
     fn unhandled_csi(&mut self, screen: &mut vt100::Screen, i1: Option<u8>, _i2: Option<u8>, params: &[&[u16]], c: char) {
         let first = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
         match (i1, c, first) {
+            (None, 't', 22) if params.get(1).and_then(|p| p.first()).is_some_and(|p| matches!(p, 0 | 2)) => {
+                if self.title_stack.len() == 10 {
+                    self.title_stack.pop_front();
+                }
+                self.title_stack.push_back(self.current_title.clone());
+            }
+            (None, 't', 23) if params.get(1).and_then(|p| p.first()).is_some_and(|p| matches!(p, 0 | 2)) => {
+                if let Some(title) = self.title_stack.pop_back() {
+                    self.current_title = title;
+                }
+                let title = self.current_title.clone();
+                self.title = Some(title.clone());
+                self.events.push(events::OutputEvent::Title(title));
+            }
             (None, 'n', 6) => {
                 let (r, c) = screen.cursor_position();
                 self.replies.extend(format!("\x1b[{};{}R", r + 1, c + 1).bytes());
@@ -712,7 +735,8 @@ impl Client {
         self.send(S_EXIT, msg.as_bytes());
     }
     pub fn name(&self) -> String {
-        format!("client-{}", self.id)
+        let id = self.ident.as_ref().filter(|i| !i.tty && i.pid != 0).map_or(self.id, |i| i.pid);
+        format!("client-{id}")
     }
 }
 
@@ -763,6 +787,9 @@ pub struct Ctx {
     pub control_open: bool,
     /// Hook context stack survives async commands that park the queue.
     pub hook_saved: events::HookSaved,
+    pub command_error: Option<String>,
+    pub hook_error: Option<String>,
+    pub skip_after: bool,
 }
 
 /// Queue markers source-file puts around a file's commands. A parsed command can hold any
@@ -1460,8 +1487,11 @@ impl Server {
         }
         self.control_output(id, data);
         let scroll_on_clear = options::is_on(&self.opt_pane(id, "scroll-on-clear"));
+        let allow_title = options::is_on(&self.opt_pane(id, "allow-set-title"));
         let p = self.panes.get_mut(&id).unwrap();
         p.parser.screen_mut().set_scroll_on_clear(scroll_on_clear);
+        p.parser.callbacks_mut().current_title = p.title.clone();
+        p.parser.callbacks_mut().suppress_title = !allow_title;
         p.parser.process(data);
         p.last_output = Instant::now();
         if !data.is_empty() {
@@ -1484,13 +1514,12 @@ impl Server {
         let bell = std::mem::take(&mut cb.bell);
         let title = cb.title.take();
         let osc_events = std::mem::take(&mut cb.events);
-        let clipboard = cb.clipboard.take();
+        cb.clipboard.take();
         if let Some(cwd) = cb.cwd.take() {
             p.current_path = cwd;
             p.cwd_seq += 1;
         }
         p.send(replies);
-        let title_changed = title.as_ref().filter(|t| **t != p.title).cloned();
         if let Some(t) = title {
             p.title = t.clone();
             if options::is_on(&self.opt_pane(id, "allow-rename")) {
@@ -1514,8 +1543,7 @@ impl Server {
         if let Some(w) = self.windows.get_mut(&wid) {
             w.activity = now_secs();
         }
-        let clipboard = clipboard.is_some_and(|data| self.pane_clipboard(id, data));
-        self.pane_output_events(id, title_changed, osc_events, clipboard);
+        self.pane_output_events(id, osc_events);
         if bell && self.opt_window_on(Some(wid), "monitor-bell") {
             self.alert(wid, ALERT_BELL);
         }
@@ -2143,11 +2171,12 @@ impl Server {
         let gids: Vec<u32> = self.groups.keys().copied().collect();
         for gid in gids {
             let members: Vec<SessId> = self.sessions.values().filter(|s| s.group == Some(gid)).map(|s| s.id).collect();
-            if members.len() < 2 {
-                for m in &members {
-                    self.sessions.get_mut(m).unwrap().group = None;
-                }
+            if members.is_empty() {
                 self.groups.remove(&gid);
+                continue;
+            }
+            if members.len() == 1 {
+                self.groups.insert(gid, self.sessions[&members[0]].links.clone());
                 continue;
             }
             let canonical = self.groups[&gid].clone();
@@ -2461,17 +2490,26 @@ impl Server {
     /// After a command: the after-<command> hook, inserted after it (cmdq_insert_hook).
     fn after_command(&mut self, argv: &[String], ctx: &Ctx) {
         self.sync_groups();
-        if ctx.hook_depth == 0 {
+        if ctx.hook_depth == 0 && !ctx.skip_after {
             if let Some(full) = argv.first().and_then(|n| cmds::canonical(n)) {
                 let mut argv = argv.to_vec();
                 argv[0] = full.to_string();
-                self.command_hook(&format!("after-{full}"), &argv, ctx);
+                let hook = match full {
+                    "next-window" | "previous-window" | "last-window" => "select-window",
+                    _ => full,
+                };
+                self.command_hook(&format!("after-{hook}"), &argv, ctx);
             }
         }
     }
 
     /// Runs a command queue, then the hooks its commands' events queued.
     pub fn run_queue(&mut self, q: Queue) {
+        if q.ctx.control_seq.is_some() {
+            if let Some(c) = q.ctx.client.and_then(|c| self.clients.get_mut(&c)) {
+                c.ctl.command_waiting = true;
+            }
+        }
         self.run_queue_inner(q);
         self.drain_hooks();
     }
@@ -2514,9 +2552,9 @@ impl Server {
     fn run_queue_inner(&mut self, mut q: Queue) {
         let mut hook_saved = std::mem::take(&mut q.ctx.hook_saved);
         // an error whose command-error hook runs first
-        let mut failed: Option<String> = None;
+        let mut failed = q.ctx.command_error.take();
         // the first error of a hook's commands: it ends only that hook's list
-        let mut hook_failed: Option<String> = None;
+        let mut hook_failed = q.ctx.hook_error.take();
         if q.ctx.control_open {
             // the command the queue waited in is done
             self.control_item_done(&mut q, None);
@@ -2625,6 +2663,8 @@ impl Server {
                 Ok(Flow::WaitOverlay(cid, epoch)) => {
                     q.ctx.control_open = q.ctx.control_seq.is_some();
                     q.ctx.hook_saved = hook_saved;
+                    q.ctx.command_error = failed;
+                    q.ctx.hook_error = hook_failed;
                     self.overlay_waits.push((cid, epoch, name, q));
                     return;
                 }
@@ -2654,6 +2694,8 @@ impl Server {
                             }
                             q.ctx.control_open = open;
                             q.ctx.hook_saved = hook_saved;
+                            q.ctx.command_error = failed;
+                            q.ctx.hook_error = hook_failed;
                             self.spawn_job(&get(2), None, kind, q);
                             return;
                         }
@@ -2670,30 +2712,40 @@ impl Server {
                             }
                             q.ctx.control_open = open;
                             q.ctx.hook_saved = hook_saved;
+                            q.ctx.command_error = failed;
+                            q.ctx.hook_error = hook_failed;
                             self.spawn_job(&get(2), cwd, kind, q);
                             return;
                         }
                         "wait" => {
                             q.ctx.control_open = open;
                             q.ctx.hook_saved = hook_saved;
+                            q.ctx.command_error = failed;
+                            q.ctx.hook_error = hook_failed;
                             self.waits.entry(get(2)).or_default().waiters.push(q);
                             return;
                         }
                         "lock" => {
                             q.ctx.control_open = open;
                             q.ctx.hook_saved = hook_saved;
+                            q.ctx.command_error = failed;
+                            q.ctx.hook_error = hook_failed;
                             self.waits.entry(get(2)).or_default().lockers.push(q);
                             return;
                         }
                         "wait-event" => {
                             q.ctx.control_open = open;
                             q.ctx.hook_saved = hook_saved;
+                            q.ctx.command_error = failed;
+                            q.ctx.hook_error = hook_failed;
                             self.park_event_waiter(get(2), (get(5) == "F").then(|| get(3)), get(4) == "v", q);
                             return;
                         }
                         "delay" => {
                             // run-shell -d: the rest of the queue (and the command) runs later
                             q.ctx.hook_saved = hook_saved;
+                            q.ctx.command_error = failed;
+                            q.ctx.hook_error = hook_failed;
                             let ms: u64 = get(2).parse().unwrap_or(0);
                             if let Some(c) = delay_cmd.as_ref().map(|c| strip_delay(c)) {
                                 q.cmds.push_front(c);
@@ -2720,6 +2772,9 @@ impl Server {
         let ctx = q.ctx;
         if ctx.out.overflowed() { err = Some("command output limit exceeded".into()); }
         if let (Some(seq), Some(cid)) = (ctx.control_seq, ctx.client) {
+            if let Some(c) = self.clients.get_mut(&cid) {
+                c.ctl.command_waiting = false;
+            }
             if !ctx.control_done || !ctx.out.is_empty() || err.is_some() {
                 self.control_block(cid, seq, ctx.control_line && ctx.hook_depth == 0, &ctx.out, err.as_deref());
             }

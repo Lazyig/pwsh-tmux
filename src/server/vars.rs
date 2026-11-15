@@ -311,7 +311,7 @@ impl Vars for VarCtx<'_> {
                 let members: Vec<&Session> = srv.sessions.values().filter(|x| x.group == Some(g)).collect();
                 Some(match name {
                     // tmux names a group after its first session
-                    "session_group" => members.iter().min_by_key(|x| x.created).map(|x| x.name.clone()).unwrap_or_default(),
+                    "session_group" => srv.group_name(g),
                     "session_group_size" => members.len().to_string(),
                     "session_group_attached" => members.iter().map(|x| srv.clients.values().filter(|c| c.attached && c.session == Some(x.id)).count()).sum::<usize>().to_string(),
                     _ => members.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(","),

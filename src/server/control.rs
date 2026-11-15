@@ -23,6 +23,10 @@ pub struct Flags {
     pub no_output: bool,
     pub wait_exit: bool,
     pub ignore_size: bool,
+    /// A waiting command holds this client's queue; later input lines stay ordered.
+    pub command_waiting: bool,
+    pub command_lines: VecDeque<String>,
+    pub command_bytes: usize,
     pub exiting: std::cell::Cell<bool>,
     /// Told to exit (CLIENT_EXIT): the exit is sent once the reply of the running
     /// command is written.
@@ -75,6 +79,15 @@ impl Server {
             return;
         }
         let Some(c) = self.clients.get_mut(&cid) else { return };
+        if c.ctl.command_waiting {
+            c.ctl.command_bytes = c.ctl.command_bytes.saturating_add(line.len() + 1);
+            if c.ctl.command_bytes > output::MAX_REPLY {
+                c.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+            c.ctl.command_lines.push_back(line.to_string());
+            return;
+        }
         c.control_seq += 1;
         let seq = c.control_seq;
         let pane = self.client_active_pane(cid);
@@ -130,7 +143,7 @@ impl Server {
                     let lag = c.lag();
                     if lag >= limit {
                         c.ctl.panes.insert(pane, PaneOutput::Paused);
-                        c.send(S_OUTPUT, format!("%pause %{pane}\n").as_bytes());
+                        self.control_notify_write(cid, &format!("%pause %{pane}"));
                         continue;
                     }
                     format!("%extended-output %{pane} {} : {escaped}\n", lag.as_millis())
@@ -160,13 +173,13 @@ impl Server {
             "pause" => {
                 c.ctl.panes.insert(pane, PaneOutput::Paused);
                 if was != PaneOutput::Paused {
-                    c.send(S_OUTPUT, format!("%pause %{pane}\n").as_bytes());
+                    self.control_notify_write(cid, &format!("%pause %{pane}"));
                 }
             }
             "continue" => {
                 if was == PaneOutput::Paused {
                     c.ctl.panes.insert(pane, PaneOutput::On);
-                    c.send(S_OUTPUT, format!("%continue %{pane}\n").as_bytes());
+                    self.control_notify_write(cid, &format!("%continue %{pane}"));
                 }
             }
             other => return Err(format!("unknown pane action: {other}")),
@@ -303,7 +316,7 @@ impl Server {
     /// Control clients that get notifications (CONTROL_SHOULD_NOTIFY_CLIENT): not
     /// those already exiting.
     fn notify_clients(&self) -> Vec<(ClientId, Option<SessId>)> {
-        self.clients.values().filter(|c| c.control > 0 && c.attached && !c.ctl.exiting.get())
+        self.clients.values().filter(|c| c.control > 0 && c.attached && !c.ctl.exiting.get() && c.ctl.deferred_exit.borrow().is_none())
             .map(|c| (c.id, c.session.filter(|s| self.sessions.contains_key(s)))).collect()
     }
 
@@ -428,6 +441,12 @@ impl Server {
     /// Writes the notifications held for a control client.
     pub fn control_flush(&mut self, cid: ClientId) {
         if let Some(text) = self.ev.ctl_queue.remove(&cid) {
+            if text.overflowed() {
+                if let Some(c) = self.clients.get(&cid) {
+                    c.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                return;
+            }
             if self.clients.get(&cid).is_some_and(|c| !c.ctl.exiting.get()) {
                 self.control_write(cid, &text);
             }
@@ -437,6 +456,19 @@ impl Server {
     /// Writes every held notification (no command block is open between commands),
     /// then lets go of control clients told to exit.
     pub fn control_notify(&mut self) {
+        // Continue input queued behind wait-for, run-shell and other async commands.
+        loop {
+            let next = self.clients.values_mut().find_map(|c| {
+                if c.ctl.command_waiting || c.ctl.exiting.get() || c.ctl.deferred_exit.borrow().is_some() || c.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                    return None;
+                }
+                let line = c.ctl.command_lines.pop_front()?;
+                c.ctl.command_bytes = c.ctl.command_bytes.saturating_sub(line.len() + 1);
+                Some((c.id, line))
+            });
+            let Some((cid, line)) = next else { break };
+            self.control_line(cid, &line);
+        }
         let ids: Vec<ClientId> = self.ev.ctl_queue.keys().copied().collect();
         for cid in ids {
             self.control_flush(cid);

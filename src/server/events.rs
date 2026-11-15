@@ -11,6 +11,13 @@ use super::*;
 use crate::opts::Opts;
 use std::collections::HashSet;
 
+/// Events parsed from a single pane read must retain their order and payloads.
+pub enum OutputEvent {
+    Osc(&'static str, OscState),
+    Title(String),
+    Clipboard((String, String)),
+}
+
 /// A payload value, printed as tmux's event_payload_item_print does.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Val {
@@ -246,6 +253,8 @@ pub struct State {
     pub cur_formats: Option<Arc<HashMap<String, String>>>,
     pub seen: Seen,
     pub spawned: Vec<Spawned>,
+    /// swap-pane fires movement for the source before the destination.
+    pub pane_move_order: Vec<PaneId>,
     /// session-closed payloads of sessions destroyed since the last check.
     pub closed: Vec<(SessId, Payload)>,
     /// Group members synchronized from a changed session: (changed, others).
@@ -267,7 +276,7 @@ pub struct State {
     /// The latest client of each window (w->latest).
     pub latest: HashMap<WinId, ClientId>,
     /// Control mode notifications waiting until no %begin block is open.
-    pub ctl_queue: BTreeMap<ClientId, String>,
+    pub ctl_queue: BTreeMap<ClientId, output::Output>,
 }
 
 /// Hook names (tmux's hooks_valid_event_name): table hooks and @ names.
@@ -292,7 +301,7 @@ impl Server {
         Val::Window(wid, name)
     }
     fn val_client(&self, cid: ClientId) -> Val {
-        Val::Client(cid, format!("client-{cid}"))
+        Val::Client(cid, self.clients.get(&cid).map(|c| c.name()).unwrap_or_else(|| format!("client-{cid}")))
     }
 
     /// A session's current window, if it still has one (a session being destroyed
@@ -765,7 +774,7 @@ impl Server {
     }
 
     fn waiter_name(&self, ctx: &Ctx) -> String {
-        ctx.reply.or(ctx.client).map(|c| format!("client-{c}")).unwrap_or_default()
+        ctx.reply.or(ctx.client).and_then(|c| self.clients.get(&c)).map(|c| c.name()).unwrap_or_default()
     }
 
     /// wait-for: channels (-S/-L/-U, waiting, -l, -w) and events (-E).
@@ -809,12 +818,13 @@ impl Server {
         }
         if let Some(who) = o.get('w') {
             // a waiter, else a locker (which goes on without the lock)
-            let who = who.to_string();
+            let clients: HashSet<ClientId> = self.clients.values().filter(|c| c.name() == who).map(|c| c.id).collect();
+            let mine = |q: &Queue| q.ctx.reply.or(q.ctx.client).is_some_and(|c| clients.contains(&c));
             let Some(ch) = self.waits.get_mut(&name) else { return Ok(Flow::Next) };
-            let w = ch.waiters.iter().position(|q| q.ctx.reply.or(q.ctx.client).map(|c| format!("client-{c}")).unwrap_or_default() == who);
+            let w = ch.waiters.iter().position(mine);
             let q = match w {
                 Some(i) => Some(ch.waiters.remove(i)),
-                None => ch.lockers.iter().position(|q| q.ctx.reply.or(q.ctx.client).map(|c| format!("client-{c}")).unwrap_or_default() == who).map(|i| ch.lockers.remove(i)),
+                None => ch.lockers.iter().position(mine).map(|i| ch.lockers.remove(i)),
             };
             if let Some(q) = q {
                 if ch.removable() {
@@ -1720,7 +1730,10 @@ impl Server {
             }
         }
         // panes moved to another window (break-pane, join-pane, swap-pane)
-        for (pane, wid, idx, _, old) in &pane_changes {
+        let order = std::mem::take(&mut self.ev.pane_move_order);
+        let mut moved: Vec<_> = pane_changes.iter().collect();
+        moved.sort_by_key(|(pane, ..)| order.iter().position(|p| p == pane).unwrap_or(order.len()));
+        for (pane, wid, idx, _, old) in moved {
             let (pane, wid, idx) = (*pane, *wid, *idx);
             if old.wid != wid {
                 let mut p = self.payload_pane(pane);
@@ -1840,7 +1853,10 @@ impl Server {
         self.ev.seen.sessions.values().filter(|x| x.group.as_ref().is_some_and(|g| g.0 == gid)).count()
     }
 
-    fn group_name(&self, gid: u32) -> String {
+    pub(super) fn group_name(&self, gid: u32) -> String {
+        if let Some((_, name)) = self.ev.seen.sessions.values().filter_map(|s| s.group.as_ref()).find(|g| g.0 == gid) {
+            return name.clone();
+        }
         self.sessions.values().filter(|s| s.group == Some(gid)).min_by_key(|s| (s.created, s.id)).map(|s| s.name.clone()).unwrap_or_default()
     }
 
@@ -1896,19 +1912,29 @@ impl Server {
 
     /// The pane events of one read of output: activity, bell, title, OSC 133 and
     /// clipboard.
-    pub fn pane_output_events(&mut self, pane: PaneId, title: Option<String>, osc: Vec<(&'static str, OscState)>, clipboard: bool) {
+    pub fn pane_output_events(&mut self, pane: PaneId, events: Vec<OutputEvent>) {
         if self.window_of(pane).is_none() {
             return;
         }
         if self.ev.activity.insert(pane) {
             self.fire_pane("pane-activity", pane);
         }
-        if let Some(t) = title {
-            let mut p = self.payload_pane(pane);
-            p.str("new_title", t);
-            self.fire("pane-title-changed", p);
-        }
-        for (name, st) in osc {
+        for event in events {
+            let (name, st) = match event {
+                OutputEvent::Title(t) => {
+                    let mut p = self.payload_pane(pane);
+                    p.str("new_title", t);
+                    self.fire("pane-title-changed", p);
+                    continue;
+                }
+                OutputEvent::Clipboard(data) => {
+                    if self.pane_clipboard(pane, data) {
+                        self.fire_pane("pane-set-clipboard", pane);
+                    }
+                    continue;
+                }
+                OutputEvent::Osc(name, st) => (name, st),
+            };
             if name == "pane-shell-prompt" || name == "pane-bell" {
                 self.fire_pane(name, pane);
                 continue;
@@ -1937,9 +1963,18 @@ impl Server {
             }
             self.fire(name, p);
         }
-        if clipboard {
-            self.fire_pane("pane-set-clipboard", pane);
+    }
+
+    /// Called by a pane prompt's owner on opening, replacing and closing it.
+    /// Status-line prompts do not fire these events (window_fire_pane_prompt).
+    #[allow(dead_code)]
+    pub fn fire_pane_prompt(&mut self, name: &str, pane: PaneId, prompt_type: &str) {
+        if self.window_of(pane).is_none() {
+            return;
         }
+        let mut p = self.payload_pane(pane);
+        p.str("prompt_type", prompt_type);
+        self.fire(name, p);
     }
 
     /// pane-exited, or pane-died when remain-on-exit keeps the pane.
@@ -2046,11 +2081,13 @@ mod tests {
         let mut p = vt100::Parser::new_with_callbacks(nz(24), nz(80), 0, PaneCb::default());
         p.process(b"\x1b]133;A\x07\x1b]133;C\x07out\x1b]133;D;7\x07\x07\x1b]52;c;aGk=\x07");
         let cb = p.callbacks_mut();
-        let names: Vec<&str> = cb.events.iter().map(|e| e.0).collect();
-        assert_eq!(names, ["pane-shell-prompt", "pane-command-started", "pane-command-finished", "pane-bell"]);
-        assert!(cb.events[1].1.cmd_running && cb.events[1].1.cmd_status.is_none());
-        assert_eq!(cb.events[2].1.cmd_status, Some(7));
-        assert!(!cb.events[2].1.cmd_running);
+        let names: Vec<&str> = cb.events.iter().map(|e| match e { OutputEvent::Osc(name, _) => *name, OutputEvent::Title(_) => "title", OutputEvent::Clipboard(_) => "clipboard" }).collect();
+        assert_eq!(names, ["pane-shell-prompt", "pane-command-started", "pane-command-finished", "pane-bell", "clipboard"]);
+        let OutputEvent::Osc(_, started) = &cb.events[1] else { panic!("command start") };
+        let OutputEvent::Osc(_, finished) = &cb.events[2] else { panic!("command end") };
+        assert!(started.cmd_running && started.cmd_status.is_none());
+        assert_eq!(finished.cmd_status, Some(7));
+        assert!(!finished.cmd_running);
         assert_eq!(cb.clipboard, Some(("c".into(), "aGk=".into())));
     }
 

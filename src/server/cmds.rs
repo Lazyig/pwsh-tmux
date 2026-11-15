@@ -95,7 +95,7 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("show-prompt-history", "showphist", "", "T"),
     ("show-window-options", "showw", "gv", "Ft"),
     ("source-file", "source", "Fnqv", "t"),
-    ("split-window", "splitw", "bdEfhIvPZ", "cefFlt"),
+    ("split-window", "splitw", "bdEfhIvPZ", "cefFltT"),
     ("start-server", "start", "", ""),
     ("suspend-client", "suspendc", "", "t"),
     ("swap-pane", "swapp", "dDUZ", "st"),
@@ -1071,6 +1071,7 @@ impl Server {
     // ---- the dispatcher ---------------------------------------------------------------------
 
     pub fn exec(&mut self, argv: Vec<String>, ctx: &mut Ctx) -> Result<Flow, String> {
+        ctx.skip_after = false;
         ctx.readonly |= self.readonly_context.get() || self.client_is_readonly(ctx.client) || self.client_is_readonly(ctx.reply);
         let previous = self.readonly_context.replace(ctx.readonly);
         let result = self.exec_inner(argv, ctx);
@@ -1175,7 +1176,7 @@ impl Server {
                 let sid = self.create_session(ctx, name, cols, rows, cwd, o.get('n').map(String::from), &o.rest, &env)?;
                 if o.has('P') {
                     let fmt = o.get('F').unwrap_or("#{session_name}:");
-                    let s = self.expand(Target { sid: Some(sid), ..Target::default() }, None, fmt);
+                    let s = self.expand(self.target_for_session(sid), None, fmt);
                     ctx.out.push_str(&s);
                     ctx.out.push('\n');
                 }
@@ -1908,6 +1909,13 @@ impl Server {
                 let command = spawn_command(&o, o.has('I'))?;
                 let new = self.split_pane(tt, o.has('h'), o.has('b'), size, o.has('f'), cwd, &command, &env)?;
                 let wid = tt.wid.unwrap();
+                if let Some(title) = o.get('T') {
+                    let title = self.expand(tt, ctx.client, title);
+                    self.panes.get_mut(&new).unwrap().title = title.clone();
+                    let mut p = self.payload_pane(new);
+                    p.str("new_title", title);
+                    self.fire("pane-title-changed", p);
+                }
                 if !o.has('d') {
                     self.select_pane(wid, new);
                 }
@@ -1947,6 +1955,7 @@ impl Server {
                 Ok(Flow::Next)
             }
             "select-pane" => {
+                ctx.skip_after = true;
                 let tt = self.resolve_pane(ctx, t)?;
                 let wid = tt.wid.unwrap();
                 let pane = tt.pane.unwrap();
@@ -1960,12 +1969,10 @@ impl Server {
                 if let Some(title) = o.get('T') {
                     let title = self.expand(tt, ctx.client, title);
                     let p = self.panes.get_mut(&pane).unwrap();
-                    if p.title != title {
-                        p.title = title.clone();
-                        let mut ev = self.payload_pane(pane);
-                        ev.str("new_title", title);
-                        self.fire("pane-title-changed", ev);
-                    }
+                    p.title = title.clone();
+                    let mut ev = self.payload_pane(pane);
+                    ev.str("new_title", title);
+                    self.fire("pane-title-changed", ev);
                     self.mark_window_dirty(wid);
                     return Ok(Flow::Next);
                 }
@@ -1990,7 +1997,10 @@ impl Server {
                 }
                 if let Some((_, d)) = DIRS.iter().find(|(c, _)| o.has(*c)) {
                     let zoomed = self.windows[&wid].zoomed;
+                    let active = self.windows[&wid].active;
                     self.select_dir(tt, *d)?;
+                    ctx.pane = Some(self.windows[&wid].active);
+                    ctx.skip_after = ctx.pane == Some(active);
                     if o.has('Z') && zoomed {
                         let w = self.windows.get_mut(&wid).unwrap();
                         w.zoomed = true;
@@ -2002,6 +2012,7 @@ impl Server {
                     let w = &self.windows[&wid];
                     let last = w.last_active.filter(|p| w.panes().contains(p)).ok_or("no last pane")?;
                     self.select_pane(wid, last);
+                    ctx.pane = Some(last);
                     return Ok(Flow::Next);
                 }
                 if let (Some(sid), Some(idx)) = (tt.sid, tt.idx) {
@@ -2011,11 +2022,14 @@ impl Server {
                 }
                 // hooks run by select_window may have removed the pane
                 if self.windows.get(&wid).is_some_and(|w| w.panes().contains(&pane)) {
+                    ctx.skip_after = self.windows[&wid].active == pane;
                     self.select_pane(wid, pane);
+                    ctx.pane = Some(pane);
                 }
                 Ok(Flow::Next)
             }
             "last-pane" => {
+                ctx.skip_after = true;
                 let wt = self.resolve_window(ctx, t)?;
                 let wid = wt.wid.unwrap();
                 let w = &self.windows[&wid];
@@ -2027,6 +2041,7 @@ impl Server {
                 }
                 let zoomed = self.windows[&wid].zoomed;
                 self.select_pane(wid, last);
+                ctx.pane = Some(last);
                 if o.has('Z') && zoomed {
                     self.windows.get_mut(&wid).unwrap().zoomed = true;
                     self.apply_layout(wid);
@@ -2116,6 +2131,7 @@ impl Server {
                 if spane == dpane {
                     return Ok(Flow::Next);
                 }
+                self.ev.pane_move_order.extend([spane, dpane]);
                 if swid == dwid {
                     let w = self.windows.get_mut(&dwid).unwrap();
                     w.pane_order = w.panes();
@@ -3396,7 +3412,7 @@ impl Server {
         self.detect_changes(None);
         self.fire_session("session-created", sid);
         if print {
-            let s = self.expand(Target { sid: Some(sid), ..Target::default() }, None, fmt.unwrap_or("#{session_name}:"));
+            let s = self.expand(self.target_for_session(sid), None, fmt.unwrap_or("#{session_name}:"));
             ctx.out.push_str(&s);
             ctx.out.push('\n');
         }
