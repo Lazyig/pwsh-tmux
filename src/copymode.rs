@@ -3349,40 +3349,120 @@ fn unwrap_position(lines: &[Line], wx: Option<usize>, wy: usize) -> (usize, usiz
     }
 }
 
-/// grid_reflow: every unwrapped line split again at `w` columns. A wide character that
-/// does not fit goes to the next row, which leaves the row before it short.
-fn reflow(lines: &[Line], w: usize) -> Vec<Line> {
-    let mut out = Vec::with_capacity(lines.len());
-    let mut cells: Vec<Cell> = Vec::new();
-    for l in lines {
-        cells.extend(l.cells[..cells_used(l).min(l.cells.len())].iter().cloned());
-        if l.wrapped {
+/// A cell's width as grid_reflow reads it: a wide character's own width, 1 for anything
+/// else, including the padding cell after a wide character (it is stored as a compact
+/// cell, which grid_get_cell1 reads back as width 1).
+fn reflow_width(c: &Cell) -> usize {
+    if c.is_continuation() { 1 } else { unicode_width::UnicodeWidthStr::width(c.text.as_str()).max(1) }
+}
+
+/// grid_reflow, with grid_reflow_move, _split and _join as tmux 3.8 has them: rows too
+/// wide are split, rows that wrap take what fits from the rows after them.
+fn reflow(lines: &[Line], sx: usize) -> Vec<Line> {
+    let mut src: Vec<(Vec<Cell>, bool)> = lines.iter().map(|l| (l.cells[..cells_used(l).min(l.cells.len())].to_vec(), l.wrapped)).collect();
+    let mut dead = vec![false; src.len()];
+    let mut target: Vec<(Vec<Cell>, bool)> = Vec::with_capacity(src.len());
+    for yy in 0..src.len() {
+        if dead[yy] {
             continue;
         }
-        let mut start = 0;
-        loop {
-            let mut end = (start + w).min(cells.len());
-            while end > start + 1 && end < cells.len() && cells[end].is_continuation() {
-                end -= 1;
+        let (mut width, mut at) = (0, 0);
+        for (i, c) in src[yy].0.iter().enumerate() {
+            let w = reflow_width(c);
+            if at == 0 && width + w > sx {
+                at = i;
             }
-            let wrapped = end < cells.len();
-            let mut row = cells[start..end].to_vec();
-            if !wrapped {
-                row.resize(w, Cell::default());
+            width += w;
+        }
+        if width > sx {
+            // grid_reflow_split
+            let (cells, wrapped) = std::mem::take(&mut src[yy]);
+            dead[yy] = true;
+            target.push((cells[..at].to_vec(), true));
+            let (mut line, mut width) = ((Vec::new(), false), 0);
+            for c in &cells[at..] {
+                let w = reflow_width(c);
+                if width + w > sx {
+                    line.1 = true;
+                    target.push(std::mem::take(&mut line));
+                    width = 0;
+                }
+                width += w;
+                line.0.push(c.clone());
             }
-            out.push(Line { cells: row, wrapped });
+            line.1 |= wrapped;
+            target.push(line);
+            if width < sx && wrapped {
+                reflow_join(&mut target, &mut src, &mut dead, sx, yy, width);
+            }
+        } else {
+            target.push(std::mem::take(&mut src[yy]));
+            dead[yy] = true;
+            if width < sx && target.last().unwrap().1 {
+                reflow_join(&mut target, &mut src, &mut dead, sx, yy, width);
+            }
+        }
+    }
+    target.into_iter().map(|(mut cells, wrapped)| {
+        if !wrapped {
+            cells.resize(sx.max(cells.len()), Cell::default());
+        }
+        Line { cells, wrapped }
+    }).collect()
+}
+
+/// grid_reflow_join: the rows after `yy` are joined onto the last target row while they
+/// fit; a row taken only in part keeps the rest for later.
+fn reflow_join(target: &mut [(Vec<Cell>, bool)], src: &mut [(Vec<Cell>, bool)], dead: &mut [bool], sx: usize, yy: usize, mut width: usize) {
+    let to = target.len() - 1;
+    let (mut lines, mut wrapped, mut from, mut want) = (0, true, None, 0);
+    loop {
+        let line = yy + 1 + lines;
+        if line >= src.len() {
+            break;
+        }
+        if !src[line].1 {
+            wrapped = false;
+        }
+        if src[line].0.is_empty() {
             if !wrapped {
                 break;
             }
-            start = end;
+            lines += 1;
+            continue;
         }
-        cells.clear();
+        let w = reflow_width(&src[line].0[0]);
+        if width + w > sx {
+            break;
+        }
+        width += w;
+        target[to].0.push(src[line].0[0].clone());
+        from = Some(line);
+        want = 1;
+        while want < src[line].0.len() {
+            let w = reflow_width(&src[line].0[want]);
+            if width + w > sx {
+                break;
+            }
+            width += w;
+            target[to].0.push(src[line].0[want].clone());
+            want += 1;
+        }
+        lines += 1;
+        if !wrapped || want != src[line].0.len() || width == sx {
+            break;
+        }
     }
-    if !cells.is_empty() {
-        // a last line that wraps into nothing
-        out.push(Line { cells: std::mem::take(&mut cells), wrapped: false });
+    let Some(from) = from.filter(|_| lines > 0) else { return };
+    if want < src[from].0.len() {
+        src[from].0.drain(..want);
+        lines -= 1;
+    } else if !wrapped {
+        target[to].1 = false;
     }
-    out
+    for d in &mut dead[yy + 1..yy + 1 + lines] {
+        *d = true;
+    }
 }
 
 /// A selection as screen_set_selection keeps it: start (selx, sely) and end, in screen cells.
@@ -4405,6 +4485,19 @@ mod tests {
         cm.resize(60, 3);
         assert_eq!(texts(&cm)[0], long);
         assert_eq!(cm.cursor(), (1, 0));
+        // grid_reflow counts a wide character's padding cell as a column: four CJK
+        // characters to a 13-column row, as live tmux 3.8 shows
+        let mut wide = Line { cells: Vec::new(), wrapped: false };
+        for _ in 0..22 {
+            wide.cells.push(Cell { text: "漢".into(), style: Style::default() });
+            wide.cells.push(Cell { text: String::new(), style: Style::default() });
+        }
+        let first = Line { cells: wide.cells[..40].to_vec(), wrapped: true };
+        let rest = Line { cells: wide.cells[40..].to_vec(), wrapped: false };
+        let mut cm = CopyMode::new(vec![first, rest, line("DONE", false)], 40, 6, (2, 0), true);
+        cm.resize(13, 6);
+        let t: Vec<String> = cm.lines.iter().map(|l| l.cells.iter().map(|c| c.text.as_str()).collect::<String>().trim_end().to_string()).collect();
+        assert_eq!(t[..7], ["漢漢漢漢", "漢漢漢漢", "漢漢漢漢", "漢漢漢漢", "漢漢漢漢", "漢漢", "DONE"]);
     }
 
     #[test]
