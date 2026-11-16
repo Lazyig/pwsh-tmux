@@ -228,3 +228,80 @@ fn client_hyperlinks_are_feature_gated_and_survive_copy_mode() {
         }
     }
 }
+
+#[test]
+fn tabs_rewrap_with_their_padding_and_stay_tabs() {
+    // grid_reflow: a tab is a cell of its width and each padding cell counts a column,
+    // so what follows a tab moves on early; widened again the tab is still a tab
+    let ctx = Ctx::new("grid-tabflow");
+    ctx.ok(&["new", "-d", "-s", "m", "-x", "20", "-y", "6", "printf 'abcde\\tf\\r\\nab\\tcd\\r\\n\\tx\\033[31m\\tq\\033[m\\r\\nzz\\t\\r\\n\\tA\\r\\033[3C\\tB'; sleep 100"]);
+    wait_for("tab output", || ctx.capture("m").contains("B"));
+    ctx.ok(&["resize-window", "-t", "m", "-x", "9"]);
+    let narrow = ["WX abcde\t", "- f", "WX ab\t", "- cd", "WX \t", "W x", "WX \t", "- q", "WX zz\t", "- "];
+    wait_for("rewrap 9", || cap(&ctx, &["-F", "-S", "-"]).starts_with(&narrow.map(String::from)));
+    ctx.ok(&["resize-window", "-t", "m", "-x", "5"]);
+    wait_for("rewrap 5", || cap(&ctx, &["-F", "-S", "-"]).len() > 16);
+    assert_eq!(cap(&ctx, &["-F", "-S", "-"])[..8], ["WX abcde", "WX \t", "- f", "WX ab", "W ", "WX \t", "W ", "- cd"]);
+    ctx.ok(&["resize-window", "-t", "m", "-x", "20"]);
+    // an HT over a tab's cells only moves the cursor (B replaces A after the tab)
+    wait_for("unwrap", || cap(&ctx, &["-F", "-S", "-"])[..6] == ["X abcde\tf", "X ab\tcd", "WX \tx", "X \tq", "X zz\t", "X \tB"]);
+    ctx.ok(&["resize-window", "-t", "m", "-x", "30"]);
+    wait_for("unwrap 30", || cap(&ctx, &["-S", "-"])[..4] == ["abcde\tf", "ab\tcd", "\tx\tq", "zz\t"]);
+}
+
+#[test]
+fn links_carry_across_captured_lines_and_reset_like_tmux() {
+    let ctx = Ctx::new("grid-linkcarry");
+    ctx.ok(&["new", "-d", "-s", "m", "-x", "10", "-y", "8", "printf '\\033]8;;http://x\\007x1\\r\\nx2\\033]8;;\\007\\r\\n\\033]8;;http://y\\007yyyyy\\r\\nyy\\033]8;;\\007\\r\\n\\033]8;id=k;http://long\\007abcdefghijklmn\\033]8;;\\007\\r\\n\\033]8;;http://m\\007a\\033[0mb\\033[mc\\r\\n\\033]8;;http://c\\\\x\\007v\\033]8;;\\007'; sleep 100"]);
+    wait_for("link output", || ctx.capture("m").contains('v'));
+    // grid_string_cells keeps the last cell from line to line: a line going on with the
+    // link the last cell read had does not open it again; without -J or -T the cells
+    // read go to the end of what the line has room for (a quarter, half or all of it)
+    let open = |id: &str, uri: &str| format!("\x1b]8;{id};{uri}\x1b\\");
+    let close = "\x1b]8;;\x1b\\";
+    let e = cap(&ctx, &["-e"]);
+    assert_eq!(e[..5], [format!("{}x1{close}", open("", "http://x")), format!("{}x2{close}", open("", "http://x")), format!("{}yyyyy{close}", open("", "http://y")), format!("{}yy{close}", open("", "http://y")), format!("{}abcdefghij{close}", open("id=k", "http://long"))]);
+    assert_eq!(e[5], "klmn");
+    let j = cap(&ctx, &["-e", "-J"]);
+    assert_eq!(j[..3], [format!("{}x1{close}", open("", "http://x")), "x2".into(), format!("{}yyyyy{close}", open("", "http://y"))]);
+    assert_eq!(j[4], format!("{}abcdefghij{close}klmn", open("id=k", "http://long")));
+    // CSI m (no parameter) ends the link, CSI 0 m does not; URIs are vis-encoded
+    assert_eq!(cap(&ctx, &["-H"])[3..], ["http://m", "http://c\\\\x"]);
+    assert!(e[6].starts_with(&format!("{}a", open("", "http://m"))) && e[6].contains(&format!("b{close}c")), "{:?}", e[6]);
+}
+
+#[test]
+fn erases_resizes_and_irm_change_lines_like_tmux() {
+    let ctx = Ctx::new("grid-erase");
+    ctx.ok(&["new", "-d", "-s", "m", "-x", "10", "-y", "8", "printf '0123456789wrap\\033[1G\\033[2K\\r\\n0123456789wrap\\033[1G\\033[K\\r\\n0123456789wrap\\033[3G\\033[K\\r\\n0123456789wrap\\033[1G\\033[J'; sleep 100"]);
+    wait_for("erase output", || cap(&ctx, &["-F"]).iter().filter(|l| l.contains("0123")).count() == 4);
+    // a whole-line clear ends the wrap of the line above (grid_clear_lines)
+    assert_eq!(cap(&ctx, &["-F"]), ["- 0123456789", "- ", "- 0123456789", "- ", "W 0123456789", "- wr", "- 0123456789", "- "]);
+    // shrinking moves lines into the history without a time (screen_resize_y)
+    ctx.ok(&["resize-window", "-t", "m", "-y", "3"]);
+    wait_for("shrink", || ctx.fmt("m", "#{history_size}") == "5");
+    assert!(cap(&ctx, &["-I", "-S", "-", "-E", "-1"]).iter().all(|l| l.starts_with("0 ")));
+    ctx.ok(&["kill-server"]);
+    // IRM: a character or a tab makes room for itself
+    let ctx = Ctx::new("grid-irm");
+    ctx.ok(&["new", "-d", "-s", "m", "-x", "30", "-y", "4", "printf 'abc\\r\\033[4hZ\\033[4l\\r\\n        X\\r\\033[4h\\tY\\033[4l'; sleep 100"]);
+    wait_for("irm output", || ctx.capture("m").contains('Y'));
+    assert_eq!(cap(&ctx, &[])[..2], ["Zabc", "\tY        X"]);
+}
+
+#[test]
+fn a_linked_tab_is_drawn_inside_its_link() {
+    let ctx = Ctx::new("grid-tablink");
+    ctx.ok(&["new", "-d", "-s", "m", "-x", "30", "-y", "4", "printf '\\033]8;;http://t\\007a        \\r\\033[C\\tb\\033]8;;\\007'; sleep 100"]);
+    wait_for("tab link output", || ctx.capture("m").contains('b'));
+    ctx.ok(&["set", "-as", "terminal-features", "xterm*:hyperlinks"]);
+    let term = Term::attach(&ctx, &["attach", "-t", "m"], 30, 4);
+    wait_for("tab link drawing", || String::from_utf8_lossy(&term.raw.lock().unwrap()).contains(";http://t\x1b\\a"));
+    // the tab takes the link of the cells it is written over (input_c0_dispatch) and is
+    // drawn as one cell with it: no link change inside it
+    let raw = String::from_utf8_lossy(&term.raw.lock().unwrap()).into_owned();
+    let at = raw.find(";http://t\x1b\\a").unwrap();
+    let rest = &raw[at..];
+    let b = rest.find('b').unwrap();
+    assert!(!rest[..b].contains("\x1b]8"), "{rest:?}");
+}
