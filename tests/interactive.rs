@@ -568,7 +568,12 @@ fn refresh_client_l_reads_the_terminal_clipboard() {
     let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]);
     ctx.ok(&["refresh-client", "-l", "-t", client.trim()]);
     // tty_clipboard_query: Ms with "?"
-    wait_for("clipboard query", || t.raw_text().contains("\x1b]52;;?\x07"));
+    t.wait("clipboard query", || t.sent_text().contains("\x1b]52;;?\x07"));
+    // ConPTY keeps the query from the terminal (and the terminal's reply from a Windows
+    // console client): the round trip only exists without it
+    if cfg!(windows) {
+        return;
+    }
     t.send(b"\x1b]52;c;aGVsbG8gY2xpcA==\x07");
     wait_for("clipboard buffer", || ctx.ok(&["list-buffers", "-F", "#{buffer_sample}"]) == "hello clip\n");
     // the reply is not typed into the pane
@@ -581,10 +586,13 @@ fn client_focus_flag_follows_focus_reports() {
     let t = start(&ctx, "fo");
     let flags = || ctx.ok(&["list-clients", "-F", "#{client_flags}"]);
     assert_eq!(flags(), "attached,focused,UTF-8\n");
+    // a terminal reports focus once asked to (Enfcs); ConPTY drops the reports before
+    ctx.ok(&["set", "-g", "focus-events", "on"]);
+    t.wait("focus reports asked for", || t.sent_text().contains("\x1b[?1004h"));
     t.send(b"\x1b[O");
-    wait_for("focus out", || flags() == "attached,UTF-8\n");
+    t.wait("focus out", || flags() == "attached,UTF-8\n");
     t.send(b"\x1b[I");
-    wait_for("focus in", || flags() == "attached,focused,UTF-8\n");
+    t.wait("focus in", || flags() == "attached,focused,UTF-8\n");
 }
 
 #[test]
@@ -734,7 +742,7 @@ fn display_scrollbars_reserve_overlay_timeout_hover_and_mouse() {
     t.send(b"\x1b[<35;1;2M");
     assert_eq!(ctx.fmt("s", "#{pane_width}"), "100");
     ctx.ok(&["setw", "-t", "s", "pane-scrollbars", "on"]);
-    t.send(b"printf 'line\\n%.0s' {1..120}\r");
+    t.send(typed_lines(120).as_bytes());
     wait_for("history for scrollbar click", || ctx.fmt("s", "#{history_size}").parse::<usize>().unwrap_or(0) > 30);
     t.mouse(0, 0, 1, false);
     t.mouse(0, 0, 1, true);
@@ -784,13 +792,14 @@ fn display_prompt_label_then_input_and_command_mode_base_style() {
     ctx.ok(&["set", "-t", "s", "message-format", "[#{message}]"]);
     t.prefix(b":");
     t.send(b"abc");
-    wait_for("label then input", || t.row(29).starts_with("[:]abc") && cursor() == (29, 6));
+    t.wait("label then input", || t.row(29).starts_with("[:]abc") && cursor() == (29, 6));
     t.send(b"\x03");
     // aligned in the message-style area, the rest of the area filled
     ctx.ok(&["set", "-t", "s", "message-style", "bg=red,width=30,align=right,fill=blue"]);
     t.prefix(b":");
     t.send(b"abc");
-    wait_for("right aligned prompt", || t.row(29).ends_with("[:]abc") && cursor() == (29, 99));
+    // (ConPTY may write the blank under the cursor in the last column as a space)
+    t.wait("right aligned prompt", || t.row(29).trim_end().ends_with("[:]abc") && cursor() == (29, 99));
     assert_eq!(t.screen.lock().unwrap().screen().cell(29, 70).unwrap().bgcolor(), vt100::Color::Idx(4));
     assert!(t.row(29).starts_with("[s]"));
     t.send(b"\x03");
@@ -799,7 +808,7 @@ fn display_prompt_label_then_input_and_command_mode_base_style() {
     ctx.ok(&["set", "-u", "-t", "s", "message-format"]);
     t.prefix(b":");
     t.send(&[b'x'; 120]);
-    wait_for("scrolled input", || cursor() == (29, 99) && t.row(29).starts_with(":xxx"));
+    t.wait("scrolled input", || cursor() == (29, 99) && t.row(29).starts_with(":xxx"));
     t.send(b"\x03");
     // vi command mode: message-command-style is the base, not message-style
     ctx.ok(&["set", "-t", "s", "status-keys", "vi"]);
@@ -808,7 +817,7 @@ fn display_prompt_label_then_input_and_command_mode_base_style() {
     t.send(b"abc");
     std::thread::sleep(Duration::from_millis(100));
     t.send(b"\x1b");
-    wait_for("command mode", || t.screen.lock().unwrap().screen().cell(29, 0).unwrap().bgcolor() == vt100::Color::Idx(2) && cursor() == (29, 3));
+    t.wait("command mode", || t.screen.lock().unwrap().screen().cell(29, 0).unwrap().bgcolor() == vt100::Color::Idx(2) && cursor() == (29, 3));
     assert_eq!(t.screen.lock().unwrap().screen().cell(29, 0).unwrap().fgcolor(), vt100::Color::Default);
 }
 
@@ -839,7 +848,7 @@ fn display_auto_hide_scrollbar_shows_only_when_scrolling_and_draws_pad() {
     let ctx = Ctx::new("display-autohide");
     let t = start(&ctx, "s");
     let bg = |y: u16, x: u16| t.screen.lock().unwrap().screen().cell(y, x).unwrap().bgcolor();
-    t.send(b"printf 'line\\n%.0s' {1..120}\r");
+    t.send(typed_lines(120).as_bytes());
     wait_for("history", || ctx.fmt("s", "#{history_size}").parse::<usize>().unwrap_or(0) > 30);
     ctx.ok(&["setw", "-t", "s", "pane-scrollbars-style", "fg=red,bg=blue,width=2,pad=2"]);
     ctx.ok(&["setw", "-t", "s", "pane-scrollbars-timeout", "300"]);
@@ -1036,7 +1045,8 @@ fn display_menu_popup_positions_and_pane_prompt_like_tmux_3_8() {
     wait_for("menu closed", || row_of("First").is_none());
     ctx.ok(&["set", "-g", "status-position", "bottom"]);
     // popup -x/-y take letters and formats; y is the bottom row
-    let _p1 = popup(&["-x", "#{e|+:2,3}", "-y", "6", "-w", "12", "-h", "4", "printf hi; sleep 10"]);
+    let hi = print_then_sleep("hi", 10);
+    let _p1 = popup(&["-x", "#{e|+:2,3}", "-y", "6", "-w", "12", "-h", "4", &hi]);
     wait_for("popup", || row_of("hi").is_some());
     assert_eq!(row_of("┌"), Some(2));
     assert_eq!(rows()[2].find('┌'), Some(5));
@@ -1044,13 +1054,13 @@ fn display_menu_popup_positions_and_pane_prompt_like_tmux_3_8() {
     t.send(b"\x1b");
     wait_for("popup closed", || row_of("┌").is_none());
     // popups are drawn over the status line
-    let _p2 = popup(&["-x", "R", "-y", "100%", "-w", "12", "-h", "4", "printf hi; sleep 10"]);
+    let _p2 = popup(&["-x", "R", "-y", "100%", "-w", "12", "-h", "4", &hi]);
     wait_for("popup over status", || t.row(29).contains('└'));
     assert_eq!(t.row(29).find('└'), Some(88));
     t.send(b"\x03");
     wait_for("popup closed", || row_of("┌").is_none());
     // after its command exits, a key that is not Escape leaves it open
-    let _p3 = popup(&["-x", "0", "-y", "0", "-w", "12", "-h", "4", "printf noE"]);
+    let _p3 = popup(&["-x", "0", "-y", "0", "-w", "12", "-h", "4", sh("printf noE", "[Console]::Write('noE')")]);
     wait_for("popup", || row_of("noE").is_some());
     std::thread::sleep(Duration::from_millis(300));
     t.send(b"q");
@@ -1103,7 +1113,7 @@ fn display_scrollbar_clicks_slider_drag_and_modes_like_tmux_3_8() {
     let bg = |y: u16, x: u16| t.screen.lock().unwrap().screen().cell(y, x).unwrap().bgcolor();
     ctx.ok(&["set", "-g", "status", "off"]);
     ctx.ok(&["set", "-g", "mouse", "on"]);
-    t.send(b"printf 'line\\n%.0s' {1..120}\r");
+    t.send(typed_lines(120).as_bytes());
     wait_for("history", || ctx.fmt("s", "#{history_size}").parse::<usize>().unwrap_or(0) > 30);
     ctx.ok(&["setw", "-t", "s", "pane-scrollbars-style", "fg=red,bg=blue"]);
     ctx.ok(&["setw", "-t", "s", "pane-scrollbars-timeout", "300"]);
@@ -1185,16 +1195,16 @@ fn display_prompt_cursor_style_and_colour() {
     ctx.ok(&["set", "-g", "prompt-cursor-style", "bar"]);
     ctx.ok(&["set", "-g", "prompt-cursor-colour", "red"]);
     t.prefix(b":");
-    wait_for("prompt cursor", || t.raw_text().contains("\x1b[6 q") && t.raw_text().contains("\x1b]12;rgb:80/00/00\x07"));
+    t.wait("prompt cursor", || t.sent_text().contains("\x1b[6 q") && t.sent_text().contains("\x1b]12;rgb:80/00/00\x07"));
     t.send(b"\x03");
-    wait_for("cursor colour reset", || t.raw_text().contains("\x1b]112\x07"));
+    t.wait("cursor colour reset", || t.sent_text().contains("\x1b]112\x07"));
     // vi command mode uses the prompt-command-* options
     ctx.ok(&["set", "-g", "status-keys", "vi"]);
     ctx.ok(&["set", "-g", "prompt-command-cursor-style", "blinking-underline"]);
     ctx.ok(&["set", "-g", "prompt-command-cursor-colour", "blue"]);
     t.prefix(b":");
     t.send(b"a\x1b");
-    wait_for("command mode cursor", || t.raw_text().contains("\x1b[3 q") && t.raw_text().contains("\x1b]12;rgb:00/00/80\x07"));
+    t.wait("command mode cursor", || t.sent_text().contains("\x1b[3 q") && t.sent_text().contains("\x1b]12;rgb:00/00/80\x07"));
     t.send(b"\x03");
 }
 
@@ -1234,7 +1244,7 @@ fn floating_and_modal_panes_on_screen() {
     let ctx = Ctx::new("float-ui");
     let t = start(&ctx, "fu");
     ctx.ok(&["set", "-g", "pane-border-status", "top-floating"]);
-    let f = ctx.ok(&["new-pane", "-P", "-F", "#{pane_id}", "-t", "fu", "-x", "30", "-y", "8", "-X", "10", "-Y", "5", "-T", "flt-title", "-B", "double", "cat"]).trim().to_string();
+    let f = ctx.ok(&["new-pane", "-P", "-F", "#{pane_id}", "-t", "fu", "-x", "30", "-y", "8", "-X", "10", "-Y", "5", "-T", "flt-title", "-B", "double", CAT]).trim().to_string();
     // the border is drawn around the content with the pane's lines and its title on top
     t.wait_screen("floating pane border", |s| s.contains("flt-title"));
     let top = t.row(5);
@@ -1244,7 +1254,7 @@ fn floating_and_modal_panes_on_screen() {
     t.send(b"typed-into-float\r");
     wait_for("text in the floating pane", || ctx.capture(&f).contains("typed-into-float"));
     // a modal pane with -K gets the prefix key too; -D closes it with Escape
-    let m = ctx.ok(&["new-pane", "-O", "-K", "-D", "-P", "-F", "#{pane_id}", "-t", "fu", "cat -v"]).trim().to_string();
+    let m = ctx.ok(&["new-pane", "-O", "-K", "-D", "-P", "-F", "#{pane_id}", "-t", "fu", CAT_V]).trim().to_string();
     wait_for("modal pane", || ctx.fmt("fu", "#{window_modal_pane}") == m);
     t.send(b"\x02x");
     wait_for("prefix sent to the modal pane", || ctx.capture(&m).contains("^Bx"));
@@ -1322,11 +1332,12 @@ fn floating_pane_above_the_active_floating_pane_hides_its_cursor() {
     let ctx = Ctx::new("float-cursor");
     let t = start(&ctx, "fc");
     let hidden = || t.screen.lock().unwrap().screen().hide_cursor();
-    ctx.ok(&["new-pane", "-t", "fc", "-x", "20", "-y", "5", "-X", "10", "-Y", "4", "printf xy; exec cat"]);
+    let xy = if cfg!(windows) { format!("[Console]::Write('xy'); {CAT}") } else { "printf xy; exec cat".into() };
+    ctx.ok(&["new-pane", "-t", "fc", "-x", "20", "-y", "5", "-X", "10", "-Y", "4", &xy]);
     t.wait_screen("active floating pane", |s| s.contains("xy"));
     wait_for("cursor shown", || !hidden() && t.screen.lock().unwrap().screen().cursor_position() == (5, 13));
     // a pane stacked above (new-pane -d) covers the cursor cell
-    let d = ctx.ok(&["new-pane", "-d", "-P", "-F", "#{pane_id}", "-t", "fc", "-x", "20", "-y", "5", "-X", "8", "-Y", "3", "cat"]).trim().to_string();
+    let d = ctx.ok(&["new-pane", "-d", "-P", "-F", "#{pane_id}", "-t", "fc", "-x", "20", "-y", "5", "-X", "8", "-Y", "3", CAT]).trim().to_string();
     assert_eq!(ctx.fmt(&d, "#{pane_z} #{pane_active}"), "0 0");
     wait_for("cursor hidden under the floating pane", hidden);
     ctx.ok(&["kill-pane", "-t", &d]);
@@ -1461,4 +1472,31 @@ fn kept_dead_panes_close_on_a_key() {
     t.send(b"c");
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(ctx.fmt("dk", "#{session_windows}"), "1");
+}
+
+/// tmux 3.8's clean_name escapes a backslash in a title set by the pane (vis(3) -c, so
+/// C:\a shows as C:\\a); on Windows, where every console title is a path, it is kept.
+#[test]
+fn pane_titles_from_osc_0_and_2_keep_windows_backslashes() {
+    let ctx = Ctx::new("title-bs");
+    let t = start(&ctx, "tb");
+    ctx.ok(&["set", "-g", "pane-border-status", "top"]);
+    let set_title = |osc: u8| {
+        if cfg!(windows) {
+            format!("$e = [string][char]27; [Console]::Write($e + ']{osc};C:\\a\\b' + $e + '\\'); Start-Sleep 100")
+        } else {
+            format!("printf '\\033]{osc};C:\\\\a\\\\b\\033\\\\'; sleep 100")
+        }
+    };
+    let want = if cfg!(windows) { r#""C:\a\b""# } else { r#""C:\\a\\b""# };
+    ctx.ok(&["split-window", "-t", "tb", &set_title(2)]);
+    // #{pane_title}, the status line (status-right) and the pane's border (pane-border-format)
+    t.wait_screen("title on the status line and the border", |s| s.matches(want).count() == 2);
+    assert_eq!(format!("\"{}\"", ctx.fmt("tb", "#{pane_title}")), want);
+    assert!(t.row(29).contains(want), "{}", t.row(29));
+    ctx.ok(&["select-pane", "-t", "tb.1", "-T", "other"]);
+    t.wait_screen("other title", |s| !s.contains(want));
+    ctx.ok(&["respawn-pane", "-k", "-t", "tb.1", &set_title(0)]);
+    t.wait_screen("title set again by OSC 0", |s| s.matches(want).count() == 2);
+    assert_eq!(format!("\"{}\"", ctx.fmt("tb", "#{pane_title}")), want);
 }

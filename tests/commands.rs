@@ -1422,8 +1422,9 @@ fn capture_pane_line_flags() {
 #[test]
 fn capture_pane_marks_survive_erasing_the_line() {
     let ctx = Ctx::new("p1fix-capf2");
-    ctx.ok(&["new-session", "-d", "-s", "f", "-x", "20", "-y", "4",
-        "printf '\\033]133;C\\033\\\\c\\033[2Kd'; sleep 100"]);
+    ctx.ok(&["new-session", "-d", "-s", "f", "-x", "20", "-y", "4", sh(
+        "printf '\\033]133;C\\033\\\\c\\033[2Kd'; sleep 100",
+        "$e = [string][char]27; [Console]::Write($e + ']133;C' + $e + '\\c' + $e + '[2Kd'); Start-Sleep 100")]);
     wait_for("output", || ctx.capture("f").contains('d'));
     // screen_write_clearline keeps the line's OSC 133 flags
     assert_eq!(ctx.ok(&["capture-pane", "-p", "-F", "-E", "0", "-t", "f"]), "O  d\n");
@@ -2600,7 +2601,9 @@ fn tmux_38_group_removal_and_monitor_session_payload() {
 #[test]
 fn tmux_38_selection_after_hooks() {
     let ctx = Ctx::new("selectafter38");
-    ctx.ok(&["new-session", "-d", "-s", "h", "sleep 100"]);
+    // only select-pane -T titles: on Windows ConPTY sets each new pane's title (the
+    // console title) once the program starts, whenever that is
+    ctx.ok(&["new-session", "-d", "-s", "h", "sleep 100", ";", "set", "-g", "allow-set-title", "off"]);
     ctx.ok(&["split-window", "-d", "-t", "h:0"]);
     ctx.ok(&["set-hook", "-g", "after-select-pane", "set -ga @sel P"]);
     ctx.ok(&["set-hook", "-g", "after-select-window", "set -ga @sel W"]);
