@@ -791,7 +791,13 @@ fn display_menu_and_popup_use_configured_border_lines() {
 fn display_prompt_label_then_input_and_command_mode_base_style() {
     let ctx = Ctx::new("display-prompt");
     let t = start(&ctx, "s");
-    let cursor = || t.screen.lock().unwrap().screen().cursor_position();
+    // A cursor left in the pending-wrap state after the last column is shown on that column by a
+    // real terminal; ConPTY skips the redundant move there, so read it the way the terminal shows it.
+    let cursor = || {
+        let screen = t.screen.lock().unwrap();
+        let (row, col) = screen.screen().cursor_position();
+        (row, col.min(screen.screen().size().1.get() - 1))
+    };
     // tmux 3.8 prompt_layout: message-format is the label, the input follows it
     ctx.ok(&["set", "-t", "s", "message-format", "[#{message}]"]);
     t.prefix(b":");
