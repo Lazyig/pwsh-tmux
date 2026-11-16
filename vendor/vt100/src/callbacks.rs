@@ -4,6 +4,9 @@
 /// don't have an impact on the terminal screen directly, as well as to emit
 /// other events like [`on_scroll`](Self::on_scroll).
 pub trait Callbacks {
+    /// Complete DCS payload, excluding ESC P and ST.
+    fn dcs(&mut self, _: &mut crate::Screen, _payload: &[u8]) {}
+
     /// This callback is called when the terminal requests an audible bell
     /// (typically with `^G`).
     fn audible_bell(&mut self, _: &mut crate::Screen) {}
@@ -24,6 +27,10 @@ pub trait Callbacks {
     /// This callback is called when the terminal requests the window title
     /// to be set (typically with `\e]2;<title>\a`)
     fn set_window_title(&mut self, _: &mut crate::Screen, _title: &[u8]) {}
+    /// RIS (ESC c) reset the screen.
+    fn reset(&mut self, _: &mut crate::Screen) {}
+    /// ESC k name ST (screen's window name), already checked and cleaned as tmux does.
+    fn rename_window(&mut self, _: &mut crate::Screen, _name: &[u8]) {}
     /// This callback is called when the terminal requests data to be copied
     /// to the system clipboard (typically with `\e]52;<ty>;<data>\a`). Note
     /// that `data` will be encoded as base64.
@@ -33,6 +40,10 @@ pub trait Callbacks {
         _ty: &[u8],
         _data: &[u8],
     ) {
+    }
+    /// Clipboard query with the original OSC terminator preserved.
+    fn clipboard_query(&mut self, screen: &mut crate::Screen, ty: &[u8], _bel: bool) {
+        self.paste_from_clipboard(screen, ty);
     }
     /// This callback is called when the terminal requests data to be pasted
     /// from the system clipboard (typically with `\e]52;<ty>;?\a`).

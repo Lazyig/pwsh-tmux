@@ -2,7 +2,7 @@ use super::vars::Target;
 use super::modes::Popup;
 use super::*;
 
-fn fixture() -> (Server, mpsc::Receiver<Event>) {
+pub(super) fn fixture() -> (Server, mpsc::Receiver<Event>) {
     let (tx, events) = mpsc::sync_channel(64);
     let mut srv = Server::new(tx);
     let cid = 1;
@@ -23,6 +23,8 @@ fn fixture() -> (Server, mpsc::Receiver<Event>) {
             key_table: "root".into(),
             repeat_until: None,
             keyp: keys::Parser::new(),
+            input_state: Default::default(),
+            term_caps: Default::default(),
             esc_deadline: None,
             prompt: None,
             overlay: None,

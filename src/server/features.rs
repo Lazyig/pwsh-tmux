@@ -3,37 +3,62 @@
 
 use std::collections::BTreeSet;
 
-#[allow(dead_code)]
+/// tmux's tty_features table, in its order (client_termfeatures lists features this way).
 pub const KNOWN: &[&str] = &[
-    "256", "RGB", "bpaste", "ccolour", "clipboard", "cstyle", "extkeys", "focus", "hyperlinks", "ignorefkeys", "margins", "mouse", "osc7", "overline",
-    "rectfill", "strikethrough", "sync", "title", "usstyle",
+    "256", "appesc", "bpaste", "ccolour", "clipboard", "hyperlinks", "cstyle", "extkeys", "focus", "ignorefkeys", "margins", "mouse", "osc7",
+    "overline", "progressbar", "rectfill", "RGB", "sixel", "strikethrough", "sync", "title", "usstyle", "utf8",
 ];
 
+/// Enabled features and the ones removed with `feature@` (term_features / term_nofeatures).
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
-pub struct Features(pub BTreeSet<String>);
+pub struct Features(pub BTreeSet<String>, pub BTreeSet<String>);
 
 impl Features {
     pub fn has(&self, f: &str) -> bool {
-        self.0.contains(f)
+        // RGB implies 256 colours (TERM_256COLOURS) without listing the 256 feature
+        self.0.contains(f) || (f == "256" && self.0.contains("RGB"))
     }
 
     fn add(&mut self, list: &str) {
-        for f in list.split([',', ':']).map(str::trim).filter(|f| !f.is_empty()) {
-            // tmux aliases
-            let f = match f {
-                "Tc" | "24bit" | "truecolor" => "RGB",
-                "256color" => "256",
-                other => other,
-            };
-            if f == "RGB" {
-                self.0.insert("256".into());
+        self.parse(list, &[',', ':']);
+    }
+
+    /// tty_parse_features: a trailing `@` removes a feature and keeps later lists from adding it
+    /// back; an unknown name ends the list.
+    pub fn parse(&mut self, list: &str, sep: &[char]) {
+        for f in list.split(sep) {
+            let (name, remove) = match f.strip_suffix('@') { Some(n) => (n, true), None => (f, false) };
+            // pwsh-tmux aliases for RGB and 256
+            let name = match name { "Tc" | "24bit" | "truecolor" => "RGB", "256color" => "256", other => other };
+            let Some(known) = KNOWN.iter().find(|k| k.eq_ignore_ascii_case(name)) else { break };
+            if remove {
+                self.0.remove(*known);
+                self.1.insert(known.to_string());
+            } else if !self.1.contains(*known) {
+                self.0.insert(known.to_string());
             }
-            self.0.insert(f.to_string());
         }
     }
 
     pub fn list(&self) -> String {
-        self.0.iter().cloned().collect::<Vec<_>>().join(",")
+        KNOWN.iter().filter(|f| self.0.contains(**f)).copied().collect::<Vec<_>>().join(",")
+    }
+}
+
+/// tty_default_features: what tmux enables for a terminal it identifies (by XDA there, by
+/// TERM_PROGRAM or TERM here since no device attributes are requested).
+fn default_features(name: &str) -> &'static [&'static str] {
+    const BASE: &str = "256,RGB,bpaste,clipboard,mouse,strikethrough,title";
+    match name {
+        "mintty" => &[BASE, "appesc,ccolour,cstyle,extkeys,margins,overline,usstyle"],
+        "tmux" => &[BASE, "ccolour,cstyle,extkeys,focus,overline,usstyle,hyperlinks,progressbar"],
+        "rxvt-unicode" => &["256,bpaste,ccolour,cstyle,mouse,title,ignorefkeys"],
+        "iTerm2" | "iTerm.app" => &[BASE, "cstyle,extkeys,margins,usstyle,sync,osc7,hyperlinks,progressbar"],
+        "foot" => &[BASE, "ccolour,cstyle,extkeys,usstyle,sync,osc7,hyperlinks"],
+        "WezTerm" => &[BASE, "ccolour,cstyle,extkeys,focus,hyperlinks,margins,usstyle"],
+        "ghostty" => &[BASE, "ccolour,cstyle,extkeys,focus,margins,overline,hyperlinks,osc7,sync,usstyle,progressbar"],
+        "Rio" | "rio" => &[BASE, "ccolour,cstyle,focus,overline,hyperlinks,osc7,sync,usstyle,progressbar"],
+        _ => &[],
     }
 }
 
@@ -52,8 +77,29 @@ pub fn fnmatch(pat: &str, s: &str) -> bool {
 
 /// `term`: the client's TERM (empty for a Windows console client), `colorterm`: its COLORTERM,
 /// `table`: terminal-features entries ("pattern:feature:feature"), `extra`: the `-T` list.
+#[cfg(test)]
 pub fn compute(term: &str, colorterm: &str, table: &[String], extra: &str) -> Features {
+    compute_named(term, "", colorterm, table, extra)
+}
+
+pub fn compute_named(term: &str, program: &str, colorterm: &str, table: &[String], extra: &str) -> Features {
+    // tmux order: -T, terminal-features, COLORTERM, then what the terminal is known to support;
+    // a `feature@` removal keeps the later additions out.
     let mut f = Features::default();
+    f.parse(extra, &[':', ',']);
+    for entry in table {
+        // the pattern is read like an override (`::` is a colon), the features split at `:`
+        let pat = override_tokens(entry).swap_remove(0);
+        let rest = entry.get(pat.len() + pat.matches(':').count() + 1..).unwrap_or("");
+        if !pat.is_empty() && fnmatch(&pat, term) && !rest.is_empty() {
+            f.parse(rest, &[':']);
+        }
+    }
+    if colorterm.eq_ignore_ascii_case("truecolor") || colorterm.eq_ignore_ascii_case("24bit") {
+        f.add("RGB");
+    } else if colorterm.contains("256") {
+        f.add("256");
+    }
     if term.is_empty() {
         // Windows console / Windows Terminal: a modern VT implementation
         f.add("RGB,mouse,bpaste,title,ccolour,cstyle,focus,clipboard,strikethrough,sync,usstyle,overline,hyperlinks");
@@ -68,17 +114,11 @@ pub fn compute(term: &str, colorterm: &str, table: &[String], extra: &str) -> Fe
             f.add("RGB");
         }
     }
-    if matches!(colorterm, "truecolor" | "24bit") {
-        f.add("RGB");
+    let lower = term.to_ascii_lowercase();
+    let name = if lower.contains("wezterm") || program.eq_ignore_ascii_case("wezterm") { "WezTerm" } else if lower.contains("ghostty") { "ghostty" } else { program };
+    for list in default_features(name) {
+        f.add(list);
     }
-    for entry in table {
-        let mut parts = entry.splitn(2, ':');
-        let pat = parts.next().unwrap_or("");
-        if !pat.is_empty() && fnmatch(pat, term) {
-            f.add(parts.next().unwrap_or(""));
-        }
-    }
-    f.add(extra);
     f
 }
 
@@ -117,6 +157,19 @@ fn idx_to_rgb(i: u8) -> (u8, u8, u8) {
             let v = 8 + 10 * (i - 232);
             (v, v, v)
         }
+    }
+}
+
+/// colour_force_rgb with tmux's colour_256toRGB table; None for the default colour.
+pub fn colour_force_rgb(c: vt100::Color) -> Option<(u8, u8, u8)> {
+    const ANSI: [u32; 16] = [0x000000, 0x800000, 0x008000, 0x808000, 0x000080, 0x800080, 0x008080, 0xc0c0c0, 0x808080, 0xff0000, 0x00ff00, 0xffff00, 0x0000ff, 0xff00ff, 0x00ffff, 0xffffff];
+    const CUBE: [u8; 6] = [0x00, 0x5f, 0x87, 0xaf, 0xd7, 0xff];
+    match c {
+        vt100::Color::Rgb(r, g, b) => Some((r, g, b)),
+        vt100::Color::Idx(i @ 0..=15) => { let v = ANSI[i as usize]; Some(((v >> 16) as u8, (v >> 8) as u8, v as u8)) }
+        vt100::Color::Idx(i @ 16..=231) => { let i = i - 16; Some((CUBE[(i / 36) as usize], CUBE[(i / 6 % 6) as usize], CUBE[(i % 6) as usize])) }
+        vt100::Color::Idx(i) => { let v = 8 + 10 * (i - 232); Some((v, v, v)) }
+        vt100::Color::Default => None,
     }
 }
 
@@ -172,4 +225,117 @@ mod tests {
         c256.add("256");
         assert_eq!(fit_color(vt100::Color::Rgb(0, 0, 0), &c256), vt100::Color::Idx(16));
     }
+}
+
+/// Apply terminfo overrides to the capabilities used by our VT renderer.
+/// String capabilities are retained so an explicit Ss/Se is never replaced by cstyle.
+pub fn overrides(term: &str, table: &[String], features: &mut Features) -> std::collections::BTreeMap<String, String> {
+    let mut caps = terminfo_capabilities(term);
+    for entry in table {
+        let parts = override_tokens(entry);
+        let mut parts = parts.iter().map(String::as_str);
+        if !fnmatch(parts.next().unwrap_or(""), term) { continue; }
+        for cap in parts.filter(|c| !c.is_empty()) {
+            let (name, value) = cap.split_once('=').map(|(n, v)| (n, v.to_string()))
+                .unwrap_or_else(|| (cap.trim_end_matches('@'), if cap.ends_with('@') { String::new() } else { "1".into() }));
+            let feature = match name {
+                "Tc" | "RGB" => "RGB", "colors" => "256", "Ss" | "Se" => "cstyle", "Cs" | "Cr" => "ccolour",
+                "Ms" => "clipboard", "Enbp" | "Dsbp" => "bpaste", "XT" => "title", "Dsfcs" | "Enfcs" => "focus",
+                _ => "",
+            };
+            if !feature.is_empty() {
+                if value.is_empty() || (name == "colors" && value.parse::<u32>().unwrap_or(0) < 256) { features.0.remove(feature); }
+                else { features.add(feature); }
+            }
+            caps.insert(name.to_string(), decode_capability(&value));
+        }
+    }
+    caps
+}
+
+/// tty_term_override_next: split at `:`, where `::` is a literal colon.
+pub fn override_tokens(s: &str) -> Vec<String> {
+    let mut out = vec![String::new()];
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != ':' { out.last_mut().unwrap().push(c); }
+        else if chars.peek() == Some(&':') { chars.next(); out.last_mut().unwrap().push(':'); }
+        else { out.push(String::new()); }
+    }
+    out
+}
+
+fn decode_capability(s: &str) -> String {
+    let mut out = String::new(); let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next() {
+                Some('E' | 'e') => out.push('\x1b'), Some('n') => out.push('\n'), Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'), Some(c @ '0'..='7') => {
+                    let mut n = c.to_digit(8).unwrap();
+                    for _ in 0..2 { if chars.clone().next().is_some_and(|c| ('0'..='7').contains(&c)) { n = n * 8 + chars.next().unwrap().to_digit(8).unwrap(); } }
+                    if let Some(c) = char::from_u32(n) { out.push(c); }
+                }
+                Some(c) => out.push(c), None => out.push('\\'),
+            },
+            '^' => if let Some(c) = chars.next() { out.push(if c == '?' { '\x7f' } else { ((c as u8) & 31) as char }); },
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+pub fn cursor_style(s: &str) -> u8 {
+    match s { "blinking-block" => 1, "block" => 2, "blinking-underline" => 3, "underline" => 4, "blinking-bar" => 5, "bar" => 6, _ => 0 }
+}
+
+pub fn cursor_sequence(caps: &std::collections::BTreeMap<String, String>, style: u8) -> String {
+    if style == 0 { if let Some(se) = caps.get("Se") { return se.clone(); } }
+    string_capability(caps, "Ss", "\x1b[%p1%d q", &[&style.to_string()])
+}
+
+/// tmux ignores malformed width entries, including reversed or invalid ranges.
+pub fn codepoint_widths(entries: &[String]) -> Vec<(u32, u32, u16)> {
+    entries.iter().filter_map(|s| {
+        let (range, width) = s.split_once('=')?;
+        let width = width.parse::<u16>().ok().filter(|n| *n <= 2)?;
+        let cp = |s: &str| s.strip_prefix("U+").and_then(|s| u32::from_str_radix(s, 16).ok()).filter(|n| *n > 0 && *n <= 0x10ffff);
+        let (a, b) = if range.starts_with("U+") {
+            if let Some((a, b)) = range.split_once('-') { (cp(a)?, cp(b)?) } else { let n = cp(range)?; (n, n) }
+        } else { let mut chars = range.chars(); let ch = chars.next()?; if chars.next().is_some() { return None; } (ch as u32, ch as u32) };
+        (a <= b).then_some((a, b, width))
+    }).collect()
+}
+
+/// Windows consoles have no terminfo database; use their native VT capabilities.
+#[cfg(windows)]
+fn terminfo_capabilities(_: &str) -> std::collections::BTreeMap<String, String> { Default::default() }
+
+#[cfg(unix)]
+fn terminfo_capabilities(term: &str) -> std::collections::BTreeMap<String, String> {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<BTreeMap<String, BTreeMap<String, String>>>> = OnceLock::new();
+    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+    if let Some(caps) = cache.get(term) { return caps.clone(); }
+    let mut caps = BTreeMap::new();
+    if !term.is_empty() && !term.starts_with('-') {
+        if let Ok(output) = std::process::Command::new("infocmp").args(["-1", "-x", term]).output() {
+            if output.status.success() {
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    let line = line.trim().trim_end_matches(',');
+                    if let Some((name, value)) = line.split_once('=') {
+                        caps.insert(name.to_string(), decode_capability(value));
+                    }
+                }
+            }
+        }
+    }
+    if cache.len() < 128 { cache.insert(term.to_string(), caps.clone()); }
+    caps
+}
+
+/// Expand the parameter forms used by VT cursor and selection capabilities.
+pub fn string_capability(caps: &std::collections::BTreeMap<String, String>, name: &str, fallback: &str, params: &[&str]) -> String {
+    super::termcap::expand(caps.get(name).map(String::as_str).unwrap_or(fallback), params).unwrap_or_default()
 }

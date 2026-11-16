@@ -525,6 +525,7 @@ fn keys_config_and_capture() {
     ctx.ok(&["source-file", &conf.to_string_lossy()]);
     let _ = std::fs::remove_file(&conf);
     assert_eq!(ctx.fmt("k", "#{@conf} #{@cond}"), "loaded yes");
+    // bindings are parsed when bound, so list-keys prints the canonical command
     assert!(ctx.ok(&["list-keys", "-T", "root", "F5"]).contains("set-option -g @f5 pressed"));
     ctx.fails(&["source-file", "/no/such/file.conf"]);
     ctx.ok(&["source-file", "-q", "/no/such/file.conf"]);

@@ -18,6 +18,8 @@ pub struct Global {
     pub control: u8,
     /// -T: extra terminal features ("RGB,sync,...")
     pub features: String,
+    /// -u: the terminal is UTF-8 whatever the locale says
+    pub utf8: bool,
 }
 
 fn spawn_server(config: Option<&str>) -> std::io::Result<()> {
@@ -149,6 +151,15 @@ fn is_tty() -> bool {
 
 /// A native Windows console supports VT even when a launcher inherited TERM=dumb.
 /// Preserve explicit terminal names and non-console clients (including Unix).
+/// CLIENT_UTF8: -u, running inside tmux, or a UTF-8 locale (LC_ALL, then LC_CTYPE, then LANG).
+/// Windows consoles are driven in UTF-8.
+fn client_utf8(flag: bool) -> bool {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let inside = std::env::var_os("TMUX").is_some() || var("PWSH_TMUX").is_some();
+    let locale = var("LC_ALL").or_else(|| var("LC_CTYPE")).or_else(|| var("LANG")).unwrap_or_default().to_ascii_uppercase();
+    flag || cfg!(windows) || inside || locale.contains("UTF-8") || locale.contains("UTF8")
+}
+
 fn terminal_name(term: String, windows_console: bool) -> String {
     if windows_console && term == "dumb" { String::new() } else { term }
 }
@@ -216,9 +227,7 @@ mod tests {
 }
 
 pub fn main(mut args: Vec<String>, g: Global) -> i32 {
-    if args.is_empty() {
-        args.push("new-session".into());
-    }
+    let default_command = args.is_empty();
     let cmds = crate::cmdparse::split_commands(&args);
     let starts = cmds.iter().any(|c| matches!(c.first().map(String::as_str), Some("new-session" | "new" | "start-server" | "start")));
     if let Err(error) = prepare_stdin_buffers(&mut args, &mut std::io::stdin().lock()) {
@@ -230,7 +239,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
         eprintln!("command frame too large (stdin data must fit after base64 encoding)");
         return 1;
     }
-    let stream = match connect(starts && !g.no_start, g.config.as_deref()) {
+    let stream = match connect((starts || default_command) && !g.no_start, g.config.as_deref()) {
         Ok(s) => s,
         Err(e) => {
             // tmux prints nothing and fails for e.g. has-session with no server
@@ -249,6 +258,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
         std::env::var("PWSH_TMUX_PANE").ok().filter(|_| std::env::var_os("PWSH_TMUX").is_some()).unwrap_or_default(),
         g.control.to_string(),
         g.features.clone(),
+        if client_utf8(g.utf8) { "1".into() } else { "0".into() },
     ];
     ident.extend(std::env::vars().map(|(k, v)| format!("{k}={v}")));
     let stream = Arc::new(stream);
@@ -268,11 +278,13 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
 
     let mut raw: Option<term::RawMode> = None;
     let mut control_started = false;
+    let mut alternate = true;
     // Set while a lock command or a suspended shell owns the terminal.
     let paused = Arc::new(AtomicBool::new(false));
     let mut out = std::io::stdout();
-    let restore = |out: &mut std::io::Stdout| {
-        let _ = out.write_all(b"\x1b[0m\x1b[?25h\x1b[?1l\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1004l\x1b[>4m\x1b[0 q\x1b[?1049l");
+    let restore = |out: &mut std::io::Stdout, alternate: bool| {
+        let _ = out.write_all(b"\x1b[0m\x1b[?25h\x1b[?1l\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1004l\x1b[>4m");
+        let _ = out.write_all(if alternate { b"\x1b[?1049l" } else { b"\x1b[H\x1b[2J" });
         let _ = out.flush();
     };
     loop {
@@ -292,7 +304,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                     if code != 0 {
                         // attach failed after we went raw
                         drop(raw.take());
-                        restore(&mut out);
+                        restore(&mut out, alternate);
                         eprintln!("{text}");
                         return 1;
                     }
@@ -328,7 +340,8 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                     });
                 }
             }
-            Ok((S_ATTACHED, _)) => {
+            Ok((S_ATTACHED, payload)) => {
+                alternate = payload != b"no-clear";
                 if raw.is_none() {
                     match term::RawMode::enter() {
                         Ok(r) => raw = Some(r),
@@ -337,7 +350,11 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                             return 1;
                         }
                     }
-                    let _ = out.write_all(b"\x1b[?1049h\x1b[H\x1b[2J");
+                    if alternate { let _ = out.write_all(b"\x1b[?1049h\x1b[H\x1b[2J"); }
+                    else {
+                        // Scroll the previous terminal contents into scrollback.
+                        let _ = out.write_all(format!("\x1b[{};1H{}\x1b[H", rows, "\r\n".repeat(rows as usize + 1)).as_bytes());
+                    }
                     let _ = out.flush();
                     let input_post = post.clone();
                     let paused = paused.clone();
@@ -406,7 +423,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
             }
             Ok((S_EXIT, p)) => {
                 drop(raw.take());
-                restore(&mut out);
+                restore(&mut out, alternate);
                 println!("{}", String::from_utf8_lossy(&p));
                 // The input thread is blocked in a terminal read; exit without joining it.
                 std::process::exit(0);
@@ -414,13 +431,13 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
             Ok((S_SUSPEND, _)) => {
                 paused.store(true, Ordering::SeqCst);
                 drop(raw.take());
-                restore(&mut out);
+                restore(&mut out, alternate);
                 #[cfg(unix)]
                 unsafe {
                     libc::raise(libc::SIGTSTP);
                 }
                 raw = term::RawMode::enter().ok();
-                let _ = out.write_all(b"\x1b[?1049h");
+                if alternate { let _ = out.write_all(b"\x1b[?1049h"); }
                 let _ = out.flush();
                 let (c, r) = term::size();
                 post(C_RESIZE, &encode_size(c, r));
@@ -432,11 +449,11 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                 // give the reader a moment to leave its wait
                 thread::sleep(Duration::from_millis(150));
                 drop(raw.take());
-                restore(&mut out);
+                restore(&mut out, alternate);
                 let cmd = String::from_utf8_lossy(&p).into_owned();
                 let _ = crate::server::procinfo::job_command(&cmd).status();
                 raw = term::RawMode::enter().ok();
-                let _ = out.write_all(b"\x1b[?1049h");
+                if alternate { let _ = out.write_all(b"\x1b[?1049h"); }
                 let _ = out.flush();
                 paused.store(false, Ordering::SeqCst);
                 post(C_RESUMED, b"");
@@ -446,7 +463,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                 let was_attached = raw.is_some();
                 drop(raw.take());
                 if was_attached {
-                    restore(&mut out);
+                    restore(&mut out, alternate);
                     println!("[lost server]");
                 } else {
                     eprintln!("lost server");

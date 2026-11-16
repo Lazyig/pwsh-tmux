@@ -14,6 +14,7 @@ mod opts;
 mod protocol;
 mod server;
 mod term;
+mod width;
 
 const USAGE: &str = "\
 usage: pwsh-tmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]
@@ -43,7 +44,7 @@ fn main() {
         };
         std::process::exit(code);
     }
-    let mut g = client::Global { config: None, no_start: false, control: 0, features: String::new() };
+    let mut g = client::Global { config: None, no_start: false, control: 0, features: String::new(), utf8: false };
     let mut shell_cmd = None;
     // global flags before the command
     while let Some(a) = args.first().cloned() {
@@ -74,7 +75,8 @@ fn main() {
                     return;
                 }
                 'C' => g.control = (g.control + 1).min(2),
-                '2' | 'D' | 'l' | 'u' | 'v' => {}
+                'u' => g.utf8 = true,
+                '2' | 'D' | 'l' | 'v' => {}
                 '-' => {
                     if a == "--help" {
                         print!("{USAGE}");

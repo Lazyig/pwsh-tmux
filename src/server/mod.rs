@@ -7,6 +7,7 @@
 mod cmds;
 mod control;
 pub mod features;
+mod termcap;
 mod input;
 mod modes;
 mod mouse;
@@ -95,9 +96,18 @@ pub struct PaneCb {
     pub replies: Vec<u8>,
     pub bell: bool,
     pub title: Option<String>,
+    /// ESC k name ST, for allow-rename.
+    pub rename: Option<String>,
     pub cwd: Option<String>,
-    /// modifyOtherKeys level the application asked for (CSI > 4 ; n m).
+    /// The pane's extended key mode (0, 1 or 2: tmux's MODE_KEYS_EXTENDED and _2), set by
+    /// CSI > 4 ; n m and CSI > 4 n, and by extended-keys always at a reset.
     pub ext_keys: u8,
+    /// extended-keys as the parser last saw it (0 off, 1 on, 2 always).
+    pub ext_option: u8,
+    pub clipboard_queries: Vec<(Vec<u8>, bool)>,
+    /// OSC 52 selections set by the application (selector, base64 data).
+    pub clipboard_sets: Vec<(Vec<u8>, Vec<u8>)>,
+    pub passthrough: Vec<Vec<u8>>,
     /// State reported for formats (pane_path, cursor_colour, pane_pb_*, pane_command_*).
     pub osc: OscState,
 }
@@ -179,6 +189,11 @@ impl OscState {
     }
 }
 
+/// extended-keys as a number: 0 off, 1 on, 2 always.
+pub fn ext_keys_option(v: &str) -> u8 {
+    match v { "always" => 2, "on" => 1, _ => 0 }
+}
+
 /// The exit status in OSC 133 "D;status[;key=value...]": 0 when absent or a key=value, 255
 /// when not a number from 0 to 255 (tmux's input_osc_133_exit_status).
 fn osc133_exit_status(arg: &str) -> i32 {
@@ -215,7 +230,18 @@ pub fn parse_x11_colour(s: &str) -> Option<String> {
         let n = |v: &str| v.trim().parse::<u16>().ok().filter(|n| *n < 256);
         return Some(rgb(n(r)?, n(g)?, n(b)?));
     }
-    crate::format::parse_color(s).map(colour_name)
+    let cmyk = s.strip_prefix("cmyk:").map(|v| (v, 4)).or_else(|| s.strip_prefix("cmy:").map(|v| (v, 3)));
+    if let Some((v, n)) = cmyk {
+        let f: Vec<f64> = v.split('/').map_while(|x| x.parse::<f64>().ok()).collect();
+        if f.len() != n || f.iter().any(|x| !(0.0..=1.0).contains(x)) {
+            return None;
+        }
+        let k = if n == 4 { f[3] } else { 0.0 };
+        let c = |x: f64| ((1.0 - x) * (1.0 - k) * 255.0) as u16;
+        return Some(rgb(c(f[0]), c(f[1]), c(f[2])));
+    }
+    // colour_parseX11 looks a name up in the X11 table, so "blue" is #0000ff, not colour 4
+    crate::format::colour_byname(s.trim_matches(' ')).map(colour_name)
 }
 
 /// tmux's colour_tostring.
@@ -267,11 +293,30 @@ fn decode_file_url(url: &str) -> Option<String> {
 }
 
 impl vt100::Callbacks for PaneCb {
+    fn clipboard_query(&mut self, _: &mut vt100::Screen, ty: &[u8], bel: bool) {
+        self.clipboard_queries.push((ty.to_vec(), bel));
+    }
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
+        if self.clipboard_sets.len() < 16 { self.clipboard_sets.push((ty.to_vec(), data.to_vec())); }
+    }
+    fn dcs(&mut self, _: &mut vt100::Screen, payload: &[u8]) {
+        // the parser already turned the doubled ESC bytes back into one
+        if let Some(payload) = payload.strip_prefix(b"tmux;") {
+            self.passthrough.push(payload.to_vec());
+        }
+    }
     fn audible_bell(&mut self, _: &mut vt100::Screen) {
         self.bell = true;
     }
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
         self.title = Some(String::from_utf8_lossy(title).into_owned());
+    }
+    fn reset(&mut self, _: &mut vt100::Screen) {
+        // screen_write_reset: extended-keys always puts the pane back in mode 1
+        self.ext_keys = (self.ext_option == 2) as u8;
+    }
+    fn rename_window(&mut self, _: &mut vt100::Screen, name: &[u8]) {
+        self.rename = Some(String::from_utf8_lossy(name).into_owned());
     }
     fn unhandled_osc(&mut self, screen: &mut vt100::Screen, params: &[&[u8]]) {
         self.osc.osc(params);
@@ -299,9 +344,13 @@ impl vt100::Callbacks for PaneCb {
             (None, 'n', 5) => self.replies.extend(b"\x1b[0n"),
             (None, 'c', 0) => self.replies.extend(b"\x1b[?1;2c"),
             (Some(b'>'), 'c', 0) => self.replies.extend(b"\x1b[>84;0;0c"),
-            (Some(b'>'), 'm', 4) => self.ext_keys = params.get(1).and_then(|p| p.first()).copied().unwrap_or(0) as u8,
+            // INPUT_CSI_MODSET: ignored with extended-keys off; always keeps at least mode 1
+            (Some(b'>'), 'm', 4) if self.ext_option != 0 => {
+                let m = params.get(1).and_then(|p| p.first()).copied().unwrap_or(0);
+                self.ext_keys = if m == 2 { 2 } else if m == 1 || self.ext_option == 2 { 1 } else { 0 };
+            }
             // CSI > 4 n turns modifyOtherKeys off again
-            (Some(b'>'), 'n', 4) => self.ext_keys = 0,
+            (Some(b'>'), 'n', 4) => self.ext_keys = (self.ext_option == 2) as u8,
             _ => {}
         }
     }
@@ -516,6 +565,8 @@ pub struct Identity {
     pub term: String,
     pub pid: u32,
     pub ctx_pane: Option<PaneId>,
+    /// CLIENT_UTF8 as decided by the client (-u, locale or $TMUX)
+    pub utf8: bool,
     pub env: Vec<(String, String)>,
 }
 
@@ -534,6 +585,12 @@ pub struct Prompt {
     pub cursor: usize,
     pub template: String,
     pub history_pos: Option<usize>,
+    /// The history this prompt reads and adds to (command-prompt -T).
+    pub history_type: usize,
+    /// vi command mode (status-keys vi after Escape).
+    pub command_mode: bool,
+    /// Text cut with C-w, pasted again by C-y.
+    pub copied: Option<Vec<char>>,
     pub pane: Option<PaneId>,
     pub numeric: bool,
     pub single_key: bool,
@@ -542,8 +599,6 @@ pub struct Prompt {
     pub bspace_exit: bool,
     /// confirm-before: the key that confirms (-c) and whether Enter does too (-y).
     pub confirm: (char, bool),
-    /// command-prompt -T search: uses the search history.
-    pub search: bool,
 }
 
 pub enum Overlay {
@@ -593,6 +648,8 @@ pub struct Client {
     pub key_table: String,
     pub repeat_until: Option<Instant>,
     pub keyp: keys::Parser,
+    pub input_state: input::InputState,
+    pub term_caps: BTreeMap<String, String>,
     pub esc_deadline: Option<Instant>,
     pub prompt: Option<Prompt>,
     pub overlay: Option<Overlay>,
@@ -668,6 +725,12 @@ pub fn now_ms() -> u64 {
 }
 
 impl Client {
+    /// CLIENT_UTF8: set by the client, or by applying the utf8 terminal feature (never cleared
+    /// by utf8@).
+    pub fn utf8(&self) -> bool {
+        self.ident.as_ref().is_none_or(|i| i.utf8) || self.features.has("utf8")
+    }
+
     pub fn is_readonly(&self) -> bool {
         self.readonly || self.acl_readonly
     }
@@ -717,6 +780,12 @@ impl Client {
                 self.ctl.exiting.set(true);
                 return;
             }
+        }
+        // detach and session exit clear `attached` first; the reset depends only on what the
+        // terminal was given, which is nothing for a command client
+        if self.control == 0 {
+            let reset = self.tty_stop_sequence();
+            if !reset.is_empty() { self.send(S_OUTPUT, reset.as_bytes()); }
         }
         self.send(S_EXIT, msg.as_bytes());
     }
@@ -839,8 +908,8 @@ pub struct Server {
     pub buffer_seq: u32,
     pub bindings: BTreeMap<String, BTreeMap<String, Binding>>,
     pub messages: VecDeque<(u64, String)>,
-    pub prompt_history: Vec<String>,
-    pub prompt_history_search: Vec<String>,
+    /// Prompt history per type (command, search).
+    pub prompt_history: [Vec<String>; 2],
     pub jobs: HashMap<u32, Parked>,
     pub waits: HashMap<String, (bool, Vec<Queue>)>,
     /// wait-for channels signalled while nobody waited (the next wait returns at once).
@@ -896,6 +965,7 @@ pub fn run(config: Option<String>) -> io::Result<()> {
     }
     // config first: its server-access lines decide who may open the Windows pipe
     srv.load_config(config);
+    srv.load_prompt_history();
     let allowed: Vec<String> = srv.acl.iter().map(|a| a.0.clone()).collect();
     let Some(listener) = ipc::listen_exclusive(&allowed)? else {
         return Ok(()); // another server won the race
@@ -950,6 +1020,7 @@ pub fn run(config: Option<String>) -> io::Result<()> {
         }
     }
     srv.shutdown();
+    srv.save_prompt_history();
     ipc::cleanup();
     log("server exiting");
     Ok(())
@@ -987,8 +1058,7 @@ impl Server {
             buffer_seq: 0,
             bindings: input::default_bindings(),
             messages: VecDeque::new(),
-            prompt_history: Vec::new(),
-            prompt_history_search: Vec::new(),
+            prompt_history: Default::default(),
             jobs: HashMap::new(),
             waits: HashMap::new(),
             waits_woken: Default::default(),
@@ -1304,6 +1374,8 @@ impl Server {
                 key_table: "root".into(),
                 repeat_until: None,
                 keyp: keys::Parser::new(),
+                input_state: Default::default(),
+                term_caps: Default::default(),
                 esc_deadline: None,
                 prompt: None,
                 overlay: None,
@@ -1407,13 +1479,18 @@ impl Server {
                     term: get(4),
                     pid: get(5).parse().unwrap_or(0),
                     ctx_pane: get(6).strip_prefix('%').and_then(|s| s.parse().ok()),
-                    env: a.iter().skip(9).filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect(),
+                    utf8: get(9) != "0",
+                    env: a.iter().skip(10).filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect(),
                 };
                 let control = get(7).parse().unwrap_or(0);
                 let colorterm = ident.env.iter().find(|(k, _)| k == "COLORTERM").map(|(_, v)| v.as_str()).unwrap_or("");
                 let table: Vec<String> = self.opts_server.0.iter().filter(|(k, _)| k.starts_with("terminal-features[")).map(|(_, v)| v.clone()).collect();
-                let features = features::compute(&ident.term, colorterm, &table, &get(8));
+                let program = ident.env.iter().find(|(k, _)| k == "TERM_PROGRAM").map(|(_, v)| v.as_str()).unwrap_or("");
+                let mut features = features::compute_named(&ident.term, program, colorterm, &table, &get(8));
+                let table = self.opts_server.array_items("terminal-overrides").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
+                let caps = features::overrides(&ident.term, &table, &mut features);
                 if let Some(c) = self.clients.get_mut(&cid) {
+                    c.term_caps = caps;
                     c.control = control;
                     c.features = features;
                     c.size = (ident.cols.max(1), ident.rows.max(1));
@@ -1430,7 +1507,12 @@ impl Server {
                     }
                     return;
                 }
-                let cmds = crate::cmdparse::split_commands(&argv);
+                let cmds = if argv.is_empty() {
+                    match crate::cmdparse::parse(&self.opt_server("default-client-command")) {
+                        Ok(cmds) => cmds,
+                        Err(e) => { if let Some(c) = self.clients.get(&cid) { c.send(S_REPLY, &encode_reply(1, &e)); } return; }
+                    }
+                } else { crate::cmdparse::split_commands(&argv) };
                 let pane = self.clients.get(&cid).and_then(|c| c.ident.as_ref()).and_then(|i| i.ctx_pane).filter(|p| self.panes.contains_key(p));
                 // control clients get the reply to their command line in a %begin block too
                 let control_seq = self.clients.get_mut(&cid).filter(|c| c.control > 0).map(|c| {
@@ -1472,8 +1554,10 @@ impl Server {
                 self.control_line(cid, &line);
             }
             C_RESUMED => {
+                if let Some(sid) = self.client_session(cid) { if let Some(s) = self.sessions.get_mut(&sid) { s.activity = now_secs(); } }
                 if let Some(c) = self.clients.get_mut(&cid) {
                     c.suspended = false;
+                    c.activity = now_secs();
                     c.prev = None;
                     c.dirty = true;
                 }
@@ -1488,7 +1572,16 @@ impl Server {
         }
         self.control_output(id, data);
         let scroll_on_clear = options::is_on(&self.opt_pane(id, "scroll-on-clear"));
+        let alternate = options::is_on(&self.opt_pane(id, "alternate-screen"));
+        let widths = features::codepoint_widths(&self.opts_server.array_items("codepoint-widths").into_iter().map(|(_, v)| v).collect::<Vec<_>>());
+        let variation_wide = options::is_on(&self.opt_server("variation-selector-always-wide"));
+        let input_limit = self.opt_server_num("input-buffer-size") as usize;
+        let ext_option = ext_keys_option(&self.opt_server("extended-keys"));
         let p = self.panes.get_mut(&id).unwrap();
+        p.parser.callbacks_mut().ext_option = ext_option;
+        p.parser.set_input_buffer_size(input_limit);
+        p.parser.screen_mut().set_alternate_screen_allowed(alternate);
+        p.parser.screen_mut().set_codepoint_widths(widths, variation_wide);
         p.parser.screen_mut().set_scroll_on_clear(scroll_on_clear);
         // capture-pane -I: rows entering the history record when
         p.parser.screen_mut().set_time(now_secs());
@@ -1513,19 +1606,31 @@ impl Server {
         let replies = std::mem::take(&mut cb.replies);
         let bell = std::mem::take(&mut cb.bell);
         let title = cb.title.take();
+        let rename = cb.rename.take();
+        let queries = std::mem::take(&mut cb.clipboard_queries);
+        let sets = std::mem::take(&mut cb.clipboard_sets);
+        let passthrough = std::mem::take(&mut cb.passthrough);
         if let Some(cwd) = cb.cwd.take() {
             p.current_path = cwd;
             p.cwd_seq += 1;
         }
         p.send(replies);
-        if let Some(t) = title {
-            p.title = t.clone();
-            if options::is_on(&self.opt_pane(id, "allow-rename")) {
-                if let Some(wid) = self.window_of(id) {
-                    if let Some(w) = self.windows.get_mut(&wid) {
-                        w.name = t;
-                        w.options.set("automatic-rename", "off".into());
+        self.pane_input_requests(id, queries, sets, passthrough);
+        if let Some(t) = title.filter(|_| options::is_on(&self.opt_pane(id, "allow-set-title"))) {
+            self.panes.get_mut(&id).unwrap().title = t;
+        }
+        // allow-rename covers only ESC k (input_exit_rename); an empty name goes back to
+        // automatic-rename's inherited value, or to an empty name when that is off
+        if let Some(n) = rename.filter(|_| options::is_on(&self.opt_pane(id, "allow-rename"))) {
+            if let Some(wid) = self.window_of(id) {
+                if n.is_empty() {
+                    if let Some(w) = self.windows.get_mut(&wid) { w.options.unset("automatic-rename"); }
+                    if !self.opt_window_on(Some(wid), "automatic-rename") {
+                        if let Some(w) = self.windows.get_mut(&wid) { w.name = n; }
                     }
+                } else if let Some(w) = self.windows.get_mut(&wid) {
+                    w.name = n;
+                    w.options.set("automatic-rename", "off".into());
                 }
             }
         }
@@ -1617,7 +1722,7 @@ impl Server {
             return;
         }
         let remain = self.opt_pane(id, "remain-on-exit");
-        let keep = remain == "on" || (remain == "failed" && status.unwrap_or(0) != 0);
+        let keep = matches!(remain.as_str(), "on" | "key") || (matches!(remain.as_str(), "failed" | "failed-key") && status.unwrap_or(0) != 0);
         if keep {
             let fmt = self.opt_pane(id, "remain-on-exit-format");
             if let Some(p) = self.panes.get_mut(&id) {
@@ -1757,12 +1862,14 @@ impl Server {
     }
 
     fn timers(&mut self) {
+        self.input_timers();
         let now = Instant::now();
         let cids: Vec<ClientId> = self.clients.keys().copied().collect();
         for cid in cids {
             let Some(c) = self.clients.get_mut(&cid) else { continue };
             if c.esc_deadline.is_some_and(|d| d <= now) {
                 c.esc_deadline = None;
+                c.keyp.expire_partial_paste_end();
                 let pending = c.keyp.flush_pending();
                 for i in pending {
                     self.dispatch_input(cid, i);
@@ -1775,7 +1882,7 @@ impl Server {
             if c.repeat_until.is_some_and(|d| d <= now) {
                 c.repeat_until = None;
                 if c.key_table != "root" {
-                    c.key_table = "root".into();
+                    c.set_key_table("root");
                     c.dirty = true;
                 }
             }
@@ -2085,7 +2192,11 @@ impl Server {
             Pane {
                 id,
                 generation,
-                parser: vt100::Parser::new_with_callbacks(nz(rows), nz(cols), history, PaneCb::default()),
+                parser: vt100::Parser::new_with_callbacks(nz(rows), nz(cols), history, {
+                    // screen_reinit: a new screen starts in mode 1 with extended-keys always
+                    let ext_option = ext_keys_option(&self.opt_server("extended-keys"));
+                    PaneCb { ext_option, ext_keys: (ext_option == 2) as u8, ..PaneCb::default() }
+                }),
                 input: itx,
                 master: pair.master,
                 killer,
@@ -2319,6 +2430,7 @@ impl Server {
     /// attach_client; `update_env` false (attach-session/switch-client -E) skips
     /// update-environment.
     pub fn attach_client_env(&mut self, cid: ClientId, sid: SessId, update_env: bool) {
+        let clear = options::is_on(&self.opt_server("clear-on-attach"));
         let Some(c) = self.clients.get_mut(&cid) else { return };
         let was_attached = c.attached;
         c.focused = true;
@@ -2331,7 +2443,13 @@ impl Server {
         c.dirty = true;
         c.key_table = "root".into();
         if !was_attached {
-            c.send(S_ATTACHED, b"");
+            c.send(S_ATTACHED, if clear { b"" } else { b"no-clear" });
+            // tty_send_requests: ask a VT100-like terminal whether it has synchronized output
+            // (DECRQM 2026); the reply adds the sync feature
+            let term = c.ident.as_ref().map(|i| i.term.as_str()).unwrap_or("");
+            if c.control == 0 && !term.is_empty() && term != "dumb" {
+                c.send(S_OUTPUT, b"\x1b[?2026$p");
+            }
         }
         let writable = !self.client_is_readonly(Some(cid));
         let now = now_secs();
@@ -2546,7 +2664,7 @@ impl Server {
 
     pub fn run_queue(&mut self, mut q: Queue) {
         while let Some(cmd) = q.cmds.pop_front() {
-            let name = cmd.first().cloned().unwrap_or_default();
+            let name = cmd.first().map(|s| s.strip_prefix("\0alias:").unwrap_or(s).to_string()).unwrap_or_default();
             let soft = q.soft > 0;
             q.soft = q.soft.saturating_sub(1);
             if name == FILE_PUSH {
@@ -2800,3 +2918,6 @@ fn strip_delay(cmd: &[String]) -> Vec<String> {
     }
     out
 }
+
+#[cfg(test)]
+mod input_tests;

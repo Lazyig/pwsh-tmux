@@ -178,7 +178,8 @@ mod tests {
         p.set_size(nz(3), nz(1));
         assert!(snapshot(p.screen()).len() <= 8);
         p.set_size(nz(3), nz(10));
-        p.process(b"\x1b[?1049habcdefghi\x1b[2;3H");
+        // the cursor stays where it was on entering the alternate screen
+        p.process(b"\x1b[?1049h\x1b[Habcdefghi\x1b[2;3H");
         p.set_size(nz(3), nz(5));
         assert_eq!(p.screen().cursor_position(), (1, 2));
         assert!(p.screen().contents().starts_with("abcde"));

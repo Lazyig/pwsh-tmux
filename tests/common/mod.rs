@@ -103,6 +103,8 @@ impl Term {
         cb.env("TERM", "xterm-256color");
         // a known terminal: 256 colours, no truecolor unless a test asks for it
         cb.env_remove("COLORTERM");
+        // TERM_PROGRAM names the outer terminal's tmux default features
+        cb.env_remove("TERM_PROGRAM");
         Term::spawn(cb, cols, rows)
     }
 

@@ -93,6 +93,7 @@ pub enum KeyCode {
     Insert,
     Delete,
     F(u8),
+    User(u16),
     /// Keypad key: '0'-'9', '/', '*', '-', '+', '.', ',', '=' and '\r' for KPEnter.
     KP(char),
 }
@@ -162,6 +163,7 @@ pub struct Parser {
     in_paste: bool,
     paste: Vec<u8>,
     paste_overflow: bool,
+    user_keys: Vec<(u16, Vec<u8>)>,
 }
 
 impl Default for Parser {
@@ -177,7 +179,26 @@ impl Parser {
             in_paste: false,
             paste: Vec::new(),
             paste_overflow: false,
+            user_keys: Vec::new(),
         }
+    }
+
+    pub fn set_user_keys(&mut self, keys: Vec<(u16, Vec<u8>)>) {
+        self.user_keys = keys.into_iter().filter(|(_, v)| !v.is_empty()).collect();
+    }
+
+    /// Recover from an unterminated paste after the server's five second limit.
+    pub fn expire_paste(&mut self) -> Vec<Input> {
+        if !self.in_paste { return Vec::new(); }
+        self.in_paste = false;
+        self.paste.extend(std::mem::take(&mut self.buf));
+        let data = std::mem::take(&mut self.paste);
+        let overflow = std::mem::replace(&mut self.paste_overflow, false);
+        if overflow { Vec::new() } else { vec![Input::Paste(data)] }
+    }
+
+    pub fn partial_paste_end(&self) -> bool {
+        self.in_paste && !self.buf.is_empty() && PASTE_END.starts_with(&self.buf)
     }
 
     pub fn feed(&mut self, data: &[u8]) -> Vec<Input> {
@@ -199,10 +220,15 @@ impl Parser {
     /// Resolve held-back bytes: a lone ESC becomes Escape, `ESC [` becomes M-[, partial UTF-8
     /// becomes Unknown, and so on. Does nothing while inside a bracketed paste.
     pub fn flush_pending(&mut self) -> Vec<Input> {
-        if self.in_paste {
-            return Vec::new();
-        }
+        if self.in_paste { return Vec::new(); }
         self.run(true)
+    }
+
+    /// Resolve a partial end marker only after the extended (500ms) escape timer.
+    pub fn expire_partial_paste_end(&mut self) {
+        if !self.partial_paste_end() { return; }
+        if self.paste.len().saturating_add(self.buf.len()) <= MAX_PASTE { self.paste.append(&mut self.buf); }
+        else { self.paste.clear(); self.buf.clear(); self.paste_overflow = true; }
     }
 
     fn run(&mut self, force: bool) -> Vec<Input> {
@@ -234,7 +260,25 @@ impl Parser {
             if self.buf.is_empty() {
                 break;
             }
-            match parse_one(&self.buf, force) {
+            // User keys share tmux's key tree with the built-in sequences: wait while a longer
+            // user key may still match, and the longest complete match wins (a user key wins ties
+            // because tty_keys_build adds user keys last).
+            if !force && self.user_keys.iter().any(|(_, v)| v.len() > self.buf.len() && v.starts_with(&self.buf)) { break; }
+            let user = self.user_keys.iter().filter(|(_, v)| self.buf.starts_with(v)).max_by_key(|(_, v)| v.len()).map(|(n, v)| (*n, v.len()));
+            let parsed = parse_one(&self.buf, force);
+            if let Some((n, len)) = user {
+                let builtin = match &parsed {
+                    Res::Done(Tok::In(Input::Key(..)), m) => *m > len,
+                    Res::Done(Tok::In(Input::Unknown(_)), _) => false,
+                    // a partial built-in sequence waits for escape-time like tmux's partial key
+                    Res::Incomplete | Res::Done(_, _) => true,
+                };
+                if !builtin {
+                    out.push(Input::Key(Key::plain(KeyCode::User(n)), self.buf.drain(..len).collect()));
+                    continue;
+                }
+            }
+            match parsed {
                 Res::Incomplete => break,
                 Res::Done(tok, n) => {
                     self.buf.drain(..n);
@@ -364,6 +408,17 @@ fn parse_esc(buf: &[u8], force: bool) -> Res {
             Csi::Incomplete if !force => Res::Incomplete,
             Csi::Incomplete | Csi::Invalid => meta_fallback(buf),
         },
+        // Only an OSC 52 reply is held back (tty_keys_clipboard); any other ESC ] is M-].
+        b']' if !force && buf.len() < 5 && b"\x1b]52;".starts_with(buf) => Res::Incomplete,
+        b']' if buf.starts_with(b"\x1b]52;") => {
+            let end = buf.iter().position(|b| *b == 7).map(|n| n + 1)
+                .or_else(|| find(buf, b"\x1b\\").map(|n| n + 2));
+            match end {
+                Some(n) => Res::Done(unknown_tok(&buf[..n]), n),
+                None if !force && buf.len() < MAX_PASTE => Res::Incomplete,
+                _ => Res::Done(unknown_tok(buf), buf.len()),
+            }
+        }
         b'O' => parse_ss3(buf, force),
         ESC => {
             if buf.len() == 2 {
@@ -398,24 +453,12 @@ fn parse_esc(buf: &[u8], force: bool) -> Res {
 }
 
 fn parse_ss3(buf: &[u8], force: bool) -> Res {
-    let mut i = 2;
-    while i < buf.len() && i < 5 && buf[i].is_ascii_digit() {
-        i += 1;
-    }
+    // tmux knows only SS3 and a final byte; ESC O 5 A is M-O then 5 and A
+    let i = 2;
     if i >= buf.len() {
-        return if force || i >= 5 {
-            meta_fallback(buf)
-        } else {
-            Res::Incomplete
-        };
+        return if force { meta_fallback(buf) } else { Res::Incomplete };
     }
-    let mods = match std::str::from_utf8(&buf[2..i])
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(p) => Mods::from_xterm(p),
-        None => Mods::NONE,
-    };
+    let mods = Mods::NONE;
     let code = match buf[i] {
         b'A' => KeyCode::Up,
         b'B' => KeyCode::Down,
@@ -488,7 +531,101 @@ fn parse_csi(buf: &[u8]) -> Csi {
         };
         return Csi::Done(tok, n + 3);
     }
-    Csi::Done(dispatch_csi(params, inter, f, &buf[..n]), n)
+    match dispatch_csi(params, inter, f, &buf[..n]) {
+        Some(tok) => Csi::Done(tok, n),
+        None => Csi::Invalid,
+    }
+}
+
+/// tty_keys_extended_key accepts only `CSI number ; modifiers u` and `CSI 27 ; modifiers ;
+/// number ~` made of digits and ';' (no kitty `:` fields, no missing modifier). Anything
+/// else is not a key there, so tmux reads the ESC [ as M-[ and the rest as typed text.
+fn tmux_extended_form(params: &[u8], f: u8) -> bool {
+    if !params.iter().all(|c| c.is_ascii_digit() || *c == b';') {
+        return false;
+    }
+    let mut it = params.split(|c| *c == b';');
+    let num = |p: Option<&[u8]>| p.is_some_and(|p| !p.is_empty());
+    match f {
+        b'u' => num(it.next()) && num(it.next()),
+        _ => it.next() == Some(b"27") && num(it.next()) && num(it.next()),
+    }
+}
+
+/// A key the terminal sent in extended form, as tmux keeps it (tty_keys_extended_key): the
+/// code point with its modifiers, Shift dropped from a printable character and S-Tab as
+/// BTab. DEL is left to the backspace handling. Returns (code point, BTab, modifiers).
+pub fn extended_input(raw: &[u8]) -> Option<(u32, bool, Mods)> {
+    let body = raw.strip_prefix(b"\x1b[")?;
+    let (&f, params) = body.split_last()?;
+    if !matches!(f, b'u' | b'~') || !tmux_extended_form(params, f) {
+        return None;
+    }
+    let s = std::str::from_utf8(params).ok()?;
+    let v: Vec<u32> = s.split(';').map(|p| p.parse().ok()).collect::<Option<_>>()?;
+    let (cp, m) = if f == b'u' { (v[0], v[1]) } else { (v[2], v[1]) };
+    if cp == 127 || (cp > 0x7f && char::from_u32(cp).is_none()) {
+        return None;
+    }
+    let mut mods = Mods::from_xterm(m.max(1));
+    if cp == 9 && mods.shift {
+        mods.shift = false;
+        return Some((cp, true, mods));
+    }
+    if ((0x21..0x7f).contains(&cp) || cp > 0x7f) && mods == Mods::SHIFT {
+        mods.shift = false;
+    }
+    Some((cp, false, mods))
+}
+
+/// input_key for a character key (not one of tmux's special keys) in a pane whose extended
+/// key mode is `mode` (0 standard, 1 or 2). Empty when tmux writes nothing.
+pub fn input_key_char(mut cp: u32, btab: bool, mut mods: Mods, mode: u8, csi_u: bool) -> Vec<u8> {
+    if btab {
+        if mode < 2 {
+            return b"\x1b[Z".to_vec();
+        }
+        cp = 9;
+        mods.shift = true;
+    }
+    let utf8 = |cp: u32| char::from_u32(cp).map(|c| c.to_string().into_bytes()).unwrap_or_default();
+    if mods.is_empty() && (matches!(cp, 9 | 13 | 27) || (0x20..=0x7f).contains(&cp) || cp > 0x7f) {
+        return utf8(cp);
+    }
+    let extended = || -> Vec<u8> {
+        let n = mods.xterm_param();
+        if n <= 1 { return Vec::new(); }
+        if csi_u { format!("\x1b[{cp};{n}u") } else { format!("\x1b[27;{n};{cp}~") }.into_bytes()
+    };
+    // input_key_vt10x
+    let vt10x = || -> Vec<u8> {
+        let mut out = if mods.meta { vec![ESC] } else { Vec::new() };
+        if cp > 0x7f {
+            out.extend(utf8(cp));
+            return out;
+        }
+        let ctrl = mods.ctrl && !matches!(cp, 9 | 10 | 13);
+        let mut b = cp as u8;
+        if ctrl {
+            const FROM: &[u8] = b"1!9(0)=+;:'\",<.>/-8? 2";
+            const TO: &[u8] = b"119900=+;;'',,..\x1f\x1f\x7f\x7f\0\0";
+            b = match FROM.iter().position(|c| *c == b) {
+                Some(i) => TO[i],
+                None if (b'3'..=b'7').contains(&b) => b - 0x18,
+                None if (b'@'..=b'~').contains(&b) => b & 0x1f,
+                None => return out,
+            };
+        }
+        out.push(b & 0x7f);
+        out
+    };
+    match mode {
+        2 => extended(),
+        // input_key_mode1: Meta without Ctrl, and some Ctrl keys, keep the standard form
+        1 if (mods.meta && !mods.ctrl) || (mods.ctrl && (cp == 32 || cp == 47 || (50..=56).contains(&cp) || (64..=126).contains(&cp))) => vt10x(),
+        1 => extended(),
+        _ => vt10x(),
+    }
 }
 
 /// Split CSI parameters on ';', taking the first ':' sub-parameter. Empty → None.
@@ -509,29 +646,32 @@ fn parse_params(params: &[u8]) -> Option<Vec<Option<u32>>> {
         .collect()
 }
 
-fn dispatch_csi(params: &[u8], inter: &[u8], f: u8, raw: &[u8]) -> Tok {
+fn dispatch_csi(params: &[u8], inter: &[u8], f: u8, raw: &[u8]) -> Option<Tok> {
     if !inter.is_empty() {
-        return unknown_tok(raw);
+        return Some(unknown_tok(raw));
+    }
+    if (f == b'u' || (f == b'~' && params.starts_with(b"27;"))) && !tmux_extended_form(params, f) {
+        return None;
     }
     if params.first() == Some(&b'<') {
         if (f == b'M' || f == b'm')
             && let Some(m) = sgr_mouse(&params[1..], f == b'm')
         {
-            return Tok::In(Input::Mouse(m, raw.to_vec()));
+            return Some(Tok::In(Input::Mouse(m, raw.to_vec())));
         }
-        return unknown_tok(raw);
+        return Some(unknown_tok(raw));
     }
     if matches!(params.first(), Some(b'=' | b'>' | b'?')) {
-        return unknown_tok(raw);
+        return Some(unknown_tok(raw));
     }
     let Some(p) = parse_params(params) else {
-        return unknown_tok(raw);
+        return Some(unknown_tok(raw));
     };
     let get = |i: usize| p.get(i).copied().flatten();
     let mods = |i: usize| Mods::from_xterm(get(i).unwrap_or(1));
     let key = match f {
         b'~' => match get(0) {
-            Some(200) => return Tok::PasteStart,
+            Some(200) => return Some(Tok::PasteStart),
             Some(27) => get(2).and_then(|c| key_from_codepoint(c, mods(1))),
             Some(n) => tilde_key(n).map(|c| Key::new(c, mods(1))),
             None => None,
@@ -549,18 +689,16 @@ fn dispatch_csi(params: &[u8], inter: &[u8], f: u8, raw: &[u8]) -> Tok {
             };
             Some(Key::new(code, mods(1)))
         }
-        b'Z' => {
-            let mut m = mods(1);
-            m.shift = false;
-            Some(Key::new(KeyCode::BTab, m))
-        }
+        // tmux has only CSI Z: CSI 1 ; 2 Z is M-[ and text
+        b'Z' if params.is_empty() => Some(Key::new(KeyCode::BTab, Mods::NONE)),
+        b'Z' => return None,
         b'_' => win32_key(&p),
         _ => None,
     };
-    match key {
+    Some(match key {
         Some(k) => key_tok(k, raw),
         None => unknown_tok(raw),
-    }
+    })
 }
 
 fn tilde_key(n: u32) -> Option<KeyCode> {
@@ -824,6 +962,13 @@ fn lookup_name(name: &str) -> Option<KeyCode> {
     if let Some((_, c)) = NAMES.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
         return Some(c.clone());
     }
+    // sscanf(string, "User%u") <= KEYC_NUSER: case-sensitive, trailing text ignored.
+    if let Some(rest) = name.strip_prefix("User") {
+        let rest = rest.trim_start().strip_prefix('+').unwrap_or(rest.trim_start());
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let n = rest[..digits].bytes().fold(0u64, |n, d| n.saturating_mul(10).saturating_add(u64::from(d - b'0')));
+        if digits > 0 && n <= 1000 { return Some(KeyCode::User(n as u16)); }
+    }
     let b = name.as_bytes();
     if b.len() >= 2 && (b[0] == b'F' || b[0] == b'f') {
         let n: u8 = name[1..].parse().ok()?;
@@ -860,6 +1005,7 @@ pub fn key_name(k: &Key) -> String {
         KeyCode::PageDown => s.push_str("NPage"),
         KeyCode::Insert => s.push_str("IC"),
         KeyCode::Delete => s.push_str("DC"),
+        KeyCode::User(n) => { let _ = write!(s, "User{n}"); }
         KeyCode::F(n) => {
             let _ = write!(s, "F{n}");
         }
@@ -907,11 +1053,9 @@ pub fn encode_extended(k: &Key, all: bool, csi_u: bool) -> Option<Vec<u8>> {
         // arrows, F-keys, paging keys already carry modifiers (CSI 1;N X)
         _ => return None,
     };
-    let lossy = match k.code {
-        // C-letter and M-anything encode fine; C-S-letter, C-digit, C-punctuation don't
-        KeyCode::Char(c) => (m.ctrl && (m.shift || !(c.is_ascii_alphabetic() || "[\\]^_@ ".contains(c)))) || (m.shift && !m.ctrl && !m.meta),
-        _ => m.ctrl || m.shift,
-    };
+    // input_key_mode1: Meta without Ctrl, and Ctrl with Space, '/', '2'-'8' or '@'-'~', keep
+    // their standard form; everything else is reported extended.
+    let lossy = if m.ctrl { !matches!(code, 32 | 47 | 50..=56 | 64..=126) } else { !m.meta };
     if !lossy && !all {
         return None;
     }
@@ -970,7 +1114,7 @@ pub fn encode_key_mode(k: &Key, app_cursor: bool, app_keypad: bool) -> Vec<u8> {
             const NUMS: [u32; 8] = [15, 17, 18, 19, 20, 21, 23, 24];
             return tilde(NUMS[(f - 5) as usize]);
         }
-        KeyCode::F(_) => return Vec::new(),
+        KeyCode::F(_) | KeyCode::User(_) => return Vec::new(),
         KeyCode::BTab => b"\x1b[Z".to_vec(),
         KeyCode::Enter => b"\r".to_vec(),
         KeyCode::Tab => b"\t".to_vec(),
@@ -995,6 +1139,9 @@ pub fn encode_key_mode(k: &Key, app_cursor: bool, app_keypad: bool) -> Vec<u8> {
                     _ => 'M',
                 };
                 format!("\x1bO{f}").into_bytes()
+            } else if c == '\r' {
+                // input_key_defaults: KPEnter is LF outside application keypad mode
+                b"\n".to_vec()
             } else {
                 c.to_string().into_bytes()
             }
@@ -1359,7 +1506,8 @@ mod tests {
             );
         }
         // SS3 with modifier digit (old xterm).
-        assert_eq!(key1(b"\x1bO5A"), km(KeyCode::Up, true, false, false));
+        // tmux has no ESC O <modifier> forms: M-O, then the text
+        assert_eq!(keys(b"\x1bO5A"), vec![meta(KeyCode::Char('O')), ch('5'), ch('A')]);
     }
 
     #[test]
@@ -1418,7 +1566,7 @@ mod tests {
     #[test]
     fn btab() {
         assert_eq!(key1(b"\x1b[Z"), k(KeyCode::BTab));
-        assert_eq!(key1(b"\x1b[1;2Z"), k(KeyCode::BTab));
+        assert_eq!(keys(b"\x1b[1;2Z")[0], meta(KeyCode::Char('[')));
         assert_eq!(key1(b"\x1b\x1b[Z"), meta(KeyCode::BTab));
     }
 
@@ -1475,9 +1623,13 @@ mod tests {
             km(KeyCode::BSpace, true, false, false)
         );
         assert_eq!(key1(b"\x1b[32;5u"), km(KeyCode::Space, true, false, false));
-        assert_eq!(key1(b"\x1b[27u"), k(KeyCode::Escape));
-        assert_eq!(key1(b"\x1b[97u"), ch('a'));
-        assert_eq!(key1(b"\x1b[97:65;5u"), ctrl('a'));
+        // tty_keys_extended_key needs the modifier and has no kitty ':' fields: these are
+        // M-[ and text there (and their bytes reach the pane unchanged in standard mode)
+        for raw in [&b"\x1b[27u"[..], b"\x1b[97u", b"\x1b[97:65;5u", b"\x1b[97;5:1u", b"\x1b[57399u"] {
+            let v = keys(raw);
+            assert_eq!(v[0], meta(KeyCode::Char('[')), "{raw:?}");
+            assert_eq!(v.len(), raw.len() - 1, "{raw:?}");
+        }
         assert_eq!(key1(b"\x1b[105;5u"), k(KeyCode::Tab)); // C-i == Tab
         assert_eq!(key1(b"\x1b[27;5;97~"), ctrl('a'));
         assert_eq!(key1(b"\x1b[27;5;49~"), ctrl('1'));
@@ -2102,7 +2254,7 @@ mod tests {
         assert_eq!(e("S-F1"), b"\x1b[1;2P");
         assert_eq!(e("C-F5"), b"\x1b[15;5~");
         assert_eq!(e("KP5"), b"5");
-        assert_eq!(e("KPEnter"), b"\r");
+        assert_eq!(e("KPEnter"), b"\n");
         assert_eq!(e("C-i"), b"\t");
     }
 
@@ -2232,5 +2384,47 @@ mod tests {
         // a key after it, and M-] typed on its own
         assert_eq!(all(b"\x1b]52;;\x07x"), vec![Input::Unknown(b"\x1b]52;;\x07".to_vec()), Input::Key(ch('x'), b"x".to_vec())]);
         assert_eq!(key1(b"\x1b]"), meta(KeyCode::Char(']')));
+    }
+}
+
+#[cfg(test)]
+mod compatibility_input_tests {
+    use super::*;
+
+    #[test]
+    fn user_keys_are_incremental_and_can_be_reconfigured() {
+        let mut parser = Parser::new();
+        parser.set_user_keys(vec![(7, b"\x1b[77~".to_vec())]);
+        assert!(parser.feed(b"\x1b[7").is_empty());
+        assert!(parser.has_pending());
+        assert_eq!(parser.feed(b"7~"), vec![Input::Key(Key::plain(KeyCode::User(7)), b"\x1b[77~".to_vec())]);
+        assert_eq!(parse_key_name("User7"), Some(Key::plain(KeyCode::User(7))));
+        assert_eq!(key_name(&Key::plain(KeyCode::User(7))), "User7");
+        assert!(parse_key_name("User1001").is_none());
+        parser.set_user_keys(vec![]);
+        assert!(matches!(&parser.feed(b"\x1b[77~")[0], Input::Unknown(_)));
+    }
+
+    #[test]
+    fn unterminated_paste_can_expire_and_partial_end_can_wait() {
+        let mut parser = Parser::new();
+        parser.feed(b"\x1b[200~abc\x1b[20");
+        assert!(parser.partial_paste_end());
+        assert!(parser.flush_pending().is_empty());
+        assert_eq!(parser.feed(b"1~"), vec![Input::Paste(b"abc".to_vec())]);
+        parser.feed(b"\x1b[200~unfinished");
+        assert_eq!(parser.expire_paste(), vec![Input::Paste(b"unfinished".to_vec())]);
+        assert!(!parser.in_paste());
+        assert!(matches!(&parser.feed(b"x")[0], Input::Key(_, _)));
+    }
+
+    #[test]
+    fn clipboard_reply_stays_one_input_across_chunks() {
+        let reply = b"\x1b]52;c;YWJj\x1b\\";
+        for at in 1..reply.len() {
+            let mut parser = Parser::new();
+            assert!(parser.feed(&reply[..at]).is_empty());
+            assert_eq!(parser.feed(&reply[at..]), vec![Input::Unknown(reply.to_vec())]);
+        }
     }
 }

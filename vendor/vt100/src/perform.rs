@@ -2,12 +2,13 @@ use alloc::vec::Vec;
 
 const BASE64: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
-const CLIPBOARD_SELECTOR: &[u8] = b"cpqs01234567";
 
 impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
     fn print(&mut self, c: char) {
-        if c == '\u{fffd}' || ('\u{80}'..'\u{a0}').contains(&c) {
-            self.callbacks.unhandled_char(&mut self.screen, c);
+        // tmux shows a byte that is not valid UTF-8, or a character it cannot measure such
+        // as a C1 control, as U+FFFD (input_stop_utf8)
+        if ('\u{80}'..'\u{a0}').contains(&c) {
+            self.text('\u{fffd}');
         } else {
             self.text(c);
         }
@@ -25,12 +26,17 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
             // we don't implement shift in/out alternate character sets, but
             // it shouldn't count as an "error"
             14 | 15 => {}
+            // vte passes a lone byte from 0x80 to 0x9f here; tmux has no C1 controls and
+            // shows it as an invalid UTF-8 byte
+            0x80..=0x9f => self.text('\u{fffd}'),
             _ => self.callbacks.unhandled_control(&mut self.screen, b),
         }
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, b: u8) {
-        if let Some(i) = intermediates.first() {
+        if intermediates == b"#" && b == b'8' {
+            self.decaln();
+        } else if let Some(i) = intermediates.first() {
             self.callbacks.unhandled_escape(
                 &mut self.screen,
                 Some(*i),
@@ -45,7 +51,10 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
                 b'>' => self.deckpnm(),
                 b'H' => self.hts(),
                 b'M' => self.ri(),
-                b'c' => self.ris(),
+                b'c' => {
+                    self.ris();
+                    self.callbacks.reset(&mut self.screen);
+                }
                 b'g' => self.callbacks.visual_bell(&mut self.screen),
                 _ => {
                     self.callbacks.unhandled_escape(
@@ -190,7 +199,7 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
         }
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bel_terminated: bool) {
+    fn osc_dispatch(&mut self, params: &[&[u8]], bel_terminated: bool) {
         match params {
             [b"0", s] => {
                 self.callbacks.set_window_icon_name(&mut self.screen, s);
@@ -203,13 +212,14 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
                 self.callbacks.set_window_title(&mut self.screen, s);
             }
             [b"52", ty, data] => {
+                // tmux keeps the allowed selector characters and drops the rest
                 match (
-                    ty.iter().all(|c| CLIPBOARD_SELECTOR.contains(c)),
+                    ty.iter().all(|c| !matches!(c, 0..=0x1f | 0x7f)),
                     *data,
                 ) {
                     (true, b"?") => {
                         self.callbacks
-                            .paste_from_clipboard(&mut self.screen, ty);
+                            .clipboard_query(&mut self.screen, ty, bel_terminated);
                     }
                     (true, data)
                         if data.iter().all(|c| BASE64.contains(c)) =>

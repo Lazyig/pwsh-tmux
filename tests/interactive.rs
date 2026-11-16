@@ -29,7 +29,8 @@ fn readonly_terminal_blocks_keys_paste_mouse_and_shared_resize() {
     t.mouse(0, 1, 1, false);
     t.mouse(0, 1, 1, true);
     // A writable input/output barrier ensures these checks run after the input.
-    // -J: a long shell prompt wraps the command line in the half-width pane.
+    // -J: the echoed command line may wrap in the half-width pane (a shell's ESC k title
+    // used to leave a second copy of it on the screen).
     // (send-keys itself is refused: its target client, the current one, is read-only)
     assert_eq!(ctx.fails(&["send-keys", "-t", "ro", "x"]).trim(), "client is read-only");
     ctx.ok(&["set-buffer", "-b", "barrier", "echo WRITABLE_BARRIER\n"]);

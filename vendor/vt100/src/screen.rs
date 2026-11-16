@@ -107,10 +107,14 @@ pub struct Screen {
 
     last_char: Option<char>,
     scroll_on_clear: bool,
+    allow_alternate: bool,
+    widths: Vec<(u32, u32, u16)>,
+    variation_wide: bool,
 
     /// Cursor saved by entering the alternate screen with DECSET 1049 (tmux's
     /// saved_cx/saved_cy), as (row, col).
     alternate_saved: Option<(u16, u16)>,
+    alternate_saved_attrs: crate::attrs::Attrs,
     /// Tab stops when changed by HTS/TBC; None means one every 8 columns.
     tabs: Option<Vec<bool>>,
 }
@@ -145,13 +149,24 @@ impl Screen {
 
             last_char: None,
             scroll_on_clear: false,
+            allow_alternate: true, widths: Vec::new(), variation_wide: false,
 
             alternate_saved: None,
+            alternate_saved_attrs: crate::attrs::Attrs::default(),
             tabs: None,
         }
     }
 
     /// Preserve cleared normal-screen rows in history, as tmux does.
+    /// Pane policy for DEC alternate-screen modes.
+    pub fn set_alternate_screen_allowed(&mut self, enabled: bool) { self.allow_alternate = enabled; }
+
+    /// Width ranges are applied in order; the last matching entry wins.
+    pub fn set_codepoint_widths(&mut self, widths: Vec<(u32, u32, u16)>, variation_wide: bool) {
+        self.widths = widths; self.variation_wide = variation_wide;
+    }
+
+    /// Scroll existing contents into history when clearing the screen.
     pub fn set_scroll_on_clear(&mut self, enabled: bool) { self.scroll_on_clear = enabled; }
 
     /// The current time (seconds since the epoch) recorded on rows as they
@@ -967,14 +982,38 @@ impl Screen {
         }
     }
 
-    fn enter_alternate_grid(&mut self) {
-        self.grid_mut().set_scrollback(0);
-        self.set_mode(MODE_ALTERNATE_SCREEN);
+    /// screen_write_alternateon: DECSET 47, 1047 and 1049 (`cursor`). The
+    /// alternate screen starts clear with the cursor where it was; nothing
+    /// happens when already there or when alternate-screen is off.
+    fn alternate_on(&mut self, cursor: bool) {
+        if !self.allow_alternate || self.mode(MODE_ALTERNATE_SCREEN) {
+            return;
+        }
+        let pos = self.grid.pos();
+        if cursor {
+            self.alternate_saved = Some((pos.row, pos.col));
+            self.alternate_saved_attrs = self.attrs;
+        }
+        self.grid.set_scrollback(0);
+        self.alternate_grid.clear();
         self.alternate_grid.allocate_rows();
+        self.alternate_grid.set_pos_abs(pos);
+        self.set_mode(MODE_ALTERNATE_SCREEN);
     }
 
-    fn exit_alternate_grid(&mut self) {
+    /// screen_write_alternateoff: DECRST 47, 1047 and 1049 (`cursor`). With
+    /// 1049 the saved cursor comes back even outside the alternate screen.
+    fn alternate_off(&mut self, cursor: bool) {
+        if !self.allow_alternate {
+            return;
+        }
+        let mut pos = self.grid().pos();
+        if let Some((row, col)) = self.alternate_saved.filter(|_| cursor) {
+            pos = crate::grid::Pos { row, col };
+            self.attrs = self.alternate_saved_attrs;
+        }
         self.clear_mode(MODE_ALTERNATE_SCREEN);
+        self.grid.set_pos_abs(pos);
     }
 
     fn save_cursor(&mut self) {
@@ -1046,7 +1085,9 @@ impl Screen {
         let pos = self.grid().pos();
         let size = self.grid().size();
 
-        let width = c.width();
+        // codepoint-widths never applies to 7-bit characters (tmux does not look them up)
+        let width = self.widths.iter().rev().find(|(a, b, _)| !c.is_ascii() && (*a..=*b).contains(&(c as u32)))
+            .map(|(_, _, w)| *w as usize).or_else(|| c.width());
         if width.is_none() && (u32::from(c)) < 256 {
             // don't even try to draw control characters
             return None;
@@ -1289,6 +1330,7 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                 .drawing_cell_mut(base_pos)
                 .unwrap()
                 .set(c, attrs);
+            screen.grid_mut().drawing_cell_mut(base_pos).unwrap().set_wide(width == 2);
             screen.last_char = Some(c);
             screen.grid_mut().col_inc(width);
         } else {
@@ -1325,6 +1367,11 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                 .drawing_cell_mut(base_pos)
                 .unwrap()
                 .append(c);
+            // VS16 makes a narrow base wide only with variation-selector-always-wide on
+            if c == '\u{FE0F}' {
+                let wide = screen.variation_wide || cell_was_wide;
+                screen.grid_mut().drawing_cell_mut(base_pos).unwrap().set_wide(wide);
+            }
             let cell_is_wide =
                 screen.grid().drawing_cell(base_pos).unwrap().is_wide();
             if !cell_was_wide && cell_is_wide {
@@ -1451,9 +1498,19 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
         self.screen.grid_mut().row_dec_scroll(1);
     }
 
+    // ESC # 8
+    pub fn decaln(&mut self) {
+        self.screen.grid_mut().alignment_test();
+    }
+
     // ESC c
     pub fn ris(&mut self) {
         let scroll_on_clear = self.screen.scroll_on_clear;
+        let allow_alternate = self.screen.allow_alternate;
+        let widths = core::mem::take(&mut self.screen.widths);
+        let variation_wide = self.screen.variation_wide;
+        // screen_write_reset keeps the cursor shape (only the mode bits are reset)
+        let cursor_style = self.screen.cursor_style;
         let counters = self.screen.grid.history_counters();
         let now = self.screen.grid.now();
         self.screen = Screen::new(
@@ -1461,6 +1518,10 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
             self.screen.grid.scrollback_capacity(),
         );
         self.screen.scroll_on_clear = scroll_on_clear;
+        self.screen.allow_alternate = allow_alternate;
+        self.screen.widths = widths;
+        self.screen.variation_wide = variation_wide;
+        self.screen.cursor_style = cursor_style;
         self.screen.grid.set_history_counters(counters);
         self.screen.set_time(now);
     }
@@ -1651,7 +1712,7 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                 [9] => screen.set_mouse_mode(MouseProtocolMode::Press),
                 [12] => screen.set_xmode(XMODE_CURSOR_BLINKING | XMODE_CURSOR_BLINKING_SET, true),
                 [25] => screen.clear_mode(MODE_HIDE_CURSOR),
-                [47] => screen.enter_alternate_grid(),
+                [47] | [1047] => screen.alternate_on(false),
                 [1000] => {
                     screen.set_mouse_mode(MouseProtocolMode::PressRelease);
                 }
@@ -1668,15 +1729,7 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                     screen.set_xmode(XMODE_MOUSE_SGR, true);
                     screen.set_mouse_encoding(MouseProtocolEncoding::Sgr);
                 }
-                [1049] => {
-                    if !screen.mode(MODE_ALTERNATE_SCREEN) {
-                        let pos = screen.grid().pos();
-                        screen.alternate_saved = Some((pos.row, pos.col));
-                    }
-                    self.decsc();
-                    self.screen.alternate_grid.clear();
-                    self.screen.enter_alternate_grid();
-                }
+                [1049] => screen.alternate_on(true),
                 [2004] => screen.set_mode(MODE_BRACKETED_PASTE),
                 [2026] => screen.set_xmode(XMODE_SYNC, true),
                 [2031] => screen.set_xmode(XMODE_THEME_UPDATES, true),
@@ -1703,9 +1756,7 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                     screen.set_xmode(XMODE_CURSOR_BLINKING_SET, true);
                 }
                 [25] => screen.set_mode(MODE_HIDE_CURSOR),
-                [47] => {
-                    screen.exit_alternate_grid();
-                }
+                [47] | [1047] => screen.alternate_off(false),
                 [1000] => {
                     screen.clear_mouse_mode(MouseProtocolMode::PressRelease);
                 }
@@ -1724,10 +1775,7 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                     screen.set_xmode(XMODE_MOUSE_SGR, false);
                     screen.clear_mouse_encoding(MouseProtocolEncoding::Sgr);
                 }
-                [1049] => {
-                    screen.exit_alternate_grid();
-                    self.decrc();
-                }
+                [1049] => screen.alternate_off(true),
                 [2004] => screen.clear_mode(MODE_BRACKETED_PASTE),
                 [2026] => screen.set_xmode(XMODE_SYNC, false),
                 [2031] => screen.set_xmode(XMODE_THEME_UPDATES, false),

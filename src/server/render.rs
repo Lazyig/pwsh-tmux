@@ -6,13 +6,27 @@ use super::*;
 use crate::cells::{Cell, Color, Line, Style, BLINK, BOLD, DIM, INVERSE, ITALIC, STRIKE, UNDERLINE};
 use crate::format::{self, Span};
 use std::fmt::Write as _;
-use unicode_width::UnicodeWidthChar;
+use crate::width::char_width;
+
+/// tty_check_codeset for a client without UTF-8: line drawing goes through the ACS charset and
+/// anything else becomes one underscore per column the cell takes (`wide`: two columns, as
+/// for a character made wide by VS16).
+pub(super) fn non_utf8_text(text: &str, wide: bool) -> String {
+    const ACS: &[(char, u8)] = &[('\u{b7}', b'~'), ('\u{2500}', b'q'), ('\u{2501}', b'q'), ('\u{2502}', b'x'), ('\u{2503}', b'x'), ('\u{250c}', b'l'), ('\u{250f}', b'k'), ('\u{2510}', b'k'), ('\u{2513}', b'l'), ('\u{2514}', b'm'), ('\u{2517}', b'm'), ('\u{2518}', b'j'), ('\u{251b}', b'j'), ('\u{251c}', b't'), ('\u{2523}', b't'), ('\u{2524}', b'u'), ('\u{252b}', b'u'), ('\u{2533}', b'w'), ('\u{2534}', b'v'), ('\u{253b}', b'v'), ('\u{253c}', b'n'), ('\u{254b}', b'n'), ('\u{2550}', b'q'), ('\u{2551}', b'x'), ('\u{2554}', b'l'), ('\u{2557}', b'k'), ('\u{255a}', b'm'), ('\u{255d}', b'j'), ('\u{2560}', b't'), ('\u{2563}', b'u'), ('\u{2566}', b'w'), ('\u{2569}', b'v'), ('\u{256c}', b'n')];
+    let mut chars = text.chars();
+    if let (Some(ch), None) = (chars.next(), chars.next()) {
+        if let Some((_, acs)) = ACS.iter().find(|(c, _)| *c == ch) {
+            return format!("\x1b(0{}\x1b(B", *acs as char);
+        }
+    }
+    "_".repeat(1 + wide as usize)
+}
 
 // ConPTY counts decomposed accents as extra columns. Compose when Windows can do
 // so, and retain the original text if the platform cannot normalize it.
 fn terminal_text(text: &str) -> std::borrow::Cow<'_, str> {
     #[cfg(windows)]
-    if text.chars().any(|c| c.width() == Some(0)) {
+    if text.chars().any(|c| char_width(c) == Some(0)) {
         use windows_sys::Win32::Globalization::{NormalizeString, NormalizationC};
         let source: Vec<u16> = text.encode_utf16().collect();
         let needed = unsafe { NormalizeString(NormalizationC, source.as_ptr(), source.len() as i32, std::ptr::null_mut(), 0) };
@@ -42,7 +56,7 @@ impl Frame {
             if self.cells[i].text.is_empty() && x > 0 {
                 self.cells[i - 1] = Cell { text: " ".into(), style: self.cells[i - 1].style };
             }
-            if !cell.text.is_empty() && x + 1 < self.w && self.cells[i + 1].text.is_empty() && self.cells[i].text.chars().next().and_then(|c| c.width()) == Some(2) {
+            if !cell.text.is_empty() && x + 1 < self.w && self.cells[i + 1].text.is_empty() && self.cells[i].text.chars().next().and_then(|c| char_width(c)) == Some(2) {
                 self.cells[i + 1] = Cell { text: " ".into(), style: self.cells[i + 1].style };
             }
             self.cells[i] = cell;
@@ -59,7 +73,7 @@ impl Frame {
     pub fn text(&mut self, mut x: u16, y: u16, text: &str, style: Style, limit: u16) -> u16 {
         let start = x;
         for ch in text.chars() {
-            let cw = ch.width().unwrap_or(0) as u16;
+            let cw = char_width(ch).unwrap_or(0) as u16;
             if cw == 0 {
                 if x > start && y < self.h {
                     let mut previous = x - 1;
@@ -94,6 +108,8 @@ pub struct Modes {
     pub mouse: u16,
     pub focus: bool,
     pub cursor_style: u8,
+    pub cursor_colour: Option<vt100::Color>,
+    pub appesc: bool,
     /// modifyOtherKeys level requested from the outer terminal (extended-keys).
     pub extkeys: u8,
 }
@@ -395,14 +411,15 @@ impl Server {
         }
         // a wide char cut by a region boundary
         for i in 0..width {
-            if line[i].text.is_empty() && (i == 0 || line[i - 1].text.chars().next().and_then(|c| c.width()) != Some(2)) {
+            if line[i].text.is_empty() && (i == 0 || line[i - 1].text.chars().next().and_then(|c| char_width(c)) != Some(2)) {
                 line[i].text = " ".into();
             }
         }
         (line, tags)
     }
 
-    fn compose(&self, cid: ClientId) -> Option<RenderState> {
+    pub(super) fn compose(&self, cid: ClientId) -> Option<RenderState> {
+        let _widths = self.width_context();
         let c = self.clients.get(&cid)?;
         let sid = c.session?;
         let s = self.sessions.get(&sid)?;
@@ -490,7 +507,10 @@ impl Server {
                         let scr = p.screen();
                         modes.app_cursor = scr.application_cursor();
                         modes.bracketed_paste = scr.bracketed_paste();
-                        modes.cursor_style = scr.cursor_style() as u8;
+                        modes.cursor_style = merged_cursor_style(scr.cursor_style() as u8, scr.cursor_blinking(), features::cursor_style(&self.opt_pane(*id, "cursor-style")));
+                        let colour = p.parser.callbacks().osc.cursor_colour.clone().unwrap_or_else(|| self.opt_pane(*id, "cursor-colour"));
+                        // a colour option, not a format (OPTIONS_TABLE_IS_COLOUR)
+                        modes.cursor_colour = format::parse_color(&colour).filter(|c| *c != vt100::Color::Default);
                         if !scr.hide_cursor() {
                             let (cy, cx) = scr.cursor_position();
                             if cx < cr.w && cy < cr.h {
@@ -718,7 +738,7 @@ impl Server {
             let mut x = lx;
             let mut col = 0u16;
             for ch in input.chars() {
-                let w = ch.width().unwrap_or(0) as u16;
+                let w = char_width(ch).unwrap_or(0) as u16;
                 if col >= skip {
                     if x + w > cw {
                         break;
@@ -741,12 +761,21 @@ impl Server {
             f.text(0, my, msg, st, cw);
         }
 
+        if let Some(pr) = &c.prompt {
+            let command = pr.command_mode;
+            let prefix = if command { "prompt-command-cursor" } else { "prompt-cursor" };
+            modes.cursor_style = features::cursor_style(&self.opt_session(Some(sid), &format!("{prefix}-style")));
+            modes.cursor_colour = format::parse_color(&self.opt_session(Some(sid), &format!("{prefix}-colour"))).filter(|c| *c != vt100::Color::Default);
+        }
+        modes.appesc = c.features.has("appesc");
+        if self.opt_session_on(Some(sid), "mouse") && self.opt_session_on(Some(sid), "focus-follows-mouse") { modes.mouse = 1003; }
         modes.app_cursor = true;
         modes.bracketed_paste = c.features.has("bpaste");
         Some(RenderState { frame: f, cursor, modes, status_ranges })
     }
 
     pub fn render(&mut self, cid: ClientId) {
+        let _widths = self.width_context();
         let Some(next) = self.compose(cid) else { return };
         // window title
         let mut title_update = None;
@@ -772,15 +801,8 @@ impl Server {
             next.modes.mouse = 0;
         }
         next.modes.focus &= feats.has("focus");
-        next.modes.extkeys = if feats.has("extkeys") {
-            match ext_keys.as_str() {
-                "always" => 2,
-                "on" => 1,
-                _ => 0,
-            }
-        } else {
-            0
-        };
+        // tty_update_features sends Eneks for both on and always
+        next.modes.extkeys = (feats.has("extkeys") && ext_keys != "off") as u8;
         c.dirty = false;
         c.status_ranges = next.status_ranges.clone();
         let prev = c.prev.as_ref().filter(|p| p.frame.w == next.frame.w && p.frame.h == next.frame.h);
@@ -810,9 +832,10 @@ impl Server {
                     push_sgr(&mut out, &fit_style(cell.style, &feats));
                     cur = Some(cell.style);
                 }
-                out.push_str(&terminal_text(&cell.text));
-                if cfg!(windows) && cell.text.chars().any(|c| c.width() == Some(0)) {
-                    let width = cell.text.chars().filter_map(|c| c.width()).sum::<usize>();
+                if c.utf8() || cell.text.is_ascii() { out.push_str(&terminal_text(&cell.text)); }
+                else { out.push_str(&non_utf8_text(&cell.text, row.get(x + 1).is_some_and(|n| n.text.is_empty()))); }
+                if cfg!(windows) && cell.text.chars().any(|c| char_width(c) == Some(0)) {
+                    let width = cell.text.chars().filter_map(|c| char_width(c)).sum::<usize>();
                     if x + width < next.frame.w as usize { let _ = write!(out, "\x1b[{};{}H", y + 1, x + width + 1); }
                 }
             }
@@ -828,7 +851,8 @@ impl Server {
         let modes_changed = pm != Some(next.modes);
         let cursor_changed = prev.is_none_or(|p| p.cursor != next.cursor);
         if let Some(t) = title_update {
-            let _ = write!(out, "\x1b]2;{}\x07", t);
+            // tty_set_title: tsl and fsl, from the title feature unless overridden
+            let _ = write!(out, "{}{}{}", features::string_capability(&c.term_caps, "tsl", "\x1b]0;", &[]), t, features::string_capability(&c.term_caps, "fsl", "\x07", &[]));
             c.title = t;
             changed = true;
         }
@@ -841,23 +865,38 @@ impl Server {
         if modes_changed {
             let m = next.modes;
             out.push_str(if m.app_cursor { "\x1b[?1h" } else { "\x1b[?1l" });
-            out.push_str(if m.bracketed_paste { "\x1b[?2004h" } else { "\x1b[?2004l" });
+            out.push_str(&features::string_capability(&c.term_caps, if m.bracketed_paste { "Enbp" } else { "Dsbp" }, if m.bracketed_paste { "\x1b[?2004h" } else { "\x1b[?2004l" }, &[]));
             out.push_str(match m.mouse {
                 0 => "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l",
                 1000 => "\x1b[?1003l\x1b[?1002l\x1b[?1000h\x1b[?1006h",
                 1002 => "\x1b[?1003l\x1b[?1000h\x1b[?1002h\x1b[?1006h",
                 _ => "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h",
             });
-            out.push_str(if m.focus { "\x1b[?1004h" } else { "\x1b[?1004l" });
-            if feats.has("cstyle") {
-                let _ = write!(out, "\x1b[{} q", m.cursor_style);
+            out.push_str(&features::string_capability(&c.term_caps, if m.focus { "Enfcs" } else { "Dsfcs" }, if m.focus { "\x1b[?1004h" } else { "\x1b[?1004l" }, &[]));
+            // tty_force_cursor_colour: Cs with rgb:RR/GG/BB (colour_force_rgb), Cr back to the
+            // default, each only when the colour the terminal has changes
+            let colour = m.cursor_colour.and_then(features::colour_force_rgb);
+            if feats.has("ccolour") && colour != c.input_state.tty_ccolour {
+                match colour {
+                    Some((r, g, b)) => out.push_str(&features::string_capability(&c.term_caps, "Cs", "\x1b]12;%p1%s\x07", &[&format!("rgb:{r:02x}/{g:02x}/{b:02x}")])),
+                    None => out.push_str(&features::string_capability(&c.term_caps, "Cr", "\x1b]112\x07", &[])),
+                }
+                c.input_state.tty_ccolour = colour;
             }
+            // tty_update_cursor: the style when it changes, and a set style again on a full
+            // redraw (tty_invalidate resets the cursor modes)
+            if feats.has("cstyle") && (m.cursor_style != c.input_state.tty_cstyle || (pm.is_none() && m.cursor_style != 0)) {
+                out.push_str(&features::cursor_sequence(&c.term_caps, m.cursor_style));
+                c.input_state.tty_cstyle = m.cursor_style;
+            }
+            if pm.is_none_or(|p| p.appesc != m.appesc) && (m.appesc || pm.is_some_and(|p| p.appesc)) { out.push_str(&features::string_capability(&c.term_caps, if m.appesc { "Enesc" } else { "Dsesc" }, if m.appesc { "\x1b[?7727h" } else { "\x1b[?7727l" }, &[])); }
+            c.input_state.tty_appesc = m.appesc;
             if pm.map_or(0, |p| p.extkeys) != m.extkeys {
                 // modifyOtherKeys: have the terminal report keys like C-Enter distinctly
-                out.push_str(match m.extkeys {
-                    2 => "\x1b[>4;2m",
-                    1 => "\x1b[>4;1m",
-                    _ => "\x1b[>4m",
+                out.push_str(&if m.extkeys != 0 {
+                    features::string_capability(&c.term_caps, "Eneks", "\x1b[>4;2m", &[])
+                } else {
+                    features::string_capability(&c.term_caps, "Dseks", "\x1b[>4m", &[])
                 });
             }
         }
@@ -871,5 +910,17 @@ impl Server {
         }
         c.send(S_OUTPUT, out.as_bytes());
         c.prev = Some(next);
+    }
+}
+
+/// The DECSCUSR style tmux sends (tty_update_cursor): the shape set by the application, or
+/// the cursor-style option's when it set none, blinking as CSI ? 12 h/l or the last
+/// DECSCUSR left it; with neither, the option's own blinking.
+pub(super) fn merged_cursor_style(app: u8, (blinking, blinking_set): (bool, bool), option: u8) -> u8 {
+    let with_blink = |style: u8| if style == 0 { 0 } else { (style + 1) / 2 * 2 - blinking as u8 };
+    match app {
+        0 if !blinking_set => option,
+        0 => with_blink(option),
+        n => with_blink(n),
     }
 }
