@@ -96,7 +96,8 @@ impl Server {
         // a read-only client cannot prompt or run other commands from copy mode
         if let (Some(cmd), Some(c), false) = (&binding, cid, pending) {
             if self.client_is_readonly(cid) && !binding_allowed_readonly(cmd) {
-                self.set_message(c, "client is read-only");
+                // key_bindings_dispatch: cmdq_error, which capitalizes a client's message
+                self.set_message(c, "Client is read-only");
                 return;
             }
         }
