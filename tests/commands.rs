@@ -3179,6 +3179,26 @@ fn run_shell_target_that_fails_prints_and_view_output_is_parsed() {
     assert_eq!(cap.lines().filter(|l| !l.is_empty()).collect::<Vec<_>>(), ["Xbc", "123Y5", "red"]);
 }
 
+#[test]
+fn resize_window_is_never_smaller_than_the_layout() {
+    // resize_window: the window can be no smaller than the layout (one cell a pane and
+    // one a separator), zoomed or not
+    let ctx = Ctx::new("resizemin");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "80", "-y", "24"]);
+    ctx.ok(&["split-window", "-h", "-d", "-t", "s:0.0"]);
+    ctx.ok(&["split-window", "-h", "-d", "-t", "s:0.0"]);
+    ctx.ok(&["split-window", "-v", "-d", "-t", "s:0.0"]);
+    let panes = || ctx.ok(&["list-panes", "-t", "s:0", "-F", "#{pane_width}x#{pane_height}@#{pane_left},#{pane_top}"]);
+    ctx.ok(&["resize-window", "-t", "s:0", "-x", "1", "-y", "1"]);
+    assert_eq!(ctx.fmt("s:0", "#{window_width}x#{window_height}"), "5x3");
+    assert_eq!(panes(), "1x1@0,0\n1x1@0,2\n1x3@2,0\n1x3@4,0\n");
+    ctx.ok(&["resize-window", "-t", "s:0", "-x", "4", "-y", "3"]);
+    assert_eq!(ctx.fmt("s:0", "#{window_width}x#{window_height}"), "5x3");
+    ctx.ok(&["resize-pane", "-Z", "-t", "s:0.0"]);
+    ctx.ok(&["resize-window", "-t", "s:0", "-x", "2", "-y", "2"]);
+    assert_eq!(ctx.fmt("s:0", "#{window_width}x#{window_height} #{window_zoomed_flag}"), "5x3 1");
+}
+
 #[cfg(unix)]
 #[test]
 fn spawn_directories_fall_back_to_home_and_resolve() {

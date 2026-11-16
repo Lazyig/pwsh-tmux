@@ -75,6 +75,16 @@ fn split_len(total: u16, ratio: f32) -> (u16, u16) {
     (a, avail - a)
 }
 
+/// split_len, moved so that each side keeps the room its own panes need when it fits.
+fn split_len_min(total: u16, ratio: f32, min_a: u16, min_b: u16) -> (u16, u16) {
+    let (a, b) = split_len(total, ratio);
+    if b == 0 || (a >= min_a && b >= min_b) || min_a as u32 + min_b as u32 + 1 > total as u32 {
+        return (a, b);
+    }
+    let a = a.clamp(min_a, total - 1 - min_b);
+    (a, total - 1 - a)
+}
+
 impl Node {
     pub fn panes(&self) -> Vec<PaneId> {
         let mut out = Vec::new();
@@ -115,6 +125,21 @@ impl Node {
     }
 
     /// tmux `layout_cell_is_tiled || layout_cell_has_tiled_child`.
+    /// The smallest size the tiled panes fit in, one cell each and one per separator
+    /// (layout_resize_check's PANE_MINIMUM): a window is never smaller than this.
+    pub fn min_size(&self) -> (u16, u16) {
+        match self {
+            Node::Leaf(_) | Node::Float(..) => (1, 1),
+            Node::Split { a, b, .. } if !(a.has_tiled() && b.has_tiled()) => {
+                if a.has_tiled() { a.min_size() } else if b.has_tiled() { b.min_size() } else { (1, 1) }
+            }
+            Node::Split { horizontal, a, b, .. } => {
+                let ((aw, ah), (bw, bh)) = (a.min_size(), b.min_size());
+                if *horizontal { (aw.saturating_add(bw).saturating_add(1), ah.max(bh)) } else { (aw.max(bw), ah.saturating_add(bh).saturating_add(1)) }
+            }
+        }
+    }
+
     pub fn has_tiled(&self) -> bool {
         match self {
             Node::Leaf(_) => true,
@@ -209,7 +234,7 @@ impl Node {
             Node::Leaf(p) => panes.push((*p, r)),
             Node::Float(..) => {}
             Node::Split { horizontal: true, ratio, a, b } => {
-                let (wa, wb) = split_len(r.w, *ratio);
+                let (wa, wb) = split_len_min(r.w, *ratio, a.min_size().0, b.min_size().0);
                 a.layout(Rect { w: wa, ..r }, panes, seps);
                 if wb > 0 {
                     seps.push(Sep { vertical: true, x: r.x + wa, y: r.y, len: r.h });
@@ -219,7 +244,7 @@ impl Node {
                 }
             }
             Node::Split { horizontal: false, ratio, a, b } => {
-                let (ha, hb) = split_len(r.h, *ratio);
+                let (ha, hb) = split_len_min(r.h, *ratio, a.min_size().1, b.min_size().1);
                 a.layout(Rect { h: ha, ..r }, panes, seps);
                 if hb > 0 {
                     seps.push(Sep { vertical: false, x: r.x, y: r.y + ha, len: r.w });
@@ -277,7 +302,8 @@ impl Node {
             Node::Split { a, b, .. } if !b.has_tiled() => a.resize_inner(target, dir, cells, r),
             Node::Split { horizontal, ratio, a, b } => {
                 let total = if *horizontal { r.w } else { r.h };
-                let (la, _) = split_len(total, *ratio);
+                let (ma, mb) = (a.min_size(), b.min_size());
+                let (la, _) = if *horizontal { split_len_min(total, *ratio, ma.0, mb.0) } else { split_len_min(total, *ratio, ma.1, mb.1) };
                 let (ra, rb) = if *horizontal {
                     (Rect { w: la, ..r }, Rect { x: r.x + la + 1, w: total.saturating_sub(la + 1), ..r })
                 } else {
@@ -357,13 +383,13 @@ fn exact_ratio(a: u16, b: u16) -> f32 {
 }
 
 /// Split `r` along the axis exactly like `Node::layout` does.
-fn child_rects(horizontal: bool, ratio: f32, r: Rect) -> (Rect, Rect) {
+fn child_rects(horizontal: bool, ratio: f32, a: &Node, b: &Node, r: Rect) -> (Rect, Rect) {
     if horizontal {
-        let (wa, wb) = split_len(r.w, ratio);
+        let (wa, wb) = split_len_min(r.w, ratio, a.min_size().0, b.min_size().0);
         let rb = if wb > 0 { Rect { x: r.x + wa + 1, w: wb, ..r } } else { Rect { w: 0, ..r } };
         (Rect { w: wa, ..r }, rb)
     } else {
-        let (ha, hb) = split_len(r.h, ratio);
+        let (ha, hb) = split_len_min(r.h, ratio, a.min_size().1, b.min_size().1);
         let rb = if hb > 0 { Rect { y: r.y + ha + 1, h: hb, ..r } } else { Rect { h: 0, ..r } };
         (Rect { h: ha, ..r }, rb)
     }
@@ -371,7 +397,7 @@ fn child_rects(horizontal: bool, ratio: f32, r: Rect) -> (Rect, Rect) {
 
 /// [`child_rects`] for a split whose side without tiled panes takes no space.
 fn tiled_rects(horizontal: bool, ratio: f32, a: &Node, b: &Node, r: Rect) -> (Rect, Rect) {
-    if a.has_tiled() && b.has_tiled() { child_rects(horizontal, ratio, r) } else { (r, r) }
+    if a.has_tiled() && b.has_tiled() { child_rects(horizontal, ratio, a, b, r) } else { (r, r) }
 }
 
 fn along(horizontal: bool, r: Rect) -> u16 {
@@ -1656,6 +1682,20 @@ fn resize_in_group(sizes: &mut [u16], i: usize, want: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn min_size_keeps_every_pane_a_cell() {
+        // a window never gets smaller than this, and each side of a split keeps what
+        // its own panes need when the total allows it
+        let inner = Node::Split { horizontal: false, ratio: 0.5, a: Box::new(Node::Leaf(0)), b: Box::new(Node::Leaf(3)) };
+        let right = Node::Split { horizontal: true, ratio: 0.5, a: Box::new(Node::Leaf(2)), b: Box::new(Node::Leaf(1)) };
+        let root = Node::Split { horizontal: true, ratio: 0.5, a: Box::new(inner), b: Box::new(right) };
+        assert_eq!(root.min_size(), (5, 3));
+        let (mut panes, mut seps) = (vec![], vec![]);
+        root.layout(Rect { x: 0, y: 0, w: 5, h: 3 }, &mut panes, &mut seps);
+        let got: Vec<_> = panes.iter().map(|(p, r)| (*p, r.x, r.y, r.w, r.h)).collect();
+        assert_eq!(got, vec![(0, 0, 0, 1, 1), (3, 0, 2, 1, 1), (2, 2, 0, 1, 3), (1, 4, 0, 1, 3)]);
+    }
 
     fn full() -> Rect {
         Rect { x: 0, y: 0, w: 81, h: 24 }

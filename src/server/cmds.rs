@@ -1244,6 +1244,17 @@ impl Server {
         }
     }
 
+    /// cmd_select_window: the session's current window gets the client that ran the
+    /// command as its latest (if that client has a session), then recalculate_sizes.
+    fn select_window_latest(&mut self, ctx: &Ctx, sid: SessId) {
+        if let Some(c) = ctx.client.filter(|c| self.client_session(*c).is_some()) {
+            if let Some((_, wid)) = self.session_window(sid) {
+                self.ev.latest.insert(wid, c);
+            }
+        }
+        self.update_session_size(sid);
+    }
+
     /// server_client_get_cwd: a command client without a session (the CLI) gives its own
     /// directory, else the target session's, else the client's session's, else home.
     pub fn client_cwd(&self, ctx: &Ctx, sid: Option<SessId>) -> String {
@@ -1971,7 +1982,10 @@ impl Server {
                     if let Some(n) = o.get('n') {
                         let existing = self.sessions[&sid].links.iter().find(|(_, w)| self.windows[w].name == n).map(|(i, _)| *i);
                         if let Some(i) = existing {
-                            self.select_window(sid, i);
+                            if !o.has('d') {
+                                self.select_window(sid, i);
+                                self.select_window_latest(ctx, sid);
+                            }
                             return Ok(Flow::Next);
                         }
                     }
@@ -1988,6 +2002,10 @@ impl Server {
                 let wid = self.new_window_obj(wname, pane, sx, sy);
                 if name.is_some() {
                     self.windows.get_mut(&wid).unwrap().options.set("automatic-rename", "off".into());
+                }
+                // spawn_window: its latest client is the target client
+                if let Some(tc) = self.resolve_client(ctx, None).ok().filter(|c| self.client_session(*c).is_some()) {
+                    self.ev.latest.insert(wid, tc);
                 }
                 self.link(sid, idx, wid, !o.has('d') || replaced.is_some_and(|_| self.sessions[&sid].active == idx));
                 if let Some(old) = replaced {
@@ -2183,6 +2201,7 @@ impl Server {
                         self.switch_client(c, sid);
                     }
                 }
+                self.select_window_latest(ctx, sid);
                 Ok(Flow::Next)
             }
             "find-window" => {
@@ -2421,8 +2440,10 @@ impl Server {
                 let w = self.windows.get_mut(&wid).unwrap();
                 w.options.set("window-size", "manual".into());
                 w.new_size = None;
-                w.sx = sx;
-                w.sy = sy;
+                // it can be no smaller than the layout
+                let (mw, mh) = w.layout.min_size();
+                w.sx = sx.max(mw);
+                w.sy = sy.max(mh);
                 self.clamp_floats(wid);
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
@@ -4686,7 +4707,7 @@ impl Server {
         }
         // side effects
         match name.as_str() {
-            "status" | "status-position" | "pane-border-status" | "window-size" | "pane-scrollbars" | "pane-scrollbars-style" | "pane-scrollbars-position" => {
+            "status" | "status-position" | "pane-border-status" | "window-size" | "aggressive-resize" | "pane-scrollbars" | "pane-scrollbars-style" | "pane-scrollbars-position" => {
                 let sids: Vec<SessId> = self.sessions.keys().copied().collect();
                 for s in sids {
                     self.update_session_size(s);

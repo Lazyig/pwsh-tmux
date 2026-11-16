@@ -210,6 +210,38 @@ fn attach_resizes_only_the_current_window() {
 }
 
 #[test]
+fn window_sizes_are_chosen_per_window() {
+    // recalculate_size: each window from the clients whose session has it; with
+    // aggressive-resize only those whose current window it is; latest takes the
+    // window's own latest client (w->latest) and leaves the size when it has none
+    let ctx = Ctx::new("perwinsize");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "120", "-y", "30"]);
+    ctx.ok(&["new-window", "-d", "-t", "s:1"]);
+    ctx.ok(&["new-window", "-d", "-t", "s:2"]);
+    ctx.ok(&["new-session", "-d", "-s", "g", "-t", "s"]);
+    ctx.ok(&["set", "-g", "status", "off"]);
+    let size = |t: &str| ctx.fmt(t, "#{window_width}x#{window_height}");
+    let a = Term::attach(&ctx, &["attach", "-t", "s"], 90, 20);
+    wait_for("s:0 sized for a", || size("s:0") == "90x20");
+    ctx.ok(&["select-window", "-t", "g:2"]);
+    ctx.ok(&["set", "-g", "aggressive-resize", "on"]);
+    let b = Term::attach(&ctx, &["attach", "-t", "g"], 50, 10);
+    wait_for("g:2 sized for b", || size("s:2") == "50x10");
+    assert_eq!(size("s:0"), "90x20");
+    // the option changes recalculate: both clients have window 2 again
+    ctx.ok(&["set", "-g", "window-size", "largest"]);
+    ctx.ok(&["set", "-g", "aggressive-resize", "off"]);
+    wait_for("s:2 largest", || size("s:2") == "90x20");
+    // latest with two clients and no latest client for window 1: it keeps the size it
+    // was given while only a was attached
+    ctx.ok(&["set", "-g", "window-size", "latest"]);
+    ctx.ok(&["select-window", "-t", "s:1"]);
+    wait_for("s:1 shown", || size("s:1") == "90x20");
+    drop(b);
+    drop(a);
+}
+
+#[test]
 fn tree_panes_and_clock() {
     let ctx = Ctx::new("tree");
     let t = start(&ctx, "one");
