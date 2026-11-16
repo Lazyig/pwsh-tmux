@@ -194,10 +194,7 @@ fn parse_args(full: &str, args: &[String]) -> Result<Opts, String> {
 /// args_print does, { } blocks kept as command lists, commands joined by " ; ".
 pub(super) fn command_list_string(v: &str, aliases: &[String]) -> Result<String, String> {
     // errors of a string parse have no file:line prefix
-    let cmds = cmdparse::parse_blocks(v).map_err(|e| match e.split_once(": ") {
-        Some((l, rest)) if l.starts_with("line ") => rest.to_string(),
-        _ => e,
-    })?;
+    let cmds = cmdparse::parse_blocks(v)?;
     let mut out = Vec::new();
     for c in cmds {
         out.extend(print_parsed_command(c, aliases, true)?);
@@ -4061,8 +4058,9 @@ impl Server {
                     let pat = if o.has('F') { self.expand(self.current(ctx), ctx.client, pat) } else { pat.clone() };
                     let path = self.resolve_path(ctx, &pat);
                     let files = glob_files(&path);
+                    // cmdq_error(item, "%s: %s", strerror(ENOENT), path): the path as given
                     if files.is_empty() && !o.has('q') {
-                        return err(format!("{path}: No such file or directory"));
+                        return err(format!("No such file or directory: {pat}"));
                     }
                     for f in files {
                         let text = match std::fs::read_to_string(&f) {
@@ -4071,7 +4069,7 @@ impl Server {
                                 let _ = e;
                                 continue;
                             }
-                            Err(e) => return err(format!("{f}: {e}")),
+                            Err(e) => return err(format!("{}: {f}", strerror(&e))),
                         };
                         // #{current_file} is this file while its %if lines are evaluated
                         let saved_file = self.cur_file.replace(f.clone());
@@ -5169,6 +5167,12 @@ pub fn buffer_vars(b: &Buffer) -> HashMap<String, String> {
         ("buffer_sample".to_string(), sample),
         ("buffer_created".to_string(), b.created.to_string()),
     ])
+}
+
+/// strerror(3) text for an I/O error (without Rust's " (os error N)").
+fn strerror(e: &std::io::Error) -> String {
+    let s = e.to_string();
+    s.split(" (os error").next().unwrap_or(&s).to_string()
 }
 
 fn glob_files(path: &str) -> Vec<String> {

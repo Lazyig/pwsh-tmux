@@ -2999,3 +2999,36 @@ fn command_line_semicolons_split_like_cmd_parse_from_arguments() {
     assert_eq!(ctx.ok(&["display", "-p", "\\;"]), ";\n");
     assert_eq!(ctx.ok(&["display", "-p", "a;", "display", "-p", "b"]), "a\nb\n");
 }
+
+#[test]
+fn parse_errors_are_yacc_syntax_errors() {
+    let ctx = Ctx::new("wq-parse-err");
+    ctx.ok(&["new-session", "-d", "-s", "s", "sleep 100"]);
+    let dir = std::env::temp_dir().join(format!("{}-conf", ctx.socket));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = |name: &str, text: &str| {
+        let p = dir.join(name);
+        std::fs::write(&p, text).unwrap();
+        p.to_string_lossy().into_owned()
+    };
+    // file:N: as cmd_parse_get_error makes it, N the line the parser reached
+    for (text, line) in [("if -F 1 { display a\n", 2), ("display a }\n", 1), ("%if\n", 1), ("%if 1\ndisplay a\n", 3), ("x\n%else\n", 2)] {
+        let f = file("e.conf", text);
+        assert_eq!(ctx.fails(&["source-file", &f]).trim_end(), format!("{f}:{line}: syntax error"), "{text:?}");
+    }
+    let f = file("e.conf", "set -g @x 1 2 3\n");
+    assert_eq!(ctx.fails(&["source-file", &f]).trim_end(), format!("{f}:1: command set-option: too many arguments (need at most 2)"));
+    // a quote left open at the end of the file ends there
+    let f = file("q.conf", "bind q display \"a\n");
+    ctx.ok(&["source-file", &f]);
+    assert_eq!(ctx.ok(&["list-keys", "-T", "prefix", "q"]).trim_end(), "bind-key  -T prefix q display-message a\\n");
+    // a string has no line
+    assert_eq!(ctx.fails(&["bind", "-n", "F11", "if -F 1 { display a"]).trim_end(), "syntax error");
+    ctx.ok(&["bind", "-n", "F11", "display \"abc"]);
+    assert_eq!(ctx.ok(&["list-keys", "-T", "root", "F11"]).trim_end(), "bind-key  -T root F11 display-message abc");
+    // source-file: strerror first, then the path as given
+    assert_eq!(ctx.fails(&["source-file", "/nonexistent-wq.conf"]).trim_end(), "No such file or directory: /nonexistent-wq.conf");
+    assert_eq!(ctx.fails(&["source-file", "nonexistent-wq.conf"]).trim_end(), "No such file or directory: nonexistent-wq.conf");
+    ctx.ok(&["source-file", "-q", "nonexistent-wq.conf"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

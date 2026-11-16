@@ -26,10 +26,20 @@ pub fn parse_with(input: &str, cond: &dyn Fn(&str) -> bool) -> Result<Vec<Vec<St
 /// later `${NAME}` in the same file sees it (the `set-environment` commands are still
 /// returned so the server's environment ends up the same).
 pub fn parse_with_env(input: &str, cond: &dyn Fn(&str) -> bool, env: &dyn Fn(&str) -> Option<String>) -> Result<Vec<Vec<String>>, String> {
-    parse_with_env_lines(input, cond, env).map(|(cmds, _)| cmds)
+    parse_with_env_lines(input, cond, env).map(|(cmds, _)| cmds).map_err(bare)
 }
 
-/// Like [`parse_with_env`], also giving the line each command starts on.
+/// A parse error without its line number: what cmd_parse_from_string reports (there is
+/// no file, so cmd_parse_get_error adds nothing).
+fn bare(e: String) -> String {
+    match e.split_once(": ") {
+        Some((n, m)) if n.parse::<usize>().is_ok() => m.to_string(),
+        _ => e,
+    }
+}
+
+/// Like [`parse_with_env`], also giving the line each command starts on. An error is
+/// "N: message" (the line the parser had reached), so a file's errors read "file:N: ...".
 pub fn parse_with_env_lines(input: &str, cond: &dyn Fn(&str) -> bool, env: &dyn Fn(&str) -> Option<String>) -> Result<(Vec<Vec<String>>, Vec<usize>), String> {
     let normalized = input.replace("\r\n", "\n");
     let mut lx = Lexer {
@@ -72,7 +82,7 @@ pub fn parse_blocks(input: &str) -> Result<Vec<Vec<(String, bool)>>, String> {
         braces: Vec::new(),
         lines: Vec::new(),
     };
-    let cmds = lx.run(&|c: &str| !c.is_empty() && c != "0")?;
+    let cmds = lx.run(&|c: &str| !c.is_empty() && c != "0").map_err(bare)?;
     let mut out: Vec<Vec<(String, bool)>> = cmds.into_iter().map(|c| c.into_iter().map(|w| (w, false)).collect()).collect();
     for (c, w) in lx.braces {
         out[c][w].1 = true;
@@ -234,7 +244,12 @@ impl Lexer<'_> {
     }
 
     fn err(&self, line: usize, msg: &str) -> String {
-        format!("line {line}: {msg}")
+        format!("{line}: {msg}")
+    }
+
+    /// yacc's "syntax error" at the line the lexer has reached.
+    fn syntax(&self) -> String {
+        self.err(self.line, "syntax error")
     }
 
     /// Skip spaces, tabs and backslash-newline continuations.
@@ -289,10 +304,13 @@ impl Lexer<'_> {
                     self.skip_comment();
                     continue;
                 }
-                '%' if line_start && cur.is_empty() => {
+                // a word of only % and digits is a token, not a condition
+                '%' if line_start && cur.is_empty() && !self.percent_token() => {
                     self.directive(&mut stack, &mut cmds, cond)?;
                     continue;
                 }
+                // a } that closes no block
+                '}' => return Err(self.syntax()),
                 '{' => {
                     let body = self.read_brace()?;
                     cur.push((body, false, true));
@@ -319,10 +337,16 @@ impl Lexer<'_> {
         while self.lines.len() < cmds.len() {
             self.lines.push(start);
         }
+        // %if without %endif
         if !stack.is_empty() {
-            return Err(self.err(self.line, "missing %endif"));
+            return Err(self.syntax());
         }
         Ok(cmds)
+    }
+
+    /// Whether the word at `%` is only % signs and digits (yylex returns a TOKEN for it).
+    fn percent_token(&self) -> bool {
+        self.s[self.pos..].iter().take_while(|c| !matches!(c, ' ' | '\t' | '\n')).all(|c| *c == '%' || c.is_ascii_digit())
     }
 
     /// Handle a `%directive` line. Consumes up to (not including) the newline.
@@ -366,6 +390,11 @@ impl Lexer<'_> {
             .collect::<Vec<_>>()
             .join(" ");
         let active = stack.last().is_none_or(|f| f.active);
+        // the grammar: "%if"/"%elif" take one condition, "%else"/"%endif" nothing
+        let argc = match name.as_str() { "if" | "elif" | "hidden" => 1, _ => 0 };
+        if words.len() != argc {
+            return Err(self.err(line, "syntax error"));
+        }
         match name.as_str() {
             "if" => {
                 let v = active && cond(&text);
@@ -379,9 +408,9 @@ impl Lexer<'_> {
             "elif" => {
                 let f = stack
                     .last_mut()
-                    .ok_or_else(|| self.err(line, "%elif without %if"))?;
+                    .ok_or_else(|| self.err(line, "syntax error"))?;
                 if f.seen_else {
-                    return Err(self.err(line, "%elif after %else"));
+                    return Err(self.err(line, "syntax error"));
                 }
                 if f.parent_active && !f.taken && cond(&text) {
                     f.active = true;
@@ -393,9 +422,9 @@ impl Lexer<'_> {
             "else" => {
                 let f = stack
                     .last_mut()
-                    .ok_or_else(|| self.err(line, "%else without %if"))?;
+                    .ok_or_else(|| self.err(line, "syntax error"))?;
                 if f.seen_else {
-                    return Err(self.err(line, "duplicate %else"));
+                    return Err(self.err(line, "syntax error"));
                 }
                 f.seen_else = true;
                 f.active = f.parent_active && !f.taken;
@@ -403,12 +432,12 @@ impl Lexer<'_> {
             }
             "endif" => {
                 if stack.pop().is_none() {
-                    return Err(self.err(line, "%endif without %if"));
+                    return Err(self.err(line, "syntax error"));
                 }
             }
             "hidden" => {
                 if words.len() != 1 || !words[0].1 {
-                    return Err(self.err(line, "%hidden requires NAME=value"));
+                    return Err(self.err(line, "syntax error"));
                 }
                 if active {
                     let (n, v) = words[0].0.split_once('=').unwrap();
@@ -421,21 +450,20 @@ impl Lexer<'_> {
                     ]);
                 }
             }
-            _ => return Err(self.err(line, &format!("unknown directive: %{name}"))),
+            _ => return Err(self.err(line, "syntax error")),
         }
         Ok(())
     }
 
     /// Read a `{ ... }` block starting at `{`. Returns the trimmed inner text.
     fn read_brace(&mut self) -> Result<String, String> {
-        let start = self.line;
         self.pos += 1; // '{'
         let mut depth = 1usize;
         let mut buf = String::new();
-        let unterminated = |l: &Lexer| l.err(start, "unterminated brace");
         loop {
+            // the end of the input inside a block (or a quote in it)
             let Some(c) = self.peek() else {
-                return Err(unterminated(self));
+                return Err(self.syntax());
             };
             self.pos += 1;
             match c {
@@ -450,11 +478,10 @@ impl Lexer<'_> {
                     }
                 }
                 '\'' | '"' => {
-                    let qline = self.line;
                     buf.push(c);
                     loop {
                         let Some(q) = self.peek() else {
-                            return Err(self.err(qline, "unterminated quoted string"));
+                            return Err(self.syntax());
                         };
                         self.pos += 1;
                         buf.push(q);
@@ -516,55 +543,58 @@ impl Lexer<'_> {
         self.assigned.get(name).cloned().or_else(|| (self.env)(name)).unwrap_or_default()
     }
 
-    /// Expand `$NAME` / `${NAME}` at `$`. Pushes a literal `$` if not a variable.
-    fn expand_var(&mut self, out: &mut String) {
+    /// Expand `$NAME` / `${NAME}` at `$` (yylex_token_variable). A `$` not followed by a
+    /// name is literal; `${` must be a name closed by `}`.
+    fn expand_var(&mut self, out: &mut String) -> Result<(), String> {
         self.pos += 1; // '$'
-        if self.peek() == Some('{') {
-            let mut end = self.pos + 1;
-            while end < self.s.len() && is_name_char(self.s[end]) {
-                end += 1;
-            }
-            if end < self.s.len() && self.s[end] == '}' && end > self.pos + 1 {
-                let name: String = self.s[self.pos + 1..end].iter().collect();
+        match self.peek() {
+            None => return Err(self.syntax()),
+            Some('{') => {
+                self.pos += 1;
+                let mut name = String::new();
+                loop {
+                    match self.peek() {
+                        Some('}') => break,
+                        Some(c) if is_name_char(c) => name.push(c),
+                        _ => return Err(self.err(self.line, "invalid environment variable")),
+                    }
+                    self.pos += 1;
+                }
+                self.pos += 1;
                 out.push_str(&self.lookup(&name));
-                self.pos = end + 1;
-                return;
             }
-            out.push('$');
-            return;
-        }
-        // A session ID ($N) is literal text, including in expanded monitor hooks.
-        if self.peek().is_some_and(|c| c.is_ascii_digit()) {
-            out.push('$');
-            return;
-        }
-        let mut name = String::new();
-        while let Some(c) = self.peek() {
-            if !is_name_char(c) {
-                break;
+            // A session ID ($N) is literal text, including in expanded monitor hooks.
+            Some(c) if is_name_char(c) && !c.is_ascii_digit() => {
+                let mut name = String::new();
+                while let Some(c) = self.peek().filter(|c| is_name_char(*c)) {
+                    name.push(c);
+                    self.pos += 1;
+                }
+                out.push_str(&self.lookup(&name));
             }
-            name.push(c);
-            self.pos += 1;
+            _ => out.push('$'),
         }
-        if name.is_empty() {
-            out.push('$');
-        } else {
-            out.push_str(&self.lookup(&name));
-        }
+        Ok(())
     }
 
-    /// Process an escape inside double quotes; `pos` is just after the `\`.
-    fn dq_escape(&mut self, out: &mut String, qline: usize) -> Result<(), String> {
+    /// Process an escape outside single quotes (yylex_token_escape); `pos` is just after
+    /// the `\`.
+    fn escape(&mut self, out: &mut String) -> Result<(), String> {
         let Some(c) = self.peek() else {
-            return Err(self.err(qline, "unterminated quoted string"));
+            return Err(self.syntax());
         };
         self.pos += 1;
         match c {
-            '\n' => self.line += 1, // continuation inside quotes
+            '\n' => self.line += 1, // continuation
+            'a' => out.push('\x07'),
+            'b' => out.push('\x08'),
+            'e' => out.push('\x1b'),
+            'f' => out.push('\x0c'),
+            's' => out.push(' '),
+            'v' => out.push('\x0b'),
+            'r' => out.push('\r'),
             'n' => out.push('\n'),
             't' => out.push('\t'),
-            'r' => out.push('\r'),
-            'e' => out.push('\x1b'),
             'u' | 'U' => {
                 let n = if c == 'u' { 4 } else { 8 };
                 let digits: String = (0..n).filter_map(|i| self.peek_at(i)).collect();
@@ -576,24 +606,34 @@ impl Lexer<'_> {
                 self.pos += n;
                 out.push(cp);
             }
-            '0'..='7' => {
-                let d1 = self.peek();
-                let d2 = self.peek_at(1);
-                match (d1, d2) {
-                    (Some(a @ '0'..='7'), Some(b @ '0'..='7')) => {
-                        let v = (c as u32 - 48) * 64 + (a as u32 - 48) * 8 + (b as u32 - 48);
-                        self.pos += 2;
-                        out.push(char::from_u32(v).unwrap());
-                    }
-                    _ => return Err(self.err(self.line, "invalid octal escape")),
+            // three octal digits, the first at most 3
+            '0'..='3' => match (self.peek(), self.peek_at(1)) {
+                (Some(a @ '0'..='7'), Some(b @ '0'..='7')) => {
+                    let v = (c as u32 - 48) * 64 + (a as u32 - 48) * 8 + (b as u32 - 48);
+                    self.pos += 2;
+                    out.push(char::from_u32(v).unwrap());
                 }
-            }
+                _ => return Err(self.err(self.line, "invalid octal escape")),
+            },
+            '4'..='7' => return Err(self.err(self.line, "invalid octal escape")),
             other => out.push(other),
         }
         Ok(())
     }
 
-    /// Read one word starting at the current (non-blank) position.
+    /// After a newline inside quotes tmux drops the next line's indentation, and a
+    /// comment line there (# not followed by one of ,#{}:) is dropped up to its newline.
+    fn skip_quoted_indent(&mut self) {
+        while matches!(self.peek(), Some(' ' | '\t')) {
+            self.pos += 1;
+        }
+        if self.peek() == Some('#') && !self.peek_at(1).is_some_and(|c| ",#{}:".contains(c)) {
+            self.skip_comment();
+        }
+    }
+
+    /// Read one word starting at the current (non-blank) position. Quotes left open at
+    /// the end of the input end there (yylex_token stops at EOF).
     fn read_word(&mut self) -> Result<Word, String> {
         let mut w = Word {
             text: String::new(),
@@ -609,60 +649,57 @@ impl Lexer<'_> {
             first = false;
             match c {
                 ' ' | '\t' | '\n' => break,
+                // } ends a word (and then closes a block or is an error)
+                '}' => break,
                 '\\' => {
-                    if self.peek_at(1) == Some('\n') {
-                        self.pos += 2;
-                        self.line += 1;
-                        continue;
-                    }
                     self.pos += 1;
-                    match self.peek() {
-                        Some(n) => {
-                            self.pos += 1;
-                            w.text.push(n);
-                        }
-                        None => w.text.push('\\'),
-                    }
+                    self.escape(&mut w.text)?;
                     w.present = true;
                     name_ok = false;
                 }
                 '\'' => {
-                    let qline = self.line;
                     self.pos += 1;
-                    loop {
-                        let Some(q) = self.peek() else {
-                            return Err(self.err(qline, "unterminated quoted string"));
-                        };
+                    while let Some(q) = self.peek() {
                         self.pos += 1;
-                        if q == '\'' {
-                            break;
+                        match q {
+                            '\'' => break,
+                            // backslash-newline is a continuation even here (yylex_getc)
+                            '\\' => {
+                                let run = 1 + self.s[self.pos..].iter().take_while(|c| **c == '\\').count();
+                                self.pos += run - 1;
+                                let cont = run % 2 == 1 && self.peek() == Some('\n');
+                                w.text.extend(std::iter::repeat_n('\\', run - cont as usize));
+                                if cont {
+                                    self.pos += 1;
+                                    self.line += 1;
+                                }
+                            }
+                            '\n' => {
+                                self.line += 1;
+                                w.text.push(q);
+                                self.skip_quoted_indent();
+                            }
+                            _ => w.text.push(q),
                         }
-                        if q == '\n' {
-                            self.line += 1;
-                        }
-                        w.text.push(q);
                     }
                     w.present = true;
                     name_ok = false;
                 }
                 '"' => {
-                    let qline = self.line;
                     self.pos += 1;
-                    loop {
-                        let Some(q) = self.peek() else {
-                            return Err(self.err(qline, "unterminated quoted string"));
-                        };
+                    while let Some(q) = self.peek() {
                         self.pos += 1;
                         match q {
                             '"' => break,
-                            '\\' => self.dq_escape(&mut w.text, qline)?,
+                            '\\' => self.escape(&mut w.text)?,
                             '$' => {
                                 self.pos -= 1;
-                                self.expand_var(&mut w.text);
+                                self.expand_var(&mut w.text)?;
                             }
                             '\n' => {
                                 self.line += 1;
                                 w.text.push(q);
+                                self.skip_quoted_indent();
                             }
                             _ => w.text.push(q),
                         }
@@ -671,11 +708,12 @@ impl Lexer<'_> {
                     name_ok = false;
                 }
                 '$' => {
-                    self.expand_var(&mut w.text);
+                    self.expand_var(&mut w.text)?;
                     w.present = true;
                     name_ok = false;
                 }
-                ';' if is_blank(self.peek_at(1)) => {
+                // an unquoted ; always ends the word and the command
+                ';' => {
                     self.pos += 1;
                     w.ends_cmd = true;
                     break;
@@ -698,13 +736,13 @@ impl Lexer<'_> {
                     let mut depth = 1usize;
                     while depth > 0 {
                         let Some(f) = self.peek() else {
-                            return Err(self.err(fline, "unterminated format"));
+                            return Err(self.err(fline, "syntax error"));
                         };
                         self.pos += 1;
                         match f {
                             '{' => depth += 1,
                             '}' => depth -= 1,
-                            '\n' => return Err(self.err(fline, "unterminated format")),
+                            '\n' => return Err(self.err(fline, "syntax error")),
                             _ => {}
                         }
                         w.text.push(f);
@@ -848,7 +886,7 @@ mod tests {
         }
         assert_eq!(
             p(
-                r#"a $CMDPARSE_T1 x${CMDPARSE_T1}y "$CMDPARSE_T1!" '$CMDPARSE_T1' \$CMDPARSE_T1 [$CMDPARSE_UNSET] $ ${"#
+                r#"a $CMDPARSE_T1 x${CMDPARSE_T1}y "$CMDPARSE_T1!" '$CMDPARSE_T1' \$CMDPARSE_T1 [$CMDPARSE_UNSET] $ ${}"#
             ),
             vec![v(&[
                 "a",
@@ -859,9 +897,13 @@ mod tests {
                 "$CMDPARSE_T1",
                 "[]",
                 "$",
-                "${",
+                "",
             ])]
         );
+        // yylex_token_variable: ${ needs a name and }; a $ at the very end is an error
+        assert_eq!(parse("a ${X").unwrap_err(), "invalid environment variable");
+        assert_eq!(parse("a ${X-}").unwrap_err(), "invalid environment variable");
+        assert_eq!(parse("a $").unwrap_err(), "syntax error");
         assert_eq!(p(r#"a "\$CMDPARSE_T1""#), vec![v(&["a", "$CMDPARSE_T1"])]);
     }
 
@@ -909,6 +951,8 @@ mod tests {
     #[test]
     fn unquoted_backslash() {
         assert_eq!(p(r"x a\ b \# \'q"), vec![v(&["x", "a b", "#", "'q"])]);
+        // escapes work outside quotes as well (yylex_token_escape)
+        assert_eq!(p(r"x a\nb \e\s\101 \u00e9"), vec![v(&["x", "a\nb", "\x1b A", "\u{e9}"])]);
     }
 
     #[test]
@@ -943,9 +987,10 @@ mod tests {
                 "-L"
             ])]
         );
+        // an unquoted ; ends the word and the command even without a blank (yylex_token)
         assert_eq!(
             p("x a;b ';' \";\" foo\\;"),
-            vec![v(&["x", "a;b", ";", ";", "foo;"])]
+            vec![v(&["x", "a"]), v(&["b", ";", ";", "foo;"])]
         );
     }
 
@@ -999,25 +1044,39 @@ mod tests {
 
     #[test]
     fn errors_have_line_numbers() {
-        let e = parse("a\nb 'oops\nc").unwrap_err();
-        assert!(e.contains("line 2") && e.contains("unterminated"), "{e}");
-        let e = parse("a\n\nb \"oops").unwrap_err();
-        assert!(e.contains("line 3"), "{e}");
-        let e = parse("a\nbind x {\n split\n").unwrap_err();
-        assert!(e.contains("line 2") && e.contains("brace"), "{e}");
-        let e = parse("%if 1\nfoo\n").unwrap_err();
-        assert!(e.contains("%endif"), "{e}");
-        assert!(parse("%endif").unwrap_err().contains("line 1"));
-        assert!(parse("x\n%else").unwrap_err().contains("line 2"));
-        assert!(parse("%bogus").is_err());
+        // tmux 3.8 (yacc): errors in the structure are "syntax error" at the line the lexer
+        // reached; a string parse has no line, a file's is "N: "
+        let lines = |s: &str| parse_with_env_lines(s, &|c: &str| c == "1", &|_: &str| None).unwrap_err();
+        assert_eq!(lines("a\nbind x {\n split\n"), "4: syntax error");
+        assert_eq!(lines("if -F 1 { display a"), "1: syntax error");
+        assert_eq!(parse("a\nbind x {\n split\n").unwrap_err(), "syntax error");
+        assert_eq!(lines("display a }\n"), "1: syntax error");
+        assert_eq!(lines("display a}b\n"), "1: syntax error");
+        assert_eq!(lines("%if\n"), "1: syntax error");
+        assert_eq!(lines("%if 1\ndisplay a\n"), "3: syntax error");
+        assert_eq!(lines("%if 1\n"), "2: syntax error");
+        assert_eq!(lines("%if 1\na\n%else\n%else\n%endif"), "4: syntax error");
+        assert_eq!(lines("%endif"), "1: syntax error");
+        assert_eq!(lines("x\n%else"), "2: syntax error");
+        assert_eq!(lines("%bogus"), "1: syntax error");
+        assert_eq!(lines("%hidden x"), "1: syntax error");
+        assert_eq!(lines("x\nx \"\\uZZ\""), "2: invalid \\u argument");
+        assert_eq!(lines("x \"\\9\" \"\\4\""), "1: invalid octal escape");
         assert!(parse("x #{abc").is_err());
+        // % and digits alone are a word
+        assert_eq!(p("%1 %%"), vec![v(&["%1", "%%"])]);
     }
 
     #[test]
     fn quotes_may_span_lines() {
         assert_eq!(p("x 'a\nb'\ny"), vec![v(&["x", "a\nb"]), v(&["y"])]);
-        let e = parse("x 'a\nb\nc").unwrap_err();
-        assert!(e.contains("line 1"), "{e}");
+        // a quote left open at the end of the input ends there
+        assert_eq!(p("x 'a\nb\nc"), vec![v(&["x", "a\nb\nc"])]);
+        assert_eq!(p("display \"abc\n"), vec![v(&["display", "abc\n"])]);
+        // the indentation after a newline in quotes goes, and so do comment lines
+        assert_eq!(p("display \"a\n   # comment\n   b\" '1\n  #{x}'"), vec![v(&["display", "a\n\nb", "1\n#{x}"])]);
+        // backslash-newline continues a line inside single quotes too
+        assert_eq!(p("x 'a\\\nb' 'c\\\\\nd'"), vec![v(&["x", "ab", "c\\\\\nd"])]);
     }
 
     #[test]
