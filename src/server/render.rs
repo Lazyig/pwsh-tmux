@@ -9,8 +9,9 @@ use std::fmt::Write as _;
 use crate::width::char_width;
 
 /// tty_check_codeset for a client without UTF-8: line drawing goes through the ACS charset and
-/// anything else becomes one underscore per column.
-fn non_utf8_text(text: &str) -> String {
+/// anything else becomes one underscore per column the cell takes (`wide`: two columns, as
+/// for a character made wide by VS16).
+pub(super) fn non_utf8_text(text: &str, wide: bool) -> String {
     const ACS: &[(char, u8)] = &[('\u{b7}', b'~'), ('\u{2500}', b'q'), ('\u{2501}', b'q'), ('\u{2502}', b'x'), ('\u{2503}', b'x'), ('\u{250c}', b'l'), ('\u{250f}', b'k'), ('\u{2510}', b'k'), ('\u{2513}', b'l'), ('\u{2514}', b'm'), ('\u{2517}', b'm'), ('\u{2518}', b'j'), ('\u{251b}', b'j'), ('\u{251c}', b't'), ('\u{2523}', b't'), ('\u{2524}', b'u'), ('\u{252b}', b'u'), ('\u{2533}', b'w'), ('\u{2534}', b'v'), ('\u{253b}', b'v'), ('\u{253c}', b'n'), ('\u{254b}', b'n'), ('\u{2550}', b'q'), ('\u{2551}', b'x'), ('\u{2554}', b'l'), ('\u{2557}', b'k'), ('\u{255a}', b'm'), ('\u{255d}', b'j'), ('\u{2560}', b't'), ('\u{2563}', b'u'), ('\u{2566}', b'w'), ('\u{2569}', b'v'), ('\u{256c}', b'n')];
     let mut chars = text.chars();
     if let (Some(ch), None) = (chars.next(), chars.next()) {
@@ -18,8 +19,7 @@ fn non_utf8_text(text: &str) -> String {
             return format!("\x1b(0{}\x1b(B", *acs as char);
         }
     }
-    let width = text.chars().filter_map(char_width).sum::<usize>().clamp(1, 2);
-    "_".repeat(width)
+    "_".repeat(1 + wide as usize)
 }
 
 // ConPTY counts decomposed accents as extra columns. Compose when Windows can do
@@ -472,8 +472,7 @@ impl Server {
                         let scr = p.screen();
                         modes.app_cursor = scr.application_cursor();
                         modes.bracketed_paste = scr.bracketed_paste();
-                        modes.cursor_style = scr.cursor_style() as u8;
-                        if modes.cursor_style == 0 { modes.cursor_style = features::cursor_style(&self.opt_pane(*id, "cursor-style")); }
+                        modes.cursor_style = merged_cursor_style(scr.cursor_style() as u8, scr.cursor_blinking(), features::cursor_style(&self.opt_pane(*id, "cursor-style")));
                         let colour = p.parser.callbacks().osc.cursor_colour.clone().unwrap_or_else(|| self.opt_pane(*id, "cursor-colour"));
                         // a colour option, not a format (OPTIONS_TABLE_IS_COLOUR)
                         modes.cursor_colour = format::parse_color(&colour).filter(|c| *c != vt100::Color::Default);
@@ -759,15 +758,8 @@ impl Server {
             next.modes.mouse = 0;
         }
         next.modes.focus &= feats.has("focus");
-        next.modes.extkeys = if feats.has("extkeys") {
-            match ext_keys.as_str() {
-                "always" => 2,
-                "on" => 1,
-                _ => 0,
-            }
-        } else {
-            0
-        };
+        // tty_update_features sends Eneks for both on and always
+        next.modes.extkeys = (feats.has("extkeys") && ext_keys != "off") as u8;
         c.dirty = false;
         c.status_ranges = next.status_ranges.clone();
         let prev = c.prev.as_ref().filter(|p| p.frame.w == next.frame.w && p.frame.h == next.frame.h);
@@ -798,7 +790,7 @@ impl Server {
                     cur = Some(cell.style);
                 }
                 if c.utf8() || cell.text.is_ascii() { out.push_str(&terminal_text(&cell.text)); }
-                else { out.push_str(&non_utf8_text(&cell.text)); }
+                else { out.push_str(&non_utf8_text(&cell.text, row.get(x + 1).is_some_and(|n| n.text.is_empty()))); }
                 if cfg!(windows) && cell.text.chars().any(|c| char_width(c) == Some(0)) {
                     let width = cell.text.chars().filter_map(|c| char_width(c)).sum::<usize>();
                     if x + width < next.frame.w as usize { let _ = write!(out, "\x1b[{};{}H", y + 1, x + width + 1); }
@@ -816,7 +808,8 @@ impl Server {
         let modes_changed = pm != Some(next.modes);
         let cursor_changed = prev.is_none_or(|p| p.cursor != next.cursor);
         if let Some(t) = title_update {
-            let _ = write!(out, "\x1b]2;{}\x07", t);
+            // tty_set_title: tsl and fsl, from the title feature unless overridden
+            let _ = write!(out, "{}{}{}", features::string_capability(&c.term_caps, "tsl", "\x1b]0;", &[]), t, features::string_capability(&c.term_caps, "fsl", "\x07", &[]));
             c.title = t;
             changed = true;
         }
@@ -857,10 +850,10 @@ impl Server {
             c.input_state.tty_appesc = m.appesc;
             if pm.map_or(0, |p| p.extkeys) != m.extkeys {
                 // modifyOtherKeys: have the terminal report keys like C-Enter distinctly
-                out.push_str(match m.extkeys {
-                    2 => "\x1b[>4;2m",
-                    1 => "\x1b[>4;1m",
-                    _ => "\x1b[>4m",
+                out.push_str(&if m.extkeys != 0 {
+                    features::string_capability(&c.term_caps, "Eneks", "\x1b[>4;2m", &[])
+                } else {
+                    features::string_capability(&c.term_caps, "Dseks", "\x1b[>4m", &[])
                 });
             }
         }
@@ -874,5 +867,17 @@ impl Server {
         }
         c.send(S_OUTPUT, out.as_bytes());
         c.prev = Some(next);
+    }
+}
+
+/// The DECSCUSR style tmux sends (tty_update_cursor): the shape set by the application, or
+/// the cursor-style option's when it set none, blinking as CSI ? 12 h/l or the last
+/// DECSCUSR left it; with neither, the option's own blinking.
+pub(super) fn merged_cursor_style(app: u8, (blinking, blinking_set): (bool, bool), option: u8) -> u8 {
+    let with_blink = |style: u8| if style == 0 { 0 } else { (style + 1) / 2 * 2 - blinking as u8 };
+    match app {
+        0 if !blinking_set => option,
+        0 => with_blink(option),
+        n => with_blink(n),
     }
 }

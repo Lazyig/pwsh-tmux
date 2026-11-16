@@ -1657,7 +1657,13 @@ pub fn parse_color(s: &str) -> Option<Color> {
         "90" | "91" | "92" | "93" | "94" | "95" | "96" | "97" => return s.parse::<u8>().ok().map(|n| Color::Idx(n - 82)),
         _ => {}
     }
-    if let Some(n) = s.strip_prefix("gray").or_else(|| s.strip_prefix("grey")) {
+    colour_byname(&s)
+}
+
+/// colour_byname: grayN/greyN and the X11 colour names (what OSC 10/11/12 accept as names).
+pub fn colour_byname(s: &str) -> Option<Color> {
+    let lower = s.to_ascii_lowercase();
+    if let Some(n) = lower.strip_prefix("gray").or_else(|| lower.strip_prefix("grey")) {
         let c = if n.is_empty() {
             0xbe
         } else {
@@ -1666,7 +1672,7 @@ pub fn parse_color(s: &str) -> Option<Color> {
         };
         return Some(Color::Rgb(c, c, c));
     }
-    X11_COLOURS.iter().find(|(name, _)| name.eq_ignore_ascii_case(&s)).map(|(_, c)| Color::Rgb((c >> 16) as u8, (c >> 8) as u8, *c as u8))
+    X11_COLOURS.iter().find(|(name, _)| name.eq_ignore_ascii_case(s)).map(|(_, c)| Color::Rgb((c >> 16) as u8, (c >> 8) as u8, *c as u8))
 }
 
 const ATTRS: [(&str, u8); 15] = [

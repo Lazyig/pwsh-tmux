@@ -5,8 +5,10 @@ const BASE64: &[u8] =
 
 impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
     fn print(&mut self, c: char) {
-        if c == '\u{fffd}' || ('\u{80}'..'\u{a0}').contains(&c) {
-            self.callbacks.unhandled_char(&mut self.screen, c);
+        // tmux shows a byte that is not valid UTF-8, or a character it cannot measure such
+        // as a C1 control, as U+FFFD (input_stop_utf8)
+        if ('\u{80}'..'\u{a0}').contains(&c) {
+            self.text('\u{fffd}');
         } else {
             self.text(c);
         }
@@ -24,12 +26,17 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
             // we don't implement shift in/out alternate character sets, but
             // it shouldn't count as an "error"
             14 | 15 => {}
+            // vte passes a lone byte from 0x80 to 0x9f here; tmux has no C1 controls and
+            // shows it as an invalid UTF-8 byte
+            0x80..=0x9f => self.text('\u{fffd}'),
             _ => self.callbacks.unhandled_control(&mut self.screen, b),
         }
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, b: u8) {
-        if let Some(i) = intermediates.first() {
+        if intermediates == b"#" && b == b'8' {
+            self.decaln();
+        } else if let Some(i) = intermediates.first() {
             self.callbacks.unhandled_escape(
                 &mut self.screen,
                 Some(*i),
@@ -44,7 +51,10 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
                 b'>' => self.deckpnm(),
                 b'H' => self.hts(),
                 b'M' => self.ri(),
-                b'c' => self.ris(),
+                b'c' => {
+                    self.ris();
+                    self.callbacks.reset(&mut self.screen);
+                }
                 b'g' => self.callbacks.visual_bell(&mut self.screen),
                 _ => {
                     self.callbacks.unhandled_escape(

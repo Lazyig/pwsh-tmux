@@ -53,6 +53,10 @@ fn input_option_backspace_user_keys_xterm_and_extended_keys() {
     assert_eq!(encode(&f, "C-1"), b"\x1b[49;5u");
     f.panes.get_mut(&pane).unwrap().parser.callbacks_mut().ext_keys = 0;
     f.opts_server.set("extended-keys", "always".into());
+    // always forces mode 1 only at a screen reset, not in a pane that exists already
+    assert_eq!(encode(&f, "C-1"), b"1");
+    let g = f.panes[&pane].generation;
+    f.pane_data(pane, g, b"\x1bc");
     assert_eq!(encode(&f, "C-1"), b"\x1b[49;5u");
     let mut p = keys::Parser::new();
     assert!(matches!(&p.feed(b"\x1b[91;5u")[0], keys::Input::Key(Key { code: KeyCode::Escape, .. }, _)));
@@ -325,6 +329,8 @@ fn input_backspace_and_extended_keys_follow_input_key() {
     f.panes.get_mut(&pane).unwrap().parser.callbacks_mut().ext_keys = 0;
     f.opts_server.set("extended-keys", "always".into());
     f.opts_server.set("extended-keys-format", "csi-u".into());
+    let g = f.panes[&pane].generation;
+    f.pane_data(pane, g, b"\x1bc");
     assert_eq!(encode(&f, "C-S-a"), b"\x01");
     assert_eq!(encode(&f, "C-Space"), b"\x00");
     assert_eq!(encode(&f, "C-1"), b"\x1b[49;5u");
@@ -517,4 +523,210 @@ fn input_buffer_size_is_a_power_of_two() {
     p.process(format!("\x1b]2;{title}\x07").as_bytes()); assert!(p.callbacks().title.is_none());
     let title = "t".repeat(1_000_000);
     p.process(format!("\x1b]2;{title}\x07").as_bytes()); assert_eq!(p.callbacks().title.as_ref().map(String::len), Some(1_000_000));
+}
+
+fn feed(f: &mut Fixture, data: &[u8]) { let pane = f.pane; let g = f.panes[&pane].generation; f.pane_data(pane, g, data); }
+fn row0(f: &Fixture) -> String { f.panes[&f.pane].screen().contents().lines().next().unwrap_or("").to_string() }
+fn title(f: &Fixture) -> String { f.panes[&f.pane].title.clone() }
+
+#[test]
+fn control_strings_end_and_dispatch_as_tmux_does() {
+    let mut f = fixture();
+    // an OSC ends on any ESC and on CAN/SUB, and is dispatched either way
+    feed(&mut f, b"\x1bcA\x1b]2;abc\x1b[31mRED\x1b[0m|B");
+    assert_eq!((title(&f), row0(&f)), ("abc".to_string(), "ARED|B".to_string()));
+    feed(&mut f, b"\x1bcC\x1b]2;def\x18XY|");
+    assert_eq!((title(&f), row0(&f)), ("def".to_string(), "CXY|".to_string()));
+    // C0 controls inside are dropped, DEL makes the title invalid, '#(' and '\' are made safe
+    feed(&mut f, b"\x1b]2;ab\ncd\x07"); assert_eq!(title(&f), "abcd");
+    feed(&mut f, b"\x1b]2;ab\x7fcd\x07"); assert_eq!(title(&f), "abcd");
+    feed(&mut f, b"\x1b]2;a\\b#(x)\x07"); assert_eq!(title(&f), "a\\\\b_(x)");
+    feed(&mut f, b"\x1b]0;q;r\x1b\\"); assert_eq!(title(&f), "q;r");
+    // APC sets the title too
+    feed(&mut f, b"\x1b_apctitle\x1b\\"); assert_eq!(title(&f), "apctitle");
+    let pane = f.pane;
+    f.panes.get_mut(&pane).unwrap().options.set("allow-set-title", "off".into());
+    feed(&mut f, b"\x1b_other\x1b\\\x1b]2;other\x07"); assert_eq!(title(&f), "apctitle");
+    // a DCS keeps CAN once its data started; only ESC \ ends it, and ESC x keeps x
+    feed(&mut f, b"\x1bcA\x1bPzz\x18B|"); assert_eq!(row0(&f), "A");
+    feed(&mut f, b"\x1b\\C"); assert_eq!(row0(&f), "AC");
+    f.panes.get_mut(&pane).unwrap().options.set("allow-passthrough", "on".into());
+    let mut p = vt100::Parser::new_with_callbacks(nz(3), nz(20), 0, PaneCb::default());
+    p.process(b"\x1bPtmux;\x1b\x1b]0;x\x07\x1b\\");
+    assert_eq!(p.callbacks().passthrough, vec![b"\x1b]0;x\x07".to_vec()]);
+    // before its final byte a DCS is cancelled by CAN
+    p.process(b"\x1bP1;2\x18Z"); assert_eq!(p.screen().contents(), "Z");
+    // bytes that are not UTF-8, and C1 bytes, show as U+FFFD
+    feed(&mut f, b"\x1bcA\x9b1mB|"); assert_eq!(row0(&f), "A\u{fffd}1mB|");
+    feed(&mut f, b"\x1bcA\xc3(B\xffC|"); assert_eq!(row0(&f), "A\u{fffd}(B\u{fffd}C|");
+    // DECALN
+    feed(&mut f, b"\x1bc\x1b[3;3HA\x1b#8|");
+    assert_eq!(row0(&f), format!("|{}", "E".repeat(f.panes[&pane].size.0 as usize - 1)));
+    assert_eq!(f.panes[&pane].screen().cursor_position(), (0, 1));
+}
+
+#[test]
+fn screen_k_renames_the_window_only_with_allow_rename() {
+    let mut f = fixture(); let pane = f.pane;
+    let wid = f.window_of(pane).unwrap();
+    let name = |f: &Fixture| f.windows[&wid].name.clone();
+    let before = name(&f);
+    // OSC titles never rename the window; ESC k is ignored with allow-rename off
+    f.panes.get_mut(&pane).unwrap().options.set("allow-rename", "on".into());
+    feed(&mut f, b"\x1bcA\x1b]2;T\x07\x1bkK#(1)\x1b\\B|");
+    assert_eq!((title(&f), name(&f), row0(&f)), ("T".to_string(), "K_(1)".to_string(), "AB|".to_string()));
+    assert_eq!(f.windows[&wid].options.get("automatic-rename"), Some("off"));
+    // an empty name goes back to automatic-rename's inherited value
+    feed(&mut f, b"\x1bk\x1b\\");
+    assert_eq!(f.windows[&wid].options.get("automatic-rename"), None);
+    assert_eq!(name(&f), "K_(1)");
+    f.opts_window.set("automatic-rename", "off".into());
+    feed(&mut f, b"\x1bk\x1b\\"); assert_eq!(name(&f), "");
+    f.panes.get_mut(&pane).unwrap().options.set("allow-rename", "off".into());
+    feed(&mut f, b"\x1bkZ\x1b\\"); assert_eq!(name(&f), "");
+    let _ = before;
+}
+
+#[test]
+fn alternate_screen_modes_match_tmux() {
+    let mut f = fixture(); let pane = f.pane;
+    let pos = |f: &Fixture| f.panes[&f.pane].screen().cursor_position();
+    let rows = |f: &Fixture| f.panes[&f.pane].screen().contents().lines().map(|l| l.trim_end().to_string()).filter(|l| !l.is_empty()).collect::<Vec<_>>();
+    // 1047 is an alternate screen without a saved cursor
+    feed(&mut f, b"\x1bcabc\r\n\x1b[?1047hALT\x1b[?1047lZ");
+    assert_eq!((rows(&f), pos(&f)), (vec!["abc".to_string(), "   Z".into()], (1, 4)));
+    // the 1049 cursor is not the DECSC one
+    feed(&mut f, b"\x1bc\x1b[3;3H\x1b7\x1b[6;6Hq\x1b[?1049h\x1b[?1049lW\x1b8");
+    assert_eq!(pos(&f), (2, 2));
+    // alternate-screen off: none of them do anything, 1049l does not restore the cursor
+    f.panes.get_mut(&pane).unwrap().options.set("alternate-screen", "off".into());
+    feed(&mut f, b"\x1bcabc\r\n\r\n\x1b[5;10H\x1b[?1049hX\x1b[?1049lY");
+    assert_eq!((rows(&f), pos(&f)), (vec!["abc".to_string(), "         XY".into()], (4, 11)));
+    feed(&mut f, b"\x1bc\x1b[3;3H\x1b7\x1b[6;6Hq\x1b[?1049h\x1b[?1049lW");
+    assert_eq!(pos(&f), (5, 7));
+}
+
+fn encode_raw(f: &Fixture, raw: &[u8]) -> Vec<u8> {
+    let mut p = keys::Parser::new();
+    let mut out = Vec::new();
+    for i in p.feed(raw).into_iter().chain(p.flush_pending()) {
+        match i {
+            keys::Input::Key(k, raw) => out.extend(f.encode_pane_key(f.pane, &k, raw).unwrap_or_default()),
+            keys::Input::Unknown(raw) => out.extend(raw),
+            _ => {}
+        }
+    }
+    out
+}
+
+#[test]
+fn extended_keys_from_the_terminal_keep_the_key_tmux_parsed() {
+    let mut f = fixture(); let pane = f.pane;
+    f.opts_server.set("extended-keys", "on".into());
+    feed(&mut f, b"\x1b[>4;2m");
+    assert_eq!(f.panes[&pane].parser.callbacks().ext_keys, 2);
+    for (input, want) in [
+        (&b"\x1b[105;5u"[..], &b"\x1b[27;5;105~"[..]), (b"\x1b[27;5;105~", b"\x1b[27;5;105~"), (b"\x1b[109;5u", b"\x1b[27;5;109~"),
+        (b"\x1b[64;5u", b"\x1b[27;5;64~"), (b"\x1b[65;5u", b"\x1b[27;5;65~"), (b"\x1b[27;6;65~", b"\x1b[27;6;65~"),
+        (b"\x1b[9;6u", b"\x1b[27;6;9~"), (b"\x1b[Z", b"\x1b[27;2;9~"), (b"\x1b[9;2u", b"\x1b[27;2;9~"), (b"\x1b[91;5u", b"\x1b[27;5;91~"),
+        // not keys for tmux: M-[ and text
+        (b"\x1b[57399u", b"\x1b[27;3;91~57399u"), (b"\x1b[97;5:1u", b"\x1b[27;3;91~97;5:1u"),
+        (b"\x1b[1;9A", b"\x1b[1;3A"),
+    ] {
+        assert_eq!(encode_raw(&f, input), want, "{input:?}");
+    }
+    // standard mode
+    feed(&mut f, b"\x1b[>4n");
+    for (input, want) in [
+        (&b"\x1b[27;5u"[..], &b""[..]), (b"\x1b[105;5u", b"\t"), (b"\x1b[65;5u", b"\x01"), (b"\x1b[59;5u", b";"),
+        (b"\x1b[57399u", b"\x1b[57399u"), (b"\x1b[97::65;6u", b"\x1b[97::65;6u"), (b"\x1b[1;9A", b"\x1b[1;3A"),
+        (b"\x1b[9;6u", b"\x1b[Z"), (b"\x1bO5A", b"\x1bO5A"),
+    ] {
+        assert_eq!(encode_raw(&f, input), want, "{input:?}");
+    }
+    // a request made while extended-keys is off is ignored
+    f.opts_server.set("extended-keys", "off".into());
+    feed(&mut f, b"\x1b[>4;2m");
+    assert_eq!(f.panes[&pane].parser.callbacks().ext_keys, 0);
+}
+
+#[test]
+fn kp_enter_and_remapped_backspace_follow_input_key() {
+    let mut f = fixture();
+    assert_eq!(encode(&f, "KPEnter"), b"\n");
+    assert_eq!(encode(&f, "M-KPEnter"), b"\x1b\n");
+    f.opts_server.set("backspace", "F1".into());
+    assert_eq!([encode(&f, "M-BSpace"), encode(&f, "C-BSpace"), encode(&f, "S-BSpace")], [b"\x1b\x1bOP".to_vec(), b"\x1b[1;5P".to_vec(), b"\x1b[1;2P".to_vec()]);
+    f.opts_server.set("backspace", "Up".into());
+    assert_eq!([encode(&f, "M-BSpace"), encode(&f, "C-BSpace")], [b"\x1b\x1b[A".to_vec(), b"\x1b[1;5A".to_vec()]);
+    f.opts_server.set("backspace", "BSpace".into());
+    assert_eq!([encode(&f, "BSpace"), encode(&f, "M-BSpace")], [b"\x07".to_vec(), b"".to_vec()]);
+    assert_eq!(encode_opt(&f, "C-BSpace"), Some(vec![]));
+    f.opts_server.set("backspace", "C-h".into());
+    assert_eq!(encode(&f, "M-BSpace"), b"\x1b\x08");
+}
+
+#[test]
+fn cursor_style_blink_colour_names_and_narrow_terminal_widths() {
+    use super::render::{merged_cursor_style, non_utf8_text};
+    // DECSET 12 makes the option's bar blink; DECSCUSR 4 then 12h is a blinking underline
+    assert_eq!(merged_cursor_style(0, (true, true), 6), 5);
+    assert_eq!(merged_cursor_style(0, (false, false), 6), 6);
+    assert_eq!(merged_cursor_style(4, (true, true), 6), 3);
+    assert_eq!(merged_cursor_style(3, (true, false), 0), 3);
+    assert_eq!(merged_cursor_style(0, (true, true), 0), 0);
+    // OSC 12 names are X11 colours
+    assert_eq!(parse_x11_colour("blue").as_deref(), Some("#0000ff"));
+    assert_eq!(parse_x11_colour(" red ").as_deref(), Some("#ff0000"));
+    assert_eq!(parse_x11_colour("cmyk:0/1/1/0").as_deref(), Some("#ff0000"));
+    let mut f = fixture();
+    feed(&mut f, b"\x1b]12;blue\x07");
+    assert_eq!(f.panes[&f.pane].parser.callbacks().osc.cursor_colour.as_deref(), Some("#0000ff"));
+    // a character made wide by VS16 is two underscores on a terminal without UTF-8
+    assert_eq!(non_utf8_text("\u{2764}\u{fe0f}", true), "__");
+    assert_eq!(non_utf8_text("\u{e9}", false), "_");
+}
+
+#[test]
+fn terminal_title_extended_keys_and_detach_use_capabilities() {
+    let mut f = fixture(); let sid = f.sid;
+    {
+        let c = f.clients.get_mut(&1).unwrap();
+        c.features = features::compute("xterm-256color", "", &[], "title,extkeys,bpaste,focus");
+        for (k, v) in [("tsl", "\x1b]1;"), ("fsl", "\x07"), ("Eneks", "\x1b[>4;7m"), ("Dseks", "\x1b[>4;8m"), ("Dsbp", "\x1b[?9200l"), ("Dsfcs", "\x1b[?9004l")] {
+            c.term_caps.insert(k.into(), v.into());
+        }
+    }
+    f.opts_server.set("extended-keys", "on".into());
+    f.sessions.get_mut(&sid).unwrap().options.set("set-titles", "on".into());
+    f.sessions.get_mut(&sid).unwrap().options.set("set-titles-string", "TT".into());
+    f.clients.get_mut(&1).unwrap().prev = None;
+    f.output.try_iter().for_each(drop); f.render(1);
+    let out = String::from_utf8_lossy(&frames(&f, S_OUTPUT)).into_owned();
+    assert!(out.contains("\x1b]1;TT\x07") && !out.contains("\x1b]2;"), "{out:?}");
+    assert!(out.contains("\x1b[>4;7m") && !out.contains("\x1b[>4;1m"), "{out:?}");
+    // the default Eneks is mode 2 for extended-keys on
+    f.clients.get_mut(&1).unwrap().term_caps.remove("Eneks");
+    f.clients.get_mut(&1).unwrap().prev = None; f.render(1);
+    assert!(String::from_utf8_lossy(&frames(&f, S_OUTPUT)).contains("\x1b[>4;2m"));
+    f.clients[&1].send_exit("");
+    let out = String::from_utf8_lossy(&frames(&f, S_OUTPUT)).into_owned();
+    assert!(out.contains("\x1b[?9200l") && out.contains("\x1b[?9004l") && out.contains("\x1b[>4;8m"), "{out:?}");
+}
+
+#[test]
+fn attach_asks_for_synchronized_output() {
+    let mut f = fixture(); let sid = f.sid;
+    f.clients.get_mut(&1).unwrap().ident = Some(Identity { cols: 80, rows: 24, tty: true, cwd: String::new(), term: "xterm-256color".into(), pid: 0, ctx_pane: None, utf8: true, env: Vec::new() });
+    f.clients.get_mut(&1).unwrap().attached = false;
+    f.output.try_iter().for_each(drop); f.attach_client(1, sid);
+    assert!(frames(&f, S_OUTPUT).ends_with(b"\x1b[?2026$p"));
+    assert!(!f.clients[&1].features.has("sync"));
+    f.pane_input.try_iter().for_each(drop);
+    f.handle_input(1, b"\x1b[?2026;2$y");
+    assert!(f.clients[&1].features.has("sync"));
+    assert!(f.pane_input.try_recv().is_err()); // the reply is not typed into the pane
+    f.clients.get_mut(&1).unwrap().features.0.remove("sync");
+    f.handle_input(1, b"\x1b[?2026;0$y");
+    assert!(!f.clients[&1].features.has("sync"));
 }

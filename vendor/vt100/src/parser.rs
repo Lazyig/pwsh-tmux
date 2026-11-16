@@ -6,7 +6,8 @@ pub struct Parser<CB: crate::Callbacks = ()> {
     string_kind: Option<u8>,
     string_overflow: bool,
     escape: bool,
-    string_escapes: usize,
+    dcs_handler: bool,
+    dcs_ignore: bool,
     input_limit: usize,
     screen: crate::screen::WrappedScreen<CB>,
 }
@@ -62,7 +63,7 @@ impl<CB: crate::Callbacks> Parser<CB> {
         Self {
             parser: vte::Parser::new(),
             string: alloc::vec::Vec::new(), string_kind: None, string_overflow: false,
-            escape: false, string_escapes: 0, input_limit: 1048575,
+            escape: false, dcs_handler: false, dcs_ignore: false, input_limit: 1048575,
             screen: crate::screen::WrappedScreen { screen, callbacks },
         }
     }
@@ -70,40 +71,124 @@ impl<CB: crate::Callbacks> Parser<CB> {
     /// Processes the contents of the given byte string, and updates the
     /// in-memory terminal state.
     pub fn process(&mut self, bytes: &[u8]) {
-        // Buffer control strings separately: vte's std OSC buffer has no limit.
-        // DCS tmux; escapes embedded ESC bytes by doubling them.
+        // Control strings are collected here, as tmux's input.c does (vte's std OSC buffer has
+        // no limit and its string rules differ). OSC, APC, ESC k and SOS/PM end on BEL (OSC
+        // only), CAN, SUB or any ESC, and are dispatched however they end; C0 bytes inside are
+        // dropped. A DCS can be cancelled until its final byte; after that it ends only on
+        // ESC \ and ESC x keeps just x, so DCS tmux; payloads double their ESC bytes.
         for &b in bytes {
             if let Some(kind) = self.string_kind {
-                let end = (kind == b']' && b == 7) || (b == b'\\' && self.string_escapes % 2 == 1);
-                let cancel = b == 0x18 || b == 0x1a;
-                let cap = self.input_limit;
-                if !self.string_overflow {
-                    if self.string.len() >= cap + 2 { self.string.clear(); self.string_overflow = true; }
-                    else { self.string.push(b); }
-                }
-                if end || cancel {
-                    let payload = self.string.len().saturating_sub(if b == 7 { 1 } else { 2 });
-                    if !self.string_overflow && !cancel && payload <= cap {
-                        if kind == b'P' {
-                            let len = self.string.len().saturating_sub(2);
-                            self.screen.callbacks.dcs(&mut self.screen.screen, &self.string[..len]);
-                        } else {
-                            self.parser.advance(&mut self.screen, b"\x1b]");
-                            self.parser.advance(&mut self.screen, &self.string);
+                if kind == b'P' && self.dcs_handler {
+                    if self.escape {
+                        self.escape = false;
+                        if b == b'\\' {
+                            if !self.string_overflow {
+                                self.screen.callbacks.dcs(&mut self.screen.screen, &self.string);
+                            }
+                            self.end_string();
+                            continue;
                         }
+                        self.string_push(b);
+                    } else if b == 0x1b {
+                        self.escape = true;
+                    } else {
+                        self.string_push(b);
                     }
-                    self.string.clear(); self.string_kind = None; self.string_overflow = false; self.string_escapes = 0;
-                } else if b == 0x1b { self.string_escapes += 1; } else { self.string_escapes = 0; }
+                    continue;
+                }
+                match b {
+                    0x18 | 0x1a | 0x1b => {
+                        self.finish_string(kind, false);
+                        if b == 0x1b { self.escape = true; }
+                    }
+                    0x07 if kind == b']' => self.finish_string(kind, true),
+                    0x00..=0x1f => {}
+                    _ if kind == b'P' => {
+                        // parameters and intermediates, then the final byte starts the data
+                        if b >= 0x7f || self.dcs_ignore { continue; }
+                        let interm = self.string.iter().any(|c| (0x20..=0x2f).contains(c));
+                        if b == b':' || (b'<'..=b'?').contains(&b) && !self.string.is_empty()
+                            || (0x30..=0x3f).contains(&b) && interm {
+                            self.dcs_ignore = true;
+                        }
+                        self.string_push(b);
+                        if (0x40..=0x7e).contains(&b) && !self.dcs_ignore { self.dcs_handler = true; }
+                    }
+                    _ if kind == b'X' => {}
+                    _ => self.string_push(b),
+                }
                 continue;
             }
             if self.escape {
                 self.escape = false;
-                if b == b']' || b == b'P' { self.string_kind = Some(b); continue; }
+                if matches!(b, b']' | b'P' | b'_' | b'k' | b'X' | b'^') {
+                    // ESC cancels whatever vte was in the middle of
+                    self.parser.advance(&mut self.screen, b"\x1b\\");
+                    self.string_kind = Some(if b == b'^' { b'X' } else { b });
+                    continue;
+                }
                 self.parser.advance(&mut self.screen, &[0x1b]);
             }
             if b == 0x1b { self.escape = true; }
             else { self.parser.advance(&mut self.screen, &[b]); }
         }
+    }
+
+    fn string_push(&mut self, b: u8) {
+        if self.string_overflow { return; }
+        if self.string.len() >= self.input_limit {
+            self.string.clear();
+            self.string_overflow = true;
+        } else {
+            self.string.push(b);
+        }
+    }
+
+    fn end_string(&mut self) {
+        self.string.clear();
+        self.string_kind = None;
+        self.string_overflow = false;
+        self.dcs_handler = false;
+        self.dcs_ignore = false;
+    }
+
+    /// The end of an OSC, APC, ESC k or SOS/PM string (input_exit_osc and friends). A DCS
+    /// cancelled before its data is dropped.
+    fn finish_string(&mut self, kind: u8, bel: bool) {
+        if !self.string_overflow {
+            let s = core::mem::take(&mut self.string);
+            match kind {
+                b']' => self.osc(&s, bel),
+                b'_' => {
+                    if let Some(t) = clean_name(&s) {
+                        self.screen.callbacks.set_window_title(&mut self.screen.screen, &t);
+                    }
+                }
+                b'k' => {
+                    if utf8_isvalid(&s) {
+                        let n = clean_name(&s).unwrap_or_default();
+                        self.screen.callbacks.rename_window(&mut self.screen.screen, &n);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.end_string();
+    }
+
+    fn osc(&mut self, s: &[u8], bel: bool) {
+        // input_exit_osc: a number, then ';' or the end
+        let digits = s.iter().take_while(|c| c.is_ascii_digit()).count();
+        if digits == 0 || !matches!(s.get(digits), None | Some(b';')) { return; }
+        if matches!(&s[..digits], b"0" | b"2") {
+            if let Some(t) = clean_name(s.get(digits + 1..).unwrap_or_default()) {
+                self.screen.callbacks.set_window_title(&mut self.screen.screen, &t);
+            }
+            return;
+        }
+        self.parser.advance(&mut self.screen, b"\x1b]");
+        self.parser.advance(&mut self.screen, s);
+        self.parser.advance(&mut self.screen, if bel { b"\x07" } else { b"\x1b\\" });
     }
 
     /// input-buffer-size: tmux grows its string buffer from 32 bytes by doubling and discards
@@ -196,6 +281,26 @@ impl<CB: crate::Callbacks> Parser<CB> {
     ) -> (&mut crate::Screen, &mut CB) {
         (&mut self.screen.screen, &mut self.screen.callbacks)
     }
+}
+
+/// tmux's utf8_isvalid: printable ASCII and complete UTF-8 characters only.
+fn utf8_isvalid(s: &[u8]) -> bool {
+    core::str::from_utf8(s).is_ok_and(|t| t.chars().all(|c| !c.is_ascii() || (' '..='~').contains(&c)))
+}
+
+/// tmux's clean_name for untrusted names: None unless valid, "#(" becomes "_(" and a
+/// backslash is escaped as vis(3) does.
+fn clean_name(s: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    if !utf8_isvalid(s) { return None; }
+    let mut out = alloc::vec::Vec::with_capacity(s.len());
+    for (i, &c) in s.iter().enumerate() {
+        match c {
+            b'#' if s.get(i + 1) == Some(&b'(') => out.push(b'_'),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            _ => out.push(c),
+        }
+    }
+    Some(out)
 }
 
 impl Default for Parser {

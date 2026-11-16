@@ -26,6 +26,13 @@ impl Client {
         if self.input_state.tty_appesc {
             out.push_str(&features::string_capability(&self.term_caps, "Dsesc", "\x1b[?7727l", &[]));
         }
+        // Dsbp, Dsfcs and Dseks: the client always sends the usual sequences, so only an
+        // override changes what goes out
+        for (name, usual) in [("Dsbp", "\x1b[?2004l"), ("Dsfcs", "\x1b[?1004l"), ("Dseks", "\x1b[>4m")] {
+            if let Some(v) = self.term_caps.get(name).filter(|v| !v.is_empty() && *v != usual) {
+                out.push_str(v);
+            }
+        }
         out
     }
 
@@ -472,6 +479,17 @@ impl Server {
             }
             Input::Unknown(raw) => {
                 if raw.starts_with(b"\x1b]52;") { self.clipboard_reply(cid, &raw); return; }
+                // tty_keys_sync: the DECRPM reply to the attach-time DECRQM 2026
+                if let Some(status) = raw.strip_prefix(b"\x1b[?2026;").and_then(|r| r.strip_suffix(b"$y")).filter(|r| r.len() == 1 && (b'0'..=b'4').contains(&r[0])) {
+                    if let Some(c) = self.clients.get_mut(&cid) {
+                        if matches!(status[0], b'1'..=b'3') && !c.features.has("sync") {
+                            c.features.parse("sync", &[',']);
+                            c.prev = None;
+                            c.dirty = true;
+                        }
+                    }
+                    return;
+                }
                 // focus reports are only forwarded when the pane asked for them
                 if raw == b"\x1b[I" || raw == b"\x1b[O" {
                     return;
@@ -521,6 +539,21 @@ impl Server {
         // internal function keys such as UserN are never written to a pane
         if matches!(k.code, KeyCode::User(_)) { return Some(Vec::new()); }
         let app = p.screen().application_cursor();
+        let keypad = p.screen().application_keypad();
+        // the pane's extended key mode (MODE_KEYS_EXTENDED, _2): set when the application asked
+        // (or by extended-keys always at a reset), not read from the option for each key
+        let mode = p.parser.callbacks().ext_keys;
+        let csi_u = self.opt_server("extended-keys-format") == "csi-u";
+        let char_code = |code: &KeyCode| -> Option<u32> {
+            Some(match code {
+                KeyCode::Char(c) => *c as u32,
+                KeyCode::Space => 32,
+                KeyCode::Enter => 13,
+                KeyCode::Tab => 9,
+                KeyCode::Escape => 27,
+                _ => return None,
+            })
+        };
         let mut mapped = k.clone();
         let mut remapped = false;
         if k.code == KeyCode::BSpace {
@@ -530,31 +563,60 @@ impl Server {
                 return Some(backspace_byte(&option).map(|b| vec![b]).unwrap_or_default());
             }
             if let Some(mut backspace) = keys::parse_key_name(&option) {
+                // key = newkey | modifiers: BSpace itself has no sequence, a character goes
+                // through the usual modes, and a special key found only without the Meta
+                // (no implied Meta) gets ESC before its unmodified form
+                if backspace.code == KeyCode::BSpace && option.eq_ignore_ascii_case("BSpace") {
+                    return Some(Vec::new());
+                }
                 backspace.mods.ctrl |= k.mods.ctrl;
                 backspace.mods.meta |= k.mods.meta;
                 backspace.mods.shift |= k.mods.shift;
+                if backspace.code != KeyCode::BSpace {
+                    if let Some(cp) = char_code(&backspace.code) {
+                        return Some(keys::input_key_char(cp, false, backspace.mods, mode, csi_u));
+                    }
+                    let meta = std::mem::replace(&mut backspace.mods.meta, false);
+                    let mut out = if meta { vec![0x1b] } else { Vec::new() };
+                    out.extend(keys::encode_key_mode(&backspace, app, keypad));
+                    return Some(out);
+                }
                 mapped = backspace;
                 remapped = true;
             }
+        } else if k.code == KeyCode::BTab {
+            // KEYC_BTAB: S-Tab in extended mode 2, else ESC [ Z without modifiers
+            return Some(keys::input_key_char(9, true, k.mods, mode, csi_u));
+        } else if let Some((cp, btab, mods)) = keys::extended_input(&raw) {
+            // a key the terminal sent in extended form: encode the exact key tmux parsed, so
+            // C-i, C-m, C-@, C-[ and C-S-a stay distinct from Tab, Enter, C-Space, Escape, C-a
+            return Some(keys::input_key_char(cp, btab, mods, mode, csi_u));
         }
         let k = &mapped;
-        // extended-keys: on = only for applications that asked (CSI > 4 ; n m), always = mode 1 at least
-        let requested = p.parser.callbacks().ext_keys;
-        let csi_u = self.opt_server("extended-keys-format") == "csi-u";
-        let extended = match self.opt_server("extended-keys").as_str() {
-            "always" => keys::encode_extended(k, requested >= 2, csi_u),
-            "on" if requested > 0 => keys::encode_extended(k, requested >= 2, csi_u),
-            _ => None,
-        };
+        let extended = if mode > 0 { keys::encode_extended(k, mode >= 2, csi_u) } else { None };
+        let special = matches!(k.code, KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End
+            | KeyCode::Insert | KeyCode::Delete | KeyCode::PageUp | KeyCode::PageDown | KeyCode::F(_));
         Some(if let Some(e) = extended {
             e
         } else if k.code == KeyCode::BSpace && k.mods.ctrl {
             // DEL has no Ctrl form in standard mode (input_key_vt10x returns -1)
             return None;
         } else if remapped || matches!(k.code, KeyCode::KP(_)) {
-            keys::encode_key_mode(k, app, p.screen().application_keypad())
-        } else if matches!(k.code, KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End) && k.mods.is_empty() {
+            keys::encode_key_mode(k, app, keypad)
+        } else if special && k.mods.is_empty() {
             keys::encode_key(k, app)
+        } else if special && raw.first() == Some(&0x1b) {
+            // a modified special key is sent in tmux's own xterm form (M-Up from CSI 1;9 A is
+            // CSI 1;3 A); ESC before an unmodified one is a Meta without the implied flag
+            let mut plain = k.clone();
+            if raw.starts_with(b"\x1b\x1b") && plain.mods.meta {
+                plain.mods.meta = false;
+                let mut out = vec![0x1b];
+                out.extend(keys::encode_key_mode(&plain, app, keypad));
+                out
+            } else {
+                keys::encode_key_mode(&plain, app, keypad)
+            }
         } else if raw.starts_with(b"\x1b[") && (raw.ends_with(b"u") || raw.starts_with(b"\x1b[27;")) {
             // the outer terminal sent an extended key but this pane didn't ask for them
             keys::encode_key(k, app)

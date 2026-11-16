@@ -439,24 +439,12 @@ fn parse_esc(buf: &[u8], force: bool) -> Res {
 }
 
 fn parse_ss3(buf: &[u8], force: bool) -> Res {
-    let mut i = 2;
-    while i < buf.len() && i < 5 && buf[i].is_ascii_digit() {
-        i += 1;
-    }
+    // tmux knows only SS3 and a final byte; ESC O 5 A is M-O then 5 and A
+    let i = 2;
     if i >= buf.len() {
-        return if force || i >= 5 {
-            meta_fallback(buf)
-        } else {
-            Res::Incomplete
-        };
+        return if force { meta_fallback(buf) } else { Res::Incomplete };
     }
-    let mods = match std::str::from_utf8(&buf[2..i])
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(p) => Mods::from_xterm(p),
-        None => Mods::NONE,
-    };
+    let mods = Mods::NONE;
     let code = match buf[i] {
         b'A' => KeyCode::Up,
         b'B' => KeyCode::Down,
@@ -529,7 +517,101 @@ fn parse_csi(buf: &[u8]) -> Csi {
         };
         return Csi::Done(tok, n + 3);
     }
-    Csi::Done(dispatch_csi(params, inter, f, &buf[..n]), n)
+    match dispatch_csi(params, inter, f, &buf[..n]) {
+        Some(tok) => Csi::Done(tok, n),
+        None => Csi::Invalid,
+    }
+}
+
+/// tty_keys_extended_key accepts only `CSI number ; modifiers u` and `CSI 27 ; modifiers ;
+/// number ~` made of digits and ';' (no kitty `:` fields, no missing modifier). Anything
+/// else is not a key there, so tmux reads the ESC [ as M-[ and the rest as typed text.
+fn tmux_extended_form(params: &[u8], f: u8) -> bool {
+    if !params.iter().all(|c| c.is_ascii_digit() || *c == b';') {
+        return false;
+    }
+    let mut it = params.split(|c| *c == b';');
+    let num = |p: Option<&[u8]>| p.is_some_and(|p| !p.is_empty());
+    match f {
+        b'u' => num(it.next()) && num(it.next()),
+        _ => it.next() == Some(b"27") && num(it.next()) && num(it.next()),
+    }
+}
+
+/// A key the terminal sent in extended form, as tmux keeps it (tty_keys_extended_key): the
+/// code point with its modifiers, Shift dropped from a printable character and S-Tab as
+/// BTab. DEL is left to the backspace handling. Returns (code point, BTab, modifiers).
+pub fn extended_input(raw: &[u8]) -> Option<(u32, bool, Mods)> {
+    let body = raw.strip_prefix(b"\x1b[")?;
+    let (&f, params) = body.split_last()?;
+    if !matches!(f, b'u' | b'~') || !tmux_extended_form(params, f) {
+        return None;
+    }
+    let s = std::str::from_utf8(params).ok()?;
+    let v: Vec<u32> = s.split(';').map(|p| p.parse().ok()).collect::<Option<_>>()?;
+    let (cp, m) = if f == b'u' { (v[0], v[1]) } else { (v[2], v[1]) };
+    if cp == 127 || (cp > 0x7f && char::from_u32(cp).is_none()) {
+        return None;
+    }
+    let mut mods = Mods::from_xterm(m.max(1));
+    if cp == 9 && mods.shift {
+        mods.shift = false;
+        return Some((cp, true, mods));
+    }
+    if ((0x21..0x7f).contains(&cp) || cp > 0x7f) && mods == Mods::SHIFT {
+        mods.shift = false;
+    }
+    Some((cp, false, mods))
+}
+
+/// input_key for a character key (not one of tmux's special keys) in a pane whose extended
+/// key mode is `mode` (0 standard, 1 or 2). Empty when tmux writes nothing.
+pub fn input_key_char(mut cp: u32, btab: bool, mut mods: Mods, mode: u8, csi_u: bool) -> Vec<u8> {
+    if btab {
+        if mode < 2 {
+            return b"\x1b[Z".to_vec();
+        }
+        cp = 9;
+        mods.shift = true;
+    }
+    let utf8 = |cp: u32| char::from_u32(cp).map(|c| c.to_string().into_bytes()).unwrap_or_default();
+    if mods.is_empty() && (matches!(cp, 9 | 13 | 27) || (0x20..=0x7f).contains(&cp) || cp > 0x7f) {
+        return utf8(cp);
+    }
+    let extended = || -> Vec<u8> {
+        let n = mods.xterm_param();
+        if n <= 1 { return Vec::new(); }
+        if csi_u { format!("\x1b[{cp};{n}u") } else { format!("\x1b[27;{n};{cp}~") }.into_bytes()
+    };
+    // input_key_vt10x
+    let vt10x = || -> Vec<u8> {
+        let mut out = if mods.meta { vec![ESC] } else { Vec::new() };
+        if cp > 0x7f {
+            out.extend(utf8(cp));
+            return out;
+        }
+        let ctrl = mods.ctrl && !matches!(cp, 9 | 10 | 13);
+        let mut b = cp as u8;
+        if ctrl {
+            const FROM: &[u8] = b"1!9(0)=+;:'\",<.>/-8? 2";
+            const TO: &[u8] = b"119900=+;;'',,..\x1f\x1f\x7f\x7f\0\0";
+            b = match FROM.iter().position(|c| *c == b) {
+                Some(i) => TO[i],
+                None if (b'3'..=b'7').contains(&b) => b - 0x18,
+                None if (b'@'..=b'~').contains(&b) => b & 0x1f,
+                None => return out,
+            };
+        }
+        out.push(b & 0x7f);
+        out
+    };
+    match mode {
+        2 => extended(),
+        // input_key_mode1: Meta without Ctrl, and some Ctrl keys, keep the standard form
+        1 if (mods.meta && !mods.ctrl) || (mods.ctrl && (cp == 32 || cp == 47 || (50..=56).contains(&cp) || (64..=126).contains(&cp))) => vt10x(),
+        1 => extended(),
+        _ => vt10x(),
+    }
 }
 
 /// Split CSI parameters on ';', taking the first ':' sub-parameter. Empty → None.
@@ -550,29 +632,32 @@ fn parse_params(params: &[u8]) -> Option<Vec<Option<u32>>> {
         .collect()
 }
 
-fn dispatch_csi(params: &[u8], inter: &[u8], f: u8, raw: &[u8]) -> Tok {
+fn dispatch_csi(params: &[u8], inter: &[u8], f: u8, raw: &[u8]) -> Option<Tok> {
     if !inter.is_empty() {
-        return unknown_tok(raw);
+        return Some(unknown_tok(raw));
+    }
+    if (f == b'u' || (f == b'~' && params.starts_with(b"27;"))) && !tmux_extended_form(params, f) {
+        return None;
     }
     if params.first() == Some(&b'<') {
         if (f == b'M' || f == b'm')
             && let Some(m) = sgr_mouse(&params[1..], f == b'm')
         {
-            return Tok::In(Input::Mouse(m, raw.to_vec()));
+            return Some(Tok::In(Input::Mouse(m, raw.to_vec())));
         }
-        return unknown_tok(raw);
+        return Some(unknown_tok(raw));
     }
     if matches!(params.first(), Some(b'=' | b'>' | b'?')) {
-        return unknown_tok(raw);
+        return Some(unknown_tok(raw));
     }
     let Some(p) = parse_params(params) else {
-        return unknown_tok(raw);
+        return Some(unknown_tok(raw));
     };
     let get = |i: usize| p.get(i).copied().flatten();
     let mods = |i: usize| Mods::from_xterm(get(i).unwrap_or(1));
     let key = match f {
         b'~' => match get(0) {
-            Some(200) => return Tok::PasteStart,
+            Some(200) => return Some(Tok::PasteStart),
             Some(27) => get(2).and_then(|c| key_from_codepoint(c, mods(1))),
             Some(n) => tilde_key(n).map(|c| Key::new(c, mods(1))),
             None => None,
@@ -590,18 +675,16 @@ fn dispatch_csi(params: &[u8], inter: &[u8], f: u8, raw: &[u8]) -> Tok {
             };
             Some(Key::new(code, mods(1)))
         }
-        b'Z' => {
-            let mut m = mods(1);
-            m.shift = false;
-            Some(Key::new(KeyCode::BTab, m))
-        }
+        // tmux has only CSI Z: CSI 1 ; 2 Z is M-[ and text
+        b'Z' if params.is_empty() => Some(Key::new(KeyCode::BTab, Mods::NONE)),
+        b'Z' => return None,
         b'_' => win32_key(&p),
         _ => None,
     };
-    match key {
+    Some(match key {
         Some(k) => key_tok(k, raw),
         None => unknown_tok(raw),
-    }
+    })
 }
 
 fn tilde_key(n: u32) -> Option<KeyCode> {
@@ -1042,6 +1125,9 @@ pub fn encode_key_mode(k: &Key, app_cursor: bool, app_keypad: bool) -> Vec<u8> {
                     _ => 'M',
                 };
                 format!("\x1bO{f}").into_bytes()
+            } else if c == '\r' {
+                // input_key_defaults: KPEnter is LF outside application keypad mode
+                b"\n".to_vec()
             } else {
                 c.to_string().into_bytes()
             }
@@ -1406,7 +1492,8 @@ mod tests {
             );
         }
         // SS3 with modifier digit (old xterm).
-        assert_eq!(key1(b"\x1bO5A"), km(KeyCode::Up, true, false, false));
+        // tmux has no ESC O <modifier> forms: M-O, then the text
+        assert_eq!(keys(b"\x1bO5A"), vec![meta(KeyCode::Char('O')), ch('5'), ch('A')]);
     }
 
     #[test]
@@ -1465,7 +1552,7 @@ mod tests {
     #[test]
     fn btab() {
         assert_eq!(key1(b"\x1b[Z"), k(KeyCode::BTab));
-        assert_eq!(key1(b"\x1b[1;2Z"), k(KeyCode::BTab));
+        assert_eq!(keys(b"\x1b[1;2Z")[0], meta(KeyCode::Char('[')));
         assert_eq!(key1(b"\x1b\x1b[Z"), meta(KeyCode::BTab));
     }
 
@@ -1522,9 +1609,13 @@ mod tests {
             km(KeyCode::BSpace, true, false, false)
         );
         assert_eq!(key1(b"\x1b[32;5u"), km(KeyCode::Space, true, false, false));
-        assert_eq!(key1(b"\x1b[27u"), k(KeyCode::Escape));
-        assert_eq!(key1(b"\x1b[97u"), ch('a'));
-        assert_eq!(key1(b"\x1b[97:65;5u"), ctrl('a'));
+        // tty_keys_extended_key needs the modifier and has no kitty ':' fields: these are
+        // M-[ and text there (and their bytes reach the pane unchanged in standard mode)
+        for raw in [&b"\x1b[27u"[..], b"\x1b[97u", b"\x1b[97:65;5u", b"\x1b[97;5:1u", b"\x1b[57399u"] {
+            let v = keys(raw);
+            assert_eq!(v[0], meta(KeyCode::Char('[')), "{raw:?}");
+            assert_eq!(v.len(), raw.len() - 1, "{raw:?}");
+        }
         assert_eq!(key1(b"\x1b[105;5u"), k(KeyCode::Tab)); // C-i == Tab
         assert_eq!(key1(b"\x1b[27;5;97~"), ctrl('a'));
         assert_eq!(key1(b"\x1b[27;5;49~"), ctrl('1'));
@@ -2149,7 +2240,7 @@ mod tests {
         assert_eq!(e("S-F1"), b"\x1b[1;2P");
         assert_eq!(e("C-F5"), b"\x1b[15;5~");
         assert_eq!(e("KP5"), b"5");
-        assert_eq!(e("KPEnter"), b"\r");
+        assert_eq!(e("KPEnter"), b"\n");
         assert_eq!(e("C-i"), b"\t");
     }
 

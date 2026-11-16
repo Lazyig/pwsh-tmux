@@ -27,6 +27,10 @@ pub trait Callbacks {
     /// This callback is called when the terminal requests the window title
     /// to be set (typically with `\e]2;<title>\a`)
     fn set_window_title(&mut self, _: &mut crate::Screen, _title: &[u8]) {}
+    /// RIS (ESC c) reset the screen.
+    fn reset(&mut self, _: &mut crate::Screen) {}
+    /// ESC k name ST (screen's window name), already checked and cleaned as tmux does.
+    fn rename_window(&mut self, _: &mut crate::Screen, _name: &[u8]) {}
     /// This callback is called when the terminal requests data to be copied
     /// to the system clipboard (typically with `\e]52;<ty>;<data>\a`). Note
     /// that `data` will be encoded as base64.

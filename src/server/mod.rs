@@ -87,9 +87,14 @@ pub struct PaneCb {
     pub replies: Vec<u8>,
     pub bell: bool,
     pub title: Option<String>,
+    /// ESC k name ST, for allow-rename.
+    pub rename: Option<String>,
     pub cwd: Option<String>,
-    /// modifyOtherKeys level the application asked for (CSI > 4 ; n m).
+    /// The pane's extended key mode (0, 1 or 2: tmux's MODE_KEYS_EXTENDED and _2), set by
+    /// CSI > 4 ; n m and CSI > 4 n, and by extended-keys always at a reset.
     pub ext_keys: u8,
+    /// extended-keys as the parser last saw it (0 off, 1 on, 2 always).
+    pub ext_option: u8,
     pub clipboard_queries: Vec<(Vec<u8>, bool)>,
     /// OSC 52 selections set by the application (selector, base64 data).
     pub clipboard_sets: Vec<(Vec<u8>, Vec<u8>)>,
@@ -175,6 +180,11 @@ impl OscState {
     }
 }
 
+/// extended-keys as a number: 0 off, 1 on, 2 always.
+pub fn ext_keys_option(v: &str) -> u8 {
+    match v { "always" => 2, "on" => 1, _ => 0 }
+}
+
 /// The exit status in OSC 133 "D;status[;key=value...]": 0 when absent or a key=value, 255
 /// when not a number from 0 to 255 (tmux's input_osc_133_exit_status).
 fn osc133_exit_status(arg: &str) -> i32 {
@@ -211,7 +221,18 @@ pub fn parse_x11_colour(s: &str) -> Option<String> {
         let n = |v: &str| v.trim().parse::<u16>().ok().filter(|n| *n < 256);
         return Some(rgb(n(r)?, n(g)?, n(b)?));
     }
-    crate::format::parse_color(s).map(colour_name)
+    let cmyk = s.strip_prefix("cmyk:").map(|v| (v, 4)).or_else(|| s.strip_prefix("cmy:").map(|v| (v, 3)));
+    if let Some((v, n)) = cmyk {
+        let f: Vec<f64> = v.split('/').map_while(|x| x.parse::<f64>().ok()).collect();
+        if f.len() != n || f.iter().any(|x| !(0.0..=1.0).contains(x)) {
+            return None;
+        }
+        let k = if n == 4 { f[3] } else { 0.0 };
+        let c = |x: f64| ((1.0 - x) * (1.0 - k) * 255.0) as u16;
+        return Some(rgb(c(f[0]), c(f[1]), c(f[2])));
+    }
+    // colour_parseX11 looks a name up in the X11 table, so "blue" is #0000ff, not colour 4
+    crate::format::colour_byname(s.trim_matches(' ')).map(colour_name)
 }
 
 /// tmux's colour_tostring.
@@ -270,13 +291,9 @@ impl vt100::Callbacks for PaneCb {
         if self.clipboard_sets.len() < 16 { self.clipboard_sets.push((ty.to_vec(), data.to_vec())); }
     }
     fn dcs(&mut self, _: &mut vt100::Screen, payload: &[u8]) {
+        // the parser already turned the doubled ESC bytes back into one
         if let Some(payload) = payload.strip_prefix(b"tmux;") {
-            let mut data = Vec::new(); let mut i = 0;
-            while i < payload.len() {
-                data.push(payload[i]);
-                i += if payload[i] == 0x1b && payload.get(i + 1) == Some(&0x1b) { 2 } else { 1 };
-            }
-            self.passthrough.push(data);
+            self.passthrough.push(payload.to_vec());
         }
     }
     fn audible_bell(&mut self, _: &mut vt100::Screen) {
@@ -284,6 +301,13 @@ impl vt100::Callbacks for PaneCb {
     }
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
         self.title = Some(String::from_utf8_lossy(title).into_owned());
+    }
+    fn reset(&mut self, _: &mut vt100::Screen) {
+        // screen_write_reset: extended-keys always puts the pane back in mode 1
+        self.ext_keys = (self.ext_option == 2) as u8;
+    }
+    fn rename_window(&mut self, _: &mut vt100::Screen, name: &[u8]) {
+        self.rename = Some(String::from_utf8_lossy(name).into_owned());
     }
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
         self.osc.osc(params);
@@ -303,9 +327,13 @@ impl vt100::Callbacks for PaneCb {
             (None, 'n', 5) => self.replies.extend(b"\x1b[0n"),
             (None, 'c', 0) => self.replies.extend(b"\x1b[?1;2c"),
             (Some(b'>'), 'c', 0) => self.replies.extend(b"\x1b[>84;0;0c"),
-            (Some(b'>'), 'm', 4) => self.ext_keys = params.get(1).and_then(|p| p.first()).copied().unwrap_or(0) as u8,
+            // INPUT_CSI_MODSET: ignored with extended-keys off; always keeps at least mode 1
+            (Some(b'>'), 'm', 4) if self.ext_option != 0 => {
+                let m = params.get(1).and_then(|p| p.first()).copied().unwrap_or(0);
+                self.ext_keys = if m == 2 { 2 } else if m == 1 || self.ext_option == 2 { 1 } else { 0 };
+            }
             // CSI > 4 n turns modifyOtherKeys off again
-            (Some(b'>'), 'n', 4) => self.ext_keys = 0,
+            (Some(b'>'), 'n', 4) => self.ext_keys = (self.ext_option == 2) as u8,
             _ => {}
         }
     }
@@ -1432,7 +1460,9 @@ impl Server {
         let widths = features::codepoint_widths(&self.opts_server.array_items("codepoint-widths").into_iter().map(|(_, v)| v).collect::<Vec<_>>());
         let variation_wide = options::is_on(&self.opt_server("variation-selector-always-wide"));
         let input_limit = self.opt_server_num("input-buffer-size") as usize;
+        let ext_option = ext_keys_option(&self.opt_server("extended-keys"));
         let p = self.panes.get_mut(&id).unwrap();
+        p.parser.callbacks_mut().ext_option = ext_option;
         p.parser.set_input_buffer_size(input_limit);
         p.parser.screen_mut().set_alternate_screen_allowed(alternate);
         p.parser.screen_mut().set_codepoint_widths(widths, variation_wide);
@@ -1458,6 +1488,7 @@ impl Server {
         let replies = std::mem::take(&mut cb.replies);
         let bell = std::mem::take(&mut cb.bell);
         let title = cb.title.take();
+        let rename = cb.rename.take();
         let queries = std::mem::take(&mut cb.clipboard_queries);
         let sets = std::mem::take(&mut cb.clipboard_sets);
         let passthrough = std::mem::take(&mut cb.passthrough);
@@ -1468,13 +1499,20 @@ impl Server {
         p.send(replies);
         self.pane_input_requests(id, queries, sets, passthrough);
         if let Some(t) = title.filter(|_| options::is_on(&self.opt_pane(id, "allow-set-title"))) {
-            self.panes.get_mut(&id).unwrap().title = t.clone();
-            if options::is_on(&self.opt_pane(id, "allow-rename")) {
-                if let Some(wid) = self.window_of(id) {
-                    if let Some(w) = self.windows.get_mut(&wid) {
-                        w.name = t;
-                        w.options.set("automatic-rename", "off".into());
+            self.panes.get_mut(&id).unwrap().title = t;
+        }
+        // allow-rename covers only ESC k (input_exit_rename); an empty name goes back to
+        // automatic-rename's inherited value, or to an empty name when that is off
+        if let Some(n) = rename.filter(|_| options::is_on(&self.opt_pane(id, "allow-rename"))) {
+            if let Some(wid) = self.window_of(id) {
+                if n.is_empty() {
+                    if let Some(w) = self.windows.get_mut(&wid) { w.options.unset("automatic-rename"); }
+                    if !self.opt_window_on(Some(wid), "automatic-rename") {
+                        if let Some(w) = self.windows.get_mut(&wid) { w.name = n; }
                     }
+                } else if let Some(w) = self.windows.get_mut(&wid) {
+                    w.name = n;
+                    w.options.set("automatic-rename", "off".into());
                 }
             }
         }
@@ -1996,7 +2034,11 @@ impl Server {
             Pane {
                 id,
                 generation,
-                parser: vt100::Parser::new_with_callbacks(nz(rows), nz(cols), history, PaneCb::default()),
+                parser: vt100::Parser::new_with_callbacks(nz(rows), nz(cols), history, {
+                    // screen_reinit: a new screen starts in mode 1 with extended-keys always
+                    let ext_option = ext_keys_option(&self.opt_server("extended-keys"));
+                    PaneCb { ext_option, ext_keys: (ext_option == 2) as u8, ..PaneCb::default() }
+                }),
                 input: itx,
                 master: pair.master,
                 killer,
@@ -2235,6 +2277,12 @@ impl Server {
         c.key_table = "root".into();
         if !was_attached {
             c.send(S_ATTACHED, if clear { b"" } else { b"no-clear" });
+            // tty_send_requests: ask a VT100-like terminal whether it has synchronized output
+            // (DECRQM 2026); the reply adds the sync feature
+            let term = c.ident.as_ref().map(|i| i.term.as_str()).unwrap_or("");
+            if c.control == 0 && !term.is_empty() && term != "dumb" {
+                c.send(S_OUTPUT, b"\x1b[?2026$p");
+            }
         }
         let writable = !self.client_is_readonly(Some(cid));
         let now = now_secs();

@@ -590,12 +590,10 @@ impl Vars for VarCtx<'_> {
             "pane_private_modes" => pane.map(|p| private_modes(p.screen())),
             "pane_tabs" => pane.map(|p| p.screen().tab_stops().iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",")).filter(|v| !v.is_empty()),
             "pane_key_mode" => pane.map(|p| {
-                let ek = srv.opt_server("extended-keys");
+                // the pane's own mode (format_cb_pane_key_mode)
                 match p.parser.callbacks().ext_keys {
-                    _ if ek == "off" => "VT10x",
                     2 => "Ext 2",
                     1 => "Ext 1",
-                    _ if ek == "always" => "Ext 1",
                     _ => "VT10x",
                 }.into()
             }),
@@ -824,8 +822,9 @@ mod tests {
         assert_eq!(srv.expand_for_pane(p, MODES), "0 0 1 0 0 default|7,25|8,16,24,32,40,48,56,64,72|0,23|0 4294967295,4294967295|none|hidden 0||0   |0 0 0 0| ");
         output(&mut srv, p, b"\x1b[4h\x1b[?6h\x1b[?7l\x1b[?12h\x1b[34l\x1b[5 q\x1b[?1004h\x1b[?1005h\x1b[?1006h\x1b[?1002h\x1b[?2004h\x1b[?2031h\x1b[3g\x1b[1;5H\x1bH\x1b[1;20H\x1bH\x1b[3;10r\x1b]12;rgb:ff/00/80\x07\x1b]9;4;1;42\x07\x1b]7;file://host/tmp/x\x07\x1b]133;A\x07\x1b]133;C\x07\x1b[?6l\x1b[2;3HQ\x1b[2;3H");
         assert_eq!(srv.expand_for_pane(p, MODES), "1 0 0 1 1 bar|12,25,1002,1004,1005,1006,2004,2031|4,19|2,9|0 4294967295,4294967295|#ff0080|normal 42|file://host/tmp/x|1  S P|1 1 1 0|Q");
+        // RIS keeps the cursor shape (screen_write_reset resets only the mode bits)
         output(&mut srv, p, b"\x1bc\x1b[2;5Hab\x1b[?1049hcd\x1b]133;D;7\x07\x1b]9;4;3\x07\x1b]112\x07\x1b[?2026h");
-        assert_eq!(srv.expand_for_pane(p, MODES), "0 0 1 0 0 default|7,25,2026|8,16,24,32,40,48,56,64,72|0,23|1 6,1|none|indeterminate 42|file://host/tmp/x|0 7 S P|0 0 0 1| ");
+        assert_eq!(srv.expand_for_pane(p, MODES), "0 0 1 0 0 bar|7,25,2026|8,16,24,32,40,48,56,64,72|0,23|1 6,1|none|indeterminate 42|file://host/tmp/x|0 7 S P|0 0 0 1| ");
         output(&mut srv, p, b"\x1b[?1049l\x1b[?2026l\x1b]133;C\x07\x1b]133;D;abc\x07\x1b]9;4;2;5\x07\x1b]12;#00ff00\x07\x1b[0 q\x1b[?12l");
         assert_eq!(srv.expand_for_pane(p, MODES), "0 0 1 0 0 default|7,25|8,16,24,32,40,48,56,64,72|0,23|0 6,1|#00ff00|error 5|file://host/tmp/x|0 255 S P|0 0 0 0| ");
         // tabs set by HTS move the cursor
@@ -846,11 +845,19 @@ mod tests {
         output(&mut srv, p, b"\x1b[>4;2m");
         // extended-keys off: the request is ignored
         assert_eq!(srv.expand_for_pane(p, "#{pane_key_mode}"), "VT10x");
+        // the mode is the pane's: turning the option on later does not apply the old request
         run(&mut srv, &["set", "-g", "extended-keys", "on"]);
+        assert_eq!(srv.expand_for_pane(p, "#{pane_key_mode}"), "VT10x");
+        output(&mut srv, p, b"\x1b[>4;2m");
         assert_eq!(srv.expand_for_pane(p, "#{pane_key_mode}"), "Ext 2");
         output(&mut srv, p, b"\x1b[>4n");
         assert_eq!(srv.expand_for_pane(p, "#{pane_key_mode}"), "VT10x");
+        // always: mode 1 from the next reset, and CSI > 4 n cannot go below it
         run(&mut srv, &["set", "-g", "extended-keys", "always"]);
+        assert_eq!(srv.expand_for_pane(p, "#{pane_key_mode}"), "VT10x");
+        output(&mut srv, p, b"\x1bc");
+        assert_eq!(srv.expand_for_pane(p, "#{pane_key_mode}"), "Ext 1");
+        output(&mut srv, p, b"\x1b[>4;2m\x1b[>4n");
         assert_eq!(srv.expand_for_pane(p, "#{pane_key_mode}"), "Ext 1");
         srv.shutdown();
     }

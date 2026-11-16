@@ -280,6 +280,14 @@ impl Grid {
         self.col_clamp();
     }
 
+    /// Moves the cursor ignoring origin mode, kept on the screen.
+    pub fn set_pos_abs(&mut self, pos: Pos) {
+        self.pos = Pos {
+            row: pos.row.min(self.size.rows() - 1),
+            col: pos.col.min(self.size.cols() - 1),
+        };
+    }
+
     pub fn save_cursor(&mut self) {
         self.saved_pos = self.pos;
         self.saved_origin_mode = self.origin_mode;
@@ -893,6 +901,23 @@ impl Grid {
         }
         // self.scroll_bottom is maintained to always be a valid row
         self.rows[usize::from(self.scroll_bottom)].wrap(false);
+    }
+
+    /// DECALN (screen_write_alignmenttest): E in every cell with default attributes, the
+    /// cursor home and the scroll region reset.
+    pub fn alignment_test(&mut self) {
+        let cols = self.size.cols();
+        for row in self.drawing_rows_mut() {
+            row.clear(crate::attrs::Attrs::default());
+            for col in 0..cols {
+                if let Some(cell) = row.get_mut(col) {
+                    cell.set('E', crate::attrs::Attrs::default());
+                }
+            }
+        }
+        self.scroll_top = 0;
+        self.scroll_bottom = self.size.rows() - 1;
+        self.pos = Pos::default();
     }
 
     pub fn set_scroll_region(&mut self, top: u16, bottom: u16) {
