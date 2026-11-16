@@ -57,6 +57,8 @@ enum Where {
     StatusDefault,
     /// A `range=control|N` (KEYC_MOUSE_LOCATION_CONTROL0 + N).
     Control(u32),
+    /// No pane there (a window with only floating panes).
+    Empty,
 }
 
 impl Where {
@@ -71,6 +73,7 @@ impl Where {
             Where::StatusLeft => "StatusLeft",
             Where::StatusRight => "StatusRight",
             Where::StatusDefault => "StatusDefault",
+            Where::Empty => "Empty",
             Where::Control(n) => ["Control0", "Control1", "Control2", "Control3", "Control4", "Control5", "Control6", "Control7", "Control8", "Control9"][n.min(9) as usize],
         }
     }
@@ -243,7 +246,30 @@ impl Server {
                 }
             }
         };
-        let Some((wh, mut ctx)) = self.mouse_where(cid, x, y) else { return };
+        // the window area outside a modal pane (not the status line): a drag of the modal
+        // pane goes on with it, anything else ends the drag and is dropped, and a press
+        // closes a new-pane -C pane
+        let mut held = None;
+        if let Some(modal) = self.modal_outside(cid, x, y) {
+            let c = self.clients.get_mut(&cid).unwrap();
+            let drag_pane = c.drag.as_ref().and_then(|d| match d.kind {
+                DragKind::Copy { pane } | DragKind::Float { pane, .. } | DragKind::NewFloat { pane, .. } | DragKind::Scrollbar { pane, .. } => Some(pane),
+                DragKind::Border => None,
+            });
+            if c.mouse_drag_flag != 0 && matches!(ty, Type::Drag | Type::Up) && drag_pane == Some(modal) {
+                held = Some(modal);
+            } else {
+                c.mouse_drag_flag = 0;
+                if let Some(Drag { kind: DragKind::Copy { pane } }) = c.drag.take() {
+                    self.copy_drag_timers.remove(&pane);
+                }
+                if matches!(ty, Type::Down | Type::Second | Type::Triple) && self.panes.get(&modal).is_some_and(|p| p.fflags & super::float::CLOSE_ON_CLICK != 0) {
+                    self.kill_pane(modal);
+                }
+                return;
+            }
+        }
+        let Some((wh, mut ctx)) = self.mouse_where(cid, x, y, held) else { return };
         // a slider drag keeps the point of the slider it started on
         if wh == Where::ScrollbarSlider {
             if let Some(c) = self.clients.get_mut(&cid).filter(|c| !matches!(c.drag, Some(Drag { kind: DragKind::Scrollbar { .. } }))) {
@@ -298,7 +324,7 @@ impl Server {
     }
 
     /// What is at client position (x, y): a status line range, a pane or a border.
-    fn mouse_where(&self, cid: ClientId, x: u16, y: u16) -> Option<(Where, MouseCtx)> {
+    fn mouse_where(&self, cid: ClientId, x: u16, y: u16, held: Option<PaneId>) -> Option<(Where, MouseCtx)> {
         let sid = self.client_session(cid)?;
         let s = &self.sessions[&sid];
         let c = &self.clients[&cid];
@@ -346,7 +372,34 @@ impl Server {
         if x > w.sx || py > w.sy {
             return None;
         }
+        // the window columns and rows shown on the client
+        let clip = (c.size.0.min(w.sx), (ch - nstatus).min(w.sy));
+        // floating panes are above the tiled ones and their status lines; nothing outside a
+        // modal pane can be reached (tmux window_get_active_at)
+        match self.float_at(wid, x as i32, py as i32) {
+            // a drag held by the modal pane outside it (tmux modal_drag)
+            Some(None) if held.is_some() => {
+                ctx.pane = held;
+                return Some((Where::Pane, ctx));
+            }
+            Some(None) => return None,
+            Some(Some(p)) => {
+                ctx.pane = Some(p);
+                let g = w.layout.geom(p)?;
+                let (xi, yi) = (x as i32, py as i32);
+                let inside = xi >= g.x && xi < g.x + g.w as i32 && yi >= g.y && yi < g.y + g.h as i32;
+                if inside {
+                    return Some((Where::Pane, ctx));
+                }
+                let wh = self.status_control(clip, wid, p, xi, yi, (g.x, g.y, g.w, g.h)).map_or(Where::Border, Where::Control);
+                return Some((wh, ctx));
+            }
+            None => {}
+        }
         for (pane, r) in self.rects(wid).0 {
+            if w.is_floating(pane) {
+                continue;
+            }
             // a hidden auto-hide bar takes no clicks (window_pane_scrollbar_visible)
             if let Some(sb) = self.pane_scrollbar(wid, pane, r).filter(|sb| sb.visible) {
                 if x >= sb.x && x < sb.x + sb.width && py >= sb.y && py < sb.y + sb.height {
@@ -361,11 +414,25 @@ impl Server {
             }
         }
         let rects: Vec<(PaneId, Rect)> = self.rects(wid).0.into_iter().map(|(p, r)| (p, self.content_rect(wid, r))).collect();
-        // window_get_active_at: the pane including its right and bottom border
-        let (pane, r) = *rects.iter().find(|(_, r)| x >= r.x && x <= r.right() && py >= r.y && py <= r.bottom())?;
+        // a pane's top status line goes before the bottom border of the pane above it
+        if self.opt_window(Some(wid), "pane-border-status") == "top" {
+            if let Some((pane, r)) = rects.iter().find(|(_, r)| r.y > 0 && py == r.y - 1 && x >= r.x && x <= r.right()) {
+                ctx.pane = Some(*pane);
+                let wh = self.status_control(clip, wid, *pane, x as i32, py as i32, (r.x as i32, r.y as i32, r.w, r.h)).map_or(Where::Border, Where::Control);
+                return Some((wh, ctx));
+            }
+        }
+        // window_get_active_at: the pane including its right and bottom border; nothing is
+        // the empty area of a window with only floating panes
+        let Some(&(pane, r)) = rects.iter().find(|(_, r)| x >= r.x && x <= r.right() && py >= r.y && py <= r.bottom()) else {
+            return Some((Where::Empty, ctx));
+        };
         ctx.pane = Some(pane);
         if x < r.right() && py < r.bottom() {
             return Some((Where::Pane, ctx));
+        }
+        if let Some(n) = self.status_control(clip, wid, pane, x as i32, py as i32, (r.x as i32, r.y as i32, r.w, r.h)) {
+            return Some((Where::Control(n), ctx));
         }
         if !w.zoomed {
             let on_border = rects.iter().any(|(_, f)| {
@@ -473,9 +540,52 @@ impl Server {
         }
     }
 
+    /// The control range (`range=control|N`) of a pane's status line at window position
+    /// (x, y), for a pane with content at `g` (tmux window_pane_status_get_range).
+    fn status_control(&self, clip: (u16, u16), wid: WinId, pane: PaneId, x: i32, y: i32, (gx, gy, gw, gh): (i32, i32, u16, u16)) -> Option<u32> {
+        let line = match self.pane_status(wid, pane) {
+            "top" => gy - 1,
+            "bottom" => gy + gh as i32,
+            _ => return None,
+        };
+        // the line starts two cells in, as wide as it is drawn
+        let i = usize::try_from(x - gx - 2).ok().filter(|_| y == line)?;
+        let width = self.pane_status_width(wid, pane, (gx + 2, line), gw.saturating_sub(2) as usize, clip);
+        match self.pane_status_line(pane, width, crate::cells::Style::default(), None).1.get(i)? {
+            Some(Range::Control(n)) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// The modal pane of the client's window when (x, y) of the client is outside it.
+    fn modal_outside(&self, cid: ClientId, x: u16, y: u16) -> Option<PaneId> {
+        let sid = self.client_session(cid)?;
+        let wid = self.sessions[&sid].active_window();
+        let w = &self.windows[&wid];
+        let modal = w.modal?;
+        // only the window area: tmux checks the modal pane where the event is on no status
+        // line, and drops events past the window first
+        let ch = self.clients[&cid].size.1;
+        let nstatus = self.status_lines(Some(sid)).min(ch.saturating_sub(1));
+        let top = self.opt_session(Some(sid), "status-position") == "top";
+        let py = match (nstatus, top) {
+            (0, _) => y,
+            (n, true) => y.checked_sub(n)?,
+            (n, false) if y >= ch - n => return None,
+            _ => y,
+        };
+        if x > w.sx || py > w.sy {
+            return None;
+        }
+        (!self.float_contains(wid, modal, x as i32, py as i32)).then_some(modal)
+    }
+
     /// Visible content rectangle of a pane in its window.
     pub fn pane_rect(&self, pane: PaneId) -> Option<Rect> {
         let wid = self.window_of(pane)?;
+        if let Some(g) = self.pane_geom(wid, pane).filter(|_| self.shown_floating(wid, pane)) {
+            return Some(Rect { x: g.x.max(0) as u16, y: g.y.max(0) as u16, w: g.w, h: g.h });
+        }
         let (rects, _) = self.rects(wid);
         rects.into_iter().find(|(p, _)| *p == pane).map(|(_, r)| self.content_rect(wid, r))
     }
@@ -542,12 +652,15 @@ impl Server {
             self.copy_scroll_to_mouse(cid, pane, m, exit);
             return;
         }
-        match self.clients.get(&cid).and_then(|c| c.drag.as_ref()).map(|d| match d.kind {
-            DragKind::Border | DragKind::Scrollbar { .. } => None,
-            DragKind::Copy { pane } => Some(pane),
-        }) {
-            Some(None) => self.border_drag_update(cid, m),
-            Some(Some(_)) => self.copy_drag_update(m),
+        let kind = self.clients.get(&cid).and_then(|c| c.drag.as_ref()).map(|d| match d.kind {
+            DragKind::Border | DragKind::Scrollbar { .. } => 0,
+            DragKind::Copy { .. } => 1,
+            DragKind::Float { .. } | DragKind::NewFloat { .. } => 2,
+        });
+        match kind {
+            Some(0) => self.border_drag_update(cid, m),
+            Some(1) => self.copy_drag_update(m),
+            Some(_) => self.float_drag_update(cid, m),
             None => {}
         }
     }

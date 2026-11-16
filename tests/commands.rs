@@ -340,8 +340,8 @@ fn compatible_layout_history_and_pane_indices() {
     ctx.ok(&["select-layout", "-o", "-t", "s"]);
     assert_eq!(ctx.fmt("s", "#{window_layout}"), spread);
     ctx.ok(&["select-layout", "-o", "-t", "s"]);
-    // Restoring a layout string assigns panes in list order, like tmux.
-    assert_eq!(ctx.fmt("s:0.2", "#{pane_left} #{pane_width}"), "41 80");
+    // Restoring a JSON layout puts each pane back in the cell of its index (tmux 3.8).
+    assert_eq!(ctx.fmt("s:0.0", "#{pane_left} #{pane_width}"), "41 80");
     ctx.ok(&["select-layout", "-t", "s", "even-horiz"]);
     ctx.fails(&["select-layout", "-t", "s", "even-"]);
 }
@@ -754,6 +754,32 @@ fn control_mode() {
     wait_for("%window-renamed", || text().contains("renamed-win\n") && text().contains("%window-renamed @"));
     send("split-window");
     wait_for("%layout-change", || text().contains("%layout-change @"));
+    // control clients get old-format layouts unless they set new-layouts (tmux 3.8)
+    let change = text().lines().find(|l| l.starts_with("%layout-change @")).unwrap().to_string();
+    assert!(change.split(' ').nth(2).is_some_and(|l| l.as_bytes().get(4) == Some(&b',')) && !change.contains("\"V\":2"), "{change}");
+    send("display-message -p 'L=#{window_layout}'");
+    wait_for("old layout", || text().lines().any(|l| l.starts_with("L=") && l.as_bytes().get(6) == Some(&b',')));
+    // floating panes and zoom are layout changes too, though the old format leaves them out
+    let changes = || text().lines().filter(|l| l.starts_with("%layout-change @")).count();
+    let before = changes();
+    send("new-pane -d -x 10 -y 4");
+    wait_for("floating %layout-change", || changes() == before + 1);
+    send("resize-pane -Z");
+    wait_for("zoom %layout-change", || text().lines().any(|l| l.starts_with("%layout-change @") && l.ends_with(" *Z")));
+    send("resize-pane -Z");
+    wait_for("unzoom %layout-change", || changes() == before + 3);
+    send("kill-pane -t :.2");
+    wait_for("closed floating %layout-change", || changes() == before + 4);
+    send("refresh-client -f new-layouts");
+    send("display-message -p 'J=#{window_layout}'");
+    wait_for("JSON layout", || text().contains("J={\"V\":2,\"L\":"));
+    // switching the format is no layout change of its own, nor is selecting a pane
+    let before = changes();
+    send("select-pane -t :.0");
+    send("refresh-client -f !new-layouts");
+    send("display-message -p 'O=#{window_layout}'");
+    wait_for("old layout again", || text().lines().any(|l| l.starts_with("O=") && l.as_bytes().get(6) == Some(&b',')));
+    assert_eq!(changes(), before, "{}", text());
     send("kill-window");
     wait_for("%window-close", || text().contains("%window-close @"));
     send("no-such-command");
@@ -1756,7 +1782,7 @@ fn global_colour_flags_accumulate_in_both_orders() {
 #[test]
 fn display_defaults_match_tmux_38_source() {
     // The bindings fixture is the key-bindings.c string array with DEFAULT_* macros
-    // expanded, with only the delegated floating/switch-mode bindings excluded.
+    // expanded.
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     #[cfg(unix)]
     {
@@ -1777,23 +1803,15 @@ fn display_defaults_match_tmux_38_source() {
     let ctx = Ctx::new("display-defaults");
     ctx.ok(&["new-session", "-d", "-s", "s"]);
     let actual = [ctx.ok(&["list-keys", "-T", "prefix"]), ctx.ok(&["list-keys", "-T", "root"]), ctx.ok(&["list-keys", "-N"])];
-    // Bindings of the floating pane (and switch-mode) packages; the floating
-    // commands' flags are needed to print the default menus' floating items.
-    const DELEGATED: &[&str] = &["Tab", "BTab", "*", "@", "g", "M-Up", "M-Left", "C-Up", "C-Left", "MouseDown1Control7",
-        "M-MouseDrag1Pane", "M-MouseDrag1Border", "C-MouseDrag1Pane", "C-MouseDrag1Empty"];
-    let floating = !ctx.ok(&["list-commands", "new-pane"]).trim().is_empty();
     let key = |l: &str| -> String {
         let w: Vec<&str> = l.split_whitespace().collect();
         if w[0] == "bind-key" { w[if w[1] == "-r" { 4 } else { 3 }].to_string() } else { w[1].to_string() }
     };
     for (want, got) in sections.iter().zip(&actual) {
-        let want: Vec<&str> = want.iter().copied().filter(|l| !DELEGATED.contains(&key(l).as_str())).collect();
-        let got: Vec<&str> = got.lines().filter(|l| !DELEGATED.contains(&key(l).as_str())).collect();
+        let got: Vec<&str> = got.lines().collect();
         assert_eq!(want.iter().map(|l| key(l)).collect::<Vec<_>>(), got.iter().map(|l| key(l)).collect::<Vec<_>>());
         for (w, g) in want.iter().zip(&got) {
-            if floating || !(w.contains("new-pane") || w.contains("move-pane -P")) {
-                assert_eq!(w, g);
-            }
+            assert_eq!(w, g);
         }
     }
     let prefix = &actual[0];
@@ -2850,4 +2868,44 @@ fn tmux_38_source_errors_respawn_and_control_parse() {
     assert!(ctx.fails(&["show", "-gv", "@ran"]).contains("invalid option"));
     child.kill().unwrap();
     let _ = child.wait();
+}
+
+#[test]
+fn floating_panes_from_the_cli() {
+    let ctx = Ctx::new("float");
+    ctx.ok(&["new-session", "-d", "-s", "f", "-x", "80", "-y", "24"]);
+    let tiled = ctx.fmt("f", "#{pane_id}");
+    // new-pane: half the width, a quarter of the height, cascaded from the top left
+    let fp = ctx.ok(&["new-pane", "-d", "-P", "-F", "#{pane_id}", "-t", "f"]).trim().to_string();
+    assert_eq!(ctx.fmt(&fp, "#{pane_floating_flag} #{pane_width}x#{pane_height} #{pane_x},#{pane_y} #{pane_z} #{pane_flags}"), "1 40x6 4,2 0 F");
+    assert_eq!(ctx.fmt(&tiled, "#{pane_z} #{pane_active}"), "2 1");
+    let layout = ctx.fmt("f", "#{window_layout}");
+    assert!(layout.starts_with(r#"{"V":2,"L":{"t":"v","w":80,"h":24,"x":0,"y":0,"c":["#), "{layout}");
+    assert!(layout.contains(&format!(r#""w":40,"h":6,"x":4,"y":2,"i":1,"z":0,"I":"{fp}""#)), "{layout}");
+    // the layout restores sizes, positions and the z-order
+    ctx.ok(&["move-pane", "-t", &fp, "-P", "centre"]);
+    ctx.ok(&["select-layout", "-t", "f", &layout]);
+    assert_eq!(ctx.fmt(&fp, "#{pane_x},#{pane_y}"), "4,2");
+    // float the tiled pane and tile it back
+    ctx.ok(&["split-window", "-d", "-h", "-t", &tiled]);
+    ctx.ok(&["break-pane", "-W", "-s", &tiled, "-x", "30", "-y", "10"]);
+    assert_eq!(ctx.fmt(&tiled, "#{pane_floating_flag} #{pane_width}x#{pane_height} #{pane_active}"), "1 28x8 1");
+    ctx.ok(&["join-pane"]);
+    assert_eq!(ctx.fmt(&tiled, "#{pane_floating_flag} #{pane_width}"), "0 40");
+    // modal panes
+    let m = ctx.ok(&["new-pane", "-O", "-P", "-F", "#{pane_id}", "-t", "f"]).trim().to_string();
+    assert_eq!(ctx.fmt("f", "#{window_modal_pane} #{window_raw_flags}"), format!("{m} *O"));
+    ctx.ok(&["select-pane", "-t", &tiled]);
+    assert_eq!(ctx.fmt("f", "#{pane_id}"), m);
+    assert!(ctx.fails(&["new-pane", "-O", "-t", "f"]).contains("window already has a modal pane"));
+    ctx.ok(&["kill-pane", "-t", &m]);
+    assert_eq!(ctx.fmt("f", "#{window_modal_pane}"), "");
+    // new-pane -W returns the command's exit status
+    #[cfg(unix)]
+    {
+        let out = ctx.command().args(["new-pane", "-W", "-t", "f", "exit 3"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        // it waits silently: no (empty) error line on stderr
+        assert!(out.stderr.is_empty(), "{:?}", String::from_utf8_lossy(&out.stderr));
+    }
 }

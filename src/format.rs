@@ -2061,8 +2061,37 @@ pub struct Span {
     pub align: Align,
     /// Mouse range. As in tmux, a range only counts once a later `#[...]` ends it.
     pub range: Option<Range>,
-    /// The last span of a range: tmux's range then covers one more cell.
+    /// The last span of a range (ranges end exactly there: status_get_range in 3.8).
     pub range_end: bool,
+    /// Which part of a `list=` the span is in (format_draw's LIST, LIST_LEFT, LIST_RIGHT and
+    /// AFTER screens); `align` is then the alignment of the list.
+    pub part: Part,
+    /// In the list's focus (`list=focus` up to the next `list=on`), kept visible when trimmed.
+    pub focus: bool,
+}
+
+/// The format_draw screen of a span outside its alignment group.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Part {
+    #[default]
+    Normal,
+    List,
+    ListLeft,
+    ListRight,
+    /// After the end of the list, in the list's alignment.
+    After,
+    /// A list (and what follows it) without an alignment: format_draw never draws it.
+    Hidden,
+}
+
+/// The sticky `list=` word of the current style (tmux style.list).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ListWord {
+    Off,
+    On,
+    Focus,
+    LeftMarker,
+    RightMarker,
 }
 
 /// Split already-expanded text into styled spans: `#[fg=red]a#[default]b`.
@@ -2084,11 +2113,19 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
     let mut range: Option<Range> = None;
     let mut range_start = 0;
     let mut buf = String::new();
-    // list=left-marker/right-marker text is only shown by tmux when the list is
-    // cut; lists are never cut here, so it is dropped
-    let mut in_marker = false;
+    // format_draw's list state: -1 before the list, 0 in it, 1 after it
+    let mut list_word = ListWord::Off;
+    let mut list_state = -1;
+    let mut list_align = Align::Left;
+    // whether align= was given (tmux STYLE_ALIGN_DEFAULT otherwise) and the list had none
+    let (mut align_set, mut list_hidden) = (false, false);
+    let mut part = Part::Normal;
+    // focus: 0 not started, 1 open (from this span index), 2 ended
+    let mut focus = (0, 0);
+    let (mut have_left, mut have_right) = (false, false);
 
-    fn flush(out: &mut Vec<Span>, buf: &mut String, style: Style, align: Align, range: &Option<Range>, link: &Option<String>) {
+    #[allow(clippy::too_many_arguments)]
+    fn flush(out: &mut Vec<Span>, buf: &mut String, style: Style, align: Align, range: &Option<Range>, link: &Option<String>, part: Part, focus: bool) {
         if buf.is_empty() {
             return;
         }
@@ -2098,10 +2135,12 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
             && last.align == align
             && last.range == *range
             && !last.range_end
+            && last.part == part
+            && last.focus == focus
         {
             last.text.push_str(buf);
         } else {
-            out.push(Span { text: buf.clone(), link: link.clone(), style, align, range: range.clone(), range_end: false });
+            out.push(Span { text: buf.clone(), link: link.clone(), style, align, range: range.clone(), range_end: false, part, focus });
         }
         buf.clear();
     }
@@ -2110,9 +2149,7 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
     while i < text.len() {
         let rest = &text[i..];
         if rest.starts_with("##") {
-            if !in_marker {
-                buf.push('#');
-            }
+            buf.push('#');
             i += 2;
         } else if rest.starts_with("#[")
             && let Some(e) = rest.find(']')
@@ -2123,7 +2160,12 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
                 i += e + 1;
                 continue;
             }
-            flush(&mut out, &mut buf, cur, align, &range, &link);
+            flush(&mut out, &mut buf, cur, if part == Part::Normal { align } else { list_align }, &range, &link, part, part == Part::List && focus.0 == 1);
+            match out.last().map(|l| l.part) {
+                Some(Part::ListLeft) => have_left = true,
+                Some(Part::ListRight) => have_right = true,
+                _ => {}
+            }
             let before = range.clone();
             let saved = cur;
             for w in style_words(&rest[2..e]) {
@@ -2143,22 +2185,96 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
                     }
                     "pop-default" => default = defaults.pop().unwrap_or(base),
                     "norange" => range = None,
-                    "list=left-marker" | "list=right-marker" => in_marker = true,
-                    "list=on" | "list=focus" | "nolist" => in_marker = false,
+                    "nolist" => list_word = ListWord::Off,
+                    "noalign" => {
+                        align_set = false;
+                        let _ = apply_word(w, &mut cur, &mut align, default, None);
+                    }
+                    _ if lower.starts_with("align=") => {
+                        align_set = true;
+                        let _ = apply_word(w, &mut cur, &mut align, default, None);
+                    }
+                    "list=on" => list_word = ListWord::On,
+                    "list=focus" => list_word = ListWord::Focus,
+                    "list=left-marker" => list_word = ListWord::LeftMarker,
+                    "list=right-marker" => list_word = ListWord::RightMarker,
                     _ if lower.starts_with("range=") => {
                         if let Ok(r) = Range::parse(&w[6..]) {
                             range = r;
                         }
                     }
+                    // as style_parse in 3.8, default keeps the range
                     "default" => {
                         link = None;
-                        range = None;
                         let _ = apply_word(w, &mut cur, &mut align, default, vars);
                     }
                     _ => {
                         let _ = apply_word(w, &mut cur, &mut align, default, vars);
                     }
                 }
+            }
+            // The list state (format_draw): entering or leaving the list or a marker drops
+            // a range still open, and the focus ends at the next list=on.
+            let mut abort = false;
+            match list_word {
+                ListWord::On => {
+                    if list_state != 0 {
+                        abort = true;
+                        list_state = 0;
+                        list_align = align;
+                        list_hidden = !align_set;
+                    }
+                    if focus.0 == 1 {
+                        focus.0 = 2;
+                    }
+                    part = if list_hidden { Part::Hidden } else { Part::List };
+                }
+                ListWord::Focus => {
+                    if list_state == 0 && focus.0 == 0 {
+                        focus = (1, out.len());
+                    }
+                }
+                ListWord::Off => {
+                    if list_state == 0 {
+                        abort = true;
+                        if focus.0 == 1 {
+                            focus.0 = 2;
+                        }
+                        list_state = 1;
+                    }
+                    part = match (list_state == 1, list_hidden) {
+                        (true, true) if !align_set => Part::Hidden,
+                        (true, false) if align == list_align => Part::After,
+                        _ => Part::Normal,
+                    };
+                }
+                ListWord::LeftMarker | ListWord::RightMarker => {
+                    let left = list_word == ListWord::LeftMarker;
+                    if list_state == 0 && !(if left { have_left } else { have_right }) {
+                        abort = true;
+                        if focus.0 == 1 {
+                            // a marker inside the focus cancels it
+                            for sp in &mut out[focus.1..] {
+                                sp.focus = false;
+                            }
+                            focus.0 = 0;
+                        }
+                        part = if list_hidden {
+                            Part::Hidden
+                        } else if left {
+                            Part::ListLeft
+                        } else {
+                            Part::ListRight
+                        };
+                    }
+                }
+            }
+            if abort && before.is_some() {
+                for sp in &mut out[range_start..] {
+                    sp.range = None;
+                    sp.range_end = false;
+                }
+                range_start = out.len();
             }
             // Control ranges all match (format_is_type), so a new one continues the open one.
             if matches!((&before, &range), (Some(Range::Control(_)), Some(Range::Control(_)))) {
@@ -2174,13 +2290,11 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
             i += e + 1;
         } else {
             let c = rest.chars().next().unwrap();
-            if !in_marker {
-                buf.push(c);
-            }
+            buf.push(c);
             i += c.len_utf8();
         }
     }
-    flush(&mut out, &mut buf, cur, align, &range, &link);
+    flush(&mut out, &mut buf, cur, if part == Part::Normal { align } else { list_align }, &range, &link, part, part == Part::List && focus.0 == 1);
     // a range still open at the end is dropped, as tmux does
     if range.is_some() {
         for sp in &mut out[range_start..] {
@@ -2200,7 +2314,6 @@ pub fn width(s: &str) -> usize {
 fn group_cells_ranged<'a>(spans: impl Iterator<Item = &'a Span>) -> (Vec<Cell>, Vec<Option<Range>>) {
     let mut cells: Vec<Cell> = Vec::new();
     let mut tags: Vec<Option<Range>> = Vec::new();
-    let mut extend: Option<Range> = None;
     for sp in spans {
         let tag = sp.range.clone();
         for c in sp.text.chars() {
@@ -2215,8 +2328,7 @@ fn group_cells_ranged<'a>(spans: impl Iterator<Item = &'a Span>) -> (Vec<Cell>, 
                 }
                 Some(w) => {
                     cells.push(Cell { text: c.to_string(), style: sp.style });
-                    // a range that ended just before covers this cell too
-                    tags.push(extend.take().or_else(|| tag.clone()));
+                    tags.push(tag.clone());
                     for _ in 1..w {
                         cells.push(Cell { text: String::new(), style: sp.style });
                         tags.push(tag.clone());
@@ -2224,21 +2336,97 @@ fn group_cells_ranged<'a>(spans: impl Iterator<Item = &'a Span>) -> (Vec<Cell>, 
                 }
             }
         }
-        if sp.range_end {
-            extend = sp.range.clone();
-        }
     }
     (cells, tags)
 }
 
-/// Copy `cells[from..from+n]` to `out[at..]`, blanking wide characters cut at either edge.
-fn put(out: &mut [Cell], at: usize, cells: &[Cell], from: usize, n: usize, fill: Style) {
-    let blank = Cell { text: " ".into(), style: fill };
-    for k in 0..n {
-        let src = &cells[from + k];
-        let cut_start = k == 0 && src.is_continuation();
-        let cut_end = k == n - 1 && cells.get(from + k + 1).is_some_and(Cell::is_continuation);
-        out[at + k] = if cut_start || cut_end { blank.clone() } else { src.clone() };
+/// One of format_draw's screens: its cells and the mouse range under each.
+struct Screen {
+    cells: Vec<Cell>,
+    tags: Vec<Option<Range>>,
+}
+
+impl Screen {
+    fn of<'a>(spans: impl Iterator<Item = &'a Span>) -> Screen {
+        let (cells, tags) = group_cells_ranged(spans);
+        Screen { cells, tags }
+    }
+
+    fn len(&self) -> usize {
+        self.cells.len()
+    }
+
+    /// Append the first `n` cells of another screen (screen_write_fast_copy onto this one).
+    fn append(&mut self, other: &Screen, n: usize) {
+        self.cells.extend_from_slice(&other.cells[..n]);
+        self.tags.extend_from_slice(&other.tags[..n]);
+    }
+}
+
+/// The line being drawn: cells nothing was drawn on stay None.
+struct Out {
+    cells: Vec<Option<Cell>>,
+    tags: Vec<Option<Range>>,
+    fill: Style,
+}
+
+impl Out {
+    /// format_draw_put: copy `n` cells of `s` from `from` to `at`, blanking wide characters
+    /// cut at either edge.
+    fn put(&mut self, at: usize, s: &Screen, from: usize, n: usize) {
+        let n = n.min(self.cells.len().saturating_sub(at)).min(s.len().saturating_sub(from));
+        for k in 0..n {
+            let src = &s.cells[from + k];
+            let cut_start = k == 0 && src.is_continuation();
+            let cut_end = k == n - 1 && s.cells.get(from + k + 1).is_some_and(Cell::is_continuation);
+            self.cells[at + k] = Some(if cut_start || cut_end { Cell { text: " ".into(), style: self.fill } } else { src.clone() });
+            self.tags[at + k] = s.tags[from + k].clone();
+        }
+    }
+
+    /// format_draw_put_list: the list, trimmed around its focus with the markers at a cut end.
+    #[allow(clippy::too_many_arguments)]
+    fn put_list(&mut self, mut at: usize, mut width: usize, list: &Screen, left: &Screen, right: &Screen, focus: (usize, usize)) {
+        if width >= list.len() {
+            self.put(at, list, 0, width);
+            return;
+        }
+        let centre = focus.0 + (focus.1.saturating_sub(focus.0)) / 2;
+        let mut start = centre.saturating_sub(width / 2);
+        if start + width > list.len() {
+            start = list.len() - width;
+        }
+        if start != 0 && width > left.len() {
+            self.put(at, left, 0, left.len());
+            at += left.len();
+            start += left.len();
+            width -= left.len();
+        }
+        if start + width < list.len() && width > right.len() {
+            self.put(at + width - right.len(), right, 0, right.len());
+            width -= right.len();
+        }
+        self.put(at, list, start, width);
+    }
+
+    /// format_draw_none.
+    fn none(&mut self, left: &Screen, centre: &Screen, right: &Screen, abs: &Screen) {
+        let width = self.cells.len();
+        let (mut lw, mut cw, mut rw) = (left.len(), centre.len(), right.len());
+        while lw + cw + rw > width {
+            if cw > 0 {
+                cw -= 1;
+            } else if rw > 0 {
+                rw -= 1;
+            } else {
+                lw -= 1;
+            }
+        }
+        self.put(0, left, 0, lw);
+        self.put(width - rw, right, right.len() - rw, rw);
+        self.put((lw + (width - rw - lw) / 2).saturating_sub(cw / 2), centre, centre.len() / 2 - cw / 2, cw);
+        let aw = abs.len().min(width);
+        self.put((width - aw) / 2, abs, 0, aw);
     }
 }
 
@@ -2251,42 +2439,130 @@ pub fn layout_line(spans: &[Span], width: usize, fill: Style) -> Vec<Cell> {
 
 /// [`layout_line`] plus the mouse range (`#[range=...]`) under every cell.
 pub fn layout_line_ranged(spans: &[Span], width: usize, fill: Style) -> (Vec<Cell>, Vec<Option<Range>>) {
-    let mut out = vec![Cell { text: " ".into(), style: fill }; width];
-    let mut tags: Vec<Option<Range>> = vec![None; width];
-    let group = |a: Align| group_cells_ranged(spans.iter().filter(move |s| s.align == a));
-    let ((left, ltags), (centre, ctags), (right, rtags)) = (group(Align::Left), group(Align::Centre), group(Align::Right));
-    let (mut lw, mut cw, mut rw) = (left.len(), centre.len(), right.len());
-    while lw + cw + rw > width {
-        if cw > 0 {
+    let (cells, tags) = draw_line(spans, width, fill);
+    (cells.into_iter().map(|c| c.unwrap_or_else(|| Cell { text: " ".into(), style: fill })).collect(), tags)
+}
+
+/// tmux format_draw: lay the spans out in `width` cells, with a `list=` trimmed around its
+/// focus and given its markers when it does not fit. Cells nothing is drawn on are None
+/// (tmux leaves what was there, such as the border line under a pane status line).
+pub fn draw_line(spans: &[Span], width: usize, fill: Style) -> (Vec<Option<Cell>>, Vec<Option<Range>>) {
+    let mut out = Out { cells: vec![None; width], tags: vec![None; width], fill };
+    let normal = |a: Align| Screen::of(spans.iter().filter(move |s| s.part == Part::Normal && s.align == a));
+    let part = |p: Part| Screen::of(spans.iter().filter(move |s| s.part == p));
+    let (mut left, mut centre, mut right, abs) = (normal(Align::Left), normal(Align::Centre), normal(Align::Right), normal(Align::AbsoluteCentre));
+    let Some(list_align) = spans.iter().find(|s| !matches!(s.part, Part::Normal | Part::Hidden)).map(|s| s.align) else {
+        out.none(&left, &centre, &right, &abs);
+        return (out.cells, out.tags);
+    };
+    let (list, ll, lr, after) = (part(Part::List), part(Part::ListLeft), part(Part::ListRight), part(Part::After));
+    // the focus as cell offsets in the list
+    let list_spans: Vec<&Span> = spans.iter().filter(|s| s.part == Part::List).collect();
+    let focus = list_spans.iter().position(|s| s.focus).map(|first| {
+        let last = list_spans.iter().rposition(|s| s.focus).unwrap();
+        (Screen::of(list_spans[..first].iter().copied()).len(), Screen::of(list_spans[..=last].iter().copied()).len())
+    });
+    let (lw0, cw0, rw0, aw0) = (left.len(), centre.len(), right.len(), abs.len());
+    let (mut lw, mut cw, mut rw, mut aw) = (lw0, cw0, rw0, aw0);
+    let (mut listw, mut afterw) = (list.len(), after.len());
+    if list_align == Align::AbsoluteCentre {
+        // format_draw_absolute_centre: the list, after it and the absolute centre are trimmed
+        // apart from the rest, which they are drawn over
+        while lw + cw + rw > width {
+            if cw > 0 {
+                cw -= 1;
+            } else if rw > 0 {
+                rw -= 1;
+            } else {
+                lw -= 1;
+            }
+        }
+        while listw + afterw + aw > width {
+            if listw > 0 {
+                listw -= 1;
+            } else if afterw > 0 {
+                afterw -= 1;
+            } else {
+                aw -= 1;
+            }
+        }
+        out.put(0, &left, 0, lw);
+        out.put(width - rw, &right, rw0 - rw, rw);
+        let middle = lw + (width - rw - lw) / 2;
+        out.put(middle.saturating_sub(cw), &centre, 0, cw);
+        let focus = focus.unwrap_or((list.len() / 2, list.len() / 2));
+        let mut at = (width - listw - aw) / 2;
+        out.put(at, &abs, 0, aw);
+        at += aw;
+        out.put_list(at, listw, &list, &ll, &lr, focus);
+        at += listw;
+        out.put(at, &after, 0, afterw);
+        return (out.cells, out.tags);
+    }
+    // format_draw_left/centre/right: trim the centre first (the list first in the centre)
+    while lw + cw + rw + listw + afterw > width {
+        if list_align == Align::Centre {
+            if listw > 0 {
+                listw -= 1;
+            } else if afterw > 0 {
+                afterw -= 1;
+            } else if cw > 0 {
+                cw -= 1;
+            } else if rw > 0 {
+                rw -= 1;
+            } else {
+                lw -= 1;
+            }
+        } else if cw > 0 {
             cw -= 1;
+        } else if listw > 0 {
+            listw -= 1;
         } else if rw > 0 {
             rw -= 1;
+        } else if afterw > 0 {
+            afterw -= 1;
         } else {
             lw -= 1;
         }
     }
-    if lw > 0 {
-        put(&mut out, 0, &left, 0, lw, fill);
-        tags[..lw].clone_from_slice(&ltags[..lw]);
+    if listw == 0 {
+        // no list left: what follows it joins its alignment group
+        match list_align {
+            Align::Left => left.append(&after, afterw),
+            Align::Centre => centre.append(&after, afterw),
+            _ => right.append(&after, afterw),
+        }
+        out.none(&left, &centre, &right, &abs);
+        return (out.cells, out.tags);
     }
-    if rw > 0 {
-        put(&mut out, width - rw, &right, right.len() - rw, rw, fill);
-        tags[width - rw..].clone_from_slice(&rtags[right.len() - rw..]);
+    out.put(0, &left, 0, lw);
+    match list_align {
+        Align::Left => {
+            out.put(width - rw, &right, rw0 - rw, rw);
+            out.put(lw + listw, &after, 0, afterw);
+            let used = lw + listw + afterw;
+            out.put((used + (width - rw - used) / 2).saturating_sub(cw / 2), &centre, cw0 / 2 - cw / 2, cw);
+            out.put_list(lw, listw, &list, &ll, &lr, focus.unwrap_or((0, 0)));
+        }
+        Align::Centre => {
+            out.put(width - rw, &right, rw0 - rw, rw);
+            let middle = lw + (width - rw - lw) / 2;
+            out.put((middle - listw / 2).saturating_sub(cw), &centre, 0, cw);
+            out.put(middle - listw / 2 + listw, &after, 0, afterw);
+            let f = focus.unwrap_or((list.len() / 2, list.len() / 2));
+            out.put_list(middle - listw / 2, listw, &list, &ll, &lr, f);
+        }
+        _ => {
+            out.put(width - afterw, &after, after.len() - afterw, afterw);
+            let rend = width - rw - listw - afterw;
+            out.put(rend, &right, 0, rw);
+            out.put((lw + (rend - lw) / 2).saturating_sub(cw / 2), &centre, cw0 / 2 - cw / 2, cw);
+            out.put_list(width - listw - afterw, listw, &list, &ll, &lr, focus.unwrap_or((0, 0)));
+        }
     }
-    if cw > 0 {
-        let at = lw + (width - rw - lw) / 2 - cw / 2;
-        let from = centre.len() / 2 - cw / 2;
-        put(&mut out, at, &centre, from, cw, fill);
-        tags[at..at + cw].clone_from_slice(&ctags[from..from + cw]);
-    }
-    let (absolute, atags) = group(Align::AbsoluteCentre);
-    let aw = absolute.len().min(width);
-    if aw > 0 {
-        let at = (width - aw) / 2;
-        put(&mut out, at, &absolute, 0, aw, fill);
-        tags[at..at + aw].clone_from_slice(&atags[..aw]);
-    }
-    (out, tags)
+    let aw = aw0.min(width);
+    out.put((width - aw) / 2, &abs, 0, aw);
+    (out.cells, out.tags)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2310,15 +2586,39 @@ mod tests {
     use crate::cells::{BLINK, BOLD, DIM, INVERSE, ITALIC, STRIKE, UNDERLINE};
 
     #[test]
+    fn lists_are_trimmed_around_their_focus() {
+        // outputs of tmux 3.8 with these status-format lines on a 12 column client
+        let base = Style::default();
+        let line = |s: &str| layout_line(&spans(s, base), 12, base).iter().map(|c| c.text.as_str()).collect::<String>();
+        // a list without an alignment is never drawn, nor what follows it in that alignment
+        assert_eq!(line("#[list=on]#[list=left-marker]<#[list=right-marker]>#[list=on]aaaa bbbb #[list=focus]CCCC#[list=on] dddd#[nolist]X"), " ".repeat(12));
+        assert_eq!(line("LLLLLLLLLL#[list=on]abcdef#[nolist]AFTER#[align=right]RR"), "LLLLLLLLLLRR");
+        let markers = "#[list=left-marker]<#[list=right-marker]>#[list=on]";
+        assert_eq!(line(&format!("#[list=on align=left]{markers}aaaa bbbb #[list=focus]CCCC#[list=on] dddd#[nolist]X")), "<b CCCC dd>X");
+        assert_eq!(line(&format!("#[list=on align=left]{markers}aaaa bbbb CCCC dddd#[nolist]X")), "aaaa bbbb >X");
+        let markers2 = "#[list=left-marker]<<#[list=right-marker]>>#[list=on]";
+        assert_eq!(line(&format!("L#[align=right list=on]{markers2}aa #[list=focus]BB#[list=on] cc dd ee#[nolist align=right]Z")), "Laa BB cc>>Z");
+        assert_eq!(line(&format!("L#[list=on align=centre]{markers}aa bb #[list=focus]CC#[list=on] dd ee ff#[nolist align=centre]Z#[align=right]R")), "L <b CC dd>Z");
+        assert_eq!(line(&format!("L#[list=on align=absolute-centre]{markers}aa bb cc #[list=focus]DD#[list=on] ee#[nolist]Z#[align=right]R")), "<b cc DD eeZ");
+        assert_eq!(line("#[list=on align=centre]ab#[nolist]Z#[align=right]R"), "    abZ    R");
+        // ranges in the list move with it; a range open as the list starts is dropped
+        let (cells, tags) = draw_line(&spans("#[range=user|a]x#[list=on align=right range=pane|%3]pp#[norange]", base), 6, base);
+        assert_eq!(tags, vec![None, None, None, None, Some(Range::Pane(3)), Some(Range::Pane(3))]);
+        // nothing drawn where nothing is (a pane status line keeps its border there)
+        assert!(cells[1].is_none() && cells[4].is_some());
+    }
+
+    #[test]
     fn mouse_ranges_follow_tmux_format_draw() {
         let base = Style::default();
         let tags = |s: &str| layout_line_ranged(&spans(s, base), 8, base).1;
         let w = |n| Some(Range::Window(n));
-        // a closed range covers one cell more; one still open at the end counts for nothing
-        assert_eq!(tags("#[range=window|3]ab#[norange]cd#[range=left]ef"), vec![w(3), w(3), w(3), None, None, None, None, None]);
-        // #[default] ends a range too; where ranges overlap the earlier one wins
-        assert_eq!(tags("#[range=window|1]a#[default]#[range=window|2]b#[norange]"), vec![w(1), w(1), None, None, None, None, None, None]);
-        assert_eq!(tags("#[range=window|1]a#[default]x#[range=window|2]b#[norange]y"), vec![w(1), w(1), w(2), w(2), None, None, None, None]);
+        // a closed range covers its cells (3.8); one still open at the end counts for nothing
+        assert_eq!(tags("#[range=window|3]ab#[norange]cd#[range=left]ef"), vec![w(3), w(3), None, None, None, None, None, None]);
+        // #[default] keeps the range (style_parse), even in the directive that starts it
+        assert_eq!(tags("#[range=window|1]a#[default]#[range=window|2]b#[norange]"), vec![w(1), w(2), None, None, None, None, None, None]);
+        assert_eq!(tags("#[range=window|1]a#[default]x#[range=window|2]b#[norange]y"), vec![w(1), w(1), w(2), None, None, None, None, None]);
+        assert_eq!(tags("#[range=window|4 default]ab#[norange]c"), vec![w(4), w(4), None, None, None, None, None, None]);
         // ranges keep to their alignment group
         let right = tags("x#[align=right]#[range=right]RR#[norange]");
         assert_eq!(right[6..], [Some(Range::Right), Some(Range::Right)]);
@@ -3017,8 +3317,8 @@ mod tests {
         assert_eq!(
             sp,
             vec![
-                Span { text: "a".into(), link: None, style: st(Color::Idx(1), 0), align: Align::Left, range: None, range_end: false },
-                Span { text: "b".into(), link: None, style: base, align: Align::Left, range: None, range_end: false },
+                Span { text: "a".into(), link: None, style: st(Color::Idx(1), 0), align: Align::Left, range: None, range_end: false, part: Part::Normal, focus: false },
+                Span { text: "b".into(), link: None, style: base, align: Align::Left, range: None, range_end: false, part: Part::Normal, focus: false },
             ]
         );
         // Merging of identical styles, `##` → `#`, `##[` is literal.
@@ -3042,8 +3342,10 @@ mod tests {
     #[test]
     fn list_markers_are_not_drawn() {
         let base = Style::default();
-        let text: String = spans("P: #[list=on]#[list=left-marker]<#[list=right-marker]>#[list=on]a b#[nolist] R", base).iter().map(|s| s.text.as_str()).collect();
-        assert_eq!(text, "P: a b R");
+        // the markers are only drawn at a cut end of a list that does not fit
+        let sp = spans("P: #[align=left,list=on]#[list=left-marker]<#[list=right-marker]>#[list=on]a b#[nolist] R", base);
+        let text: String = layout_line(&sp, 12, base).iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(text, "P: a b R    ");
     }
 
     #[test]

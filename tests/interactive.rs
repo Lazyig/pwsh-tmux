@@ -1228,3 +1228,208 @@ fn attach_resize_and_focus_order() {
     drop(t.child.kill());
     t.wait_exit();
 }
+
+#[test]
+fn floating_and_modal_panes_on_screen() {
+    let ctx = Ctx::new("float-ui");
+    let t = start(&ctx, "fu");
+    ctx.ok(&["set", "-g", "pane-border-status", "top-floating"]);
+    let f = ctx.ok(&["new-pane", "-P", "-F", "#{pane_id}", "-t", "fu", "-x", "30", "-y", "8", "-X", "10", "-Y", "5", "-T", "flt-title", "-B", "double", "cat"]).trim().to_string();
+    // the border is drawn around the content with the pane's lines and its title on top
+    t.wait_screen("floating pane border", |s| s.contains("flt-title"));
+    let top = t.row(5);
+    assert!(top.contains('╔') && top.contains('╗') && top.contains("flt-title"), "{top:?}");
+    assert!(t.row(12).contains('╚'), "{:?}", t.row(12));
+    // typed text goes to the floating pane, which is active
+    t.send(b"typed-into-float\r");
+    wait_for("text in the floating pane", || ctx.capture(&f).contains("typed-into-float"));
+    // a modal pane with -K gets the prefix key too; -D closes it with Escape
+    let m = ctx.ok(&["new-pane", "-O", "-K", "-D", "-P", "-F", "#{pane_id}", "-t", "fu", "cat -v"]).trim().to_string();
+    wait_for("modal pane", || ctx.fmt("fu", "#{window_modal_pane}") == m);
+    t.send(b"\x02x");
+    wait_for("prefix sent to the modal pane", || ctx.capture(&m).contains("^Bx"));
+    assert_eq!(ctx.fmt("fu", "#{window_panes}"), "3");
+    t.send(b"\x1b");
+    wait_for("modal pane closed", || ctx.fmt("fu", "#{window_modal_pane}").is_empty() && ctx.fmt("fu", "#{window_panes}") == "2");
+    // the pane active before the modal one is active again
+    assert_eq!(ctx.fmt("fu", "#{pane_id}"), f);
+    // a click on the tiled pane makes it active; the floating pane is still drawn above it
+    ctx.ok(&["set", "-g", "mouse", "on"]);
+    t.mouse(0, 60, 20, false);
+    t.mouse(0, 60, 20, true);
+    wait_for("click selects the tiled pane", || ctx.fmt("fu", "#{pane_floating_flag}") == "0");
+    t.mouse(0, 15, 8, false);
+    t.mouse(0, 15, 8, true);
+    wait_for("click selects the floating pane", || ctx.fmt("fu", "#{pane_id}") == f);
+}
+
+#[test]
+fn floating_panes_follow_mouse_drags() {
+    let ctx = Ctx::new("float-drag");
+    let t = start(&ctx, "fd");
+    ctx.ok(&["set", "-g", "mouse", "on"]);
+    ctx.ok(&["bind", "-n", "M-MouseDrag1Pane", "move-pane", "-M"]);
+    let f = ctx.ok(&["new-pane", "-P", "-F", "#{pane_id}", "-t", "fd", "-x", "30", "-y", "8", "-X", "10", "-Y", "5", "cat"]).trim().to_string();
+    t.wait_screen("floating pane", |s| s.contains('┌'));
+    // dragging the right border (column 39) resizes it (MouseDrag1Border runs resize-pane -M)
+    t.mouse(0, 39, 8, false);
+    t.mouse(32, 43, 8, false);
+    t.mouse(0, 43, 8, true);
+    wait_for("resized by the border", || ctx.fmt(&f, "#{pane_width}x#{pane_height} #{pane_x},#{pane_y}") == "32x6 11,6");
+    // the top border moves it
+    t.mouse(0, 20, 5, false);
+    t.mouse(32, 22, 7, false);
+    t.mouse(0, 22, 7, true);
+    wait_for("moved by the top border", || ctx.fmt(&f, "#{pane_x},#{pane_y}") == "13,8");
+    // M-drag inside moves it too (move-pane -M)
+    t.mouse(8, 20, 12, false);
+    t.mouse(40, 21, 11, false);
+    t.mouse(8, 21, 11, true);
+    wait_for("moved by move-pane -M", || ctx.fmt(&f, "#{pane_x},#{pane_y}") == "14,7");
+}
+
+#[test]
+fn floating_pane_above_the_active_floating_pane_hides_its_cursor() {
+    let ctx = Ctx::new("float-cursor");
+    let t = start(&ctx, "fc");
+    let hidden = || t.screen.lock().unwrap().screen().hide_cursor();
+    ctx.ok(&["new-pane", "-t", "fc", "-x", "20", "-y", "5", "-X", "10", "-Y", "4", "printf xy; exec cat"]);
+    t.wait_screen("active floating pane", |s| s.contains("xy"));
+    wait_for("cursor shown", || !hidden() && t.screen.lock().unwrap().screen().cursor_position() == (5, 13));
+    // a pane stacked above (new-pane -d) covers the cursor cell
+    let d = ctx.ok(&["new-pane", "-d", "-P", "-F", "#{pane_id}", "-t", "fc", "-x", "20", "-y", "5", "-X", "8", "-Y", "3", "cat"]).trim().to_string();
+    assert_eq!(ctx.fmt(&d, "#{pane_z} #{pane_active}"), "0 0");
+    wait_for("cursor hidden under the floating pane", hidden);
+    ctx.ok(&["kill-pane", "-t", &d]);
+    wait_for("cursor shown again", || !hidden());
+}
+
+#[test]
+fn pane_status_lines_fit_what_floating_panes_leave_visible() {
+    let ctx = Ctx::new("float-status-width");
+    let t = start(&ctx, "sw");
+    ctx.ok(&["set", "-g", "status", "off"]);
+    ctx.ok(&["set", "-g", "pane-border-status", "top"]);
+    ctx.ok(&["set", "-g", "pane-border-format", "#[align=left]L#{pane_index}#[align=right]R#{pane_index}"]);
+    // clipped by the window edge: formatted to the last column but one (its border)
+    ctx.ok(&["new-pane", "-t", "sw", "-x", "16", "-y", "4", "-X", "90", "-Y", "4", "cat"]);
+    t.wait_screen("clipped floating status", |_| t.row(4).ends_with("┌──L1──R1─"));
+    // covering the right end of the tiled status line: R0 moves left of it
+    ctx.ok(&["move-pane", "-t", "sw", "-X", "90", "-Y", "0"]);
+    t.wait_screen("covered tiled status", |_| t.row(0).ends_with("──R0┌──L1──R1─"));
+    assert!(t.row(0).starts_with("──L0──"), "{:?}", t.row(0));
+    // the default format's controls are clicked where they are drawn
+    ctx.ok(&["set", "-gu", "pane-border-format"]);
+    ctx.ok(&["set", "-g", "mouse", "on"]);
+    ctx.ok(&["bind", "-n", "MouseDown1Control8", "set -gF @hit '8 #{pane_index}'"]);
+    t.wait_screen("controls left of the floating pane", |_| t.row(0).contains("[f][z][x]┌"));
+    t.wait_screen("mouse mode on", |_| t.raw_text().contains("\x1b[?1006h"));
+    let row = t.row(0);
+    let col = row[..row.find("[z]").unwrap()].chars().count() as u16;
+    t.mouse(0, col + 1, 0, false);
+    t.mouse(0, col + 1, 0, true);
+    wait_for("[z] hit", || ctx.ok(&["show", "-gqv", "@hit"]).trim() == "8 0");
+}
+
+#[test]
+fn modal_panes_keep_their_drags_and_status_clicks() {
+    let ctx = Ctx::new("float-modal-mouse");
+    let t = start(&ctx, "mm");
+    ctx.ok(&["set", "-g", "mouse", "on"]);
+    t.wait_screen("mouse mode on", |_| t.raw_text().contains("\x1b[?1006h"));
+    ctx.ok(&["new-window", "-d", "-t", "mm:1", "-n", "other", "cat"]);
+    let m = ctx.ok(&["new-pane", "-O", "-C", "-P", "-F", "#{pane_id}", "-t", "mm:0", "-x", "30", "-y", "8", "-X", "20", "-Y", "6", "cat"]).trim().to_string();
+    t.wait_screen("modal pane", |s| s.contains('┌'));
+    // a fast drag of the top border leaves the modal pane but still moves it (modal_drag)
+    t.mouse(0, 29, 6, false);
+    t.mouse(32, 30, 6, false);
+    t.mouse(32, 59, 17, false);
+    t.mouse(0, 59, 17, true);
+    wait_for("modal pane dragged", || ctx.fmt(&m, "#{pane_width}x#{pane_height} #{pane_x},#{pane_y}") == "28x6 51,18");
+    // a status line click is no click outside the modal pane: it selects the window
+    std::thread::sleep(Duration::from_millis(400));
+    let status = t.row(29);
+    let col = status.find("1:other").unwrap_or_else(|| panic!("{status:?}")) as u16;
+    t.mouse(0, col, 29, false);
+    t.mouse(0, col, 29, true);
+    wait_for("window selected from the status line", || ctx.fmt("mm", "#{window_index}") == "1");
+    assert_eq!(ctx.fmt("mm:0", "#{window_modal_pane}"), m);
+    // a press in the window outside closes the -C pane
+    ctx.ok(&["select-window", "-t", "mm:0"]);
+    std::thread::sleep(Duration::from_millis(400));
+    t.mouse(0, 5, 5, false);
+    t.mouse(0, 5, 5, true);
+    wait_for("modal pane closed by the click", || ctx.fmt("mm:0", "#{window_modal_pane}").is_empty());
+}
+
+#[test]
+fn floating_pane_default_mouse_bindings_and_pane_list() {
+    let ctx = Ctx::new("float-bind");
+    let t = start(&ctx, "fb");
+    ctx.ok(&["set", "-g", "mouse", "on"]);
+    t.wait_screen("mouse mode on", |_| t.raw_text().contains("\x1b[?1006h"));
+    ctx.ok(&["select-pane", "-T", "t0"]);
+    ctx.ok(&["split-window", "-h", "-t", "fb", "cat"]);
+    ctx.ok(&["select-pane", "-T", "t1"]);
+    assert_eq!(ctx.fmt("fb", "#{pane_width} #{pane_x}"), "49 51");
+    // C-drag (C-MouseDrag1Pane: new-pane -M) makes a floating pane between the two corners
+    t.mouse(16, 4, 2, false);
+    t.mouse(48, 5, 3, false);
+    t.mouse(48, 19, 8, false);
+    t.mouse(16, 19, 8, true);
+    wait_for("dragged floating pane", || ctx.fmt("fb", "#{pane_floating_flag} #{pane_width}x#{pane_height} #{pane_x},#{pane_y}") == "1 14x5 5,3");
+    let f = ctx.fmt("fb", "#{pane_id}");
+    ctx.ok(&["kill-pane", "-t", &f]);
+    // the [f][z][x] controls of the default pane-border-format: [z] of pane 1 zooms it
+    ctx.ok(&["set", "-g", "pane-border-status", "top"]);
+    t.wait_screen("pane status lines", |s| s.lines().next().is_some_and(|l| l.contains("[f][z][x]┬")));
+    let top = t.row(0);
+    assert!(top.contains("──1 \"t1\"──") && top.ends_with("─[f][z][x]"), "{top:?}");
+    t.mouse(0, 95, 0, false);
+    t.mouse(0, 95, 0, true);
+    wait_for("zoomed by [z]", || ctx.fmt("fb", "#{window_zoomed_flag} #P") == "1 1");
+    // (after the double click time, or this is SecondClick1Control8)
+    std::thread::sleep(Duration::from_millis(400));
+    t.mouse(0, 95, 0, false);
+    t.mouse(0, 95, 0, true);
+    wait_for("unzoomed by [u]", || ctx.fmt("fb", "#{window_zoomed_flag}") == "0");
+    // [f] of pane 0 floats it
+    std::thread::sleep(Duration::from_millis(400));
+    t.mouse(0, 42, 0, false);
+    t.mouse(0, 42, 0, true);
+    wait_for("floated by [f]", || ctx.fmt("fb.0", "#{pane_floating_flag}") == "1");
+    ctx.ok(&["join-pane", "-s", "fb.0"]);
+    // status 2 shows the panes; a click on one selects it
+    ctx.ok(&["set", "-g", "status", "2"]);
+    t.wait_screen("pane list", |s| s.contains("P: "));
+    let list = t.row(29);
+    let other = if ctx.fmt("fb", "#P") == "0" { "1" } else { "0" };
+    let col = list.find(&format!("{other}:[t{other}]")).unwrap_or_else(|| panic!("{list:?}")) as u16;
+    std::thread::sleep(Duration::from_millis(400));
+    t.mouse(0, col + 1, 29, false);
+    t.mouse(0, col + 1, 29, true);
+    wait_for("pane selected from the status line", || ctx.fmt("fb", "#P") == other);
+}
+
+#[test]
+fn kept_dead_panes_close_on_a_key() {
+    let ctx = Ctx::new("float-dead-key");
+    let t = start(&ctx, "dk");
+    // new-pane -k keeps the pane once its command exits, until a key is pressed (tmux
+    // remain-on-exit key and server_client_handle_dead_key); the key goes nowhere else
+    let f = ctx.ok(&["new-pane", "-k", "-P", "-F", "#{pane_id}", "-t", "dk", "-x", "40", "-y", "8", "true"]).trim().to_string();
+    wait_for("dead floating pane", || ctx.fmt(&f, "#{pane_dead}") == "1");
+    assert_eq!(ctx.fmt(&f, "#{remain-on-exit} #{pane_floating_flag}"), "key 1");
+    t.send(b"x");
+    wait_for("closed by a key", || ctx.fmt("dk", "#{window_panes}") == "1");
+    // -m sets the message, drawn on the last line of the pane like server_destroy_pane
+    let f = ctx.ok(&["new-pane", "-m", "bye #{pane_dead_status}", "-P", "-F", "#{pane_id}", "-t", "dk", "-x", "40", "-y", "8", "-X", "2", "-Y", "2", "exit 3"]).trim().to_string();
+    wait_for("dead pane with a message", || ctx.fmt(&f, "#{pane_dead}") == "1");
+    t.wait_screen("message on the last line", |_| t.row(8).contains("│bye 3"));
+    // the prefix key closes it too, without starting the prefix table
+    t.send(b"\x02");
+    wait_for("closed by the prefix", || ctx.fmt("dk", "#{window_panes}") == "1");
+    t.send(b"c");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(ctx.fmt("dk", "#{session_windows}"), "1");
+}

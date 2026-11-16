@@ -8,6 +8,9 @@ mod cmds;
 mod control;
 mod copy;
 mod events;
+mod float;
+/// The JSON subset tmux parses (layouts, display-message -j).
+pub use cmds::json::{parse as json_parse, Node as Json};
 pub mod features;
 mod termcap;
 mod input;
@@ -518,6 +521,8 @@ pub struct Pane {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub host_pid: Option<u32>,
     pub track: PaneTrack,
+    /// Floating pane flags (float::OVER_ZOOM and friends; tmux PANE_FLOATOVERZOOM...).
+    pub fflags: u8,
 }
 
 /// Pane state tmux keeps for format variables.
@@ -618,8 +623,20 @@ pub struct Window {
     /// Pane indices follow the pane list, independently of layout geometry.
     pub pane_order: Vec<PaneId>,
     pub active: PaneId,
-    pub last_active: Option<PaneId>,
+    /// Previously active panes, most recent first (tmux `last_panes`).
+    pub last_panes: Vec<PaneId>,
     pub zoomed: bool,
+    /// The zoomed pane while a pane floating above the zoom is active.
+    pub zoom_pane: Option<PaneId>,
+    /// Panes front to back (tmux `z_index`): floating panes come before tiled ones.
+    pub zorder: Vec<PaneId>,
+    /// The modal pane and the pane active before it.
+    pub modal: Option<PaneId>,
+    pub modal_last: Option<PaneId>,
+    /// Where the last new floating pane was put, for cascading.
+    pub last_new_pane: (i32, i32),
+    /// The cell a pane had when it last floated (tmux `layout_cell.fg`), for break-pane -W.
+    pub float_saved: HashMap<PaneId, crate::layout::FGeom>,
     pub options: Options,
     #[allow(dead_code)]
     pub alerts: u8,
@@ -644,6 +661,22 @@ impl Window {
         order
     }
 
+    /// Place a new pane in the pane list like tmux window_add_pane: -b goes before the target
+    /// (at the head with -f), otherwise after it (at the tail with -f or for a floating pane).
+    pub fn add_pane_order(&mut self, target: PaneId, new: PaneId, before: bool, full: bool, floating: bool) {
+        let mut order = self.panes();
+        order.retain(|p| *p != new);
+        if before && full {
+            order.insert(0, new);
+        } else if !before && (full || floating) {
+            order.push(new);
+        } else {
+            let idx = order.iter().position(|p| *p == target).unwrap_or(order.len());
+            order.insert((idx + usize::from(!before)).min(order.len()), new);
+        }
+        self.pane_order = order;
+    }
+
     fn insert_pane(&mut self, target: PaneId, new: PaneId, before: bool) {
         let mut order = self.panes();
         order.retain(|p| *p != new);
@@ -656,6 +689,40 @@ impl Window {
         for p in &mut self.pane_order {
             if *p == a { *p = b; } else if *p == b { *p = a; }
         }
+    }
+
+    /// The last pane (top of the last-panes stack).
+    pub fn last(&self) -> Option<PaneId> {
+        let live = self.layout.panes();
+        self.last_panes.iter().copied().find(|p| live.contains(p) && *p != self.active)
+    }
+
+    /// Make `pane` active, pushing the old active pane on the last-panes stack.
+    pub fn set_active(&mut self, pane: PaneId) {
+        if pane == self.active {
+            return;
+        }
+        let old = self.active;
+        self.last_panes.retain(|p| *p != pane && *p != old);
+        self.last_panes.insert(0, old);
+        self.active = pane;
+    }
+
+    /// Live panes front to back: floating panes in their z-order, then the tiled ones.
+    pub fn zlist(&self) -> Vec<PaneId> {
+        let live = self.layout.panes();
+        let mut z: Vec<PaneId> = self.zorder.iter().copied().filter(|p| live.contains(p)).collect();
+        for p in self.panes() {
+            if !z.contains(&p) {
+                // a pane that was never ordered goes in front if floating, else at the back
+                if self.layout.is_float(p) { z.insert(0, p) } else { z.push(p) }
+            }
+        }
+        z
+    }
+
+    pub fn is_floating(&self, pane: PaneId) -> bool {
+        self.layout.is_float(pane)
     }
 }
 
@@ -784,6 +851,11 @@ pub enum DragKind {
     Copy { pane: PaneId },
     /// A scrollbar slider drag (copy-mode -S or scroll-to-mouse, with -e).
     Scrollbar { pane: PaneId, exit: bool },
+    /// A floating pane: resize-pane -M resizes it by a border or corner (moves it by the top
+    /// border), move-pane -M (`moving`) moves it.
+    Float { pane: PaneId, moving: bool },
+    /// new-pane -M: the new floating pane spans from where the drag started to the mouse.
+    NewFloat { pane: PaneId, x: i32, y: i32 },
 }
 
 /// Multi-click detection, as tmux's CLIENT_DOUBLECLICK / CLIENT_TRIPLECLICK and click timer.
@@ -1005,7 +1077,8 @@ pub struct Ctx {
     pub readonly: bool,
     /// Files being sourced (innermost last), for #{current_file}.
     pub files: Vec<String>,
-    /// The exit status for the command-line client (c->retval: run-shell sets it).
+    /// The exit status for the command-line client (c->retval: run-shell and new-pane -W
+    /// set it).
     pub retval: i32,
     /// The key a bound command runs for (the message log names it).
     pub key: Option<String>,
@@ -1157,6 +1230,8 @@ pub struct Server {
     pub pipe_acl: Option<Vec<String>>,
     /// Configuration files tried at startup (config_files).
     pub cfg_files: Vec<String>,
+    /// Queues waiting for a pane's command to exit (new-pane -W).
+    pub pane_waits: HashMap<PaneId, Vec<(Vec<String>, Queue)>>,
 }
 
 pub fn run(config: Option<String>) -> io::Result<()> {
@@ -1304,6 +1379,7 @@ impl Server {
             acl: Vec::new(),
             pipe_acl: None,
             cfg_files: Vec::new(),
+            pane_waits: HashMap::new(),
         };
         srv.opts_session.set("default-shell", procinfo::default_shell());
         srv
@@ -2010,6 +2086,16 @@ impl Server {
 
     fn pane_exited(&mut self, id: PaneId, status: Option<i32>) {
         log(&format!("pane %{id} exited with {status:?}"));
+        // new-pane -W continues after the pane is handled: tmux's cmdq_continue only wakes
+        // the client queue, which runs after the global queue (pane-exited, the layout hooks)
+        let waits = self.pane_waits.remove(&id);
+        self.pane_exited_now(id, status);
+        if let Some(q) = waits {
+            self.resume_pane_waits(q, Some(status.unwrap_or(129)));
+        }
+    }
+
+    fn pane_exited_now(&mut self, id: PaneId, status: Option<i32>) {
         // popup?
         let popup_owner = self.clients.values().find(|c| matches!(&c.overlay, Some(Overlay::Popup(p)) if p.pane == id)).map(|c| c.id);
         if let Some(cid) = popup_owner {
@@ -2033,6 +2119,7 @@ impl Server {
             return;
         }
         let remain = self.opt_pane(id, "remain-on-exit");
+        // "key" and "failed-key" keep it until a key is pressed (see Server::dead_key)
         let keep = matches!(remain.as_str(), "on" | "key") || (matches!(remain.as_str(), "failed" | "failed-key") && status.unwrap_or(0) != 0);
         if keep {
             let fmt = self.opt_pane(id, "remain-on-exit-format");
@@ -2579,6 +2666,7 @@ impl Server {
                 cwd_seq: 0,
                 host_pid,
                 track: PaneTrack { argv: start_argv, ..Default::default() },
+                fflags: self.panes.get(&id).map_or(0, |p| p.fflags),
             },
         );
         let respawn = previous.is_some();
@@ -2601,6 +2689,9 @@ impl Server {
 
     /// Removes a pane's process and state without touching layouts.
     pub fn destroy_pane(&mut self, id: PaneId) {
+        // new-pane -W waiting for a pane that never exited: 128 + SIGHUP
+        let status = self.panes.get(&id).and_then(|p| p.dead).map(|d| d.0.unwrap_or(129));
+        self.finish_pane_waits(id, status);
         if let Some(mut p) = self.panes.remove(&id) {
             p.kill();
             release(p);
@@ -2613,30 +2704,32 @@ impl Server {
     /// Kills a pane and removes it from its window (closing the window/session if empty).
     pub fn kill_pane(&mut self, id: PaneId) {
         let wid = self.window_of(id);
-        // server_kill_pane: unzoom (with its events) before closing the pane's cell
+        // server_kill_pane: window_push_zoom unzooms (with its events) before closing the
+        // pane's cell, and window_pop_zoom zooms again a window the pane floated above
+        let mut rezoom = None;
         if let Some(wid) = wid.filter(|w| self.windows.get(w).is_some_and(|w| w.panes().len() > 1)) {
+            let was = self.zoomed_pane(wid);
+            if self.windows[&wid].is_floating(id) && self.over_zoom(id) && was.is_some_and(|z| z != id) {
+                rezoom = was;
+            }
             self.unzoom_window(wid);
         }
         self.destroy_pane(id);
         let Some(wid) = wid else { return };
-        let w = self.windows.get_mut(&wid).unwrap();
-        let layout = std::mem::replace(&mut w.layout, Node::Leaf(PaneId::MAX));
-        match layout.remove(id) {
-            Some(n) => {
-                w.layout = n;
-                let panes = w.panes();
-                w.last_active = w.last_active.filter(|p| panes.contains(p));
-                if w.active == id {
-                    w.active = w.last_active.take().unwrap_or(panes[0]);
-                }
-                w.zoomed = false;
-                self.apply_layout(wid);
-                self.mark_window_dirty(wid);
-                // layout_close_pane fires window-layout-changed before window_remove_pane
-                // picks the new active pane
-                self.flush_window_layout(wid);
+        if !self.windows.contains_key(&wid) {
+            return;
+        }
+        if self.detach_pane(wid, id) {
+            self.apply_layout(wid);
+            self.mark_window_dirty(wid);
+            // layout_close_pane fires window-layout-changed before window_remove_pane
+            // picks the new active pane
+            self.flush_window_layout(wid);
+            if rezoom.is_some() {
+                self.rezoom_window(wid, rezoom);
             }
-            None => self.kill_window(wid),
+        } else {
+            self.kill_window(wid);
         }
     }
 
@@ -2953,8 +3046,8 @@ impl Server {
     pub fn rects(&self, wid: WinId) -> (Vec<(PaneId, Rect)>, Vec<crate::layout::Sep>) {
         let w = &self.windows[&wid];
         let area = self.window_area(wid);
-        if w.zoomed {
-            return (vec![(w.active, area)], vec![]);
+        if let Some(z) = self.zoomed_pane(wid) {
+            return (vec![(z, area)], vec![]);
         }
         let (mut panes, mut seps) = (vec![], vec![]);
         w.layout.layout(area, &mut panes, &mut seps);
@@ -2987,6 +3080,14 @@ impl Server {
     pub fn apply_layout(&mut self, wid: WinId) {
         if !self.windows.contains_key(&wid) {
             return;
+        }
+        let zoomed = self.zoomed_pane(wid);
+        for (id, g) in self.windows[&wid].layout.floats() {
+            if Some(id) != zoomed {
+                if let Some(p) = self.panes.get_mut(&id) {
+                    p.resize(g.w, g.h);
+                }
+            }
         }
         let (rects, _) = self.rects(wid);
         for (id, r) in rects {
@@ -3031,6 +3132,7 @@ impl Server {
             if (w.sx, w.sy) != (sx, sy) {
                 w.sx = sx;
                 w.sy = sy;
+                self.clamp_floats(wid);
                 self.apply_layout(wid);
             }
         }
@@ -3052,6 +3154,8 @@ impl Server {
                 argv[0] = full.to_string();
                 let hook = match full {
                     "next-window" | "previous-window" | "last-window" => "select-window",
+                    // new-pane runs split-window's hook (tmux cmd_split_window_exec)
+                    "new-pane" => "split-window",
                     _ => full,
                 };
                 self.command_hook(&format!("after-{hook}"), &argv, ctx);
@@ -3316,6 +3420,19 @@ impl Server {
                             q.ctx.command_error = failed;
                             q.ctx.hook_error = hook_failed;
                             self.park_event_waiter(get(2), (get(5) == "F").then(|| get(3)), get(4) == "v", q);
+                            return;
+                        }
+                        "pane-wait" => {
+                            // new-pane -W: continued when the pane's command exits
+                            match get(2).parse::<PaneId>() {
+                                Ok(id) if self.panes.contains_key(&id) => {
+                                    q.ctx.hook_saved = hook_saved;
+                                    q.ctx.command_error = failed;
+                                    q.ctx.hook_error = hook_failed;
+                                    self.pane_waits.entry(id).or_default().push((argv, q));
+                                }
+                                _ => self.finish_queue(q, None),
+                            }
                             return;
                         }
                         "delay" => {

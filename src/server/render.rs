@@ -373,6 +373,14 @@ const BORDER_SETS: [(&str, [&str; 11]); 6] = [
     ("none", [" "; 11]),
 ];
 
+/// The digit tmux draws for pane-border-lines number: the pane index, modulo 10.
+fn pane_number(panes: &[PaneId], base: usize, pane: Option<PaneId>) -> String {
+    match pane.and_then(|p| panes.iter().position(|q| *q == p)) {
+        Some(i) => char::from(b'0' + ((i + base) % 10) as u8).to_string(),
+        None => "*".into(),
+    }
+}
+
 impl Server {
     /// A status line format. As status.c's format_defaults(ft, c, NULL, NULL, NULL), its
     /// type is unknown (the window list entries are window formats); the target only
@@ -380,6 +388,15 @@ impl Server {
     fn expand_status_time(&self, t: Target, cid: ClientId, template: &str, ftype: &str) -> String {
         let extra = HashMap::from([(vars::FORMAT_TYPE.to_string(), ftype.to_string())]);
         format::expand_status_time(template, &vars::VarCtx { srv: self, t, client: Some(cid), extra })
+    }
+
+    /// A pane status line (tmux window_make_pane_status): pane-border-format drawn over the
+    /// border line in `width` cells; None cells keep the border. The ranges are what a click
+    /// on the line hits (window_pane_status_get_range).
+    pub fn pane_status_line(&self, id: PaneId, width: usize, base: Style, cid: Option<ClientId>) -> (Vec<Option<Cell>>, Vec<Option<format::Range>>) {
+        let text = self.expand_for_pane(id, &self.opt_pane(id, "pane-border-format"));
+        let ctx = vars::VarCtx { srv: self, t: self.target_for_pane(id), client: cid, extra: HashMap::new() };
+        format::draw_line(&format::spans_with(&text, base, Some(&ctx)), width, base)
     }
 
     pub fn render_all(&mut self) {
@@ -484,13 +501,8 @@ impl Server {
                 cur_range = (start, wcells.len());
             }
             if k + 1 < n {
-                let sep_start = wcells.len();
                 wcells.extend(spans_cells(&self.styled_spans(&sep, base, t, cid), usize::MAX, base));
                 wtags.resize(wcells.len(), None);
-                // tmux's window range (closed by #[norange]) covers one cell more
-                if let Some(t) = wtags.get_mut(sep_start) {
-                    *t = Some(format::Range::Window(*idx));
-                }
             }
         }
         let avail = width.saturating_sub(lcells.len() + rcells.len());
@@ -551,6 +563,279 @@ impl Server {
         (line, tags)
     }
 
+    /// Draw a pane's content (or its mode) with its top left at (x0, y0) of the window,
+    /// clipped to `clip` (window columns and rows on the client); sets the cursor and the
+    /// terminal modes for the active pane.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_pane_body(&self, f: &mut Frame, cid: ClientId, wid: WinId, id: PaneId, (x0, y0, w, h): (i32, i32, u16, u16), clip: (u16, u16), oy: u16, modes: &mut Modes, cursor: &mut Option<(u16, u16)>) {
+        let win = &self.windows[&wid];
+        let Some(p) = self.panes.get(&id) else { return };
+        let Some(c) = self.clients.get(&cid) else { return };
+        let cw = clip.0;
+        // columns and rows of the pane that are on the client
+        let vis = |x: u16, y: u16| -> Option<(u16, u16)> {
+            let (ax, ay) = (x0 + x as i32, y0 + y as i32);
+            (ax >= 0 && ay >= 0 && ax < clip.0 as i32 && ay < clip.1 as i32).then_some((ax as u16, ay as u16))
+        };
+        // only the part on the client: a floating pane may be far bigger
+        let span = |o: i32, n: u16, c: u16| (o.max(0) - o).min(n as i32) as u16..((c as i32 - o).clamp(0, n as i32)) as u16;
+        let is_active = id == win.active;
+        let pane_target = self.target_for_pane(id);
+        let pst = |name: &str| self.style_option(&self.opt_pane(id, name), Style::default(), pane_target, Some(cid)).unwrap_or_default();
+        // Active: active style > pane palette > window style. Inactive: window style > palette.
+        let mut wstyle = pst("window-style");
+        let own = &p.parser.callbacks().colours;
+        if is_active {
+            if let Some(c) = own.fg { wstyle.fg = c; }
+            if let Some(c) = own.bg { wstyle.bg = c; }
+            let active = pst("window-active-style");
+            if active.fg != Color::Default { wstyle.fg = active.fg; }
+            if active.bg != Color::Default { wstyle.bg = active.bg; }
+        }
+        if wstyle.fg == Color::Default { wstyle.fg = own.fg.unwrap_or(Color::Default); }
+        if wstyle.bg == Color::Default { wstyle.bg = own.bg.unwrap_or(Color::Default); }
+        let (default_fg, default_bg) = self.pane_style_colours(id);
+        if default_fg == super::theme::StyleColour::Terminal { wstyle.fg = Color::Default; }
+        if default_bg == super::theme::StyleColour::Terminal { wstyle.bg = Color::Default; }
+        let dim_ctx = vars::VarCtx { srv: self, t: pane_target, client: Some(cid), extra: HashMap::new() };
+        let mut dim = format::parse_style_with(&self.opt_pane(id, "window-style"), Style::default(), Some(&dim_ctx)).map(|p| p.dim).unwrap_or(0);
+        if is_active {
+            let active_dim = format::parse_style_with(&self.opt_pane(id, "window-active-style"), Style::default(), Some(&dim_ctx)).map(|p| p.dim).unwrap_or(0);
+            dim = active_dim;
+        }
+        let dim_style = |style: &mut Style| {
+            if dim != 0 {
+                style.fg = dim_default(style.fg, true, &c.terminal, dim);
+                style.bg = dim_default(style.bg, false, &c.terminal, dim);
+            }
+        };
+        let mode_lines: Option<(Vec<Line>, Option<(u16, u16)>)> = match &p.mode {
+            Some(PaneMode::Copy(cm)) => {
+                let (lines, cur) = cm.render_with(&self.copy_render_style(id, Some(cid)));
+                Some((lines, Some((cur.1, cur.0))))
+            }
+            Some(PaneMode::Tree(t)) => Some(t.render(self, w, h)),
+            Some(PaneMode::Switch(s)) => Some(s.render(self, w, h)),
+            Some(PaneMode::Panes(m)) => Some((m.render(self, w, h), None)),
+            // the clock's screen is cleared before the time is drawn
+            Some(PaneMode::Clock) => Some((Vec::new(), None)),
+            None => None,
+        };
+        match &mode_lines {
+            Some((lines, _)) => {
+                for y in span(y0, h, clip.1) {
+                    for x in span(x0, w, clip.0) {
+                        let Some((ax, ay)) = vis(x, y) else { continue };
+                        let mut cell = lines.get(y as usize).and_then(|l| l.cells.get(x as usize)).cloned().unwrap_or_default();
+                        overlay_style(&mut cell.style, wstyle);
+                        f.set(ax, oy + ay, cell);
+                    }
+                }
+            }
+            None => {
+                let scr = p.screen();
+                for y in span(y0, h, clip.1) {
+                    for x in span(x0, w, clip.0) {
+                        let Some((ax, ay)) = vis(x, y) else { continue };
+                        let Some(vc) = scr.cell(y, x) else {
+                            f.set(ax, oy + ay, Cell { text: " ".into(), style: wstyle });
+                            continue;
+                        };
+                        let mut cell = crate::cells::cell_from_vt(vc);
+                        if vc.is_wide() && (x + 1 >= w || ax + 1 >= cw) {
+                            cell.text = " ".into();
+                        }
+                        overlay_style(&mut cell.style, wstyle);
+                        f.set(ax, oy + ay, cell);
+                    }
+                }
+            }
+        }
+        // the clock is drawn in the pane and then clipped with it (a huge pane's clock is
+        // far off the client anyway)
+        if matches!(p.mode, Some(PaneMode::Clock)) && (w as usize * h as usize) <= 1 << 20 {
+            // style_apply of clock-mode-colour: a format, theme colours from the client
+            let colour = self.style_option(&format!("fg={}", self.opt_window(Some(wid), "clock-mode-colour")), Style::default(), pane_target, Some(cid)).map_or(Color::Idx(4), |s| s.fg);
+            let text = clock_text(&self.opt_window(Some(wid), "clock-mode-style"), chrono::Local::now().time());
+            let mut pf = Frame::new(w, h);
+            let marker = Style { attrs: 0x80, ..Style::default() };
+            pf.cells.iter_mut().for_each(|c| c.style = marker);
+            draw_clock(&mut pf, Rect { x: 0, y: 0, w, h }, &text, colour, wstyle.bg);
+            for y in span(y0, h, clip.1) {
+                for x in span(x0, w, clip.0) {
+                    if let (Some((ax, ay)), Some(cell)) = (vis(x, y), pf.get(x, y).filter(|c| c.style != marker)) {
+                        f.set(ax, oy + ay, cell.clone());
+                    }
+                }
+            }
+        }
+        if dim != 0 {
+            for y in span(y0, h, clip.1) {
+                for x in span(x0, w, clip.0) {
+                    let Some((ax, ay)) = vis(x, y) else { continue };
+                    if let Some(cell) = f.get(ax, oy + ay).cloned() {
+                        let mut cell = cell;
+                        dim_style(&mut cell.style);
+                        f.set(ax, oy + ay, cell);
+                    }
+                }
+            }
+        }
+        if is_active {
+            match &mode_lines {
+                Some((_, Some((cx, cy)))) => {
+                    if *cx < w && *cy < h {
+                        *cursor = vis(*cx, *cy).map(|(x, y)| (x, oy + y));
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    let scr = p.screen();
+                    modes.app_cursor = scr.application_cursor();
+                    modes.bracketed_paste = scr.bracketed_paste();
+                    modes.cursor_style = merged_cursor_style(scr.cursor_style() as u8, scr.cursor_blinking(), features::cursor_style(&self.opt_pane(id, "cursor-style")));
+                    let colour = p.parser.callbacks().osc.cursor_colour.clone().unwrap_or_else(|| self.opt_pane(id, "cursor-colour"));
+                    // a colour option, not a format (OPTIONS_TABLE_IS_COLOUR)
+                    modes.cursor_colour = format::parse_color(&colour).filter(|c| *c != vt100::Color::Default);
+                    if !scr.hide_cursor() {
+                        let (cy, cx) = scr.cursor_position();
+                        if cx < w && cy < h {
+                            *cursor = vis(cx, cy).map(|(x, y)| (x, oy + y));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A pane prompt over the last line of its pane, or the first with the status line at
+    /// the top (redraw_draw_pane_prompt), clipped like the pane.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_pane_prompt(&self, f: &mut Frame, cid: ClientId, wid: WinId, id: PaneId, (x0, y0, w, h): (i32, i32, u16, u16), clip: (u16, u16), oy: u16, modes: &mut Modes, cursor: &mut Option<(u16, u16)>) {
+        let Some(pr) = self.panes.get(&id).and_then(|p| p.prompt.as_ref()) else { return };
+        let Some(sid) = self.clients.get(&cid).and_then(|c| c.session) else { return };
+        if w == 0 || h == 0 {
+            return;
+        }
+        let top = self.opt_session(Some(sid), "status-position") == "top" && self.status_lines(Some(sid)) > 0;
+        let row = y0 + if top { 0 } else { h as i32 - 1 };
+        if row < 0 || row >= clip.1 as i32 {
+            return;
+        }
+        // the visible columns of a wide pane only
+        let first = (-x0).max(0).min(w as i32) as u16;
+        let last = (clip.0 as i32 - x0).clamp(0, w as i32) as u16;
+        if first >= last {
+            return;
+        }
+        let mut line = Frame::new(w, 1);
+        let x = self.draw_prompt(&mut line, cid, pr, 0, w, 0);
+        for i in first..last {
+            if let Some(cell) = line.get(i, 0) {
+                f.set((x0 + i as i32) as u16, oy + row as u16, cell.clone());
+            }
+        }
+        if id == self.windows[&wid].active {
+            let cx = x0 + x.min(w - 1) as i32;
+            *cursor = (cx >= 0 && cx < clip.0 as i32).then_some((cx as u16, oy + row as u16));
+            self.prompt_cursor(modes, sid, pr);
+        }
+    }
+
+    /// Draw the floating panes above the tiled ones, back to front: border lines (the pane's
+    /// own pane-border-lines, -style and -status), the title on the border and the content.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_floats(&self, f: &mut Frame, cid: ClientId, wid: WinId, clip: (u16, u16), oy: u16, modes: &mut Modes, cursor: &mut Option<(u16, u16)>) {
+        let win = &self.windows[&wid];
+        let floats = self.float_rects(wid);
+        if floats.is_empty() {
+            return;
+        }
+        // a floating pane above the active pane's cursor hides it
+        if let Some((cx, cy)) = *cursor {
+            let (wx, wy) = (cx as i32, cy as i32 - oy as i32);
+            if floats.iter().any(|(p, _)| *p != win.active && self.float_contains(wid, *p, wx, wy)) && !win.is_floating(win.active) {
+                *cursor = None;
+            }
+        }
+        let panes = win.panes();
+        let base_index = self.opt_window_num(Some(wid), "pane-base-index").max(0) as usize;
+        let arrows = matches!(self.opt_window(Some(wid), "pane-border-indicators").as_str(), "arrows" | "both");
+        for &(id, g) in &floats {
+            if win.is_floating(win.active) && id == win.active {
+                *cursor = None;
+            }
+            let t = self.target_for_pane(id);
+            let lines = self.pane_lines(wid, id);
+            let active = id == win.active;
+            let base = self.style_option(&self.opt_pane(id, "pane-border-style"), Style::default(), t, Some(cid)).unwrap_or_default();
+            let st = if active { self.style_option(&self.opt_pane(id, "pane-active-border-style"), base, t, Some(cid)).unwrap_or(base) } else { base };
+            let st = if self.marked == Some(id) { Style { attrs: st.attrs | INVERSE, ..st } } else { st };
+            let put = |f: &mut Frame, x: i32, y: i32, text: &str| {
+                if x >= 0 && y >= 0 && x < clip.0 as i32 && y < clip.1 as i32 {
+                    f.set(x as u16, oy + y as u16, Cell { text: text.into(), style: st });
+                }
+            };
+            if lines != "none" {
+                // number draws the pane's own index (tmux window_get_border_cell)
+                let digit = pane_number(&panes, base_index, Some(id));
+                let set: [&str; 6] = match lines.as_str() {
+                    "double" => ["═", "║", "╔", "╗", "╚", "╝"],
+                    "heavy" => ["━", "┃", "┏", "┓", "┗", "┛"],
+                    "simple" => ["-", "|", "+", "+", "+", "+"],
+                    "spaces" => [" "; 6],
+                    "number" => [digit.as_str(); 6],
+                    _ => ["─", "│", "┌", "┐", "└", "┘"],
+                };
+                let (l, r, top, bot) = (g.x - 1, g.x + g.w as i32, g.y - 1, g.y + g.h as i32);
+                for x in l..=r {
+                    let (tc, bc) = if x == l { (set[2], set[4]) } else if x == r { (set[3], set[5]) } else { (set[0], set[0]) };
+                    put(f, x, top, tc);
+                    put(f, x, bot, bc);
+                }
+                for y in g.y..bot {
+                    put(f, l, y, set[1]);
+                    put(f, r, y, set[1]);
+                }
+                // tmux redraw_mark_border_arrows: the active floating pane's own border
+                // points at it (the cells taken by the status line are skipped below)
+                if active && arrows {
+                    let (ax, ay) = (g.x + 1, g.y + 1);
+                    if ax <= r {
+                        put(f, ax, top, "↓");
+                        put(f, ax, bot, "↑");
+                    }
+                    if ay < bot {
+                        put(f, l, ay, "→");
+                        put(f, r, ay, "←");
+                    }
+                }
+                let status = self.pane_status(wid, id);
+                if status != "off" {
+                    let by = if status == "top" { top } else { bot };
+                    let width = self.pane_status_width(wid, id, (g.x + 2, by), g.w.saturating_sub(2) as usize, clip);
+                    let (cells, _) = if width > 0 { self.pane_status_line(id, width, st, Some(cid)) } else { Default::default() };
+                    for (i, c) in cells.into_iter().enumerate() {
+                        let x = g.x + 2 + i as i32;
+                        if let Some(c) = c.filter(|_| x >= 0 && by >= 0 && x < clip.0 as i32 && by < clip.1 as i32 && x < r) {
+                            f.set(x as u16, oy + by as u16, c);
+                        }
+                    }
+                }
+            }
+            self.draw_pane_body(f, cid, wid, id, (g.x, g.y, g.w, g.h), clip, oy, modes, cursor);
+            self.draw_pane_prompt(f, cid, wid, id, (g.x, g.y, g.w, g.h), clip, oy, modes, cursor);
+        }
+        // ... and so does one above an active floating pane
+        if let (Some((cx, cy)), true) = (*cursor, win.is_floating(win.active)) {
+            let (wx, wy) = (cx as i32, cy as i32 - oy as i32);
+            let above = floats.iter().skip_while(|(p, _)| *p != win.active).skip(1);
+            if above.into_iter().any(|(p, _)| self.float_contains(wid, *p, wx, wy)) {
+                *cursor = None;
+            }
+        }
+    }
+
     pub(super) fn compose(&self, cid: ClientId) -> Option<RenderState> {
         let _widths = self.width_context();
         let c = self.clients.get(&cid)?;
@@ -569,7 +854,11 @@ impl Server {
         let mut modes = Modes { mouse: self.outer_mouse_mode(cid), focus: options::is_on(&self.opt_server("focus-events")), ..Modes::default() };
         let active_rect = rects.iter().find(|(p, _)| *p == win.active).map(|(_, r)| *r);
         let area_h = ch.saturating_sub(nstatus);
-        let border_status = self.opt_window(Some(wid), "pane-border-status");
+        // top-floating and bottom-floating show status lines on floating panes only
+        let border_status = match self.opt_window(Some(wid), "pane-border-status").as_str() {
+            s @ ("top" | "bottom") => s.to_string(),
+            _ => "off".to_string(),
+        };
         let active_target = self.target_for_pane(win.active);
         let active_border = self.style_option(&self.opt_window(Some(wid), "pane-active-border-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
         let inactive_border = self.style_option(&self.opt_window(Some(wid), "pane-border-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
@@ -607,120 +896,8 @@ impl Server {
 
         // panes
         for (id, r) in &rects {
-            let Some(p) = self.panes.get(id) else { continue };
             let cr = self.content_rect(wid, *r);
-            let is_active = *id == win.active;
-            let pane_target = self.target_for_pane(*id);
-            let pst = |name: &str| self.style_option(&self.opt_pane(*id, name), Style::default(), pane_target, Some(cid)).unwrap_or_default();
-            // Active: active style > pane palette > window style. Inactive: window style > palette.
-            let mut wstyle = pst("window-style");
-            let own = &p.parser.callbacks().colours;
-            if is_active {
-                if let Some(c) = own.fg { wstyle.fg = c; }
-                if let Some(c) = own.bg { wstyle.bg = c; }
-                let active = pst("window-active-style");
-                if active.fg != Color::Default { wstyle.fg = active.fg; }
-                if active.bg != Color::Default { wstyle.bg = active.bg; }
-            }
-            if wstyle.fg == Color::Default { wstyle.fg = own.fg.unwrap_or(Color::Default); }
-            if wstyle.bg == Color::Default { wstyle.bg = own.bg.unwrap_or(Color::Default); }
-            let (default_fg, default_bg) = self.pane_style_colours(*id);
-            if default_fg == super::theme::StyleColour::Terminal { wstyle.fg = Color::Default; }
-            if default_bg == super::theme::StyleColour::Terminal { wstyle.bg = Color::Default; }
-            let dim_ctx = vars::VarCtx { srv: self, t: pane_target, client: Some(cid), extra: HashMap::new() };
-            let mut dim = format::parse_style_with(&self.opt_pane(*id, "window-style"), Style::default(), Some(&dim_ctx)).map(|p| p.dim).unwrap_or(0);
-            if is_active {
-                let active_dim = format::parse_style_with(&self.opt_pane(*id, "window-active-style"), Style::default(), Some(&dim_ctx)).map(|p| p.dim).unwrap_or(0);
-                dim = active_dim;
-            }
-            let dim_style = |style: &mut Style| {
-                if dim != 0 {
-                    style.fg = dim_default(style.fg, true, &c.terminal, dim);
-                    style.bg = dim_default(style.bg, false, &c.terminal, dim);
-                }
-            };
-            let mode_lines: Option<(Vec<Line>, Option<(u16, u16)>)> = match &p.mode {
-                Some(PaneMode::Copy(cm)) => {
-                    let (lines, cur) = cm.render_with(&self.copy_render_style(*id, Some(cid)));
-                    Some((lines, Some((cur.1, cur.0))))
-                }
-                Some(PaneMode::Tree(t)) => {
-                    Some(t.render(self, cr.w, cr.h))
-                }
-                Some(PaneMode::Switch(s)) => {
-                    Some(s.render(self, cr.w, cr.h))
-                }
-                Some(PaneMode::Panes(m)) => Some((m.render(self, cr.w, cr.h), None)),
-                // the clock's screen is cleared before the time is drawn
-                Some(PaneMode::Clock) => Some((vec![Line { cells: vec![Cell::default(); cr.w as usize], wrapped: false }; cr.h as usize], None)),
-                None => None,
-            };
-            match &mode_lines {
-                Some((lines, _)) => {
-                    for (y, line) in lines.iter().enumerate().take(cr.h as usize) {
-                        for (x, cell) in line.cells.iter().enumerate().take(cr.w as usize) {
-                            let mut cell = cell.clone();
-                            overlay_style(&mut cell.style, wstyle);
-                            f.set(cr.x + x as u16, oy + cr.y + y as u16, cell);
-                        }
-                    }
-                }
-                None => {
-                    let scr = p.screen();
-                    for y in 0..cr.h {
-                        for x in 0..cr.w {
-                            let Some(vc) = scr.cell(y, x) else { continue };
-                            let mut cell = crate::cells::cell_from_vt(vc);
-                            if vc.is_wide() && (x + 1 >= cr.w || cr.x + x + 1 >= cw) {
-                                cell.text = " ".into();
-                            }
-                            overlay_style(&mut cell.style, wstyle);
-                            f.set(cr.x + x, oy + cr.y + y, cell);
-                        }
-                    }
-                }
-            }
-            if matches!(p.mode, Some(PaneMode::Clock)) {
-                // style_apply of clock-mode-colour: a format, theme colours from the client
-                let t = Target { sid: Some(sid), idx: None, wid: Some(wid), pane: Some(p.id) };
-                let colour = self.style_option(&format!("fg={}", self.opt_window(Some(wid), "clock-mode-colour")), Style::default(), t, Some(cid)).map_or(Color::Idx(4), |s| s.fg);
-                let text = clock_text(&self.opt_window(Some(wid), "clock-mode-style"), chrono::Local::now().time());
-                draw_clock(&mut f, Rect { y: oy + cr.y, ..cr }, &text, colour, wstyle.bg);
-            }
-            if dim != 0 {
-                for y in 0..cr.h { for x in 0..cr.w {
-                    if let Some(cell) = f.get(cr.x + x, oy + cr.y + y).cloned() {
-                        let mut cell = cell;
-                        dim_style(&mut cell.style);
-                        f.set(cr.x + x, oy + cr.y + y, cell);
-                    }
-                } }
-            }
-            if is_active {
-                match &mode_lines {
-                    Some((_, Some((cx, cy)))) => {
-                        if *cx < cr.w && *cy < cr.h {
-                            cursor = Some((cr.x + cx, oy + cr.y + cy));
-                        }
-                    }
-                    Some(_) => {}
-                    None => {
-                        let scr = p.screen();
-                        modes.app_cursor = scr.application_cursor();
-                        modes.bracketed_paste = scr.bracketed_paste();
-                        modes.cursor_style = merged_cursor_style(scr.cursor_style() as u8, scr.cursor_blinking(), features::cursor_style(&self.opt_pane(*id, "cursor-style")));
-                        let colour = p.parser.callbacks().osc.cursor_colour.clone().unwrap_or_else(|| self.opt_pane(*id, "cursor-colour"));
-                        // a colour option, not a format (OPTIONS_TABLE_IS_COLOUR)
-                        modes.cursor_colour = format::parse_color(&colour).filter(|c| *c != vt100::Color::Default);
-                        if !scr.hide_cursor() {
-                            let (cy, cx) = scr.cursor_position();
-                            if cx < cr.w && cy < cr.h {
-                                cursor = Some((cr.x + cx, oy + cr.y + cy));
-                            }
-                        }
-                    }
-                }
-            }
+            self.draw_pane_body(&mut f, cid, wid, *id, (cr.x as i32, cr.y as i32, cr.w, cr.h), (cw, area_h), oy, &mut modes, &mut cursor);
         }
 
         for (id, r) in &rects {
@@ -850,12 +1027,12 @@ impl Server {
                     f.set(cr.x + 1, oy + by, Cell { text: (if border_status == "top" { "↓" } else { "↑" }).into(), style: st });
                 }
                 if sx < r.right() {
-                    let text = self.expand_for_pane(*id, &self.opt_window(Some(wid), "pane-border-format"));
-                    // no public style attribute uses bit 7: it marks cells the format left empty
-                    let marker = Style { attrs: 0x80, ..Style::default() };
-                    let cells = format::layout_line(&self.styled_spans(&text, st, self.target_for_pane(*id), cid), (r.right() - sx) as usize, marker);
+                    // as wide as what floating panes leave visible (redraw_pane_status_width)
+                    let clip = (cw.min(win.sx), area_h.min(win.sy));
+                    let width = self.pane_status_width(wid, *id, (sx as i32, by as i32), (r.right() - sx) as usize, clip);
+                    let (cells, _) = if width > 0 { self.pane_status_line(*id, width, st, Some(cid)) } else { Default::default() };
                     for (i, cell) in cells.into_iter().enumerate() {
-                        if cell.style != marker { f.set(sx + i as u16, oy + by, cell); }
+                        if let Some(cell) = cell { f.set(sx + i as u16, oy + by, cell); }
                     }
                 }
             }
@@ -888,19 +1065,13 @@ impl Server {
         // pane prompts over the last line of their panes (the first with the
         // status line at the top, redraw_draw_pane_prompt)
         for (id, r) in &rects {
-            let Some(pr) = self.panes.get(id).and_then(|p| p.prompt.as_ref()) else { continue };
-            let cr = self.content_rect(wid, *r);
             // a zoomed window shows only the active pane's
-            if cr.w == 0 || cr.h == 0 || (win.zoomed && *id != win.active) { continue; }
-            let row = if top && nstatus > 0 { cr.y } else { cr.bottom() - 1 };
-            let mut line = Frame::new(cr.w, 1);
-            let x = self.draw_prompt(&mut line, cid, pr, 0, cr.w, 0);
-            f.put_cells(cr.x, oy + row, &line.cells);
-            if *id == win.active {
-                cursor = Some((cr.x + x.min(cr.w - 1), oy + row));
-                self.prompt_cursor(&mut modes, sid, pr);
-            }
+            if win.zoomed && *id != win.active { continue; }
+            let cr = self.content_rect(wid, *r);
+            self.draw_pane_prompt(&mut f, cid, wid, *id, (cr.x as i32, cr.y as i32, cr.w, cr.h), (cw, area_h), oy, &mut modes, &mut cursor);
         }
+        // floating panes above the tiled ones
+        self.draw_floats(&mut f, cid, wid, (cw.min(win.sx), area_h.min(win.sy)), oy, &mut modes, &mut cursor);
 
         // the window menu, above the panes (redraw_mark_menu)
         if let Some(m) = self.menus.get(&wid).filter(|_| c.overlay.is_none()) {

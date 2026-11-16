@@ -15,7 +15,12 @@ Local change: history rows use lossless indexed cell storage in src/row_cells.rs
 Default-style ASCII cells share an immutable table; other cells use a bounded
 per-row palette that preserves complete contents, attributes and wide-cell flags.
 Rows with too many distinct cells or no storage saving retain dense storage.
-Current screen rows remain dense; editing a compact row expands it on demand.
+Current screen rows are sparse until written: a new, reset or default-cleared row
+stores no cells, and editing a cell stores the cells up to it only (inserts and
+deletes shift the stored cells only), so a huge, mostly empty screen (a floating
+pane of up to 10000x10000) stays small like tmux's lazily grown grid lines.
+Clearing with a colour or rewriting a whole row makes it dense; editing a compact
+row expands it on demand.
 Read-only cell access does not expand compact rows. Reflow compacts its history
 output as well. This does not lower the history limit or change cell capacity.
 

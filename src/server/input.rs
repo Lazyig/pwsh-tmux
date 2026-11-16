@@ -85,16 +85,6 @@ pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
             cmd, repeat: o.has('r'), note: o.get('N').unwrap_or("").into(),
         });
     }
-    // Tiled-only forms of the floating-aware resize bindings (the fixture leaves
-    // the tmux 3.8 if-shell versions to the floating pane package).
-    for (key, cmd, note) in [
-        ("M-Up", "resize-pane -U 5", "Resize the pane up by 5"),
-        ("M-Left", "resize-pane -L 5", "Resize the pane left by 5"),
-        ("C-Up", "resize-pane -U", "Resize the pane up"),
-        ("C-Left", "resize-pane -L", "Resize the pane left"),
-    ] {
-        t.entry("prefix".into()).or_default().entry(key.into()).or_insert(Binding { cmd: cmd.into(), repeat: true, note: note.into() });
-    }
     // the copy mode tables of tmux 3.8, run by the copy mode engine while unchanged
     for (table, vi) in [("copy-mode", false), ("copy-mode-vi", true)] {
         for (k, c) in CopyMode::default_bindings(vi) {
@@ -414,6 +404,13 @@ impl Server {
                 if c.is_readonly() {
                     return;
                 }
+                // the first pasted key closes a pane waiting for one (tmux only skips the
+                // paste start and end markers)
+                if let Some(pane) = self.client_active_pane(cid).filter(|_| !data.is_empty()) {
+                    if self.dead_key(pane) {
+                        return;
+                    }
+                }
                 if let Some(target) = self.input_target(cid) {
                     // the paste-start key reaches the pane's mode first: it ends clock mode
                     // like any key; in another mode the pasted text is dropped
@@ -646,6 +643,24 @@ impl Server {
             }
         }
         let Some(sid) = self.client_session(cid) else { return };
+        // a modal pane closes on Escape or C-c with -D; with -K it gets every key, the
+        // prefix included, unless it is in a mode (tmux server_client_handle_key, not for
+        // read-only clients)
+        if let Some(pane) = self.client_active_pane(cid).filter(|_| !self.client_is_readonly(Some(cid))) {
+            if self.dead_key(pane) {
+                return;
+            }
+            let fl = self.panes.get(&pane).map_or(0, |p| p.fflags);
+            let modal = self.window_of(pane).is_some_and(|w| self.windows[&w].modal == Some(pane));
+            if modal && fl & super::float::CLOSE_ON_CANCEL != 0 && (name == "Escape" || name == "C-c") {
+                self.kill_pane(pane);
+                return;
+            }
+            if fl & super::float::CAPTURE_KEYS != 0 && self.panes.get(&pane).is_some_and(|p| p.mode.is_none() && p.dead.is_none()) {
+                self.send_key_to_pane(cid, pane, &k, raw);
+                return;
+            }
+        }
         let now = Instant::now();
         let threshold = self.opt_session_num(Some(sid), "assume-paste-time").max(0) as u64;
         let c = self.clients.get_mut(&cid).unwrap();
@@ -731,6 +746,7 @@ impl Server {
         }
         // not bound: to the pane (or its mode)
         let Some(pane) = pane else { return };
+        // forward_key: before the read-only check, so read-only clients may dismiss it too
         if self.dead_key(pane) { return; }
         if self.panes.get(&pane).is_some_and(|p| p.mode.is_some()) {
             self.mode_key(pane, Some(cid), &name);
@@ -749,15 +765,6 @@ impl Server {
             }
             Err(e) => self.set_message(cid, &e),
         }
-    }
-
-    /// server_client_handle_dead_key: an unbound key closes a pane kept by remain-on-exit key or
-    /// failed-key. It runs before the read-only check, so read-only clients may dismiss it too.
-    fn dead_key(&mut self, pane: PaneId) -> bool {
-        if !self.panes.get(&pane).is_some_and(|p| p.dead.is_some()) { return false; }
-        if !matches!(self.opt_pane(pane, "remain-on-exit").as_str(), "key" | "failed-key") { return false; }
-        self.kill_pane(pane);
-        true
     }
 
     /// Runs a command string for a client (key bindings, prompts, menus).

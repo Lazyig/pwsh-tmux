@@ -5,10 +5,10 @@ use super::vars::Target;
 use super::*;
 use crate::cmdparse;
 use crate::layout::{self, Dir};
-use crate::opts::{getopt, Opts};
+use crate::opts::{getopt, getopt_optional, Opts};
 use std::cmp::Ordering;
 
-mod json;
+pub(crate) mod json;
 pub(crate) mod sort;
 mod vis;
 
@@ -21,7 +21,7 @@ pub fn command_names() -> impl Iterator<Item = &'static str> {
 const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("attach-session", "attach", "dErx", "cfst"),
     ("bind-key", "bind", "nr", "TN"),
-    ("break-pane", "breakp", "abdP", "FnstL"),
+    ("break-pane", "breakp", "abdPW", "FnstLxXyY"),
     ("capture-pane", "capturep", "aCeFHIJLMNpPqRT", "bESt"),
     ("choose-buffer", "", "kNrZy", "FfKOt"),
     ("choose-client", "", "hikNrZy", "FfKOt"),
@@ -61,8 +61,9 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("lock-client", "lockc", "", "t"),
     ("lock-server", "lock", "", ""),
     ("lock-session", "locks", "", "t"),
-    ("move-pane", "movep", "bdfhv", "lst"),
+    ("move-pane", "movep", "bdfhMvDLRU", "lPstXYz"),
     ("move-window", "movew", "abdkr", "st"),
+    ("new-pane", "newp", "AbCDdEfhIkKLMOPvWZ", "BcefFlmpRsStTxXyY"),
     ("new-session", "new", "AdDEPX", "cefFnstxy"),
     ("new-window", "neww", "abdEkPS", "cefFnt"),
     ("next-layout", "nextl", "", "t"),
@@ -100,7 +101,7 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("show-prompt-history", "showphist", "", "T"),
     ("show-window-options", "showw", "gv", "Ft"),
     ("source-file", "source", "Fnqv", "t"),
-    ("split-window", "splitw", "bdEfhIvPZ", "cefFltT"),
+    ("split-window", "splitw", "bdEfhIkPvWZ", "BcefFlmpRsStT"),
     ("start-server", "start", "", ""),
     ("suspend-client", "suspendc", "", "t"),
     ("swap-pane", "swapp", "dDUZ", "st"),
@@ -139,7 +140,7 @@ pub fn is_empty_pane(cmd: &[String]) -> bool {
 
 /// The command for a new pane: -E (or a single empty argument, or `input` for split-window
 /// -I) makes an empty pane, which can't also be given a command.
-fn spawn_command(o: &Opts, input: bool) -> Result<Vec<String>, String> {
+pub(super) fn spawn_command(o: &Opts, input: bool) -> Result<Vec<String>, String> {
     let empty_arg = matches!(o.rest.as_slice(), [one] if one.is_empty());
     let empty = o.has('E') || input || empty_arg;
     if empty && !o.rest.is_empty() && !empty_arg {
@@ -805,7 +806,7 @@ impl Server {
         let p = p.as_str();
         let r = match p {
             "" => Some(active),
-            "{last}" | "!" => w.last_active,
+            "{last}" | "!" => w.last(),
             "{next}" | "+" => Some(off(1)),
             "{previous}" | "-" => Some(off(-1)),
             "{top}" => pick(&|r| (r.y as i64, r.x as i64)),
@@ -916,22 +917,31 @@ impl Server {
         });
     }
 
-    /// The panes of a window sorted by the -O order. Activity approximates tmux's
-    /// active_point: panes never active, then the last active, then the active pane.
+    /// The panes of a window sorted by the -O order. Activity is tmux's active_point
+    /// (the order panes were last made active, never-active panes first), which the
+    /// last-panes stack holds most recent first.
     fn sorted_panes(&self, wid: WinId, crit: sort::Criteria) -> Vec<PaneId> {
         let w = &self.windows[&wid];
         let order_of = w.panes();
         let mut v = order_of.clone();
         let title = |p: &PaneId| self.panes.get(p).map(|x| x.title.as_str()).unwrap_or("");
         let index = |p: &PaneId| order_of.iter().position(|x| x == p).unwrap_or(0);
-        let point = |p: &PaneId| if *p == w.active { 2 } else if w.last_active == Some(*p) { 1 } else { 0 };
+        let point = |p: &PaneId| {
+            if *p == w.active {
+                usize::MAX
+            } else {
+                w.last_panes.iter().position(|x| x == p).map_or(0, |i| w.last_panes.len() - i)
+            }
+        };
         let size = |p: &PaneId| self.panes.get(p).map(|x| x.size.0 as u32 * x.size.1 as u32).unwrap_or(0);
         crit.sort(&mut v, |a, b, order| {
             match order {
                 sort::Order::Activity => point(a).cmp(&point(b)),
                 sort::Order::Creation => a.cmp(b),
                 sort::Order::Size => size(a).cmp(&size(b)),
-                sort::Order::Index | sort::Order::Z => index(a).cmp(&index(b)),
+                sort::Order::Index => index(a).cmp(&index(b)),
+                // floating panes front to back, then the tiled ones (tmux window_pane_zindex)
+                sort::Order::Z => self.pane_z(wid, *a).cmp(&self.pane_z(wid, *b)),
                 sort::Order::Name => title(a).cmp(title(b)),
                 _ => Ordering::Equal,
             }
@@ -996,8 +1006,14 @@ impl Server {
                 layout: Node::Leaf(pane),
                 pane_order: vec![pane],
                 active: pane,
-                last_active: None,
+                last_panes: Vec::new(),
                 zoomed: false,
+                zoom_pane: None,
+                zorder: Vec::new(),
+                modal: None,
+                modal_last: None,
+                last_new_pane: (0, 0),
+                float_saved: HashMap::new(),
                 options: Options::default(),
                 alerts: 0,
                 layout_cycle: None,
@@ -1140,12 +1156,15 @@ impl Server {
     }
 
     pub fn select_pane(&mut self, wid: WinId, pane: PaneId) {
-        if self.windows[&wid].active != pane {
-            // window_push_zoom: the unzoom's events come first
-            self.unzoom_window(wid);
-            let w = self.windows.get_mut(&wid).unwrap();
-            w.last_active = Some(w.active);
-            w.active = pane;
+        let w = &self.windows[&wid];
+        // a modal pane keeps the focus
+        if w.active != pane && w.modal.is_none_or(|m| m == pane) {
+            // window_push_zoom: the unzoom's events come first; a pane shown above the
+            // zoom keeps it
+            if self.zoomed_pane(wid).is_some() && !self.pane_visible(wid, pane) {
+                self.unzoom_window(wid);
+            }
+            self.set_active_pane(wid, pane);
         }
         self.mark_window_dirty(wid);
     }
@@ -1153,7 +1172,11 @@ impl Server {
     fn select_dir(&mut self, t: Target, dir: Dir) -> Result<(), String> {
         let wid = t.wid.unwrap();
         let pane = t.pane.unwrap();
-        let (rects, _) = self.rects(wid);
+        let (mut rects, _) = self.rects(wid);
+        // floating panes are found by their position like tiled ones (tmux window_pane_find_*)
+        for (p, g) in self.float_rects(wid) {
+            rects.push((p, Rect { x: g.x.max(0) as u16, y: g.y.max(0) as u16, w: g.w, h: g.h }));
+        }
         let r = rects.iter().find(|(p, _)| *p == pane).map(|(_, r)| *r).ok_or("pane not visible")?;
         let (cy, cx) = self.panes.get(&pane).map(|p| p.screen().cursor_position()).unwrap_or((0, 0));
         let n = layout::neighbour(&rects, pane, dir, (r.x + cx, r.y + cy)).or_else(|| {
@@ -1185,7 +1208,7 @@ impl Server {
         let (rects, _) = self.rects(wid);
         let r = if full { area } else { rects.iter().find(|(p, _)| *p == target).map(|(_, r)| *r).ok_or("pane not visible")? };
         if (horizontal && r.w < 3) || (!horizontal && r.h < 3) {
-            return err("no space for new pane");
+            return err("no space for a new pane");
         }
         let total = if horizontal { r.w } else { r.h };
         let new_size = size.unwrap_or((total - 1) / 2).clamp(1, total - 2);
@@ -1193,7 +1216,7 @@ impl Server {
         let cwd = cwd.or_else(|| self.panes.get(&target).map(|p| p.current_path.clone()));
         let new = self.spawn_pane(t.sid, w, h, cmd, cwd.as_deref(), env)?;
         let win = self.windows.get_mut(&wid).unwrap();
-        win.insert_pane(target, new, before);
+        win.add_pane_order(target, new, before, full, false);
         if full {
             let old = std::mem::replace(&mut win.layout, Node::Leaf(PaneId::MAX));
             let ratio_new = new_size as f32 / (total - 1) as f32;
@@ -1393,7 +1416,7 @@ impl Server {
         }
         let spec = COMMANDS.iter().find(|c| c.0 == full).unwrap();
         let mut args = rest.to_vec();
-        let env = if matches!(full, "new-session" | "new-window" | "split-window" | "respawn-pane" | "respawn-window" | "display-popup") {
+        let env = if matches!(full, "new-session" | "new-window" | "split-window" | "new-pane" | "respawn-pane" | "respawn-window" | "display-popup") {
             take_env(&mut args)
         } else {
             Vec::new()
@@ -1402,8 +1425,9 @@ impl Server {
         if ctx.readonly && !READ_ONLY_OK.contains(&full) {
             return err("client is read-only");
         }
-        // args_parse errors, as cmd_parse reports them
-        let o = getopt(&args, spec.2, spec.3).map_err(|e| format!("command {full}: {e}"))?;
+        // args_parse errors, as cmd_parse reports them; flags with an optional value (tmux `D::`)
+        let optional = if matches!(full, "move-pane" | "resize-pane") { "DLRU" } else { "" };
+        let o = if optional.is_empty() { getopt(&args, spec.2, spec.3) } else { getopt_optional(&args, spec.2, spec.3, optional) }.map_err(|e| format!("command {full}: {e}"))?;
         if let Some(&(_, min, max)) = ARG_COUNTS.iter().find(|a| a.0 == full) {
             if (o.rest.len() as i32) < min {
                 return err(format!("command {full}: too few arguments (need at least {min})"));
@@ -2139,7 +2163,10 @@ impl Server {
                     let w = self.windows.get_mut(&wid).unwrap();
                     w.layout = Node::Leaf(keep);
                     w.zoomed = false;
-                    w.last_active = None;
+                    w.zoom_pane = None;
+                    w.modal = None;
+                    w.modal_last = None;
+                    w.last_panes.clear();
                     keep
                 } else {
                     tt.pane.unwrap()
@@ -2179,11 +2206,12 @@ impl Server {
                 for (i, p) in order.iter().enumerate() { w.layout.replace(*p, PaneId::MAX - i as u32); }
                 for (i, p) in rotated.iter().enumerate() { w.layout.replace(PaneId::MAX - i as u32, *p); }
                 // the pane now in the active pane's place becomes active (TAILQ_NEXT /
-                // TAILQ_PREV of the old active pane in the rotated list)
+                // TAILQ_PREV of the old active pane in the rotated list), unless a modal
+                // pane keeps the focus (window_set_active_pane, no raise)
                 if let Some(i) = order.iter().position(|p| *p == w.active) {
-                    if rotated[i] != w.active {
-                        w.last_active = Some(w.active);
-                        w.active = rotated[i];
+                    let next = rotated[i];
+                    if next != w.active && w.modal.is_none_or(|m| m == next) {
+                        w.set_active(next);
                     }
                 }
                 w.pane_order = rotated;
@@ -2191,7 +2219,7 @@ impl Server {
                 self.mark_window_dirty(wid);
                 if zoomed && o.has('Z') {
                     self.detect_changes(Some("rotate-window"));
-                    self.rezoom_window(wid);
+                    self.rezoom_window(wid, None);
                 }
                 Ok(Flow::Next)
             }
@@ -2211,9 +2239,11 @@ impl Server {
                     };
                     n.filter(|n| *n <= total as u32).map(|n| n as u16)
                 };
+                // control clients without new-layouts get (and give) the old format
+                let old_layout = self.window_layout(wid, false, ctx.client).unwrap_or_default();
                 let w = &self.windows[&wid];
-                let panes = w.panes();
-                let old_layout = w.layout.to_layout_string(area);
+                // presets arrange the tiled panes; floating ones stay as they are
+                let all: Vec<(PaneId, Option<crate::layout::FGeom>)> = w.panes().into_iter().map(|p| (p, w.layout.geom(p))).collect();
                 let name: Option<String> = if cmd == "next-layout" || o.has('n') {
                     Some(layout::PRESETS[w.layout_cycle.map_or(0, |i| (i + 1) % layout::PRESETS.len())].to_string())
                 } else if cmd == "previous-layout" || o.has('p') {
@@ -2222,7 +2252,6 @@ impl Server {
                     let w = self.windows.get_mut(&wid).unwrap();
                     w.old_layout = Some(old_layout);
                     w.layout.spread(wt.pane.unwrap_or(w.active), area);
-                    w.zoomed = false;
                     self.apply_layout(wid);
                     self.mark_window_dirty(wid);
                     self.ev.layout_fired.push((wid, 1));
@@ -2232,32 +2261,36 @@ impl Server {
                         if o.has('o') { w.old_layout.clone() } else { w.layout_cycle.map(|i| layout::PRESETS[i].to_string()) }
                     })
                 };
-                let node = if let Some(name) = name {
-                    if let Some(preset) = layout::preset_name(&name).filter(|_| !o.has('o')) {
-                        let horizontal = preset.starts_with("main-horizontal");
-                        let dimension = if horizontal { "height" } else { "width" };
-                        let total = if horizontal { area.h } else { area.w }.saturating_sub(1);
-                        let main = size_option(self, &format!("main-pane-{dimension}"), total);
-                        let other = size_option(self, &format!("other-pane-{dimension}"), total);
-                        let columns = self.opt_window_num(Some(wid), "tiled-layout-max-columns").max(0) as usize;
-                        let n = layout::preset_with_options(preset, &panes, area, main, other, columns).unwrap();
-                        let w = self.windows.get_mut(&wid).unwrap();
-                        w.layout_cycle = layout::PRESETS.iter().position(|p| *p == preset);
-                        n
-                    } else {
-                        layout::parse_layout_string(&name, &panes, area).map_err(|e| format!("can't set layout: {e}"))?
+                match name {
+                    Some(name) => match layout::preset_name(&name).filter(|_| !o.has('o')) {
+                        Some(preset) => {
+                            let horizontal = preset.starts_with("main-horizontal");
+                            let dimension = if horizontal { "height" } else { "width" };
+                            let total = if horizontal { area.h } else { area.w }.saturating_sub(1);
+                            let main = size_option(self, &format!("main-pane-{dimension}"), total);
+                            let other = size_option(self, &format!("other-pane-{dimension}"), total);
+                            let columns = self.opt_window_num(Some(wid), "tiled-layout-max-columns").max(0) as usize;
+                            if let Some(n) = layout::preset_with_floats(preset, &all, area, main, other, columns) {
+                                self.windows.get_mut(&wid).unwrap().layout = n;
+                            }
+                            self.windows.get_mut(&wid).unwrap().layout_cycle = layout::PRESETS.iter().position(|p| *p == preset);
+                        }
+                        // cmd_select_layout: "cause: layout"
+                        None => self.set_layout_string(wid, &name).map_err(|e| format!("{e}: {name}"))?,
+                    },
+                    None => {
+                        // layout_dump into w->old_layout happens whether or not anything changes
+                        self.windows.get_mut(&wid).unwrap().old_layout = Some(old_layout);
+                        return Ok(Flow::Next);
                     }
-                } else {
-                    w.layout.clone()
-                };
+                }
                 let w = self.windows.get_mut(&wid).unwrap();
                 w.old_layout = Some(old_layout);
-                w.layout = node;
-                w.zoomed = false;
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
                 // layout_set_select and layout_parse fire it too, with panes to lay out
-                self.ev.layout_fired.push((wid, if panes.len() > 1 { 2 } else { 1 }));
+                let tiled = all.iter().filter(|p| p.1.is_none()).count();
+                self.ev.layout_fired.push((wid, if tiled > 1 { 2 } else { 1 }));
                 Ok(Flow::Next)
             }
             "resize-window" => {
@@ -2290,6 +2323,7 @@ impl Server {
                 if o.has('D') {
                     w.sy = w.sy.saturating_add(n).min(MAX_SIZE);
                 }
+                self.clamp_floats(wid);
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
                 Ok(Flow::Next)
@@ -2314,46 +2348,7 @@ impl Server {
                 Ok(Flow::Next)
             }
             // ---------------------------------------------------------------- panes
-            "split-window" => {
-                let tt = self.resolve_pane(ctx, t)?;
-                let size = match o.get('l') {
-                    Some(l) if l.ends_with('%') => {
-                        let pct: u32 = l.trim_end_matches('%').parse().map_err(|_| format!("bad size: {l}"))?;
-                        let (rects, _) = self.rects(tt.wid.unwrap());
-                        let r = if o.has('f') { self.window_area(tt.wid.unwrap()) } else { rects.iter().find(|(p, _)| Some(*p) == tt.pane).map(|(_, r)| *r).unwrap_or_default() };
-                        let total = if o.has('h') { r.w } else { r.h } as u32;
-                        Some((total * pct / 100) as u16)
-                    }
-                    Some(l) => Some(l.parse().map_err(|_| format!("bad size: {l}"))?),
-                    None => None,
-                };
-                let cwd = o.get('c').map(|c| self.expand(tt, ctx.client, c));
-                let command = spawn_command(&o, o.has('I'))?;
-                let new = self.split_pane(tt, o.has('h'), o.has('b'), size, o.has('f'), cwd, &command, &env)?;
-                let wid = tt.wid.unwrap();
-                if let Some(title) = o.get('T') {
-                    let title = self.expand(tt, ctx.client, title);
-                    self.panes.get_mut(&new).unwrap().title = title.clone();
-                    let mut p = self.payload_pane(new);
-                    p.str("new_title", title);
-                    self.fire("pane-title-changed", p);
-                }
-                if !o.has('d') {
-                    self.select_pane(wid, new);
-                }
-                if o.has('Z') {
-                    self.windows.get_mut(&wid).unwrap().zoomed = true;
-                    self.apply_layout(wid);
-                }
-                if o.has('P') {
-                    let fmt = o.get('F').unwrap_or("#{session_name}:#{window_index}.#{pane_index}");
-                    let line = self.expand_for_pane(new, fmt);
-                    ctx.out.push_str(&line);
-                    ctx.out.push('\n');
-                }
-                ctx.pane = Some(new);
-                Ok(Flow::Next)
-            }
+            "split-window" | "new-pane" => self.cmd_new_pane(cmd, &o, &env, ctx),
             "kill-pane" => {
                 let tt = self.resolve_pane(ctx, t)?;
                 let filter = o.get('f');
@@ -2426,13 +2421,12 @@ impl Server {
                     if o.has('Z') && zoomed {
                         // window_pop_zoom, after window-pane-changed
                         self.flush_active_pane(wid);
-                        self.rezoom_window(wid);
+                        self.rezoom_window(wid, None);
                     }
                     return Ok(Flow::Next);
                 }
                 if o.has('l') {
-                    let w = &self.windows[&wid];
-                    let last = w.last_active.filter(|p| w.panes().contains(p)).ok_or("no last pane")?;
+                    let last = self.last_pane_of(wid).ok_or("no last pane")?;
                     self.select_pane(wid, last);
                     ctx.pane = Some(last);
                     return Ok(Flow::Next);
@@ -2446,7 +2440,7 @@ impl Server {
                     ctx.pane = Some(pane);
                     if o.has('Z') && zoomed {
                         self.flush_active_pane(wid);
-                        self.rezoom_window(wid);
+                        self.rezoom_window(wid, None);
                     }
                 }
                 Ok(Flow::Next)
@@ -2455,8 +2449,7 @@ impl Server {
                 ctx.skip_after = true;
                 let wt = self.resolve_window(ctx, t)?;
                 let wid = wt.wid.unwrap();
-                let w = &self.windows[&wid];
-                let last = w.last_active.filter(|p| w.panes().contains(p)).ok_or("no last pane")?;
+                let last = self.last_pane_of(wid).ok_or("no last pane")?;
                 if o.has('d') || o.has('e') {
                     let v = if o.has('d') { "on" } else { "off" };
                     self.panes.get_mut(&last).unwrap().options.set("@input-disabled", v.into());
@@ -2475,25 +2468,6 @@ impl Server {
                 let tt = self.resolve_pane(ctx, t)?;
                 let wid = tt.wid.unwrap();
                 let pane = tt.pane.unwrap();
-                if o.has('Z') {
-                    let w = self.windows.get_mut(&wid).unwrap();
-                    if w.panes().len() > 1 {
-                        if w.active != pane {
-                            w.last_active = Some(w.active);
-                            w.active = pane;
-                        }
-                        w.zoomed = !w.zoomed;
-                        self.apply_layout(wid);
-                        self.mark_window_dirty(wid);
-                    }
-                    return Ok(Flow::Next);
-                }
-                if o.has('M') {
-                    if let Some(cid) = ctx.client {
-                        self.start_border_drag(cid, ctx.mouse.clone());
-                    }
-                    return Ok(Flow::Next);
-                }
                 if o.has('T') {
                     if let Some(p) = self.panes.get_mut(&pane) {
                         let (_, rows) = p.size;
@@ -2505,6 +2479,39 @@ impl Server {
                     }
                     return Ok(Flow::Next);
                 }
+                if o.has('M') {
+                    if let Some(cid) = ctx.client {
+                        // a floating pane under the mouse is resized (or moved by its top border)
+                        match ctx.mouse.clone() {
+                            Some(m) if self.mouse_pane(&m).is_some_and(|p| self.windows.get(&wid).is_some_and(|w| w.is_floating(p))) => {
+                                let p = self.mouse_pane(&m).unwrap();
+                                self.start_float_drag(cid, &m, p, false, false);
+                            }
+                            m => self.start_border_drag(cid, m),
+                        }
+                    }
+                    return Ok(Flow::Next);
+                }
+                if o.has('Z') {
+                    // tmux window_zoom: a zoom of the pane (unless the active pane floats above
+                    // the zoom, the pane becomes active) or an unzoom
+                    if !self.unzoom(wid) && self.windows[&wid].panes().len() > 1 {
+                        let w = &self.windows[&wid];
+                        if w.active != pane && !(w.is_floating(w.active) && self.over_zoom(w.active)) {
+                            self.set_active_pane(wid, pane);
+                        }
+                        let w = self.windows.get_mut(&wid).unwrap();
+                        w.zoomed = true;
+                        w.zoom_pane = (w.active != pane).then_some(pane);
+                        self.apply_layout(wid);
+                        self.mark_window_dirty(wid);
+                    }
+                    return Ok(Flow::Next);
+                }
+                if self.windows[&wid].is_floating(pane) && self.zoomed_pane(wid) != Some(pane) {
+                    return self.cmd_resize_float(&o, wid, pane, tt);
+                }
+                self.unzoom(wid);
                 let area = self.window_area(wid);
                 let parse_size = |v: &str, total: u16| -> Option<u16> {
                     if let Some(p) = v.strip_suffix('%') {
@@ -2522,10 +2529,16 @@ impl Server {
                 if x.is_some() || y.is_some() {
                     w.layout.set_size(pane, x, y, area);
                 }
-                let n: u16 = o.rest.first().and_then(|v| v.parse().ok()).unwrap_or(1);
                 for (c, d) in DIRS {
-                    if o.has(c) {
-                        w.layout.resize(pane, d, n, area);
+                    if let Some(v) = o.get(c) {
+                        // tmux D:: and friends: the flag's value, else the argument, else 1
+                        let v = if v.is_empty() { o.rest.first().map_or("1", String::as_str) } else { v };
+                        let n: i64 = v.parse().map_err(|_| "adjustment invalid".to_string())?;
+                        // a negative adjustment moves the border the other way
+                        let d = if n < 0 {
+                            match d { Dir::Left => Dir::Right, Dir::Right => Dir::Left, Dir::Up => Dir::Down, Dir::Down => Dir::Up }
+                        } else { d };
+                        w.layout.resize(pane, d, n.unsigned_abs().min(u16::MAX as u64) as u16, area);
                     }
                 }
                 let moved = self.windows[&wid].layout.to_layout_string(area) != before;
@@ -2539,10 +2552,15 @@ impl Server {
                 let dst = self.resolve_pane(ctx, t)?;
                 let (dwid, dpane) = (dst.wid.unwrap(), dst.pane.unwrap());
                 let (swid, spane) = if o.has('U') || o.has('D') {
-                    let panes = self.windows[&dwid].panes();
+                    // the previous or next tiled pane
+                    if self.windows[&dwid].is_floating(dpane) {
+                        return err(format!("cannot swap {} on floating pane", if o.has('D') { "down" } else { "up" }));
+                    }
+                    let w = &self.windows[&dwid];
+                    let panes: Vec<PaneId> = w.panes().into_iter().filter(|p| !w.is_floating(*p)).collect();
                     let i = panes.iter().position(|p| *p == dpane).ok_or("pane not in window")?;
                     let n = panes.len();
-                    let other = if o.has('U') { panes[(i + n - 1) % n] } else { panes[(i + 1) % n] };
+                    let other = if o.has('D') { panes[(i + 1) % n] } else { panes[(i + n - 1) % n] };
                     (dwid, other)
                 } else {
                     let src = match o.get('s') {
@@ -2554,30 +2572,34 @@ impl Server {
                     };
                     (src.wid.unwrap(), src.pane.unwrap())
                 };
+                if self.windows[&swid].modal == Some(spane) || self.windows[&dwid].modal == Some(dpane) {
+                    return err("pane is modal");
+                }
                 // window_push_zoom on both windows (their events first); -Z zooms them
                 // again at the end
                 let dzoom = self.unzoom_window(dwid);
                 let szoom = swid != dwid && self.unzoom_window(swid);
                 if spane == dpane {
                     if o.has('Z') && dzoom {
-                        self.rezoom_window(dwid);
+                        self.rezoom_window(dwid, None);
                     }
                     return Ok(Flow::Next);
                 }
                 self.ev.pane_move_order.extend([spane, dpane]);
+                // the panes swap places in the z-order too (a floating cell keeps its depth)
+                for wid in if swid == dwid { vec![swid] } else { vec![swid, dwid] } {
+                    let w = self.windows.get_mut(&wid).unwrap();
+                    let mut z = w.zlist();
+                    for p in &mut z {
+                        if *p == spane { *p = dpane } else if *p == dpane { *p = spane }
+                    }
+                    w.zorder = z;
+                }
                 if swid == dwid {
                     let w = self.windows.get_mut(&dwid).unwrap();
                     w.pane_order = w.panes();
                     w.swap_pane_order(spane, dpane);
                     w.layout.swap(spane, dpane);
-                    if !o.has('d') {
-                        // tmux keeps the active pane position unless -d
-                        if w.active == dpane {
-                            w.active = spane;
-                        } else if w.active == spane {
-                            w.active = dpane;
-                        }
-                    }
                 } else {
                     for wid in [swid, dwid] {
                         let w = self.windows.get_mut(&wid).unwrap();
@@ -2588,20 +2610,28 @@ impl Server {
                     self.windows.get_mut(&swid).unwrap().layout.replace(spane, pane_tmp);
                     self.windows.get_mut(&dwid).unwrap().layout.replace(dpane, spane);
                     self.windows.get_mut(&swid).unwrap().layout.replace(pane_tmp, dpane);
-                    for wid in [swid, dwid] {
-                        let w = self.windows.get_mut(&wid).unwrap();
-                        if w.active == spane && wid == dwid || w.active == dpane && wid == swid {
-                            continue;
-                        }
-                        if w.active == spane {
-                            w.active = dpane;
-                        } else if w.active == dpane {
-                            w.active = spane;
-                        }
-                        w.last_active = None;
-                    }
                     self.apply_layout(swid);
                     self.mark_window_dirty(swid);
+                }
+                // tmux: the target pane becomes active (the source in the target window), or
+                // with -d an active pane that moved is followed by its replacement
+                let activate = |srv: &mut Server, wid: WinId, p: PaneId| srv.windows.get_mut(&wid).unwrap().set_active(p);
+                if !o.has('d') {
+                    activate(self, swid, dpane);
+                    if swid != dwid {
+                        activate(self, dwid, spane);
+                    }
+                } else {
+                    if self.windows[&swid].active == spane {
+                        activate(self, swid, dpane);
+                    }
+                    if self.windows[&dwid].active == dpane {
+                        activate(self, dwid, spane);
+                    }
+                }
+                if swid != dwid {
+                    self.windows.get_mut(&swid).unwrap().last_panes.retain(|p| *p != spane);
+                    self.windows.get_mut(&dwid).unwrap().last_panes.retain(|p| *p != dpane);
                 }
                 self.apply_layout(dwid);
                 self.mark_window_dirty(dwid);
@@ -2610,7 +2640,7 @@ impl Server {
                     self.detect_changes(Some("swap-pane"));
                     for (wid, z) in [(swid, if swid == dwid { dzoom } else { szoom }), (dwid, dzoom && swid != dwid)] {
                         if z {
-                            self.rezoom_window(wid);
+                            self.rezoom_window(wid, None);
                         }
                     }
                 }
@@ -2619,6 +2649,12 @@ impl Server {
             "break-pane" => {
                 let src = self.resolve_pane(ctx, o.get('s'))?;
                 let (swid, pane) = (src.wid.unwrap(), src.pane.unwrap());
+                if self.windows[&swid].modal == Some(pane) {
+                    return err("pane is modal");
+                }
+                if o.has('W') {
+                    return self.cmd_float_pane(&o, swid, pane, src);
+                }
                 let ssid = src.sid.ok_or("no session")?;
                 let (dsid, didx) = match t {
                     Some(tt) => {
@@ -2640,14 +2676,7 @@ impl Server {
                 // active pane), layout_close_pane, then the new window is attached,
                 // laid out and created, and the pane moved
                 self.unzoom_window(swid);
-                let w = self.windows.get_mut(&swid).unwrap();
-                let l = std::mem::replace(&mut w.layout, Node::Leaf(PaneId::MAX));
-                w.layout = l.remove(pane).unwrap();
-                if w.active == pane {
-                    w.active = w.last_active.filter(|p| *p != pane).unwrap_or(w.panes()[0]);
-                }
-                w.last_active = None;
-                w.zoomed = false;
+                self.detach_pane(swid, pane);
                 self.apply_layout(swid);
                 self.flush_active_pane(swid);
                 self.flush_window_layout(swid);
@@ -2680,18 +2709,47 @@ impl Server {
                 Ok(Flow::Next)
             }
             "join-pane" | "move-pane" => {
+                let dst = self.resolve_pane(ctx, t)?;
+                let (dwid, dpane) = (dst.wid.unwrap(), dst.pane.unwrap());
+                if cmd == "move-pane" {
+                    if o.has('M') {
+                        // drag the floating pane under the mouse (from a mouse binding)
+                        if let (Some(cid), Some(m)) = (ctx.client, ctx.mouse.clone()) {
+                            if let Some(p) = self.mouse_pane(&m) {
+                                self.start_float_drag(cid, &m, p, true, false);
+                            }
+                        }
+                        return Ok(Flow::Next);
+                    }
+                    if ['P', 'z', 'X', 'Y', 'U', 'D', 'L', 'R'].into_iter().any(|c| o.has(c)) {
+                        return self.cmd_move_float(&o, dwid, dpane, dst);
+                    }
+                }
+                // the source is the marked pane, else the current one
                 let src = match o.get('s') {
                     Some(s) => self.resolve_pane(ctx, Some(s))?,
-                    None => self.target_for_pane(self.marked.ok_or("no source pane (use -s or mark a pane)")?),
+                    None => match self.marked.filter(|m| self.window_of(*m).is_some()) {
+                        Some(m) => self.target_for_pane(m),
+                        None => self.current(ctx),
+                    },
                 };
-                let dst = self.resolve_pane(ctx, t)?;
-                let (swid, spane) = (src.wid.unwrap(), src.pane.unwrap());
-                let (dwid, dpane) = (dst.wid.unwrap(), dst.pane.unwrap());
+                let (swid, spane) = (src.wid.ok_or("no source pane")?, src.pane.ok_or("no source pane")?);
+                if self.windows[&swid].modal == Some(spane) || self.windows[&dwid].modal == Some(dpane) {
+                    return err("pane is modal");
+                }
+                if spane == dpane {
+                    // a floating pane joined to itself is tiled again
+                    if self.windows[&swid].is_floating(spane) {
+                        self.unzoom_window(swid);
+                        return self.cmd_tile_pane(&o, swid, spane, src);
+                    }
+                    return err("source and target panes must be different");
+                }
                 // server_unzoom_window on both, with their events
                 self.unzoom_window(dwid);
                 self.unzoom_window(swid);
-                if spane == dpane {
-                    return err("source and target panes must be different");
+                if self.windows[&dwid].is_floating(dpane) {
+                    return err("size or position can't split a floating pane");
                 }
                 let horizontal = o.has('h');
                 let (rects, _) = self.rects(dwid);
@@ -2711,35 +2769,22 @@ impl Server {
                     }
                     (None, None) => None,
                 };
-                // detach from source window
-                let sw = self.windows.get_mut(&swid).unwrap();
-                let l = std::mem::replace(&mut sw.layout, Node::Leaf(PaneId::MAX));
-                match l.remove(spane) {
-                    Some(n) => {
-                        sw.layout = n;
-                        if sw.active == spane {
-                            sw.active = sw.panes()[0];
-                        }
-                        sw.last_active = sw.last_active.filter(|p| *p != spane);
-                        sw.zoomed = false;
-                        self.apply_layout(swid);
-                        // layout_close_pane, then window_lost_pane
-                        self.flush_window_layout(swid);
-                        if swid != dwid {
-                            self.flush_active_pane(swid);
-                        }
+                // detach from source window: layout_close_pane, then window_lost_pane
+                if self.detach_pane(swid, spane) {
+                    self.apply_layout(swid);
+                    self.flush_window_layout(swid);
+                    if swid != dwid {
+                        self.flush_active_pane(swid);
                     }
-                    None => {
-                        self.fire_window("window-layout-changed", swid);
-                        let sw = self.windows.get_mut(&swid).unwrap();
-                        // source window becomes empty: unlink it everywhere (sessions, clients and
-                        // hooks handled normally) without killing the moved pane
-                        sw.layout = Node::Leaf(PaneId::MAX);
-                        while let Some(&(sid, idx)) = self.links_of(swid).first() {
-                            self.unlink(sid, idx);
-                        }
-                        self.windows.remove(&swid);
+                } else {
+                    self.fire_window("window-layout-changed", swid);
+                    // source window becomes empty: unlink it everywhere (sessions, clients and
+                    // hooks handled normally) without killing the moved pane
+                    self.windows.get_mut(&swid).unwrap().layout = Node::Leaf(PaneId::MAX);
+                    while let Some(&(sid, idx)) = self.links_of(swid).first() {
+                        self.unlink(sid, idx);
                     }
+                    self.windows.remove(&swid);
                 }
                 let dw = self.windows.get_mut(&dwid).unwrap();
                 dw.insert_pane(dpane, spane, o.has('b'));
@@ -2755,12 +2800,12 @@ impl Server {
                 }
                 dw.zoomed = false;
                 if !o.has('d') {
-                    dw.last_active = Some(dw.active);
-                    dw.active = spane;
+                    dw.set_active(spane);
                 }
                 self.apply_layout(dwid);
                 self.mark_all_dirty();
-                // layout_assign_pane resizes the panes; the new active pane and window,
+                // layout_assign_pane resizes the panes; the new active pane and window
+                // (without -d the destination window becomes current: session_select),
                 // pane-moved, then the layouts of both windows (cmd-join-pane.c)
                 for p in self.windows[&dwid].panes() {
                     self.pane_resized_now(p);
@@ -2768,8 +2813,10 @@ impl Server {
                 if !o.has('d') {
                     self.flush_active_pane(dwid);
                     if let (Some(sid), Some(idx)) = (dst.sid, dst.idx) {
-                        self.select_window(sid, idx);
-                        self.detect_current_window(sid, false);
+                        if self.sessions.contains_key(&sid) {
+                            self.select_window(sid, idx);
+                            self.detect_current_window(sid, false);
+                        }
                     }
                 }
                 self.pane_moved_now(spane);
