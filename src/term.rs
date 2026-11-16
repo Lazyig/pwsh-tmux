@@ -96,12 +96,15 @@ impl Drop for RawMode {
 pub struct Input {
     #[cfg(windows)]
     high_surrogate: Option<u16>,
+    /// Focus reports made from console focus records, returned by the next read.
+    #[cfg(windows)]
+    pending: Vec<u8>,
 }
 
 impl Input {
     /// Waits up to `ms` for typed input; Ok(false) on timeout, Err when the terminal is gone. Lets the reader thread stay
     /// out of `read` while a lock command or suspended shell owns the terminal.
-    pub fn wait(&self, ms: u32) -> io::Result<bool> {
+    pub fn wait(&mut self, ms: u32) -> io::Result<bool> {
         #[cfg(unix)]
         {
             let mut fds = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
@@ -117,6 +120,9 @@ impl Input {
         }
         #[cfg(windows)]
         unsafe {
+            if !self.pending.is_empty() {
+                return Ok(true);
+            }
             use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
             use windows_sys::Win32::System::Threading::WaitForSingleObject;
             match WaitForSingleObject(win::stdin(), ms) {
@@ -125,7 +131,9 @@ impl Input {
                 // the console went away (terminal closed)
                 _ => return Err(io::Error::last_os_error()),
             }
-            // Drop non-key records (focus, resize, menu) so a later read can't block on them.
+            // Drop non-key records (resize, menu) so a later read can't block on them. A
+            // console that does not pass the terminal's focus reports on as VT input (conhost
+            // makes FOCUS_EVENT records of them) gets them back as CSI I / CSI O.
             loop {
                 let mut rec: win::INPUT_RECORD = std::mem::zeroed();
                 let mut n = 0u32;
@@ -140,6 +148,10 @@ impl Input {
                 }
                 if win::ReadConsoleInputW(win::stdin(), &mut rec, 1, &mut n) == 0 {
                     return Err(io::Error::last_os_error());
+                }
+                if n == 1 && rec.EventType as u32 == win::FOCUS_EVENT as u32 {
+                    self.pending.extend_from_slice(if rec.Event.FocusEvent.bSetFocus != 0 { b"\x1b[I" } else { b"\x1b[O" });
+                    return Ok(true);
                 }
             }
         }
@@ -164,6 +176,9 @@ impl Input {
         }
         #[cfg(windows)]
         {
+            if !self.pending.is_empty() {
+                return Ok(std::mem::take(&mut self.pending));
+            }
             // Raw ReadConsoleW rather than std's stdin, which treats ^Z as EOF and
             // ReadFile, which mangles non-ASCII input on older consoles.
             let mut wbuf = [0u16; 4096];
