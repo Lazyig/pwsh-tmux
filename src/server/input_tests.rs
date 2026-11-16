@@ -586,6 +586,10 @@ fn control_strings_end_and_dispatch_as_tmux_does() {
     // bytes that are not UTF-8, and C1 bytes, show as U+FFFD
     feed(&mut f, b"\x1bcA\x9b1mB|"); assert_eq!(row0(&f), "A\u{fffd}1mB|");
     feed(&mut f, b"\x1bcA\xc3(B\xffC|"); assert_eq!(row0(&f), "A\u{fffd}(B\u{fffd}C|");
+    // a C1 character sent as UTF-8 is kept with no width: it joins the cell before, and is
+    // dropped at the start of a line (tmux 3.8 capture-pane: "a\302\205b")
+    feed(&mut f, "\x1bca\u{85}b|\u{80}\u{9f}c\r\n\u{85}x".as_bytes());
+    assert_eq!(f.panes[&f.pane].screen().contents(), "a\u{85}b|\u{80}\u{9f}c\nx");
     // DECALN
     feed(&mut f, b"\x1bc\x1b[3;3HA\x1b#8|");
     assert_eq!(row0(&f), format!("|{}", "E".repeat(f.panes[&pane].size.0 as usize - 1)));

@@ -1088,6 +1088,8 @@ impl Screen {
         // codepoint-widths never applies to 7-bit characters (tmux does not look them up)
         let width = self.widths.iter().rev().find(|(a, b, _)| !c.is_ascii() && (*a..=*b).contains(&(c as u32)))
             .map(|(_, _, w)| *w as usize).or_else(|| c.width());
+        // utf8_width: C1 control characters are always zero width
+        let width = if ('\u{80}'..='\u{9f}').contains(&c) { Some(width.unwrap_or(0)) } else { width };
         if width.is_none() && (u32::from(c)) < 256 {
             // don't even try to draw control characters
             return None;
