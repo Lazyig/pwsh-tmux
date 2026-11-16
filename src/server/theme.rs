@@ -21,7 +21,22 @@ pub struct Terminal {
     style_fg: StyleColour,
     style_bg: StyleColour,
     active_style: Option<(StyleColour, StyleColour)>,
+    /// TTY_HAVEDA, TTY_HAVEDA2, TTY_HAVEXDA, TTY_HAVESYNC: the replies received, or no
+    /// longer waited for.
+    have: u8,
+    /// When the requests were sent (tty_start_start_timer).
+    started: Option<Instant>,
 }
+
+/// The request flags of Terminal::have (TTY_ALL_REQUEST_FLAGS is all of them).
+pub const HAVE_DA: u8 = 1;
+pub const HAVE_DA2: u8 = 2;
+pub const HAVE_XDA: u8 = 4;
+pub const HAVE_SYNC: u8 = 8;
+const HAVE_ALL: u8 = HAVE_DA | HAVE_DA2 | HAVE_XDA | HAVE_SYNC;
+
+/// tmux TTY_QUERY_TIMEOUT: how long replies to the requests are waited for.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// tmux TTY_REQUEST_LIMIT: colour requests are repeated (on resize) at most this often.
 const REQUEST_LIMIT: Duration = Duration::from_secs(30);
@@ -31,12 +46,32 @@ impl Terminal {
         self.reported.or_else(|| self.bg.and_then(background_theme))
     }
     /// tty_start_tty + tty_send_requests: subscribe to theme changes and ask for the theme,
-    /// the secondary and extended device attributes, synchronized output (DECRQM 2026, the
-    /// reply adds the sync feature) and the colours (VT100-like terminals only).
+    /// the primary, secondary and extended device attributes and synchronized output
+    /// (DECRQM 2026) not answered yet, and the colours (VT100-like terminals only).
     pub fn start(&mut self) -> Option<Vec<u8>> {
-        let mut out = self.vt100.then(|| b"\x1b[?2031h\x1b[?996n\x1b[>c\x1b[>q\x1b[?2026$p".to_vec())?;
+        if !self.vt100 {
+            return None;
+        }
+        let mut out = b"\x1b[?2031h\x1b[?996n".to_vec();
+        for (bit, q) in [(HAVE_DA, &b"\x1b[c"[..]), (HAVE_DA2, b"\x1b[>c"), (HAVE_XDA, b"\x1b[>q"), (HAVE_SYNC, b"\x1b[?2026$p")] {
+            if self.have & bit == 0 {
+                out.extend(q);
+            }
+        }
         out.extend(self.requests(true)?);
+        self.started = Some(Instant::now());
         Some(out)
+    }
+    /// A reply of this kind is still taken: not received yet, and the start timer has
+    /// not fired (tty_start_timer_callback stops waiting for all of them).
+    pub fn waiting(&mut self, bit: u8) -> bool {
+        if self.started.is_some_and(|t| t.elapsed() > QUERY_TIMEOUT) {
+            self.have = HAVE_ALL;
+        }
+        self.have & bit == 0
+    }
+    pub fn received(&mut self, bit: u8) {
+        self.have |= bit;
     }
     /// tty_repeat_requests: ask for the colours again, unless asked within REQUEST_LIMIT.
     pub fn requests(&mut self, force: bool) -> Option<&'static [u8]> {
@@ -314,10 +349,43 @@ impl PaneColours {
 impl Server {
     pub(super) fn terminal_report(&mut self, cid: ClientId, raw: &[u8]) -> bool {
         if let Some(c) = self.clients.get_mut(&cid) {
-            if !c.denied && c.features.device_report(raw) {
+            // tty_keys_device_attributes2 and _extended: once per terminal
+            let bit = if raw.starts_with(b"\x1bP>|") { HAVE_XDA } else if raw.starts_with(b"\x1b[>") { HAVE_DA2 } else { 0 };
+            if bit != 0 && !c.denied && c.terminal.waiting(bit) && c.features.device_report(raw) {
+                c.terminal.received(bit);
                 c.prev = None;
                 c.dirty = true;
                 return true;
+            }
+            // tty_keys_device_attributes: VT420 and later levels list features
+            if raw.starts_with(b"\x1b[?") && raw.ends_with(b"c") && c.terminal.waiting(HAVE_DA) {
+                if let Ok(body) = std::str::from_utf8(&raw[3..raw.len() - 1]) {
+                    if body.bytes().all(|b| b.is_ascii_digit() || b == b';') {
+                        let p: Vec<u32> = body.split(';').take(32).map(|n| n.parse().unwrap_or(0)).collect();
+                        if (61..=65).contains(&p[0]) {
+                            for n in &p[1..] {
+                                let f = match n { 4 => "sixel", 21 => "margins", 28 => "rectfill", 52 => "clipboard", _ => continue };
+                                c.features.parse(f, &[',']);
+                            }
+                        }
+                        c.terminal.received(HAVE_DA);
+                        c.prev = None;
+                        c.dirty = true;
+                        return true;
+                    }
+                }
+            }
+            // tty_keys_sync: the DECRPM reply to DECRQM 2026
+            if let Some(status) = raw.strip_prefix(b"\x1b[?2026;").and_then(|r| r.strip_suffix(b"$y")).filter(|r| r.len() == 1 && (b'0'..=b'4').contains(&r[0])) {
+                if c.terminal.waiting(HAVE_SYNC) {
+                    if matches!(status[0], b'1'..=b'3') && !c.features.has("sync") {
+                        c.features.parse("sync", &[',']);
+                        c.prev = None;
+                        c.dirty = true;
+                    }
+                    c.terminal.received(HAVE_SYNC);
+                    return true;
+                }
             }
         }
         let reported = match raw {

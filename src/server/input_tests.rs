@@ -755,9 +755,45 @@ fn attach_asks_for_synchronized_output() {
     f.handle_input(1, b"\x1b[?2026;2$y");
     assert!(f.clients[&1].features.has("sync"));
     assert!(f.pane_input.try_recv().is_err()); // the reply is not typed into the pane
+    // tty_keys_sync: only the first reply is read (TTY_HAVESYNC)
     f.clients.get_mut(&1).unwrap().features.0.remove("sync");
-    f.handle_input(1, b"\x1b[?2026;0$y");
+    f.handle_input(1, b"\x1b[?2026;2$y");
     assert!(!f.clients[&1].features.has("sync"));
+}
+
+#[test]
+fn attach_asks_for_primary_device_attributes() {
+    // tty_send_requests asks for DA1; tty_keys_device_attributes adds margins, rectfill,
+    // sixel and clipboard from a VT420 or later reply, once
+    let mut f = fixture(); let sid = f.sid;
+    f.clients.get_mut(&1).unwrap().ident = Some(Identity { cols: 80, rows: 24, tty: true, cwd: String::new(), term: "xterm-256color".into(), pid: 0, ctx_pane: None, utf8: true, env: Vec::new() });
+    f.clients.get_mut(&1).unwrap().attached = false;
+    f.clients.get_mut(&1).unwrap().terminal.vt100 = true;
+    for feat in ["margins", "rectfill", "sixel"] {
+        f.clients.get_mut(&1).unwrap().features.0.remove(feat);
+    }
+    f.output.try_iter().for_each(drop); f.attach_client(1, sid);
+    let out = frames(&f, S_OUTPUT);
+    assert!(out.windows(3).any(|w| w == b"\x1b[c"), "{:?}", String::from_utf8_lossy(&out));
+    f.pane_input.try_iter().for_each(drop);
+    f.handle_input(1, b"\x1b[?64;1;2;4;6;9;15;18;21;22;28c");
+    let c = &f.clients[&1];
+    assert!(c.features.has("margins") && c.features.has("rectfill") && c.features.has("sixel"), "{:?}", c.features);
+    assert!(f.pane_input.try_recv().is_err());
+}
+
+#[test]
+fn readonly_clients_read_terminal_replies() {
+    // the DECRPM 2026 reply is a terminal reply, not input: read-only clients get sync too
+    let mut f = fixture(); let sid = f.sid;
+    f.clients.get_mut(&1).unwrap().ident = Some(Identity { cols: 80, rows: 24, tty: true, cwd: String::new(), term: "xterm-256color".into(), pid: 0, ctx_pane: None, utf8: true, env: Vec::new() });
+    f.clients.get_mut(&1).unwrap().attached = false;
+    f.clients.get_mut(&1).unwrap().terminal.vt100 = true;
+    f.attach_client(1, sid);
+    f.clients.get_mut(&1).unwrap().readonly = true;
+    f.clients.get_mut(&1).unwrap().features.0.remove("sync");
+    f.handle_input(1, b"\x1b[?2026;1$y");
+    assert!(f.clients[&1].features.has("sync"));
 }
 
 #[test]

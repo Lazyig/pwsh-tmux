@@ -363,6 +363,8 @@ impl Server {
                 self.clipboard_reply(cid, raw);
                 return;
             }
+            // terminal replies (device attributes, DECRPM 2026, theme and colours) are
+            // read for every client, read-only ones too (tty_keys_next)
             if self.terminal_report(cid, raw) { return; }
             // focus reports set the client's focus (also for read-only clients)
             if raw == b"\x1b[I" || raw == b"\x1b[O" {
@@ -424,17 +426,6 @@ impl Server {
                 }
             }
             Input::Unknown(raw) => {
-                // tty_keys_sync: the DECRPM reply to the attach-time DECRQM 2026
-                if let Some(status) = raw.strip_prefix(b"\x1b[?2026;").and_then(|r| r.strip_suffix(b"$y")).filter(|r| r.len() == 1 && (b'0'..=b'4').contains(&r[0])) {
-                    if let Some(c) = self.clients.get_mut(&cid) {
-                        if matches!(status[0], b'1'..=b'3') && !c.features.has("sync") {
-                            c.features.parse("sync", &[',']);
-                            c.prev = None;
-                            c.dirty = true;
-                        }
-                    }
-                    return;
-                }
                 // focus reports reach panes through pane-focus-in/out (only those that asked)
                 if raw == b"\x1b[I" || raw == b"\x1b[O" {
                     self.client_focus(cid, raw == b"\x1b[I");
