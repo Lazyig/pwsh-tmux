@@ -396,6 +396,11 @@ impl Tree {
 
 // ---- menu ------------------------------------------------------------------------
 
+/// Width of a menu item name drawn as a format (format_width).
+fn styled_width(name: &str) -> usize {
+    crate::format::spans(name, Style::default()).iter().map(|s| crate::format::width(&s.text)).sum()
+}
+
 pub struct MenuItem {
     pub name: String,
     pub key: String,
@@ -433,7 +438,7 @@ impl Menu {
     pub fn box_size(title: &str, items: &[MenuItem]) -> (u16, u16) {
         let inner = items
             .iter()
-            .map(|i| crate::format::width(&i.name) + if i.key.is_empty() { 0 } else { crate::format::width(&i.key) + 3 })
+            .map(|i| styled_width(&i.name) + if i.key.is_empty() { 0 } else { crate::format::width(&i.key) + 3 })
             .chain(std::iter::once(crate::format::spans(title, Style::default()).iter().map(|s| crate::format::width(&s.text)).sum()))
             .max()
             .unwrap_or(0) as u16;
@@ -480,7 +485,7 @@ impl Menu {
     pub fn new(title: String, items: Vec<MenuItem>, x: Option<&str>, y: Option<&str>, cw: u16, ch: u16, mouse: Option<(u16, u16)>, pane: Option<PaneId>) -> Menu {
         let inner = items
             .iter()
-            .map(|i| crate::format::width(&i.name) + if i.key.is_empty() { 0 } else { crate::format::width(&i.key) + 3 })
+            .map(|i| styled_width(&i.name) + if i.key.is_empty() { 0 } else { crate::format::width(&i.key) + 3 })
             .chain(std::iter::once(crate::format::spans(&title, Style::default()).iter().map(|s| crate::format::width(&s.text)).sum()))
             .max()
             .unwrap_or(10) as u16;
@@ -559,8 +564,12 @@ impl Menu {
                 f.set(x0 + w - 1, y, Cell { text: lines[8].into(), style: border });
                 continue;
             }
+            // names are formats (menu_add_item: "Paste #[underscore]..."), drawn
+            // like format_draw over the item's style
             let dim = Style { attrs: style.attrs | crate::cells::DIM, ..st };
-            f.text(x0 + 2, y, &it.name, if it.cmd.is_empty() { dim } else { st }, x0 + w - 1);
+            let base = if it.cmd.is_empty() { dim } else { st };
+            let cells = crate::format::layout_line(&crate::format::spans(&it.name, base), w.saturating_sub(4) as usize, st);
+            f.put_cells(x0 + 2, y, &cells);
             if !it.key.is_empty() {
                 let k = format!("({})", it.key);
                 let kw = crate::format::width(&k) as u16;
@@ -655,6 +664,23 @@ fn clock_text_at(style: &str, now: chrono::DateTime<chrono::Local>) -> String {
         // strftime "%l:%M " (or "%l:%M:%S ") then AM or PM
         let (pm, h) = now.hour12();
         format!("{h:>2}:{:02}{seconds} {}", now.minute(), if pm { "PM" } else { "AM" })
+    }
+}
+
+#[cfg(test)]
+mod menu_format_tests {
+    use super::*;
+    #[test]
+    fn menu_names_are_drawn_as_formats() {
+        let items = vec![MenuItem { name: "Paste #[underscore]abc".into(), key: "p".into(), cmd: "paste-buffer".into() }];
+        let (w, h) = Menu::box_size("", &items);
+        assert_eq!((w, h), (9 + 4 + 4, 3));
+        let m = Menu::at(String::new(), items, 0, 0, None, true, false, None);
+        let mut f = super::super::render::Frame::new(30, 4);
+        m.draw(&mut f, Style::default(), Style::default(), Style::default(), "single");
+        let row: String = (0..w).map(|x| f.cells[(30 + x) as usize].text.clone()).collect();
+        assert_eq!(row, "│ Paste abc (p) │");
+        assert_ne!(f.cells[30 + 8].style.attrs & crate::cells::UNDERLINE, 0);
     }
 }
 
