@@ -166,6 +166,10 @@ impl Server {
 
 impl Vars for VarCtx<'_> {
     fn theme_color(&self, name: &str) -> Option<Color> {
+        // without a client a theme name stays unresolved (COLOUR_FLAG_THEME): a style is
+        // drawn in the palette of the client it is drawn for (tty_map_theme_colour), as
+        // the modes' styles are, not in the terminal's own colours
+        self.client?;
         self.resolve_theme_colour(name)
     }
 
