@@ -730,3 +730,93 @@ fn attach_asks_for_synchronized_output() {
     f.handle_input(1, b"\x1b[?2026;0$y");
     assert!(!f.clients[&1].features.has("sync"));
 }
+
+#[test]
+fn pasted_input_never_reaches_a_pane_in_a_mode() {
+    let mut f = fixture(); let pane = f.pane;
+    f.clients.get_mut(&1).unwrap().features.0.remove("bpaste");
+    f.opts_session.set("assume-paste-time", "1000".into());
+    run(&mut f, &["copy-mode"]);
+    f.pane_input.try_iter().for_each(drop);
+    f.handle_input(1, b"abcdef");
+    f.handle_input(1, b"\x1b[200~hello\x1b[201~");
+    assert!(f.pane_input.try_recv().is_err());
+    assert!(f.panes[&pane].mode.is_some());
+    run(&mut f, &["send-keys", "-X", "cancel"]);
+    // the paste-start key ends clock mode, then the text goes to the pane
+    run(&mut f, &["clock-mode"]);
+    f.handle_input(1, b"\x1b[200~hi\x1b[201~");
+    assert!(f.panes[&pane].mode.is_none());
+    assert_eq!(f.pane_input.try_iter().flatten().collect::<Vec<u8>>(), b"hi");
+    // a guessed paste goes as the bytes typed, and does not close a dead pane kept by
+    // remain-on-exit key
+    f.panes.get_mut(&pane).unwrap().options.set("remain-on-exit", "key".into());
+    run(&mut f, &["new-window", "-d"]);
+    f.pane_exited(pane, Some(0));
+    f.handle_input(1, b"xyz");
+    assert!(f.panes.contains_key(&pane));
+}
+
+#[test]
+fn repeat_ends_on_a_binding_that_does_not_repeat() {
+    let mut f = fixture();
+    f.opts_session.set("repeat-time", "2000".into());
+    run(&mut f, &["bind-key", "-r", "a", "set-option -ga @r a"]);
+    run(&mut f, &["bind-key", "z", "set-option -ga @r z"]);
+    f.opts_session.set("@r", "".into());
+    f.pane_input.try_iter().for_each(drop);
+    // C-b a z: z is not a repeating binding, so it goes to the root table (and the pane)
+    f.handle_input(1, b"\x02a"); f.handle_input(1, b"z");
+    assert_eq!(f.opts_session.get("@r"), Some("a"));
+    assert_eq!(f.pane_input.try_iter().flatten().collect::<Vec<u8>>(), b"z");
+    // C-b a C-b z: the prefix ends the repeat and starts the prefix table again
+    f.handle_input(1, b"\x02a"); f.handle_input(1, b"\x02"); f.handle_input(1, b"z");
+    assert_eq!(f.opts_session.get("@r"), Some("aaz"));
+    assert!(f.pane_input.try_recv().is_err());
+    assert_eq!(f.clients[&1].key_table, "root");
+}
+
+#[test]
+fn prefix_timeout_counts_from_when_the_table_was_set() {
+    let mut f = fixture();
+    f.opts_server.set("prefix-timeout", "1000".into());
+    run(&mut f, &["bind-key", "z", "set-option -g @z yes"]);
+    f.handle_input(1, b"\x02");
+    // the prefix was pressed long ago, but switch-client -T sets the table now
+    f.clients.get_mut(&1).unwrap().input_state.table_at = Some(Instant::now() - Duration::from_secs(10));
+    run(&mut f, &["switch-client", "-T", "prefix"]);
+    f.handle_input(1, b"z");
+    assert_eq!(f.opts_session.get("@z"), Some("yes"));
+    f.opts_session.unset("@z");
+    f.handle_input(1, b"\x02");
+    f.clients.get_mut(&1).unwrap().input_state.table_at = Some(Instant::now() - Duration::from_secs(10));
+    f.handle_input(1, b"z");
+    assert!(f.opts_session.get("@z").is_none());
+}
+
+#[test]
+fn clipboard_request_goes_to_the_most_recent_usable_client() {
+    let mut f = fixture(); let pane = f.pane; let sid = f.sid;
+    f.opts_server.set("set-clipboard", "on".into());
+    f.opts_server.set("get-clipboard", "request".into());
+    // a second attached client, more recently active than client 1
+    let (tx, out2) = mpsc::channel();
+    let mut c2 = super::security_tests::fixture().0.clients.remove(&1).unwrap();
+    c2.id = 2; c2.tx = tx; c2.readonly = false; c2.acl_readonly = false; c2.closed.store(false, std::sync::atomic::Ordering::SeqCst);
+    c2.features = features::compute("xterm-256color", "", &[], "clipboard");
+    f.clients.insert(2, c2);
+    f.attach_client(2, sid);
+    f.clients.get_mut(&1).unwrap().features.0.insert("clipboard".into());
+    f.clients.get_mut(&1).unwrap().activity = 1;
+    f.clients.get_mut(&2).unwrap().activity = now_secs();
+    f.output.try_iter().for_each(drop); out2.try_iter().for_each(drop);
+    let g = f.panes[&pane].generation;
+    f.pane_data(pane, g, b"\x1b]52;c;?\x07");
+    assert!(out2.try_iter().any(|frame| frame.ends_with(b"\x1b]52;;?\x07")));
+    assert!(!f.output.try_iter().any(|frame| frame.ends_with(b"\x1b]52;;?\x07")));
+    // a suspended (locked) client is skipped
+    f.clients.get_mut(&2).unwrap().suspended = true;
+    f.pane_data(pane, g, b"\x1b]52;c;?\x07");
+    assert!(!out2.try_iter().any(|frame| frame.ends_with(b"\x1b]52;;?\x07")));
+    assert!(f.output.try_iter().any(|frame| frame.ends_with(b"\x1b]52;;?\x07")));
+}

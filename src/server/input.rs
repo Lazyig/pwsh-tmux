@@ -36,6 +36,13 @@ impl Client {
         out
     }
 
+    /// server_client_set_key_table: the table and when it was set, which prefix-timeout
+    /// measures from.
+    pub fn set_key_table(&mut self, name: &str) {
+        self.key_table = name.to_string();
+        self.input_state.table_at = Some(Instant::now());
+    }
+
     /// Before the client gives up the terminal (exit, suspend, lock): reset it and forget what
     /// it was given, so a later redraw sends it again.
     pub(super) fn tty_stop(&mut self) {
@@ -51,7 +58,8 @@ impl Client {
 /// Per-client key timing. Monotonic time avoids wall clock changes during a paste.
 #[derive(Default)]
 pub struct InputState {
-    prefix_at: Option<Instant>,
+    /// When the key table was last set (keytable->activity_time), for prefix-timeout.
+    pub(super) table_at: Option<Instant>,
     last_key: String,
     key_at: Option<Instant>,
     assume_paste: bool,
@@ -374,7 +382,12 @@ impl Server {
                         }
                     }
                     "request" | "both" => {
-                        let cid = self.clients.values().find(|c| c.attached && c.control == 0 && c.features.has("clipboard") && c.session.is_some_and(|s| self.sessions[&s].links.values().any(|w| self.windows[w].panes().contains(&pane)))).map(|c| c.id);
+                        // input_add_request: the most recently active attached client (not suspended or
+                        // locked) whose session has the window; Ms goes to it if it has the feature
+                        let cid = self.clients.values()
+                            .filter(|c| c.attached && !c.suspended && c.control == 0 && c.session.is_some_and(|s| self.sessions[&s].links.values().any(|w| self.windows[w].panes().contains(&pane))))
+                            .max_by_key(|c| (c.activity, c.input_state.key_at, std::cmp::Reverse(c.id)))
+                            .filter(|c| c.features.has("clipboard")).map(|c| c.id);
                         if let Some(cid) = cid {
                             let c = self.clients.get_mut(&cid).unwrap();
                             if c.input_state.clipboard.len() < 64 {
@@ -474,6 +487,14 @@ impl Server {
                     return;
                 }
                 if let Some(target) = self.input_target(cid) {
+                    // the paste-start key reaches the pane's mode first: it ends clock mode
+                    // like any key; in another mode the pasted text is dropped
+                    match self.panes.get(&target).map(|p| &p.mode) {
+                        Some(Some(PaneMode::Clock)) => self.exit_mode(target),
+                        Some(Some(_)) => return,
+                        _ => {}
+                    }
+                    if self.panes.get(&target).is_some_and(|p| p.options.get("@input-disabled") == Some("on")) { return; }
                     self.paste(target, &data, true, true, None);
                 }
             }
@@ -529,6 +550,21 @@ impl Server {
             }
         } else if let Some(p) = self.panes.get(&pane) {
             p.send(bytes);
+        }
+    }
+
+    /// window_pane_paste: pasted bytes go to the pane as they are, but not to a pane in a mode
+    /// or with input disabled.
+    fn paste_bytes(&mut self, cid: ClientId, pane: PaneId, data: &[u8]) {
+        if self.client_is_readonly(Some(cid)) { return; }
+        let ok = |p: &Pane| p.mode.is_none() && p.dead.is_none() && p.options.get("@input-disabled") != Some("on");
+        if !self.panes.get(&pane).is_some_and(ok) { return; }
+        let mut targets = vec![pane];
+        if let Some(w) = self.window_of(pane).filter(|w| self.opt_window_on(Some(*w), "synchronize-panes")) {
+            targets = self.windows[&w].panes();
+        }
+        for q in targets {
+            if let Some(p) = self.panes.get(&q).filter(|p| ok(p)) { p.send(data.to_vec()); }
         }
     }
 
@@ -689,53 +725,61 @@ impl Server {
         c.input_state.assume_paste = quick;
         c.input_state.key_at = Some(now);
         if paste {
-            if let Some(pane) = self.input_target(cid) {
-                if !self.dead_key(pane) { self.send_key_to_pane(cid, pane, &k, raw); }
-            }
+            // paste_key: the bytes as they came (window_pane_paste), never to a pane in a mode
+            // and without the dead-key check
+            if let Some(pane) = self.input_target(cid) { self.paste_bytes(cid, pane, &raw); }
             return;
         }
         let mut table = self.clients[&cid].key_table.clone();
-        let repeating = self.clients[&cid].repeat_until.is_some_and(|d| d > Instant::now());
+        let mut repeating = self.clients[&cid].repeat_until.is_some_and(|d| d > Instant::now());
         let prefix_ms = self.opt_server_num("prefix-timeout").max(0) as u64;
         let repeat_binding = self.bindings.get(&table).and_then(|t| t.get(&name)).is_some_and(|b| b.repeat);
+        // prefix-timeout counts from when the table was set, also by switch-client -T
         if table == "prefix" && prefix_ms > 0 && !(repeating && repeat_binding)
-            && self.clients[&cid].input_state.prefix_at.is_some_and(|t| now.duration_since(t) > Duration::from_millis(prefix_ms)) {
+            && self.clients[&cid].input_state.table_at.is_some_and(|t| now.duration_since(t) > Duration::from_millis(prefix_ms)) {
             table = "root".into();
-            let c = self.clients.get_mut(&cid).unwrap(); c.key_table = table.clone(); c.repeat_until = None;
-        }
-        if table == "root" {
-            let prefix = self.opt_session(Some(sid), "prefix");
-            let prefix2 = self.opt_session(Some(sid), "prefix2");
-            let is_prefix = |p: &str| p != "None" && keys::parse_key_name(p).is_some_and(|pk| keys::key_name(&pk) == name);
-            if is_prefix(&prefix) || is_prefix(&prefix2) {
-                // root bindings for the prefix key itself take precedence (tmux checks root first)
-                if !self.bindings.get("root").is_some_and(|t| t.contains_key(&name)) {
-                    let c = self.clients.get_mut(&cid).unwrap();
-                    c.key_table = "prefix".into();
-                    c.input_state.prefix_at = Some(now);
-                    c.repeat_until = None;
-                    c.dirty = true;
-                    return;
-                }
-            }
+            let c = self.clients.get_mut(&cid).unwrap(); c.set_key_table("root"); c.repeat_until = None;
         }
         let pane = self.client_active_pane(cid);
         loop {
+            if table == "root" {
+                let prefix = self.opt_session(Some(sid), "prefix");
+                let prefix2 = self.opt_session(Some(sid), "prefix2");
+                let is_prefix = |p: &str| p != "None" && keys::parse_key_name(p).is_some_and(|pk| keys::key_name(&pk) == name);
+                if is_prefix(&prefix) || is_prefix(&prefix2) {
+                    // root bindings for the prefix key itself take precedence (tmux checks root first)
+                    if !self.bindings.get("root").is_some_and(|t| t.contains_key(&name)) {
+                        let c = self.clients.get_mut(&cid).unwrap();
+                        c.set_key_table("prefix");
+                        c.repeat_until = None;
+                        c.dirty = true;
+                        return;
+                    }
+                }
+            }
             let found = self.bindings.get(&table).and_then(|t| t.get(&name)).map(|b| (b.cmd.clone(), b.repeat));
             match found {
+                Some((_, false)) if repeating => {
+                    // a binding that does not repeat ends the repeat; the key is looked up
+                    // again from the root table, where it may be the prefix
+                    let c = self.clients.get_mut(&cid).unwrap();
+                    c.set_key_table("root");
+                    c.repeat_until = None;
+                    c.dirty = true;
+                    repeating = false;
+                    table = "root".into();
+                }
                 Some((cmd, repeat)) => {
                     let mut ms = self.opt_session_num(Some(sid), "repeat-time").max(0) as u64;
                     let initial = self.opt_session_num(Some(sid), "initial-repeat-time").max(0) as u64;
                     if ms > 0 && initial > 0 && (!repeating || self.clients[&cid].input_state.last_key != name) { ms = initial; }
                     let c = self.clients.get_mut(&cid).unwrap();
                     c.input_state.last_key = name.clone();
-                    c.input_state.prefix_at = Some(now);
                     if repeat && ms > 0 && table != "root" {
                         c.repeat_until = Some(Instant::now() + Duration::from_millis(ms));
-                        c.key_table = table.clone();
                     } else {
                         c.repeat_until = None;
-                        c.key_table = "root".into();
+                        c.set_key_table("root");
                     }
                     c.dirty = true;
                     self.run_string(cid, &cmd, pane);
@@ -743,12 +787,13 @@ impl Server {
                 }
                 None if table != "root" => {
                     let c = self.clients.get_mut(&cid).unwrap();
-                    c.key_table = "root".into();
+                    c.set_key_table("root");
                     c.repeat_until = None;
                     c.dirty = true;
                     if !repeating {
                         return; // unbound key after the prefix is discarded
                     }
+                    repeating = false;
                     table = "root".into();
                 }
                 None => break,

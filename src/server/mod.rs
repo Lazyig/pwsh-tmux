@@ -1744,7 +1744,7 @@ impl Server {
             if c.repeat_until.is_some_and(|d| d <= now) {
                 c.repeat_until = None;
                 if c.key_table != "root" {
-                    c.key_table = "root".into();
+                    c.set_key_table("root");
                     c.dirty = true;
                 }
             }

@@ -1200,7 +1200,7 @@ impl Server {
                 let cid = self.resolve_client(ctx, o.get('c'))?;
                 if let Some(table) = o.get('T') {
                     let c = self.clients.get_mut(&cid).unwrap();
-                    c.key_table = table.to_string();
+                    c.set_key_table(table);
                     c.dirty = true;
                     return Ok(Flow::Next);
                 }
