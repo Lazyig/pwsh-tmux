@@ -714,11 +714,14 @@ impl Window {
         let live = self.layout.panes();
         let mut z: Vec<PaneId> = self.zorder.iter().copied().filter(|p| live.contains(p)).collect();
         for p in self.panes() {
-            if !z.contains(&p) {
-                // a pane that was never ordered goes in front if floating, else at the back
-                if self.layout.is_float(p) { z.insert(0, p) } else { z.push(p) }
-            }
+            // a pane that was never ordered goes in front if floating, else at the back
+            if !z.contains(&p) && self.layout.is_float(p) { z.insert(0, p) }
         }
+        // tiled panes go on the back of the z-order as they are made (spawn_pane), so
+        // in id order
+        let mut made: Vec<PaneId> = self.panes().into_iter().filter(|p| !z.contains(p)).collect();
+        made.sort_unstable();
+        z.extend(made);
         z
     }
 

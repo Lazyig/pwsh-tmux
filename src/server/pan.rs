@@ -246,6 +246,24 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn a_panned_window_ends_its_separators_on_the_window_not_the_client() {
+        let (mut srv, _evs, top) = bigger();
+        ok(&mut srv, &["set", "-g", "pane-border-status", "bottom"]);
+        ok(&mut srv, &["split-window", "-v", "-d", "-l", "3"]);
+        ok(&mut srv, &["split-window", "-h", "-d", "-l", "40", "-t", &format!("%{top}")]);
+        ok(&mut srv, &["refresh-client", "-U", "100"]);
+        ok(&mut srv, &["refresh-client", "-D", "2"]);
+        assert_eq!(vars(&srv), "1 0 2");
+        // the last row shown is window row 15, a content row: the separator stays a
+        // line there, the junction is on the status row below it
+        let cell = |srv: &Server, y: u16| srv.compose(1).unwrap().frame.get(59, y).unwrap().text.clone();
+        assert_eq!(cell(&srv, 13), "│");
+        ok(&mut srv, &["refresh-client", "-D", "1"]);
+        assert_eq!(cell(&srv, 13), "┴");
+        kill(&mut srv);
+    }
+
+    #[test]
     fn windows_are_sized_for_the_clients_that_show_them() {
         let (mut srv, _evs) = clients((80, 24), Some((50, 12)));
         ok(&mut srv, &["new-session", "-d", "-s", "a", "-x", "80", "-y", "24", "-n", "w0"]);
