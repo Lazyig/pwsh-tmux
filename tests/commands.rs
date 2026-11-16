@@ -3080,3 +3080,18 @@ fn startup_config_causes_go_to_the_first_attach() {
     assert_eq!(attach(), vec!["%session-changed $0 s".to_string()]);
     let _ = std::fs::remove_file(&conf);
 }
+
+#[cfg(unix)]
+#[test]
+fn respawn_keeps_the_pane_history() {
+    // screen_reinit clears only the visible lines: the history stays
+    let ctx = Ctx::new("respawnhist");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "40", "-y", "6", "seq 20; sleep 100"]);
+    wait_for("history", || ctx.fmt("s", "#{history_size}") == "15");
+    for cmd in ["respawn-pane", "respawn-window"] {
+        ctx.ok(&[cmd, "-k", "-t", "s", "echo x; sleep 100"]);
+        wait_for("new output", || ctx.capture("s").starts_with("x\n"));
+        assert_eq!(ctx.fmt("s", "#{history_size}"), "15", "{cmd}");
+        assert!(ctx.ok(&["capture-pane", "-p", "-S", "-", "-t", "s"]).starts_with("1\n2\n3\n"), "{cmd}");
+    }
+}

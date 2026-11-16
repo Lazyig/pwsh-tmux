@@ -105,6 +105,13 @@ pub struct PaneInfo {
     pub path: Option<String>,
 }
 
+/// screen_reinit as terminal input: any sequence in progress is cancelled, the alternate
+/// screen left, the scroll region, modes (origin, insert, cursor keys, keypad, cursor,
+/// wrap, bracketed paste, mouse, focus) and attributes reset and the visible lines
+/// cleared with the cursor at the top left; the history stays.
+const SCREEN_REINIT: &[u8] = b"\x18\x1b[?1049l\x1b[r\x1b[?6l\x1b[4l\x1b[?1l\x1b>\x1b[?25h\x1b[?7h\x1b[?2004l\
+\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1004l\x1b[0m\x1b[H\x1b[2J";
+
 /// Answers terminal queries and collects title / bell / cwd reports from a pane.
 #[derive(Default)]
 pub struct PaneCb {
@@ -2693,7 +2700,22 @@ impl Server {
             },
         );
         let respawn = previous.is_some();
-        if let Some(old) = previous {
+        if let Some(mut old) = previous {
+            // screen_reinit: a respawned pane keeps its screen with the history; only the
+            // visible lines are cleared and the modes, scroll region and cursor reset
+            // (the input parser and its state start again)
+            if let Some(p) = self.panes.get_mut(&id) {
+                std::mem::swap(&mut p.parser, &mut old.parser);
+                let cb = std::mem::replace(old.parser.callbacks_mut(), PaneCb::default());
+                *p.parser.callbacks_mut() = cb;
+                if p.parser.screen().size() != (nz(rows), nz(cols)) {
+                    p.parser.set_size(nz(rows), nz(cols));
+                }
+                p.parser.screen_mut().set_scroll_on_clear(false);
+                p.parser.process(SCREEN_REINIT);
+                p.parser.callbacks_mut().replies.clear();
+                p.parser.callbacks_mut().events.clear();
+            }
             release(old); // respawn: the old pty
         }
         // pane-created fires once the pane is in a window (popups never are)
