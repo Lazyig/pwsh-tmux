@@ -90,8 +90,14 @@ pub fn connect() -> io::Result<Stream> {
     };
     #[cfg(windows)]
     let s = {
-        use interprocess::local_socket::GenericNamespaced;
-        Stream::connect(pipe_name().to_ns_name::<GenericNamespaced>()?)?
+        use interprocess::local_socket::{ConnectOptions, GenericNamespaced};
+        // A busy pipe (every instance connected) is a server between two accepts, or one
+        // on its way out (see cleanup): wait for an instance, or for the pipe to go away
+        // (then there is no server), but not forever.
+        ConnectOptions::new()
+            .name(pipe_name().to_ns_name::<GenericNamespaced>()?)
+            .wait_mode(interprocess::ConnectWaitMode::Timeout(std::time::Duration::from_secs(10)))
+            .connect_sync()?
     };
     let creds = s.peer_creds()?;
     #[cfg(unix)]
@@ -434,8 +440,45 @@ pub fn set_shared(shared: bool) {
     let _ = shared;
 }
 
-/// Removes the server's socket, once: after kill-server has removed it a new server may
-/// already own the path.
+#[cfg(windows)]
+static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(windows)]
+static STOPPED: (std::sync::Mutex<Option<bool>>, std::sync::Condvar) = (std::sync::Mutex::new(None), std::sync::Condvar::new());
+
+/// Accepts connections on a thread until `conn` returns false or `cleanup` stops listening.
+pub fn serve(listener: Listener, mut conn: impl FnMut(io::Result<Stream>) -> bool + Send + 'static) {
+    #[cfg(windows)]
+    {
+        *STOPPED.0.lock().unwrap() = Some(false);
+    }
+    std::thread::spawn(move || {
+        for c in listener.incoming() {
+            // cleanup woke us with a connection of its own (or a client came just before
+            // it): neither is served by a server on its way out
+            #[cfg(windows)]
+            if STOPPING.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            if !conn(c) {
+                break;
+            }
+        }
+        // the waiting pipe instance goes with the listener
+        drop(listener);
+        #[cfg(windows)]
+        {
+            *STOPPED.0.lock().unwrap() = Some(true);
+            STOPPED.1.notify_all();
+        }
+    });
+}
+
+/// Stops listening, once: kill-server does it before it returns, so a client started next
+/// starts a new server instead of reaching this one (tmux's server has exited by then).
+/// Unix removes the socket (after that a new server may already own the path). A Windows
+/// pipe name lasts while any instance of it is open, so the accept thread closes the
+/// instance it waits on; until the connections still open are closed (this process
+/// exits), a client finds the pipe busy and waits, then finds no pipe and starts a server.
 pub fn cleanup() {
     static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -444,5 +487,32 @@ pub fn cleanup() {
     #[cfg(unix)]
     if let Ok(p) = socket_path() {
         let _ = std::fs::remove_file(p);
+    }
+    #[cfg(windows)]
+    {
+        use interprocess::local_socket::{ConnectOptions, GenericNamespaced};
+        use std::time::{Duration, Instant};
+        if STOPPED.0.lock().unwrap().is_none() {
+            return; // not listening
+        }
+        STOPPING.store(true, std::sync::atomic::Ordering::SeqCst);
+        // The accept thread is blocked in ConnectNamedPipe: connect to wake it, and stay
+        // connected until it has gone (a client that hangs up before the accept is
+        // dropped and waited for again).
+        let wake = pipe_name().to_ns_name::<GenericNamespaced>().ok().and_then(|name| {
+            ConnectOptions::new().name(name).wait_mode(interprocess::ConnectWaitMode::Timeout(Duration::from_millis(500))).connect_sync().ok()
+        });
+        // bounded: the accept thread may be stuck handing over a connection
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut stopped = STOPPED.0.lock().unwrap();
+        while *stopped != Some(true) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            stopped = STOPPED.1.wait_timeout(stopped, left).unwrap().0;
+        }
+        drop(stopped);
+        drop(wake);
     }
 }

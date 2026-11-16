@@ -1311,16 +1311,11 @@ pub fn run(config: Option<String>, cwd: Option<String>) -> io::Result<()> {
         ipc::set_shared(true);
     }
     log(&format!("server started on {}", ipc::describe()));
-    thread::spawn(move || {
-        for conn in listener.incoming() {
-            match conn {
-                Ok(s) => {
-                    if atx.send(Event::Conn(s)).is_err() {
-                        break;
-                    }
-                }
-                Err(e) => log(&format!("accept failed: {e}")),
-            }
+    ipc::serve(listener, move |conn| match conn {
+        Ok(s) => atx.send(Event::Conn(s)).is_ok(),
+        Err(e) => {
+            log(&format!("accept failed: {e}"));
+            true
         }
     });
 
@@ -1368,9 +1363,10 @@ pub fn run(config: Option<String>, cwd: Option<String>) -> io::Result<()> {
             break;
         }
     }
+    // no client reaches a server that is shutting down (kill-server has done this already)
+    ipc::cleanup();
     srv.shutdown();
     srv.save_prompt_history();
-    ipc::cleanup();
     log("server exiting");
     Ok(())
 }

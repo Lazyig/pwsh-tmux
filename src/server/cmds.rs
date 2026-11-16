@@ -1898,6 +1898,10 @@ impl Server {
                 if self.pipe_acl.is_some() {
                     crate::ipc::cleanup();
                 }
+                // a Windows pipe lasts until the process exits: the command's client waits
+                if cfg!(windows) && let Some(c) = ctx.reply.and_then(|c| self.clients.get(&c)) {
+                    c.send(S_SHUTDOWN, b"");
+                }
                 self.quit = true;
                 Ok(Flow::Next)
             }

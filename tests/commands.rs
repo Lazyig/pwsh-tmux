@@ -3576,6 +3576,20 @@ fn startup_config_waits_on_its_jobs_and_uses_the_starting_directory() {
 }
 
 #[test]
+fn kill_server_lets_the_next_client_start_a_new_server() {
+    // tmux's kill-server has exited (and given up its socket) when the client returns: a
+    // client right after it never reaches the old server. A Windows pipe stays while the
+    // process lives, so kill-server stops listening and its client waits for the exit.
+    let ctx = Ctx::new("killnew");
+    for i in 0..5 {
+        ctx.ok(&["new-session", "-d", "-s", &format!("s{i}"), "sleep 100"]);
+        ctx.ok(&["kill-server"]);
+    }
+    ctx.ok(&["new-session", "-d", "-s", "last", "sleep 100"]);
+    assert_eq!(ctx.ok(&["list-sessions", "-F", "#{session_name}"]).trim_end(), "last");
+}
+
+#[test]
 fn run_shell_target_that_fails_prints_and_view_output_is_parsed() {
     // run-shell's target is CANFAIL: one that does not resolve leaves no pane and the
     // output goes to the command-line client; output in view mode is parsed

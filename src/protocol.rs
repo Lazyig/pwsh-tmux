@@ -31,6 +31,9 @@ pub const S_SHELL: u8 = 15;
 pub const S_STDOUT: u8 = 16;
 /// detach-client -E: leave and run this command instead; payload "command\0shell".
 pub const S_EXEC: u8 = 17;
+/// kill-server (Windows): the server is exiting; after the reply, wait until it has closed
+/// the connection (its pipe is gone then), so a client started next starts a new server.
+pub const S_SHUTDOWN: u8 = 18;
 
 const MAX_FRAME: usize = 64 << 20;
 pub const MAX_CLIENT_FRAME: usize = 1 << 20;

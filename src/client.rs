@@ -163,13 +163,27 @@ fn connect(autostart: bool, config: Option<&str>) -> Result<Stream, String> {
         Err(_) => {}
     }
     spawn_server(config).map_err(|e| format!("failed to start server: {e}"))?;
-    for _ in 0..100 {
+    // by time: a connect attempt can wait for a busy Windows pipe
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
         thread::sleep(Duration::from_millis(50));
         if let Ok(s) = ipc::connect() {
             return Ok(s);
         }
     }
     Err("server did not start".into())
+}
+
+/// After kill-server: waits (bounded) until the server has closed the connection, which
+/// on Windows it does by exiting.
+fn wait_closed(stream: &Arc<Stream>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stream = stream.clone();
+    thread::spawn(move || {
+        while read_frame(&mut &*stream).is_ok() {}
+        let _ = tx.send(());
+    });
+    let _ = rx.recv_timeout(Duration::from_secs(10));
 }
 
 fn is_tty() -> bool {
@@ -314,6 +328,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
     }
 
     let mut raw: Option<term::RawMode> = None;
+    let mut server_exiting = false;
     let mut control_started = false;
     let mut alternate = true;
     // Set while a lock command or a suspended shell owns the terminal.
@@ -363,8 +378,12 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                     let _ = std::io::stderr().write_all(&crate::rawarg::to_bytes(&format!("{text}{nl}")));
                 }
                 let _ = std::io::stdout().flush();
+                if server_exiting {
+                    wait_closed(&stream);
+                }
                 return code as i32;
             }
+            Ok((S_SHUTDOWN, _)) => server_exiting = true,
             Ok((S_ATTACHED, _)) if g.control > 0 => {
                 if !control_started {
                     control_started = true;
