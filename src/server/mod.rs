@@ -364,9 +364,8 @@ impl vt100::Callbacks for PaneCb {
         self.colours.osc(params, bel, &mut self.replies);
         self.osc.osc(params);
         match params {
-            // input_osc_133: the cursor's line starts a prompt (a continuation prompt,
-            // P;k=s, does not count) or command output; capture-pane -F shows them, and
-            // A/N, C and D fire pane-shell-prompt, pane-command-started and -finished
+            // input_osc_133: vt100 marks the cursor's line (prompt, command, output start
+            // and end); A/N, C and D fire pane-shell-prompt, pane-command-started and -finished
             [b"133", arg, ..] => {
                 let name = match arg.first() {
                     Some(b'A' | b'N') => Some("pane-shell-prompt"),
