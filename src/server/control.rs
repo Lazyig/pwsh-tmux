@@ -388,10 +388,13 @@ impl Server {
                     let Some(idx) = in_session(self, *sid, wid) else { continue };
                     let t = Target { sid: *sid, idx: Some(idx), wid: Some(wid), pane: Some(self.windows[&wid].active) };
                     let mut extra = HashMap::new();
-                    // the unzoomed moment of a zoomed window's resize: its old layout
-                    if let Some(Val::Str(layout)) = p.get("_unzoomed_layout") {
+                    // the unzoomed moment of a zoomed window's resize: its layout at the old
+                    // size, in the client's format (new-layouts or not)
+                    if let (Some(Val::Int(sx)), Some(Val::Int(sy))) = (p.get("_unzoomed_sx"), p.get("_unzoomed_sy")) {
+                        let area = crate::layout::Rect { x: 0, y: 0, w: (*sx).max(1) as u16, h: (*sy).max(1) as u16 };
+                        let layout = self.window_layout_at(wid, false, Some(*c), area).unwrap_or_default();
                         let flags = self.expand(t, Some(*c), "#{window_raw_flags}").replace('Z', "");
-                        extra.extend([("window_layout".to_string(), layout.clone()), ("window_visible_layout".to_string(), layout.clone()), ("window_raw_flags".to_string(), flags)]);
+                        extra.extend([("window_layout".to_string(), layout.clone()), ("window_visible_layout".to_string(), layout), ("window_raw_flags".to_string(), flags)]);
                     }
                     let line = self.expand_extra(t, Some(*c), "%layout-change #{window_id} #{window_layout} #{window_visible_layout} #{window_raw_flags}", extra);
                     lines.push((*c, line));

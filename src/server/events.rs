@@ -1783,7 +1783,7 @@ impl Server {
             if rezoom {
                 self.fire_window("window-unzoomed", wid);
                 let mut p = self.payload_window(wid);
-                p.str("_unzoomed_layout", old.layout.clone());
+                p.int("_unzoomed_sx", old.size.0 as i64).int("_unzoomed_sy", old.size.1 as i64);
                 self.fire("window-layout-changed", p);
                 self.fire_window("window-zoomed", wid);
                 self.fire_window("window-layout-changed", wid);

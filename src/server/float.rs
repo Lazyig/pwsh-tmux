@@ -435,8 +435,14 @@ impl Server {
     /// #{window_layout} (the unzoomed layout) and #{window_visible_layout} (what is shown:
     /// a zoomed window has its zoomed pane and the panes floating above it).
     pub fn window_layout(&self, wid: WinId, visible: bool, client: Option<ClientId>) -> Option<String> {
+        self.windows.get(&wid)?;
+        self.window_layout_at(wid, visible, client, self.window_area(wid))
+    }
+
+    /// The window's layout laid out over `area` (a size it had before a resize), in the
+    /// client's format.
+    pub fn window_layout_at(&self, wid: WinId, visible: bool, client: Option<ClientId>, area: crate::layout::Rect) -> Option<String> {
         let w = self.windows.get(&wid)?;
-        let area = self.window_area(wid);
         let zoomed = self.zoomed_pane(wid).filter(|_| visible);
         let node = match zoomed {
             None => w.layout.clone(),

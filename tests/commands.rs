@@ -3107,3 +3107,36 @@ fn respawn_keeps_the_pane_history() {
         assert!(ctx.ok(&["capture-pane", "-p", "-S", "-", "-t", "s"]).starts_with("1\n2\n3\n"), "{cmd}");
     }
 }
+
+#[test]
+fn zoomed_resize_layout_change_uses_the_clients_layout_format() {
+    // resize_window unzooms first: that %layout-change has the layout at the old size,
+    // as JSON for a new-layouts client
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::{Arc, Mutex};
+    let ctx = Ctx::new("zoomlayout");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "80", "-y", "24"]);
+    ctx.ok(&["split-window", "-d", "-t", "s"]);
+    ctx.ok(&["resize-pane", "-Z", "-t", "s:0.0"]);
+    let mut child = ctx.command().args(["-C", "attach", "-t", "s"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let out = Arc::new(Mutex::new(String::new()));
+    let o = out.clone();
+    let stdout = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            o.lock().unwrap().push_str(&(line + "\n"));
+        }
+    });
+    let mut stdin = child.stdin.take().unwrap();
+    wait_for("attached", || out.lock().unwrap().contains("%session-changed"));
+    stdin.write_all(b"refresh-client -f new-layouts\nrefresh-client -C 60x20\n").unwrap();
+    stdin.flush().unwrap();
+    let changes = || out.lock().unwrap().lines().filter(|l| l.starts_with("%layout-change")).map(String::from).collect::<Vec<_>>();
+    wait_for("layout changes", || changes().len() >= 2);
+    let first = changes()[0].clone();
+    assert!(first.contains(r#"{"V":2,"L":{"t":"v","w":80,"h":24"#) && first.ends_with(" *"), "{first}");
+    assert!(!changes().iter().any(|l| l.contains(" b25f,") || l.contains("80x24,0,0")), "{:?}", changes());
+    drop(stdin);
+    let _ = child.wait();
+}
