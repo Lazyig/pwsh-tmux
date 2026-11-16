@@ -682,3 +682,16 @@ fn pane_mode_hooks_fire_like_window_fire_pane_mode_changed() {
     ctx.ok(&["clock-mode", "-t", "mh"]);
     wait_for("raised", || v("@e") == "eeeee");
 }
+
+#[test]
+fn choose_client_info_view_has_window_client_info_lines() {
+    let ctx = Ctx::new("client-info");
+    let t = start(&ctx, "ci");
+    ctx.ok(&["choose-client", "-i", "-t", "ci"]);
+    t.wait_screen("info", |s| s.contains("(view: info)"));
+    let c = t.contents();
+    let labels: Vec<String> = c.lines().filter_map(|l| l.strip_prefix("│ ")).map(|l| l.split('│').next().unwrap_or("").trim().to_string()).filter(|l| !l.is_empty()).collect();
+    assert_eq!(labels[..9], ["Client Name", "Session", "Attach Time", "Activity Time", "Terminal Type", "TERM", "Size", "Bytes Written", "Features"], "{c}");
+    assert!(c.contains("(cell ") && c.contains(" discarded)"), "{c}");
+    t.send(b"q");
+}

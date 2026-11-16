@@ -1552,18 +1552,21 @@ impl Tree {
                 if let ItemData::Client(c) = data {
                     let Some(cl) = srv.clients.get(c) else { return };
                     if self.info {
+                        // window_client_draw_info: the lines for the client, then the line
+                        // between the labels and the values down the rest of the preview
                         let t = Tree::client_target(srv, cl);
-                        let ctx = crate::server::vars::VarCtx { srv, t, client: Some(*c), extra: HashMap::new() };
-                        let lines = [
-                            info_line("Client Name", "#{client_name} #[fg=themelightgrey](PID #{client_pid})#[default]"),
-                            info_line("Session", "#{session_name}"),
-                            info_line("Size", "#{client_width}x#{client_height}"),
-                            info_line("Terminal", "#{client_termname}"),
-                            info_line("TTY", "#{client_tty}"),
-                        ];
-                        for (i, l) in lines.iter().take(sy).enumerate() {
+                        let ctx = crate::server::vars::VarCtx { srv, t, client: Some(*c), extra: HashMap::from([("clipboard_invalid".to_string(), "0".to_string())]) };
+                        let mut i = 0;
+                        for l in CLIENT_INFO_LINES.iter().take(sy) {
                             let cells = format_cells(&crate::format::expand(l, &ctx), sx, Style::default());
                             put_cells(&mut grid[y + i], x, &cells);
+                            i += 1;
+                        }
+                        if sx > 14 && i < sy {
+                            let gc = mode_style(srv, &srv.opt_window(t.wid, "tree-mode-border-style"), Style::default(), t);
+                            for yy in i..sy {
+                                grid[y + yy][x + 14] = Cell { text: "│".into(), style: gc };
+                            }
                         }
                         return;
                     }
@@ -1792,6 +1795,34 @@ impl Tree {
         }
     }
 }
+
+/// window_client_info_lines (choose-client -i), with the ACS line characters as box
+/// drawing characters.
+pub const CLIENT_INFO_LINES: &[&str] = &[
+    "#[fg=themelightgrey]Client Name   #[#{E:tree-mode-border-style},acs]│#[default] #{client_name} #[fg=themelightgrey]#[fg=themelightgrey](PID #{client_pid})#[default]",
+    "#[fg=themelightgrey]Session       #[#{E:tree-mode-border-style},acs]│#[default] #{session_name}",
+    "#[fg=themelightgrey]Attach Time   #[#{E:tree-mode-border-style},acs]│#[default] #{t:client_created} #[fg=themelightgrey](#{t/r:client_created})#[default]",
+    "#[fg=themelightgrey]Activity Time #[#{E:tree-mode-border-style},acs]│#[default] #{t:client_activity} #[fg=themelightgrey](#{t/r:client_activity})#[default]",
+    "#[fg=themelightgrey]Terminal Type #[#{E:tree-mode-border-style},acs]│#[default] #{?client_termtype,#{client_termtype},Unknown}",
+    "#[fg=themelightgrey]TERM          #[#{E:tree-mode-border-style},acs]│#[default] #{client_termname}",
+    "#[fg=themelightgrey]Size          #[#{E:tree-mode-border-style},acs]│#[default] #{client_width}x#{client_height} #[fg=themelightgrey](cell #{client_cell_width}x#{client_cell_height})#[default]",
+    "#[fg=themelightgrey]Bytes Written #[#{E:tree-mode-border-style},acs]│#[default] #{client_written} #[fg=themelightgrey](#{client_discarded} discarded)#[default]",
+    "#[fg=themelightgrey]Features      #[#{E:tree-mode-border-style},acs]│#[default] #{?#{I/f:256},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:256}}#[default] #{?#{I/f:RGB},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:RGB}}#[default] #{?#{I/f:bpaste},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:bpaste}}#[default] #{?#{I/f:ccolour},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:ccolour}}#[default]",
+    "              #[#{E:tree-mode-border-style},acs]│#[default] #{?#{I/f:clipboard},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:clipboard}}#[default] #{?#{I/f:cstyle},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:cstyle}}#[default] #{?#{I/f:extkeys},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:extkeys}}#[default] #{?#{I/f:focus},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:focus}}#[default]",
+    "              #[#{E:tree-mode-border-style},acs]│#[default] #{?#{I/f:hyperlinks},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:hyperlinks}}#[default] #{?#{I/f:ignorefkeys},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:ignorefkeys}}#[default] #{?#{I/f:margins},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:margins}}#[default] #{?#{I/f:mouse},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:mouse}}#[default]",
+    "              #[#{E:tree-mode-border-style},acs]│#[default] #{?#{I/f:osc7},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:osc7}}#[default] #{?#{I/f:overline},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:overline}}#[default] #{?#{I/f:progressbar},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:progressbar}}#[default] #{?#{I/f:rectfill},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:rectfill}}#[default]",
+    "              #[#{E:tree-mode-border-style},acs]│#[default] #{?#{I/f:sixel},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:sixel}}#[default] #{?#{I/f:strikethrough},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:strikethrough}}#[default] #{?#{I/f:sync},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:sync}}#[default] #{?#{I/f:title},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:title}}#[default]",
+    "              #[#{E:tree-mode-border-style},acs]│#[default] #{?#{I/f:usstyle},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:usstyle}}#[default] #{?#{I/f:utf8},#[fg=themegreen],#[fg=themelightgrey]}#{p/15:#{l:utf8}}#[default]",
+    "#[#{E:tree-mode-border-style},acs]──────────────┼#{R:─,#{window_width}}#[default]",
+    "#[fg=themelightgrey]prefix        #[#{E:tree-mode-border-style},acs]│#[default] #{prefix}",
+    "#[fg=themelightgrey]mouse         #[#{E:tree-mode-border-style},acs]│#[default] #{?mouse,#{?#{I/c:kmous},,#[fg=themered]}on,#[fg=themelightgrey]off} #{?#{I/c:kmous},,#[align=right]unavailable: [kmous] missing}",
+    "#[fg=themelightgrey]set-clipboard #[#{E:tree-mode-border-style},acs]│#[default] #{?#{!=:#{set-clipboard},off},#{?#{I/c:Ms},,#[fg=themered]}#{set-clipboard},#[fg=themelightgrey]off} #{?#{I/c:Ms},,#[align=right]unavailable: [Ms] #{?clipboard_invalid,invalid,missing}}",
+    "#[fg=themelightgrey]get-clipboard #[#{E:tree-mode-border-style},acs]│#[default] #{?#{!=:#{get-clipboard},off},#{?#{I/c:Ms},,#[fg=themered]}#{get-clipboard},#[fg=themelightgrey]off} #{?#{I/c:Ms},,#[align=right]unavailable: [Ms] #{?clipboard_invalid,invalid,missing}}",
+    "#[fg=themelightgrey]focus-events  #[#{E:tree-mode-border-style},acs]│#[default] #{?focus-events,#{?#{I/f:focus},,#[fg=themered]}on,#[fg=themelightgrey]off} #{?#{I/f:focus},,#[align=right]unavailable: [Enfcs] or [Dcfcs] missing}",
+    "#[fg=themelightgrey]extended-keys #[#{E:tree-mode-border-style},acs]│#[default] #{?#{!=:#{extended-keys},off},#{?#{I/f:extkeys},,#[fg=themered]}#{extended-keys},#[fg=themelightgrey]off} #{?#{I/f:extkeys},,#[align=right]unavailable: [Eneks] or [Dseks] missing}",
+    "#[fg=themelightgrey]set-titles    #[#{E:tree-mode-border-style},acs]│#[default] #{?set-titles,on,#[fg=themelightgrey]off}",
+    "#[fg=themelightgrey]escape-time   #[#{E:tree-mode-border-style},acs]│#[default] #{escape-time} ms",
+];
 
 struct StripGeo {
     start: usize,
