@@ -132,6 +132,8 @@ pub struct PaneCb {
     pub ext_keys: u8,
     /// extended-keys as the parser last saw it (0 off, 1 on, 2 always).
     pub ext_option: u8,
+    /// The pane's cursor-style option (DECSCUSR number), for DECRQM 12 and DECRQSS.
+    pub cursor_style_opt: u16,
     pub clipboard_queries: Vec<(Vec<u8>, bool)>,
     /// OSC 52 selections set by the application (selector, base64 data).
     pub clipboard_sets: Vec<(Vec<u8>, Vec<u8>)>,
@@ -340,7 +342,27 @@ impl vt100::Callbacks for PaneCb {
             self.events.push(events::OutputEvent::Clipboard);
         }
     }
-    fn dcs(&mut self, _: &mut vt100::Screen, payload: &[u8]) {
+    fn dcs(&mut self, screen: &mut vt100::Screen, payload: &[u8]) {
+        // DECRQSS (DCS $ q Pt ST, input_handle_decrqss): only the cursor style (SP q) is
+        // known; anything else is answered as not recognized
+        let data = payload.iter().position(|b| !(0x30..=0x3f).contains(b)).map_or(&payload[payload.len()..], |i| &payload[i..]);
+        if let Some(pt) = data.strip_prefix(b"$q") {
+            if pt.starts_with(b" q") {
+                use vt100::CursorStyle as C;
+                let blink = screen.cursor_blinking().0;
+                let ps = match screen.cursor_style() {
+                    C::BlinkBlock | C::SteadyBlock => if blink { 1 } else { 2 },
+                    C::BlinkUnderline | C::SteadyUnderline => if blink { 3 } else { 4 },
+                    C::BlinkVerticalBar | C::SteadyVerticalBar => if blink { 5 } else { 6 },
+                    // no style set: the cursor-style option
+                    C::Default => self.cursor_style_opt.min(6),
+                };
+                self.replies.extend(format!("\x1bP1$r q{ps} q\x1b\\").bytes());
+            } else {
+                self.replies.extend(b"\x1bP0$r\x1b\\");
+            }
+            return;
+        }
         // the parser already turned the doubled ESC bytes back into one
         if let Some(payload) = payload.strip_prefix(b"tmux;") {
             self.passthrough.push(payload.to_vec());
@@ -394,23 +416,102 @@ impl vt100::Callbacks for PaneCb {
     fn unhandled_csi(&mut self, screen: &mut vt100::Screen, i1: Option<u8>, _i2: Option<u8>, params: &[&[u16]], c: char) {
         let first = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
         match (i1, c, first) {
-            (Some(b'?'), 'p', 2031) if _i2 == Some(b'$') => {
-                self.replies.extend(format!("\x1b[?2031;{}$y", if screen.theme_updates() { 1 } else { 2 }).bytes());
+            // DECRQM for DEC private modes (INPUT_CSI_QUERY_PRIVATE): 1 set, 2 reset,
+            // 4 permanently reset, 0 unknown
+            (Some(b'?'), 'p', m) if _i2 == Some(b'$') && m > 0 => {
+                use vt100::MouseProtocolMode as M;
+                let on = |v: bool| if v { 1 } else { 2 };
+                let mouse = screen.mouse_protocol_mode();
+                let n = match m {
+                    1 => on(screen.application_cursor()),
+                    3 => 4,
+                    6 => on(screen.origin_mode()),
+                    7 => on(screen.wrap_mode()),
+                    12 => {
+                        let (blink, set) = screen.cursor_blinking();
+                        if screen.cursor_style() != vt100::CursorStyle::Default || set {
+                            on(blink)
+                        } else {
+                            // blinking for the odd cursor-style values
+                            on(self.cursor_style_opt % 2 == 1)
+                        }
+                    }
+                    25 => on(!screen.hide_cursor()),
+                    47 | 1047 | 1049 => on(screen.alternate_screen()),
+                    1000 => on(matches!(mouse, M::PressRelease | M::Press)),
+                    1002 => on(mouse == M::ButtonMotion),
+                    1003 => on(mouse == M::AnyMotion),
+                    1004 => on(screen.focus_events()),
+                    1005 => on(screen.mouse_encodings().0),
+                    1006 => on(screen.mouse_encodings().1),
+                    2004 => on(screen.bracketed_paste()),
+                    2026 => on(screen.synchronized_output()),
+                    2031 => on(screen.theme_updates()),
+                    _ => 0,
+                };
+                self.replies.extend(format!("\x1b[?{m};{n}$y").bytes());
             }
+            // DECRQM for ANSI modes (INPUT_CSI_QUERY): only IRM is known
+            (Some(b'$'), 'p', m) if _i2.is_none() && m > 0 => {
+                let n = if m == 4 { if screen.insert_mode() { 1 } else { 2 } } else { 0 };
+                self.replies.extend(format!("\x1b[{m};{n}$y").bytes());
+            }
+            // XTVERSION
+            (Some(b'>'), 'q', 0) => self.replies.extend(format!("\x1bP>|tmux {}\x1b\\", TMUX_VERSION).bytes()),
             (Some(b'?'), 'n', 996) => self.colours.report(&mut self.replies),
-            (None, 't', 22) if params.get(1).and_then(|p| p.first()).is_some_and(|p| matches!(p, 0 | 2)) => {
-                if self.title_stack.len() == 10 {
-                    self.title_stack.pop_front();
+            // window operations (input_csi_dispatch_winops), each with its arguments;
+            // vt100 itself handles 8 (resize)
+            (None, 't', _) => {
+                let arg = |i: usize| params.get(i).and_then(|p| p.first()).copied();
+                let (rows, cols) = screen.size();
+                let (y, x) = (u32::from(rows.get()), u32::from(cols.get()));
+                // tmux's default cell size when the terminal does not report pixels
+                let (xpixel, ypixel) = (16, 32);
+                let mut m = 0;
+                while let Some(n) = arg(m) {
+                    match n {
+                        3 | 4 | 8 => {
+                            m += 2;
+                            if arg(m - 1).is_none() || arg(m).is_none() {
+                                return;
+                            }
+                        }
+                        9 | 10 => {
+                            m += 1;
+                            if arg(m).is_none() {
+                                return;
+                            }
+                        }
+                        14 => self.replies.extend(format!("\x1b[4;{};{}t", y * ypixel, x * xpixel).bytes()),
+                        15 => self.replies.extend(format!("\x1b[5;{};{}t", y * ypixel, x * xpixel).bytes()),
+                        16 => self.replies.extend(format!("\x1b[6;{ypixel};{xpixel}t").bytes()),
+                        18 => self.replies.extend(format!("\x1b[8;{y};{x}t").bytes()),
+                        19 => self.replies.extend(format!("\x1b[9;{y};{x}t").bytes()),
+                        22 | 23 => {
+                            m += 1;
+                            match arg(m) {
+                                None => return,
+                                Some(0 | 2) if n == 22 => {
+                                    if self.title_stack.len() == 10 {
+                                        self.title_stack.pop_front();
+                                    }
+                                    self.title_stack.push_back(self.current_title.clone());
+                                }
+                                Some(0 | 2) => {
+                                    if let Some(title) = self.title_stack.pop_back() {
+                                        self.current_title = title;
+                                    }
+                                    let title = self.current_title.clone();
+                                    self.title = Some(title.clone());
+                                    self.events.push(events::OutputEvent::Title(title));
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                    m += 1;
                 }
-                self.title_stack.push_back(self.current_title.clone());
-            }
-            (None, 't', 23) if params.get(1).and_then(|p| p.first()).is_some_and(|p| matches!(p, 0 | 2)) => {
-                if let Some(title) = self.title_stack.pop_back() {
-                    self.current_title = title;
-                }
-                let title = self.current_title.clone();
-                self.title = Some(title.clone());
-                self.events.push(events::OutputEvent::Title(title));
             }
             (None, 'n', 6) => {
                 let (r, c) = screen.cursor_position();
@@ -2114,8 +2215,12 @@ impl Server {
         let ext_option = ext_keys_option(&self.opt_server("extended-keys"));
         let colours = self.pane_colours(id);
         let allow_title = options::is_on(&self.opt_pane(id, "allow-set-title"));
+        // the DECSCUSR number of the cursor-style choice
+        let cursor_style = ["default", "blinking-block", "block", "blinking-underline", "underline", "blinking-bar", "bar"]
+            .iter().position(|v| *v == self.opt_pane(id, "cursor-style")).unwrap_or(0) as u16;
         let p = self.panes.get_mut(&id).unwrap();
         p.parser.callbacks_mut().ext_option = ext_option;
+        p.parser.callbacks_mut().cursor_style_opt = cursor_style;
         p.parser.set_input_buffer_size(input_limit);
         p.parser.screen_mut().set_alternate_screen_allowed(alternate);
         p.parser.screen_mut().set_codepoint_widths(widths, variation_wide);
