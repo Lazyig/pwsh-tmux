@@ -902,14 +902,12 @@ impl Server {
     }
 
     pub fn select_pane(&mut self, wid: WinId, pane: PaneId) {
-        let w = self.windows.get_mut(&wid).unwrap();
-        if w.active != pane {
+        if self.windows[&wid].active != pane {
+            // window_push_zoom: the unzoom's events come first
+            self.unzoom_window(wid);
+            let w = self.windows.get_mut(&wid).unwrap();
             w.last_active = Some(w.active);
             w.active = pane;
-            if w.zoomed {
-                w.zoomed = false;
-                self.apply_layout(wid);
-            }
         }
         self.mark_window_dirty(wid);
     }
@@ -943,6 +941,8 @@ impl Server {
     pub fn split_pane(&mut self, t: Target, horizontal: bool, before: bool, size: Option<u16>, full: bool, cwd: Option<String>, cmd: &[String], env: &[(String, String)]) -> Result<PaneId, String> {
         let wid = t.wid.ok_or("no window")?;
         let target = t.pane.ok_or("no pane")?;
+        // window_push_zoom: unzoomed (with its events) before splitting
+        self.unzoom_window(wid);
         let area = self.window_area(wid);
         let (rects, _) = self.rects(wid);
         let r = if full { area } else { rects.iter().find(|(p, _)| *p == target).map(|(_, r)| *r).ok_or("pane not visible")? };
@@ -1789,6 +1789,8 @@ impl Server {
             "rotate-window" => {
                 let wt = self.resolve_window(ctx, t)?;
                 let wid = wt.wid.unwrap();
+                // window_push_zoom: unzoomed (with its events); -Z zooms it again
+                let zoomed = self.unzoom_window(wid);
                 let w = self.windows.get_mut(&wid).unwrap();
                 let order = w.panes();
                 let mut rotated = order.clone();
@@ -1796,16 +1798,28 @@ impl Server {
                 // Replace via temporary ids so cycles do not overwrite one another.
                 for (i, p) in order.iter().enumerate() { w.layout.replace(*p, PaneId::MAX - i as u32); }
                 for (i, p) in rotated.iter().enumerate() { w.layout.replace(PaneId::MAX - i as u32, *p); }
+                // the pane now in the active pane's place becomes active (TAILQ_NEXT /
+                // TAILQ_PREV of the old active pane in the rotated list)
+                if let Some(i) = order.iter().position(|p| *p == w.active) {
+                    if rotated[i] != w.active {
+                        w.last_active = Some(w.active);
+                        w.active = rotated[i];
+                    }
+                }
                 w.pane_order = rotated;
-                // -Z keeps a zoomed window zoomed
-                w.zoomed = w.zoomed && o.has('Z');
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
+                if zoomed && o.has('Z') {
+                    self.detect_changes(Some("rotate-window"));
+                    self.rezoom_window(wid);
+                }
                 Ok(Flow::Next)
             }
             "select-layout" | "next-layout" | "previous-layout" => {
                 let wt = if cmd == "select-layout" { self.resolve_pane(ctx, t)? } else { self.resolve_window(ctx, t)? };
                 let wid = wt.wid.unwrap();
+                // server_unzoom_window, with its events, first
+                self.unzoom_window(wid);
                 let area = self.window_area(wid);
                 let main_size = |s: &Server, name: &str| -> Option<u16> {
                     let v = s.opt_window_num(Some(wid), if name.starts_with("main-horizontal") { "main-pane-height" } else { "main-pane-width" });
@@ -2017,9 +2031,9 @@ impl Server {
                     ctx.pane = Some(self.windows[&wid].active);
                     ctx.skip_after = ctx.pane == Some(active);
                     if o.has('Z') && zoomed {
-                        let w = self.windows.get_mut(&wid).unwrap();
-                        w.zoomed = true;
-                        self.apply_layout(wid);
+                        // window_pop_zoom, after window-pane-changed
+                        self.flush_active_pane(wid);
+                        self.rezoom_window(wid);
                     }
                     return Ok(Flow::Next);
                 }
@@ -2030,16 +2044,17 @@ impl Server {
                     ctx.pane = Some(last);
                     return Ok(Flow::Next);
                 }
-                if let (Some(sid), Some(idx)) = (tt.sid, tt.idx) {
-                    if self.sessions.get(&sid).is_some_and(|s| s.active != idx) {
-                        self.select_window(sid, idx);
-                    }
-                }
-                // hooks run by select_window may have removed the pane
+                // the pane becomes active in its window; the session's current window
+                // stays (cmd-select-pane.c selects no window)
                 if self.windows.get(&wid).is_some_and(|w| w.panes().contains(&pane)) {
                     ctx.skip_after = self.windows[&wid].active == pane;
+                    let zoomed = self.windows[&wid].zoomed && !ctx.skip_after;
                     self.select_pane(wid, pane);
                     ctx.pane = Some(pane);
+                    if o.has('Z') && zoomed {
+                        self.flush_active_pane(wid);
+                        self.rezoom_window(wid);
+                    }
                 }
                 Ok(Flow::Next)
             }
@@ -2107,6 +2122,9 @@ impl Server {
                 };
                 let x = o.get('x').and_then(|v| parse_size(v, area.w));
                 let y = o.get('y').and_then(|v| parse_size(v, area.h));
+                // server_unzoom_window first
+                self.unzoom_window(wid);
+                let before = self.windows[&wid].layout.to_layout_string(area);
                 let w = self.windows.get_mut(&wid).unwrap();
                 if x.is_some() || y.is_some() {
                     w.layout.set_size(pane, x, y, area);
@@ -2117,11 +2135,11 @@ impl Server {
                         w.layout.resize(pane, d, n, area);
                     }
                 }
-                let n = self.windows[&wid].panes().len();
+                let moved = self.windows[&wid].layout.to_layout_string(area) != before;
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
-                // as does layout_resize_pane, with other panes
-                self.ev.layout_fired.push((wid, if n > 1 { 2 } else { 1 }));
+                // as does layout_resize_pane, when there is a cell to resize
+                self.ev.layout_fired.push((wid, if moved { 2 } else { 1 }));
                 Ok(Flow::Next)
             }
             "swap-pane" => {
@@ -2143,7 +2161,14 @@ impl Server {
                     };
                     (src.wid.unwrap(), src.pane.unwrap())
                 };
+                // window_push_zoom on both windows (their events first); -Z zooms them
+                // again at the end
+                let dzoom = self.unzoom_window(dwid);
+                let szoom = swid != dwid && self.unzoom_window(swid);
                 if spane == dpane {
+                    if o.has('Z') && dzoom {
+                        self.rezoom_window(dwid);
+                    }
                     return Ok(Flow::Next);
                 }
                 self.ev.pane_move_order.extend([spane, dpane]);
@@ -2185,11 +2210,17 @@ impl Server {
                     self.apply_layout(swid);
                     self.mark_window_dirty(swid);
                 }
-                if !o.has('Z') {
-                    self.windows.get_mut(&dwid).unwrap().zoomed = false;
-                }
                 self.apply_layout(dwid);
                 self.mark_window_dirty(dwid);
+                if o.has('Z') && (dzoom || szoom) {
+                    // window_pop_zoom after the swap's own events
+                    self.detect_changes(Some("swap-pane"));
+                    for (wid, z) in [(swid, if swid == dwid { dzoom } else { szoom }), (dwid, dzoom && swid != dwid)] {
+                        if z {
+                            self.rezoom_window(wid);
+                        }
+                    }
+                }
                 Ok(Flow::Next)
             }
             "break-pane" => {
@@ -2212,6 +2243,10 @@ impl Server {
                     }
                     return Ok(Flow::Next);
                 }
+                // cmd-break-pane.c: server_unzoom_window, window_lost_pane (the new
+                // active pane), layout_close_pane, then the new window is attached,
+                // laid out and created, and the pane moved
+                self.unzoom_window(swid);
                 let w = self.windows.get_mut(&swid).unwrap();
                 let l = std::mem::replace(&mut w.layout, Node::Leaf(PaneId::MAX));
                 w.layout = l.remove(pane).unwrap();
@@ -2221,6 +2256,8 @@ impl Server {
                 w.last_active = None;
                 w.zoomed = false;
                 self.apply_layout(swid);
+                self.flush_active_pane(swid);
+                self.flush_window_layout(swid);
                 let (sx, sy) = (self.windows[&swid].sx, self.windows[&swid].sy);
                 let wname = name.clone().unwrap_or_else(|| self.panes.get(&pane).map(|p| p.current_cmd.clone()).unwrap_or_default());
                 let nwid = self.new_window_obj(wname, pane, sx, sy);
@@ -2235,7 +2272,11 @@ impl Server {
                     didx.filter(|i| !self.sessions[&dsid].links.contains_key(i)).unwrap_or_else(|| self.next_index(dsid, None))
                 };
                 self.link(dsid, idx, nwid, !o.has('d'));
+                self.link_now(dsid, idx, nwid);
                 self.apply_layout(nwid);
+                self.pane_resized_now(pane);
+                self.detect_window_created(nwid);
+                self.pane_moved_now(pane);
                 self.mark_all_dirty();
                 if o.has('P') {
                     let fmt = o.get('F').unwrap_or("#{session_name}:#{window_index}.#{pane_index}");
@@ -2253,6 +2294,9 @@ impl Server {
                 let dst = self.resolve_pane(ctx, t)?;
                 let (swid, spane) = (src.wid.unwrap(), src.pane.unwrap());
                 let (dwid, dpane) = (dst.wid.unwrap(), dst.pane.unwrap());
+                // server_unzoom_window on both, with their events
+                self.unzoom_window(dwid);
+                self.unzoom_window(swid);
                 if spane == dpane {
                     return err("source and target panes must be different");
                 }
@@ -2286,8 +2330,15 @@ impl Server {
                         sw.last_active = sw.last_active.filter(|p| *p != spane);
                         sw.zoomed = false;
                         self.apply_layout(swid);
+                        // layout_close_pane, then window_lost_pane
+                        self.flush_window_layout(swid);
+                        if swid != dwid {
+                            self.flush_active_pane(swid);
+                        }
                     }
                     None => {
+                        self.fire_window("window-layout-changed", swid);
+                        let sw = self.windows.get_mut(&swid).unwrap();
                         // source window becomes empty: unlink it everywhere (sessions, clients and
                         // hooks handled normally) without killing the moved pane
                         sw.layout = Node::Leaf(PaneId::MAX);
@@ -2316,6 +2367,27 @@ impl Server {
                 }
                 self.apply_layout(dwid);
                 self.mark_all_dirty();
+                // layout_assign_pane resizes the panes; the new active pane and window,
+                // pane-moved, then the layouts of both windows (cmd-join-pane.c)
+                for p in self.windows[&dwid].panes() {
+                    self.pane_resized_now(p);
+                }
+                if !o.has('d') {
+                    self.flush_active_pane(dwid);
+                    if let (Some(sid), Some(idx)) = (dst.sid, dst.idx) {
+                        self.select_window(sid, idx);
+                        self.detect_current_window(sid, false);
+                    }
+                }
+                self.pane_moved_now(spane);
+                if self.windows.contains_key(&swid) {
+                    self.layout_changed_now(swid);
+                } else {
+                    // server_kill_window for the emptied source comes first
+                    self.seen_layout_now(dwid);
+                    self.detect_changes(Some("join-pane"));
+                }
+                self.layout_changed_now(dwid);
                 Ok(Flow::Next)
             }
             "list-panes" => {
@@ -3258,7 +3330,9 @@ impl Server {
                 }
                 let cwd = o.get('c').map(|c| self.expand(tt, ctx.client, c)).or_else(|| tt.pane.and_then(|p| self.panes.get(&p)).map(|p| p.current_path.clone()));
                 let flags = format!("{}{}", if o.has('b') { "b" } else { "" }, if o.has('E') { "E" } else { "" });
-                Err(format!("\0job-run\0{command}\0{}\0{flags}\0{}", cwd.unwrap_or_default(), tt.pane.map(|p| p.to_string()).unwrap_or_default()))
+                // output goes to a pane only with -t (cdata->wp_id), else to the client
+                let out_pane = tt.pane.filter(|_| o.has('t'));
+                Err(format!("\0job-run\0{command}\0{}\0{flags}\0{}", cwd.unwrap_or_default(), out_pane.map(|p| p.to_string()).unwrap_or_default()))
             }
             "wait-for" => self.cmd_wait_for(&o, ctx),
             "list-commands" => {
@@ -3410,6 +3484,51 @@ impl Server {
             Some(n) => n,
             None => (0..).map(|i: u32| i.to_string()).find(|n| !self.sessions.values().any(|s| &s.name == n)).unwrap(),
         };
+        let sid = self.id();
+        let now = now_secs();
+        let t = &self.sessions[&tsid];
+        let (tcols, trows, tactive) = (t.cols, t.rows, t.active);
+        let (sx, sy) = self.windows.get(&t.active_window()).map(|w| (w.sx, w.sy)).unwrap_or((80, 24));
+        let session = Session {
+            id: sid,
+            name,
+            links: BTreeMap::new(),
+            active: 0,
+            last: Vec::new(),
+            cols: tcols,
+            rows: trows,
+            cwd: t.cwd.clone(),
+            options: Options::default(),
+            env: t.env.clone(),
+            created: now,
+            activity: now,
+            last_attached: 0,
+            alerts: BTreeMap::new(),
+            group: None,
+        };
+        let cwd = session.cwd.clone();
+        self.sessions.insert(sid, session);
+        // cmd-new-session.c spawns the session's own first window, then
+        // session_group_synchronize_to replaces it with the group's windows: its
+        // pane and window are created, linked, unlinked and closed (with no process
+        // here: it never runs)
+        if let Ok(pane) = self.spawn_pane(Some(sid), sx, sy, &[EMPTY_PANE.to_string()], Some(&cwd), &[]) {
+            if let Some(sp) = self.ev.spawned.iter_mut().find(|sp| sp.pane == pane) {
+                sp.empty = false;
+            }
+            let wname = self.window_name_for(&[], Some(sid));
+            let wid = self.new_window_obj(wname, pane, sx, sy);
+            let idx = self.next_index(sid, None);
+            self.sessions.get_mut(&sid).unwrap().active = idx;
+            self.link(sid, idx, wid, true);
+            self.detect_changes(None);
+            self.sessions.get_mut(&sid).unwrap().links.clear();
+            if let Some(w) = self.windows.remove(&wid) {
+                for p in w.panes() {
+                    self.destroy_pane(p);
+                }
+            }
+        }
         let gid = match self.sessions[&tsid].group {
             Some(g) => g,
             None => {
@@ -3419,27 +3538,17 @@ impl Server {
                 g
             }
         };
-        let sid = self.id();
-        let now = now_secs();
-        let t = &self.sessions[&tsid];
-        let session = Session {
-            id: sid,
-            name,
-            links: t.links.clone(),
-            active: t.active,
-            last: Vec::new(),
-            cols: t.cols,
-            rows: t.rows,
-            cwd: t.cwd.clone(),
-            options: Options::default(),
-            env: t.env.clone(),
-            created: now,
-            activity: now,
-            last_attached: 0,
-            alerts: BTreeMap::new(),
-            group: Some(gid),
-        };
-        self.sessions.insert(sid, session);
+        let links = self.sessions[&tsid].links.clone();
+        let s = self.sessions.get_mut(&sid).unwrap();
+        // the lowest window is current (session_select of RB_MIN): no
+        // session-window-changed
+        s.active = links.keys().next().copied().unwrap_or(tactive);
+        s.links = links;
+        s.group = Some(gid);
+        self.seen_active_now(sid);
+        // session_group_add, then every group window linked and the first one unlinked
+        self.detect_groups();
+        self.detect_group_sync(sid);
         self.detect_changes(None);
         self.fire_session("session-created", sid);
         if print {

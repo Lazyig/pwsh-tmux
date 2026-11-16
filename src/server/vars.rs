@@ -421,9 +421,9 @@ impl Vars for VarCtx<'_> {
             "pane_marked" => Some(b(t.pane.is_some() && srv.marked == t.pane)),
             "pane_marked_set" => Some(b(srv.marked.is_some())),
             "pane_dead" => pane.map(|p| b(p.dead.is_some())),
-            "pane_dead_status" => pane.and_then(|p| p.dead).and_then(|d| d.0).map(|s| s.to_string()),
+            "pane_dead_status" => pane.and_then(|p| p.dead).and_then(|d| d.0).filter(|s| super::exit_signal(*s).is_none()).map(|s| s.to_string()),
             "pane_dead_time" => pane.and_then(|p| p.dead).map(|d| d.1.to_string()),
-            "pane_dead_signal" => Some(String::new()),
+            "pane_dead_signal" => Some(pane.and_then(|p| p.dead).and_then(|d| d.0).and_then(super::exit_signal).map(|s| s.to_string()).unwrap_or_default()),
             "pane_in_mode" => pane.map(|p| b(p.mode.is_some())),
             "pane_mode" => pane.map(|p| match &p.mode {
                 Some(PaneMode::Copy(_)) => "copy-mode".into(),

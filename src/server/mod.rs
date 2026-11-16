@@ -178,6 +178,30 @@ impl OscState {
     }
 }
 
+/// A pane process's exit: its exit code, or (on Unix) minus the signal that killed
+/// it (tmux's WIFSIGNALED status, shown by exit_signal and pane_dead_signal).
+fn exit_status_code(s: &portable_pty::ExitStatus) -> i32 {
+    #[cfg(unix)]
+    if let Some(name) = s.signal() {
+        // portable-pty keeps only strsignal's text
+        for sig in 1..65 {
+            let p = unsafe { libc::strsignal(sig) };
+            if !p.is_null() && unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy() == name {
+                return -sig;
+            }
+        }
+        if let Some(n) = name.strip_prefix("Signal ").and_then(|n| n.parse::<i32>().ok()) {
+            return -n;
+        }
+    }
+    s.exit_code() as i32
+}
+
+/// The signal number in a pane's exit status (see exit_status_code).
+pub fn exit_signal(status: i32) -> Option<i32> {
+    (cfg!(unix) && status < 0).then_some(-status)
+}
+
 /// The exit status in OSC 133 "D;status[;key=value...]": 0 when absent or a key=value, 255
 /// when not a number from 0 to 255 (tmux's input_osc_133_exit_status).
 fn osc133_exit_status(arg: &str) -> i32 {
@@ -859,7 +883,8 @@ pub struct Server {
     pub prompt_history: Vec<String>,
     pub jobs: HashMap<u32, Parked>,
     pub waits: HashMap<String, events::Channel>,
-    pub overlay_waits: Vec<(ClientId, u64, String, Queue)>,
+    /// Queues waiting for an overlay to close, with the command's argv (its after hook).
+    pub overlay_waits: Vec<(ClientId, u64, Vec<String>, Queue)>,
     /// Copy-mode panes scrolling while a selection drag rests at an edge.
     pub copy_drag_timers: HashMap<PaneId, Instant>,
     /// A lookup of what the panes run is in progress (at most one at a time).
@@ -1462,7 +1487,8 @@ impl Server {
                 if let Some(sid) = session {
                     self.update_session_size(sid);
                 }
-                if new != old {
+                // MSG_RESIZE fires it even when the size is the same (as after attach)
+                if session.is_some() {
                     let mut p = self.payload_client(cid);
                     p.int("width", new.0 as i64).int("height", new.1 as i64).int("old_width", old.0 as i64).int("old_height", old.1 as i64);
                     self.fire("client-resized", p);
@@ -1641,6 +1667,11 @@ impl Server {
             return;
         }
         self.fire_pane_exit("pane-exited", id, status);
+        // server_destroy_pane closes the pane's layout cell (window-layout-changed)
+        // before killing a window left empty; other windows' changes are found later
+        if let Some(wid) = self.window_of(id).filter(|w| self.windows.get(w).is_some_and(|w| w.panes() == [id])) {
+            self.fire_window("window-layout-changed", wid);
+        }
         self.kill_pane(id);
     }
 
@@ -1652,6 +1683,13 @@ impl Server {
                 if !output.is_empty() && !background {
                     if queue.ctx.reply.is_some_and(|c| !self.clients.get(&c).is_some_and(|c| c.attached)) {
                         queue.ctx.out.push_str(&output);
+                    } else if let (Some(cid), Some(_), None) = (queue.ctx.client, queue.ctx.control_seq, pane) {
+                        // cmdq_print to a control client: bare lines after its %end
+                        let mut text = output.clone();
+                        if !text.ends_with('\n') {
+                            text.push('\n');
+                        }
+                        self.ev.ctl_queue.entry(cid).or_default().push_str(&text);
                     } else if let Some(p) = pane.or(queue.ctx.pane) {
                         self.view_output(p, &output);
                     }
@@ -1785,16 +1823,16 @@ impl Server {
             }
         }
         let waiting = std::mem::take(&mut self.overlay_waits);
-        for (cid, epoch, name, queue) in waiting {
+        for (cid, epoch, argv, queue) in waiting {
             if self.clients.get(&cid).is_none_or(|c| c.overlay.is_none() || c.overlay_epoch != epoch) {
                 let mut queue = queue;
-                self.after_command(&[name], &queue.ctx);
+                self.after_command(&argv, &queue.ctx);
                 for c in std::mem::take(&mut self.ev.inject).into_iter().rev() {
                     queue.cmds.push_front(c);
                 }
                 self.run_queue(queue);
             } else {
-                self.overlay_waits.push((cid, epoch, name, queue));
+                self.overlay_waits.push((cid, epoch, argv, queue));
             }
         }
         // Animation cycles request a one-shot status redraw every 100ms.
@@ -2037,7 +2075,7 @@ impl Server {
         if let Some(mut child) = child {
             let tx = self.tx.clone();
             thread::spawn(move || {
-                let status = child.wait().ok().map(|s| s.exit_code() as i32);
+                let status = child.wait().ok().map(|s| exit_status_code(&s));
                 let _ = tx.send(Event::PaneExit(id, generation, status));
             });
         }
@@ -2113,6 +2151,10 @@ impl Server {
     /// Kills a pane and removes it from its window (closing the window/session if empty).
     pub fn kill_pane(&mut self, id: PaneId) {
         let wid = self.window_of(id);
+        // server_kill_pane: unzoom (with its events) before closing the pane's cell
+        if let Some(wid) = wid.filter(|w| self.windows.get(w).is_some_and(|w| w.panes().len() > 1)) {
+            self.unzoom_window(wid);
+        }
         self.destroy_pane(id);
         let Some(wid) = wid else { return };
         let w = self.windows.get_mut(&wid).unwrap();
@@ -2128,6 +2170,9 @@ impl Server {
                 w.zoomed = false;
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
+                // layout_close_pane fires window-layout-changed before window_remove_pane
+                // picks the new active pane
+                self.flush_window_layout(wid);
             }
             None => self.kill_window(wid),
         }
@@ -2349,7 +2394,12 @@ impl Server {
         if let Some((_, wid)) = self.session_window(sid) {
             self.ev.latest.insert(wid, cid);
         }
-        self.update_focus();
+        // the old session's current window, then the new one's
+        for s in [old_session, Some(sid)].into_iter().flatten() {
+            if let Some((_, wid)) = self.session_window(s) {
+                self.update_window_focus(wid);
+            }
+        }
         let mut p = self.payload_client(cid);
         p.set("new_session", p.get("session").cloned().unwrap_or(events::Val::Session(sid, String::new())));
         if let Some(old) = old_session.filter(|o| self.sessions.contains_key(o)) {
@@ -2676,7 +2726,7 @@ impl Server {
                     q.ctx.hook_saved = hook_saved;
                     q.ctx.command_error = failed;
                     q.ctx.hook_error = hook_failed;
-                    self.overlay_waits.push((cid, epoch, name, q));
+                    self.overlay_waits.push((cid, epoch, argv, q));
                     return;
                 }
                 Ok(Flow::Next) => {
@@ -2692,8 +2742,6 @@ impl Server {
                     // async commands: park the rest of the queue
                     let parts: Vec<String> = e.split('\0').map(String::from).collect();
                     let get = |i: usize| parts.get(i).cloned().unwrap_or_default();
-                    // the reply of the command waited in is written when it is done
-                    let open = q.ctx.control_seq.is_some() && get(1) != "delay";
                     match get(1).as_str() {
                         "job-if" => {
                             let kind = JobKind::IfShell { then: get(3), otherwise: Some(get(4)).filter(|s| !s.is_empty()) };
@@ -2703,7 +2751,8 @@ impl Server {
                                 self.control_item_done(&mut q, None);
                                 continue;
                             }
-                            q.ctx.control_open = open;
+                            // CMD_RETURN_WAIT: the reply block ends now (cmdq_fire_command)
+                            self.control_item_done(&mut q, None);
                             q.ctx.hook_saved = hook_saved;
                             q.ctx.command_error = failed;
                             q.ctx.hook_error = hook_failed;
@@ -2721,7 +2770,8 @@ impl Server {
                                 self.control_item_done(&mut q, None);
                                 continue;
                             }
-                            q.ctx.control_open = open;
+                            // CMD_RETURN_WAIT: the reply block ends now (cmdq_fire_command)
+                            self.control_item_done(&mut q, None);
                             q.ctx.hook_saved = hook_saved;
                             q.ctx.command_error = failed;
                             q.ctx.hook_error = hook_failed;
@@ -2729,7 +2779,8 @@ impl Server {
                             return;
                         }
                         "wait" => {
-                            q.ctx.control_open = open;
+                            // cmdq_fire_command writes %end as soon as wait-for waits
+                            self.control_item_done(&mut q, None);
                             q.ctx.hook_saved = hook_saved;
                             q.ctx.command_error = failed;
                             q.ctx.hook_error = hook_failed;
@@ -2737,7 +2788,8 @@ impl Server {
                             return;
                         }
                         "lock" => {
-                            q.ctx.control_open = open;
+                            // cmdq_fire_command writes %end as soon as wait-for waits
+                            self.control_item_done(&mut q, None);
                             q.ctx.hook_saved = hook_saved;
                             q.ctx.command_error = failed;
                             q.ctx.hook_error = hook_failed;
@@ -2745,7 +2797,8 @@ impl Server {
                             return;
                         }
                         "wait-event" => {
-                            q.ctx.control_open = open;
+                            // cmdq_fire_command writes %end as soon as wait-for waits
+                            self.control_item_done(&mut q, None);
                             q.ctx.hook_saved = hook_saved;
                             q.ctx.command_error = failed;
                             q.ctx.hook_error = hook_failed;

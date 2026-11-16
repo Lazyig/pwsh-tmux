@@ -1429,10 +1429,10 @@ fn tmux_38_event_order() {
     ctx.ok(&["swap-window", "-d", "-s", "a:1", "-t", "a:0"]);
     assert_eq!(log(&ctx), "session-window-changed<a:0>");
     assert_eq!(ctx.fmt("a", "#{window_index}"), "0");
-    // a group: joining comes first, the new member gets every window (tmux also
-    // spawns and closes a window of its own first)
+    // a group: the new session spawns a window of its own, joins the group, gets
+    // every window and loses its own (session_group_synchronize_to)
     ctx.ok(&["new-session", "-d", "-s", "b", "-t", "a"]);
-    assert_eq!(log(&ctx), "session-added-to-group<a:> session-added-to-group<b:> window-linked<b:0> window-linked<b:1> window-linked<b:2> session-created<b:>");
+    assert_eq!(log(&ctx), "pane-created<b:0> window-created<:> window-linked<b:0> session-added-to-group<a:> session-added-to-group<b:> window-linked<b:0> window-linked<b:1> window-linked<b:2> window-unlinked<b:0> window-closed<:> session-created<b:>");
     ctx.ok(&["new-window", "-d", "-t", "a:3"]);
     assert_eq!(log(&ctx), "pane-created<a:3> window-created<:> window-linked<a:3> window-linked<b:0> window-linked<b:1> window-linked<b:2> window-linked<b:3>");
     ctx.ok(&["kill-window", "-t", "a:3"]);
@@ -1753,4 +1753,167 @@ fn tmux_38_hook_arrays_channels_and_buffers() {
     ctx.ok(&["set-hook", "-g", "pane-created", "set -gF @pc '#{hook_pane_command}|#{hook_created_empty}'"]);
     ctx.ok(&["split-window", "-d", "-t", "a", ""]);
     assert_eq!(ctx.ok(&["show", "-gv", "@pc"]).trim(), "''|1");
+}
+
+fn log_hooks(ctx: &Ctx, hooks: &[&str]) {
+    for h in hooks {
+        ctx.ok(&["set-hook", "-g", h, &format!("set -gaF @log '{h} '")]);
+    }
+}
+
+fn take_log(ctx: &Ctx) -> String {
+    std::thread::sleep(Duration::from_millis(150));
+    let out = ctx.cmd(&["show", "-gqv", "@log"]).1.trim().to_string();
+    ctx.ok(&["set", "-g", "@log", ""]);
+    out
+}
+
+/// Events of commands that change layouts in steps fire in tmux's order: an unzoom
+/// first, the closed or split cell, the new active pane, links before unlinks.
+#[test]
+fn tmux_38_layout_event_order() {
+    let ctx = Ctx::new("layord");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-n", "w0", "-x", "80", "-y", "24"]);
+    ctx.ok(&["split-window", "-d", "-t", "s:0"]);
+    ctx.ok(&["split-window", "-d", "-t", "s:0"]);
+    log_hooks(&ctx, &["window-zoomed", "window-unzoomed", "window-layout-changed", "pane-resized", "window-pane-changed"]);
+    ctx.ok(&["resize-pane", "-Z", "-t", "s:0.0"]);
+    assert_eq!(take_log(&ctx), "pane-resized window-zoomed window-layout-changed");
+    ctx.ok(&["select-pane", "-t", "s:0.1"]);
+    assert_eq!(take_log(&ctx), "pane-resized window-unzoomed window-layout-changed window-pane-changed");
+    ctx.ok(&["resize-pane", "-Z", "-t", "s:0.1"]);
+    take_log(&ctx);
+    // -Z keeps the window zoomed (window_pop_zoom after window-pane-changed)
+    ctx.ok(&["select-pane", "-Z", "-t", "s:0.2"]);
+    assert_eq!(take_log(&ctx), "pane-resized window-unzoomed window-layout-changed window-pane-changed pane-resized window-zoomed window-layout-changed");
+    assert_eq!(ctx.fmt("s:0", "#{window_zoomed_flag}"), "1");
+    // the zoomed pane killed: unzoom, its cell closed, then the new active pane
+    ctx.ok(&["kill-pane", "-t", "s:0.2"]);
+    let log = take_log(&ctx);
+    assert!(log.starts_with("pane-resized window-unzoomed window-layout-changed pane-resized") && log.ends_with("pane-resized window-layout-changed window-pane-changed"), "{log}");
+    // split-window resizes the new pane from the window's size as well
+    ctx.ok(&["split-window", "-d", "-t", "s:0.0"]);
+    assert_eq!(take_log(&ctx), "pane-resized pane-resized window-layout-changed");
+    ctx.ok(&["resize-pane", "-Z", "-t", "s:0.0"]);
+    take_log(&ctx);
+    ctx.ok(&["select-layout", "-t", "s:0", "even-vertical"]);
+    assert!(take_log(&ctx).starts_with("pane-resized window-unzoomed window-layout-changed pane-resized"));
+    // rotate-window keeps the active position: the pane moved there is active
+    let first = ctx.fmt("s:0.0", "#{pane_id}");
+    ctx.ok(&["select-pane", "-t", "s:0.0"]);
+    take_log(&ctx);
+    ctx.ok(&["rotate-window", "-t", "s:0"]);
+    assert!(take_log(&ctx).ends_with("window-pane-changed"));
+    assert_eq!(ctx.fmt("s:0", "#{pane_index}"), "0");
+    assert_ne!(ctx.fmt("s:0", "#{pane_id}"), first);
+    // select-pane does not select the pane's window
+    ctx.ok(&["new-window", "-d", "-t", "s:1"]);
+    ctx.ok(&["split-window", "-d", "-t", "s:1"]);
+    ctx.ok(&["set-hook", "-g", "session-window-changed", "set -gaF @log 'swc '"]);
+    take_log(&ctx);
+    ctx.ok(&["select-pane", "-t", "s:1.1"]);
+    assert_eq!(take_log(&ctx), "window-pane-changed");
+    assert_eq!(ctx.fmt("s", "#{window_index}"), "0");
+    // a window's last pane exiting closes its cell first
+    log_hooks(&ctx, &["pane-exited", "window-unlinked", "window-closed"]);
+    ctx.ok(&["new-window", "-d", "-t", "s:5", "sleep 0.3"]);
+    wait_for("window gone", || !ctx.ok(&["list-windows", "-t", "s", "-F", "#{window_index}"]).lines().any(|l| l == "5"));
+    assert_eq!(take_log(&ctx), "pane-exited window-layout-changed window-unlinked window-closed");
+}
+
+/// break-pane, join-pane, move-window and new-session -t fire their events in the
+/// order of their tmux functions.
+#[test]
+fn tmux_38_window_event_order() {
+    let ctx = Ctx::new("winord");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-n", "w0", "-x", "80", "-y", "24"]);
+    ctx.ok(&["new-window", "-d", "-t", "s:1", "-n", "w1"]);
+    ctx.ok(&["split-window", "-d", "-t", "s:w1"]);
+    for h in ["window-layout-changed", "pane-resized", "window-pane-changed", "pane-moved", "window-linked", "window-unlinked", "window-created", "window-closed", "session-window-changed", "pane-created", "session-added-to-group", "session-created"] {
+        ctx.ok(&["set-hook", "-g", h, &format!("set -gaF @log '{h}:#{{hook_window_name}} '")]);
+    }
+    ctx.ok(&["set-option", "-g", "automatic-rename", "off"]);
+    ctx.ok(&["break-pane", "-d", "-s", "s:w1.1", "-n", "bp"]);
+    assert_eq!(take_log(&ctx), "pane-resized:w1 window-layout-changed:w1 window-linked:bp pane-resized:bp window-created:bp pane-moved:bp");
+    ctx.ok(&["join-pane", "-s", "s:bp", "-t", "s:w0", "-d"]);
+    assert_eq!(take_log(&ctx), "window-layout-changed:bp pane-resized:w0 pane-resized:w0 pane-moved:w0 window-unlinked:bp window-closed:bp window-layout-changed:w0");
+    ctx.ok(&["move-window", "-s", "s:w1", "-t", "s:7"]);
+    // (server_link_window selects it without -d)
+    assert_eq!(take_log(&ctx), "window-linked:w1 session-window-changed:w1 window-unlinked:w1");
+    ctx.ok(&["select-window", "-t", "s:w0"]);
+    take_log(&ctx);
+    ctx.ok(&["move-window", "-s", "s:w0", "-t", "s:8"]);
+    assert_eq!(take_log(&ctx), "window-linked:w0 session-window-changed:w0 window-unlinked:w0");
+    // the first pane's window has no name yet when pane-created fires
+    ctx.ok(&["new-window", "-d", "-t", "s:3", "-n", "named"]);
+    assert_eq!(take_log(&ctx), "pane-created: window-created:named window-linked:named");
+    // new-session -t creates its own first window, then replaces it with the group's
+    ctx.ok(&["new-session", "-d", "-s", "g", "-t", "s"]);
+    let log = take_log(&ctx);
+    let n = log.split(' ').nth(1).and_then(|w| w.strip_prefix("window-created:")).unwrap_or("?").to_string();
+    assert_eq!(log, format!("pane-created: window-created:{n} window-linked:{n} session-added-to-group: session-added-to-group: window-linked:named window-linked:w1 window-linked:w0 window-unlinked:{n} window-closed:{n} session-created:"));
+    assert_eq!(ctx.ok(&["list-windows", "-t", "g", "-F", "#{window_name}"]), ctx.ok(&["list-windows", "-t", "s", "-F", "#{window_name}"]));
+    assert_eq!(ctx.fmt("g", "#{window_index}"), "3");
+}
+
+/// wait-for -F filters see no client; a control client's wait-for block ends at once
+/// and -v payloads follow as plain lines; monitors skip dead panes; panes killed by a
+/// signal report exit_signal.
+#[test]
+fn tmux_38_waiters_monitors_and_exit_signals() {
+    use std::io::{BufRead, BufReader};
+    use std::sync::{Arc, Mutex};
+    let ctx = Ctx::new("waitmon");
+    ctx.ok(&["new-session", "-d", "-s", "w", "-n", "w0"]);
+    ctx.ok(&["set", "-g", "automatic-rename", "off"]);
+    let mut child = ctx.command().args(["wait-for", "-E", "-F", "#{client_name}", "window-renamed"]).spawn().unwrap();
+    wait_for("waiter", || !ctx.ok(&["wait-for", "-E", "-l", "window-renamed"]).is_empty());
+    ctx.ok(&["rename-window", "-t", "w:0", "n1"]);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(child.try_wait().unwrap().is_none(), "client_name is empty for the filter");
+    child.kill().unwrap();
+    let _ = child.wait();
+
+    let mut child = ctx.command().args(["-C", "attach", "-t", "w"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let out = Arc::new(Mutex::new(String::new()));
+    let stdout = child.stdout.take().unwrap();
+    let o = out.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            o.lock().unwrap().push_str(&(line + "\n"));
+        }
+    });
+    let mut stdin = child.stdin.take().unwrap();
+    wait_for("attached", || out.lock().unwrap().contains("%session-changed"));
+    stdin.write_all(b"wait-for -E -v @ctl\ndisplay -p after\n").unwrap();
+    stdin.flush().unwrap();
+    wait_for("block ended", || out.lock().unwrap().matches("%end").count() >= 2);
+    assert!(!out.lock().unwrap().contains("after"));
+    ctx.ok(&["set-hook", "-E", "-t", "w:0", "@ctl"]);
+    wait_for("woken", || out.lock().unwrap().contains("after"));
+    let text = out.lock().unwrap().clone();
+    let end = text.match_indices("%end").nth(1).unwrap().0;
+    let payload = text.find("event=@ctl\n").unwrap();
+    let begin = text.rfind("%begin").unwrap();
+    assert!(end < payload && payload < begin && text[begin..].contains("after"), "{text}");
+    child.kill().unwrap();
+    let _ = child.wait();
+
+    // dead panes are not checked
+    ctx.ok(&["set", "-g", "remain-on-exit", "on"]);
+    ctx.ok(&["split-window", "-d", "-t", "w:0", "sleep 1.2"]);
+    let pane = ctx.fmt("w:0.1", "#{pane_id}");
+    ctx.ok(&["set-hook", "-B", &format!("@dead:{pane}:#{{pane_dead}}"), "set -g @deadfired 1"]);
+    wait_for("dead", || ctx.fmt(&pane, "#{pane_dead}") == "1");
+    std::thread::sleep(Duration::from_millis(2200));
+    assert_eq!(ctx.ok(&["show-hooks", "-B", "-F", "#{hook_fire_count}"]).trim(), "0");
+    #[cfg(unix)]
+    {
+        ctx.ok(&["set", "-g", "default-shell", "/bin/sh"]);
+        ctx.ok(&["set-hook", "-g", "pane-died", "set -gF @died '#{hook_exit_status}|#{hook_exit_signal}'"]);
+        ctx.ok(&["split-window", "-d", "-t", "w:0", "sleep 0.2; kill -TERM $$"]);
+        wait_for("signal", || ctx.cmd(&["show", "-gqv", "@died"]).1.trim() == "|15");
+        let dead = ctx.ok(&["list-panes", "-t", "w:0", "-F", "#{pane_dead_status}|#{pane_dead_signal}"]);
+        assert!(dead.lines().any(|l| l == "|15"), "{dead}");
+    }
 }

@@ -216,7 +216,7 @@ fn overlay_queue_waits_for_close_and_rechecks_access() {
         cmds: VecDeque::from([vec!["set-option".into(), "-g".into(), "@overlay-result".into(), "written".into()]]),
         ctx: Ctx { client: Some(1), ..Ctx::default() }, soft: 0,
     };
-    srv.overlay_waits.push((1, 7, "display-menu".into(), queue));
+    srv.overlay_waits.push((1, 7, vec!["display-menu".into()], queue));
     srv.timers();
     assert_eq!(srv.overlay_waits.len(), 1);
     assert!(!srv.opts_session.0.contains_key("@overlay-result"));
@@ -238,7 +238,7 @@ fn replacing_overlay_resumes_the_previous_queue() {
     client.overlay = Some(Overlay::DisplayPanes {
         until: Instant::now() + Duration::from_secs(30), template: String::new(),
     });
-    srv.overlay_waits.push((1, 7, "display-menu".into(), Queue {
+    srv.overlay_waits.push((1, 7, vec!["display-menu".into()], Queue {
         cmds: VecDeque::from([vec!["set-option".into(), "-g".into(), "@overlay-result".into(), "written".into()]]),
         ctx: Ctx { client: Some(1), ..Ctx::default() }, soft: 0,
     }));

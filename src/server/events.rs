@@ -188,7 +188,6 @@ pub struct Waiter {
     pub filter: Option<String>,
     pub verbose: bool,
     pub queue: Queue,
-    pub client: Option<ClientId>,
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -206,6 +205,8 @@ pub struct PaneSeen {
     pub idx: Option<u32>,
     pub size: (u16, u16),
     pub mode: String,
+    /// Modes seen under the current one (the pane's mode stack).
+    pub below: Vec<String>,
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -749,11 +750,12 @@ impl Server {
             }
             let w = &self.ev.waiters[i];
             if let Some(f) = &w.filter {
-                // the payload and the client, no target (no format_defaults); tmux's
-                // own variables (window_name, ...) come first and are empty
+                // the payload only, no target or client (format_create without
+                // format_defaults: ft->c is unset); tmux's own variables (window_name,
+                // client_name, ...) come first and are empty
                 let mut extra = p.formats("");
                 extra.retain(|k, _| !cmds::VAR_NAMES.contains(&k.as_str()));
-                let ok = cmds::truthy(&self.expand_extra(Target::default(), w.client, f, extra));
+                let ok = cmds::truthy(&self.expand_extra(Target::default(), None, f, extra));
                 if !ok {
                     i += 1;
                     continue;
@@ -764,9 +766,15 @@ impl Server {
         }
     }
 
-    /// cmdq_print to a waiting client: straight to the stdout of a command client.
+    /// cmdq_print to a waiting client: straight to the stdout of a command client;
+    /// bare lines to a control client, whose block for wait-for already ended (in
+    /// order with the event's notifications).
     fn waiter_print(&mut self, i: usize, text: &str) {
         let w = &mut self.ev.waiters[i];
+        if let (Some(_), Some(cid)) = (w.queue.ctx.control_seq, w.queue.ctx.client) {
+            self.ev.ctl_queue.entry(cid).or_default().push_str(text);
+            return;
+        }
         let reply = w.queue.ctx.reply.filter(|_| w.queue.ctx.control_seq.is_none());
         match reply.and_then(|r| self.clients.get(&r)).filter(|c| !c.attached) {
             Some(c) => {
@@ -897,8 +905,7 @@ impl Server {
 
     /// Parks a queue on wait-for -E (from run_queue).
     pub fn park_event_waiter(&mut self, name: String, filter: Option<String>, verbose: bool, q: Queue) {
-        let client = q.ctx.reply.or(q.ctx.client);
-        self.ev.waiters.push(Waiter { name, filter, verbose, queue: q, client });
+        self.ev.waiters.push(Waiter { name, filter, verbose, queue: q });
     }
 
     /// cmd_wait_for_client_lost: a client that goes away stops waiting, and the rest of
@@ -1429,6 +1436,10 @@ impl Server {
             let mut seen_keys = HashSet::new();
             for (k, t, idx, pane) in targets {
                 seen_keys.insert(k);
+                // monitor_check_pane skips a pane without a process (wp->fd == -1)
+                if pane.is_some_and(|p| self.panes.get(&p).is_none_or(|p| p.dead.is_some() || p.pid.is_none())) {
+                    continue;
+                }
                 let value = self.expand(t, None, &format);
                 let m = self.ev.monitors.get_mut(&key).unwrap();
                 match m.last.insert(k, value.clone()) {
@@ -1469,7 +1480,7 @@ impl Server {
     /// session-window-changed for sessions whose current window changed.
     /// session-window-changed when a session's current winlink changed. After
     /// swap-window the winlink is the same with another window in it: no event.
-    fn detect_current_window(&mut self, sid: SessId, swapped: bool) {
+    pub(super) fn detect_current_window(&mut self, sid: SessId, swapped: bool) {
         let Some(s) = self.sessions.get(&sid) else { return };
         let Some(&wid) = s.links.get(&s.active) else { return };
         let now = (s.active, wid);
@@ -1483,13 +1494,17 @@ impl Server {
         let mut p = self.payload_winlink(sid, now.0, now.1);
         p.set("new_window", self.val_window(now.1)).int("new_window_index", now.0 as i64);
         p.set("old_window", self.val_window(old.1)).int("old_window_index", old.0 as i64);
-        // session_set_current updates focus if focus-events is on
-        self.ev.focus_dirty |= options::is_on(&self.opt_server("focus-events"));
+        // session_set_current updates the old and new windows' focus first, if
+        // focus-events is on
+        if options::is_on(&self.opt_server("focus-events")) {
+            self.update_window_focus(old.1);
+            self.update_window_focus(now.1);
+        }
         self.fire("session-window-changed", p);
     }
 
     /// window-created for a new window as it is first linked (spawn_window).
-    fn detect_window_created(&mut self, wid: WinId) {
+    pub(super) fn detect_window_created(&mut self, wid: WinId) {
         if self.ev.seen.windows.contains_key(&wid) {
             return;
         }
@@ -1564,13 +1579,17 @@ impl Server {
         if !links_first && !new_session {
             self.detect_current_window(sid, swapped);
         }
-        if !swapped {
-            for (idx, wid) in &old {
-                if links.get(idx) != Some(wid) {
-                    let p = self.payload_winlink(sid, *idx, *wid);
-                    self.fire_unlinked(p, *wid);
-                }
-            }
+        // server_link_window unlinks a window it replaces (-k) first; move-window
+        // unlinks the source only after linking and selecting
+        let unlinked: Vec<(u32, WinId)> = if swapped {
+            Vec::new()
+        } else {
+            old.iter().filter(|(i, w)| links.get(i) != Some(w)).map(|(i, w)| (*i, *w)).collect()
+        };
+        let (replaced, rest): (Vec<_>, Vec<_>) = unlinked.into_iter().partition(|(i, _)| !links_first || links.contains_key(i));
+        for (idx, wid) in replaced {
+            let p = self.payload_winlink(sid, idx, wid);
+            self.fire_unlinked(p, wid);
         }
         for (idx, wid) in &links {
             self.detect_window_created(*wid);
@@ -1584,9 +1603,13 @@ impl Server {
         } else if links_first {
             self.detect_current_window(sid, swapped);
         }
+        for (idx, wid) in rest {
+            let p = self.payload_winlink(sid, idx, wid);
+            self.fire_unlinked(p, wid);
+        }
     }
 
-    fn seen_active_now(&mut self, sid: SessId) {
+    pub(super) fn seen_active_now(&mut self, sid: SessId) {
         let active = self.sessions.get(&sid).and_then(|s| s.links.get(&s.active).map(|w| (s.active, *w))).unwrap_or_default();
         if let Some(e) = self.ev.seen.sessions.get_mut(&sid) {
             e.active = active;
@@ -1595,7 +1618,7 @@ impl Server {
 
     /// session_group_synchronize1: a new current window if the old one went, every
     /// window linked again, then the windows no longer there unlinked.
-    fn detect_group_sync(&mut self, sid: SessId) {
+    pub(super) fn detect_group_sync(&mut self, sid: SessId) {
         let Some(s) = self.sessions.get(&sid) else { return };
         let links = s.links.clone();
         let name = s.name.clone();
@@ -1643,7 +1666,18 @@ impl Server {
             let size = pp.size;
             let mode = self.expand(Target { pane: Some(pane), wid: Some(wid), ..Target::default() }, None, "#{pane_mode}");
             let idx = self.session_of_pane(pane).map(|x| x.1);
-            let Some(old) = self.ev.seen.panes.insert(pane, PaneSeen { wid, idx, size, mode: mode.clone() }) else { continue };
+            let Some(old) = self.ev.seen.panes.insert(pane, PaneSeen { wid, idx, size, mode: mode.clone(), below: Vec::new() }) else {
+                // a new pane starts at the window's size (window_pane_create) and is
+                // resized as it is laid out
+                let new = self.ev.spawned.iter().any(|s| s.pane == pane && !s.respawn);
+                let wsize = self.windows.get(&wid).map(|w| (w.sx, w.sy)).unwrap_or(size);
+                if new && wsize != size {
+                    let mut p = self.payload_pane(pane);
+                    p.int("width", size.0 as i64).int("height", size.1 as i64).int("old_width", wsize.0 as i64).int("old_height", wsize.1 as i64);
+                    self.fire("pane-resized", p);
+                }
+                continue;
+            };
             if old.size != size {
                 let mut p = self.payload_pane(pane);
                 p.int("width", size.0 as i64).int("height", size.1 as i64).int("old_width", old.size.0 as i64).int("old_height", old.size.1 as i64);
@@ -1662,6 +1696,10 @@ impl Server {
             }
             let mut p = self.payload_pane(sp.pane);
             let t = p.target;
+            // spawn_window names the window after spawn_pane fired pane-created
+            if let Some(w) = t.wid.filter(|w| !sp.respawn && !self.ev.seen.windows.contains_key(w)) {
+                p.set("window", Val::Window(w, String::new()));
+            }
             if let Some(s) = t.sid {
                 p.set("session", self.val_session(s));
             }
@@ -1725,13 +1763,14 @@ impl Server {
                 changed.push((wid, old, now));
             }
         }
-        // window_set_active_pane updates focus before window-pane-changed, if
-        // focus-events is on
-        if changed.iter().any(|(_, old, now)| old.active != now.active) && options::is_on(&self.opt_server("focus-events")) {
-            self.update_focus();
-        }
+        // window_set_active_pane updates the old and new panes' focus before
+        // window-pane-changed, if focus-events is on
+        let focus_events = options::is_on(&self.opt_server("focus-events"));
         for (wid, old, now) in &changed {
             if old.active != now.active && self.windows.get(wid).is_some_and(|w| w.active == now.active) {
+                if focus_events {
+                    self.update_pane_focus(&[old.active, now.active]);
+                }
                 let mut p = Payload { target: self.target_for_pane(now.active), ..Payload::default() };
                 p.set("window", self.val_window(*wid)).set("pane", Val::Pane(now.active)).set("new_pane", Val::Pane(now.active)).set("old_pane", Val::Pane(old.active));
                 self.fire("window-pane-changed", p);
@@ -1797,8 +1836,29 @@ impl Server {
             }
         }
         for (pane, _, _, mode, old) in pane_changes {
+            let mut below = old.below.clone();
+            // window_pane_reset_mode pops back to the mode under it: exited, with the
+            // next mode current; anything else on top of a mode was pushed
+            let entered = match (old.mode.is_empty(), mode.is_empty()) {
+                _ if old.mode == mode => false,
+                (_, true) => {
+                    below.clear();
+                    false
+                }
+                (true, false) => true,
+                (false, false) if below.last() == Some(&mode) => {
+                    below.pop();
+                    false
+                }
+                (false, false) => {
+                    below.push(old.mode.clone());
+                    true
+                }
+            };
+            if let Some(seen) = self.ev.seen.panes.get_mut(&pane) {
+                seen.below = below;
+            }
             if old.mode != mode {
-                let entered = !mode.is_empty();
                 let mut p = self.payload_pane(pane);
                 if !mode.is_empty() {
                     p.str("current_mode", mode.clone());
@@ -1814,18 +1874,152 @@ impl Server {
         // focus changes where tmux updates it: active panes and windows, overlays,
         // attaching and focus reports (not when a client goes)
         let overlays: HashMap<ClientId, bool> = self.clients.values().map(|c| (c.id, c.overlay.is_some())).collect();
+        // server_client_set_overlay / clear_overlay: the client's current window
+        let mut windows = Vec::new();
         for (c, o) in &overlays {
-            self.ev.focus_dirty |= self.ev.overlays.get(c) != Some(o) && (*o || self.ev.overlays.contains_key(c));
+            if self.ev.overlays.get(c) != Some(o) && (*o || self.ev.overlays.contains_key(c)) {
+                windows.extend(self.client_session(*c).and_then(|s| self.session_window(s)).map(|w| w.1));
+            }
         }
         self.ev.overlays = overlays;
+        windows.sort_unstable();
+        windows.dedup();
+        for w in windows {
+            self.update_window_focus(w);
+        }
         if std::mem::take(&mut self.ev.focus_dirty) {
             self.update_focus();
         }
     }
 
+    /// Events for a window's layout as it is now, in the middle of a command (tmux
+    /// fires them where the layout changes, before what the command does next):
+    /// pane-resized for its panes (layout_fix_panes), window-zoomed/unzoomed and
+    /// window-layout-changed. detect_changes reports the rest of the command.
+    pub fn flush_window_layout(&mut self, wid: WinId) {
+        let Some(w) = self.windows.get(&wid) else { return };
+        let (zoomed, layout) = (w.zoomed, w.layout.to_layout_string(self.window_area(wid)));
+        for pane in w.panes() {
+            let Some(size) = self.panes.get(&pane).map(|p| p.size) else { continue };
+            let Some(seen) = self.ev.seen.panes.get_mut(&pane).filter(|s| s.wid == wid) else { continue };
+            if seen.size != size {
+                let old = std::mem::replace(&mut seen.size, size);
+                let mut p = self.payload_pane(pane);
+                p.int("width", size.0 as i64).int("height", size.1 as i64).int("old_width", old.0 as i64).int("old_height", old.1 as i64);
+                self.fire("pane-resized", p);
+            }
+        }
+        let Some(seen) = self.ev.seen.windows.get_mut(&wid) else { return };
+        let zoom_changed = seen.zoomed != zoomed;
+        let changed = zoom_changed || seen.layout != layout;
+        seen.zoomed = zoomed;
+        seen.layout = layout;
+        if zoom_changed {
+            self.fire_window(if zoomed { "window-zoomed" } else { "window-unzoomed" }, wid);
+        }
+        if changed {
+            self.fire_window("window-layout-changed", wid);
+        }
+    }
+
+    /// window_unzoom with notify (server_unzoom_window, window_push_zoom): its events
+    /// come before those of the command that unzooms. Whether it was zoomed.
+    pub fn unzoom_window(&mut self, wid: WinId) -> bool {
+        let Some(w) = self.windows.get_mut(&wid).filter(|w| w.zoomed) else { return false };
+        w.zoomed = false;
+        self.apply_layout(wid);
+        self.flush_window_layout(wid);
+        true
+    }
+
+    /// window-linked now, for a command that links a window before its other events
+    /// (session_attach in break-pane).
+    pub fn link_now(&mut self, sid: SessId, idx: u32, wid: WinId) {
+        let Some(e) = self.ev.seen.sessions.get_mut(&sid) else { return };
+        if e.links.insert(idx, wid) != Some(wid) {
+            self.fire_winlink("window-linked", sid, idx, wid);
+        }
+    }
+
+    /// pane-resized for one pane now (window_pane_resize).
+    pub fn pane_resized_now(&mut self, pane: PaneId) {
+        let Some(size) = self.panes.get(&pane).map(|p| p.size) else { return };
+        let Some(seen) = self.ev.seen.panes.get_mut(&pane) else { return };
+        if seen.size == size {
+            return;
+        }
+        let old = std::mem::replace(&mut seen.size, size);
+        let mut p = self.payload_pane(pane);
+        p.int("width", size.0 as i64).int("height", size.1 as i64).int("old_width", old.0 as i64).int("old_height", old.1 as i64);
+        self.fire("pane-resized", p);
+    }
+
+    /// pane-moved now (window_fire_pane_moved) for a pane that went to another window.
+    pub fn pane_moved_now(&mut self, pane: PaneId) {
+        let Some(wid) = self.window_of(pane) else { return };
+        let idx = self.session_of_pane(pane).map(|x| x.1);
+        let Some(old) = self.ev.seen.panes.get(&pane).cloned().filter(|s| s.wid != wid) else { return };
+        if let Some(seen) = self.ev.seen.panes.get_mut(&pane) {
+            seen.wid = wid;
+            seen.idx = idx;
+        }
+        let mut p = self.payload_pane(pane);
+        p.set("window", self.val_window(wid)).set("new_window", self.val_window(wid)).set("old_window", self.val_window(old.wid));
+        if let Some(i) = old.idx {
+            p.int("old_window_index", i as i64);
+        }
+        if let Some(i) = idx {
+            p.int("window_index", i as i64).int("new_window_index", i as i64);
+        }
+        self.fire("pane-moved", p);
+    }
+
+    /// Records a window's layout as reported, for a command that fires its
+    /// window-layout-changed itself.
+    pub fn seen_layout_now(&mut self, wid: WinId) {
+        let Some(w) = self.windows.get(&wid) else { return };
+        let (zoomed, layout) = (w.zoomed, w.layout.to_layout_string(self.window_area(wid)));
+        if let Some(seen) = self.ev.seen.windows.get_mut(&wid) {
+            seen.zoomed = zoomed;
+            seen.layout = layout;
+        }
+    }
+
+    /// window-layout-changed now for a command that fires it itself.
+    pub fn layout_changed_now(&mut self, wid: WinId) {
+        if self.windows.contains_key(&wid) {
+            self.seen_layout_now(wid);
+            self.fire_window("window-layout-changed", wid);
+        }
+    }
+
+    /// window_pop_zoom: zooms the (new) active pane again.
+    pub fn rezoom_window(&mut self, wid: WinId) {
+        let Some(w) = self.windows.get_mut(&wid).filter(|w| !w.zoomed && w.panes().len() > 1) else { return };
+        w.zoomed = true;
+        self.apply_layout(wid);
+        self.flush_window_layout(wid);
+    }
+
+    /// window-pane-changed now if the active pane changed (window_set_active_pane,
+    /// which updates focus first if focus-events is on).
+    pub fn flush_active_pane(&mut self, wid: WinId) {
+        let Some(active) = self.windows.get(&wid).map(|w| w.active) else { return };
+        let Some(old) = self.ev.seen.windows.get(&wid).map(|w| w.active).filter(|a| *a != active) else { return };
+        if let Some(seen) = self.ev.seen.windows.get_mut(&wid) {
+            seen.active = active;
+        }
+        if options::is_on(&self.opt_server("focus-events")) {
+            self.update_pane_focus(&[old, active]);
+        }
+        let mut p = Payload { target: self.target_for_pane(active), ..Payload::default() };
+        p.set("window", self.val_window(wid)).set("pane", Val::Pane(active)).set("new_pane", Val::Pane(active)).set("old_pane", Val::Pane(old));
+        self.fire("window-pane-changed", p);
+    }
+
     /// Sessions joining and leaving groups (session_group_add/remove), oldest
     /// session first; a new session joins before its windows are synchronized.
-    fn detect_groups(&mut self) {
+    pub(super) fn detect_groups(&mut self) {
         let mut by_age: Vec<(u64, SessId)> = self.sessions.values().map(|s| (s.created, s.id)).collect();
         by_age.sort_unstable();
         for (_, sid) in by_age {
@@ -1896,6 +2090,51 @@ impl Server {
         }
     }
 
+    /// Whether a pane should have focus: the active pane of a window that is current
+    /// for a focused client without an overlay.
+    fn pane_should_focus(&self, pane: PaneId) -> bool {
+        let Some(wid) = self.window_of(pane) else { return false };
+        if self.windows.get(&wid).is_none_or(|w| w.active != pane) {
+            return false;
+        }
+        self.clients.values().any(|c| {
+            c.attached && c.overlay.is_none() && !self.ev.unfocused.contains(&c.id)
+                && c.session.and_then(|s| self.session_window(s)).is_some_and(|(_, w)| w == wid)
+        })
+    }
+
+    /// window_pane_update_focus for these panes only: other panes keep the focus
+    /// they had, even if stale (tmux updates only the windows it is told about).
+    pub fn update_pane_focus(&mut self, panes: &[PaneId]) {
+        for &p in panes {
+            if !self.panes.contains_key(&p) {
+                continue;
+            }
+            let focused = self.pane_should_focus(p);
+            let (seq, name) = match (self.ev.focused.contains(&p), focused) {
+                (true, false) => ("\x1b[O", "pane-focus-out"),
+                (false, true) => ("\x1b[I", "pane-focus-in"),
+                _ => continue,
+            };
+            if focused {
+                self.ev.focused.insert(p);
+            } else {
+                self.ev.focused.remove(&p);
+            }
+            if let Some(pane) = self.panes.get(&p).filter(|x| x.screen().focus_events()) {
+                pane.send(seq.as_bytes().to_vec());
+            }
+            self.fire_pane(name, p);
+        }
+    }
+
+    /// window_update_focus: the window's active pane.
+    pub fn update_window_focus(&mut self, wid: WinId) {
+        if let Some(a) = self.windows.get(&wid).map(|w| w.active) {
+            self.update_pane_focus(&[a]);
+        }
+    }
+
     /// server_client_update_latest: a client typing or resized becomes its window's
     /// latest client.
     pub fn update_latest(&mut self, cid: ClientId) {
@@ -1907,13 +2146,19 @@ impl Server {
 
     /// A client's focus report (only sent with focus-events on).
     pub fn client_focus(&mut self, cid: ClientId, focus: bool) {
+        // tty_keys: the client's current window
+        let wid = self.client_session(cid).and_then(|s| self.session_window(s)).map(|w| w.1);
         if focus {
             self.ev.unfocused.remove(&cid);
             self.fire_client("client-focus-in", cid);
-            self.update_focus();
+            if let Some(w) = wid {
+                self.update_window_focus(w);
+            }
         } else {
             self.ev.unfocused.insert(cid);
-            self.update_focus();
+            if let Some(w) = wid {
+                self.update_window_focus(w);
+            }
             self.fire_client("client-focus-out", cid);
         }
     }
@@ -1988,10 +2233,16 @@ impl Server {
     /// pane-exited, or pane-died when remain-on-exit keeps the pane.
     pub fn fire_pane_exit(&mut self, name: &str, pane: PaneId, status: Option<i32>) {
         let mut p = self.payload_pane(pane);
+        // sig2name: the number where there are no signal names (Linux)
         match status {
-            Some(s) => {
-                p.int("exit_status", s as i64);
-            }
+            Some(s) => match super::exit_signal(s) {
+                Some(sig) => {
+                    p.str("exit_signal", sig.to_string());
+                }
+                None => {
+                    p.int("exit_status", s as i64);
+                }
+            },
             None => {
                 p.str("exit_signal", "");
             }
