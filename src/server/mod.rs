@@ -649,6 +649,9 @@ pub struct Window {
     /// Width/height the window is laid out at (follows the attached session size).
     pub sx: u16,
     pub sy: u16,
+    /// A size waiting until the window is the current window of an attached session
+    /// (WINDOW_RESIZE with new_sx/new_sy).
+    pub new_size: Option<(u16, u16)>,
 }
 
 impl Window {
@@ -1298,6 +1301,7 @@ pub fn run(config: Option<String>) -> io::Result<()> {
         }
         srv.sync_groups();
         srv.timers();
+        srv.check_window_resizes();
         if !output_only || last_detect.elapsed() >= Duration::from_millis(50) {
             last_detect = Instant::now();
             srv.detect_changes(None);
@@ -3100,6 +3104,19 @@ impl Server {
 
     /// Window sizes follow the attached clients (window-size: latest/smallest/largest/manual).
     pub fn update_session_size(&mut self, sid: SessId) {
+        self.recalculate_session_size(sid, false);
+    }
+
+    /// recalculate_sizes_now(1): the new sizes are applied at once, also to windows that
+    /// are not shown (refresh-client -C, resize-window -A/-a).
+    pub fn update_session_size_now(&mut self, sid: SessId) {
+        self.recalculate_session_size(sid, true);
+    }
+
+    /// recalculate_size for the session's windows: a window that is not the current window
+    /// of an attached session keeps its size and gets it when it is next shown
+    /// (server_client_check_window_resize), unless `now` or window-size is manual.
+    fn recalculate_session_size(&mut self, sid: SessId, now: bool) {
         let Some(s) = self.sessions.get(&sid) else { return };
         let status = self.status_lines(Some(sid));
         // control clients only count once they set a size (refresh-client -C), and
@@ -3117,23 +3134,23 @@ impl Server {
         let mut size = None;
         for wid in links {
             let mode = self.opt_window(Some(wid), "window-size");
-            let aggressive = self.opt_window_on(Some(wid), "aggressive-resize");
             let pick = match mode.as_str() {
                 "manual" => None,
                 "smallest" => smallest,
                 "largest" => largest,
                 _ => latest,
             };
-            let _ = aggressive;
             let Some((cols, rows)) = pick else { continue };
             size = Some((cols, rows));
             let (sx, sy) = (cols.max(1), rows.saturating_sub(status).max(1));
+            let shown = self.window_shown(wid);
             let w = self.windows.get_mut(&wid).unwrap();
-            if (w.sx, w.sy) != (sx, sy) {
-                w.sx = sx;
-                w.sy = sy;
-                self.clamp_floats(wid);
-                self.apply_layout(wid);
+            if (w.sx, w.sy) == (sx, sy) {
+                w.new_size = None;
+            } else if now || shown {
+                self.resize_window_now(wid, sx, sy);
+            } else {
+                w.new_size = Some((sx, sy));
             }
         }
         if let (Some((c, r)), Some(s)) = (size, self.sessions.get_mut(&sid)) {
@@ -3141,6 +3158,34 @@ impl Server {
             s.rows = r;
         }
         self.mark_session_dirty(sid);
+    }
+
+    /// The window is the current window of a session with an attached client.
+    fn window_shown(&self, wid: WinId) -> bool {
+        self.sessions.iter().any(|(sid, s)| s.links.get(&s.active) == Some(&wid) && self.clients.values().any(|c| c.attached && c.session == Some(*sid)))
+    }
+
+    fn resize_window_now(&mut self, wid: WinId, sx: u16, sy: u16) {
+        let Some(w) = self.windows.get_mut(&wid) else { return };
+        w.new_size = None;
+        if (w.sx, w.sy) != (sx, sy) {
+            w.sx = sx;
+            w.sy = sy;
+            self.clamp_floats(wid);
+            self.apply_layout(wid);
+        }
+    }
+
+    /// server_client_check_window_resize: a waiting size is applied once the window is
+    /// the current window of an attached session.
+    pub fn check_window_resizes(&mut self) {
+        let waiting: Vec<(WinId, (u16, u16))> = self.windows.iter().filter_map(|(id, w)| w.new_size.map(|s| (*id, s))).collect();
+        for (wid, (sx, sy)) in waiting {
+            if self.window_shown(wid) {
+                self.resize_window_now(wid, sx, sy);
+                self.mark_window_dirty(wid);
+            }
+        }
     }
 
     // ---- hooks & queue ---------------------------------------------------------------------

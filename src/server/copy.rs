@@ -106,7 +106,12 @@ impl Server {
         }
         let pending = matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(cm)) if cm.waiting_for_key());
         let binding = self.bindings.get(table).and_then(|t| t.get(name)).map(|b| b.cmd.clone());
-        let default = copymode::CopyMode::default_bindings(vi).iter().find(|(k, _)| keys::parse_key_name(k).map(|k| keys::key_name(&k)).as_deref().unwrap_or(k) == name).map(|(_, c)| default_binding_command(c));
+        let default_raw = copymode::CopyMode::default_bindings(vi).iter().find(|(k, _)| keys::parse_key_name(k).map(|k| keys::key_name(&k)).as_deref().unwrap_or(k) == name).map(|(_, c)| *c);
+        let default = default_raw.map(default_binding_command);
+        // the repeat count bindings open the real numeric pane prompt ("(repeat) N"): it
+        // takes the digits and gives the count to the mode (send-keys -N) when another key
+        // closes it, which is then looked up again
+        let numeric = default_raw.is_some_and(|c| c.starts_with("command-prompt -NP"));
         // a read-only client cannot prompt or run other commands from copy mode
         if let (Some(cmd), Some(c), false) = (&binding, cid, pending) {
             if self.client_is_readonly(cid) && !binding_allowed_readonly(cmd) {
@@ -116,7 +121,7 @@ impl Server {
             }
         }
         match binding {
-            Some(cmd) if !pending && Some(&cmd) != default.as_ref() => {
+            Some(cmd) if !pending && (Some(&cmd) != default.as_ref() || (numeric && cid.is_some())) => {
                 if let Some(c) = cid {
                     self.run_key_string(c, &cmd, Some(pane), name);
                 }

@@ -1033,6 +1033,7 @@ impl Server {
                 activity_us: now_us(),
                 sx,
                 sy,
+                new_size: None,
             },
         );
         wid
@@ -1842,7 +1843,7 @@ impl Server {
                         c.control_size = Some((w.clamp(1, MAX_SIZE), h.clamp(1, MAX_SIZE)));
                     }
                     if let Some(sid) = self.client_session(cid) {
-                        self.update_session_size(sid);
+                        self.update_session_size_now(sid);
                     }
                     return Ok(Flow::Next);
                 }
@@ -2307,10 +2308,11 @@ impl Server {
                 if o.has('A') || o.has('a') {
                     w.options.unset("window-size");
                     let sid = wt.sid.unwrap();
-                    self.update_session_size(sid);
+                    self.update_session_size_now(sid);
                     return Ok(Flow::Next);
                 }
                 w.options.set("window-size", "manual".into());
+                w.new_size = None;
                 if let Some(x) = o.get('x').and_then(|v| v.parse::<u16>().ok()) {
                     w.sx = x.clamp(1, MAX_SIZE);
                 }

@@ -168,6 +168,47 @@ fn copy_mode_count_then_rebound_or_unbound_key() {
 }
 
 #[test]
+fn copy_mode_repeat_count_shows_the_numeric_pane_prompt() {
+    // the digit bindings are command-prompt -NP -p (repeat): the count is drawn on the
+    // pane's last line and given to the next key's command (send-keys -N)
+    let ctx = Ctx::new("copyrepeat");
+    let t = start(&ctx, "r");
+    ctx.ok(&["set", "-g", "mode-keys", "vi"]);
+    t.send(b"clear; seq 1 60\r");
+    wait_for("output", || ctx.capture("r").contains("60"));
+    t.prefix(b"[");
+    wait_for("copy mode", || ctx.fmt("r", "#{pane_in_mode}") == "1");
+    let y: usize = ctx.fmt("r", "#{copy_cursor_y}").parse().unwrap();
+    t.send(b"3");
+    t.wait_screen("(repeat) 3", |s| s.lines().any(|l| l.trim_end() == "(repeat) 3"));
+    t.send(b"2");
+    t.wait_screen("(repeat) 32", |s| s.lines().any(|l| l.trim_end() == "(repeat) 32"));
+    t.send(b"k");
+    t.wait_screen("prompt closed", |s| !s.contains("(repeat)"));
+    wait_for("k moved 32 lines", || ctx.fmt("r", "#{copy_cursor_y} #{scroll_position}") == format!("0 {}", 32 - y));
+    t.send(b"q");
+    wait_for("quit", || ctx.fmt("r", "#{pane_in_mode}") == "0");
+}
+
+#[test]
+fn attach_resizes_only_the_current_window() {
+    // recalculate_size sets WINDOW_RESIZE; the size is applied when the window is the
+    // current window of an attached session (server_client_check_window_resize)
+    let ctx = Ctx::new("attachsize");
+    ctx.ok(&["new-session", "-d", "-s", "z", "-x", "120", "-y", "30"]);
+    ctx.ok(&["new-window", "-d", "-t", "z:1"]);
+    ctx.ok(&["new-window", "-d", "-t", "z:2"]);
+    let t = Term::attach(&ctx, &["attach", "-t", "z"], 70, 15);
+    t.wait_screen("status line", |s| s.contains("[z]"));
+    wait_for("current window resized", || ctx.fmt("z:0", "#{window_width}x#{window_height}") == "70x14");
+    assert_eq!(ctx.ok(&["list-windows", "-t", "z", "-F", "#{window_index} #{window_width}x#{window_height}"]).trim_end(), "0 70x14\n1 120x30\n2 120x30");
+    ctx.ok(&["select-window", "-t", "z:1"]);
+    wait_for("selected window resized", || ctx.fmt("z:1", "#{window_width}x#{window_height}") == "70x14");
+    assert_eq!(ctx.fmt("z:2", "#{window_width}x#{window_height}"), "120x30");
+    drop(t);
+}
+
+#[test]
 fn tree_panes_and_clock() {
     let ctx = Ctx::new("tree");
     let t = start(&ctx, "one");
