@@ -2092,6 +2092,11 @@ impl Server {
     pub fn update_latest(&mut self, cid: ClientId) {
         let Some((_, wid)) = self.client_session(cid).and_then(|s| self.session_window(s)) else { return };
         if self.ev.latest.insert(wid, cid) != Some(cid) {
+            // server_client_update_latest: a latest-sized window follows its new latest client
+            if self.opt_window(Some(wid), "window-size") == "latest" {
+                let clients = self.sizing_clients();
+                self.recalculate_window_size(wid, &clients, false);
+            }
             self.fire_client("client-active", cid);
         }
     }

@@ -1162,7 +1162,9 @@ impl Server {
         // session_set_current leaves the session's activity alone: only attaching and
         // keys from its clients count
         s.alerts.remove(&idx);
-        self.mark_session_dirty(sid);
+        // recalculate_sizes: with aggressive-resize a window follows the clients it is
+        // current for
+        self.update_session_size(sid);
     }
 
     pub fn select_pane(&mut self, wid: WinId, pane: PaneId) {
@@ -1842,7 +1844,7 @@ impl Server {
                         c.control_size = Some((w.clamp(1, MAX_SIZE), h.clamp(1, MAX_SIZE)));
                     }
                     if let Some(sid) = self.client_session(cid) {
-                        self.update_session_size(sid);
+                        self.update_session_size_now(sid);
                     }
                     return Ok(Flow::Next);
                 }
@@ -2109,6 +2111,15 @@ impl Server {
                 if let Some(c) = ctx.client {
                     if self.client_session(c) != Some(sid) && cmd == "select-window" && t.is_some() && ctx.from_key {
                         self.switch_client(c, sid);
+                    }
+                    // the client running it is the window's latest (cmd_select_window_exec),
+                    // which a latest-sized window then follows
+                    if self.client_session(c).is_some() {
+                        if let Some((_, wid)) = self.session_window(sid) {
+                            if self.ev.latest.insert(wid, c) != Some(c) {
+                                self.update_session_size(sid);
+                            }
+                        }
                     }
                 }
                 Ok(Flow::Next)
@@ -4572,7 +4583,7 @@ impl Server {
         }
         // side effects
         match name.as_str() {
-            "status" | "status-position" | "pane-border-status" | "window-size" | "pane-scrollbars" | "pane-scrollbars-style" | "pane-scrollbars-position" => {
+            "status" | "status-position" | "pane-border-status" | "window-size" | "aggressive-resize" | "pane-scrollbars" | "pane-scrollbars-style" | "pane-scrollbars-position" => {
                 let sids: Vec<SessId> = self.sessions.keys().copied().collect();
                 for s in sids {
                     self.update_session_size(s);

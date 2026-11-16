@@ -3098,49 +3098,104 @@ impl Server {
         }
     }
 
-    /// Window sizes follow the attached clients (window-size: latest/smallest/largest/manual).
-    pub fn update_session_size(&mut self, sid: SessId) {
-        let Some(s) = self.sessions.get(&sid) else { return };
-        let status = self.status_lines(Some(sid));
-        // control clients only count once they set a size (refresh-client -C), and
-        // have no status line (status_line_size): their size is all window
-        let clients: Vec<(u64, (u16, u16))> = self
-            .clients
+    /// The attached clients that size windows (ignore_client_size): not read-only or
+    /// ignore-size, and control clients only once they set a size (refresh-client -C).
+    /// Each with its session and the size it gives a window: its terminal less its
+    /// session's status lines (status_line_size; control clients have none).
+    fn sizing_clients(&self) -> Vec<(ClientId, SessId, (u16, u16))> {
+        self.clients
             .values()
-            .filter(|c| c.attached && c.session == Some(sid) && !c.is_readonly() && !c.ctl.ignore_size)
-            .filter_map(|c| if c.control > 0 { c.control_size.map(|s| (c.activity, (s.0, s.1.saturating_add(status)))) } else { Some((c.activity, c.size)) })
-            .collect();
-        let latest = clients.iter().max_by_key(|c| c.0).map(|c| c.1);
-        let smallest = clients.iter().map(|c| c.1).reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)));
-        let largest = clients.iter().map(|c| c.1).reduce(|a, b| (a.0.max(b.0), a.1.max(b.1)));
-        let links: Vec<WinId> = s.links.values().copied().collect();
-        let mut size = None;
-        for wid in links {
-            let mode = self.opt_window(Some(wid), "window-size");
-            let aggressive = self.opt_window_on(Some(wid), "aggressive-resize");
-            let pick = match mode.as_str() {
-                "manual" => None,
-                "smallest" => smallest,
-                "largest" => largest,
-                _ => latest,
-            };
-            let _ = aggressive;
-            let Some((cols, rows)) = pick else { continue };
-            size = Some((cols, rows));
-            let (sx, sy) = (cols.max(1), rows.saturating_sub(status).max(1));
-            let w = self.windows.get_mut(&wid).unwrap();
-            if (w.sx, w.sy) != (sx, sy) {
-                w.sx = sx;
-                w.sy = sy;
-                self.clamp_floats(wid);
-                self.apply_layout(wid);
-            }
+            .filter(|c| c.attached && !c.is_readonly() && !c.ctl.ignore_size)
+            .filter_map(|c| {
+                let sid = c.session.filter(|s| self.sessions.contains_key(s))?;
+                let size = if c.control > 0 {
+                    c.control_size?
+                } else {
+                    let status = self.status_lines(Some(sid));
+                    // CLIENT_STATUSOFF: a terminal no taller than the status lines has none
+                    (c.size.0, if c.size.1 <= status { c.size.1 } else { c.size.1 - status })
+                };
+                Some((c.id, sid, size))
+            })
+            .collect()
+    }
+
+    /// recalculate_size: the size window-size picks for a window from the clients that
+    /// show it (clients_calculate_size). Only clients whose session has the window count,
+    /// or with aggressive-resize only those whose current window it is; latest takes the
+    /// window's latest client when more than one client has the window. None for manual
+    /// or with no client.
+    fn window_client_size(&self, wid: WinId, clients: &[(ClientId, SessId, (u16, u16))]) -> Option<(u16, u16)> {
+        let mode = self.opt_window(Some(wid), "window-size");
+        let current = self.opt_window_on(Some(wid), "aggressive-resize");
+        let has = |sid: &SessId| self.sessions.get(sid).is_some_and(|s| s.links.values().any(|w| *w == wid));
+        // clients_with_window: only whether there is more than one matters
+        let shared = clients.iter().filter(|(_, sid, _)| has(sid)).count() > 1;
+        let latest = self.ev.latest.get(&wid).copied();
+        let sizes = clients.iter().filter(|(cid, sid, _)| {
+            let shown = if current { self.session_window(*sid).map(|(_, w)| w) == Some(wid) } else { has(sid) };
+            shown && (mode != "latest" || !shared || latest == Some(*cid))
+        }).map(|(_, _, size)| *size);
+        match mode.as_str() {
+            "manual" => None,
+            "largest" => sizes.reduce(|a, b| (a.0.max(b.0), a.1.max(b.1))),
+            _ => sizes.reduce(|a, b| (a.0.min(b.0), a.1.min(b.1))),
         }
+    }
+
+    /// Window sizes follow the attached clients (recalculate_sizes): each window linked to
+    /// the session is sized for itself from the clients that show it. The session's own
+    /// size (new windows, session_width) is picked from its clients.
+    pub fn update_session_size(&mut self, sid: SessId) {
+        self.recalculate_session_sizes(sid, false);
+    }
+
+    /// recalculate_sizes_now(1) (refresh-client -C): windows no attached session shows
+    /// are resized at once too.
+    pub fn update_session_size_now(&mut self, sid: SessId) {
+        self.recalculate_session_sizes(sid, true);
+    }
+
+    fn recalculate_session_sizes(&mut self, sid: SessId, now: bool) {
+        let Some(s) = self.sessions.get(&sid) else { return };
+        let clients = self.sizing_clients();
+        let links: Vec<WinId> = s.links.values().copied().collect();
+        let mode = self.opt_window(Some(s.active_window()), "window-size");
+        for wid in links {
+            self.recalculate_window_size(wid, &clients, now);
+        }
+        // default_window_size without a window: the session's clients
+        let status = self.status_lines(Some(sid));
+        let own: Vec<(u64, (u16, u16))> = clients.iter().filter(|c| c.1 == sid).filter_map(|c| self.clients.get(&c.0).map(|cl| (cl.activity_seq, c.2))).collect();
+        let size = match mode.as_str() {
+            "manual" => None,
+            "largest" => own.iter().map(|c| c.1).reduce(|a, b| (a.0.max(b.0), a.1.max(b.1))),
+            "smallest" => own.iter().map(|c| c.1).reduce(|a, b| (a.0.min(b.0), a.1.min(b.1))),
+            _ => own.iter().max_by_key(|c| c.0).map(|c| c.1),
+        };
         if let (Some((c, r)), Some(s)) = (size, self.sessions.get_mut(&sid)) {
             s.cols = c;
-            s.rows = r;
+            s.rows = r.saturating_add(status);
         }
         self.mark_session_dirty(sid);
+    }
+
+    /// The new size is applied once the window is the current window of an attached
+    /// session (server_client_check_window_resize); until then it keeps its old size.
+    fn recalculate_window_size(&mut self, wid: WinId, clients: &[(ClientId, SessId, (u16, u16))], now: bool) {
+        let shown = self.clients.values().filter(|c| c.attached).filter_map(|c| c.session).any(|s| self.session_window(s).map(|(_, w)| w) == Some(wid));
+        if !now && !shown {
+            return;
+        }
+        let Some((cols, rows)) = self.window_client_size(wid, clients) else { return };
+        let (sx, sy) = (cols.max(1), rows.max(1));
+        let Some(w) = self.windows.get_mut(&wid) else { return };
+        if (w.sx, w.sy) != (sx, sy) {
+            w.sx = sx;
+            w.sy = sy;
+            self.clamp_floats(wid);
+            self.apply_layout(wid);
+        }
     }
 
     // ---- hooks & queue ---------------------------------------------------------------------
