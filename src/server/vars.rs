@@ -404,8 +404,6 @@ impl Vars for VarCtx<'_> {
             "session_stack" => sess.map(|s| std::iter::once(&s.active).chain(s.last.iter()).map(|i| i.to_string()).collect::<Vec<_>>().join(",")),
             "active_window_index" => sess.map(|s| s.active.to_string()),
             "last_window_index" => sess.and_then(|s| s.links.keys().next_back()).map(|i| i.to_string()),
-            "session_width" => sess.map(|s| s.cols.to_string()),
-            "session_height" => sess.map(|s| s.rows.to_string()),
             // window
             "window_index" => t.idx.map(|i| i.to_string()),
             "window_name" => win.map(|w| w.name.clone()),
@@ -431,8 +429,8 @@ impl Vars for VarCtx<'_> {
             "window_end_flag" => Some(b(sess.zip(t.idx).is_some_and(|(s, i)| s.links.keys().next_back() == Some(&i)))),
             "window_linked" => win.map(|w| b(srv.links_of(w.id).len() > 1)),
             "window_linked_sessions" => win.map(|w| srv.links_of(w.id).len().to_string()),
-            // windows always fit their clients here (no offset)
-            "window_bigger" => client.map(|_| "0".into()),
+            // the format client's view of its current window (tty_window_offset)
+            "window_bigger" => client.map(|c| b(srv.view_offset(c.id).bigger)),
             "window_active_clients" | "window_active_clients_list" => win.map(|w| {
                 let names: Vec<String> = srv.clients.values()
                     .filter(|c| c.attached && c.session.and_then(|s| srv.sessions.get(&s)).is_some_and(|s| s.links.get(&s.active) == Some(&w.id)))
@@ -451,11 +449,12 @@ impl Vars for VarCtx<'_> {
             "window_cell_height" => win.map(|_| "32".into()),
             "window_manual_width" | "window_manual_height" => win.map(|w| {
                 if srv.opt_window(Some(w.id), "window-size") != "manual" { String::new() }
-                else if name == "window_manual_width" { w.sx.to_string() } else { w.sy.to_string() }
+                else if name == "window_manual_width" { w.manual_sx.to_string() } else { w.manual_sy.to_string() }
             }),
             "window_modal_pane" => win.and_then(|w| w.modal).map(|m| format!("%{m}")),
-            // only set while the client shows part of a larger window, which never happens here
-            "window_offset_x" | "window_offset_y" => None,
+            // only set while the client shows part of a larger window
+            "window_offset_x" | "window_offset_y" => client.map(|c| srv.view_offset(c.id)).filter(|v| v.bigger)
+                .map(|v| if name == "window_offset_x" { v.ox } else { v.oy }.to_string()),
             "window_format" => Some(b(ftype == "W")),
             // pane
             "pane_index" => win.zip(t.pane).and_then(|(w, p)| {
@@ -551,6 +550,8 @@ impl Vars for VarCtx<'_> {
                 }
                 // a floating pane's cell (also while hidden by a zoom)
                 if let Some(g) = w.layout.geom(p).filter(|_| srv.zoomed_pane(w.id) != Some(p)) {
+                    // less a reserved scrollbar (wp->xoff and wp->sx)
+                    let g = srv.float_content(w.id, p, g);
                     let (right, bottom) = (g.x + g.w as i32, g.y + g.h as i32);
                     return Some(match name {
                         "pane_left" | "pane_x" => g.x.to_string(),

@@ -147,7 +147,7 @@ fn attach_split_type_detach() {
     // terminal resize propagates to the session
     pair.master.resize(PtySize { rows: 40, cols: 120, pixel_width: 0, pixel_height: 0 }).unwrap();
     screen.lock().unwrap().set_size(nz(40), nz(120));
-    wait_for("resize", t, || ctx.ok(&["display-message", "-p", "-t", "t", "#{session_width}x#{session_height} #{window_height}"]).trim() == "120x40 39");
+    wait_for("resize", t, || ctx.ok(&["display-message", "-p", "-t", "t", "#{window_width}x#{window_height}"]).trim() == "120x39");
 
     // prefix d detaches; the session survives
     send(b"\x02d");

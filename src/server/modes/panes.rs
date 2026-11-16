@@ -24,6 +24,39 @@ pub struct Panes {
     pub zoomed: Option<bool>,
     pub kill: bool,
     pub client: Option<ClientId>,
+    /// The pane's screen from before the mode zoomed it (window_panes_set_preview).
+    pub preview: Option<Preview>,
+}
+
+/// A copy of a pane's screen (window_panes_set_preview): its size, cursor and cells.
+/// Only the part a drawing can show is kept: the whole screen up to the window's size,
+/// round the cursor for a bigger (floating) pane.
+pub struct Preview {
+    size: (u16, u16),
+    cursor: (u16, u16),
+    hidden: bool,
+    origin: (u16, u16),
+    rows: Vec<Vec<Cell>>,
+}
+
+impl Preview {
+    pub fn new(pane: &Pane, (wsx, wsy): (u16, u16)) -> Preview {
+        let scr = pane.screen();
+        let (pw, ph) = pane.size;
+        let (cy, cx) = scr.cursor_position();
+        let hidden = scr.hide_cursor();
+        // screen_write_preview's start for an area as big as the window
+        let start = |c: u16, n: u16, size: u16| if hidden || n >= size { 0 } else { c.saturating_sub(n / 3).min(size - n) };
+        let (nx, ny) = (wsx.max(1).min(pw), wsy.max(1).min(ph));
+        let origin = (start(cx, nx, pw), start(cy, ny, ph));
+        let rows = (0..ny).map(|y| (0..nx).map(|x| scr.cell(origin.1 + y, origin.0 + x).map(crate::cells::cell_from_vt).unwrap_or_default()).collect()).collect();
+        Preview { size: (pw, ph), cursor: (cx, cy), hidden, origin, rows }
+    }
+
+    fn cell(&self, y: u16, x: u16) -> Cell {
+        let (Some(y), Some(x)) = (y.checked_sub(self.origin.1), x.checked_sub(self.origin.0)) else { return Cell::default() };
+        self.rows.get(y as usize).and_then(|r| r.get(x as usize)).cloned().unwrap_or_default()
+    }
 }
 
 const BORDER_L: u8 = 1;
@@ -59,27 +92,38 @@ fn border_char(mask: u8) -> &'static str {
     }
 }
 
+/// The border lines of a w x h screen, kept only for rows `rows` (the rows drawn, and one
+/// more each side for the joins): a huge pane's screen does not get a w x h map.
 struct BorderMap {
     w: usize,
     h: usize,
+    rows: std::ops::Range<usize>,
     m: Vec<u8>,
 }
 
 impl BorderMap {
+    fn new(w: usize, h: usize, shown: &std::ops::Range<usize>) -> BorderMap {
+        let rows = shown.start.saturating_sub(1)..(shown.end + 1).min(h);
+        BorderMap { w, h, m: vec![0; w * rows.len()], rows }
+    }
+    fn index(&self, x: i32, y: i32) -> Option<usize> {
+        (x >= 0 && y >= 0 && (x as usize) < self.w && self.rows.contains(&(y as usize))).then(|| (y as usize - self.rows.start) * self.w + x as usize)
+    }
     fn mark(&mut self, x: i32, y: i32, mask: u8) {
-        if x >= 0 && y >= 0 && (x as usize) < self.w && (y as usize) < self.h {
-            self.m[y as usize * self.w + x as usize] |= mask;
+        if let Some(i) = self.index(x, y) {
+            self.m[i] |= mask;
         }
     }
     fn get(&self, x: i32, y: i32) -> u8 {
-        if x >= 0 && y >= 0 && (x as usize) < self.w && (y as usize) < self.h { self.m[y as usize * self.w + x as usize] } else { 0 }
+        self.index(x, y).map_or(0, |i| self.m[i])
     }
     fn vline(&mut self, x: i32, y: i32, y2: i32) {
         if x < 0 || x as usize >= self.w || y2 <= y {
             return;
         }
         let (y, y2) = (y.max(0), y2.min(self.h as i32));
-        for yy in y..y2 {
+        // the mask depends on the line's ends, so only the rows kept are walked
+        for yy in y.max(self.rows.start as i32)..y2.min(self.rows.end as i32) {
             let mut mask = 0;
             if yy > y {
                 mask |= BORDER_U;
@@ -91,7 +135,7 @@ impl BorderMap {
         }
     }
     fn hline(&mut self, x: i32, x2: i32, y: i32) {
-        if y < 0 || y as usize >= self.h || x2 <= x {
+        if y < 0 || y as usize >= self.h || !self.rows.contains(&(y as usize)) || x2 <= x {
             return;
         }
         let (x, x2) = (x.max(0), x2.min(self.w as i32));
@@ -212,9 +256,12 @@ impl Panes {
         out
     }
 
-    pub fn render(&self, srv: &Server, w: u16, h: u16) -> Vec<Line> {
+    /// The mode's screen with only `rows` drawn: the other rows are empty and take no
+    /// writes (a huge floating pane shows a few of its rows).
+    pub fn render_rows(&self, srv: &Server, w: u16, h: u16, rows: std::ops::Range<usize>) -> Vec<Line> {
         let (wu, hu) = (w as usize, h as usize);
-        let mut grid = vec![vec![Cell { text: " ".into(), style: Style::default() }; wu]; hu];
+        let mut grid: Vec<Vec<Cell>> = (0..hu).map(|y| if rows.contains(&y) { vec![Cell { text: " ".into(), style: Style::default() }; wu] } else { Vec::new() }).collect();
+        let shown = rows.start.min(hu)..rows.end.min(hu);
         let Some((_, seps, osx, osy)) = self.layout(srv) else { return grid.into_iter().map(|cells| Line { cells, wrapped: false, ..Default::default() }).collect() };
         let sid = self.session_of(srv);
         let wid = self.source;
@@ -225,11 +272,23 @@ impl Panes {
         let format = srv.opt_window(owner_t.wid, "display-panes-format");
         let draw_pane = |grid: &mut Vec<Vec<Cell>>, (p, x, y, sx, sy): Area| {
             let Some(pane) = srv.panes.get(&p) else { return };
-            // the pane's content: the top left, or the area around the cursor when scaled
+            // the mode's own pane is drawn from its screen before the zoom, when that is big
+            // enough (window_panes_draw_pane)
+            let preview = self.preview.as_ref().filter(|v| p == self.owner && sx <= v.size.0 && sy <= v.size.1);
             let scr = pane.screen();
-            let (cy, cx) = scr.cursor_position();
-            let (pw, ph) = (pane.size.0, pane.size.1);
-            let (px, py) = if !scaled || scr.hide_cursor() {
+            let ((cx, cy), hidden, (pw, ph)) = match preview {
+                Some(v) => (v.cursor, v.hidden, v.size),
+                None => {
+                    let (cy, cx) = scr.cursor_position();
+                    ((cx, cy), scr.hide_cursor(), pane.size)
+                }
+            };
+            let cell_at = |y: u16, x: u16| match preview {
+                Some(v) => v.cell(y, x),
+                None => scr.cell(y, x).map(crate::cells::cell_from_vt).unwrap_or_default(),
+            };
+            // the pane's content: the top left, or the area around the cursor when scaled
+            let (px, py) = if !scaled || hidden {
                 (0, 0)
             } else {
                 let px = cx.saturating_sub(sx / 3);
@@ -239,8 +298,11 @@ impl Panes {
                 (px, py)
             };
             for yy in 0..sy {
+                if grid.get((y + yy) as usize).is_none_or(|r| r.is_empty()) {
+                    continue;
+                }
                 for xx in 0..sx {
-                    let cell = scr.cell(py + yy, px + xx).map(crate::cells::cell_from_vt).unwrap_or_default();
+                    let cell = cell_at(py + yy, px + xx);
                     if let Some(row) = grid.get_mut((y + yy) as usize) {
                         if let Some(c) = row.get_mut((x + xx) as usize) {
                             *c = if cell.text.is_empty() && xx == 0 { Cell { text: " ".into(), ..cell } } else { cell };
@@ -249,7 +311,7 @@ impl Panes {
                 }
             }
             // screen_write_preview marks the cursor with reverse (borders may cover it later)
-            if scaled && !scr.hide_cursor() && cx >= px && cy >= py {
+            if scaled && !hidden && cx >= px && cy >= py {
                 if let Some(c) = grid.get_mut((y + cy - py) as usize).and_then(|r| r.get_mut((x + cx - px) as usize)) {
                     if c.text.is_empty() {
                         c.text = " ".into();
@@ -338,7 +400,7 @@ impl Panes {
         }
 
         // window_panes_draw_borders
-        let mut bm = BorderMap { w: wu, h: hu, m: vec![0; wu * hu] };
+        let mut bm = BorderMap::new(wu, hu, &shown);
         let mx = |v: u16| map(v, osx, w) as i32;
         let my = |v: u16| map(v, osy, h) as i32;
         for s in &seps {
@@ -385,9 +447,9 @@ impl Panes {
         }
         let t = Target { sid, idx, wid: Some(wid), pane: active };
         let bstyle = mode_style(srv, &srv.opt_window(owner_t.wid, "display-panes-border-style"), Style::default(), t);
-        for y in 0..hu {
+        for y in shown.clone() {
             for x in 0..wu {
-                let m = bm.m[y * wu + x];
+                let m = bm.get(x as i32, y as i32);
                 if m != 0 {
                     grid[y][x] = Cell { text: border_char(m).into(), style: bstyle };
                 }
@@ -396,7 +458,7 @@ impl Panes {
         // window_panes_draw_screen: the floating panes go over the tiled ones, back to front,
         // each on a cleared area inside its own border
         for (p, area, (bx, by, bx2, by2)) in floats {
-            for yy in by.max(0)..=by2.min(h as i32 - 1) {
+            for yy in by.max(shown.start as i32)..=by2.min(shown.end as i32 - 1) {
                 for xx in bx.max(0)..=bx2.min(w as i32 - 1) {
                     grid[yy as usize][xx as usize] = Cell { text: " ".into(), style: Style::default() };
                 }
@@ -404,14 +466,14 @@ impl Panes {
             if let Some((x, y, sx, sy)) = area {
                 draw_pane(&mut grid, (p, x, y, sx, sy));
             }
-            let mut fm = BorderMap { w: wu, h: hu, m: vec![0; wu * hu] };
+            let mut fm = BorderMap::new(wu, hu, &shown);
             fm.hline(bx, bx2 + 1, by);
             fm.hline(bx, bx2 + 1, by2);
             fm.vline(bx, by, by2 + 1);
             fm.vline(bx2, by, by2 + 1);
-            for y in 0..hu {
+            for y in shown.clone() {
                 for x in 0..wu {
-                    let m = fm.m[y * wu + x];
+                    let m = fm.get(x as i32, y as i32);
                     if m != 0 {
                         grid[y][x] = Cell { text: border_char(m).into(), style: bstyle };
                     }
@@ -461,5 +523,47 @@ impl Panes {
             Some((p, ..)) if srv.panes.contains_key(&p) => self.run(p),
             _ => ModeAction::None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::server::pan::tests::{clients, kill, run};
+
+    #[test]
+    fn the_mode_pane_is_drawn_from_its_screen_before_the_zoom() {
+        let (mut srv, _) = clients((100, 21), None);
+        run(&mut srv, 1, &["new-session", "-d", "-s", "s", "-x", "100", "-y", "20"]).unwrap();
+        let sid = *srv.sessions.keys().next().unwrap();
+        srv.attach_client(1, sid);
+        let pane = srv.client_active_pane(1).unwrap();
+        let g = srv.panes[&pane].generation;
+        let text: String = (1..=60).map(|i| format!("row{i:02} abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz\r\n")).collect();
+        srv.pane_data(pane, g, format!("{text}TOP").as_bytes());
+        run(&mut srv, 1, &["split-window", "-h", "-d"]).unwrap();
+        run(&mut srv, 1, &["display-panes", "-d", "0"]).unwrap();
+        // the pane is zoomed to 100 columns, but shows its 50 column lines
+        assert_eq!(srv.panes[&pane].size.0, 100);
+        let f = srv.compose(1).unwrap().frame;
+        let row = |y: u16| -> String { f.row(y).iter().map(|c| c.text.as_str()).collect() };
+        assert!(row(1).starts_with("row55 abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH"), "{}", row(1));
+        assert!(row(2).starts_with("IJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuv"), "{}", row(2));
+        kill(&mut srv);
+    }
+}
+
+#[cfg(test)]
+mod border_map_tests {
+    use super::*;
+
+    #[test]
+    fn a_border_map_keeps_only_the_rows_drawn_and_their_neighbours() {
+        let mut bm = BorderMap::new(10, 1000, &(5..7));
+        assert_eq!(bm.m.len(), 10 * 4);
+        bm.vline(3, 0, 1000);
+        bm.hline(0, 10, 6);
+        bm.hline(0, 10, 500);
+        assert_eq!((bm.get(3, 4), bm.get(3, 5), bm.get(3, 3), bm.get(0, 500)), (BORDER_U | BORDER_D, BORDER_U | BORDER_D, 0, 0));
+        assert_eq!(bm.get(3, 6), BORDER_U | BORDER_D | BORDER_L | BORDER_R);
     }
 }

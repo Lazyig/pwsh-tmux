@@ -25,6 +25,8 @@ fn err<T>(s: impl Into<String>) -> Result<T, String> {
 
 /// The window row of a mouse row (below a top status line, or clamped above a bottom one).
 fn drag_row(m: &super::input::MouseCtx, v: u16) -> i32 {
+    // in the window (m->y + m->oy), less the status lines
+    let v = v.saturating_add(m.oy);
     (match m.statusat {
         Some(0) if v >= m.statuslines => v - m.statuslines,
         Some(at) if at > 0 && v >= at => at - 1,
@@ -1092,7 +1094,7 @@ impl Server {
         if !self.windows[&wid].is_floating(pane) || self.client_session(cid) != m.sid {
             return;
         }
-        let (lx, ly) = (m.lx as i32, drag_row(m, m.ly));
+        let (lx, ly) = (m.lx as i32 + m.ox as i32, drag_row(m, m.ly));
         let kind = if new { DragKind::NewFloat { pane, x: lx, y: ly } } else { DragKind::Float { pane, moving } };
         if !new {
             self.set_active_pane(wid, pane);
@@ -1118,7 +1120,7 @@ impl Server {
             }
             return;
         };
-        let (x, y, lx, ly) = (m.x as i32, drag_row(m, m.y), m.lx as i32, drag_row(m, m.ly));
+        let (x, y, lx, ly) = (m.x as i32 + m.ox as i32, drag_row(m, m.y), m.lx as i32 + m.ox as i32, drag_row(m, m.ly));
         let border = self.pane_lines(wid, pane) != "none";
         let w = self.windows.get_mut(&wid).unwrap();
         let Some(g) = w.layout.geom_mut(pane) else { return };
@@ -1210,6 +1212,11 @@ impl Server {
         Ok(())
     }
 }
+
+/// Tests that allocate huge panes take this, so that one measuring the process's memory
+/// does not run beside another.
+#[cfg(test)]
+pub(crate) static HUGE_PANES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -1623,6 +1630,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn huge_floating_panes_stay_small() {
+        let _huge = HUGE_PANES.lock().unwrap_or_else(|e| e.into_inner());
         let rss = || {
             let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
             statm.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() * 4096
@@ -1725,7 +1733,7 @@ mod tests {
         let wid = win(&srv);
         let a = srv.windows[&wid].active;
         let Some(PaneMode::Panes(m)) = &srv.panes[&a].mode else { panic!("no panes mode") };
-        let lines = m.render(&srv, 50, 14);
+        let lines = m.render_rows(&srv, 50, 14, 0..14);
         let row = |y: usize| -> String { lines[y].cells.iter().map(|c| c.text.as_str()).collect() };
         // window_panes_draw_screen: the tiled panes with their display-panes-format...
         assert_eq!(row(0), "                    25x14│                   24x14");

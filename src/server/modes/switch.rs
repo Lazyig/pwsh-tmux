@@ -218,10 +218,12 @@ impl Switch {
     }
 
     /// window_switch_draw_screen: the lines and the prompt cursor.
-    pub fn render(&self, srv: &Server, w: u16, h: u16) -> (Vec<Line>, Option<(u16, u16)>) {
+    /// The mode's screen with only `rows` drawn (the others are empty lines): a huge
+    /// floating pane shows a few of its rows.
+    pub fn render_rows(&self, srv: &Server, w: u16, h: u16, rows: std::ops::Range<usize>) -> (Vec<Line>, Option<(u16, u16)>) {
         let (wu, hu) = (w as usize, h as usize);
         let blank = Line { cells: vec![crate::cells::Cell { text: " ".into(), style: Style::default() }; wu], wrapped: false, ..Default::default() };
-        let mut lines = vec![blank; hu];
+        let mut lines: Vec<Line> = (0..hu).map(|y| if rows.contains(&y) { blank.clone() } else { Line::default() }).collect();
         if hu <= 1 {
             return (lines, None);
         }
@@ -233,6 +235,9 @@ impl Switch {
         for i in 0..Switch::visible(hu) {
             let idx = self.offset + i;
             let Some(it) = items.get(idx) else { break };
+            if !rows.contains(&i) {
+                continue;
+            }
             let base = if idx == self.current { sstyle } else { Style::default() };
             let mut cells = format_cells(&it.text, wu, base);
             if let Some(mask) = &it.mask {
@@ -249,8 +254,8 @@ impl Switch {
         }
         let (cells, cx) = self.prompt.draw(srv, t, self.client, wu, false);
         for (x, c) in cells.into_iter().enumerate() {
-            if let Some(c) = c {
-                lines[hu - 1].cells[x] = c;
+            if let Some(slot) = c.and_then(|c| lines[hu - 1].cells.get_mut(x).map(|d| (d, c))) {
+                *slot.0 = slot.1;
             }
         }
         (lines, Some((cx as u16, h - 1)))

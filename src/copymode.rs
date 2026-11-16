@@ -2061,6 +2061,12 @@ impl CopyMode {
     /// window_copy_write_line for every row: line numbers, the text with the current line,
     /// mark, search match and selection styles, the position indicator and the cursor.
     pub fn render_with(&self, st: &RenderStyle) -> (Vec<Line>, (u16, u16)) {
+        self.render_rows(st, 0..self.height)
+    }
+
+    /// render_with drawing only `rows` of the screen; the others are empty lines (a huge
+    /// floating pane shows a few of its rows).
+    pub fn render_rows(&self, st: &RenderStyle, rows: std::ops::Range<usize>) -> (Vec<Line>, (u16, u16)) {
         let mut out = Vec::with_capacity(self.height);
         let lnw = self.line_number_width();
         let content = self.content_width();
@@ -2070,6 +2076,10 @@ impl CopyMode {
         let screen_sel = self.screen_selection();
         let text_x = lnw.min(self.width - 1);
         for row in 0..self.height {
+            if !rows.contains(&row) {
+                out.push(Line::default());
+                continue;
+            }
             let y = self.top + row;
             let mut line = Line { cells: Vec::with_capacity(self.width), wrapped: false, ..Default::default() };
             if let Some(src) = self.lines.get(y) {
@@ -2166,13 +2176,16 @@ impl CopyMode {
             }
             out.push(line);
         }
-        if self.show_position {
+        // window_copy_write_line: not with a one line screen (rupper < rlower)
+        if self.show_position && self.height > 1 && rows.contains(&0) {
             self.draw_position(&mut out[0], st, text_x, content);
         }
         // a cursor past the last column shows as a '$'
         if self.cx >= content {
             let x = self.cursor_offset(self.cx).min(self.width - 1);
-            out[cur_row].cells[x] = Cell { text: "$".into(), style: Style::default() };
+            if let Some(c) = out[cur_row].cells.get_mut(x) {
+                *c = Cell { text: "$".into(), style: Style::default() };
+            }
         }
         let cursor = (cur_row as u16, self.cursor_offset(self.cx).min(self.width - 1) as u16);
         (out, cursor)
@@ -4807,7 +4820,7 @@ mod tests {
 
     #[test]
     fn position_format_overlays_only_its_cells() {
-        let cm = CopyMode::new(lines(&["hello world"]), W, 1, (0, 0), false);
+        let cm = CopyMode::new(lines(&["hello world", ""]), W, 2, (0, 0), false);
         let pos = Style { fg: Color::Idx(4), ..Style::default() };
         let st = RenderStyle { position: pos, position_text: Some("#[align=right]<#[fg=red]x>".into()), ..RenderStyle::default() };
         let (view, _) = cm.render_with(&st);
@@ -4815,6 +4828,9 @@ mod tests {
         assert_eq!(view[0].cells[17].style.fg, Color::Idx(4));
         assert_eq!(view[0].cells[18].style.fg, Color::Idx(1));
         assert_eq!(view[0].cells[16].style, Style::default());
+        // a one line screen has no indicator (window_copy_write_line: rupper < rlower)
+        let cm = CopyMode::new(lines(&["hello world"]), W, 1, (0, 0), false);
+        assert_eq!(text_of(&cm.render_with(&st).0[0]).trim_end(), "hello world");
     }
 
     #[test]

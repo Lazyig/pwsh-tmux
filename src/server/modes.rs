@@ -13,7 +13,7 @@ pub mod prompt;
 mod switch;
 mod tree;
 
-pub use panes::{Panes, DEFAULT_TEMPLATE as PANES_DEFAULT_TEMPLATE};
+pub use panes::{Panes, Preview as PanesPreview, DEFAULT_TEMPLATE as PANES_DEFAULT_TEMPLATE};
 pub use switch::Switch;
 pub use tree::{Collapse, Preview, Sort, Tree, TreeKind};
 
@@ -328,7 +328,12 @@ impl Menu {
 
     /// Draw the menu with the window `oy` rows down the client.
     pub fn draw(&self, f: &mut super::render::Frame, oy: u16, style: Style, border: Style, selected_style: Style, lines_kind: &str) {
-        let (x0, y0, w, h) = (self.x, self.y + oy, self.w, self.h);
+        self.draw_at(f, (self.x, self.y + oy), style, border, selected_style, lines_kind);
+    }
+
+    /// The menu with its top left at (x0, y0) of the frame.
+    pub fn draw_at(&self, f: &mut super::render::Frame, (x0, y0): (u16, u16), style: Style, border: Style, selected_style: Style, lines_kind: &str) {
+        let (w, h) = (self.w, self.h);
         let lines = super::render::box_lines(lines_kind);
         super::render::draw_box_lines(f, x0, y0, w, h, border, &self.title, lines_kind);
         for (i, it) in self.items.iter().enumerate() {

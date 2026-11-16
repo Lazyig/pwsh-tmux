@@ -1392,9 +1392,16 @@ impl Tree {
 
     // ---- drawing ---------------------------------------------------------------------
 
+    #[cfg(test)]
     pub fn render(&self, srv: &Server, w: u16, h: u16) -> (Vec<Line>, Option<(u16, u16)>) {
+        self.render_rows(srv, w, h, 0..h as usize)
+    }
+
+    /// The mode's screen with only `rows` drawn: the other rows are empty and take no
+    /// writes (a huge floating pane shows a few of its rows).
+    pub fn render_rows(&self, srv: &Server, w: u16, h: u16, rows: std::ops::Range<usize>) -> (Vec<Line>, Option<(u16, u16)>) {
         let (wu, hu) = (w as usize, h as usize);
-        let mut grid: Vec<Vec<Cell>> = vec![vec![Cell::default(); wu]; hu];
+        let mut grid: Vec<Vec<Cell>> = (0..hu).map(|y| if rows.contains(&y) { vec![Cell::default(); wu] } else { Vec::new() }).collect();
         let b = self.build(srv);
         let t = srv.target_for_pane(self.owner);
         let wid = t.wid;
@@ -1402,7 +1409,7 @@ impl Tree {
         let height = self.list_height(hu, n);
         let (cur, offset) = self.resolve(&b, height);
         if n == 0 {
-            if let Some(last) = self.last_grid.borrow().as_ref().filter(|g| g.len() == hu && g.first().is_none_or(|l| l.len() == wu)) {
+            if let Some(last) = self.last_grid.borrow().as_ref().filter(|g| g.len() == hu && g.iter().zip(&grid).all(|(l, n)| l.len() == n.len())) {
                 grid = last.clone();
             }
         } else if wu != 0 && hu != 0 {
@@ -1450,8 +1457,8 @@ impl Tree {
                 // mode_tree_draw_prompt: cells the prompt style does not fill stay as drawn
                 let (cells, cx) = p.draw(srv, t, self.client, wu, false);
                 for (x, c) in cells.into_iter().enumerate() {
-                    if let Some(c) = c {
-                        grid[py][x] = c;
+                    if let (Some(c), Some(d)) = (c, grid[py].get_mut(x)) {
+                        *d = c;
                     }
                 }
                 cursor = Some((cx as u16, py as u16));
@@ -1603,7 +1610,7 @@ impl Tree {
                         if sx > 14 && i < sy {
                             let gc = mode_style(srv, &srv.opt_window(t.wid, "tree-mode-border-style"), Style::default(), t);
                             for yy in i..sy {
-                                grid[y + yy][x + 14] = Cell { text: "│".into(), style: gc };
+                                if let Some(c) = grid[y + yy].get_mut(x + 14) { *c = Cell { text: "│".into(), style: gc }; }
                             }
                         }
                         return;
@@ -1783,7 +1790,7 @@ impl Tree {
                     break;
                 }
                 for xx in 0..sx {
-                    grid[cy + i][cx + xx] = Cell { text: if xx == 14 { "┼" } else { "─" }.into(), style: gc };
+                    if let Some(c) = grid[cy + i].get_mut(cx + xx) { *c = Cell { text: if xx == 14 { "┼" } else { "─" }.into(), style: gc }; }
                 }
                 i += 1;
             }
@@ -1799,7 +1806,7 @@ impl Tree {
         }
         if sx > 14 {
             for yy in i..sy {
-                grid[cy + yy][cx + 14] = Cell { text: "│".into(), style: gc };
+                if let Some(c) = grid[cy + yy].get_mut(cx + 14) { *c = Cell { text: "│".into(), style: gc }; }
             }
         }
     }

@@ -366,12 +366,19 @@ impl Server {
     /// Later drag events of the same drag go here too (DragKind::Scrollbar keeps `exit`).
     pub(super) fn copy_scroll_to_mouse(&mut self, cid: ClientId, pane: PaneId, m: &MouseCtx, exit: bool) {
         let Some(wid) = self.window_of(pane) else { return };
-        let Some((_, r)) = self.rects(wid).0.into_iter().find(|(p, _)| *p == pane) else { return };
-        let area = self.scrollbar_area(wid, r);
+        // the bar's top row: a tiled pane's below its status line, a floating pane's
+        let top = match self.rects(wid).0.into_iter().find(|(p, _)| *p == pane) {
+            Some((_, r)) => self.scrollbar_area(wid, r).y as i64,
+            None => match self.float_rects(wid).into_iter().find(|(p, _)| *p == pane) {
+                Some((_, g)) => g.y as i64,
+                None => return,
+            },
+        };
         let Some(c) = self.clients.get_mut(&cid) else { return };
         c.drag = Some(Drag { kind: DragKind::Scrollbar { pane, exit } });
         let sl_mpos = c.slider_mpos as usize;
-        let my = m.y.saturating_sub(if m.statusat == Some(0) { m.statuslines } else { 0 }) as i64 - area.y as i64;
+        // in the window: the client's view of a bigger window starts at m.oy
+        let my = m.y.saturating_sub(if m.statusat == Some(0) { m.statuslines } else { 0 }) as i64 + m.oy as i64 - top;
         let leave = match self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
             Some(PaneMode::Copy(cm)) => cm.scroll_to_slider(sl_mpos, my, exit),
             _ => return,

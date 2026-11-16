@@ -1137,6 +1137,8 @@ impl Server {
                 activity_us: now_us(),
                 sx,
                 sy,
+                manual_sx: sx,
+                manual_sy: sy,
             },
         );
         wid
@@ -1267,7 +1269,9 @@ impl Server {
         // session_set_current leaves the session's activity alone: only attaching and
         // keys from its clients count
         s.alerts.remove(&idx);
-        self.mark_session_dirty(sid);
+        // recalculate_sizes: with aggressive-resize a window follows the clients it is
+        // current for
+        self.update_session_size(sid);
     }
 
     pub fn select_pane(&mut self, wid: WinId, pane: PaneId) {
@@ -1920,19 +1924,18 @@ impl Server {
             }
             "refresh-client" => {
                 let cid = self.resolve_client(ctx, t)?;
-                // -c/-L/-R/-U/-D pan a window larger than the client; windows are drawn from
-                // their top left here, so only the adjustment is checked
-                if ['c', 'L', 'R', 'U', 'D'].into_iter().any(|f| o.has(f)) {
-                    if let Some(a) = o.rest.first() {
-                        match a.parse::<i64>() {
-                            Ok(n) if (1..=i32::MAX as i64).contains(&n) => {}
-                            Ok(n) if n < 1 => return err("adjustment too small"),
-                            Ok(_) => return err("adjustment too large"),
-                            Err(_) => return err("adjustment invalid"),
-                        }
-                    }
-                    if let Some(c) = self.clients.get_mut(&cid) {
-                        c.dirty = true;
+                // -c/-L/-R/-U/-D pan a window larger than the client (-c: follow the cursor
+                // again); the adjustment is 1 by default
+                if let Some(dir) = ['c', 'L', 'R', 'U', 'D'].into_iter().find(|f| o.has(*f)) {
+                    let adjust = match o.rest.first().map(|a| a.parse::<i64>()) {
+                        None => 1,
+                        Some(Ok(n)) if (1..=i32::MAX as i64).contains(&n) => n,
+                        Some(Ok(n)) if n < 1 => return err("adjustment too small"),
+                        Some(Ok(_)) => return err("adjustment too large"),
+                        Some(Err(_)) => return err("adjustment invalid"),
+                    };
+                    if self.client_session(cid).is_some() {
+                        self.pan_client(cid, dir, adjust.min(u16::MAX as i64) as u16);
                     }
                     return Ok(Flow::Next);
                 }
@@ -1977,7 +1980,7 @@ impl Server {
                         c.control_size = Some((w.clamp(1, MAX_SIZE), h.clamp(1, MAX_SIZE)));
                     }
                     if let Some(sid) = self.client_session(cid) {
-                        self.update_session_size(sid);
+                        self.update_session_size_now(sid);
                     }
                     return Ok(Flow::Next);
                 }
@@ -2051,9 +2054,9 @@ impl Server {
                         }
                     }
                 }
+                // spawn_window: default_window_size for the target client
+                let (sx, sy) = self.default_window_size(self.resolve_client(ctx, None).ok(), sid, None, None);
                 let s = &self.sessions[&sid];
-                let status = self.status_lines(Some(sid));
-                let (sx, sy) = (s.cols.max(1), s.rows.saturating_sub(status).max(1));
                 let cwd = o.get('c').map(|c| self.expand(self.current(ctx), ctx.client, c)).or_else(|| Some(s.cwd.clone()));
                 let pane = self.spawn_pane(Some(sid), sx, sy, &command, cwd.as_deref(), &env)?;
                 let named = if is_empty_pane(&command) { &[][..] } else { &command[..] };
@@ -2185,6 +2188,8 @@ impl Server {
                 } else {
                     self.link(dsid, idx, wid, !o.has('d'));
                 }
+                // recalculate_sizes: the window now shows on the destination's clients
+                self.update_session_size(dsid);
                 self.mark_all_dirty();
                 Ok(Flow::Next)
             }
@@ -2257,6 +2262,15 @@ impl Server {
                 if let Some(c) = ctx.client {
                     if self.client_session(c) != Some(sid) && cmd == "select-window" && t.is_some() && ctx.from_key {
                         self.switch_client(c, sid);
+                    }
+                    // the client running it is the window's latest (cmd_select_window_exec),
+                    // which a latest-sized window then follows
+                    if self.client_session(c).is_some() {
+                        if let Some((_, wid)) = self.session_window(sid) {
+                            if self.ev.latest.insert(wid, c) != Some(c) {
+                                self.update_session_size(sid);
+                            }
+                        }
                     }
                 }
                 Ok(Flow::Next)
@@ -2452,21 +2466,14 @@ impl Server {
                 let wid = wt.wid.unwrap();
                 // cmd_resize_window_exec: the adjustment (strtonum 1..INT_MAX), then
                 // args_strtonum(args, 'x', WINDOW_MINIMUM, WINDOW_MAXIMUM) and 'y' are
-                // checked before anything changes
+                // checked before anything changes; the size is then kept to MAX_SIZE
                 let adjust = match o.rest.first() {
                     Some(v) => super::float::strtonum(v, 1, i32::MAX as i64).map_err(|e| format!("adjustment {e}"))?,
                     None => 1,
                 };
                 let num = |c: char, what: &str| o.get(c).map(|v| super::float::strtonum(v, 1, 10000).map_err(|e| format!("{what} {e}"))).transpose();
                 let (x, y) = (num('x', "width")?, num('y', "height")?);
-                let w = self.windows.get_mut(&wid).unwrap();
-                if o.has('A') || o.has('a') {
-                    w.options.unset("window-size");
-                    let sid = wt.sid.unwrap();
-                    self.update_session_size(sid);
-                    return Ok(Flow::Next);
-                }
-                w.options.set("window-size", "manual".into());
+                let w = &self.windows[&wid];
                 let (mut sx, mut sy) = (x.unwrap_or(w.sx as i64), y.unwrap_or(w.sy as i64));
                 // one direction only, and no change when it would go below zero
                 if o.has('L') {
@@ -2478,11 +2485,16 @@ impl Server {
                 } else if o.has('D') {
                     sy += adjust;
                 }
-                w.sx = sx.clamp(1, MAX_SIZE as i64) as u16;
-                w.sy = sy.clamp(1, MAX_SIZE as i64) as u16;
-                self.clamp_floats(wid);
-                self.apply_layout(wid);
-                self.mark_window_dirty(wid);
+                let mut size = (sx.clamp(1, MAX_SIZE as i64) as u16, sy.clamp(1, MAX_SIZE as i64) as u16);
+                // -A and -a: the largest or smallest of the clients with the window, once
+                if o.has('A') || o.has('a') {
+                    size = self.default_window_size(None, wt.sid.unwrap(), Some(wid), Some(if o.has('A') { "largest" } else { "smallest" }));
+                }
+                // the window is sized manually from now on, at this size
+                let w = self.windows.get_mut(&wid).unwrap();
+                w.options.set("window-size", "manual".into());
+                (w.manual_sx, w.manual_sy) = size;
+                self.resize_window(wid, size);
                 Ok(Flow::Next)
             }
             "list-windows" => {
@@ -3386,8 +3398,15 @@ impl Server {
                     zoomed: None,
                     kill: o.has('k'),
                     client: self.ctx_mode_client(ctx),
+                    preview: None,
                 };
                 if !o.has('Z') {
+                    // window_panes_init: a copy of the pane's screen before an unzoomed
+                    // window is zoomed for the mode
+                    let wid = tt.wid.unwrap();
+                    if !self.windows[&wid].zoomed {
+                        m.preview = self.panes.get(&pane).map(|p| super::modes::PanesPreview::new(p, (self.windows[&wid].sx, self.windows[&wid].sy)));
+                    }
                     m.zoomed = Some(self.zoom_for_mode(pane));
                 }
                 self.set_pane_mode(pane, PaneMode::Panes(Box::new(m)));
@@ -4923,7 +4942,7 @@ impl Server {
         }
         // side effects
         match name.as_str() {
-            "status" | "status-position" | "pane-border-status" | "window-size" | "pane-scrollbars" | "pane-scrollbars-style" | "pane-scrollbars-position" => {
+            "status" | "status-position" | "pane-border-status" | "window-size" | "aggressive-resize" | "pane-scrollbars" | "pane-scrollbars-style" | "pane-scrollbars-position" => {
                 let sids: Vec<SessId> = self.sessions.keys().copied().collect();
                 for s in sids {
                     self.update_session_size(s);
