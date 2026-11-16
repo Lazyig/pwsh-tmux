@@ -5112,9 +5112,9 @@ impl Server {
                 let def = options::def(base);
                 let is_hook = options::hook_scope(base).is_some();
                 let is_array = is_hook || def.is_some_and(|d| d.kind == options::Kind::Array);
-                // OPTIONS_IS_STRING: user options and string-typed ones (styles and string
-                // arrays), not commands (hooks), colours or numbers
-                let is_string = !is_hook && def.is_none_or(|d| matches!(d.kind, options::Kind::Str | options::Kind::Style)
+                // OPTIONS_IS_STRING: user options and string-typed ones (styles, string
+                // arrays and the colour formats), not commands (hooks), colours or numbers
+                let is_string = !is_hook && def.is_none_or(|d| matches!(d.kind, options::Kind::Str | options::Kind::Style | options::Kind::ColourFormat)
                     || (d.kind == options::Kind::Array && d.name != "pane-colours"));
                 let b = |v: bool| if v { "1".to_string() } else { "0".to_string() };
                 let vars = HashMap::from([
