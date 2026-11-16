@@ -627,3 +627,91 @@ fn display_message_keys_prompt_words_and_menu_flags() {
     wait_for("menu closed", || !t.contents().contains('╔'));
     assert!(ctx.command().args(["display-menu", "-b", "bad", "Item", "i", ""]).output().unwrap().stderr.starts_with(b"menu-border-lines unknown value: bad"));
 }
+
+#[test]
+fn display_prompt_flags_completion_and_mouse_like_tmux_3_8() {
+    let ctx = Ctx::new("display-prompt38");
+    let t = start(&ctx, "s");
+    let cursor = || t.screen.lock().unwrap().screen().cursor_position();
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    ctx.ok(&["set", "-g", "display-time", "5000"]);
+    let prompt = |args: &[&str]| {
+        let mut a = vec!["command-prompt", "-b", "-t", &client];
+        a.extend_from_slice(args);
+        ctx.ok(&a);
+        std::thread::sleep(Duration::from_millis(150));
+    };
+    // -N: a key that is not a digit runs the command and then goes to the pane
+    t.send(b"echo ");
+    prompt(&["-N", "-p", "num:", "display \"got [%%]\""]);
+    t.send(b"12z");
+    wait_for("numeric done", || t.row(29).starts_with("got [12]"));
+    wait_for("z typed into the pane", || ctx.capture("s").contains("echo z"));
+    t.send(b"\x15");
+    // -1 takes control keys and BSpace as one character
+    prompt(&["-1", "-p", "one:", "set -g @one '%%'"]);
+    t.send(b"\x01");
+    wait_for("C-a", || ctx.ok(&["show", "-gv", "@one"]) == "\x01\n");
+    prompt(&["-1", "-p", "one:", "set -g @one '%%'"]);
+    t.send(b"\x7f");
+    wait_for("BSpace", || ctx.ok(&["show", "-gv", "@one"]) == "\x7f\n");
+    // -1 with -I text closes without running anything
+    prompt(&["-1", "-I", "ab", "-p", "one:", "set -g @one '%%'"]);
+    t.send(b"q");
+    wait_for("closed", || !t.row(29).starts_with("one:"));
+    assert_eq!(ctx.ok(&["show", "-gv", "@one"]), "\x7f\n");
+    // -i runs the template on every change after '=', C-s/C-r give '+'/'-'
+    prompt(&["-i", "-I", "zz", "-p", "inc:", "set -g @inc '%%'"]);
+    wait_for("start", || ctx.ok(&["show", "-gv", "@inc"]) == "=\n");
+    t.send(b"\x13");
+    wait_for("C-s on empty takes -I", || ctx.ok(&["show", "-gv", "@inc"]) == "=zz\n");
+    t.send(b"y\x12");
+    wait_for("C-r", || ctx.ok(&["show", "-gv", "@inc"]) == "-zzy\n");
+    t.send(b"\x7f");
+    wait_for("BSpace", || ctx.ok(&["show", "-gv", "@inc"]) == "=zz\n");
+    t.send(b"\r");
+    wait_for("Enter closes", || !t.row(29).starts_with("inc:"));
+    assert_eq!(ctx.ok(&["show", "-gv", "@inc"]), "=zz\n");
+    // %%% escapes double quotes; empty input runs the command too
+    prompt(&["-p", "q:", "display \"got [%%%]\""]);
+    t.send(b"a\"b\r");
+    wait_for("quote3", || t.row(29).starts_with("got [a\"b]"));
+    prompt(&["-p", "q:", "display \"empty [%%]\""]);
+    t.send(b"\r");
+    wait_for("empty input", || t.row(29).starts_with("empty []"));
+    // confirm-before puts a space after the prompt; -l adds none
+    ctx.ok(&["confirm-before", "-b", "-t", &client, "display yes"]);
+    wait_for("confirm", || t.row(29).starts_with("Confirm 'display-message'? (y/n)"));
+    assert_eq!(cursor(), (29, 33));
+    t.send(b"n");
+    prompt(&["-l", "-p", "a:,b:", "-I", "x,y", "display \"%1\""]);
+    wait_for("literal", || t.row(29).starts_with("a:,b:x,y"));
+    assert_eq!(cursor(), (29, 8));
+    t.send(b"\x03");
+    // Tab completes to the common prefix, then lists the matches after the input
+    t.prefix(b":");
+    t.send(b"sel\t");
+    wait_for("common prefix", || t.row(29).trim_end() == ":select-");
+    t.send(b"\t");
+    wait_for("matches", || t.row(29).trim_end() == ":select- select-layout select-pane select-window");
+    assert_eq!(cursor(), (29, 8));
+    // a click on a match picks it, a click in the input moves the cursor
+    ctx.ok(&["set", "-g", "mouse", "on"]);
+    t.mouse(0, 25, 29, false);
+    t.mouse(0, 25, 29, true);
+    wait_for("picked", || t.row(29).trim_end() == ":select-pane");
+    t.send(b"\x15display hello world");
+    t.mouse(0, 4, 29, false);
+    t.mouse(0, 4, 29, true);
+    wait_for("cursor moved", || cursor() == (29, 4));
+    t.send(b"X");
+    wait_for("typed at the cursor", || t.row(29).starts_with(":disXplay hello world"));
+    t.send(b"\x03");
+    // errors start with a capital and their # are text; a click clears a message
+    t.prefix(b":");
+    t.send(b"x#[reverse]zz##q\r");
+    wait_for("error", || t.row(29).starts_with("Unknown command: x#[reverse]zz##q"));
+    t.mouse(0, 10, 5, false);
+    t.mouse(0, 10, 5, true);
+    wait_for("click clears the message", || !t.row(29).starts_with("Can't"));
+}

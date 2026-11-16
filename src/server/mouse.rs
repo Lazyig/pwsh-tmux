@@ -96,10 +96,22 @@ impl Server {
         if self.client_is_readonly(Some(cid)) {
             return;
         }
+        // like a key, a mouse event clears a message unless display -N
+        // (server_client_handle_key)
+        if let Some(c) = self.clients.get_mut(&cid) {
+            if c.message.is_some() {
+                if c.message_ignore_keys {
+                    return;
+                }
+                c.message = None;
+                c.dirty = true;
+            }
+        }
         if self.mouse_overlay(cid, &m) {
             return;
         }
-        if self.clients.get(&cid).is_none_or(|c| c.prompt.is_some()) {
+        // the prompt takes button 1 presses on its line; other events go on
+        if self.clients.get(&cid).is_some_and(|c| c.prompt.is_some()) && self.prompt_mouse(cid, &m) {
             return;
         }
         if let Some(sid) = self.client_session(cid) {
@@ -377,7 +389,7 @@ impl Server {
                         let qctx = Ctx { client: Some(cid), pane: fs_pane, mouse: Some(ctx), from_key: true, ..Ctx::default() };
                         self.run_queue(Queue { cmds: cmds.into(), ctx: qctx, soft: 0 });
                     }
-                    Err(e) => self.set_message(cid, &e),
+                    Err(e) => self.set_error(cid, &e),
                 }
                 return;
             }

@@ -523,11 +523,34 @@ pub struct Prompt {
     pub pane: Option<PaneId>,
     pub numeric: bool,
     pub single_key: bool,
+    /// command-prompt -i: the template runs on every change (PROMPT_INCREMENTAL);
+    /// `last` is the -I text, restored by C-r/C-s on an empty prompt.
+    pub incremental: bool,
+    pub last: String,
+    /// -T search: no command completion.
+    pub search: bool,
+    /// Inline Tab completion matches drawn after the input (complete_list).
+    pub complete: Vec<String>,
+    /// The prompt finished (prompt_closed).
+    pub closed: bool,
     pub copy_incremental: Option<(PaneId, bool)>,
     /// command-prompt -e: backspace on an empty prompt closes it.
     pub bspace_exit: bool,
     /// confirm-before: the key that confirms (-c) and whether Enter does too (-y).
     pub confirm: (char, bool),
+}
+
+impl Prompt {
+    /// A prompt showing the first of `prompts` (label, initial input).
+    pub fn new(kind: PromptKind, prompts: Vec<(String, String)>, template: String, pane: Option<PaneId>) -> Prompt {
+        let (label, init) = prompts.first().cloned().unwrap_or_default();
+        let input: Vec<char> = init.chars().collect();
+        Prompt {
+            vi_command: false, quote_next: false, copied: Vec::new(), kind, prompts, answers: Vec::new(), label, cursor: input.len(), input,
+            template, history_pos: None, pane, numeric: false, single_key: false, incremental: false, last: String::new(), search: false,
+            complete: Vec::new(), closed: false, copy_incremental: None, bspace_exit: false, confirm: ('y', false),
+        }
+    }
 }
 
 pub enum Overlay {
@@ -585,6 +608,8 @@ pub struct Client {
     pub message: Option<(String, Instant)>,
     /// display-message -N: keys do not clear the message (only with a timer)
     pub message_ignore_keys: bool,
+    /// The message is text: its # are not styles (all but display-message).
+    pub message_ignore_styles: bool,
     pub prev: Option<RenderState>,
     pub dirty: bool,
     pub last_session: Option<SessId>,
@@ -1076,8 +1101,19 @@ impl Server {
         }
     }
 
+    /// A status message that is text, not a format (status_message_set with ignore_styles).
     pub fn set_message(&mut self, cid: ClientId, msg: &str) {
         self.set_message_for(cid, msg, None, false);
+        if let Some(c) = self.clients.get_mut(&cid) {
+            c.message_ignore_styles = true;
+        }
+    }
+
+    /// A command error for an attached client (cmdq_error): the first letter is upper case.
+    pub fn set_error(&mut self, cid: ClientId, msg: &str) {
+        let mut chars = msg.chars();
+        let msg: String = chars.next().map(|c| c.to_ascii_uppercase()).into_iter().chain(chars).collect();
+        self.set_message(cid, &msg);
     }
 
     /// tmux status_message_set: `delay` None uses display-time; zero waits for a
@@ -1088,6 +1124,7 @@ impl Server {
         if let Some(c) = self.clients.get_mut(&cid) {
             let until = if ms == 0 { MESSAGE_FOREVER } else { Duration::from_millis(ms) };
             c.message = Some((msg.to_string(), Instant::now() + until));
+            c.message_ignore_styles = false;
             // as tmux, a message without a timer keeps the previous setting
             if ms != 0 {
                 c.message_ignore_keys = ignore_keys;
@@ -1226,6 +1263,7 @@ impl Server {
                 overlay_epoch: 0,
                 message: None,
                 message_ignore_keys: false,
+                message_ignore_styles: true,
                 prev: None,
                 dirty: false,
                 last_session: None,
@@ -2522,7 +2560,7 @@ impl Server {
                     }
                 }
                 if let Some(e) = err {
-                    self.set_message(rc, &e);
+                    self.set_error(rc, &e);
                 }
                 return;
             }
@@ -2539,7 +2577,7 @@ impl Server {
         if attached {
             let cid = ctx.client.unwrap();
             if let Some(e) = err {
-                self.set_message(cid, &e);
+                self.set_error(cid, &e);
             } else if !ctx.out.is_empty() {
                 if ctx.readonly || self.client_is_readonly(Some(cid)) {
                     self.set_message(cid, &ctx.out);

@@ -3,7 +3,7 @@
 use super::modes::{MenuAction, TreeAction};
 use super::*;
 use crate::copymode::Action;
-use crate::{cmdparse, opts};
+use crate::{cmdparse, format, opts};
 use crate::keys::{Input, Key, KeyCode};
 
 pub use super::mouse::MouseCtx;
@@ -55,42 +55,54 @@ pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
     t
 }
 
-fn escape_for(template: &str, at: usize, input: &str) -> String {
-    let before = template[..at].chars().last();
-    match before {
-        Some('\'') => input.replace('\'', "'\\''"),
-        Some('"') => input.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$"),
-        // unquoted: inserted as-is, so a bare %% / %1 template runs the input as a command
-        _ => input.to_string(),
+/// cmd_template_replace: in `template` replace %N (and %N%) with `s`, and the
+/// first %% (or %%%) left. %% escapes single quotes, %%% and %N% escape
+/// characters special inside double quotes.
+fn template_replace(template: &str, s: &str, idx: usize) -> String {
+    if !template.contains('%') {
+        return template.to_string();
     }
-}
-
-/// Replaces %1..%9 and successive %% in a prompt template.
-pub fn fill_template(template: &str, answers: &[String]) -> String {
-    let mut out = String::new();
-    let mut next = 0;
     let b = template.as_bytes();
-    let mut i = 0;
+    let mut out: Vec<u8> = Vec::new();
+    let (mut i, mut replaced) = (0, false);
     while i < b.len() {
-        if b[i] == b'%' && i + 1 < b.len() {
-            let c = b[i + 1];
-            if c == b'%' {
-                let a = answers.get(next).or(answers.last()).cloned().unwrap_or_default();
-                next += 1;
-                out.push_str(&escape_for(template, i, &a));
-                i += 2;
-                continue;
-            }
-            if c.is_ascii_digit() && c != b'0' {
-                let a = answers.get((c - b'1') as usize).cloned().unwrap_or_default();
-                out.push_str(&escape_for(template, i, &a));
-                i += 2;
+        let ch = b[i];
+        i += 1;
+        if ch == b'%' {
+            let quote = if i < b.len() && (b'1'..=b'9').contains(&b[i]) && (b[i] - b'0') as usize == idx {
+                i += 1;
+                Some(if i < b.len() && b[i] == b'%' { i += 1; '"' } else { ' ' })
+            } else if i < b.len() && b[i] == b'%' && !replaced {
+                replaced = true;
+                i += 1;
+                Some(if i < b.len() && b[i] == b'%' { i += 1; '"' } else { '\'' })
+            } else {
+                None
+            };
+            if let Some(quote) = quote {
+                for c in s.bytes() {
+                    if quote == '\'' && c == b'\'' {
+                        out.extend_from_slice(b"'\\''");
+                        continue;
+                    }
+                    if quote == '"' && b"\"\\$;~".contains(&c) {
+                        out.push(b'\\');
+                    }
+                    out.push(c);
+                }
                 continue;
             }
         }
-        let ch = template[i..].chars().next().unwrap();
         out.push(ch);
-        i += ch.len_utf8();
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// args_make_commands: each answer replaces %N and the next %% of the template.
+pub fn fill_template(template: &str, answers: &[String]) -> String {
+    let mut out = template.to_string();
+    for (i, a) in answers.iter().enumerate() {
+        out = template_replace(&out, a, i + 1);
     }
     out
 }
@@ -209,11 +221,10 @@ impl Server {
             c.message = None;
             c.dirty = true;
         }
-        let c = &self.clients[&cid];
-        if c.prompt.is_some() {
-            self.prompt_key(cid, &k, &name);
+        if self.clients[&cid].prompt.is_some() && self.prompt_key(cid, &k, &name) {
             return;
         }
+        let Some(c) = self.clients.get(&cid) else { return };
         // overlays
         match &c.overlay {
             Some(Overlay::Menu(_)) => {
@@ -324,7 +335,7 @@ impl Server {
                 let ctx = Ctx { client: Some(cid), pane, from_key: true, ..Ctx::default() };
                 self.run_queue(Queue { cmds: cmds.into(), ctx , soft: 0 });
             }
-            Err(e) => self.set_message(cid, &e),
+            Err(e) => self.set_error(cid, &e),
         }
     }
 
@@ -507,7 +518,7 @@ impl Server {
                 if let Some(c) = cid {
                     // the pane is the prompt's context target (a %id in the template would read as %N)
                     let template = format!("send-keys -X {command} '%%'");
-                    self.open_prompt(c, PromptKind::Command, vec![(label, String::new())], template, Some(pane), false, false);
+                    self.open_prompt(c, PromptKind::Command, vec![(format!("{label} "), String::new())], template, Some(pane), false, false);
                     if command.ends_with("-incremental") {
                         if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
                             cm.begin_incremental_search();
@@ -526,184 +537,29 @@ impl Server {
 
     // ---- prompt ----------------------------------------------------------------------
 
-    fn prompt_key(&mut self, cid: ClientId, k: &Key, name: &str) {
-        let vi = self.opt_session(self.client_session(cid), "status-keys") == "vi";
-        let seps: Vec<char> = self.opt_session(self.client_session(cid), "word-separators").chars().collect();
-        // C-y without a C-w text inserts the top buffer up to a control character
-        let paste = self.buffers.iter().find(|b| b.automatic).map(|b| String::from_utf8_lossy(&b.data).into_owned()).unwrap_or_default();
-        let hist_len = self.prompt_history.len();
-        let c = self.clients.get_mut(&cid).unwrap();
+    /// A key for the status line prompt (status_prompt_key): false when the
+    /// prompt does not use it and it goes on to the key tables.
+    fn prompt_key(&mut self, cid: ClientId, k: &Key, name: &str) -> bool {
+        let Some(c) = self.clients.get_mut(&cid) else { return false };
+        let Some(mut pr) = c.prompt.take() else { return false };
         c.dirty = true;
-        let pr = c.prompt.as_mut().unwrap();
+        let result = self.prompt_process(cid, &mut pr, k, name);
+        self.prompt_done_key(cid, pr);
+        matches!(result, PromptResult::Handled | PromptResult::Close)
+    }
+
+    /// Puts an edited prompt back unless it finished, and follows a copy-mode
+    /// incremental search.
+    fn prompt_done_key(&mut self, cid: ClientId, pr: Prompt) {
         let incremental = pr.copy_incremental;
-        match pr.kind {
-            PromptKind::Confirm => {
-                let (key, default_yes) = pr.confirm;
-                let yes = (k.code == KeyCode::Char(key) && !k.mods.ctrl && !k.mods.meta) || (k.code == KeyCode::Enter && default_yes);
-                let pr = c.prompt.take().unwrap();
-                if yes {
-                    self.run_string(cid, &pr.template, pr.pane);
-                }
-                return;
-            }
-            PromptKind::Key => {
-                let pr = c.prompt.take().unwrap();
-                let cmd = fill_template(&pr.template, &[name.to_string()]);
-                self.run_string(cid, &cmd, pr.pane);
-                return;
-            }
-            PromptKind::Command => {}
-        }
-        // tmux prompt_key: a quoted key (C-v) is inserted as its character
-        if pr.quote_next {
-            pr.quote_next = false;
-            let ch = match &k.code {
-                KeyCode::BSpace => Some('\x7f'),
-                KeyCode::Char(ch) if k.mods.ctrl => Some(((*ch as u8) & 0x1f) as char),
-                KeyCode::Char(ch) if !k.mods.meta => Some(*ch),
-                KeyCode::Space => Some(' '),
-                KeyCode::Tab => Some('\t'),
-                KeyCode::Enter => Some('\r'),
-                KeyCode::Escape => Some('\x1b'),
-                _ => None,
-            };
-            if let Some(ch) = ch {
-                pr.input.insert(pr.cursor, ch);
-                pr.cursor += 1;
-            }
-            return;
-        }
-        let op = if vi && !pr.single_key { prompt_vi_op(pr, k) } else { prompt_emacs_op(k) };
-        let n = pr.input.len();
-        match op {
-            PromptOp::None => {}
-            PromptOp::Enter => {
-                let mut pr = c.prompt.take().unwrap();
-                if let Some((pane, _)) = incremental {
-                    if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
-                        cm.finish_incremental_search(false);
-                    }
-                    return;
-                }
-                let input: String = pr.input.iter().collect();
-                pr.answers.push(input.clone());
-                if !input.is_empty() && !pr.template.starts_with("send-keys -X ") {
-                    self.prompt_history.retain(|h| h != &input);
-                    self.prompt_history.push(input);
-                    let lim = self.opt_server_num("prompt-history-limit").max(1) as usize;
-                    while self.prompt_history.len() > lim {
-                        self.prompt_history.remove(0);
-                    }
-                }
-                if pr.answers.len() < pr.prompts.len() {
-                    let (label, init) = pr.prompts[pr.answers.len()].clone();
-                    pr.label = label;
-                    pr.input = init.chars().collect();
-                    pr.cursor = pr.input.len();
-                    self.clients.get_mut(&cid).unwrap().prompt = Some(pr);
-                    return;
-                }
-                if pr.answers.iter().all(|a| a.is_empty()) && pr.template != "%1" && pr.template.contains('%') {
-                    return; // empty input cancels, like tmux
-                }
-                let cmd = fill_template(&pr.template, &pr.answers);
-                self.run_string(cid, &cmd, pr.pane);
-            }
-            PromptOp::Cancel => c.prompt = None,
-            PromptOp::BSpace if pr.bspace_exit && n == 0 => c.prompt = None,
-            PromptOp::BSpace => {
-                if pr.cursor > 0 {
-                    pr.cursor -= 1;
-                    pr.input.remove(pr.cursor);
-                }
-            }
-            PromptOp::Delete => {
-                if pr.cursor < n {
-                    pr.input.remove(pr.cursor);
-                }
-            }
-            PromptOp::Left => pr.cursor = pr.cursor.saturating_sub(1),
-            PromptOp::Right => pr.cursor = (pr.cursor + 1).min(n),
-            PromptOp::Home => pr.cursor = 0,
-            PromptOp::End => pr.cursor = n,
-            // C-u and C-k don't fill the C-y buffer in tmux; only C-w does
-            PromptOp::ClearLine => {
-                pr.input.clear();
-                pr.cursor = 0;
-            }
-            PromptOp::KillLine => pr.input.truncate(pr.cursor),
-            PromptOp::DeleteWord => {
-                let i = prompt_backward_word(&pr.input, pr.cursor, &seps);
-                pr.copied = pr.input.drain(i..pr.cursor).collect();
-                pr.cursor = i;
-            }
-            PromptOp::ForwardWord => pr.cursor = prompt_forward_word(&pr.input, pr.cursor, false, &seps),
-            PromptOp::ViForward(big) => pr.cursor = prompt_forward_word(&pr.input, pr.cursor, true, if big { &[] } else { &seps }),
-            PromptOp::ViEnd(big) => pr.cursor = prompt_end_word(&pr.input, pr.cursor, if big { &[] } else { &seps }),
-            PromptOp::BackWord(big) => pr.cursor = prompt_backward_word(&pr.input, pr.cursor, if big { &[] } else { &seps }),
-            PromptOp::Up => {
-                if hist_len > 0 && pr.history_pos != Some(0) {
-                    let pos = pr.history_pos.map(|p| p.min(hist_len).saturating_sub(1)).unwrap_or(hist_len - 1);
-                    pr.history_pos = Some(pos);
-                    pr.input = self.prompt_history[pos].chars().collect();
-                    pr.cursor = pr.input.len();
-                }
-            }
-            PromptOp::Down => {
-                // past the newest entry the line is empty (prompt_down_history)
-                match pr.history_pos.map(|p| p.min(hist_len)) {
-                    Some(p) if p + 1 < hist_len => {
-                        pr.history_pos = Some(p + 1);
-                        pr.input = self.prompt_history[p + 1].chars().collect();
-                    }
-                    _ => {
-                        pr.history_pos = None;
-                        pr.input.clear();
-                    }
-                }
-                pr.cursor = pr.input.len();
-            }
-            PromptOp::Yank => {
-                let value: Vec<_> = if pr.copied.is_empty() { paste.chars().take_while(|c| !c.is_control()).collect() } else { pr.copied.clone() };
-                let len = value.len();
-                pr.input.splice(pr.cursor..pr.cursor, value);
-                pr.cursor += len;
-            }
-            PromptOp::Transpose => {
-                let i = if pr.cursor < n { pr.cursor + 1 } else { pr.cursor };
-                if i >= 2 {
-                    pr.input.swap(i - 2, i - 1);
-                    pr.cursor = i;
-                }
-            }
-            PromptOp::QuoteNext => pr.quote_next = true,
-            PromptOp::Tab => {
-                // complete a command name at the start
-                let text: String = pr.input.iter().collect();
-                if !text.contains(' ') {
-                    let names: Vec<&str> = COMMAND_NAMES.iter().copied().filter(|n| n.starts_with(&text)).collect();
-                    if names.len() == 1 {
-                        pr.input = format!("{} ", names[0]).chars().collect();
-                        pr.cursor = pr.input.len();
-                    }
-                }
-            }
-            PromptOp::Insert(ch) => {
-                if pr.numeric && !ch.is_ascii_digit() {
-                    return;
-                }
-                pr.input.insert(pr.cursor, ch);
-                pr.cursor += 1;
-                if pr.single_key {
-                    let mut pr = c.prompt.take().unwrap();
-                    pr.answers.push(pr.input.iter().collect());
-                    let cmd = fill_template(&pr.template, &pr.answers);
-                    self.run_string(cid, &cmd, pr.pane);
-                }
+        let text = (!pr.closed).then(|| pr.input.iter().collect::<String>());
+        if !pr.closed {
+            if let Some(c) = self.clients.get_mut(&cid) {
+                if c.prompt.is_none() { c.prompt = Some(pr); }
+                c.dirty = true;
             }
         }
         if let Some((pane, forward)) = incremental {
-            let text = self.clients.get(&cid).and_then(|c| c.prompt.as_ref()).map(|pr| pr.input.iter().collect::<String>());
             let wrap = self.opt_window_on(self.window_of(pane), "wrap-search");
             if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
                 cm.wrap_search = wrap;
@@ -716,6 +572,402 @@ impl Server {
         }
     }
 
+    /// A prompt mouse event (prompt_mouse): button 1 presses on the prompt
+    /// line move the cursor or pick an inline completion. Others are not used.
+    pub(crate) fn prompt_mouse(&mut self, cid: ClientId, m: &keys::Mouse) -> bool {
+        if m.kind != keys::MouseKind::Down || m.button != 1 || self.message_row(cid) != Some(m.y) {
+            return false;
+        }
+        let Some(sid) = self.client_session(cid) else { return false };
+        let cw = self.clients[&cid].size.0.max(1);
+        let style_text = self.expand_time(self.current(&Ctx { client: Some(cid), ..Ctx::default() }), Some(cid), &self.opt_session(Some(sid), "message-style"));
+        let (ax, aw) = super::render::message_area(cw, &style_text);
+        let Some(mut pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.take()) else { return false };
+        let used = self.prompt_mouse_at(cid, &mut pr, m.x as usize, ax, aw);
+        if let Some(c) = self.clients.get_mut(&cid) {
+            if c.prompt.is_none() { c.prompt = Some(pr); }
+            c.dirty = true;
+        }
+        used
+    }
+
+    fn prompt_mouse_at(&mut self, cid: ClientId, pr: &mut Prompt, x: usize, ax: u16, aw: u16) -> bool {
+        if x < ax as usize || x >= (ax + aw) as usize {
+            return false;
+        }
+        let l = self.prompt_layout(cid, pr, ax, aw);
+        if l.input_width == 0 {
+            return true;
+        }
+        let pwidth = super::render::prompt_width(&pr.input) + pr.quote_next as usize;
+        // prompt_mouse_complete: a click on one of the inline matches
+        let (cx, cax, caw) = (l.cursor_x, l.content_x, l.content_width);
+        if !pr.complete.is_empty() && pr.cursor == pr.input.len() && cx >= cax && cx - cax < caw && x >= cx {
+            let avail = caw - (cx - cax);
+            let clicked = x - cx;
+            let width = format::width(&super::render::prompt_complete_display(&pr.complete)).min(avail);
+            if clicked < width {
+                let mut end = 0;
+                for i in 0..pr.complete.len() {
+                    let start = end + 1;
+                    end = start + format::width(&pr.complete[i]);
+                    if clicked >= start && clicked < end {
+                        let replace = format!("{} ", pr.complete[i]);
+                        if prompt_replace_word(pr, &replace) {
+                            pr.complete.clear();
+                        }
+                        break;
+                    }
+                }
+                return true;
+            }
+        }
+        let target = if x <= l.input_x { l.input_offset } else { l.input_offset + x - l.input_x }.min(pwidth);
+        let mut width = 0;
+        let mut idx = 0;
+        while idx < pr.input.len() && width < target {
+            width += super::render::prompt_width(&pr.input[idx..idx + 1]);
+            idx += 1;
+        }
+        if idx != pr.cursor {
+            pr.cursor = idx;
+            pr.complete.clear();
+        }
+        true
+    }
+
+    /// The prompt's input callback (cmd_command_prompt_callback,
+    /// cmd_confirm_before_callback): `s` None cancels. True when the prompt closes.
+    fn prompt_fire(&mut self, cid: ClientId, pr: &mut Prompt, s: Option<&str>, fire: Fire) -> bool {
+        let close = match pr.kind {
+            PromptKind::Key => {
+                if let Some(s) = s {
+                    let cmd = fill_template(&pr.template, &[s.to_string()]);
+                    self.run_string(cid, &cmd, pr.pane);
+                }
+                true
+            }
+            PromptKind::Confirm => {
+                let first = s.and_then(|s| s.chars().next());
+                if first == Some(pr.confirm.0) || (first == Some('\r') && pr.confirm.1) {
+                    let template = pr.template.clone();
+                    self.run_string(cid, &template, pr.pane);
+                }
+                true
+            }
+            PromptKind::Command => match s {
+                None => true,
+                Some(_) if fire == Fire::Move => true,
+                // a copy-mode search ends where the incremental search got to
+                Some(_) if pr.copy_incremental.is_some() => fire == Fire::Close,
+                Some(_) if fire == Fire::Close && pr.incremental => true,
+                Some(s) => {
+                    let mut argv = pr.answers.clone();
+                    argv.push(s.to_string());
+                    if fire == Fire::Close {
+                        pr.answers.push(s.to_string());
+                        if pr.answers.len() < pr.prompts.len() {
+                            let (label, init) = pr.prompts[pr.answers.len()].clone();
+                            pr.label = label;
+                            pr.input = init.chars().collect();
+                            pr.cursor = pr.input.len();
+                            pr.history_pos = None;
+                            pr.complete.clear();
+                            return false;
+                        }
+                    }
+                    let cmd = fill_template(&pr.template, &argv);
+                    self.run_string(cid, &cmd, pr.pane);
+                    // an incremental prompt stays open for more typing
+                    !pr.incremental
+                }
+            },
+        };
+        if close {
+            pr.closed = true;
+        }
+        close
+    }
+
+    /// tmux 3.8 prompt_key: edit the prompt with a key, firing the callback.
+    fn prompt_process(&mut self, cid: ClientId, pr: &mut Prompt, k: &Key, name: &str) -> PromptResult {
+        pr.closed = false;
+        // inline completion matches are dropped by any key (Tab rebuilds them)
+        pr.complete.clear();
+        if matches!(pr.kind, PromptKind::Key) {
+            self.prompt_fire(cid, pr, Some(name), Fire::Close);
+            pr.closed = true;
+            return PromptResult::Close;
+        }
+        let k = &prompt_keypad_key(k);
+        if pr.numeric {
+            // a digit is typed, anything else runs the command and is then handled
+            if let KeyCode::Char(d @ '0'..='9') = k.code {
+                if k.mods.is_empty() {
+                    return self.prompt_append(cid, pr, d);
+                }
+            }
+            let s: String = pr.input.iter().collect();
+            self.prompt_fire(cid, pr, Some(&s), Fire::Close);
+            pr.closed = true;
+            return PromptResult::NotHandled;
+        }
+        if pr.single_key || pr.quote_next || matches!(pr.kind, PromptKind::Confirm) {
+            let Some(ch) = prompt_key_char(k) else { return PromptResult::Handled };
+            pr.quote_next = false;
+            return self.prompt_append(cid, pr, ch);
+        }
+        let vi = self.opt_session(self.client_session(cid), "status-keys") == "vi";
+        let op = if vi { prompt_vi_op(pr, k) } else { prompt_emacs_op(k) };
+        // prompt_check_move: cursor keys end an incremental prompt
+        if pr.incremental && matches!(op, PromptOp::Up | PromptOp::Down | PromptOp::Page | PromptOp::Left | PromptOp::Right) {
+            let s: String = pr.input.iter().collect();
+            if self.prompt_fire(cid, pr, Some(&s), Fire::Move) {
+                return PromptResult::Close;
+            }
+            return PromptResult::Move;
+        }
+        let seps: Vec<char> = self.opt_session(self.client_session(cid), "word-separators").chars().collect();
+        let n = pr.input.len();
+        let mut prefix = '=';
+        let changed = match op {
+            PromptOp::None | PromptOp::Page => false,
+            PromptOp::Insert(ch) => return self.prompt_append(cid, pr, ch),
+            PromptOp::Enter => {
+                let input: String = pr.input.iter().collect();
+                if !input.is_empty() && !pr.template.starts_with("send-keys -X ") && !pr.search {
+                    self.prompt_history.retain(|h| h != &input);
+                    self.prompt_history.push(input.clone());
+                    let lim = self.opt_server_num("prompt-history-limit").max(1) as usize;
+                    while self.prompt_history.len() > lim {
+                        self.prompt_history.remove(0);
+                    }
+                }
+                return self.prompt_done(cid, pr, Some(&input));
+            }
+            PromptOp::Cancel => return self.prompt_done(cid, pr, None),
+            PromptOp::BSpace if pr.bspace_exit && n == 0 => return self.prompt_done(cid, pr, None),
+            PromptOp::BSpace => {
+                let moved = pr.cursor > 0;
+                if moved {
+                    pr.cursor -= 1;
+                    pr.input.remove(pr.cursor);
+                }
+                moved
+            }
+            PromptOp::Delete => {
+                if pr.cursor < n {
+                    pr.input.remove(pr.cursor);
+                }
+                pr.cursor < n
+            }
+            PromptOp::Left => {
+                pr.cursor = pr.cursor.saturating_sub(1);
+                false
+            }
+            PromptOp::Right => {
+                pr.cursor = (pr.cursor + 1).min(n);
+                false
+            }
+            PromptOp::Home => {
+                pr.cursor = 0;
+                false
+            }
+            PromptOp::End => {
+                pr.cursor = n;
+                false
+            }
+            // C-u and C-k don't fill the C-y buffer in tmux; only C-w does
+            PromptOp::ClearLine => {
+                pr.input.clear();
+                pr.cursor = 0;
+                true
+            }
+            PromptOp::KillLine => {
+                pr.input.truncate(pr.cursor);
+                pr.cursor < n
+            }
+            PromptOp::DeleteWord => {
+                let i = prompt_backward_word(&pr.input, pr.cursor, &seps);
+                pr.copied = pr.input.drain(i..pr.cursor).collect();
+                pr.cursor = i;
+                true
+            }
+            PromptOp::ForwardWord => {
+                pr.cursor = prompt_forward_word(&pr.input, pr.cursor, false, &seps);
+                true
+            }
+            PromptOp::ViForward(big) => {
+                pr.cursor = prompt_forward_word(&pr.input, pr.cursor, true, if big { &[] } else { &seps });
+                true
+            }
+            PromptOp::ViEnd(big) => {
+                pr.cursor = prompt_end_word(&pr.input, pr.cursor, if big { &[] } else { &seps });
+                true
+            }
+            PromptOp::BackWord(big) => {
+                pr.cursor = prompt_backward_word(&pr.input, pr.cursor, if big { &[] } else { &seps });
+                true
+            }
+            PromptOp::Up => {
+                let hist_len = self.prompt_history.len();
+                if hist_len > 0 && pr.history_pos != Some(0) {
+                    let pos = pr.history_pos.map(|p| p.min(hist_len).saturating_sub(1)).unwrap_or(hist_len - 1);
+                    pr.history_pos = Some(pos);
+                    pr.input = self.prompt_history[pos].chars().collect();
+                    pr.cursor = pr.input.len();
+                    true
+                } else {
+                    false
+                }
+            }
+            PromptOp::Down => {
+                // past the newest entry the line is empty (prompt_down_history)
+                let hist_len = self.prompt_history.len();
+                match pr.history_pos.map(|p| p.min(hist_len)) {
+                    Some(p) if p + 1 < hist_len => {
+                        pr.history_pos = Some(p + 1);
+                        pr.input = self.prompt_history[p + 1].chars().collect();
+                    }
+                    _ => {
+                        pr.history_pos = None;
+                        pr.input.clear();
+                    }
+                }
+                pr.cursor = pr.input.len();
+                true
+            }
+            PromptOp::Yank => {
+                // prompt_paste: the C-w text, else the top buffer up to a control character
+                let value: Option<Vec<char>> = if !pr.copied.is_empty() {
+                    Some(pr.copied.clone())
+                } else {
+                    self.buffers.iter().find(|b| b.automatic).map(|b| prompt_paste_text(&b.data))
+                };
+                match value {
+                    Some(value) => {
+                        let len = value.len();
+                        pr.input.splice(pr.cursor..pr.cursor, value);
+                        pr.cursor += len;
+                        true
+                    }
+                    None => false,
+                }
+            }
+            PromptOp::Transpose => {
+                let i = if pr.cursor < n { pr.cursor + 1 } else { pr.cursor };
+                if i >= 2 {
+                    pr.input.swap(i - 2, i - 1);
+                    pr.cursor = i;
+                }
+                i >= 2
+            }
+            PromptOp::QuoteNext => {
+                pr.quote_next = true;
+                false
+            }
+            PromptOp::Tab => self.prompt_complete(pr),
+            // C-r/C-s in an incremental prompt: search again, an empty prompt takes the -I text
+            PromptOp::Search(back) if pr.incremental => {
+                if pr.input.is_empty() {
+                    pr.input = pr.last.chars().collect();
+                    pr.cursor = pr.input.len();
+                } else {
+                    prefix = if back { '-' } else { '+' };
+                }
+                true
+            }
+            PromptOp::Search(_) => false,
+        };
+        if changed {
+            self.prompt_changed(cid, pr, prefix);
+        }
+        PromptResult::Handled
+    }
+
+    /// prompt_done: fire the callback for a finished prompt.
+    fn prompt_done(&mut self, cid: ClientId, pr: &mut Prompt, s: Option<&str>) -> PromptResult {
+        if self.prompt_fire(cid, pr, s, Fire::Close) { PromptResult::Close } else { PromptResult::Handled }
+    }
+
+    /// The append_key path of prompt_key: insert a character; a single key
+    /// prompt (-1, confirm-before) then finishes.
+    fn prompt_append(&mut self, cid: ClientId, pr: &mut Prompt, ch: char) -> PromptResult {
+        pr.input.insert(pr.cursor.min(pr.input.len()), ch);
+        pr.cursor += 1;
+        let mut result = PromptResult::Handled;
+        if pr.single_key || matches!(pr.kind, PromptKind::Confirm) {
+            if pr.input.len() != 1 {
+                // with -I text there is no single key to report
+                pr.closed = true;
+                result = PromptResult::Close;
+            } else {
+                let s: String = pr.input.iter().collect();
+                result = self.prompt_done(cid, pr, Some(&s));
+            }
+        }
+        self.prompt_changed(cid, pr, '=');
+        result
+    }
+
+    /// An incremental prompt runs its template on every change, the input
+    /// after a '=', '+' (C-s) or '-' (C-r).
+    fn prompt_changed(&mut self, cid: ClientId, pr: &mut Prompt, prefix: char) {
+        if pr.incremental && !pr.closed {
+            let s = format!("{prefix}{}", pr.input.iter().collect::<String>());
+            self.prompt_fire(cid, pr, Some(&s), Fire::Handled);
+        }
+    }
+
+    /// prompt_incremental_start: an incremental prompt fires once when opened.
+    pub(crate) fn prompt_incremental_start(&mut self, cid: ClientId) {
+        let Some(mut pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.take()) else { return };
+        if pr.incremental {
+            let s = format!("={}", pr.input.iter().collect::<String>());
+            self.prompt_fire(cid, &mut pr, Some(&s), Fire::Handled);
+        }
+        self.prompt_done_key(cid, pr);
+    }
+
+    /// prompt_replace_complete: Tab completes a command name at the start of
+    /// the prompt to the longest common prefix of the matches, or keeps the
+    /// matches for drawing after the input when there is nothing to add.
+    fn prompt_complete(&self, pr: &mut Prompt) -> bool {
+        let Some((first, last)) = prompt_word_bounds(pr) else { return false };
+        let word: String = pr.input[first..last].iter().collect();
+        if word.len() >= 64 || pr.search || first != 0 || word.is_empty() {
+            return false;
+        }
+        let mut list: Vec<String> = super::cmds::command_names().filter(|n| n.starts_with(&word)).map(String::from).collect();
+        for (_, alias) in self.opts_server.array_items("command-alias") {
+            if let Some((name, _)) = alias.split_once('=') {
+                if name.starts_with(&word) && !list.iter().any(|l| l == name) {
+                    list.push(name.to_string());
+                }
+            }
+        }
+        if list.is_empty() {
+            return false;
+        }
+        list.sort();
+        let out = if list.len() == 1 {
+            format!("{} ", list[0])
+        } else {
+            let mut prefix = list[0].clone();
+            for item in &list[1..] {
+                let common = prefix.chars().zip(item.chars()).take_while(|(a, b)| a == b).count();
+                prefix = prefix.chars().take(common).collect();
+            }
+            prefix
+        };
+        if out == word {
+            if list.len() > 1 {
+                pr.complete = list;
+            }
+            return false;
+        }
+        prompt_replace_word(pr, &out)
+    }
 }
 
 /// A command prompt editing operation (the emacs keys of tmux prompt_key).
@@ -723,7 +975,90 @@ impl Server {
 enum PromptOp {
     None, Left, Right, Home, End, Tab, BSpace, Delete, ClearLine, KillLine, DeleteWord,
     ForwardWord, ViForward(bool), ViEnd(bool), BackWord(bool), Up, Down, Yank, Transpose,
-    Enter, Cancel, QuoteNext, Insert(char),
+    Enter, Cancel, QuoteNext, Insert(char), Page, Search(bool),
+}
+
+/// What a prompt did with a key (enum prompt_key_result).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PromptResult {
+    Handled,
+    Close,
+    NotHandled,
+    Move,
+}
+
+/// Why the prompt callback runs (PROMPT_KEY_CLOSE, _HANDLED, _MOVE).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Fire {
+    Close,
+    Handled,
+    Move,
+}
+
+/// prompt_keypad_key: unmodified keypad keys are their characters.
+fn prompt_keypad_key(k: &Key) -> Key {
+    match k.code {
+        KeyCode::KP('\r') if k.mods.is_empty() => Key { code: KeyCode::Enter, mods: k.mods },
+        KeyCode::KP(c) if k.mods.is_empty() => Key { code: KeyCode::Char(c), mods: k.mods },
+        _ => k.clone(),
+    }
+}
+
+/// A key as the character a single key prompt (or C-v) takes: BSpace is
+/// 0x7f, C-x the control character and other modifiers are dropped; keys
+/// without a character give None and are ignored.
+fn prompt_key_char(k: &Key) -> Option<char> {
+    let c = match k.code {
+        KeyCode::BSpace => return Some('\x7f'),
+        KeyCode::Char(c) => c,
+        KeyCode::Space => ' ',
+        KeyCode::Enter => '\r',
+        KeyCode::Tab => '\t',
+        KeyCode::Escape => '\x1b',
+        _ => return None,
+    };
+    Some(if k.mods.ctrl && c.is_ascii() { ((c as u8) & 0x1f) as char } else { c })
+}
+
+/// The top buffer as prompt_paste inserts it: up to the first control character.
+fn prompt_paste_text(data: &[u8]) -> Vec<char> {
+    let end = data.iter().position(|b| *b <= 31 || *b == 127).unwrap_or(data.len());
+    String::from_utf8_lossy(&data[..end]).chars().collect()
+}
+
+/// The word around the cursor that completion replaces (prompt_replace_complete).
+fn prompt_word_bounds(pr: &Prompt) -> Option<(usize, usize)> {
+    let n = pr.input.len();
+    let sp = |i: usize| i < n && pr.input[i] == ' ';
+    let idx = pr.cursor.min(n).saturating_sub(1);
+    let mut first = idx;
+    while first > 0 && !sp(first) {
+        first -= 1;
+    }
+    while first < n && sp(first) {
+        first += 1;
+    }
+    let mut last = idx;
+    while last < n && !sp(last) {
+        last += 1;
+    }
+    while last > 0 && sp(last) {
+        last -= 1;
+    }
+    if last < n {
+        last += 1;
+    }
+    (last >= first).then_some((first, last))
+}
+
+/// Replaces the word around the cursor with `s`, the cursor after it.
+fn prompt_replace_word(pr: &mut Prompt, s: &str) -> bool {
+    let Some((first, last)) = prompt_word_bounds(pr) else { return false };
+    let new: Vec<char> = s.chars().collect();
+    let len = new.len();
+    pr.input.splice(first..last, new);
+    pr.cursor = first + len;
+    true
 }
 
 fn prompt_emacs_op(k: &Key) -> PromptOp {
@@ -748,6 +1083,8 @@ fn prompt_emacs_op(k: &Key) -> PromptOp {
             'c' | 'g' | '[' => PromptOp::Cancel,
             'v' => PromptOp::QuoteNext,
             'i' => PromptOp::Tab,
+            'r' => PromptOp::Search(true),
+            's' => PromptOp::Search(false),
             _ => PromptOp::None,
         },
         KeyCode::Char('f') if m.meta && !m.ctrl => PromptOp::ForwardWord,
@@ -768,6 +1105,7 @@ fn prompt_emacs_op(k: &Key) -> PromptOp {
         KeyCode::Delete => PromptOp::Delete,
         KeyCode::Up => PromptOp::Up,
         KeyCode::Down => PromptOp::Down,
+        KeyCode::PageUp | KeyCode::PageDown => PromptOp::Page,
         KeyCode::Escape => PromptOp::Cancel,
         _ => PromptOp::None,
     }
@@ -914,17 +1252,6 @@ fn prompt_backward_word(s: &[char], mut i: usize, seps: &[char]) -> usize {
     i
 }
 
-pub const COMMAND_NAMES: &[&str] = &[
-    "attach-session", "bind-key", "break-pane", "capture-pane", "choose-buffer", "choose-client", "choose-tree", "clear-history", "clock-mode", "command-prompt",
-    "confirm-before", "copy-mode", "customize-mode", "delete-buffer", "detach-client", "display-menu", "display-message", "display-panes", "display-popup", "find-window",
-    "has-session", "if-shell", "join-pane", "kill-pane", "kill-server", "kill-session", "kill-window", "last-pane", "last-window", "link-window", "list-buffers",
-    "list-clients", "list-commands", "list-keys", "list-panes", "list-sessions", "list-windows", "load-buffer", "lock-client", "lock-server", "lock-session", "move-pane",
-    "move-window", "new-session", "new-window", "next-layout", "next-window", "paste-buffer", "pipe-pane", "previous-layout", "previous-window", "refresh-client",
-    "rename-session", "rename-window", "resize-pane", "resize-window", "respawn-pane", "respawn-window", "rotate-window", "run-shell", "save-buffer", "select-layout",
-    "select-pane", "select-window", "send-keys", "send-prefix", "set-buffer", "set-environment", "set-hook", "set-option", "set-window-option", "show-buffer",
-    "show-environment", "show-hooks", "show-messages", "show-options", "show-window-options", "source-file", "split-window", "start-server", "suspend-client",
-    "swap-pane", "swap-window", "switch-client", "unbind-key", "unlink-window", "wait-for",
-];
 
 #[cfg(test)]
 mod tests {
@@ -954,11 +1281,7 @@ mod tests {
 
     #[test]
     fn prompt_vi_translation() {
-        let mut pr = Prompt {
-            vi_command: false, quote_next: false, copied: Vec::new(), kind: PromptKind::Command, prompts: Vec::new(), answers: Vec::new(),
-            label: String::new(), input: "ab".chars().collect(), cursor: 2, template: String::new(), history_pos: None, pane: None,
-            numeric: false, single_key: false, copy_incremental: None, bspace_exit: false, confirm: ('y', false),
-        };
+        let mut pr = Prompt::new(PromptKind::Command, vec![(String::new(), "ab".into())], String::new(), None);
         let key = |n: &str| keys::parse_key_name(n).unwrap();
         // insert mode: Escape is command mode and one to the left; M-f is dropped
         assert_eq!(prompt_vi_op(&mut pr, &key("M-f")), PromptOp::None);
@@ -974,6 +1297,29 @@ mod tests {
         assert_eq!(prompt_vi_op(&mut pr, &key("C-a")), PromptOp::Home);
         assert_eq!(prompt_emacs_op(&key("M-BSpace")), PromptOp::None);
         assert_eq!(prompt_emacs_op(&key("C-Left")), PromptOp::BackWord(false));
+        assert_eq!(prompt_emacs_op(&key("C-r")), PromptOp::Search(true));
+        // single keys: C-x is the control character, BSpace 0x7f, special keys none
+        assert_eq!(prompt_key_char(&key("C-a")), Some('\x01'));
+        assert_eq!(prompt_key_char(&key("BSpace")), Some('\x7f'));
+        assert_eq!(prompt_key_char(&key("Escape")), Some('\x1b'));
+        assert_eq!(prompt_key_char(&key("M-y")), Some('y'));
+        assert_eq!(prompt_key_char(&key("Up")), None);
+    }
+
+    #[test]
+    fn prompt_completion_word() {
+        let mut pr = Prompt::new(PromptKind::Command, vec![(String::new(), "kill-se".into())], String::new(), None);
+        assert_eq!(prompt_word_bounds(&pr), Some((0, 7)));
+        pr.input = "set -g sta".chars().collect();
+        pr.cursor = 10;
+        assert_eq!(prompt_word_bounds(&pr), Some((7, 10)));
+        pr.input = "kill-server ".chars().collect();
+        pr.cursor = 12;
+        assert_eq!(prompt_word_bounds(&pr), None);
+        pr.input = "sel".chars().collect();
+        pr.cursor = 3;
+        assert!(prompt_replace_word(&mut pr, "select-"));
+        assert_eq!((pr.input.iter().collect::<String>(), pr.cursor), ("select-".to_string(), 7));
     }
 
     #[test]
@@ -981,6 +1327,13 @@ mod tests {
         assert_eq!(fill_template("rename-window -- '%%'", &["it's".into()]), "rename-window -- 'it'\\''s'");
         assert_eq!(fill_template("a %1 b %2", &["x".into(), "y z".into()]), "a x b y z");
         assert_eq!(fill_template("%%", &["new-window -n x".into()]), "new-window -n x");
+        // cmd_template_replace: %%% and %N% escape for double quotes, each answer takes the next %%
+        assert_eq!(fill_template("display \"[%%%]\"", &["a\"b$c".into()]), "display \"[a\\\"b\\$c]\"");
+        assert_eq!(fill_template("x %1% %1", &["a;b".into()]), "x a\\;b a;b");
+        assert_eq!(fill_template("\"%%\"", &["it's".into()]), "\"it'\\''s\"");
+        assert_eq!(fill_template("%% %%", &["q".into()]), "q %%");
+        assert_eq!(fill_template("%% %%", &["q".into(), "r".into()]), "q r");
+        assert_eq!(fill_template("100%", &["q".into()]), "100%");
         let b = default_bindings();
         assert!(b["prefix"].contains_key("%"));
         assert!(b["prefix"].contains_key("\""));

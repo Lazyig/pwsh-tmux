@@ -161,6 +161,31 @@ fn prompt_char(ch: char) -> (String, usize) {
     }
 }
 
+/// The width of prompt input as drawn.
+pub(crate) fn prompt_width(chars: &[char]) -> usize {
+    chars.iter().map(|ch| prompt_char(*ch).1).sum()
+}
+
+/// prompt_store_complete: a leading space then the matches separated by spaces.
+pub(crate) fn prompt_complete_display(list: &[String]) -> String {
+    list.iter().map(|m| format!(" {m}")).collect()
+}
+
+/// Where prompt_layout puts the parts of a prompt.
+#[derive(Default)]
+pub(crate) struct PromptLayout {
+    pub spans: Vec<Span>,
+    pub style: Style,
+    pub fill: Option<Color>,
+    pub content_x: usize,
+    pub content_width: usize,
+    pub label_width: usize,
+    pub input_x: usize,
+    pub cursor_x: usize,
+    pub input_offset: usize,
+    pub input_width: usize,
+}
+
 /// A menu or popup -s/-S/-H style: parsed over the option's style, only its
 /// colours are taken (menu_reapply_styles, popup_reapply_styles).
 fn flag_colours(base: Style, flag: &Option<String>) -> Style {
@@ -170,7 +195,7 @@ fn flag_colours(base: Style, flag: &Option<String>) -> Style {
     }
 }
 
-fn message_area(width: u16, style: &str) -> (u16, u16) {
+pub(crate) fn message_area(width: u16, style: &str) -> (u16, u16) {
     let mut w = width;
     let mut align = "left";
     for word in style.split(',') {
@@ -801,68 +826,16 @@ impl Server {
         let message_line = self.opt_session_num(Some(sid), "message-line").max(0) as u16;
         let my = if nstatus > 0 { (if top { 0 } else { ch - nstatus }) + message_line.min(nstatus - 1) } else { ch - 1 };
         if let Some(pr) = &c.prompt {
-            // tmux 3.8 prompt_layout/prompt_draw: message-format is expanded with
-            // #{message} set to the prompt string and drawn as a label, the input
-            // follows it; both are placed in the message-style area by the
-            // effective style (message-command-style in vi command mode).
             let style_text = self.expand_time(active_target, Some(cid), &self.opt_session(Some(sid), "message-style"));
             let (ax, aw) = message_area(cw, &style_text);
-            let label = pr.label.clone() + if matches!(pr.kind, PromptKind::Confirm) || pr.label == ":" || pr.label.ends_with(' ') || pr.label.is_empty() { "" } else { " " };
-            let flags = [(pr.single_key, "SINGLE"), (pr.numeric, "NUMERIC"), (pr.copy_incremental.is_some(), "INCREMENTAL"), (pr.bspace_exit, "BSPACE_EXIT"), (pr.vi_command, "COMMANDMODE")];
-            let extra = HashMap::from([
-                ("prompt_input".to_string(), pr.input.iter().collect::<String>()),
-                ("prompt_flags".to_string(), flags.into_iter().filter_map(|(on, flag)| on.then_some(flag)).collect::<Vec<_>>().join(",")),
-                ("command_prompt".to_string(), if pr.vi_command { "1" } else { "0" }.to_string()),
-                ("message".to_string(), label),
-            ]);
-            let vars = super::vars::VarCtx { srv: self, t: active_target, client: Some(cid), extra };
-            let effective = format::expand_time(&self.opt_session(Some(sid), if pr.vi_command { "message-command-style" } else { "message-style" }), &vars);
-            let sy = self.style_option(&effective, Style::default(), active_target, Some(cid)).unwrap_or_default();
-            let (fill, align) = style_fill_align(&effective);
-            let expanded = format::expand_time(&self.opt_session(Some(sid), "message-format"), &vars);
-            let spans = format::spans(&expanded, sy);
-            let label_width = spans.iter().map(|s| format::width(&s.text)).sum::<usize>().min(aw as usize);
-            let cw_of = |chars: &[char]| chars.iter().map(|ch| prompt_char(*ch).1).sum::<usize>();
-            let (pcursor, pwidth) = (cw_of(&pr.input[..pr.cursor.min(pr.input.len())]), cw_of(&pr.input));
-            let avail = aw as usize - label_width;
-            let (offset, input_width) = if avail == 0 { (0, 0) } else if pcursor >= avail { (pcursor - avail + 1, avail) } else { (0, pwidth.min(avail)) };
-            let content_width = (label_width + input_width).min(aw as usize);
-            let content_x = ax as usize + match align.as_str() {
-                "centre" | "absolute-centre" => (aw as usize - content_width) / 2,
-                "right" => aw as usize - content_width,
-                _ => 0,
-            };
-            if let Some(bg) = fill {
-                for x in ax..ax + aw { f.set(x, my, Cell { text: " ".into(), style: Style { bg, ..Style::default() } }); }
-            }
-            if label_width > 0 {
-                f.put_cells(content_x as u16, my, &format::layout_line(&spans, label_width, sy));
-            }
-            // input from offset, control characters as ^X
-            // and a '^' at the cursor while C-v waits for the key to quote
-            let (mut width, mut x) = (0, content_x + label_width);
-            let quote = pr.quote_next.then_some(pr.cursor.min(pr.input.len()));
-            let mut shown: Vec<char> = pr.input.clone();
-            if let Some(at) = quote { shown.insert(at, '^'); }
-            for ch in &shown {
-                let (text, w) = prompt_char(*ch);
-                if width < offset { width += w; continue; }
-                if width + w > offset + input_width { break; }
-                width += w;
-                if text.len() == 2 && text.starts_with('^') {
-                    f.set(x as u16, my, Cell { text: "^".into(), style: sy });
-                    f.set(x as u16 + 1, my, Cell { text: text[1..].into(), style: sy });
-                } else {
-                    f.set(x as u16, my, Cell { text, style: sy });
-                    if w == 2 { f.set(x as u16 + 1, my, Cell { text: String::new(), style: sy }); }
-                }
-                x += w;
-            }
-            cursor = Some(((content_x + label_width + pcursor - offset).min(cw as usize - 1) as u16, my));
+            let x = self.draw_prompt(&mut f, cid, pr, ax, aw, my);
+            cursor = Some((x.min(cw - 1), my));
         } else if let Some((msg, _)) = &c.message {
             let style_text = self.expand_time(active_target, Some(cid), &self.opt_session(Some(sid), "message-style"));
             let (ax, aw) = message_area(cw, &style_text);
-            let extra = HashMap::from([("message".to_string(), msg.clone()), ("command_prompt".to_string(), "0".to_string())]);
+            // status_message_escape: a text message's # are drawn as they are
+            let msg = if c.message_ignore_styles { msg.replace('#', "##") } else { msg.clone() };
+            let extra = HashMap::from([("message".to_string(), msg), ("command_prompt".to_string(), "0".to_string())]);
             let vars = super::vars::VarCtx { srv: self, t: active_target, client: Some(cid), extra };
             let st = self.style_option(&style_text, Style::default(), active_target, Some(cid)).unwrap_or_default();
             let expanded = format::expand_time(&self.opt_session(Some(sid), "message-format"), &vars);
@@ -876,6 +849,121 @@ impl Server {
         modes.app_cursor = true;
         modes.bracketed_paste = c.features.has("bpaste");
         Some(RenderState { frame: f, cursor, modes, status_ranges })
+    }
+
+    /// The status line row of the client's prompt and messages
+    /// (status_prompt_screen_line).
+    pub(crate) fn message_row(&self, cid: ClientId) -> Option<u16> {
+        let c = self.clients.get(&cid)?;
+        let sid = c.session?;
+        let ch = c.size.1.max(1);
+        let nstatus = self.status_lines(Some(sid)).min(ch.saturating_sub(1));
+        let top = self.opt_session(Some(sid), "status-position") == "top";
+        let line = self.opt_session_num(Some(sid), "message-line").max(0) as u16;
+        Some(if nstatus > 0 { (if top { 0 } else { ch - nstatus }) + line.min(nstatus - 1) } else { ch - 1 })
+    }
+
+    /// tmux 3.8 prompt_layout: message-format is expanded with #{message} set
+    /// to the prompt string and drawn as a label, the input follows it; both
+    /// (and any inline completion matches) are placed in the area by the
+    /// effective style's align (message-command-style in vi command mode).
+    pub(crate) fn prompt_layout(&self, cid: ClientId, pr: &Prompt, ax: u16, aw: u16) -> PromptLayout {
+        let sid = self.client_session(cid);
+        let t = sid.map(|s| self.sessions[&s].active_window()).map(|w| self.target_for_pane(self.windows[&w].active)).unwrap_or_default();
+        let flags = [(pr.single_key, "SINGLE"), (pr.numeric, "NUMERIC"), (pr.incremental || pr.copy_incremental.is_some(), "INCREMENTAL"), (pr.bspace_exit, "BSPACE_EXIT"), (pr.vi_command, "COMMANDMODE")];
+        let extra = HashMap::from([
+            ("prompt_input".to_string(), pr.input.iter().collect::<String>()),
+            ("prompt_flags".to_string(), flags.into_iter().filter_map(|(on, flag)| on.then_some(flag)).collect::<Vec<_>>().join(",")),
+            ("prompt_type".to_string(), if pr.search { "search" } else { "command" }.to_string()),
+            ("command_prompt".to_string(), if pr.vi_command { "1" } else { "0" }.to_string()),
+        ]);
+        let mut vars = super::vars::VarCtx { srv: self, t, client: Some(cid), extra };
+        let label = format::expand_time(&pr.label, &vars);
+        vars.extra.insert("message".to_string(), label);
+        let effective = format::expand_time(&self.opt_session(sid, if pr.vi_command { "message-command-style" } else { "message-style" }), &vars);
+        let style = self.style_option(&effective, Style::default(), t, Some(cid)).unwrap_or_default();
+        let (fill, align) = style_fill_align(&effective);
+        let expanded = format::expand_time(&self.opt_session(sid, "message-format"), &vars);
+        let spans = format::spans(&expanded, style);
+        let mut l = PromptLayout { spans, style, fill, ..PromptLayout::default() };
+        if aw == 0 {
+            return l;
+        }
+        let aw = aw as usize;
+        l.label_width = l.spans.iter().map(|s| format::width(&s.text)).sum::<usize>().min(aw);
+        let pcursor = prompt_width(&pr.input[..pr.cursor.min(pr.input.len())]);
+        let pwidth = prompt_width(&pr.input) + pr.quote_next as usize;
+        let avail = aw - l.label_width;
+        let mut cursor_x = l.label_width;
+        if avail > 0 {
+            let (offset, width) = if pcursor >= avail { (pcursor - avail + 1, avail) } else { (0, pwidth.min(avail)) };
+            l.input_offset = offset;
+            l.input_width = width;
+            cursor_x = l.label_width + pcursor - offset;
+        }
+        l.content_width = l.label_width + l.input_width;
+        if !pr.complete.is_empty() && pr.cursor == pr.input.len() && cursor_x < aw {
+            let width = format::width(&prompt_complete_display(&pr.complete)).min(aw - cursor_x);
+            l.content_width = l.content_width.max(cursor_x + width);
+        }
+        l.content_width = l.content_width.min(aw);
+        l.content_x = ax as usize + match align.as_str() {
+            "centre" | "absolute-centre" => (aw - l.content_width) / 2,
+            "right" => aw - l.content_width,
+            _ => 0,
+        };
+        l.input_x = l.content_x + l.label_width;
+        l.cursor_x = cursor_x + l.content_x;
+        l
+    }
+
+    /// prompt_draw: the prompt in columns ax..ax+aw of row y; returns the cursor column.
+    pub(crate) fn draw_prompt(&self, f: &mut Frame, cid: ClientId, pr: &Prompt, ax: u16, aw: u16, y: u16) -> u16 {
+        let l = self.prompt_layout(cid, pr, ax, aw);
+        let sy = l.style;
+        if let Some(bg) = l.fill {
+            for x in ax..ax + aw { f.set(x, y, Cell { text: " ".into(), style: Style { bg, ..Style::default() } }); }
+        }
+        if l.content_width == 0 {
+            return l.cursor_x as u16;
+        }
+        if l.label_width > 0 {
+            f.put_cells(l.content_x as u16, y, &format::layout_line(&l.spans, l.label_width, sy));
+        }
+        // input from offset, control characters as ^X
+        // and a '^' at the cursor while C-v waits for the key to quote
+        let (mut width, mut x) = (0, l.input_x);
+        let mut shown: Vec<char> = pr.input.clone();
+        if pr.quote_next { shown.insert(pr.cursor.min(pr.input.len()), '^'); }
+        for ch in &shown {
+            let (text, w) = prompt_char(*ch);
+            if width < l.input_offset { width += w; continue; }
+            if width + w > l.input_offset + l.input_width { break; }
+            width += w;
+            if text.len() == 2 && text.starts_with('^') {
+                f.set(x as u16, y, Cell { text: "^".into(), style: sy });
+                f.set(x as u16 + 1, y, Cell { text: text[1..].into(), style: sy });
+            } else {
+                f.set(x as u16, y, Cell { text, style: sy });
+                if w == 2 { f.set(x as u16 + 1, y, Cell { text: String::new(), style: sy }); }
+            }
+            x += w;
+        }
+        // prompt_draw_complete: the matches underlined after the input
+        if !pr.complete.is_empty() && pr.cursor == pr.input.len() && l.cursor_x >= l.content_x && l.cursor_x - l.content_x < l.content_width {
+            let avail = l.content_width - (l.cursor_x - l.content_x);
+            let st = Style { attrs: sy.attrs | UNDERLINE, ..sy };
+            let (mut x, mut used) = (l.cursor_x, 0);
+            for ch in prompt_complete_display(&pr.complete).chars() {
+                let w = ch.width().unwrap_or(0);
+                if used + w > avail { break; }
+                f.set(x as u16, y, Cell { text: ch.to_string(), style: st });
+                if w == 2 { f.set(x as u16 + 1, y, Cell { text: String::new(), style: st }); }
+                x += w;
+                used += w;
+            }
+        }
+        l.cursor_x as u16
     }
 
     pub fn render(&mut self, cid: ClientId) {

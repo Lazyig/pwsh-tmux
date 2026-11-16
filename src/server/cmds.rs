@@ -12,6 +12,11 @@ mod json;
 mod sort;
 mod vis;
 
+/// The names of all commands, for prompt completion.
+pub fn command_names() -> impl Iterator<Item = &'static str> {
+    COMMANDS.iter().map(|c| c.0)
+}
+
 /// (name, alias, flags without value, flags with value)
 const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("attach-session", "attach", "dErx", "cfst"),
@@ -2670,34 +2675,54 @@ impl Server {
             // ---------------------------------------------------------------- prompts & messages
             "command-prompt" => {
                 let cid = self.resolve_client(ctx, t)?;
+                if self.clients.get(&cid).is_some_and(|c| c.prompt.is_some()) {
+                    return Ok(Flow::Next);
+                }
                 let tt = self.current(&Ctx { client: Some(cid), ..ctx.clone() });
                 let template = o.rest.first().cloned().unwrap_or_else(|| "%1".into());
                 // -F: the template is a format, expanded now
                 let template = if o.has('F') { self.expand(tt, Some(cid), &template) } else { template };
-                // -l: one prompt and input taken literally, not split at commas
-                let split = |v: &str| -> Vec<String> { if o.has('l') { vec![v.to_string()] } else { v.split(',').map(String::from).collect() } };
-                let labels: Vec<String> = match o.get('p') {
-                    Some(p) => split(p).iter().map(|s| self.expand(tt, Some(cid), s)).collect(),
-                    None => vec![if o.rest.is_empty() { ":".into() } else { format!("({})", template.split_whitespace().next().unwrap_or("")) }],
+                // -l: one prompt and input taken literally, not split at commas; others
+                // get a space after the prompt, except the default ':' (prompts are
+                // formats expanded when drawn, inputs are expanded now)
+                let (labels, space): (Vec<String>, bool) = match o.get('p') {
+                    Some(p) if o.has('l') => (vec![p.to_string()], false),
+                    Some(p) => (p.split(',').map(String::from).collect(), true),
+                    None if o.rest.is_empty() => (vec![":".into()], false),
+                    None => (vec![format!("({})", template.split_whitespace().next().unwrap_or(""))], true),
                 };
                 let inits: Vec<String> = match o.get('I') {
-                    Some(i) => split(i).iter().map(|s| self.expand(tt, Some(cid), s)).collect(),
+                    Some(i) if o.has('l') => vec![self.expand(tt, Some(cid), i)],
+                    Some(i) => i.split(',').map(|s| self.expand(tt, Some(cid), s)).collect(),
                     None => Vec::new(),
                 };
-                let prompts: Vec<(String, String)> = labels.into_iter().enumerate().map(|(i, l)| (l, inits.get(i).cloned().unwrap_or_default())).collect();
-                let kind = if o.has('k') { PromptKind::Key } else { PromptKind::Command };
-                self.open_prompt(cid, kind, prompts, template, ctx.pane, o.has('N'), o.has('1'));
-                // -e: backspace on empty input closes the prompt; -C (keep updating panes) is
-                // how prompts behave here anyway
+                let prompts: Vec<(String, String)> = labels.into_iter().enumerate()
+                    .map(|(i, l)| (if space { format!("{l} ") } else { l }, inits.get(i).cloned().unwrap_or_default())).collect();
+                let search = match o.get('T') {
+                    None | Some("command") => false,
+                    Some("search") => true,
+                    Some(other) => return err(&format!("unknown type: {other}")),
+                };
+                let kind = if o.has('k') && !o.has('1') && !o.has('N') && !o.has('i') { PromptKind::Key } else { PromptKind::Command };
+                // -1, -N, -i, -k and -e exclude each other in this order
+                self.open_prompt(cid, kind, prompts, template, ctx.pane, o.has('N') && !o.has('1'), o.has('1'));
                 if let Some(pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
+                    pr.search = search;
+                    pr.incremental = o.has('i') && !o.has('1') && !o.has('N');
+                    if pr.incremental {
+                        // the -I text is kept for C-r/C-s, the prompt starts empty
+                        pr.last = pr.input.drain(..).collect();
+                        pr.cursor = 0;
+                    }
                     pr.bspace_exit = o.has('e') && !o.has('1') && !o.has('N') && !o.has('i') && !o.has('k');
                 }
+                self.prompt_incremental_start(cid);
+                // -C (keep updating panes) is how prompts behave here anyway
                 Ok(Flow::Next)
             }
             "confirm-before" => {
                 let cid = self.resolve_client(ctx, t)?;
                 let command = o.rest.first().ok_or("confirm-before needs a command")?.clone();
-                let tt = self.current(&Ctx { client: Some(cid), ..ctx.clone() });
                 // -c: the confirming key (printable ASCII), -y: Enter confirms too
                 let key = match o.get('c') {
                     Some(c) => match c.as_bytes() {
@@ -2706,12 +2731,13 @@ impl Server {
                     },
                     None => 'y',
                 };
+                // the prompt is a format expanded when drawn, followed by a space
                 let label = match o.get('p') {
-                    Some(p) => self.expand(tt, Some(cid), p),
+                    Some(p) => format!("{p} "),
                     None => {
                         // tmux names the first command, not the whole command line
                         let name = cmdparse::parse(&command).ok().and_then(|c| c.first().and_then(|c| c.first()).cloned()).map(|n| canonical(&n).map(String::from).unwrap_or(n));
-                        format!("Confirm '{}'? ({key}/n)", name.unwrap_or_else(|| command.clone()))
+                        format!("Confirm '{}'? ({key}/n) ", name.unwrap_or_else(|| command.clone()))
                     }
                 };
                 self.open_prompt(cid, PromptKind::Confirm, vec![(label, String::new())], command, ctx.pane, false, true);
@@ -3980,11 +4006,11 @@ impl Server {
     }
 
     pub fn open_prompt(&mut self, cid: ClientId, kind: PromptKind, prompts: Vec<(String, String)>, template: String, pane: Option<PaneId>, numeric: bool, single: bool) {
-        let (label, init) = prompts.first().cloned().unwrap_or_default();
-        let input: Vec<char> = init.chars().collect();
-        let cursor = input.len();
+        let mut pr = Prompt::new(kind, prompts, template, pane);
+        pr.numeric = numeric;
+        pr.single_key = single;
         if let Some(c) = self.clients.get_mut(&cid) {
-            c.prompt = Some(Prompt { vi_command: false, quote_next: false, copied: Vec::new(), kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false, confirm: ('y', false) });
+            c.prompt = Some(pr);
             c.dirty = true;
         }
     }
