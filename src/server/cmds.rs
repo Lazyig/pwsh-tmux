@@ -4795,26 +4795,6 @@ impl Server {
         self.set_pane_mode(pane, PaneMode::Tree(Box::new(tree)));
     }
 
-    /// Open or close a pane's own prompt (window_pane_set_prompt, window_pane_clear_prompt).
-    pub fn set_pane_prompt(&mut self, pane: PaneId, prompt: Option<Prompt>) {
-        let Some(p) = self.panes.get_mut(&pane) else { return };
-        p.prompt = prompt;
-        if let Some(wid) = self.window_of(pane) {
-            self.mark_window_dirty(wid);
-        }
-    }
-
-    /// The pane prompt a client's keys go to (server_client_handle_key): the active pane's,
-    /// else that of the first visible pane in the client's window that has one.
-    pub fn key_pane_prompt(&self, cid: ClientId) -> Option<PaneId> {
-        let w = self.windows.get(&self.client_window(cid)?)?;
-        let has = |p: PaneId| self.panes.get(&p).is_some_and(|p| p.prompt.is_some());
-        if has(w.active) {
-            return Some(w.active);
-        }
-        w.panes().into_iter().find(|p| has(*p) && (!w.zoomed || *p == w.active))
-    }
-
     /// CMD_RETURN_WAIT for the prompt `id` just opened (unless `background`): the
     /// queue goes on when that prompt is closed.
     fn prompt_wait(&self, cid: ClientId, id: u64, background: bool) -> Result<Flow, String> {
@@ -4837,13 +4817,15 @@ impl Server {
             || self.panes.values().any(|p| p.prompt.as_ref().is_some_and(|p| p.id == id)))
     }
 
+    /// window_pane_set_prompt: the pane's own prompt, drawn over its last line.
     pub fn set_pane_prompt(&mut self, pane: PaneId, pr: Prompt) {
-        if let Some(p) = self.panes.get_mut(&pane) {
-            p.prompt = Some(pr);
-        }
+        let ty = input::PROMPT_TYPES.get(pr.history_type).copied().unwrap_or("command");
+        let Some(p) = self.panes.get_mut(&pane) else { return };
+        p.prompt = Some(pr);
         if let Some(wid) = self.window_of(pane) {
             self.mark_window_dirty(wid);
         }
+        self.fire_pane_prompt("pane-prompt-opened", pane, ty);
     }
 
     /// Shows a status line prompt on a client; returns its id.

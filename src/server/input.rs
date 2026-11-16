@@ -871,7 +871,7 @@ impl Server {
         let pane = self.panes.contains_key(&pane).then_some(pane);
         match client {
             Some(c) => self.run_string(c, cmd, pane),
-            None => match crate::cmdparse::parse(cmd) {
+            None => match crate::cmdparse::parse(cmd).and_then(|c| c.iter().try_for_each(|c| self.check_parsed(c)).map(|_| c)) {
                 Ok(cmds) => self.run_queue(Queue { cmds: cmds.into(), ctx: Ctx { pane, ..Ctx::default() }, soft: 0 }),
                 Err(e) => log(&format!("mode command: {e}")),
             },
@@ -888,10 +888,7 @@ impl Server {
                 // choosing a pane in panes mode unzooms its window (window_panes_key)
                 if matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Panes(_))) {
                     if let Some(wid) = self.window_of(pane) {
-                        if self.windows[&wid].zoomed {
-                            self.windows.get_mut(&wid).unwrap().zoomed = false;
-                            self.apply_layout(wid);
-                        }
+                        self.unzoom_window(wid);
                     }
                 }
                 // like tmux, the mode is gone before the queued command runs
@@ -964,7 +961,7 @@ impl Server {
             }
         };
         let editor = Some(Box::new(super::modes::PopupEditor { path, command, buffer }));
-        self.replace_overlay(cid, Some(Overlay::Popup(super::modes::Popup { pane, x, y, w, h, border: true, close_on_exit: true, title: String::new(), editor })))?;
+        self.replace_overlay(cid, Some(Overlay::Popup(super::modes::Popup { pane, x, y, w, h, border: true, close_on_exit: true, close_any_key: false, title: String::new(), look: Default::default(), editor })))?;
         Ok(())
     }
 
@@ -1022,6 +1019,10 @@ impl Server {
                 if let Some(p) = self.panes.get_mut(&host) {
                     if p.prompt.is_none() { p.prompt = Some(pr); }
                 }
+            } else {
+                // window_pane_clear_prompt
+                let ty = PROMPT_TYPES.get(pr.history_type).copied().unwrap_or("command");
+                self.fire_pane_prompt("pane-prompt-closed", host, ty);
             }
             if let Some(wid) = self.window_of(host) { self.mark_window_dirty(wid); }
         } else if !pr.closed {

@@ -624,17 +624,27 @@ mod tests {
     fn tree_prefixes_use_theme_colours() {
         let (mut srv, pane) = with_pane();
         command(&mut srv, &["new-window", "-d", "sleep 30"]);
-        let mut tree = modes::Tree::new(modes::TreeKind::Windows, None, None, &srv, pane);
-        let lines = tree.render(&srv, 1, 80, 24);
+        command(&mut srv, &["choose-tree", "-w", "-t", &format!("%{pane}")]);
+        // theme names parsed without a client are drawn in the client's palette
+        let palette = ctx(&srv).theme_palette();
+        let render = |srv: &Server, h: u16| match srv.panes[&pane].mode.as_ref() {
+            Some(PaneMode::Tree(t)) => crate::format::with_draw_palette(palette, || t.render(srv, 80, h).0),
+            _ => panic!("not in tree mode"),
+        };
+        let lines = render(&srv, 24);
         let grey = ctx(&srv).theme_color("themelightgrey").unwrap();
         assert!(lines.iter().skip(1).flat_map(|l| &l.cells).any(|c| c.style.fg == grey));
-        tree.tagged.insert(tree.items[0].id.clone());
-        tree.sel = 1;
-        let tagged = tree.render(&srv, 1, 80, 24);
+        // t tags the current window ("0", selected when the mode opens): a tagged item's
+        // name and '*' are themecyan
+        srv.mode_key(pane, Some(1), "t");
+        let tagged = render(&srv, 24);
         let cyan = ctx(&srv).theme_color("themecyan").unwrap();
-        assert!(tagged[0].cells.iter().all(|c| c.style.fg == cyan));
-        tree.key("i", 10, &srv);
-        let lines = tree.render(&srv, 1, 80, 40);
+        let row = &tagged[1];
+        assert!(row.text().contains("0*: "), "{:?}", row.text());
+        let star = row.cells.iter().position(|c| c.text == "*").unwrap();
+        assert!(row.cells[star - 1..=star].iter().all(|c| c.style.fg == cyan));
+        srv.mode_key(pane, Some(1), "i");
+        let lines = render(&srv, 40);
         assert!(lines.iter().any(|l| l.text().contains("Window") && l.cells.iter().any(|c| c.text == "W" && c.style.fg == grey)));
         srv.shutdown();
     }

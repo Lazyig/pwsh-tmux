@@ -173,12 +173,11 @@ pub fn build(tree: &Tree, srv: &Server, b: &mut Builder, filter: Option<&str>) {
         if hooks {
             let names: Vec<&str> = options::HOOKS.iter().filter(|(_, s)| if table == OScope::Session { *s == OScope::Session } else { *s != OScope::Session }).map(|(n, _)| *n).collect();
             for name in names {
-                let session_hooks = t.sid.and_then(|s| srv.sessions.get(&s)).and_then(|s| s.hooks.get(name));
-                let (scope, cmds) = match session_hooks {
-                    Some(c) if table == OScope::Session => (Scope::Session(t.sid.unwrap()), c.clone()),
-                    _ => (if table == OScope::Session { Scope::GlobalSession } else { Scope::GlobalWindow }, srv.hooks.get(name).cloned().unwrap_or_default()),
-                };
-                count += add_option(tree, srv, b, top, scope, name, None, &cmds.iter().enumerate().map(|(i, c)| (i.to_string(), c.clone())).collect::<Vec<_>>(), true, filter);
+                // hooks are array options of the levels (the nearest that holds one, else
+                // the global level)
+                let Some(&(global, _)) = lv.last() else { continue };
+                let scope = lv.iter().find(|(_, st)| !st.array_items(name).is_empty()).map_or(global, |(sc, _)| *sc);
+                count += add_option(tree, srv, b, top, scope, name, None, &hook_items(srv, scope, name), true, filter);
             }
         } else {
             // user options first, then the table, by name
@@ -364,11 +363,8 @@ fn add_option(tree: &Tree, srv: &Server, b: &mut Builder, top: usize, scope: Sco
 /// The current value of an option item (an array element or a plain option).
 fn option_value(srv: &Server, scope: Scope, name: &str, key: Option<&str>, hook: bool) -> Option<String> {
     if hook {
-        let cmds = match scope {
-            Scope::Session(s) => srv.sessions.get(&s)?.hooks.get(name)?,
-            _ => srv.hooks.get(name)?,
-        };
-        return key.and_then(|k| k.parse::<usize>().ok()).and_then(|i| cmds.get(i).cloned());
+        let k = key?;
+        return hook_items(srv, scope, name).into_iter().find(|(i, _)| i == k).map(|(_, v)| v);
     }
     let store = match scope {
         Scope::Server => &srv.opts_server,
@@ -411,13 +407,27 @@ fn effective_value(srv: &Server, scope: Scope, name: &str) -> Option<String> {
 /// The values of an array option or hook in key order.
 fn array_values(srv: &Server, scope: Scope, name: &str, hook: bool) -> Vec<String> {
     if hook {
-        let cmds = match scope {
-            Scope::Session(s) => srv.sessions.get(&s).and_then(|x| x.hooks.get(name)),
-            _ => srv.hooks.get(name),
-        };
-        return cmds.cloned().unwrap_or_default();
+        return hook_items(srv, scope, name).into_iter().map(|(_, v)| v).collect();
     }
     store_of(srv, scope).map(|o| o.array_items(name).into_iter().map(|(_, v)| v).collect()).unwrap_or_default()
+}
+
+/// A hook's commands at one level, as (array index, command).
+fn hook_items(srv: &Server, scope: Scope, name: &str) -> Vec<(String, String)> {
+    store_of(srv, scope).map(|o| o.array_items(name).into_iter().map(|(k, v)| (k[name.len() + 1..k.len() - 1].to_string(), v)).collect()).unwrap_or_default()
+}
+
+/// The hook level of a customize scope.
+fn hook_level(scope: Scope) -> Option<crate::server::events::Level> {
+    use crate::server::events::Level;
+    Some(match scope {
+        Scope::GlobalSession => Level::GlobalSession,
+        Scope::Session(s) => Level::Session(s),
+        Scope::GlobalWindow => Level::GlobalWindow,
+        Scope::Window(w) => Level::Window(w),
+        Scope::Pane(p) => Level::Pane(p),
+        _ => return None,
+    })
 }
 
 fn store_of(srv: &Server, scope: Scope) -> Option<&options::Options> {
@@ -916,10 +926,10 @@ impl Writer<'_> {
     }
 }
 
-/// hook_fire_count and hook_fire_time of a hook (options_get_fire_count/time). The hook
-/// runner keeps these; until it does here, a hook counts as never fired.
-fn hook_fire(_srv: &Server, _scope: Scope, _name: &str) -> (u32, u64) {
-    (0, 0)
+/// hook_fire_count and hook_fire_time of a hook (hooks_monitor_get_fire_count/time), as
+/// the event runner keeps them.
+fn hook_fire(srv: &Server, scope: Scope, name: &str) -> (u32, u64) {
+    hook_level(scope).and_then(|l| srv.ev.fired.get(&(l, name.to_string())).copied()).unwrap_or((0, 0))
 }
 
 /// window_customize_write_hook_fire.

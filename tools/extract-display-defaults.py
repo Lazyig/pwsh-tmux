@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Extract tmux 3.8 prefix/root defaults, expanding C string macros.
 Usage: extract-display-defaults.py /path/to/tmux-3.8/key-bindings.c
-Floating pane and switch-mode bindings are maintained by their work packages.
+Floating pane bindings are maintained by their work package; the switch-mode
+bindings (Tab, BTab), which open a floating pane, are kept.
 """
 import ast
 import re
@@ -25,11 +26,11 @@ for line in lines:
 body = src.split('static const char *const defaults[] = {', 1)[1].split('/* Copy mode (emacs)', 1)[0]
 excluded = ('new-pane', 'move-pane', 'break-pane -W', 'floating_pane_flag', 'MouseDown1Control7')
 print('# Generated from tmux 3.8 key-bindings.c by tools/extract-display-defaults.py.')
-print('# Floating pane bindings and switch-mode Tab/BTab are owned by other packages.')
+print('# Floating pane bindings are owned by another package.')
 for line in body.splitlines():
     if not line.lstrip().startswith('"'):
         continue
     cmd = expand(line)
-    if '-Tmove' in cmd or any(x in cmd for x in excluded) and 'DEFAULT_' not in line:
+    if '-Tmove' in cmd or any(x in cmd for x in excluded) and 'DEFAULT_' not in line and 'switch-mode' not in cmd:
         continue
     print(cmd)

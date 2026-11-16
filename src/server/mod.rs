@@ -745,8 +745,6 @@ pub struct Prompt {
     pub bspace_exit: bool,
     /// confirm-before: the key that confirms (-c) and whether Enter does too (-y).
     pub confirm: (char, bool),
-    /// command-prompt -P: drawn on the last line of `pane` rather than the status line.
-    pub in_pane: bool,
 }
 
 impl Prompt {
@@ -2165,7 +2163,7 @@ impl Server {
         // Start at the top of the output.
         cm.run("history-top", &[]);
         // output replaces the view on top; any other mode stays under it
-        if let Some(p) = self.panes.get_mut(&pane).filter(|p| matches!(p.mode, Some(PaneMode::Copy(_)))) {
+        if let Some(p) = self.panes.get_mut(&pane).filter(|p| matches!(&p.mode, Some(PaneMode::Copy(c)) if c.is_view_mode())) {
             p.mode = Some(PaneMode::Copy(Box::new(cm)));
             if let Some(wid) = self.window_of(pane) {
                 self.mark_window_dirty(wid);

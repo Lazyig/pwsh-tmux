@@ -114,10 +114,6 @@ pub struct Modes {
     pub extkeys: u8,
 }
 
-pub fn draw_box(f: &mut Frame, x: u16, y: u16, w: u16, h: u16, style: Style, title: &str) {
-    draw_box_lines(f, x, y, w, h, style, title, "single");
-}
-
 /// Box characters for the *-border-lines options: horizontal, vertical, the corners
 /// (tl, tr, bl, br), a cross, the left and right ends of a separator, then the top and
 /// bottom junctions.

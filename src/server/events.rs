@@ -207,9 +207,6 @@ pub struct PaneSeen {
     pub wid: WinId,
     pub idx: Option<u32>,
     pub size: (u16, u16),
-    pub mode: String,
-    /// Modes seen under the current one (the pane's mode stack).
-    pub below: Vec<String>,
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -1639,13 +1636,12 @@ impl Server {
         let live: HashSet<PaneId> = panes.iter().map(|p| p.0).collect();
         self.ev.seen.panes.retain(|p, _| live.contains(p));
         self.ev.focused.retain(|p| live.contains(p));
-        let mut pane_changes: Vec<(PaneId, WinId, Option<u32>, String, PaneSeen)> = Vec::new();
+        let mut pane_changes: Vec<(PaneId, WinId, Option<u32>, PaneSeen)> = Vec::new();
         for (pane, wid) in panes {
             let Some(pp) = self.panes.get(&pane) else { continue };
             let size = pp.size;
-            let mode = super::vars::pane_mode_name(pp).to_string();
             let idx = self.session_of_pane(pane).map(|x| x.1);
-            let Some(old) = self.ev.seen.panes.insert(pane, PaneSeen { wid, idx, size, mode: mode.clone(), below: Vec::new() }) else {
+            let Some(old) = self.ev.seen.panes.insert(pane, PaneSeen { wid, idx, size }) else {
                 // a new pane starts at the window's size (window_pane_create) and is
                 // resized as it is laid out
                 let new = self.ev.spawned.iter().any(|s| s.pane == pane && !s.respawn);
@@ -1662,7 +1658,7 @@ impl Server {
                 p.int("width", size.0 as i64).int("height", size.1 as i64).int("old_width", old.size.0 as i64).int("old_height", old.size.1 as i64);
                 self.fire("pane-resized", p);
             }
-            pane_changes.push((pane, wid, idx, mode, old));
+            pane_changes.push((pane, wid, idx, old));
         }
         // panes spawned since: pane-created once they are in a window
         let spawned = std::mem::take(&mut self.ev.spawned);
@@ -1759,7 +1755,7 @@ impl Server {
         let order = std::mem::take(&mut self.ev.pane_move_order);
         let mut moved: Vec<_> = pane_changes.iter().collect();
         moved.sort_by_key(|(pane, ..)| order.iter().position(|p| p == pane).unwrap_or(order.len()));
-        for (pane, wid, idx, _, old) in moved {
+        for (pane, wid, idx, old) in moved {
             let (pane, wid, idx) = (*pane, *wid, *idx);
             if old.wid != wid {
                 let mut p = self.payload_pane(pane);
@@ -1814,42 +1810,8 @@ impl Server {
                 }
             }
         }
-        for (pane, _, _, mode, old) in pane_changes {
-            let mut below = old.below.clone();
-            // window_pane_reset_mode pops back to the mode under it: exited, with the
-            // next mode current; anything else on top of a mode was pushed
-            let entered = match (old.mode.is_empty(), mode.is_empty()) {
-                _ if old.mode == mode => false,
-                (_, true) => {
-                    below.clear();
-                    false
-                }
-                (true, false) => true,
-                (false, false) if below.last() == Some(&mode) => {
-                    below.pop();
-                    false
-                }
-                (false, false) => {
-                    below.push(old.mode.clone());
-                    true
-                }
-            };
-            if let Some(seen) = self.ev.seen.panes.get_mut(&pane) {
-                seen.below = below;
-            }
-            if old.mode != mode {
-                let mut p = self.payload_pane(pane);
-                if !mode.is_empty() {
-                    p.str("current_mode", mode.clone());
-                }
-                if !old.mode.is_empty() {
-                    p.str("previous_mode", old.mode.clone());
-                }
-                p.int("mode_entered", entered as i64);
-                self.fire(if entered { "pane-mode-entered" } else { "pane-mode-exited" }, p.clone());
-                self.fire("pane-mode-changed", p);
-            }
-        }
+        // pane-mode-entered/exited/changed fire where the mode changes (set_pane_mode,
+        // raise_mode, exit_mode), as window_fire_pane_mode_changed does
         // focus changes where tmux updates it: active panes and windows, overlays,
         // attaching and focus reports (not when a client goes)
         let overlays: HashMap<ClientId, bool> = self.clients.values().map(|c| (c.id, c.overlay.is_some())).collect();
@@ -2200,9 +2162,8 @@ impl Server {
         }
     }
 
-    /// Called by a pane prompt's owner on opening, replacing and closing it.
-    /// Status-line prompts do not fire these events (window_fire_pane_prompt).
-    #[allow(dead_code)]
+    /// pane-prompt-opened and pane-prompt-closed (window_fire_pane_prompt), from
+    /// set_pane_prompt and prompt_done_key. Status-line prompts do not fire these events.
     pub fn fire_pane_prompt(&mut self, name: &str, pane: PaneId, prompt_type: &str) {
         if self.window_of(pane).is_none() {
             return;

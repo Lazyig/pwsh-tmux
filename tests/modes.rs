@@ -41,10 +41,13 @@ fn switch_mode_filters_and_switches() {
     t.wait_screen("window list", |s| s.contains("target-win gamma:0"));
     t.send(b"\x1b");
     wait_for("escape", || ctx.fmt("gamma", "#{pane_in_mode}") == "0");
-    // the default bindings open it in a new pane (Tab windows, BTab sessions)
+    // the default bindings open it in a new pane (Tab windows, BTab sessions); list-keys
+    // prints them in canonical form once new-pane (floating panes) exists
     let keys = ctx.ok(&["list-keys", "-T", "prefix"]);
-    assert!(keys.lines().any(|l| l.contains(" Tab ") && l.contains("switch-mode -kw")), "{keys}");
-    assert!(keys.lines().any(|l| l.contains(" BTab ") && l.contains("switch-mode -ks")), "{keys}");
+    let floating = !ctx.ok(&["list-commands", "new-pane"]).trim().is_empty();
+    let (w, s) = if floating { ("switch-mode -kw", "switch-mode -ks") } else { ("switch-mode -wk", "switch-mode -sk") };
+    assert!(keys.lines().any(|l| l.contains(" Tab ") && l.contains(w)), "{keys}");
+    assert!(keys.lines().any(|l| l.contains(" BTab ") && l.contains(s)), "{keys}");
 }
 
 #[test]
