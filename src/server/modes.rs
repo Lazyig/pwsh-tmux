@@ -46,6 +46,9 @@ pub enum ModeAction {
     /// Open `value` in the editor and run `command` (%% is the new text) when it closes,
     /// or replace the contents of paste buffer `buffer` with it.
     Edit { value: Vec<u8>, command: String, buffer: Option<String> },
+    /// mode_tree_display_menu: a menu at (x, y) in the pane whose items are keys for the
+    /// mode, as (name, key shown, key sent).
+    Menu { title: String, items: Vec<(&'static str, &'static str, &'static str)>, x: u16, y: u16 },
 }
 
 /// Which of session_format, window_format and pane_format a format sees as set (the type

@@ -695,3 +695,32 @@ fn choose_client_info_view_has_window_client_info_lines() {
     assert!(c.contains("(cell ") && c.contains(" discarded)"), "{c}");
     t.send(b"q");
 }
+
+#[test]
+fn mode_tree_right_click_menus_send_keys_to_the_mode() {
+    let ctx = Ctx::new("mode-menu");
+    let t = start(&ctx, "mm");
+    ctx.ok(&["set", "-g", "mouse", "on"]);
+    ctx.ok(&["set", "-g", "status-position", "bottom"]);
+    ctx.ok(&["new-window", "-d", "-t", "mm", "-n", "second"]);
+    ctx.ok(&["choose-tree", "-w", "-t", "mm"]);
+    t.wait_screen("tree", |s| s.contains("1: second"));
+    // right press on an item: its menu, titled with the item's name, with the keys
+    let row = t.contents().lines().position(|l| l.contains("1: second")).unwrap() as u16;
+    t.mouse(2, 10, row, false);
+    t.wait_screen("menu", |s| s.contains("Tag All ([DC4])") && s.contains("Kill Tagged (X)") && s.contains("─1─"));
+    // Tag sends t for that item
+    let tag = t.contents().lines().position(|l| l.contains("│ Tag ") && l.contains("(t)")).unwrap() as u16;
+    t.mouse(0, 6, tag, false);
+    t.mouse(0, 6, tag, true);
+    t.wait_screen("tagged", |s| s.contains("second*") || s.contains("1*:") || s.lines().any(|l| l.contains("1: second") && l.contains('*')));
+    // outside the list: the menu that scrolls the previews; Cancel leaves the mode
+    t.mouse(2, 50, 30, false);
+    t.wait_screen("outside menu", |s| s.contains("Scroll Left") && s.contains("Scroll Right"));
+    let cancel = t.contents().lines().position(|l| l.contains("Cancel")).unwrap() as u16;
+    let r = t.row(cancel);
+    let col = r[..r.find("Cancel").unwrap()].chars().count() as u16;
+    t.mouse(0, col, cancel, false);
+    t.mouse(0, col, cancel, true);
+    wait_for("cancelled", || ctx.fmt("mm", "#{pane_in_mode}") == "0");
+}

@@ -118,7 +118,8 @@ pub fn draw_box(f: &mut Frame, x: u16, y: u16, w: u16, h: u16, style: Style, tit
         let spans = format::spans(title, style);
         let cells = spans_cells(&spans, w.saturating_sub(4) as usize, style);
         let start = match spans.first().map(|s| s.align) {
-            Some(format::Align::Centre | format::Align::AbsoluteCentre) => x + (w.saturating_sub(cells.len() as u16)) / 2,
+            // format_draw from x + 2 in w - 4 cells: the centre is available / 2 - width / 2
+            Some(format::Align::Centre | format::Align::AbsoluteCentre) => x + 2 + (w - 4) / 2 - (cells.len() as u16 / 2).min((w - 4) / 2),
             Some(format::Align::Right) => x + w - 2 - cells.len() as u16,
             _ => x + 2,
         };
@@ -126,8 +127,6 @@ pub fn draw_box(f: &mut Frame, x: u16, y: u16, w: u16, h: u16, style: Style, tit
     }
 }
 
-/// One prompt line (label, then the input scrolled to keep the cursor in view) from `x` up to
-/// `right`; returns where the cursor goes.
 fn push_color(out: &mut String, c: Color, base: u8) {
     match c {
         Color::Default => {}

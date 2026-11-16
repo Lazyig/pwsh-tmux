@@ -1291,6 +1291,9 @@ impl Tree {
         (self.cur, self.offset) = self.resolve(&b, height);
         let (x, y) = (x as usize, y as usize);
         if x > w || y >= height {
+            if key == "MouseDown3Pane" {
+                return self.menu(&b, true, x, y);
+            }
             // the preview: clicking a window or pane in a session or window preview chooses it
             if self.kind == TreeKind::Tree && key == "MouseDown1Pane" && self.preview != Preview::Off && !self.info {
                 return self.preview_click(srv, &b, x, w);
@@ -1308,13 +1311,48 @@ impl Tree {
                     if key == "DoubleClick1Pane" {
                         return self.key("Enter", srv, w, h);
                     }
+                    if key == "MouseDown3Pane" {
+                        return self.menu(&b, false, x, y);
+                    }
                 }
                 "WheelUpPane" => return self.key("Up", srv, w, h),
                 "WheelDownPane" => return self.key("Down", srv, w, h),
                 _ => {}
             }
+        } else if key == "MouseDown3Pane" {
+            return self.menu(&b, false, x, y);
         }
         ModeAction::None
+    }
+
+    /// mode_tree_display_menu: the mode's menu for the current item, or (outside the list)
+    /// the one that scrolls the previews.
+    fn menu(&self, b: &Built, outside: bool, x: usize, y: usize) -> ModeAction {
+        const LINE: (&str, &str, &str) = ("", "", "");
+        const TAGS: [(&str, &str, &str); 3] = [("Tag", "t", "t"), ("Tag All", "[DC4]", "C-t"), ("Tag None", "T", "T")];
+        const CANCEL: (&str, &str, &str) = ("Cancel", "q", "q");
+        let items: Vec<(&'static str, &'static str, &'static str)> = if outside {
+            vec![("Scroll Left", "<", "<"), ("Scroll Right", ">", ">"), LINE, CANCEL]
+        } else {
+            let mut v = match self.kind {
+                TreeKind::Tree => vec![("Select", "Enter", "Enter"), ("Expand", "Right", "Right"), ("Mark", "m", "m"), LINE],
+                TreeKind::Buffers => vec![("Paste", "p", "p"), ("Paste Tagged", "P", "P"), LINE],
+                TreeKind::Clients => vec![("Detach", "d", "d"), ("Detach Tagged", "D", "D"), LINE],
+                TreeKind::Options => vec![("Select", "Enter", "Enter"), ("Edit", "e", "e"), ("Expand", "Right", "Right"), LINE],
+            };
+            v.extend(TAGS);
+            v.push(LINE);
+            match self.kind {
+                TreeKind::Tree => v.extend([("Kill", "x", "x"), ("Kill Tagged", "X", "X"), LINE]),
+                TreeKind::Buffers => v.extend([("Delete", "d", "d"), ("Delete Tagged", "D", "D"), LINE]),
+                TreeKind::Options => v.extend([("Changed Only", "C", "C"), LINE]),
+                TreeKind::Clients => {}
+            }
+            v.push(CANCEL);
+            v
+        };
+        let title = if outside { String::new() } else { b.lines.get(self.cur).map(|l| format!("#[align=centre]{}", b.nodes[l.item].name)).unwrap_or_default() };
+        ModeAction::Menu { title, items, x: x as u16, y: y as u16 }
     }
 
     fn preview_click(&mut self, srv: &Server, b: &Built, x: usize, w: usize) -> ModeAction {

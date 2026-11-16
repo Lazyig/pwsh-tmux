@@ -566,6 +566,28 @@ impl Server {
                 self.run_mode_command(client, &cmd, pane);
             }
             ModeAction::RunKeep(cmd) => self.run_mode_command(client, &cmd, pane),
+            ModeAction::Menu { title, items, x, y } => {
+                // the items send their key to the mode (mode_tree_menu_callback)
+                let mode = self.panes.get(&pane).and_then(|p| p.mode.as_ref()).map(|m| m.name().to_string()).unwrap_or_default();
+                let items: Vec<super::modes::MenuItem> = items
+                    .into_iter()
+                    .map(|(name, key, send)| super::modes::MenuItem {
+                        name: name.to_string(),
+                        key: key.to_string(),
+                        cmd: if name.is_empty() { String::new() } else { format!("if-shell -F -t '%{pane}' '#{{==:#{{pane_mode}},{mode}}}' \"send-keys -t '%{pane}' {send}\"") },
+                    })
+                    .collect();
+                if let (Some(wid), Some(r)) = (self.window_of(pane), self.pane_rect(pane)) {
+                    let (w, h) = super::modes::Menu::box_size(&title, &items);
+                    let x = if x >= w / 2 { x - w / 2 } else { 0 } + r.x;
+                    let y = y + r.y;
+                    // menu_prepare: inside the window
+                    let (wsx, wsy) = self.windows.get(&wid).map_or((0, 0), |w| (w.sx, w.sy));
+                    let fit = |p: u16, size: u16, total: u16| if size >= total { 0 } else if p + size > total { total - size } else { p };
+                    let menu = super::modes::Menu::at(title, items, fit(x, w, wsx), fit(y, h, wsy), Some(pane), false, false, None);
+                    self.set_window_menu(wid, Some(menu));
+                }
+            }
             ModeAction::Edit { value, command, buffer } => {
                 if let Some(c) = client {
                     if let Err(e) = self.open_editor(c, &value, command, buffer) {
