@@ -45,9 +45,10 @@ const GRID_EXTD: usize = 23;
 fn history_usage(screen: &vt100::Screen) -> (usize, usize, usize) {
     let width = screen.size().1.get() as usize;
     let (mut cells, mut ext) = (0, 0);
-    let lines = screen.history_rows_len();
+    // the base grid: the normal screen's history also while the alternate screen is on
+    let lines = screen.base_history_len();
     for i in 0..lines {
-        let Some(row) = screen.history_row(i) else { continue };
+        let Some(row) = screen.base_history_row(i) else { continue };
         let mut used = 0;
         for x in 0..width {
             let Some(c) = row.cell(x as u16) else { break };
@@ -605,8 +606,9 @@ impl Vars for VarCtx<'_> {
             "cursor_y" => pane.map(|p| p.screen().cursor_position().0.to_string()),
             "cursor_flag" => pane.map(|p| b(!p.screen().hide_cursor())),
             "alternate_on" => pane.map(|p| b(p.screen().alternate_screen())),
-            "history_size" => pane.map(|p| p.screen().scrollback_len().to_string()),
-            "history_limit" => pane.map(|p| p.screen().scrollback_capacity().to_string()),
+            // wp->base.grid: the normal screen's history, also on the alternate screen
+            "history_size" => pane.map(|p| p.screen().base_scrollback().0.to_string()),
+            "history_limit" => pane.map(|p| p.screen().base_scrollback().1.to_string()),
             // copy mode (window_copy_formats)
             _ if super::copy::is_copy_var(name) => t.pane.and_then(|p| self.srv.copy_var(p, name)),
             "mouse_x" | "mouse_y" | "mouse_word" | "mouse_line" | "mouse_hyperlink" | "mouse_status_line" | "mouse_status_range" | "mouse_pane" => {

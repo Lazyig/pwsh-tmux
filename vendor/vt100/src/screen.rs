@@ -816,6 +816,34 @@ impl Screen {
         self.grid().absolute_row(index).map(crate::capture::RowContents)
     }
 
+    /// tmux's base grid (wp->base.grid) as the history formats see it: the
+    /// normal screen's history, then the visible rows of the active screen
+    /// (tmux swaps the alternate screen into the base grid's visible area).
+    #[must_use]
+    pub fn base_history_len(&self) -> usize {
+        self.grid.scrollback_len() + usize::from(self.grid().size().rows.get())
+    }
+
+    /// Normal screen history limit and length, also while the alternate
+    /// screen is active.
+    #[must_use]
+    pub fn base_scrollback(&self) -> (usize, usize) {
+        (self.grid.scrollback_len(), self.grid.scrollback_capacity())
+    }
+
+    /// Row `index` of [`Screen::base_history_len`].
+    #[must_use]
+    pub fn base_history_row(&self, index: usize) -> Option<crate::capture::RowContents<'_>> {
+        let history = self.grid.scrollback_len();
+        if index < history {
+            self.grid.absolute_row(index)
+        } else {
+            let g = self.grid();
+            g.absolute_row(g.scrollback_len() + index - history)
+        }
+        .map(crate::capture::RowContents)
+    }
+
     /// Visible row `row` of the normal screen while the alternate screen is
     /// active (tmux's saved grid, read by `capture-pane -a`); `None` otherwise.
     #[must_use]
