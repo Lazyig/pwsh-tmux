@@ -122,6 +122,14 @@ pub fn canonical(name: &str) -> Option<&'static str> {
 
 /// The command given to spawn_pane for a pane without a process (-E, or an empty command).
 pub const EMPTY_PANE: &str = "\u{1}empty-pane";
+/// An empty pane from a single empty argument: its argv stays [""] (pane-created's
+/// pane_command is `''`).
+pub const EMPTY_PANE_ARG: &str = "\u{1}empty-pane-arg";
+
+/// Whether a spawn command is one of the empty pane markers.
+pub fn is_empty_pane(cmd: &[String]) -> bool {
+    matches!(cmd, [one] if one == EMPTY_PANE || one == EMPTY_PANE_ARG)
+}
 
 /// The command for a new pane: -E (or a single empty argument, or `input` for split-window
 /// -I) makes an empty pane, which can't also be given a command.
@@ -131,7 +139,11 @@ fn spawn_command(o: &Opts, input: bool) -> Result<Vec<String>, String> {
     if empty && !o.rest.is_empty() && !empty_arg {
         return err("command cannot be given for empty pane");
     }
-    Ok(if empty { vec![EMPTY_PANE.to_string()] } else { o.rest.clone() })
+    Ok(match (empty, empty_arg) {
+        (true, true) => vec![EMPTY_PANE_ARG.to_string()],
+        (true, false) => vec![EMPTY_PANE.to_string()],
+        _ => o.rest.clone(),
+    })
 }
 
 /// Store a command option (default-client-command, hooks) the way tmux parses
@@ -999,31 +1011,34 @@ impl Server {
 
     // ---- buffers ---------------------------------------------------------------------------
 
-    pub fn add_buffer(&mut self, name: Option<String>, data: Vec<u8>, append: bool) {
+    /// paste_set / paste_add. A named buffer is replaced by a new one (the old one is
+    /// freed first, firing paste-buffer-deleted); `append` keeps the old data in front.
+    /// tmux appends only to a named buffer: without -b a new automatic one is added.
+    pub fn add_buffer(&mut self, name: Option<String>, mut data: Vec<u8>, append: bool) {
         if let Some(n) = &name {
-            if let Some(b) = self.buffers.iter_mut().find(|b| &b.name == n) {
+            if let Some(pos) = self.buffers.iter().position(|b| &b.name == n) {
+                let old = self.buffers.remove(pos);
                 if append {
-                    b.data.extend(data);
-                } else {
-                    b.data = data;
+                    let mut joined = old.data;
+                    joined.extend(data);
+                    data = joined;
                 }
-                let n = b.name.clone();
-                self.buffer_event(&n, false);
-                return;
-            }
-        } else if append {
-            if let Some(b) = self.buffers.first_mut() {
-                b.data.extend(data);
-                let n = b.name.clone();
-                self.buffer_event(&n, false);
+                self.buffer_event(&old.name, true);
+                self.buffers.insert(0, Buffer { name: n.clone(), data, automatic: false, created: now_secs() });
+                self.buffer_event(n, false);
                 return;
             }
         }
+        if data.is_empty() {
+            return;
+        }
         let automatic = name.is_none();
-        let name = name.unwrap_or_else(|| {
+        let name = name.unwrap_or_else(|| loop {
             let n = format!("buffer{}", self.buffer_seq);
             self.buffer_seq += 1;
-            n
+            if !self.buffers.iter().any(|b| b.name == n) {
+                break n;
+            }
         });
         let limit = self.opt_server_num("buffer-limit").max(1) as usize;
         // paste_add frees the oldest automatic buffers first
@@ -1494,7 +1509,7 @@ impl Server {
                 let cwd = o.get('c').map(|c| self.expand(self.current(ctx), ctx.client, c)).or_else(|| Some(s.cwd.clone()));
                 let pane = self.spawn_pane(Some(sid), sx, sy, &command, cwd.as_deref(), &env)?;
                 let name = o.get('n').map(|n| self.expand(self.current(ctx), ctx.client, n));
-                let named = if command.first().is_some_and(|c| c == EMPTY_PANE) { &[][..] } else { &command[..] };
+                let named = if is_empty_pane(&command) { &[][..] } else { &command[..] };
                 let wname = name.clone().unwrap_or_else(|| self.window_name_for(named, Some(sid)));
                 let wid = self.new_window_obj(wname, pane, sx, sy);
                 if name.is_some() {
@@ -2988,11 +3003,27 @@ impl Server {
             "set-buffer" => {
                 let name = o.get('b').map(String::from);
                 if let Some(newname) = o.get('n') {
-                    let b = match &name {
-                        Some(n) => self.buffers.iter_mut().find(|b| &b.name == n),
-                        None => self.buffers.first_mut(),
+                    let pos = match &name {
+                        Some(n) => self.buffers.iter().position(|b| &b.name == n).ok_or_else(|| format!("unknown buffer: {n}"))?,
+                        None if self.buffers.is_empty() => return err("no buffer"),
+                        None => 0,
+                    };
+                    if newname.is_empty() {
+                        return err("new name is empty");
                     }
-                    .ok_or("no buffer")?;
+                    if self.buffers[pos].name == newname {
+                        return Ok(Flow::Next);
+                    }
+                    // paste_rename frees a buffer that already has the new name
+                    let mut pos = pos;
+                    if let Some(other) = self.buffers.iter().position(|b| b.name == newname) {
+                        let gone = self.buffers.remove(other);
+                        self.buffer_event(&gone.name, true);
+                        if other < pos {
+                            pos -= 1;
+                        }
+                    }
+                    let b = &mut self.buffers[pos];
                     let old = std::mem::replace(&mut b.name, newname.to_string());
                     b.automatic = false;
                     self.buffer_event(&old, true);

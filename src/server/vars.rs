@@ -956,6 +956,8 @@ mod tests {
         assert_eq!(super::super::osc133_exit_status("D;3;aid=1"), 3);
         assert_eq!(super::super::osc133_exit_status("D;err=x"), 0);
         assert_eq!(super::super::osc133_exit_status("D;256"), 255);
+        assert_eq!(super::super::osc133_exit_status("D; 3"), 3);
+        assert_eq!(super::super::osc133_exit_status("D;3 "), 255);
     }
 
     #[test]

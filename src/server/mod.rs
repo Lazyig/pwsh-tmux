@@ -186,6 +186,8 @@ fn osc133_exit_status(arg: &str) -> i32 {
     if field.is_empty() || field.contains('=') {
         return 0;
     }
+    // strtonum (strtoll) skips leading white space
+    let field = field.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
     field.parse::<i32>().ok().filter(|n| (0..=255).contains(n)).unwrap_or(255)
 }
 
@@ -1956,7 +1958,8 @@ impl Server {
     pub fn spawn_into(&mut self, id: PaneId, generation: u32, sid: Option<SessId>, cols: u16, rows: u16, cmd: &[String], cwd: Option<&str>, extra_env: &[(String, String)]) -> Result<(), String> {
         let (cols, rows) = (cols.max(1), rows.max(1));
         // an empty pane (new-window -E and friends) gets a terminal but no process
-        let empty = matches!(cmd, [one] if one == cmds::EMPTY_PANE);
+        let empty = cmds::is_empty_pane(cmd);
+        let empty_arg = empty && cmd[0] == cmds::EMPTY_PANE_ARG;
         let cmd: &[String] = if empty { &[] } else { cmd };
         let shell = self.opt_session(sid, "default-shell");
         let shell = if shell.is_empty() { procinfo::default_shell() } else { shell };
@@ -2083,7 +2086,15 @@ impl Server {
             release(old); // respawn: the old pty
         }
         // pane-created fires once the pane is in a window (popups never are)
-        let command = if !cmd.is_empty() { events::stringify_argv(cmd) } else if !default_cmd.is_empty() { default_cmd } else { shell };
+        let command = if empty_arg {
+            events::stringify_argv(&[String::new()])
+        } else if !cmd.is_empty() {
+            events::stringify_argv(cmd)
+        } else if !default_cmd.is_empty() {
+            default_cmd
+        } else {
+            shell
+        };
         self.ev.spawned.push(events::Spawned { pane: id, respawn, empty, command, cwd: dir_for_event });
         Ok(())
     }
@@ -2540,7 +2551,7 @@ impl Server {
             match events::hook_mark_kind(&cmd) {
                 Some(true) => depth += 1,
                 Some(false) if depth == 0 => {
-                    events::apply_hook_mark(&cmd, &mut q.ctx, saved);
+                    events::apply_hook_mark(&cmd, &mut q.ctx, saved, &mut q.soft);
                     return;
                 }
                 Some(false) => depth -= 1,
@@ -2562,7 +2573,7 @@ impl Server {
         while let Some(cmd) = q.cmds.pop_front() {
             let name = cmd.first().cloned().unwrap_or_default();
             if events::hook_mark_kind(&cmd).is_some() {
-                events::apply_hook_mark(&cmd, &mut q.ctx, &mut hook_saved);
+                events::apply_hook_mark(&cmd, &mut q.ctx, &mut hook_saved, &mut q.soft);
                 continue;
             }
             let soft = q.soft > 0;

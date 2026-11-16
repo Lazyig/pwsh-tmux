@@ -1661,3 +1661,96 @@ fn tmux_38_selection_after_hooks() {
     assert_eq!(ctx.ok(&["show", "-gv", "@sel"]).trim(), "PWWW");
     assert_eq!(ctx.ok(&["show", "-gv", "@title"]).trim(), "TT");
 }
+
+/// Hook commands inserted into a sourced file take none of its error allowance, and
+/// after hooks need a session: config lines before the first session fire none.
+#[test]
+fn tmux_38_hooks_in_sourced_files() {
+    let ctx = Ctx::new("hooksrc");
+    let dir = std::env::temp_dir().join(format!("{}-files", ctx.socket));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("lines.conf");
+    std::fs::write(&file, "set -g @a 1\nset -g @b 1\nset -g @c 1\nselectw -t :99\nset -g @z 1\n").unwrap();
+    let startup = dir.join("startup.conf");
+    std::fs::write(&startup, "set-hook -g after-set-option 'set -Fga @log \"aso:#{hook_argument_0} \"'\nset -g @a 1\nselectw -t :98\nselectw -t :97\nnew -d -s cfg\nset -g @b 1\n").unwrap();
+    let file = file.to_str().unwrap().to_string();
+    ctx.ok(&["new-session", "-d", "-s", "s"]);
+    ctx.ok(&["set-hook", "-g", "after-set-option", "set -ga @log 'aso '"]);
+    let _ = ctx.cmd(&["source-file", &file]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@z"]).trim(), "1");
+    ctx.ok(&["set-hook", "-gu", "after-set-option"]);
+    ctx.ok(&["set-hook", "-g", "command-error", "set -ga @log 'err '"]);
+    std::fs::write(&file, "selectw -t :91\nselectw -t :92\nselectw -t :93\nselectw -t :94\nselectw -t :95\nset -g @x 1\nset -g @y 1\n").unwrap();
+    let _ = ctx.cmd(&["source-file", &file]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@x"]).trim(), "1");
+    assert_eq!(ctx.ok(&["show", "-gv", "@y"]).trim(), "1");
+    ctx.ok(&["kill-server"]);
+    let ctx = Ctx::new("hookstart");
+    let out = ctx.command().args(["-f", startup.to_str().unwrap(), "new-session", "-d", "-s", "main"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let log = ctx.ok(&["show", "-gv", "@log"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(log.trim(), "aso:@b");
+}
+
+/// set-hook with a command that does not parse still empties the hook; a second
+/// wait-for -S uses up the remembered signal; replacing or renaming over a named
+/// buffer frees the old one first.
+#[test]
+fn tmux_38_hook_arrays_channels_and_buffers() {
+    let ctx = Ctx::new("hookarr");
+    ctx.ok(&["new-session", "-d", "-s", "a"]);
+    ctx.ok(&["set-hook", "-g", "window-renamed[0]", "display -p good"]);
+    ctx.ok(&["set-hook", "-g", "window-renamed[5]", "display -p five"]);
+    assert!(ctx.fails(&["set-hook", "-g", "window-renamed", "nosuchcmd"]).contains("unknown command: nosuchcmd"));
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "window-renamed"]).trim(), "window-renamed");
+    ctx.ok(&["set-hook", "-g", "window-renamed[0]", "display -p good"]);
+    assert!(ctx.fails(&["set", "-g", "window-renamed", "nosuchcmd"]).contains("unknown command"));
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "window-renamed"]).trim(), "window-renamed");
+    // -a keeps what is there
+    ctx.ok(&["set-hook", "-g", "window-renamed[0]", "display -p good"]);
+    assert!(ctx.fails(&["set-hook", "-ga", "window-renamed", "nosuchcmd"]).contains("unknown command"));
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "window-renamed"]).trim(), "window-renamed[0] display-message -p good");
+
+    ctx.ok(&["wait-for", "-S", "c1"]);
+    ctx.ok(&["wait-for", "-S", "c1"]);
+    let mut child = ctx.command().args(["wait-for", "c1"]).spawn().unwrap();
+    wait_for("waiting after two signals", || !ctx.ok(&["wait-for", "-l", "c1"]).is_empty());
+    ctx.ok(&["wait-for", "-S", "c1"]);
+    wait_for("woken", || child.try_wait().unwrap().is_some());
+
+    {
+        use std::io::{BufRead, BufReader};
+        use std::sync::{Arc, Mutex};
+        let mut child = ctx.command().args(["-C", "attach", "-t", "a"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let out = Arc::new(Mutex::new(String::new()));
+        let stdout = child.stdout.take().unwrap();
+        let o = out.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if line.starts_with("%paste-buffer") {
+                    o.lock().unwrap().push_str(&(line + "\n"));
+                }
+            }
+        });
+        wait_for("attached", || ctx.ok(&["list-clients"]).contains("a"));
+        ctx.ok(&["set-buffer", "-b", "b1", "one"]);
+        ctx.ok(&["set-buffer", "-b", "b1", "two"]);
+        ctx.ok(&["set-buffer", "-a", "-b", "b1", "three"]);
+        ctx.ok(&["set-buffer", "-b", "b2", "other"]);
+        ctx.ok(&["set-buffer", "-b", "b1", "-n", "b2"]);
+        let want = "%paste-buffer-changed b1\n%paste-buffer-deleted b1\n%paste-buffer-changed b1\n%paste-buffer-deleted b1\n%paste-buffer-changed b1\n%paste-buffer-changed b2\n%paste-buffer-deleted b2\n%paste-buffer-deleted b1\n%paste-buffer-changed b2\n";
+        wait_for("buffer notifications", || out.lock().unwrap().len() >= want.len());
+        assert_eq!(out.lock().unwrap().as_str(), want);
+        child.kill().unwrap();
+        let _ = child.wait();
+    }
+    // without -b, -a adds a new automatic buffer
+    ctx.ok(&["set-buffer", "auto1"]);
+    ctx.ok(&["set-buffer", "-a", "auto2"]);
+    assert_eq!(ctx.ok(&["list-buffers", "-F", "#{buffer_sample}"]), "auto2\nauto1\ntwothree\n");
+    // pane-created reports a single empty argument as ''
+    ctx.ok(&["set-hook", "-g", "pane-created", "set -gF @pc '#{hook_pane_command}|#{hook_created_empty}'"]);
+    ctx.ok(&["split-window", "-d", "-t", "a", ""]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@pc"]).trim(), "''|1");
+}

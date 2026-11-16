@@ -719,6 +719,11 @@ impl Server {
         let t = flags.get(&'t').and_then(|v| v.iter().rev().flatten().next())
             .and_then(|t| self.resolve_pane(ctx, Some(t)).or_else(|_| self.resolve_window(ctx, Some(t))).ok())
             .unwrap_or_else(|| self.current(ctx));
+        // cmdq_fire_command: an after hook needs a valid target (no session, as in a
+        // startup config, means none); command-error fires without one
+        if hook != "command-error" && !self.target_is_valid(t) {
+            return;
+        }
         p.target = t;
         self.fire(hook, p);
     }
@@ -844,7 +849,8 @@ impl Server {
             // only the waiters: lockers wait for -U. They go on once this command
             // list is done (cmdq_continue).
             let waiters = std::mem::take(&mut ch.waiters);
-            if ch.removable() {
+            // cmd_wait_for_remove: a second signal uses up the remembered one
+            if ch.spent() || ch.removable() {
                 self.waits.remove(&name);
             }
             self.ev.pending.extend(waiters);
@@ -994,16 +1000,18 @@ impl Server {
         let store = self.level_store_mut(level).ok_or("no such target")?;
         // the level gets the (empty) array even when the command does not parse
         store.touch_array(&base);
+        // options_array_clear comes before options_array_assign: a command that does
+        // not parse still empties the hook
+        if key.is_none() && !o.has('a') {
+            let keys: Vec<String> = store.array_items(&base).into_iter().map(|(k, _)| k).collect();
+            for k in keys {
+                store.0.remove(&k);
+            }
+        }
         let cmd = cmd?;
         match key {
             Some(k) => store.set(&format!("{base}[{k}]"), cmd),
             None => {
-                if !o.has('a') {
-                    let keys: Vec<String> = store.array_items(&base).into_iter().map(|(k, _)| k).collect();
-                    for k in keys {
-                        store.0.remove(&k);
-                    }
-                }
                 // options_array_assign adds nothing for an empty value, else uses the first free key
                 if !value.is_empty() {
                     let mut i = 0u32;
@@ -2014,7 +2022,9 @@ fn wrap_hook(cmds: VecDeque<Vec<String>>, t: Target, formats: &HashMap<String, S
     out
 }
 
-pub type HookSaved = Vec<(u8, Option<PaneId>, Option<Target>, Option<Arc<HashMap<String, String>>>)>;
+/// What a hook's open mark replaced: depth, pane, target, formats and the queue's
+/// soft (config file) commands still to run outside the hook.
+pub type HookSaved = Vec<(u8, Option<PaneId>, Option<Target>, Option<Arc<HashMap<String, String>>>, usize)>;
 
 /// Whether a queue entry opens (Some(true)) or closes (Some(false)) a hook's commands.
 pub fn hook_mark_kind(cmd: &[String]) -> Option<bool> {
@@ -2022,9 +2032,11 @@ pub fn hook_mark_kind(cmd: &[String]) -> Option<bool> {
 }
 
 /// Applies a hook mark to the queue's context, saving or restoring what it replaces.
-pub fn apply_hook_mark(mark: &[String], ctx: &mut Ctx, saved: &mut HookSaved) {
+/// Hook commands are items of their own (cmdq_insert_after), not lines of the file
+/// they were inserted into: they take none of its soft slots.
+pub fn apply_hook_mark(mark: &[String], ctx: &mut Ctx, saved: &mut HookSaved, soft: &mut usize) {
     if mark.get(1).map(String::as_str) == Some("1") {
-        saved.push((ctx.hook_depth, ctx.pane, ctx.target, ctx.formats.clone()));
+        saved.push((ctx.hook_depth, ctx.pane, ctx.target, ctx.formats.clone(), std::mem::take(soft)));
         ctx.hook_depth = ctx.hook_depth.max(1);
         let n = |i: usize| mark.get(i).and_then(|p| p.parse::<u32>().ok());
         if let Some(p) = n(2) {
@@ -2033,7 +2045,8 @@ pub fn apply_hook_mark(mark: &[String], ctx: &mut Ctx, saved: &mut HookSaved) {
         ctx.target = n(3).map(|sid| Target { sid: Some(sid), idx: n(4), wid: n(5), pane: n(2) });
         let f: HashMap<String, String> = mark.get(6..).unwrap_or_default().chunks(2).filter(|c| c.len() == 2).map(|c| (c[0].clone(), c[1].clone())).collect();
         ctx.formats = Some(Arc::new(f));
-    } else if let Some((depth, pane, target, formats)) = saved.pop() {
+    } else if let Some((depth, pane, target, formats, outer)) = saved.pop() {
+        *soft = outer;
         ctx.hook_depth = depth;
         ctx.pane = pane;
         ctx.target = target;
@@ -2099,16 +2112,17 @@ mod tests {
         let wrapped = wrap_hook(cmds, t, &HashMap::from([("hook".to_string(), "x".to_string())]));
         assert_eq!(wrapped.len(), 3);
         let mut saved = Vec::new();
-        apply_hook_mark(&wrapped[0], &mut ctx, &mut saved);
-        assert_eq!((ctx.hook_depth, ctx.pane), (1, Some(9)));
+        let mut soft = 4;
+        apply_hook_mark(&wrapped[0], &mut ctx, &mut saved, &mut soft);
+        assert_eq!((ctx.hook_depth, ctx.pane, soft), (1, Some(9), 0));
         assert_eq!(ctx.target.and_then(|t| t.idx), Some(4));
         assert_eq!(ctx.formats.as_ref().unwrap()["hook"], "x");
-        apply_hook_mark(&wrapped[2], &mut ctx, &mut saved);
-        assert_eq!((ctx.hook_depth, ctx.pane), (0, Some(3)));
+        apply_hook_mark(&wrapped[2], &mut ctx, &mut saved, &mut soft);
+        assert_eq!((ctx.hook_depth, ctx.pane, soft), (0, Some(3), 4));
         assert!(ctx.formats.is_none() && ctx.target.is_none());
         // a forged mark (a parsed "\0hook" word) is not one, and a short one is no panic
         assert_eq!(hook_mark_kind(&["\0hook".to_string(), "1".to_string()]), None);
-        apply_hook_mark(&[HOOK_MARK.to_string(), "1".to_string()], &mut ctx, &mut saved);
+        apply_hook_mark(&[HOOK_MARK.to_string(), "1".to_string()], &mut ctx, &mut saved, &mut soft);
         assert_eq!(ctx.hook_depth, 1);
     }
 
