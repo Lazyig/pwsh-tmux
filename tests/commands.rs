@@ -3298,7 +3298,9 @@ fn startup_config_runs_in_the_client_directory_and_keeps_its_errors() {
     let out = ctx.command().args(["source-file", &ok]).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "a.conf:1: invalid option: nosuchopt\na.conf:5: invalid option: nosuch\n");
     assert_eq!(out.status.code(), Some(1));
-    std::fs::remove_dir_all(&dir).unwrap();
+    // the panes run in the directory (on Windows a process's directory cannot be removed)
+    ctx.ok(&["kill-server"]);
+    wait_for("directory removed", || std::fs::remove_dir_all(&dir).is_ok());
 }
 
 #[test]
