@@ -212,9 +212,12 @@ impl Panes {
         out
     }
 
-    pub fn render(&self, srv: &Server, w: u16, h: u16) -> Vec<Line> {
+    /// The mode's screen with only `rows` drawn: the other rows are empty and take no
+    /// writes (a huge floating pane shows a few of its rows).
+    pub fn render_rows(&self, srv: &Server, w: u16, h: u16, rows: std::ops::Range<usize>) -> Vec<Line> {
         let (wu, hu) = (w as usize, h as usize);
-        let mut grid = vec![vec![Cell { text: " ".into(), style: Style::default() }; wu]; hu];
+        let mut grid: Vec<Vec<Cell>> = (0..hu).map(|y| if rows.contains(&y) { vec![Cell { text: " ".into(), style: Style::default() }; wu] } else { Vec::new() }).collect();
+        let shown = rows.start.min(hu)..rows.end.min(hu);
         let Some((_, seps, osx, osy)) = self.layout(srv) else { return grid.into_iter().map(|cells| Line { cells, wrapped: false }).collect() };
         let sid = self.session_of(srv);
         let wid = self.source;
@@ -239,6 +242,9 @@ impl Panes {
                 (px, py)
             };
             for yy in 0..sy {
+                if grid.get((y + yy) as usize).is_none_or(|r| r.is_empty()) {
+                    continue;
+                }
                 for xx in 0..sx {
                     let cell = scr.cell(py + yy, px + xx).map(crate::cells::cell_from_vt).unwrap_or_default();
                     if let Some(row) = grid.get_mut((y + yy) as usize) {
@@ -385,7 +391,7 @@ impl Panes {
         }
         let t = Target { sid, idx, wid: Some(wid), pane: active };
         let bstyle = mode_style(srv, &srv.opt_window(owner_t.wid, "display-panes-border-style"), Style::default(), t);
-        for y in 0..hu {
+        for y in shown.clone() {
             for x in 0..wu {
                 let m = bm.m[y * wu + x];
                 if m != 0 {
@@ -396,7 +402,7 @@ impl Panes {
         // window_panes_draw_screen: the floating panes go over the tiled ones, back to front,
         // each on a cleared area inside its own border
         for (p, area, (bx, by, bx2, by2)) in floats {
-            for yy in by.max(0)..=by2.min(h as i32 - 1) {
+            for yy in by.max(shown.start as i32)..=by2.min(shown.end as i32 - 1) {
                 for xx in bx.max(0)..=bx2.min(w as i32 - 1) {
                     grid[yy as usize][xx as usize] = Cell { text: " ".into(), style: Style::default() };
                 }
@@ -409,7 +415,7 @@ impl Panes {
             fm.hline(bx, bx2 + 1, by2);
             fm.vline(bx, by, by2 + 1);
             fm.vline(bx2, by, by2 + 1);
-            for y in 0..hu {
+            for y in shown.clone() {
                 for x in 0..wu {
                     let m = fm.m[y * wu + x];
                     if m != 0 {

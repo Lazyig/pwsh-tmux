@@ -609,14 +609,16 @@ impl Server {
                 style.bg = dim_default(style.bg, false, &c.terminal, dim);
             }
         };
+        // a huge floating pane's mode screen is drawn only in the rows on the client
+        let rows = if (w as usize * h as usize) <= 1 << 20 { 0..h as usize } else { let r = span(y0, h, clip.1); r.start as usize..r.end as usize };
         let mode_lines: Option<(Vec<Line>, Option<(u16, u16)>)> = match &p.mode {
             Some(PaneMode::Copy(cm)) => {
-                let (lines, cur) = cm.render_with(&self.copy_render_style(id, Some(cid)));
+                let (lines, cur) = cm.render_rows(&self.copy_render_style(id, Some(cid)), rows);
                 Some((lines, Some((cur.1, cur.0))))
             }
-            Some(PaneMode::Tree(t)) => Some(t.render(self, w, h)),
-            Some(PaneMode::Switch(s)) => Some(s.render(self, w, h)),
-            Some(PaneMode::Panes(m)) => Some((m.render(self, w, h), None)),
+            Some(PaneMode::Tree(t)) => Some(t.render_rows(self, w, h, rows)),
+            Some(PaneMode::Switch(s)) => Some(s.render_rows(self, w, h, rows)),
+            Some(PaneMode::Panes(m)) => Some((m.render_rows(self, w, h, rows), None)),
             // the clock's screen is cleared before the time is drawn
             Some(PaneMode::Clock) => Some((Vec::new(), None)),
             None => None,
@@ -1644,6 +1646,43 @@ mod border_tests {
         let red = |x: u16, y: u16| f.get(x, y).unwrap().style.fg == Color::Idx(1);
         assert!(red(30, 7) && !red(31, 7) && !red(32, 7) && !red(34, 7));
         assert!(red(30, 0) && red(31, 0) && red(34, 0));
+        kill(&mut srv);
+    }
+}
+
+#[cfg(test)]
+mod huge_float_tests {
+    use super::*;
+    use super::super::pan::tests::{clients, kill, run};
+
+    #[test]
+    fn a_huge_floating_pane_draws_only_the_rows_of_its_mode_on_the_client() {
+        let (mut srv, _) = clients((80, 24), None);
+        run(&mut srv, 1, &["new-session", "-d", "-s", "s", "-x", "80", "-y", "23"]).unwrap();
+        let sid = *srv.sessions.keys().next().unwrap();
+        srv.attach_client(1, sid);
+        run(&mut srv, 1, &["new-pane", "-d", "-x", "4000", "-y", "4000", "-X", "2", "-Y", "2"]).unwrap();
+        let wid = srv.client_window(1).unwrap();
+        let float = srv.float_rects(wid)[0].0;
+        let g = srv.panes[&float].generation;
+        srv.pane_data(float, g, b"\x1b[2J\x1b[Hhello huge");
+        run(&mut srv, 1, &["copy-mode", "-t", &format!("%{float}")]).unwrap();
+        let Some(PaneMode::Copy(cm)) = &srv.panes[&float].mode else { panic!("no copy mode") };
+        let (w, h) = srv.panes[&float].size;
+        let (lines, _) = cm.render_rows(&srv.copy_render_style(float, Some(1)), 0..3);
+        assert_eq!(lines.len(), h as usize);
+        assert!(lines[0].cells.len() == w as usize && lines[3].cells.is_empty() && lines[h as usize - 1].cells.is_empty());
+        let f = srv.compose(1).unwrap().frame;
+        let row: String = f.row(3).iter().map(|c| c.text.as_str()).collect();
+        assert!(row.contains("hello huge"), "{row}");
+        srv.exit_mode(float);
+        run(&mut srv, 1, &["choose-tree", "-t", &format!("%{float}")]).unwrap();
+        let Some(PaneMode::Tree(t)) = &srv.panes[&float].mode else { panic!("no tree mode") };
+        let (lines, _) = t.render_rows(&srv, w, h, 0..21);
+        assert!(lines[20].cells.len() == w as usize && lines[21].cells.is_empty());
+        let f = srv.compose(1).unwrap().frame;
+        let row: String = f.row(3).iter().map(|c| c.text.as_str()).collect();
+        assert!(row.contains("(0)") && row.contains("s:"), "{row}");
         kill(&mut srv);
     }
 }

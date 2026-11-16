@@ -2021,6 +2021,12 @@ impl CopyMode {
     /// window_copy_write_line for every row: line numbers, the text with the current line,
     /// mark, search match and selection styles, the position indicator and the cursor.
     pub fn render_with(&self, st: &RenderStyle) -> (Vec<Line>, (u16, u16)) {
+        self.render_rows(st, 0..self.height)
+    }
+
+    /// render_with drawing only `rows` of the screen; the others are empty lines (a huge
+    /// floating pane shows a few of its rows).
+    pub fn render_rows(&self, st: &RenderStyle, rows: std::ops::Range<usize>) -> (Vec<Line>, (u16, u16)) {
         let mut out = Vec::with_capacity(self.height);
         let lnw = self.line_number_width();
         let content = self.content_width();
@@ -2030,6 +2036,10 @@ impl CopyMode {
         let screen_sel = self.screen_selection();
         let text_x = lnw.min(self.width - 1);
         for row in 0..self.height {
+            if !rows.contains(&row) {
+                out.push(Line::default());
+                continue;
+            }
             let y = self.top + row;
             let mut line = Line { cells: Vec::with_capacity(self.width), wrapped: false };
             if let Some(src) = self.lines.get(y) {
@@ -2116,13 +2126,15 @@ impl CopyMode {
             }
             out.push(line);
         }
-        if self.show_position {
+        if self.show_position && rows.contains(&0) {
             self.draw_position(&mut out[0], st, text_x, content);
         }
         // a cursor past the last column shows as a '$'
         if self.cx >= content {
             let x = self.cursor_offset(self.cx).min(self.width - 1);
-            out[cur_row].cells[x] = Cell { text: "$".into(), style: Style::default() };
+            if let Some(c) = out[cur_row].cells.get_mut(x) {
+                *c = Cell { text: "$".into(), style: Style::default() };
+            }
         }
         let cursor = (cur_row as u16, self.cursor_offset(self.cx).min(self.width - 1) as u16);
         (out, cursor)

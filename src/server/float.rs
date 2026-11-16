@@ -1724,7 +1724,7 @@ mod tests {
         let wid = win(&srv);
         let a = srv.windows[&wid].active;
         let Some(PaneMode::Panes(m)) = &srv.panes[&a].mode else { panic!("no panes mode") };
-        let lines = m.render(&srv, 50, 14);
+        let lines = m.render_rows(&srv, 50, 14, 0..14);
         let row = |y: usize| -> String { lines[y].cells.iter().map(|c| c.text.as_str()).collect() };
         // window_panes_draw_screen: the tiled panes with their display-panes-format...
         assert_eq!(row(0), "                    25x14│                   24x14");
