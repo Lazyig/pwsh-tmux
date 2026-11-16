@@ -41,6 +41,8 @@ pub type PaneId = u32;
 pub type WinId = u32;
 pub type SessId = u32;
 pub type ClientId = u32;
+/// The environment level of the global environment (session ids start at 0).
+pub const GLOBAL_ENV: SessId = SessId::MAX - 1;
 
 pub fn log(msg: &str) {
     if let Ok(dir) = ipc::runtime_dir() {
@@ -52,6 +54,13 @@ pub fn log(msg: &str) {
 
 pub fn now_secs() -> u64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// A counter ordering session activity updates made within the same second (tmux
+/// compares the timevals, so the session used last is the current one).
+pub fn activity_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
 pub enum Event {
@@ -264,9 +273,17 @@ impl vt100::Callbacks for PaneCb {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
         self.title = Some(String::from_utf8_lossy(title).into_owned());
     }
-    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+    fn unhandled_osc(&mut self, screen: &mut vt100::Screen, params: &[&[u8]]) {
         self.osc.osc(params);
         match params {
+            // input_osc_133: the cursor's line starts a prompt (a continuation prompt,
+            // P;k=s, does not count) or command output; capture-pane -F shows them
+            [b"133", arg, rest @ ..] => match arg.first() {
+                Some(b'A' | b'N') => screen.mark_cursor_row(vt100::ROW_START_PROMPT),
+                Some(b'P') if !rest.contains(&&b"k=s"[..]) => screen.mark_cursor_row(vt100::ROW_START_PROMPT),
+                Some(b'C') => screen.mark_cursor_row(vt100::ROW_START_OUTPUT),
+                _ => {}
+            },
             [b"7", url, ..] => self.cwd = decode_file_url(&String::from_utf8_lossy(url)),
             [b"9", b"9", path, ..] => self.cwd = Some(String::from_utf8_lossy(path).trim_matches('"').to_string()),
             _ => {}
@@ -305,12 +322,13 @@ pub struct Pane {
     pub killer: Option<Box<dyn ChildKiller + Send + Sync>>,
     pub size: (u16, u16),
     pub pid: Option<u32>,
-    pub start_cmd: String,
     pub start_path: String,
     pub title: String,
     pub dead: Option<(Option<i32>, u64)>,
     pub mode: Option<PaneMode>,
     pub options: Options,
+    /// Hooks set on the pane (set-hook -p).
+    pub hooks: BTreeMap<String, Vec<String>>,
     pub pipe: Option<Sender<Vec<u8>>>,
     pub last_output: Instant,
     pub created: u64,
@@ -423,6 +441,8 @@ pub struct Window {
     pub last_active: Option<PaneId>,
     pub zoomed: bool,
     pub options: Options,
+    /// Hooks set on the window (window and pane hooks without -g).
+    pub hooks: BTreeMap<String, Vec<String>>,
     #[allow(dead_code)]
     pub alerts: u8,
     pub layout_cycle: Option<usize>,
@@ -473,6 +493,8 @@ pub struct Session {
     pub hooks: BTreeMap<String, Vec<String>>,
     pub created: u64,
     pub activity: u64,
+    /// activity_seq() at the last activity update.
+    pub activity_seq: u64,
     pub last_attached: u64,
     pub alerts: BTreeMap<u32, u8>,
     /// Session group (new-session -t): members share one window list.
@@ -520,6 +542,8 @@ pub struct Prompt {
     pub bspace_exit: bool,
     /// confirm-before: the key that confirms (-c) and whether Enter does too (-y).
     pub confirm: (char, bool),
+    /// command-prompt -T search: uses the search history.
+    pub search: bool,
 }
 
 pub enum Overlay {
@@ -573,12 +597,17 @@ pub struct Client {
     pub prompt: Option<Prompt>,
     pub overlay: Option<Overlay>,
     pub overlay_epoch: u64,
+    /// Counts the prompts opened on this client (a waiting command-prompt is done when
+    /// its prompt is closed or replaced).
+    pub prompt_epoch: u64,
     pub message: Option<(String, Instant)>,
     pub prev: Option<RenderState>,
     pub dirty: bool,
     pub last_session: Option<SessId>,
     pub created: u64,
     pub activity: u64,
+    /// activity_seq() at the last key: tmux compares activity timevals, finer than seconds.
+    pub activity_seq: u64,
     pub drag: Option<Drag>,
     pub title: String,
     pub suspended: bool,
@@ -597,6 +626,12 @@ pub struct Client {
     pub seen: control::Seen,
     /// What the client's terminal supports (terminal-features, -T).
     pub features: features::Features,
+    /// refresh-client -l: until when a clipboard reply from the terminal makes a buffer
+    /// (TTY_OSC52QUERY).
+    pub clipboard_query: Option<Instant>,
+    /// CLIENT_FOCUSED: set when the client gets a session, then follows the terminal's
+    /// focus reports.
+    pub focused: bool,
     /// Frames queued for the writer thread, and since when the queue has been non-empty
     /// (ms since the epoch): how far behind the client is (control mode pause-after).
     pub pending: Arc<std::sync::atomic::AtomicUsize>,
@@ -616,6 +651,16 @@ pub struct Client {
 pub struct ClientIo {
     pub written: std::sync::atomic::AtomicU64,
     pub discarded: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(unix)]
+fn exit_signal(s: &std::process::ExitStatus) -> Option<i32> {
+    std::os::unix::process::ExitStatusExt::signal(s)
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_: &std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 pub fn now_ms() -> u64 {
@@ -712,6 +757,13 @@ pub struct Ctx {
     pub readonly: bool,
     /// Files being sourced (innermost last), for #{current_file}.
     pub files: Vec<String>,
+    /// The exit status for the command-line client (c->retval: run-shell sets it).
+    pub retval: i32,
+    /// The key a bound command runs for (the message log names it).
+    pub key: Option<String>,
+    /// The client the message log names when it is not `client` (send-keys -K: the
+    /// client that ran send-keys).
+    pub log_client: Option<ClientId>,
 }
 
 /// Queue markers source-file puts around a file's commands (never typed: they start with NUL).
@@ -731,6 +783,8 @@ pub struct Queue {
 pub enum Flow {
     Next,
     WaitOverlay(ClientId, u64),
+    /// command-prompt and confirm-before without -b: the queue waits for the prompt.
+    WaitPrompt(ClientId, u64),
     /// Run these commands next, before the rest of the queue (source-file, if-shell -F, run-shell -C).
     /// With `soft`, their errors are reported but don't stop the queue (like config files).
     Inject(Vec<Vec<String>>, bool),
@@ -745,6 +799,12 @@ pub enum JobKind {
 pub struct Parked {
     pub queue: Queue,
     pub kind: JobKind,
+    /// The job's command and process (show-messages -J), and when it started.
+    pub cmd: String,
+    pub pid: Option<u32>,
+    /// The descriptor the server reads the job's output from (-1 where there is none).
+    pub fd: i64,
+    pub started: u64,
 }
 
 pub struct Server {
@@ -755,21 +815,38 @@ pub struct Server {
     pub panes: HashMap<PaneId, Pane>,
     pub clients: BTreeMap<ClientId, Client>,
     pub next_id: u32,
+    /// Sessions, windows and panes are numbered apart, each from 0 (next_session_id,
+    /// next_window_id, next_window_pane_id).
+    pub next_session_id: SessId,
+    pub next_window_id: WinId,
+    pub next_pane_id: PaneId,
     pub opts_server: Options,
     pub opts_session: Options,
     pub opts_window: Options,
     pub env: BTreeMap<String, Option<String>>,
+    /// Hidden environment variables (set-environment -h, %hidden): (session or 0 for
+    /// the global environment, name). Not given to new processes.
+    pub env_hidden: std::collections::HashSet<(SessId, String)>,
     pub hooks: BTreeMap<String, Vec<String>>,
+    /// User options set with set-hook (hooks_add_event): show-hooks lists them.
+    pub hook_events: std::collections::BTreeSet<String>,
+    /// The configuration has been loaded (cfg_finished): commands are logged from then.
+    pub cfg_finished: bool,
+    /// While send-keys -K types keys: the client that ran it (key_bindings_dispatch
+    /// queues the bound commands for that client).
+    pub key_origin: Option<ClientId>,
     pub buffers: Vec<Buffer>,
     pub buffer_seq: u32,
     pub bindings: BTreeMap<String, BTreeMap<String, Binding>>,
     pub messages: VecDeque<(u64, String)>,
     pub prompt_history: Vec<String>,
+    pub prompt_history_search: Vec<String>,
     pub jobs: HashMap<u32, Parked>,
     pub waits: HashMap<String, (bool, Vec<Queue>)>,
     /// wait-for channels signalled while nobody waited (the next wait returns at once).
     pub waits_woken: std::collections::HashSet<String>,
     pub overlay_waits: Vec<(ClientId, u64, String, Queue)>,
+    pub prompt_waits: Vec<(ClientId, u64, String, Queue)>,
     /// Copy-mode panes scrolling while a selection drag rests at an edge.
     pub copy_drag_timers: HashMap<PaneId, Instant>,
     /// A lookup of what the panes run is in progress (at most one at a time).
@@ -894,20 +971,29 @@ impl Server {
             panes: HashMap::new(),
             clients: BTreeMap::new(),
             next_id: 0,
+            next_session_id: 0,
+            next_window_id: 0,
+            next_pane_id: 0,
             opts_server: Options::defaults(Scope::Server),
             opts_session: Options::defaults(Scope::Session),
             opts_window: Options::defaults(Scope::Window),
             env,
+            env_hidden: std::collections::HashSet::new(),
             hooks: BTreeMap::new(),
+            hook_events: Default::default(),
+            cfg_finished: false,
+            key_origin: None,
             buffers: Vec::new(),
             buffer_seq: 0,
             bindings: input::default_bindings(),
             messages: VecDeque::new(),
             prompt_history: Vec::new(),
+            prompt_history_search: Vec::new(),
             jobs: HashMap::new(),
             waits: HashMap::new(),
             waits_woken: Default::default(),
             overlay_waits: Vec::new(),
+            prompt_waits: Vec::new(),
             copy_drag_timers: HashMap::new(),
             pane_info_busy: false,
             delayed: Vec::new(),
@@ -937,6 +1023,21 @@ impl Server {
         self.next_id
     }
 
+    pub fn new_session_id(&mut self) -> SessId {
+        self.next_session_id += 1;
+        self.next_session_id - 1
+    }
+
+    pub fn new_window_id(&mut self) -> WinId {
+        self.next_window_id += 1;
+        self.next_window_id - 1
+    }
+
+    pub fn new_pane_id(&mut self) -> PaneId {
+        self.next_pane_id += 1;
+        self.next_pane_id - 1
+    }
+
     fn load_config(&mut self, explicit: Option<String>) {
         let mut files = Vec::new();
         if let Some(f) = explicit {
@@ -960,6 +1061,7 @@ impl Server {
             let ctx = Ctx::default();
             self.run_queue(Queue { cmds: VecDeque::from([args]), ctx , soft: 0 });
         }
+        self.cfg_finished = true;
     }
 
     pub fn add_message(&mut self, msg: &str) {
@@ -1042,7 +1144,7 @@ impl Server {
     }
 
     pub fn current_session(&self) -> Option<SessId> {
-        self.sessions.values().max_by_key(|s| (s.activity, s.id)).map(|s| s.id)
+        self.sessions.values().max_by_key(|s| s.activity_seq).map(|s| s.id)
     }
 
     pub fn mark_session_dirty(&mut self, sid: SessId) {
@@ -1067,7 +1169,11 @@ impl Server {
 
     pub fn set_message(&mut self, cid: ClientId, msg: &str) {
         let ms = self.client_session(cid).map(|s| self.opt_session_num(Some(s), "display-time")).unwrap_or(750).max(1) as u64;
-        self.add_message(msg);
+        // status_message_set
+        match self.clients.get(&cid).map(|c| c.name()) {
+            Some(n) => self.add_message(&format!("{n} message: {msg}")),
+            None => self.add_message(&format!("message: {msg}")),
+        }
         if let Some(c) = self.clients.get_mut(&cid) {
             c.message = Some((msg.to_string(), Instant::now() + Duration::from_millis(ms)));
             c.dirty = true;
@@ -1202,12 +1308,14 @@ impl Server {
                 prompt: None,
                 overlay: None,
                 overlay_epoch: 0,
+                prompt_epoch: 0,
                 message: None,
                 prev: None,
                 dirty: false,
                 last_session: None,
                 created: now,
                 activity: now,
+                activity_seq: activity_seq(),
                 drag: None,
                 title: String::new(),
                 suspended: false,
@@ -1220,6 +1328,8 @@ impl Server {
                 control_seq: 0,
                 seen: Default::default(),
                 features: Default::default(),
+                clipboard_query: None,
+                focused: false,
                 pending,
                 queued_bytes,
                 closed,
@@ -1328,11 +1438,22 @@ impl Server {
                     c.control_seq
                 });
                 let ctx = Ctx { client: Some(cid), reply: Some(cid), pane, control_seq, ..Ctx::default() };
+                // cmd_parse_from_arguments: every command is checked before any runs
+                if let Some(e) = cmds.iter().find_map(|c| cmds::check_command(c).err()) {
+                    self.finish_queue(Queue { cmds: VecDeque::new(), ctx, soft: 0 }, Some(e));
+                    return;
+                }
                 self.run_queue(Queue { cmds: cmds.into_iter().filter(|c| !c.is_empty()).collect(), ctx , soft: 0 });
             }
             C_INPUT => {
                 if let Some(c) = self.clients.get_mut(&cid) {
                     c.activity = now_secs();
+                    c.activity_seq = activity_seq();
+                }
+                // so does the session's (server_client_handle_key)
+                if let Some(s) = self.clients.get(&cid).filter(|c| c.attached).and_then(|c| c.session).and_then(|s| self.sessions.get_mut(&s)) {
+                    s.activity = now_secs();
+                    s.activity_seq = activity_seq();
                 }
                 self.handle_input(cid, &payload);
             }
@@ -1369,6 +1490,8 @@ impl Server {
         let scroll_on_clear = options::is_on(&self.opt_pane(id, "scroll-on-clear"));
         let p = self.panes.get_mut(&id).unwrap();
         p.parser.screen_mut().set_scroll_on_clear(scroll_on_clear);
+        // capture-pane -I: rows entering the history record when
+        p.parser.screen_mut().set_time(now_secs());
         p.parser.process(data);
         p.last_output = Instant::now();
         if !data.is_empty() {
@@ -1520,17 +1643,37 @@ impl Server {
         let mut queue = parked.queue;
         match parked.kind {
             JobKind::RunShell { pane, background, .. } => {
+                // cmd_run_shell_callback: a failure is printed after the output, and
+                // a command-line client exits with the status
+                let mut output = output;
+                if status != 0 {
+                    let msg = if status < 0 { format!("'{}' terminated by signal {}", parked.cmd, -status) } else { format!("'{}' returned {status}", parked.cmd) };
+                    if !output.is_empty() && !output.ends_with('\n') {
+                        output.push('\n');
+                    }
+                    output.push_str(&msg);
+                    output.push('\n');
+                }
+                // each run-shell sets the exit status (the last one wins)
+                if !background {
+                    queue.ctx.retval = if status < 0 { 128 - status } else { status };
+                }
                 if !output.is_empty() && !background {
                     if queue.ctx.reply.is_some_and(|c| !self.clients.get(&c).is_some_and(|c| c.attached)) {
                         queue.ctx.out.push_str(&output);
                     } else if let Some(p) = pane.or(queue.ctx.pane) {
                         self.view_output(p, &output);
                     }
-                }
-                if status != 0 && !background {
-                    let msg = format!("'{}' returned {status}", "run-shell");
-                    if let Some(cid) = queue.ctx.client.filter(|c| self.clients.get(c).is_some_and(|c| c.attached)) {
-                        self.set_message(cid, &msg);
+                } else if !output.is_empty() {
+                    // cmd_run_shell_print without a queue item: the -t pane, else the
+                    // target client's current pane, else the current one
+                    let tc = queue.ctx.client.filter(|c| self.clients.get(c).is_some_and(|c| c.attached))
+                        .or_else(|| self.resolve_client(&queue.ctx, None).ok());
+                    let p = pane.filter(|p| self.panes.contains_key(p))
+                        .or_else(|| tc.and_then(|c| self.client_active_pane(c)))
+                        .or_else(|| self.current(&queue.ctx).pane);
+                    if let Some(p) = p {
+                        self.view_output(p, &output);
                     }
                 }
             }
@@ -1653,6 +1796,15 @@ impl Server {
             self.delayed = rest;
             for (_, q) in due {
                 self.run_queue(q);
+            }
+        }
+        let waiting = std::mem::take(&mut self.prompt_waits);
+        for (cid, epoch, name, queue) in waiting {
+            if self.clients.get(&cid).is_none_or(|c| c.prompt.is_none() || c.prompt_epoch != epoch) {
+                self.after_command(&name, &queue.ctx);
+                self.run_queue(queue);
+            } else {
+                self.prompt_waits.push((cid, epoch, name, queue));
             }
         }
         let waiting = std::mem::take(&mut self.overlay_waits);
@@ -1802,11 +1954,22 @@ impl Server {
 
     // ---- panes ------------------------------------------------------------------------
 
+    /// environ_for_session: the global environment then the session's, without hidden
+    /// variables.
     pub fn session_env(&self, sid: Option<SessId>) -> Vec<(String, Option<String>)> {
-        let mut env: BTreeMap<String, Option<String>> = self.env.clone();
+        let mut env: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for (k, v) in &self.env {
+            if !self.env_hidden.contains(&(GLOBAL_ENV, k.clone())) {
+                env.insert(k.clone(), v.clone());
+            }
+        }
         if let Some(s) = sid.and_then(|s| self.sessions.get(&s)) {
             for (k, v) in &s.env {
-                env.insert(k.clone(), v.clone());
+                if self.env_hidden.contains(&(s.id, k.clone())) {
+                    env.remove(k);
+                } else {
+                    env.insert(k.clone(), v.clone());
+                }
             }
         }
         env.into_iter().collect()
@@ -1814,7 +1977,7 @@ impl Server {
 
     /// Spawns a process in a new pty. `cmd`: empty = default-command / shell; one arg = via shell; more = argv.
     pub fn spawn_pane(&mut self, sid: Option<SessId>, cols: u16, rows: u16, cmd: &[String], cwd: Option<&str>, extra_env: &[(String, String)]) -> Result<PaneId, String> {
-        let id = self.id();
+        let id = self.new_pane_id();
         self.spawn_into(id, 0, sid, cols, rows, cmd, cwd, extra_env)?;
         Ok(id)
     }
@@ -1834,7 +1997,6 @@ impl Server {
             [one] => procinfo::via_shell(&shell, one),
             many => many.to_vec(),
         };
-        let start_cmd = cmd.join(" ");
         // tmux keeps the command given, else default-command; respawn without one keeps the old
         let start_argv = match cmd {
             [] if default_cmd.is_empty() => self.panes.get(&id).map(|p| p.track.argv.clone()).unwrap_or_default(),
@@ -1916,6 +2078,7 @@ impl Server {
         let now = now_secs();
         let prog = procinfo::program_name(&argv[0]);
         let existing_opts = self.panes.get(&id).map(|p| p.options.clone()).unwrap_or_default();
+        let existing_hooks = self.panes.get(&id).map(|p| p.hooks.clone()).unwrap_or_default();
         let title = self.panes.get(&id).map(|p| p.title.clone()).unwrap_or_else(|| self.host.clone());
         let previous = self.panes.insert(
             id,
@@ -1928,12 +2091,12 @@ impl Server {
                 killer,
                 size: (cols, rows),
                 pid,
-                start_cmd,
                 start_path: dir.clone(),
                 title,
                 dead: None,
                 mode: None,
                 options: existing_opts,
+                hooks: existing_hooks,
                 pipe: None,
                 last_output: Instant::now(),
                 created: now,
@@ -2119,6 +2282,8 @@ impl Server {
                     .and_then(|c| c.last_session)
                     .filter(|s| self.sessions.contains_key(s))
                     .or_else(|| self.current_session()),
+                // a no-detach-on-destroy client goes to any other session
+                _ if self.clients.get(&cid).is_some_and(|c| c.ctl.no_detach_on_destroy) => self.current_session(),
                 _ => None,
             };
             match next {
@@ -2148,8 +2313,15 @@ impl Server {
     }
 
     pub fn attach_client(&mut self, cid: ClientId, sid: SessId) {
+        self.attach_client_env(cid, sid, true);
+    }
+
+    /// attach_client; `update_env` false (attach-session/switch-client -E) skips
+    /// update-environment.
+    pub fn attach_client_env(&mut self, cid: ClientId, sid: SessId, update_env: bool) {
         let Some(c) = self.clients.get_mut(&cid) else { return };
         let was_attached = c.attached;
+        c.focused = true;
         if c.session != Some(sid) {
             c.last_session = c.session;
         }
@@ -2169,15 +2341,9 @@ impl Server {
         if let Some(s) = self.sessions.get_mut(&sid) {
             s.last_attached = now;
             s.activity = now;
-            for n in names.iter().filter(|_| writable) {
-                match env.iter().find(|(k, _)| k == n) {
-                    Some((_, v)) => {
-                        s.env.insert(n.clone(), Some(v.clone()));
-                    }
-                    None => {
-                        s.env.insert(n.clone(), None);
-                    }
-                }
+            s.activity_seq = activity_seq();
+            if writable && update_env {
+                s.env.extend(cmds::environ_update(&names, &env));
             }
             let active = s.active;
             if writable { s.alerts.remove(&active); }
@@ -2197,8 +2363,12 @@ impl Server {
     }
 
     pub fn switch_client(&mut self, cid: ClientId, sid: SessId) {
+        self.switch_client_env(cid, sid, true);
+    }
+
+    pub fn switch_client_env(&mut self, cid: ClientId, sid: SessId, update_env: bool) {
         let old = self.clients.get(&cid).and_then(|c| c.session);
-        self.attach_client(cid, sid);
+        self.attach_client_env(cid, sid, update_env);
         if let Some(o) = old.filter(|o| *o != sid) {
             self.update_session_size(o);
             self.check_destroy_unattached(o);
@@ -2206,6 +2376,13 @@ impl Server {
     }
 
     pub fn detach_client(&mut self, cid: ClientId, msg: &str) {
+        self.detach_client_exec(cid, msg, None);
+    }
+
+    /// detach_client; with `exec` (detach-client -E) the client runs that command with
+    /// the session's default-shell instead of printing the message.
+    pub fn detach_client_exec(&mut self, cid: ClientId, msg: &str, exec: Option<&str>) {
+        let shell = self.clients.get(&cid).and_then(|c| c.session).map(|s| self.opt_session(Some(s), "default-shell")).unwrap_or_default();
         let Some(c) = self.clients.get_mut(&cid) else { return };
         if !c.attached {
             return;
@@ -2213,7 +2390,10 @@ impl Server {
         let sid = c.session;
         c.attached = false;
         c.session = None;
-        c.send_exit(msg);
+        match exec.filter(|e| !e.is_empty() && c.control == 0) {
+            Some(cmd) => c.send(S_EXEC, format!("{cmd}\0{shell}").as_bytes()),
+            None => c.send_exit(msg),
+        }
         let readonly = c.is_readonly();
         if let Some(sid) = sid {
             self.update_session_size(sid);
@@ -2281,8 +2461,8 @@ impl Server {
         let clients: Vec<(u64, (u16, u16))> = self
             .clients
             .values()
-            .filter(|c| c.attached && c.session == Some(sid) && !c.is_readonly())
-            .filter_map(|c| if c.control > 0 { c.control_size.filter(|_| !c.ctl.ignore_size).map(|s| (c.activity, s)) } else { Some((c.activity, c.size)) })
+            .filter(|c| c.attached && c.session == Some(sid) && !c.is_readonly() && !c.ctl.ignore_size)
+            .filter_map(|c| if c.control > 0 { c.control_size.map(|s| (c.activity, s)) } else { Some((c.activity, c.size)) })
             .collect();
         let latest = clients.iter().max_by_key(|c| c.0).map(|c| c.1);
         let smallest = clients.iter().map(|c| c.1).reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)));
@@ -2322,9 +2502,18 @@ impl Server {
         if ctx.hook_depth > 4 || ctx.readonly || self.readonly_context.get() || self.client_is_readonly(ctx.client) {
             return;
         }
-        let cmds = sid
-            .and_then(|s| self.sessions.get(&s))
-            .and_then(|s| s.hooks.get(name))
+        // session hooks: the session, then the global options; window and pane hooks:
+        // the pane, its window, then the global window options
+        let session_hook = crate::options::hook_scope(name).is_none_or(|s| s == crate::options::Scope::Session);
+        let pane = ctx.pane.filter(|p| self.panes.contains_key(p))
+            .or_else(|| sid.and_then(|s| self.sessions.get(&s)).and_then(|s| s.links.get(&s.active)).and_then(|w| self.windows.get(w)).map(|w| w.active));
+        let local = if session_hook {
+            sid.and_then(|s| self.sessions.get(&s)).and_then(|s| s.hooks.get(name))
+        } else {
+            pane.and_then(|p| self.panes.get(&p)).and_then(|p| p.hooks.get(name))
+                .or_else(|| pane.and_then(|p| self.window_of(p)).and_then(|w| self.windows.get(&w)).and_then(|w| w.hooks.get(name)))
+        };
+        let cmds = local
             .or_else(|| self.hooks.get(name))
             .cloned()
             .unwrap_or_default();
@@ -2384,12 +2573,16 @@ impl Server {
                 }
                 Err(e) if soft && !e.starts_with('\0') => {
                     log(&format!("{e}"));
-                    self.add_message(&e);
+                    self.log_error(q.ctx.client.or(q.ctx.reply), &e);
                     q.ctx.out.push_str(&e);
                     q.ctx.out.push('\n');
                 }
                 Ok(Flow::WaitOverlay(cid, epoch)) => {
                     self.overlay_waits.push((cid, epoch, name, q));
+                    return;
+                }
+                Ok(Flow::WaitPrompt(cid, epoch)) => {
+                    self.prompt_waits.push((cid, epoch, name, q));
                     return;
                 }
                 Ok(Flow::Next) => self.after_command(&name, &q.ctx),
@@ -2477,19 +2670,35 @@ impl Server {
                 }
                 return;
             }
+            if let Some(e) = &err {
+                let msg = format!("{} message: {e}", c.name());
+                self.add_message(&msg);
+            }
+            let Some(c) = self.clients.get(&rc) else { return };
             match err {
                 Some(e) => c.send(S_REPLY, &encode_reply(1, &format!("{}{e}", &*ctx.out))),
+                // the output goes to stdout even when the exit status is not 0
+                None if ctx.retval != 0 => {
+                    c.send(S_STDOUT, ctx.out.as_bytes());
+                    c.send(S_REPLY, &encode_reply(ctx.retval as u8, ""));
+                }
                 None => c.send(S_REPLY, &encode_reply(0, &ctx.out)),
             }
             return;
         }
         if let Some(e) = &err {
             log(&format!("command error: {e}"));
-            self.add_message(e);
+            if !attached {
+                self.log_error(None, e);
+            }
         }
         if attached {
             let cid = ctx.client.unwrap();
             if let Some(e) = err {
+                // cmdq_error: an attached client shows it as a status message,
+                // capitalised
+                let mut chars = e.chars();
+                let e: String = chars.next().map(|f| f.to_uppercase().chain(chars).collect()).unwrap_or_default();
                 self.set_message(cid, &e);
             } else if !ctx.out.is_empty() {
                 if ctx.readonly || self.client_is_readonly(Some(cid)) {
@@ -2498,6 +2707,14 @@ impl Server {
                     self.view_output(p, &ctx.out);
                 }
             }
+        }
+    }
+
+    /// cmdq_error's message log entry for a client that shows no status line (or none).
+    pub fn log_error(&mut self, client: Option<ClientId>, e: &str) {
+        match client.and_then(|c| self.clients.get(&c)).map(|c| c.name()) {
+            Some(n) => self.add_message(&format!("{n} message: {e}")),
+            None => self.add_message(&format!("message: {e}")),
         }
     }
 
@@ -2515,17 +2732,28 @@ impl Server {
             cmd.current_dir(d);
         }
         cmd.stdin(std::process::Stdio::null());
-        if !matches!(kind, JobKind::RunShell { stderr: true, .. }) {
+        cmd.stdout(std::process::Stdio::piped());
+        if matches!(kind, JobKind::RunShell { stderr: true, .. }) {
+            cmd.stderr(std::process::Stdio::piped());
+        } else {
             cmd.stderr(std::process::Stdio::null());
         }
+        // started here so the job's process id is known while it runs
+        let child = cmd.spawn();
+        let pid = child.as_ref().ok().map(|c| c.id());
+        #[cfg(unix)]
+        let fd = child.as_ref().ok().and_then(|c| c.stdout.as_ref()).map_or(-1, |o| std::os::fd::AsRawFd::as_raw_fd(o) as i64);
+        #[cfg(not(unix))]
+        let fd = -1;
         thread::spawn(move || {
-            let (status, out) = match cmd.output() {
-                Ok(o) => (o.status.code().unwrap_or(1), String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr)),
+            let (status, out) = match child.and_then(|c| c.wait_with_output()) {
+                // a signal is passed on as its negated number
+                Ok(o) => (o.status.code().or_else(|| exit_signal(&o.status).map(|s| -s)).unwrap_or(1), String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr)),
                 Err(e) => (127, format!("{e}\n")),
             };
             let _ = tx.send(Event::Job(id, status, out));
         });
-        self.jobs.insert(id, Parked { queue, kind });
+        self.jobs.insert(id, Parked { queue, kind, cmd: command.to_string(), pid, fd, started: now_ms() });
         id
     }
 }

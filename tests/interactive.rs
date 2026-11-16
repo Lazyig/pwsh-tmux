@@ -29,8 +29,12 @@ fn readonly_terminal_blocks_keys_paste_mouse_and_shared_resize() {
     t.mouse(0, 1, 1, false);
     t.mouse(0, 1, 1, true);
     // A writable input/output barrier ensures these checks run after the input.
-    ctx.ok(&["send-keys", "-t", "ro", "echo WRITABLE_BARRIER", "Enter"]);
-    wait_for("writable input barrier", || ctx.capture("ro").matches("WRITABLE_BARRIER").count() >= 2);
+    // -J: a long shell prompt wraps the command line in the half-width pane.
+    // (send-keys itself is refused: its target client, the current one, is read-only)
+    assert_eq!(ctx.fails(&["send-keys", "-t", "ro", "x"]).trim(), "client is read-only");
+    ctx.ok(&["set-buffer", "-b", "barrier", "echo WRITABLE_BARRIER\n"]);
+    ctx.ok(&["paste-buffer", "-d", "-b", "barrier", "-t", "ro"]);
+    wait_for("writable input barrier", || ctx.ok(&["capture-pane", "-p", "-J", "-t", "ro"]).matches("WRITABLE_BARRIER").count() >= 2);
     let capture = ctx.ok(&["capture-pane", "-p", "-t", "ro", "-S", "-"]);
     assert!(!capture.contains("READONLY_TYPED") && !capture.contains("READONLY_PASTED"), "{capture}");
     assert_eq!(ctx.fmt("ro", "#{pane_id}:#{window_width}x#{window_height}:#{session_windows}"), before);
@@ -383,4 +387,236 @@ fn current_target_sorted_switch_and_prompt_flags() {
     t.send(b"y");
     std::thread::sleep(Duration::from_millis(300));
     assert!(ctx.ok(&["show-options", "-gqv", "@conf2"]).trim().is_empty());
+}
+
+#[test]
+fn attach_flags_environment_and_destroy() {
+    let ctx = Ctx::new("attach-flags");
+    ctx.ok(&["new-session", "-d", "-s", "a1"]);
+    ctx.ok(&["new-session", "-d", "-s", "a2"]);
+    ctx.ok(&["set", "-g", "update-environment", "P1FIX_*"]);
+    let mut cb = portable_pty::CommandBuilder::new(common::binary());
+    cb.args(["attach-session", "-E", "-f", "ignore-size,no-detach-on-destroy,bogus", "-t", "a1"]);
+    cb.env("PWSH_TMUX_SOCKET", &ctx.socket);
+    cb.env_remove("PWSH_TMUX");
+    cb.env_remove("PWSH_TMUX_PANE");
+    cb.env("TERM", "xterm-256color");
+    cb.env("P1FIX_VAR", "yes");
+    let t = Term::spawn(cb, 80, 24);
+    t.wait_screen("attach", |s| s.contains("[a1]"));
+    // server_client_get_flags; unknown flags are ignored
+    assert_eq!(ctx.ok(&["list-clients", "-F", "#{client_flags}|#{session_name}"]).trim_end(), "attached,focused,ignore-size,no-detach-on-destroy,UTF-8|a1");
+    // -E: no update-environment; switch-client without -E applies it (patterns match)
+    assert!(ctx.fails(&["show-environment", "-t", "a1", "P1FIX_VAR"]).contains("unknown variable: P1FIX_VAR"));
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    ctx.ok(&["switch-client", "-c", &client, "-t", "a2"]);
+    assert_eq!(ctx.ok(&["show-environment", "-t", "a2", "P1FIX_VAR"]), "P1FIX_VAR=yes\n");
+    // detach-on-destroy is on, but this client moves to another session
+    ctx.ok(&["kill-session", "-t", "a2"]);
+    wait_for("moved to a1", || ctx.ok(&["list-clients", "-F", "#{session_name}"]).trim() == "a1");
+    ctx.ok(&["refresh-client", "-t", &client, "-f", "!ignore-size,!no-detach-on-destroy"]);
+    assert_eq!(ctx.ok(&["list-clients", "-F", "#{client_flags}"]).trim_end(), "attached,focused,UTF-8");
+    // switch-client -r toggles read-only and ignore-size; the server's user may turn it off
+    ctx.ok(&["switch-client", "-c", &client, "-r"]);
+    assert_eq!(ctx.ok(&["list-clients", "-F", "#{client_flags}"]).trim_end(), "attached,focused,ignore-size,read-only,UTF-8");
+    ctx.ok(&["switch-client", "-c", &client, "-r"]);
+    assert_eq!(ctx.ok(&["list-clients", "-F", "#{client_flags}"]).trim_end(), "attached,focused,UTF-8");
+}
+
+#[test]
+fn prompt_types_keep_separate_histories() {
+    let ctx = Ctx::new("prompt-types");
+    let t = start(&ctx, "h");
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    ctx.ok(&["command-prompt", "-b", "-t", &client, "-T", "search", "set -g @searched '%%'"]);
+    t.send(b"needle\r");
+    wait_for("search prompt ran", || ctx.fmt("h", "#{@searched}") == "needle");
+    // without -b the command waits for the prompt (CMD_RETURN_WAIT)
+    let mut waiting = ctx.command().args(["command-prompt", "-t", &client, "set -g @typed '%%'"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+    wait_for("prompt open", || t.row(29).starts_with("(set)"));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(waiting.try_wait().unwrap().is_none(), "command-prompt returned before the prompt closed");
+    t.send(b"typed\r");
+    wait_for("command prompt ran", || ctx.fmt("h", "#{@typed}") == "typed");
+    wait_for("command-prompt returns", || waiting.try_wait().unwrap().is_some());
+    // copy-mode searches go in the search history too
+    ctx.ok(&["copy-mode", "-t", "h"]);
+    t.send(b"\x13");
+    t.wait_screen("search prompt", |s| s.contains("(search down)"));
+    t.send(b"other\r");
+    wait_for("search history", || ctx.ok(&["show-prompt-history", "-T", "search"]).contains("2: other"));
+    ctx.ok(&["send-keys", "-t", "h", "-X", "cancel"]);
+    assert_eq!(ctx.ok(&["show-prompt-history", "-T", "search"]), "History for search:\n\n1: needle\n2: other\n\n");
+    assert_eq!(ctx.ok(&["show-prompt-history", "-T", "command"]), "History for command:\n\n1: typed\n\n");
+    assert!(ctx.fails(&["command-prompt", "-t", &client, "-T", "window-target", "x"]).contains("unknown type: window-target"));
+    // commands run from the prompt are logged for its client
+    assert!(ctx.ok(&["show-messages"]).contains(&format!("{client} command: set-option -g @typed typed")));
+}
+
+#[test]
+fn send_keys_as_typed_and_detach_exec() {
+    let ctx = Ctx::new("sendk");
+    let mut t = start(&ctx, "k");
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    ctx.ok(&["bind-key", "-n", "F9", "set", "-ga", "@order", "a"]);
+    // -K: through the client's key tables; the binding runs before the next command
+    ctx.ok(&["send-keys", "-K", "-c", &client, "F9", ";", "set", "-ga", "@order", "b"]);
+    assert_eq!(ctx.fmt("k", "#{@order}"), "ab");
+    // the prefix and a prefix binding
+    ctx.ok(&["send-keys", "-K", "-c", &client, "C-b", "c"]);
+    wait_for("new window", || ctx.fmt("k", "#{session_windows}") == "2");
+    // without a client there is nothing to type into
+    let ctx2 = Ctx::new("sendk-none");
+    ctx2.ok(&["new-session", "-d", "-s", "n"]);
+    ctx2.ok(&["send-keys", "-K", "-t", "n", "x"]);
+    // detach-client -E: the command replaces the client
+    ctx.ok(&["detach-client", "-t", &client, "-E", "echo EXEC-REPLACED-42"]);
+    t.wait_screen("exec output", |s| s.contains("EXEC-REPLACED-42"));
+    t.wait_exit();
+    assert_eq!(ctx.ok(&["list-clients"]), "");
+}
+
+#[test]
+fn menu_and_popup_lines_styles_and_closing_keys() {
+    let ctx = Ctx::new("menu-look");
+    let t = start(&ctx, "m");
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    // popups make the command wait until they close; display-menu returns at once
+    let bg = |args: &[&str]| ctx.command().args(args).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    assert!(ctx.fails(&["display-menu", "-c", &client, "-b", "wavy", "x", "x", "display x"]).contains("menu-border-lines unknown value: wavy"));
+    let mut w1 = bg(&["display-menu", "-c", &client, "-b", "double", "-x", "0", "-y", "10", "-T", "T", "First", "f", "display first"]);
+    t.wait_screen("double menu border", |s| s.contains('╔') && s.contains("First"));
+    wait_for("display-menu returns while the menu is open", || w1.try_wait().unwrap().is_some());
+    assert!(t.contents().contains('╔'));
+    t.send(b"\x1b");
+    t.wait_screen("menu closed", |s| !s.contains('╔'));
+    assert!(ctx.fails(&["display-popup", "-c", &client, "-b", "wavy", "true"]).contains("popup-border-lines unknown value: wavy"));
+    // -b rounded; the command exits; without -k only Escape or C-c close it
+    let mut w2 = bg(&["display-popup", "-c", &client, "-b", "rounded", "-w", "30", "-h", "8", "echo POPUP-DONE"]);
+    t.wait_screen("rounded popup", |s| s.contains('╭') && s.contains("POPUP-DONE"));
+    t.send(b"x");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(t.contents().contains('╭'), "a key other than Escape closed the popup");
+    t.send(b"\x1b");
+    t.wait_screen("popup closed", |s| !s.contains('╭'));
+    // -k: any key closes it once the command has exited
+    let mut w3 = bg(&["display-popup", "-c", &client, "-k", "-b", "heavy", "-w", "30", "-h", "8", "echo POPUP-K"]);
+    t.wait_screen("heavy popup", |s| s.contains('┏') && s.contains("POPUP-K"));
+    t.send(b"x");
+    t.wait_screen("popup closed by any key", |s| !s.contains('┏'));
+    for w in [&mut w2, &mut w3] {
+        wait_for("waiting command", || w.try_wait().unwrap().is_some());
+    }
+}
+
+#[test]
+fn attaching_and_typing_make_the_session_current() {
+    let ctx = Ctx::new("p1fix-attcur");
+    ctx.ok(&["new-session", "-d", "-s", "a", "sleep 100"]);
+    ctx.ok(&["new-session", "-d", "-s", "b", "sleep 100"]);
+    assert_eq!(ctx.ok(&["display-message", "-p", "#S"]), "b\n");
+    // attaching updates the session's activity: commands from outside now use it,
+    // with or without -c (cmd_find_best_session)
+    let t = Term::attach(&ctx, &["attach-session", "-t", "a"], 80, 24);
+    t.wait_screen("attach", |s| s.contains("[a]"));
+    assert_eq!(ctx.ok(&["display-message", "-p", "#S"]), "a\n");
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]);
+    assert_eq!(ctx.ok(&["display-message", "-p", "-c", client.trim(), "#S #{client_session}"]), "a a\n");
+    ctx.ok(&["new-session", "-d", "-s", "c", "sleep 100"]);
+    assert_eq!(ctx.ok(&["display-message", "-p", "-c", client.trim(), "#S #{client_session}"]), "c a\n");
+    // so do keys from its client
+    t.send(b"x");
+    wait_for("key activity", || ctx.ok(&["display-message", "-p", "#S"]) == "a\n");
+}
+
+#[test]
+fn refresh_client_l_reads_the_terminal_clipboard() {
+    let ctx = Ctx::new("p1fix-clip");
+    let t = start(&ctx, "clip");
+    // replies nobody asked for are dropped
+    t.send(b"\x1b]52;c;aWdub3JlZA==\x07");
+    ctx.ok(&["set-option", "-g", "@sync", "1"]);
+    assert_eq!(ctx.ok(&["list-buffers"]), "");
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]);
+    ctx.ok(&["refresh-client", "-l", "-t", client.trim()]);
+    // tty_clipboard_query: Ms with "?"
+    wait_for("clipboard query", || t.raw_text().contains("\x1b]52;;?\x07"));
+    t.send(b"\x1b]52;c;aGVsbG8gY2xpcA==\x07");
+    wait_for("clipboard buffer", || ctx.ok(&["list-buffers", "-F", "#{buffer_sample}"]) == "hello clip\n");
+    // the reply is not typed into the pane
+    assert!(!ctx.capture("clip").contains("52;"));
+}
+
+#[test]
+fn client_focus_flag_follows_focus_reports() {
+    let ctx = Ctx::new("p1fix-focus");
+    let t = start(&ctx, "fo");
+    let flags = || ctx.ok(&["list-clients", "-F", "#{client_flags}"]);
+    assert_eq!(flags(), "attached,focused,UTF-8\n");
+    t.send(b"\x1b[O");
+    wait_for("focus out", || flags() == "attached,UTF-8\n");
+    t.send(b"\x1b[I");
+    wait_for("focus in", || flags() == "attached,focused,UTF-8\n");
+}
+
+#[test]
+fn readonly_client_send_keys_and_refresh_client_control_flags() {
+    let ctx = Ctx::new("p1fix-rosend");
+    ctx.ok(&["new-session", "-d", "-s", "s1", "-x", "80", "-y", "24", "cat"]);
+    let t = Term::attach(&ctx, &["attach-session", "-r", "-t", "s1"], 80, 24);
+    t.wait_screen("readonly attach", |s| s.contains("[s1]"));
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    // the target client of send-keys may not be read-only (except for -X)
+    assert_eq!(ctx.fails(&["send-keys", "-c", &client, "-t", "s1", "abc"]).trim(), "client is read-only");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!ctx.capture("s1").contains("abc"));
+    // a trailing ':' is trimmed from a client name
+    assert_eq!(ctx.ok(&["display-message", "-p", "-c", &format!("{client}:"), "#{client_name}"]).trim(), client);
+    // -A, -B and -C are for control clients, checked first
+    for args in [["-C", "90x20"], ["-B", "x"], ["-A", "%0:on"]] {
+        assert_eq!(ctx.fails(&["refresh-client", "-t", &client, args[0], args[1]]).trim(), "not a control client", "{args:?}");
+    }
+    drop(t);
+}
+
+#[test]
+fn status_line_formats_have_no_pane_type() {
+    let ctx = Ctx::new("p1fix-stype");
+    ctx.ok(&["new-session", "-d", "-s", "s1", "-x", "60", "-y", "10", "sleep 100"]);
+    let f = "#{session_format}#{window_format}#{pane_format}";
+    ctx.ok(&["set", "-g", "status-left", &format!("L[{f}]")]);
+    ctx.ok(&["set", "-g", "status-right", &format!("R[{f}]")]);
+    ctx.ok(&["set", "-g", "window-status-current-format", &format!("W[{f}]")]);
+    let t = Term::attach(&ctx, &["attach-session", "-t", "s1"], 60, 10);
+    // format_defaults(ft, c, NULL, NULL, NULL); window entries are window formats
+    t.wait_screen("status formats", |s| s.contains("L[000]W[010]") && s.contains("R[000]"));
+}
+
+#[test]
+fn message_log_names_keys_messages_and_errors() {
+    let ctx = Ctx::new("p1fix-msglog");
+    let t = start(&ctx, "s1");
+    ctx.ok(&["bind-key", "-n", "F5", "set", "-g", "@f5", "1"]);
+    t.send(b"\x1b[15~");
+    wait_for("F5 binding", || ctx.cmd(&["show-options", "-gv", "@f5"]).1 == "1\n");
+    ctx.ok(&["display-message", "hello"]);
+    ctx.fails(&["nosuch"]);
+    ctx.fails(&["new-window", "-Q"]);
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    // send-keys -K: the bound commands are logged for the client that sent the keys
+    ctx.ok(&["bind-key", "-n", "F6", "set", "-g", "@f6", "1"]);
+    ctx.ok(&["send-keys", "-K", "-c", &client, "F6"]);
+    let log: Vec<String> = ctx.ok(&["show-messages"]).lines().map(|l| l.split_once(' ').map_or(l, |x| x.1).to_string()).collect();
+    let has = |want: &str| log.iter().any(|l| l == want);
+    assert!(has(&format!("{client} key F5: set-option -g @f5 1")), "{log:?}");
+    assert!(has(&format!("{client} message: hello")), "{log:?}");
+    assert!(log.iter().any(|l| l.ends_with(" message: unknown command: nosuch") && l.starts_with("client-")), "{log:?}");
+    assert!(log.iter().any(|l| l.ends_with(" message: command new-window: unknown flag -Q")), "{log:?}");
+    let f6 = log.iter().find(|l| l.ends_with("command: set-option -g @f6 1")).expect("F6 logged");
+    assert!(!f6.starts_with(&format!("{client} ")), "{f6}");
+    // -T: the terminal and its tty_term flags (VT100-like, 0x20)
+    let term = ctx.ok(&["show-messages", "-T"]);
+    let flags = term.split("flags=0x").nth(1).and_then(|r| r.split(':').next()).and_then(|h| u32::from_str_radix(h, 16).ok()).unwrap();
+    assert!(term.starts_with("Terminal 0: ") && flags & 0x20 != 0, "{term}");
+    drop(t);
 }

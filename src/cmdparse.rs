@@ -26,6 +26,11 @@ pub fn parse_with(input: &str, cond: &dyn Fn(&str) -> bool) -> Result<Vec<Vec<St
 /// later `${NAME}` in the same file sees it (the `set-environment` commands are still
 /// returned so the server's environment ends up the same).
 pub fn parse_with_env(input: &str, cond: &dyn Fn(&str) -> bool, env: &dyn Fn(&str) -> Option<String>) -> Result<Vec<Vec<String>>, String> {
+    parse_with_env_lines(input, cond, env).map(|(cmds, _)| cmds)
+}
+
+/// Like [`parse_with_env`], also giving the line each command starts on.
+pub fn parse_with_env_lines(input: &str, cond: &dyn Fn(&str) -> bool, env: &dyn Fn(&str) -> Option<String>) -> Result<(Vec<Vec<String>>, Vec<usize>), String> {
     let normalized = input.replace("\r\n", "\n");
     let mut lx = Lexer {
         s: normalized.chars().collect(),
@@ -34,9 +39,22 @@ pub fn parse_with_env(input: &str, cond: &dyn Fn(&str) -> bool, env: &dyn Fn(&st
         env,
         assigned: std::collections::HashMap::new(),
         braces: Vec::new(),
+        lines: Vec::new(),
     };
-    lx.run(cond)
+    let mut cmds = lx.run(cond)?;
+    // bind-key keeps its { } blocks as blocks (list-keys prints them so): they reach
+    // it with a mark in front
+    for (c, w) in std::mem::take(&mut lx.braces) {
+        if matches!(cmds[c][0].as_str(), "bind-key" | "bind") {
+            cmds[c][w].insert_str(0, BLOCK_MARK);
+        }
+    }
+    Ok((cmds, lx.lines))
 }
+
+/// Put in front of a `{ ... }` block argument of bind-key by [`parse_with_env`]
+/// (never typed: it starts with NUL).
+pub const BLOCK_MARK: &str = "\0{";
 
 /// Like [`parse`], but each argument also says whether it was a `{ ... }`
 /// block (its text is then the block's body), as tmux keeps command blocks
@@ -51,6 +69,7 @@ pub fn parse_blocks(input: &str) -> Result<Vec<Vec<(String, bool)>>, String> {
         env: &env,
         assigned: std::collections::HashMap::new(),
         braces: Vec::new(),
+        lines: Vec::new(),
     };
     let cmds = lx.run(&|c: &str| !c.is_empty() && c != "0")?;
     let mut out: Vec<Vec<(String, bool)>> = cmds.into_iter().map(|c| c.into_iter().map(|w| (w, false)).collect()).collect();
@@ -86,6 +105,39 @@ pub fn split_commands(args: &[String]) -> Vec<Vec<String>> {
     if !cur.is_empty() {
         out.push(cur);
     }
+    out
+}
+
+/// Split already-separated arguments into commands as cmd_parse_from_arguments does
+/// (bind-key with several arguments): an argument ending in ";" ends a command (the
+/// ";" is dropped, and an argument that was only ";" goes away), but "\;" at the end
+/// is a literal ";". Arguments starting with [`BLOCK_MARK`] are { } blocks and are kept.
+pub fn split_arguments(args: &[String]) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    for a in args {
+        let mut end = false;
+        let mut a = a.clone();
+        if !a.starts_with(BLOCK_MARK) && a.ends_with(';') {
+            a.pop();
+            if a.ends_with('\\') {
+                a.pop();
+                a.push(';');
+            } else {
+                end = true;
+            }
+        }
+        if !end || !a.is_empty() {
+            cur.push(a);
+        }
+        if end {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out.retain(|c| !c.is_empty());
     out
 }
 
@@ -183,6 +235,8 @@ struct Lexer<'a> {
     assigned: std::collections::HashMap<String, String>,
     /// (command, argument) positions of `{ ... }` blocks.
     braces: Vec<(usize, usize)>,
+    /// The line each command starts on.
+    lines: Vec<usize>,
 }
 
 fn is_blank(c: Option<char>) -> bool {
@@ -230,10 +284,17 @@ impl Lexer<'_> {
         let mut cur: Vec<(String, bool, bool)> = Vec::new();
         let mut stack: Vec<Frame> = Vec::new();
         let mut line_start = true;
+        let mut start = self.line;
 
         loop {
+            while self.lines.len() < cmds.len() {
+                self.lines.push(start);
+            }
             self.skip_blanks();
             let Some(c) = self.peek() else { break };
+            if cur.is_empty() {
+                start = self.line;
+            }
             let active = stack.last().is_none_or(|f| f.active);
             match c {
                 '\n' => {
@@ -274,6 +335,9 @@ impl Lexer<'_> {
         }
         let active = stack.last().is_none_or(|f| f.active);
         finish(&mut cmds, &mut cur, active, &mut self.assigned, &mut self.braces);
+        while self.lines.len() < cmds.len() {
+            self.lines.push(start);
+        }
         if !stack.is_empty() {
             return Err(self.err(self.line, "missing %endif"));
         }
@@ -902,13 +966,15 @@ mod tests {
     fn braces() {
         assert_eq!(
             p("bind x { split-window; select-pane -L }"),
-            vec![v(&["bind", "x", "split-window; select-pane -L"])]
+            vec![v(&["bind", "x", "\0{split-window; select-pane -L"])]
         );
+        // only bind-key's blocks are marked
+        assert_eq!(p("unbind x { y }"), vec![v(&["unbind", "x", "y"])]);
         let cmds = p("bind x {\n  split-window -h # comment }\n  select-pane -L\n}\nnext");
         assert_eq!(
             cmds,
             vec![
-                v(&["bind", "x", "split-window -h\n  select-pane -L"]),
+                v(&["bind", "x", "\0{split-window -h\n  select-pane -L"]),
                 v(&["next"])
             ]
         );
@@ -1147,6 +1213,20 @@ if-shell 'test -n "$SSH_CLIENT"' {
             split_commands(bound),
             vec![v(&["split-window"]), v(&["select-pane", "-L"])]
         );
+    }
+
+    #[test]
+    fn split_arguments_like_cmd_parse_from_arguments() {
+        let a = |x: &[&str]| split_arguments(&v(x));
+        assert_eq!(a(&["a", "1", ";", "b"]), vec![v(&["a", "1"]), v(&["b"])]);
+        assert_eq!(a(&["a", "1;", "b"]), vec![v(&["a", "1"]), v(&["b"])]);
+        // a trailing \\; is a literal ";"
+        assert_eq!(a(&["send", "-l", "\\;"]), vec![v(&["send", "-l", ";"])]);
+        assert_eq!(a(&["send", "-l", ";"]), vec![v(&["send", "-l"])]);
+        assert_eq!(a(&["send", ";x"]), vec![v(&["send", ";x"])]);
+        // blocks are kept as they are
+        let blk = format!("{BLOCK_MARK}x;");
+        assert_eq!(a(&["if", "1", &blk]), vec![v(&["if", "1", &blk])]);
     }
 
     #[test]

@@ -129,6 +129,31 @@ fn spawn_command(o: &Opts, input: bool) -> Result<Vec<String>, String> {
     Ok(if empty { vec![EMPTY_PANE.to_string()] } else { o.rest.clone() })
 }
 
+/// The checks cmd_parse_build_commands makes before anything runs: the command
+/// exists, its flags parse and the argument count fits (args_parse).
+pub fn check_command(argv: &[String]) -> Result<(), String> {
+    let Some((name, rest)) = argv.split_first() else { return Ok(()) };
+    if !name.starts_with('-') && name.contains('=') && rest.is_empty() {
+        return Ok(());
+    }
+    let full = canonical(name).ok_or_else(|| format!("unknown command: {name}"))?;
+    let spec = COMMANDS.iter().find(|c| c.0 == full).unwrap();
+    let mut args = rest.to_vec();
+    if matches!(full, "new-session" | "new-window" | "split-window" | "respawn-pane" | "respawn-window" | "display-popup") {
+        take_env(&mut args);
+    }
+    let o = getopt(&args, spec.2, spec.3).map_err(|e| format!("command {full}: {e}"))?;
+    if let Some(&(_, min, max)) = ARG_COUNTS.iter().find(|a| a.0 == full) {
+        if (o.rest.len() as i32) < min {
+            return err(format!("command {full}: too few arguments (need at least {min})"));
+        }
+        if max != -1 && o.rest.len() as i32 > max {
+            return err(format!("command {full}: too many arguments (need at most {max})"));
+        }
+    }
+    Ok(())
+}
+
 /// Store a command option (default-client-command, hooks) the way tmux parses
 /// it with cmd_parse_from_string and prints it with cmd_list_print: command-alias
 /// entries expanded, unknown commands and flags rejected, flags sorted as
@@ -144,6 +169,22 @@ fn command_list_string(v: &str, aliases: &[String]) -> Result<String, String> {
         out.extend(print_parsed_command(c, aliases, true)?);
     }
     Ok(out.join(" ; "))
+}
+
+/// A stored command string (a key binding or hook) printed as cmd_list_print does:
+/// full command names, flags sorted, arguments escaped, { } blocks kept; commands are
+/// separated by ` \; ` when `escaped` (list-keys), else ` ; `. Strings that do not
+/// parse are shown as they are.
+pub fn print_command_string(v: &str, aliases: &[String], escaped: bool) -> String {
+    let Ok(cmds) = cmdparse::parse_blocks(v) else { return v.to_string() };
+    let mut out = Vec::new();
+    for c in cmds {
+        match print_parsed_command(c, aliases, true) {
+            Ok(c) => out.extend(c),
+            Err(_) => return v.to_string(),
+        }
+    }
+    out.join(if escaped { " \\; " } else { " ; " })
 }
 
 /// Whether positional argument `idx` of a command may be a { } block
@@ -231,6 +272,16 @@ fn print_parsed_command(words: Vec<(String, bool)>, aliases: &[String], expand: 
         }
         out.push(if *brace { a.clone() } else { options::escape_arg(a) });
     }
+    // args_parse checks the argument counts last
+    if let Some(&(_, min, max)) = ARG_COUNTS.iter().find(|a| a.0 == full) {
+        let n = (args.len() - i) as i32;
+        if n < min {
+            return Err(fail(format!("too few arguments (need at least {min})")));
+        }
+        if max != -1 && n > max {
+            return Err(fail(format!("too many arguments (need at most {max})")));
+        }
+    }
     Ok(vec![out.join(" ")])
 }
 
@@ -266,6 +317,20 @@ fn take_env(args: &mut Vec<String>) -> Vec<(String, String)> {
     env
 }
 
+/// environ_update: each update-environment pattern copies the matching variables of the
+/// client's environment, or marks the pattern removed when none match.
+pub fn environ_update(patterns: &[String], src: &[(String, String)]) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    for p in patterns {
+        let found: Vec<&(String, String)> = src.iter().filter(|(k, _)| fnmatch(p, k)).collect();
+        if found.is_empty() {
+            out.push((p.clone(), None));
+        }
+        out.extend(found.into_iter().map(|(k, v)| (k.clone(), Some(v.clone()))));
+    }
+    out
+}
+
 fn fnmatch(pat: &str, s: &str) -> bool {
     fn m(p: &[char], s: &[char]) -> bool {
         match (p.first(), s.first()) {
@@ -278,6 +343,17 @@ fn fnmatch(pat: &str, s: &str) -> bool {
     }
     m(&pat.chars().collect::<Vec<_>>(), &s.chars().collect::<Vec<_>>())
 }
+
+/// The target type of a command (CMD_FIND_SESSION, _WINDOW, _PANE).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Find {
+    Session,
+    Window,
+    Pane,
+}
+
+/// CMD_FIND_CANFAIL: an unresolved target is an empty target, not an error.
+pub const FIND_CANFAIL: u8 = 1;
 
 const DIRS: [(char, Dir); 4] = [('L', Dir::Left), ('R', Dir::Right), ('U', Dir::Up), ('D', Dir::Down)];
 
@@ -319,56 +395,259 @@ impl Server {
         })
     }
 
-    fn find_session(&self, ctx: &Ctx, name: &str) -> Result<SessId, String> {
-        if name.is_empty() {
-            return self.current(ctx).sid.ok_or_else(|| "no current session".to_string());
-        }
-        if name == "{mouse}" || name == "=" {
-            return ctx.mouse.as_ref().and_then(|m| m.sid).ok_or_else(|| "no mouse target".to_string());
-        }
-        if name == "{marked}" || name == "~" {
-            return self.marked.and_then(|p| self.session_of_pane(p)).map(|x| x.0).ok_or_else(|| "no marked target".to_string());
-        }
-        if let Some(id) = name.strip_prefix('$').and_then(|i| i.parse().ok()) {
-            if self.sessions.contains_key(&id) {
-                return Ok(id);
-            }
-        }
-        if let Some(exact) = name.strip_prefix('=') {
-            return self.sessions.values().find(|s| s.name == exact).map(|s| s.id).ok_or_else(|| format!("can't find session: {name}"));
+    /// cmd_find_get_session: a `$id`, an exact name, a client's session, else (unless
+    /// exact) a unique prefix and then a unique fnmatch pattern.
+    fn get_session(&self, name: &str, exact: bool) -> Option<SessId> {
+        if let Some(id) = name.strip_prefix('$') {
+            return id.parse().ok().filter(|id| self.sessions.contains_key(id));
         }
         if let Some(s) = self.sessions.values().find(|s| s.name == name) {
-            return Ok(s.id);
+            return Some(s.id);
         }
-        // a pane or window id names its session
-        if name.starts_with('%') || name.starts_with('@') {
-            let t = self.resolve_pane(ctx, Some(name))?;
-            return t.sid.ok_or_else(|| format!("can't find session: {name}"));
+        if let Some(sid) = self.clients.values().find(|c| c.attached && c.name() == name).and_then(|c| c.session).filter(|s| self.sessions.contains_key(s)) {
+            return Some(sid);
         }
-        let m: Vec<SessId> = self.sessions.values().filter(|s| s.name.starts_with(name)).map(|s| s.id).collect();
-        match m.len() {
-            1 => return Ok(m[0]),
-            0 => {}
-            _ => return err(format!("more than one session: {name}")),
+        if exact {
+            return None;
         }
-        let m: Vec<SessId> = self.sessions.values().filter(|s| fnmatch(name, &s.name)).map(|s| s.id).collect();
-        match m.len() {
-            1 => Ok(m[0]),
-            0 => err(format!("can't find session: {name}")),
-            _ => err(format!("more than one session: {name}")),
+        let unique = |f: &dyn Fn(&Session) -> bool| -> Result<Option<SessId>, ()> {
+            let m: Vec<SessId> = self.sessions.values().filter(|s| f(s)).map(|s| s.id).collect();
+            match m.len() {
+                0 => Ok(None),
+                1 => Ok(Some(m[0])),
+                _ => Err(()),
+            }
+        };
+        match unique(&|s| s.name.starts_with(name)) {
+            Ok(Some(s)) => return Some(s),
+            Ok(None) => {}
+            Err(()) => return None,
         }
+        unique(&|s| fnmatch(name, &s.name)).ok().flatten()
+    }
+
+    /// cmd_find_best_session_with_window and cmd_find_best_winlink_with_window: the most
+    /// recently active session holding the window, at its current winlink or the first.
+    fn best_link(&self, wid: WinId, sid: Option<SessId>) -> Option<(SessId, u32)> {
+        let links = self.links_of(wid);
+        let sid = match sid {
+            Some(s) => s,
+            None => links.iter().map(|l| l.0).max_by_key(|s| self.sessions[s].activity_seq)?,
+        };
+        let s = self.sessions.get(&sid)?;
+        if s.links.get(&s.active) == Some(&wid) {
+            return Some((sid, s.active));
+        }
+        s.links.iter().find(|(_, w)| **w == wid).map(|(i, _)| (sid, *i))
+    }
+
+    /// A session by name for commands that look one up directly: a whole session target.
+    fn find_session(&self, ctx: &Ctx, name: &str) -> Result<SessId, String> {
+        let t = self.cmd_find(ctx, Some(name), Find::Session, 0)?;
+        t.sid.ok_or_else(|| format!("can't find session: {name}"))
     }
 
     pub fn resolve_session(&self, ctx: &Ctx, t: Option<&str>) -> Result<SessId, String> {
-        match t {
-            None => self.current(ctx).sid.ok_or_else(|| "no current session".to_string()),
-            Some(t) => {
-                if let Some(c) = self.client_current(ctx, t) {
-                    return c.map(|c| c.sid.unwrap());
+        let t = self.cmd_find(ctx, t, Find::Session, 0)?;
+        t.sid.ok_or_else(|| "no current target".to_string())
+    }
+
+    pub fn resolve_window(&self, ctx: &Ctx, t: Option<&str>) -> Result<Target, String> {
+        self.cmd_find(ctx, t, Find::Window, 0)
+    }
+
+    pub fn resolve_pane(&self, ctx: &Ctx, t: Option<&str>) -> Result<Target, String> {
+        self.cmd_find(ctx, t, Find::Pane, 0)
+    }
+
+    /// cmd_find_target: split a target into session, window and pane parts (a bare
+    /// word is the part the command's target type names, or a `$`/`@`/`%` id), look
+    /// each up, and report the part that failed. With FIND_CANFAIL a failure is an
+    /// empty target instead of an error.
+    pub fn cmd_find(&self, ctx: &Ctx, target: Option<&str>, ty: Find, flags: u8) -> Result<Target, String> {
+        let canfail = flags & FIND_CANFAIL != 0;
+        let fail = |e: String| if canfail { Ok(Target::default()) } else { Err(e) };
+        let target = target.unwrap_or("");
+        if let Some(c) = self.client_current(ctx, target) {
+            return c;
+        }
+        let cur = self.current(ctx);
+        let (Some(csid), Some(cwid)) = (cur.sid, cur.wid) else {
+            return fail("no current target".to_string());
+        };
+        if target.is_empty() {
+            return Ok(cur);
+        }
+        let mk = |sid: SessId, idx: u32| -> Target {
+            let wid = self.sessions[&sid].links[&idx];
+            Target { sid: Some(sid), idx: Some(idx), wid: Some(wid), pane: Some(self.windows[&wid].active) }
+        };
+        if target == "{mouse}" || target == "=" {
+            let m = ctx.mouse.as_ref();
+            if ty == Find::Pane {
+                if let Some(p) = m.and_then(|m| self.mouse_pane(m)) {
+                    let wid = self.window_of(p);
+                    let sid = m.and_then(|m| m.sid).filter(|s| self.sessions.contains_key(s));
+                    let idx = m.and_then(|m| m.idx).filter(|_| sid.is_some());
+                    return Ok(Target { sid: sid.or(cur.sid), idx: idx.or(cur.idx), wid, pane: Some(p) });
                 }
-                let s = t.split(':').next().unwrap_or("");
-                self.find_session(ctx, s)
             }
+            if let Some(wid) = m.and_then(|m| m.wid).filter(|w| self.windows.contains_key(w)) {
+                let sid = m.and_then(|m| m.sid).filter(|s| self.sessions.contains_key(s));
+                return Ok(Target { sid, idx: m.and_then(|m| m.idx), wid: Some(wid), pane: Some(self.windows[&wid].active) });
+            }
+            return fail("no mouse target".to_string());
+        }
+        if target == "{marked}" || target == "~" {
+            return match self.marked.filter(|p| self.window_of(*p).is_some()) {
+                Some(p) => Ok(self.target_for_pane(p)),
+                None => fail("no marked target".to_string()),
+            };
+        }
+
+        let (copy, colon) = match target.split_once(':') {
+            Some((a, b)) => (a, Some(b)),
+            None => (target, None),
+        };
+        let (mut session, mut window, mut pane) = (None, None, None);
+        let (mut window_only, mut pane_only) = (false, false);
+        match colon {
+            Some(rest) => {
+                session = Some(copy);
+                window_only = true;
+                match rest.split_once('.') {
+                    Some((w, p)) => (window, pane, pane_only) = (Some(w), Some(p), true),
+                    None => window = Some(rest),
+                }
+            }
+            None => match copy.split_once('.') {
+                Some((w, p)) => (window, pane, pane_only) = (Some(w), Some(p), true),
+                None if copy.starts_with('$') => session = Some(copy),
+                None if copy.starts_with('@') => window = Some(copy),
+                None if copy.starts_with('%') => pane = Some(copy),
+                None => match ty {
+                    Find::Session => session = Some(copy),
+                    Find::Window => window = Some(copy),
+                    Find::Pane => pane = Some(copy),
+                },
+            },
+        }
+        let exact_session = session.is_some_and(|s| s.starts_with('='));
+        let session = session.map(|s| s.strip_prefix('=').unwrap_or(s)).filter(|s| !s.is_empty());
+        let exact_window = window.is_some_and(|w| w.starts_with('='));
+        let window = window.map(|w| w.strip_prefix('=').unwrap_or(w)).filter(|w| !w.is_empty());
+        let pane = pane.filter(|p| !p.is_empty()).map(|p| match p {
+            "{last}" => "!",
+            "{next}" => "+",
+            "{previous}" => "-",
+            _ => p,
+        });
+
+        // with CANFAIL, what was found before the failing part stays in the state
+        let partial = |t: Target, e: String| if canfail { Ok(t) } else { Err(e) };
+        let no_session = |s: &str| fail(format!("can't find session: {s}"));
+        let no_window = |t: Target, w: &str| partial(t, format!("can't find window: {w}"));
+        let no_pane = |t: Target, p: &str| partial(t, format!("can't find pane: {p}"));
+        let empty = Target::default();
+        // cmd_find_get_window_with_session
+        let window_in = |sid: SessId, w: &str| -> Option<u32> {
+            if let Some(id) = w.strip_prefix('@') {
+                let wid = id.parse::<WinId>().ok()?;
+                return self.best_link(wid, Some(sid)).map(|l| l.1);
+            }
+            let w = if exact_window { format!("={w}") } else { w.to_string() };
+            self.find_window_in(sid, &w, ctx).ok()
+        };
+        // cmd_find_get_pane_with_window
+        let pane_in = |t: Target, p: &str| -> Option<Target> {
+            let wid = t.wid?;
+            let cur_pane = if t.wid == cur.wid { ctx.pane } else { None };
+            if p.starts_with('%') {
+                let id = p[1..].parse::<PaneId>().ok()?;
+                return self.windows[&wid].panes().contains(&id).then_some(Target { pane: Some(id), ..t });
+            }
+            self.find_pane_in(wid, p, cur_pane, ctx).ok().map(|id| Target { pane: Some(id), ..t })
+        };
+        // cmd_find_get_window: an id, a window of the current session, else a session
+        let get_window = |w: &str, only: bool| -> Option<Target> {
+            if let Some(id) = w.strip_prefix('@') {
+                let wid = id.parse::<WinId>().ok().filter(|w| self.windows.contains_key(w))?;
+                let (sid, idx) = self.best_link(wid, None)?;
+                return Some(mk(sid, idx));
+            }
+            if let Some(idx) = window_in(csid, w) {
+                return Some(mk(csid, idx));
+            }
+            if !only && let Some(sid) = self.get_session(w, exact_session) {
+                return Some(mk(sid, self.sessions[&sid].active));
+            }
+            None
+        };
+
+        if let Some(sn) = session {
+            let Some(sid) = self.get_session(sn, exact_session) else { return no_session(sn) };
+            let here = mk(sid, self.sessions[&sid].active);
+            let only_session = Target { sid: Some(sid), ..empty };
+            return match (window, pane) {
+                (None, None) => Ok(here),
+                (Some(w), None) => match window_in(sid, w) {
+                    Some(idx) => Ok(mk(sid, idx)),
+                    None => no_window(only_session, w),
+                },
+                (None, Some(p)) => {
+                    if let Some(id) = p.strip_prefix('%') {
+                        let found = id.parse::<PaneId>().ok().and_then(|id| Some((id, self.window_of(id)?)));
+                        return match found.and_then(|(id, wid)| Some((id, self.best_link(wid, Some(sid))?))) {
+                            Some((id, (_, idx))) => Ok(Target { pane: Some(id), ..mk(sid, idx) }),
+                            None => no_pane(only_session, p),
+                        };
+                    }
+                    match pane_in(here, p) {
+                        Some(t) => Ok(t),
+                        None => no_pane(Target { pane: None, ..here }, p),
+                    }
+                }
+                (Some(w), Some(p)) => {
+                    let Some(idx) = window_in(sid, w) else { return no_window(only_session, w) };
+                    match pane_in(mk(sid, idx), p) {
+                        Some(t) => Ok(t),
+                        None => no_pane(Target { pane: None, ..mk(sid, idx) }, p),
+                    }
+                }
+            };
+        }
+        match (window, pane) {
+            (Some(w), p) => {
+                let Some(t) = get_window(w, window_only) else { return no_window(empty, w) };
+                match p {
+                    None => Ok(t),
+                    Some(p) => match pane_in(t, p) {
+                        Some(t) => Ok(t),
+                        None => no_pane(Target { pane: None, ..t }, p),
+                    },
+                }
+            }
+            (None, Some(p)) => {
+                // cmd_find_get_pane: an id, a pane of the current window, else a window
+                if let Some(id) = p.strip_prefix('%') {
+                    return match id.parse::<PaneId>().ok().filter(|id| self.panes.contains_key(id)).and_then(|id| Some((id, self.window_of(id)?))) {
+                        Some((id, wid)) => match self.best_link(wid, None) {
+                            Some((sid, idx)) => Ok(Target { pane: Some(id), ..mk(sid, idx) }),
+                            None => no_pane(empty, p),
+                        },
+                        None => no_pane(empty, p),
+                    };
+                }
+                let here = Target { sid: Some(csid), idx: cur.idx, wid: Some(cwid), pane: cur.pane };
+                if let Some(t) = pane_in(here, p) {
+                    return Ok(t);
+                }
+                match (!pane_only).then(|| get_window(p, false)).flatten() {
+                    Some(t) => Ok(t),
+                    None => no_pane(empty, p),
+                }
+            }
+            (None, None) => Ok(cur),
         }
     }
 
@@ -436,61 +715,6 @@ impl Server {
         err(format!("can't find window: {w}"))
     }
 
-    pub fn resolve_window(&self, ctx: &Ctx, t: Option<&str>) -> Result<Target, String> {
-        let Some(t) = t else {
-            let c = self.current(ctx);
-            return if c.wid.is_some() { Ok(c) } else { err("no current window") };
-        };
-        if let Some(c) = self.client_current(ctx, t) {
-            return c;
-        }
-        let mk = |sid: SessId, idx: u32| -> Target {
-            let wid = self.sessions[&sid].links[&idx];
-            Target { sid: Some(sid), idx: Some(idx), wid: Some(wid), pane: Some(self.windows[&wid].active) }
-        };
-        if t == "{mouse}" || t == "=" {
-            let m = ctx.mouse.as_ref().ok_or("no mouse target")?;
-            let wid = m.wid.filter(|w| self.windows.contains_key(w)).ok_or("no mouse target")?;
-            let pane = m.pane.filter(|p| self.panes.contains_key(p)).unwrap_or(self.windows[&wid].active);
-            return Ok(Target { sid: m.sid.filter(|s| self.sessions.contains_key(s)), idx: m.idx, wid: Some(wid), pane: Some(pane) });
-        }
-        if t == "{marked}" || t == "~" {
-            let p = self.marked.ok_or("no marked target")?;
-            return Ok(self.target_for_pane(p));
-        }
-        if let Some(id) = t.strip_prefix('@').and_then(|i| i.parse::<WinId>().ok()) {
-            if self.windows.contains_key(&id) {
-                let cur = self.current(ctx).sid;
-                let links = self.links_of(id);
-                let (sid, idx) = links.iter().find(|(s, _)| Some(*s) == cur).or(links.first()).copied().ok_or("window not linked")?;
-                return Ok(mk(sid, idx));
-            }
-        }
-        if t.starts_with('%') {
-            let p = self.resolve_pane(ctx, Some(t))?;
-            return Ok(p);
-        }
-        match t.split_once(':') {
-            Some((s, w)) => {
-                let w = w.split('.').next().unwrap_or("");
-                let sid = self.find_session(ctx, s)?;
-                let idx = self.find_window_in(sid, w, ctx)?;
-                Ok(mk(sid, idx))
-            }
-            None => {
-                let cur = self.current(ctx).sid;
-                if let Some(sid) = cur {
-                    if let Ok(idx) = self.find_window_in(sid, t, ctx) {
-                        return Ok(mk(sid, idx));
-                    }
-                }
-                let sid = self.find_session(ctx, t)?;
-                let idx = self.sessions[&sid].active;
-                Ok(mk(sid, idx))
-            }
-        }
-    }
-
     fn find_pane_in(&self, wid: WinId, p: &str, cur_pane: Option<PaneId>, ctx: &Ctx) -> Result<PaneId, String> {
         let w = &self.windows[&wid];
         let panes = w.panes();
@@ -505,6 +729,13 @@ impl Server {
             let r = rect_of(active).unwrap_or_default();
             layout::neighbour(&rects, active, d, (r.x + cur.1, r.y + cur.0))
         };
+        // window_find_string names a corner or edge, in any case
+        let lower = p.to_ascii_lowercase();
+        let p = match lower.as_str() {
+            "top" | "bottom" | "left" | "right" | "top-left" | "top-right" | "bottom-left" | "bottom-right" => format!("{{{lower}}}"),
+            _ => p.to_string(),
+        };
+        let p = p.as_str();
         let r = match p {
             "" => Some(active),
             "{last}" | "!" => w.last_active,
@@ -549,65 +780,21 @@ impl Server {
         err(format!("can't find pane: {p}"))
     }
 
-    pub fn resolve_pane(&self, ctx: &Ctx, t: Option<&str>) -> Result<Target, String> {
-        let Some(t) = t else {
-            let c = self.current(ctx);
-            return if c.pane.is_some() { Ok(c) } else { err("no current pane") };
-        };
-        if let Some(c) = self.client_current(ctx, t) {
-            return c;
-        }
-        if let Some(id) = t.strip_prefix('%').and_then(|i| i.parse::<PaneId>().ok()) {
-            if self.panes.contains_key(&id) && self.window_of(id).is_some() {
-                return Ok(self.target_for_pane(id));
-            }
-            return err(format!("can't find pane: {t}"));
-        }
-        if t == "{mouse}" || t == "=" {
-            let m = ctx.mouse.as_ref().ok_or("no mouse target")?;
-            let p = self.mouse_pane(m).ok_or("no mouse target")?;
-            return Ok(self.target_for_pane(p));
-        }
-        if t == "{marked}" || t == "~" {
-            return Ok(self.target_for_pane(self.marked.ok_or("no marked target")?));
-        }
-        let (wpart, ppart) = match t.rfind('.') {
-            Some(i) if !t[..i].ends_with(':') || t.contains(':') => (Some(&t[..i]), &t[i + 1..]),
-            _ => (None, t),
-        };
-        if wpart.is_none() && !t.contains(':') {
-            // a bare word: pane in the current window, else a window target
-            let cur = self.current(ctx);
-            if let Some(wid) = cur.wid {
-                if let Ok(p) = self.find_pane_in(wid, t, ctx.pane, ctx) {
-                    return Ok(Target { pane: Some(p), ..cur });
-                }
-            }
-            return self.resolve_window(ctx, Some(t));
-        }
-        let wt = match wpart {
-            Some(w) => self.resolve_window(ctx, Some(w))?,
-            None => self.resolve_window(ctx, Some(t))?,
-        };
-        let wid = wt.wid.unwrap();
-        let ppart = if wpart.is_some() { ppart } else { "" };
-        let cur_pane = if wt.wid == self.current(ctx).wid { ctx.pane } else { None };
-        let p = self.find_pane_in(wid, ppart, cur_pane, ctx)?;
-        Ok(Target { pane: Some(p), ..wt })
+    /// Target client for commands with -c/-t client: a client name, or the context's client.
+    /// The target client of a CMD_CLIENT_CANFAIL command: a client that is not found
+    /// is no error, there is just no target client.
+    pub fn resolve_client_canfail(&self, ctx: &Ctx, t: Option<&str>) -> Option<ClientId> {
+        self.resolve_client(ctx, t).ok()
     }
 
-    /// Target client for commands with -c/-t client: a client name, or the context's client.
     pub fn resolve_client(&self, ctx: &Ctx, t: Option<&str>) -> Result<ClientId, String> {
         match t {
             Some(name) => {
-                if let Some(c) = self.clients.values().find(|c| c.attached && (c.name() == name || c.id.to_string() == name)) {
+                // cmd_find_client: one trailing ':' is trimmed, then only client names
+                // match (a session name is not a client)
+                let n = name.strip_suffix(':').unwrap_or(name);
+                if let Some(c) = self.clients.values().find(|c| c.attached && (c.name() == n || c.id.to_string() == n)) {
                     return Ok(c.id);
-                }
-                // a session name → its most recent client
-                if let Ok(sid) = self.find_session(ctx, name.trim_end_matches(':')) {
-                    if let Some(c) = self.clients.values().filter(|c| c.attached && c.session == Some(sid)).max_by_key(|c| c.activity) {
-                        return Ok(c.id);
-                    }
                 }
                 err(format!("can't find client: {name}"))
             }
@@ -620,7 +807,7 @@ impl Server {
                 self.clients
                     .values()
                     .filter(|c| c.attached && (sid.is_none() || c.session == sid))
-                    .max_by_key(|c| c.activity)
+                    .max_by_key(|c| c.activity_seq)
                     .map(|c| c.id)
                     .ok_or_else(|| "no current client".to_string())
             }
@@ -637,7 +824,7 @@ impl Server {
             match order {
                 sort::Order::Index => a.id.cmp(&b.id),
                 sort::Order::Creation => (a.created, a.id).cmp(&(b.created, b.id)),
-                sort::Order::Activity => b.activity.cmp(&a.activity),
+                sort::Order::Activity => b.activity_seq.cmp(&a.activity_seq),
                 sort::Order::Name => a.name.cmp(&b.name),
                 _ => Ordering::Equal,
             }
@@ -732,7 +919,7 @@ impl Server {
     }
 
     pub fn new_window_obj(&mut self, name: String, pane: PaneId, sx: u16, sy: u16) -> WinId {
-        let wid = self.id();
+        let wid = self.new_window_id();
         let now = now_secs();
         self.windows.insert(
             wid,
@@ -745,6 +932,7 @@ impl Server {
                 last_active: None,
                 zoomed: false,
                 options: Options::default(),
+                hooks: BTreeMap::new(),
                 alerts: 0,
                 layout_cycle: None,
                 old_layout: None,
@@ -799,9 +987,14 @@ impl Server {
             Some(n) if n.is_empty() || n.contains([':', '.']) => return err(format!("invalid session: {n}")),
             Some(n) if self.sessions.values().any(|s| s.name == n) => return err(format!("duplicate session: {n}")),
             Some(n) => n,
-            None => (0..).map(|i: u32| i.to_string()).find(|n| !self.sessions.values().any(|s| &s.name == n)).unwrap(),
+            // session_create: an unnamed session is named by its id (the next free one)
+            None => loop {
+                let n = self.next_session_id.to_string();
+                if !self.sessions.values().any(|s| s.name == n) { break n; }
+                self.next_session_id += 1;
+            },
         };
-        let sid = self.id();
+        let sid = self.new_session_id();
         let now = now_secs();
         let cwd = cwd
             .filter(|d| !d.is_empty())
@@ -810,11 +1003,7 @@ impl Server {
             .unwrap_or_default();
         let mut senv = BTreeMap::new();
         if let Some(ident) = ctx.client.and_then(|c| self.clients.get(&c)).and_then(|c| c.ident.as_ref()) {
-            for n in self.opt_array(None, "update-environment") {
-                if let Some((_, v)) = ident.env.iter().find(|(k, _)| *k == n) {
-                    senv.insert(n, Some(v.clone()));
-                }
-            }
+            senv.extend(environ_update(&self.opt_array(None, "update-environment"), &ident.env));
         }
         for (k, v) in env {
             senv.insert(k.clone(), Some(v.clone()));
@@ -835,6 +1024,7 @@ impl Server {
                 hooks: BTreeMap::new(),
                 created: now,
                 activity: now,
+                activity_seq: super::activity_seq(),
                 last_attached: 0,
                 alerts: BTreeMap::new(),
                 group: None,
@@ -873,8 +1063,9 @@ impl Server {
             s.last.insert(0, a);
             s.active = idx;
         }
+        // session_set_current leaves the session's activity alone: only attaching and
+        // keys from its clients count
         s.alerts.remove(&idx);
-        s.activity = now_secs();
         self.mark_session_dirty(sid);
         self.run_hook(Some(sid), "session-window-changed", Ctx::default());
     }
@@ -1087,9 +1278,32 @@ impl Server {
         if ctx.readonly && !READ_ONLY_OK.contains(&full) {
             return err("client is read-only");
         }
-        let o = getopt(&args, spec.2, spec.3).map_err(|e| format!("{full}: {e}"))?;
+        // args_parse errors, as cmd_parse reports them
+        let o = getopt(&args, spec.2, spec.3).map_err(|e| format!("command {full}: {e}"))?;
+        if let Some(&(_, min, max)) = ARG_COUNTS.iter().find(|a| a.0 == full) {
+            if (o.rest.len() as i32) < min {
+                return err(format!("command {full}: too few arguments (need at least {min})"));
+            }
+            if max != -1 && o.rest.len() as i32 > max {
+                return err(format!("command {full}: too many arguments (need at most {max})"));
+            }
+        }
         if ctx.readonly {
             self.check_readonly_command(full, &o, ctx)?;
+        }
+        // cmdq_add_message: each command goes in the message log (show-messages) once
+        // the configuration is loaded, by key for a bound command of an attached client
+        if self.cfg_finished {
+            let words = std::iter::once(full.to_string()).chain(args.iter().cloned())
+                .map(|a| match a.strip_prefix(cmdparse::BLOCK_MARK) { Some(b) => (b.to_string(), true), None => (a, false) }).collect();
+            let printed = print_parsed_command(words, &[], false).ok().and_then(|v| v.into_iter().next())
+                .unwrap_or_else(|| std::iter::once(full).chain(args.iter().map(String::as_str)).collect::<Vec<_>>().join(" "));
+            let msg = match ctx.log_client.or(ctx.client).or(ctx.reply).and_then(|c| self.clients.get(&c)) {
+                Some(c) if c.attached && c.session.is_some() && ctx.key.is_some() => format!("{} key {}: {printed}", c.name(), ctx.key.as_deref().unwrap_or("")),
+                Some(c) => format!("{} command: {printed}", c.name()),
+                None => format!("command: {printed}"),
+            };
+            self.add_message(&msg);
         }
         self.command(full, o, env, ctx)
     }
@@ -1126,28 +1340,45 @@ impl Server {
                 if o.has('A') {
                     if let Some(n) = &name {
                         if let Some(sid) = self.sessions.values().find(|s| &s.name == n).map(|s| s.id) {
-                            return self.attach_or_switch(ctx, sid, o.has('D'), false, o.has('E'));
+                            return self.attach_or_switch(ctx, sid, o.has('D'), false, o.has('E'), None);
                         }
                     }
                 }
                 let cid = ctx.reply.or(ctx.client);
                 let ident_size = cid.and_then(|c| self.clients.get(&c)).and_then(|c| c.ident.as_ref()).filter(|i| i.tty).map(|i| (i.cols, i.rows));
                 let default = self.opt_session(None, "default-size");
-                let (dx, dy) = default.split_once('x').map(|(a, b)| (a.parse().unwrap_or(80), b.parse().unwrap_or(24))).unwrap_or((80, 24));
+                let (dx, dy): (u16, u16) = default.split_once('x').map(|(a, b)| (a.parse().unwrap_or(80), b.parse().unwrap_or(24))).unwrap_or((80, 24));
                 let control = cid.is_some_and(|c| self.is_control(c));
                 let detached = o.has('d') || ident_size.is_none() && !control && ctx.client.and_then(|c| self.clients.get(&c)).is_none_or(|c| !c.attached);
                 let ident_size = if control { None } else { ident_size };
-                let (mut cols, mut rows) = if detached { (dx, dy) } else { ident_size.unwrap_or((dx, dy)) };
-                if let Some(x) = o.get('x').and_then(|v| v.parse().ok()) {
-                    cols = x;
-                }
-                if let Some(y) = o.get('y').and_then(|v| v.parse().ok()) {
-                    rows = y;
-                }
-                // Detached/control dimensions describe the pane area; attached
-                // terminal dimensions also include the status line.
-                let (cols, rows) = (cols.min(MAX_SIZE), rows.min(MAX_SIZE));
-                let rows = if detached || control { rows.saturating_add(self.status_lines(None)) } else { rows };
+                // cmd_new_session_exec: -x/-y (or "-" for the client's size) give the
+                // default size; an attached client's session gets the terminal's size
+                // (less a status line), others default-size with -x/-y over it
+                let dim = |f: char, tty: Option<u16>, def: u16, what: &str| -> Result<u16, String> {
+                    match o.get(f) {
+                        Some("-") => Ok(tty.unwrap_or(def)),
+                        Some(v) => options::strtonum(v, 1, u16::MAX as i64).map(|n| n as u16).map_err(|e| format!("{what} {e}")),
+                        None => Ok(def),
+                    }
+                };
+                let dsx = dim('x', ident_size.map(|s| s.0), 80, "width")?;
+                let dsy = dim('y', ident_size.map(|s| s.1), 24, "height")?;
+                let status = self.status_lines(None);
+                let (sx, sy) = if !detached && !control {
+                    let (c, r) = ident_size.unwrap_or((dx, dy.saturating_add(status)));
+                    (c, r.saturating_sub(status))
+                } else {
+                    let (mut sx, mut sy) = if default.split_once('x').is_some_and(|(a, b)| a.parse::<u16>().is_ok() && b.parse::<u16>().is_ok()) { (dx, dy) } else { (dsx, dsy) };
+                    if o.has('x') { sx = dsx; }
+                    if o.has('y') { sy = dsy; }
+                    (sx, sy)
+                };
+                let (sx, sy) = (sx.clamp(1, MAX_SIZE), sy.clamp(1, MAX_SIZE));
+                // -x/-y also set the session's default-size, as given
+                let default_size = (o.has('x') || o.has('y')).then(|| {
+                    format!("{}x{}", if o.has('x') { dsx } else { sx }, if o.has('y') { dsy } else { sy })
+                });
+                let (cols, rows) = (sx, sy.saturating_add(status));
                 if !detached {
                     // already attached clients switch, CLI clients attach
                     if let Some(c) = cid.and_then(|c| self.clients.get(&c)) {
@@ -1158,6 +1389,15 @@ impl Server {
                 }
                 let cwd = o.get('c').map(|c| self.expand(self.current(ctx), ctx.client, c));
                 let sid = self.create_session(ctx, name, cols, rows, cwd, o.get('n').map(String::from), &o.rest, &env)?;
+                if let (Some(ds), Some(s)) = (default_size, self.sessions.get_mut(&sid)) {
+                    s.options.set("default-size", ds);
+                }
+                if o.has('E') {
+                    // -E: no update-environment, only the -e variables
+                    if let Some(s) = self.sessions.get_mut(&sid) {
+                        s.env = env.iter().map(|(k, v)| (k.clone(), Some(v.clone()))).collect();
+                    }
+                }
                 if o.has('P') {
                     let fmt = o.get('F').unwrap_or("#{session_name}:");
                     let s = self.expand(Target { sid: Some(sid), ..Target::default() }, None, fmt);
@@ -1185,7 +1425,7 @@ impl Server {
                     let c = self.expand(self.current(ctx), None, c);
                     self.sessions.get_mut(&sid).unwrap().cwd = c;
                 }
-                self.attach_or_switch(ctx, sid, o.has('d') || o.has('x'), o.has('r'), o.has('E'))
+                self.attach_or_switch(ctx, sid, o.has('d') || o.has('x'), o.has('r'), o.has('E'), o.get('f'))
             }
             "switch-client" => {
                 let cid = self.resolve_client(ctx, o.get('c'))?;
@@ -1198,9 +1438,16 @@ impl Server {
                 // -r toggles read-only and also reverses the -n/-p order; -F is accepted and
                 // unused, as in tmux
                 if o.has('r') {
+                    // only the server's own user may make a read-only client writable
+                    let own_user = ctx.client.or(ctx.reply).and_then(|c| self.clients.get(&c))
+                        .is_some_and(|c| c.user.as_ref().is_none_or(|u| *u == self.owner));
                     let c = self.clients.get_mut(&cid).unwrap();
-                    if c.is_readonly() { return err("client is read-only"); }
-                    c.readonly = !c.readonly;
+                    if c.is_readonly() && !own_user { return err("client is read-only"); }
+                    // read-only and ignore-size together (also the read-only of server-access -r)
+                    let ro = c.is_readonly();
+                    c.readonly = !ro;
+                    c.acl_readonly &= !ro;
+                    c.ctl.ignore_size = c.readonly;
                     if t.is_none() && !o.has('n') && !o.has('p') && !o.has('l') {
                         return Ok(Flow::Next);
                     }
@@ -1235,7 +1482,8 @@ impl Server {
                         self.apply_layout(wid);
                     }
                 }
-                self.switch_client(cid, sid);
+                // -E: no update-environment
+                self.switch_client_env(cid, sid, !o.has('E'));
                 Ok(Flow::Next)
             }
             "detach-client" => {
@@ -1245,7 +1493,7 @@ impl Server {
                     let cids: Vec<ClientId> = self.clients.values().filter(|c| c.attached && c.session == Some(sid)).map(|c| c.id).collect();
                     let m = msg_for(self, Some(sid));
                     for c in cids {
-                        self.detach_client(c, &m);
+                        self.detach_client_exec(c, &m, o.get('E'));
                     }
                     return Ok(Flow::Next);
                 }
@@ -1256,11 +1504,11 @@ impl Server {
                     let cids: Vec<ClientId> = self.clients.values().filter(|c| c.attached && c.id != cid).map(|c| c.id).collect();
                     for c in cids {
                         let m = msg_for(self, self.client_session(c));
-                        self.detach_client(c, &m);
+                        self.detach_client_exec(c, &m, o.get('E'));
                     }
                 } else {
                     let m = if o.has('P') { "[detached and SIGHUP]".to_string() } else { m };
-                    self.detach_client(cid, &m);
+                    self.detach_client_exec(cid, &m, o.get('E'));
                 }
                 Ok(Flow::Next)
             }
@@ -1322,7 +1570,8 @@ impl Server {
                 let crit = sort::Criteria::from_args(o.get('O'), o.has('r'))?;
                 for (i, sid) in self.sorted_sessions(crit).into_iter().enumerate() {
                     let tt = Target { sid: Some(sid), idx: Some(self.sessions[&sid].active), wid: Some(self.sessions[&sid].active_window()), pane: None };
-                    self.list_line(ctx, tt, ctx.client, fmt, o.get('f'), HashMap::from([("line".to_string(), i.to_string())]));
+                    let extra = HashMap::from([("line".to_string(), i.to_string()), (super::vars::FORMAT_TYPE.to_string(), "S".to_string())]);
+                    self.list_line(ctx, tt, ctx.client, fmt, o.get('f'), extra);
                 }
                 Ok(Flow::Next)
             }
@@ -1348,7 +1597,9 @@ impl Server {
                         continue;
                     }
                     let tt = Target { sid: Some(sid), idx: Some(self.sessions[&sid].active), wid: Some(self.sessions[&sid].active_window()), pane: None };
-                    self.list_line(ctx, tt, Some(cid), fmt, o.get('f'), HashMap::from([("line".to_string(), i.to_string())]));
+                    // format_defaults gets only the client: no format type
+                    let extra = HashMap::from([("line".to_string(), i.to_string()), (super::vars::FORMAT_TYPE.to_string(), String::new())]);
+                    self.list_line(ctx, tt, Some(cid), fmt, o.get('f'), extra);
                 }
                 Ok(Flow::Next)
             }
@@ -1383,6 +1634,52 @@ impl Server {
             }
             "refresh-client" => {
                 let cid = self.resolve_client(ctx, t)?;
+                // -c/-L/-R/-U/-D pan a window larger than the client; windows are drawn from
+                // their top left here, so only the adjustment is checked
+                if ['c', 'L', 'R', 'U', 'D'].into_iter().any(|f| o.has(f)) {
+                    if let Some(a) = o.rest.first() {
+                        match a.parse::<i64>() {
+                            Ok(n) if (1..=i32::MAX as i64).contains(&n) => {}
+                            Ok(n) if n < 1 => return err("adjustment too small"),
+                            Ok(_) => return err("adjustment too large"),
+                            Err(_) => return err("adjustment invalid"),
+                        }
+                    }
+                    if let Some(c) = self.clients.get_mut(&cid) {
+                        c.dirty = true;
+                    }
+                    return Ok(Flow::Next);
+                }
+                if o.has('l') {
+                    // tty_clipboard_query: ask the terminal for its clipboard (Ms with "?");
+                    // a reply within 5 seconds makes a new buffer
+                    if let Some(c) = self.clients.get_mut(&cid).filter(|c| c.attached && c.control == 0 && c.features.has("clipboard")) {
+                        if c.clipboard_query.is_none_or(|d| Instant::now() >= d) {
+                            c.send(S_OUTPUT, b"\x1b]52;;?\x07");
+                            c.clipboard_query = Some(Instant::now() + Duration::from_secs(5));
+                        }
+                    }
+                    return Ok(Flow::Next);
+                }
+                // -f/-F apply first; -A, -B and -C are for control clients only (checked
+                // before their argument)
+                if let Some(f) = o.get('F') {
+                    self.control_flags(cid, f)?;
+                }
+                if let Some(f) = o.get('f') {
+                    self.control_flags(cid, f)?;
+                }
+                if (o.has('A') || o.has('B') || o.has('C')) && !self.is_control(cid) {
+                    return err("not a control client");
+                }
+                if let Some(a) = o.get('A') {
+                    self.control_pane_action(cid, a)?;
+                    return Ok(Flow::Next);
+                }
+                if let Some(b) = o.get('B') {
+                    self.control_subscribe(cid, b)?;
+                    return Ok(Flow::Next);
+                }
                 if let Some(size) = o.get('C') {
                     // control clients: -C WxH (or W,H)
                     let (w, h) = size.split_once(['x', ',']).ok_or_else(|| format!("bad size: {size}"))?;
@@ -1393,22 +1690,6 @@ impl Server {
                     if let Some(sid) = self.client_session(cid) {
                         self.update_session_size(sid);
                     }
-                    return Ok(Flow::Next);
-                }
-                let mut handled = false;
-                if let Some(a) = o.get('A') {
-                    self.control_pane_action(cid, a)?;
-                    handled = true;
-                }
-                if let Some(b) = o.get('B') {
-                    self.control_subscribe(cid, b)?;
-                    handled = true;
-                }
-                if let Some(f) = o.get('f').or(o.get('F')) {
-                    self.control_flags(cid, f)?;
-                    handled = true;
-                }
-                if handled {
                     return Ok(Flow::Next);
                 }
                 if o.has('S') {
@@ -1631,7 +1912,7 @@ impl Server {
                 w.name = name;
                 w.options.set("automatic-rename", "off".into());
                 self.mark_window_dirty(wt.wid.unwrap());
-                self.run_hook(wt.sid, "window-renamed", Ctx::default());
+                self.run_hook(wt.sid, "window-renamed", Ctx { pane: wt.wid.and_then(|w| self.windows.get(&w)).map(|w| w.active), ..Ctx::default() });
                 Ok(Flow::Next)
             }
             "select-window" | "next-window" | "previous-window" | "last-window" => {
@@ -1744,7 +2025,7 @@ impl Server {
                 let generation = p.generation + 1;
                 let size = p.size;
                 let cwd = o.get('c').map(String::from).unwrap_or_else(|| p.start_path.clone());
-                let cmdv = if o.rest.is_empty() && !p.start_cmd.is_empty() && !o.has('E') { vec![p.start_cmd.clone()] } else { requested };
+                let cmdv = if o.rest.is_empty() && !p.track.argv.is_empty() && !o.has('E') { p.track.argv.clone() } else { requested };
                 self.spawn_into(pane, generation, tt.sid, size.0, size.1, &cmdv, Some(&cwd), &env)?;
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
@@ -1789,7 +2070,7 @@ impl Server {
                     w.zoomed = false;
                     self.apply_layout(wid);
                     self.mark_window_dirty(wid);
-                    self.run_hook(wt.sid, "window-layout-changed", Ctx::default());
+                    self.run_hook(wt.sid, "window-layout-changed", Ctx { pane: wt.wid.and_then(|w| self.windows.get(&w)).map(|w| w.active), ..Ctx::default() });
                     return Ok(Flow::Next);
                 } else {
                     o.rest.first().cloned().or_else(|| {
@@ -1814,7 +2095,7 @@ impl Server {
                 w.zoomed = false;
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
-                self.run_hook(wt.sid, "window-layout-changed", Ctx::default());
+                self.run_hook(wt.sid, "window-layout-changed", Ctx { pane: wt.wid.and_then(|w| self.windows.get(&w)).map(|w| w.active), ..Ctx::default() });
                 Ok(Flow::Next)
             }
             "resize-window" => {
@@ -1865,7 +2146,8 @@ impl Server {
                 let n = wls.len().to_string();
                 for (sid, idx, wid) in wls {
                     let tt = Target { sid: Some(sid), idx: Some(idx), wid: Some(wid), pane: Some(self.windows[&wid].active) };
-                    self.list_line(ctx, tt, ctx.client, fmt, o.get('f'), HashMap::from([("line".to_string(), n.clone())]));
+                    let extra = HashMap::from([("line".to_string(), n.clone()), (super::vars::FORMAT_TYPE.to_string(), "W".to_string())]);
+                    self.list_line(ctx, tt, ctx.client, fmt, o.get('f'), extra);
                 }
                 Ok(Flow::Next)
             }
@@ -2060,7 +2342,7 @@ impl Server {
                 }
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
-                self.run_hook(tt.sid, "window-layout-changed", Ctx::default());
+                self.run_hook(tt.sid, "window-layout-changed", Ctx { pane: tt.wid.and_then(|w| self.windows.get(&w)).map(|w| w.active), ..Ctx::default() });
                 Ok(Flow::Next)
             }
             "swap-pane" => {
@@ -2355,11 +2637,22 @@ impl Server {
                             out.push_str(&format!("{} ", i - hist));
                         }
                         if o.has('I') {
-                            // when the line entered the history: not recorded here
-                            out.push_str("0 ");
+                            // when the line entered the history (0 for screen lines)
+                            let time = if mode_lines.is_some() || o.has('a') { 0 } else { screen.history_row_time(i as usize) };
+                            out.push_str(&format!("{time} "));
                         }
                         if o.has('F') {
-                            out.push_str(if wrapped { "W " } else { "- " });
+                            // the line's marks: start of output (O) or prompt (P), wrapped (W)
+                            // and extended cells (X); hyperlinks (H) are not kept
+                            let (marks, extended) = if mode_lines.is_some() || o.has('a') { (0, false) } else { screen.history_row_flags(i as usize) };
+                            let mut f = String::new();
+                            if marks & vt100::ROW_START_OUTPUT != 0 { f.push('O'); }
+                            if marks & vt100::ROW_START_PROMPT != 0 { f.push('P'); }
+                            if wrapped { f.push('W'); }
+                            if extended { f.push('X'); }
+                            if f.is_empty() { f.push('-'); }
+                            out.push_str(&f);
+                            out.push(' ');
                         }
                         out.push_str(&text);
                         if !(o.has('J') && wrapped) {
@@ -2522,6 +2815,9 @@ impl Server {
             }
             "display-menu" => {
                 let cid = self.resolve_client(ctx, o.get('c'))?;
+                if let Some(b) = o.get('b').filter(|b| !super::modes::BOX_LINES.contains(b)) {
+                    return err(format!("menu-border-lines unknown value: {b}"));
+                }
                 if self.clients.get(&cid).is_some_and(|c| c.overlay.is_some()) {
                     return Ok(Flow::Next);
                 }
@@ -2561,12 +2857,22 @@ impl Server {
                 let (w, h) = Menu::box_size(&title, &items);
                 let Some((x, y)) = self.overlay_position(cid, tt, ctx.mouse.as_ref(), o.get('x'), o.get('y'), w, h) else { return Ok(Flow::Next) };
                 let nomouse = ctx.mouse.is_none() && !o.has('M');
-                let menu = Menu::at(title, items, x, y, tt.pane, nomouse, o.has('O'), start);
-                let epoch = self.replace_overlay(cid, Some(Overlay::Menu(menu)))?;
-                Ok(Flow::WaitOverlay(cid, epoch))
+                let mut menu = Menu::at(title, items, x, y, tt.pane, nomouse, o.has('O'), start);
+                menu.look = super::modes::OverlayLook {
+                    style: o.get('s').map(String::from),
+                    selected_style: o.get('H').map(String::from),
+                    border_style: o.get('S').map(String::from),
+                    lines: o.get('b').map(String::from),
+                };
+                // cmd_display_menu_exec returns at once (only display-popup waits)
+                self.replace_overlay(cid, Some(Overlay::Menu(menu)))?;
+                Ok(Flow::Next)
             }
             "display-popup" => {
                 let cid = self.resolve_client(ctx, o.get('c'))?;
+                if let Some(b) = o.get('b').filter(|b| !super::modes::BOX_LINES.contains(b)) {
+                    return err(format!("popup-border-lines unknown value: {b}"));
+                }
                 if o.has('C') {
                     if matches!(self.clients.get(&cid).and_then(|c| c.overlay.as_ref()), Some(Overlay::Popup(_))) {
                         self.replace_overlay(cid, None)?;
@@ -2591,18 +2897,26 @@ impl Server {
                 let h = dim(o.get('h'), ch).clamp(3, ch);
                 let x = o.get('x').and_then(|v| v.parse().ok()).unwrap_or(((cw - 1) / 2).saturating_sub(w / 2)).min(cw - w);
                 let y = o.get('y').and_then(|v| v.parse().ok()).unwrap_or(((ch - 1) / 2).saturating_sub(h / 2)).min(ch - h);
-                let border = !o.has('B');
+                // -B, or -b none: no border
+                let border = !o.has('B') && o.get('b') != Some("none");
                 let (iw, ih) = if border { (w - 2, h - 2) } else { (w, h) };
                 let tt = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
                 let cwd = o.get('d').map(|d| self.expand(tt, Some(cid), d)).or_else(|| tt.pane.and_then(|p| self.panes.get(&p)).map(|p| p.current_path.clone()));
                 let pane = self.spawn_pane(tt.sid, iw.max(1), ih.max(1), &o.rest, cwd.as_deref(), &env)?;
                 let title = o.get('T').map(|s| self.expand(tt, Some(cid), s)).unwrap_or_default();
-                let epoch = self.replace_overlay(cid, Some(Overlay::Popup(Popup { pane, x, y, w, h, border, close_on_exit: o.has('E'), title })))?;
+                let epoch = self.replace_overlay(cid, Some(Overlay::Popup(Popup {
+                    pane, x, y, w, h, border, close_on_exit: o.has('E'), title, any_key: o.has('k') && !o.has('N'),
+                    look: super::modes::OverlayLook { style: o.get('s').map(String::from), border_style: o.get('S').map(String::from), lines: o.get('b').map(String::from), ..Default::default() },
+                })))?;
                 Ok(Flow::WaitOverlay(cid, epoch))
             }
             // ---------------------------------------------------------------- prompts & messages
             "command-prompt" => {
                 let cid = self.resolve_client(ctx, t)?;
+                // a client shows one prompt at a time
+                if self.clients.get(&cid).is_some_and(|c| c.prompt.is_some()) {
+                    return Ok(Flow::Next);
+                }
                 let tt = self.current(&Ctx { client: Some(cid), ..ctx.clone() });
                 let template = o.rest.first().cloned().unwrap_or_else(|| "%1".into());
                 // -F: the template is a format, expanded now
@@ -2619,13 +2933,21 @@ impl Server {
                 };
                 let prompts: Vec<(String, String)> = labels.into_iter().enumerate().map(|(i, l)| (l, inits.get(i).cloned().unwrap_or_default())).collect();
                 let kind = if o.has('k') { PromptKind::Key } else { PromptKind::Command };
+                // -T: which history the prompt uses (tmux 3.8 has command and search)
+                let search = match o.get('T') {
+                    None | Some("command") => false,
+                    Some("search") => true,
+                    Some(ty) => return err(format!("unknown type: {ty}")),
+                };
                 self.open_prompt(cid, kind, prompts, template, ctx.pane, o.has('N'), o.has('1'));
                 // -e: backspace on empty input closes the prompt; -C (keep updating panes) is
                 // how prompts behave here anyway
                 if let Some(pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
                     pr.bspace_exit = o.has('e') && !o.has('1') && !o.has('N') && !o.has('i') && !o.has('k');
+                    pr.search = search;
                 }
-                Ok(Flow::Next)
+                // without -b (or -i) the command waits until the prompt is done
+                self.prompt_wait(cid, o.has('b') || o.has('i'))
             }
             "confirm-before" => {
                 let cid = self.resolve_client(ctx, t)?;
@@ -2651,19 +2973,46 @@ impl Server {
                 if let Some(pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
                     pr.confirm = (key, o.has('y'));
                 }
-                Ok(Flow::Next)
+                self.prompt_wait(cid, o.has('b'))
             }
             "display-message" => {
-                let tt = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
-                let cid = o.get('c').map(|c| self.resolve_client(ctx, Some(c))).transpose()?
-                    .or_else(|| ctx.client.filter(|id| self.clients.get(id).is_some_and(|c| c.attached)))
-                    .or_else(|| self.resolve_client(ctx, None).ok()).or(ctx.client);
+                let tt = self.cmd_find(ctx, t, Find::Pane, FIND_CANFAIL)?;
+                // CMD_CLIENT_CANFAIL: a -c that is not found leaves no target client
+                let cid = match o.get('c') {
+                    Some(c) => self.resolve_client_canfail(ctx, Some(c)),
+                    None => ctx.client.filter(|id| self.clients.get(id).is_some_and(|c| c.attached))
+                        .or_else(|| self.resolve_client(ctx, None).ok()),
+                };
+                // the formats use -c (or the current client) if it shows the target session,
+                // else the best client of that session, or of any if it has none attached
+                let fc = match tt.sid {
+                    Some(s) if cid.and_then(|c| self.clients.get(&c)).is_some_and(|c| c.session == Some(s)) => cid,
+                    Some(s) => {
+                        let attached = |c: &&Client| c.attached && c.session.is_some_and(|x| self.sessions.contains_key(&x));
+                        let on_s = self.clients.values().filter(attached).any(|c| c.session == Some(s));
+                        self.clients.values().filter(attached).filter(|c| !on_s || c.session == Some(s)).max_by_key(|c| c.activity_seq).map(|c| c.id)
+                    }
+                    None => None,
+                };
+                // cmdq_merge_formats adds the command's name
+                let extra = HashMap::from([("command".to_string(), "display-message".to_string())]);
                 if o.has('a') && !o.has('j') {
                     let mut names: Vec<&str> = VAR_NAMES.to_vec();
                     names.sort();
-                    let vc = super::vars::VarCtx { srv: self, t: tt, client: cid, extra: HashMap::new() };
+                    let vc = super::vars::VarCtx { srv: self, t: tt, client: fc, extra: HashMap::new() };
+                    // format_each: the table (variables without a value are left out),
+                    // then the added entries
                     for n in names {
-                        let v = crate::format::Vars::get(&vc, n).unwrap_or_default();
+                        if let Some(v) = crate::format::Vars::get(&vc, n) {
+                            ctx.out.push_str(&format!("{n}={v}\n"));
+                        }
+                    }
+                    // the added entries are a sorted tree: the command's, and the copy
+                    // mode's (window_copy_formats) while the pane is in copy mode
+                    let mut tree: Vec<(String, String)> = extra.iter().map(|(n, v)| (n.clone(), v.clone())).collect();
+                    tree.extend(COPY_VAR_NAMES.iter().filter_map(|n| crate::format::Vars::get(&vc, n).map(|v| (n.to_string(), v))));
+                    tree.sort();
+                    for (n, v) in tree {
                         ctx.out.push_str(&format!("{n}={v}\n"));
                     }
                     return Ok(Flow::Next);
@@ -2671,6 +3020,7 @@ impl Server {
                 if o.has('F') && !o.rest.is_empty() {
                     return err("only one of -F or argument must be given");
                 }
+                let delay = o.get('d').map(|d| options::strtonum(d, 0, u32::MAX as i64).map_err(|e| format!("delay {e}"))).transpose()?;
                 let fmt = match o.rest.first().map(String::as_str).or(o.get('F')) {
                     Some(f) => f,
                     None if o.has('j') => "",
@@ -2678,16 +3028,30 @@ impl Server {
                 };
                 // -l: literal, -j: JSON printed back in tmux's form; -C (keep updating the
                 // pane) and -N (ignore keys) are how messages behave here anyway
-                let msg = if o.has('l') { fmt.to_string() } else { self.expand_time(tt, cid, fmt) };
+                let msg = if o.has('l') { fmt.to_string() } else if o.has('v') {
+                    // -v: the expansion steps are printed first
+                    let (msg, log) = crate::format::expand_time_verbose(fmt, &super::vars::VarCtx { srv: self, t: tt, client: fc, extra });
+                    for line in log {
+                        ctx.out.push_str(&line);
+                        ctx.out.push('\n');
+                    }
+                    msg
+                } else {
+                    crate::format::expand_time(fmt, &super::vars::VarCtx { srv: self, t: tt, client: fc, extra })
+                };
                 let msg = if o.has('j') { json::normalize(&msg)? } else { msg };
                 let attached_client = cid.filter(|c| self.clients.get(c).is_some_and(|c| c.attached));
-                if o.has('p') || attached_client.is_none() {
+                // without -p the message needs a client to show it on; with none, tmux
+                // shows nothing (a command without any client, as from the configuration,
+                // reports it as an error)
+                if o.has('p') || (attached_client.is_none() && ctx.client.is_none() && ctx.reply.is_none()) {
                     ctx.out.push_str(&msg);
                     ctx.out.push('\n');
-                } else {
-                    let c = attached_client.unwrap();
+                } else if let Some(c) = attached_client.filter(|c| self.is_control(*c)) {
+                    self.control_write(c, &format!("%message {msg}\n"));
+                } else if let Some(c) = attached_client {
                     self.set_message(c, &msg);
-                    if let Some(ms) = o.get('d').and_then(|v| v.parse::<u64>().ok()) {
+                    if let Some(ms) = delay.map(|d| d as u64) {
                         if let Some(cl) = self.clients.get_mut(&c) {
                             if let Some(m) = &mut cl.message {
                                 m.1 = Instant::now() + Duration::from_millis(if ms == 0 { 86_400_000 } else { ms });
@@ -2698,18 +3062,62 @@ impl Server {
                 Ok(Flow::Next)
             }
             "show-messages" => {
-                for (t, m) in &self.messages {
-                    ctx.out.push_str(&format!("{}: {m}\n", crate::format::expand_time(&format!("#{{t:@t}}"), &HashMap::from([("@t".to_string(), t.to_string())]))));
+                // -T: the clients' terminals (there is no terminfo description to list,
+                // only which terminal each client has), -J: the running jobs
+                let mut blank = false;
+                if o.has('T') {
+                    let only = o.get('t').and_then(|t| self.resolve_client_canfail(ctx, Some(t)));
+                    let mut n = 0;
+                    for c in self.clients.values().filter(|c| c.attached && c.control == 0 && only.is_none_or(|o| o == c.id)) {
+                        let term = c.ident.as_ref().map(|i| i.term.as_str()).unwrap_or("");
+                        // tty_term's flags from what the terminal supports: 256 and RGB
+                        // colours, margins (DECSLRM), rectfill (DECFRA); the output is
+                        // always VT100-like
+                        let f = |name: &str, bit: u32| if c.features.has(name) { bit } else { 0 };
+                        let flags = f("256", 0x1) | f("margins", 0x4) | f("rectfill", 0x8) | f("RGB", 0x11) | 0x20;
+                        ctx.out.push_str(&format!("Terminal {n}: {term} for {}, flags=0x{flags:x}:\n", c.name()));
+                        n += 1;
+                    }
+                    blank = n != 0;
+                }
+                if o.has('J') {
+                    let mut jobs: Vec<(&u32, &Parked)> = self.jobs.iter().collect();
+                    jobs.sort_by_key(|(id, j)| std::cmp::Reverse((j.started, **id)));
+                    for (n, (_, j)) in jobs.into_iter().enumerate() {
+                        if std::mem::take(&mut blank) {
+                            ctx.out.push('\n');
+                        }
+                        let pid = j.pid.map_or(-1, |p| p as i64);
+                        ctx.out.push_str(&format!("Job {n}: {} [fd={}, pid={pid}, status=0]\n", j.cmd, j.fd));
+                    }
+                }
+                if o.has('T') || o.has('J') {
+                    return Ok(Flow::Next);
+                }
+                // newest first, as "#{t/p:message_time}: #{message_text}"
+                for (t, m) in self.messages.iter().rev() {
+                    let vars = HashMap::from([("message_time".to_string(), t.to_string())]);
+                    ctx.out.push_str(&format!("{}: {m}\n", crate::format::expand(&format!("#{{t/p:message_time}}"), &vars)));
                 }
                 Ok(Flow::Next)
             }
-            "clear-prompt-history" => {
-                self.prompt_history.clear();
-                Ok(Flow::Next)
-            }
-            "show-prompt-history" => {
-                for h in &self.prompt_history {
-                    ctx.out.push_str(h);
+            "clear-prompt-history" | "show-prompt-history" => {
+                // two histories: command and search
+                let types: Vec<&str> = match o.get('T') {
+                    Some(ty @ ("command" | "search")) => vec![ty],
+                    Some(ty) => return err(format!("invalid type: {ty}")),
+                    None => vec!["command", "search"],
+                };
+                for ty in types {
+                    let h = if ty == "search" { &mut self.prompt_history_search } else { &mut self.prompt_history };
+                    if cmd == "clear-prompt-history" {
+                        h.clear();
+                        continue;
+                    }
+                    ctx.out.push_str(&format!("History for {ty}:\n\n"));
+                    for (i, v) in h.iter().enumerate() {
+                        ctx.out.push_str(&format!("{}: {v}\n", i + 1));
+                    }
                     ctx.out.push('\n');
                 }
                 Ok(Flow::Next)
@@ -2723,10 +3131,21 @@ impl Server {
                 let key = args.remove(0);
                 let kname = keys::parse_key_name(&key).map(|k| keys::key_name(&k)).unwrap_or(key.clone());
                 let table = if o.has('n') { "root".to_string() } else { o.get('T').unwrap_or("prefix").to_string() };
-                let command = if args.len() == 1 { args[0].clone() } else { args.iter().map(|a| if a == ";" { "\\;".into() } else { cmdparse::quote(a) }).collect::<Vec<_>>().join(" ") };
+                // separate arguments: ";" separates commands as cmd_parse_from_arguments
+                // does ("{" and "}" are plain strings there); { } blocks of a parsed
+                // command come marked and stay blocks
+                let block = |a: &str| a.strip_prefix(cmdparse::BLOCK_MARK).map(str::to_string);
+                let command = if args.len() == 1 { block(&args[0]).unwrap_or_else(|| args[0].clone()) } else {
+                    cmdparse::split_arguments(&args).iter().map(|c| {
+                        c.iter().map(|a| block(a).map_or_else(|| cmdparse::quote(a), |b| format!("{{ {b} }}"))).collect::<Vec<_>>().join(" ")
+                    }).collect::<Vec<_>>().join(" ; ")
+                };
                 if command.is_empty() {
                     return err("bind-key needs a command");
                 }
+                // the command is parsed when it is bound (cmd_parse_from_*): unknown
+                // commands, flags and argument counts are errors here
+                command_list_string(&command, &self.command_aliases())?;
                 self.bindings.entry(table).or_default().insert(kname, Binding { cmd: command, repeat: o.has('r'), note: o.get('N').unwrap_or("").to_string() });
                 Ok(Flow::Next)
             }
@@ -2808,6 +3227,7 @@ impl Server {
                 let key_width = l.iter().map(|(_, k, _)| crate::format::width(k)).max().unwrap_or(0);
                 let table_width = l.iter().map(|(t, _, _)| crate::format::width(t)).max().unwrap_or(0);
                 let pad = |s: &str, w: usize| format!("{s}{}", " ".repeat(w.saturating_sub(crate::format::width(s))));
+                let aliases = self.command_aliases();
                 let mut lines = Vec::new();
                 for (table, key, b) in &l {
                     let line = match o.get('F') {
@@ -2822,14 +3242,14 @@ impl Server {
                                 ("key_prefix".to_string(), prefix.clone()),
                                 ("key_table".to_string(), table.to_string()),
                                 ("key_string".to_string(), key.to_string()),
-                                ("key_command".to_string(), b.cmd.clone()),
+                                ("key_command".to_string(), print_command_string(&b.cmd, &aliases, true)),
                             ]);
                             self.expand_extra(self.current(ctx), ctx.client, f, vars)
                         }
-                        None if notes_only => format!("{prefix} {} {}", pad(key, key_width), if b.note.is_empty() { &b.cmd } else { &b.note }),
+                        None if notes_only => format!("{prefix} {} {}", pad(key, key_width), if b.note.is_empty() { print_command_string(&b.cmd, &aliases, true) } else { b.note.clone() }),
                         None => {
                             let r = if !has_repeat { "" } else if b.repeat { "-r" } else { "  " };
-                            format!("bind-key {r} -T {} {} {}", pad(table, table_width), pad(&vis::args_escape(key), key_width), b.cmd)
+                            format!("bind-key {r} -T {} {} {}", pad(table, table_width), pad(&vis::args_escape(key), key_width), print_command_string(&b.cmd, &aliases, true))
                         }
                     };
                     if !line.is_empty() {
@@ -2862,10 +3282,28 @@ impl Server {
                     }
                     return Ok(Flow::Next);
                 }
+                // cmd_send_keys_exec: the target client (-c, CANFAIL, or the current one)
+                // must not be read-only unless -X; -N is a count from 1; -X (and -N with
+                // no keys in a mode) needs a mode with commands (only copy mode has them)
+                let tc = match o.get('c') {
+                    Some(c) => self.resolve_client_canfail(ctx, Some(c)),
+                    None => ctx.client.filter(|id| self.clients.get(id).is_some_and(|c| c.attached)).or_else(|| self.resolve_client(ctx, None).ok()),
+                };
+                if !o.has('X') && tc.is_some() && self.client_is_readonly(tc) {
+                    return err("client is read-only");
+                }
+                let n: usize = match o.get('N') {
+                    Some(v) => options::strtonum(&self.expand(tt, ctx.client, v), 1, u32::MAX as i64).map_err(|e| format!("repeat count {e}"))? as usize,
+                    None => 1,
+                };
+                let has_commands = self.panes.get(&pane).is_some_and(|p| matches!(p.mode, Some(PaneMode::Copy(_))));
+                let in_any_mode = self.panes.get(&pane).is_some_and(|p| p.mode.is_some());
+                if (o.has('X') && !has_commands) || (o.has('N') && in_any_mode && !has_commands && o.rest.is_empty()) {
+                    return err("not in a mode");
+                }
                 if o.has('X') {
                     let name = o.rest.first().ok_or("send-keys -X needs a command")?.clone();
                     let rest: Vec<String> = o.rest[1..].iter().map(|a| if o.has('F') { self.expand(tt, ctx.client, a) } else { a.clone() }).collect();
-                    let n: usize = o.get('N').and_then(|v| v.parse().ok()).unwrap_or(1);
                     if let Some(m) = ctx.mouse.clone() {
                         // from a mouse binding: the cursor goes to the mouse first, and
                         // begin-selection starts a drag (window_copy_command)
@@ -2888,13 +3326,42 @@ impl Server {
                     self.window_pane_mouse(p, ctx.client, &m);
                     return Ok(Flow::Next);
                 }
+                if o.has('K') {
+                    // -K: the keys are handled as if the client (-c) typed them (prefix, key
+                    // tables, bindings); bindings run before the commands after send-keys
+                    let Ok(cid) = self.resolve_client(ctx, o.get('c')) else { return Ok(Flow::Next) };
+                    let app = self.panes.get(&pane).is_some_and(|p| p.screen().application_cursor());
+                    let mut list = Vec::new();
+                    for k in &o.rest {
+                        let k = if o.has('F') { self.expand(tt, ctx.client, k) } else { k.clone() };
+                        let text = if o.has('H') {
+                            let bytes = k.split_whitespace().map(|h| u8::from_str_radix(h, 16).map_err(|_| format!("invalid hex: {h}"))).collect::<Result<Vec<u8>, String>>()?;
+                            String::from_utf8_lossy(&bytes).into_owned()
+                        } else { k };
+                        match keys::parse_key_name(&text).filter(|_| !o.has('l') && !o.has('H')) {
+                            Some(key) => list.push(key),
+                            None => list.extend(text.chars().filter_map(|c| keys::parse_key_name(&c.to_string()))),
+                        }
+                    }
+                    // the bound commands are the sending client's (cmdq_insert_after)
+                    let saved = self.key_origin.replace(ctx.client.or(ctx.reply).unwrap_or(cid));
+                    for _ in 0..n {
+                        for key in &list {
+                            self.handle_key(cid, key.clone(), keys::encode_key(key, app));
+                        }
+                    }
+                    self.key_origin = saved;
+                    return Ok(Flow::Next);
+                }
                 if o.has('R') {
                     if let Some(p) = self.panes.get_mut(&pane) {
                         p.parser.process(b"\x1bc");
                     }
                     self.mark_window_dirty(tt.wid.unwrap());
                 }
-                let n: usize = o.get('N').and_then(|v| v.parse().ok()).unwrap_or(1);
+                if o.rest.is_empty() && (o.has('N') || o.has('R')) {
+                    return Ok(Flow::Next);
+                }
                 let app = self.panes.get(&pane).is_some_and(|p| p.screen().application_cursor());
                 let mut data = Vec::new();
                 for k in &o.rest {
@@ -3053,29 +3520,50 @@ impl Server {
             }
             // ---------------------------------------------------------------- options & env
             "set-option" | "set-window-option" => self.cmd_set_option(cmd == "set-window-option", &o, ctx).map(|_| Flow::Next),
-            "show-options" | "show-window-options" => self.cmd_show_options(cmd == "show-window-options", &o, ctx).map(|_| Flow::Next),
+            "show-options" | "show-window-options" => self.cmd_show_options(cmd == "show-window-options", false, &o, ctx).map(|_| Flow::Next),
             "set-environment" => {
                 let name = o.rest.first().ok_or("set-environment needs a name")?.clone();
                 let value = o.rest.get(1).map(|v| if o.has('F') { self.expand(self.current(ctx), ctx.client, v) } else { v.clone() });
-                let map = if o.has('g') { &mut self.env } else { &mut self.sessions.get_mut(&self.resolve_session(ctx, t)?).unwrap().env };
+                if name.is_empty() { return err("empty variable name"); }
+                if name.contains('=') { return err("variable name contains ="); }
+                let level = if o.has('g') { GLOBAL_ENV } else { self.resolve_session(ctx, t)? };
+                let map = if level == GLOBAL_ENV { &mut self.env } else { &mut self.sessions.get_mut(&level).unwrap().env };
                 if o.has('u') {
+                    if value.is_some() { return err("can't specify a value with -u"); }
                     map.remove(&name);
+                    self.env_hidden.remove(&(level, name));
                 } else if o.has('r') {
+                    // environ_clear keeps the hidden flag
+                    if value.is_some() { return err("can't specify a value with -r"); }
                     map.insert(name, None);
                 } else {
-                    map.insert(name, Some(value.ok_or("no value specified")?));
+                    map.insert(name.clone(), Some(value.ok_or("no value specified")?));
+                    // -h: hidden, not passed to new processes; setting without -h shows it again
+                    if o.has('h') { self.env_hidden.insert((level, name)); } else { self.env_hidden.remove(&(level, name)); }
                 }
                 Ok(Flow::Next)
             }
             "show-environment" => {
-                let map = if o.has('g') { self.env.clone() } else { self.sessions[&self.resolve_session(ctx, t)?].env.clone() };
+                let level = if o.has('g') { GLOBAL_ENV } else { self.resolve_session(ctx, t)? };
+                let map = if level == GLOBAL_ENV { self.env.clone() } else { self.sessions[&level].env.clone() };
+                if let Some(n) = o.rest.first().filter(|n| !map.contains_key(*n)) {
+                    return err(format!("unknown variable: {n}"));
+                }
                 for (k, v) in map {
                     if o.rest.first().is_some_and(|n| *n != k) {
                         continue;
                     }
+                    // hidden variables show only with -h, and -h shows only those
+                    if self.env_hidden.contains(&(level, k.clone())) != o.has('h') {
+                        continue;
+                    }
                     match (v, o.has('s')) {
                         (Some(v), false) => ctx.out.push_str(&format!("{k}={v}\n")),
-                        (Some(v), true) => ctx.out.push_str(&format!("{k}={}; export {k};\n", cmdparse::quote(&v))),
+                        (Some(v), true) => {
+                            // POSIX interprets $ ` " and \ in double quotes
+                            let escaped: String = v.chars().flat_map(|c| if matches!(c, '$' | '`' | '"' | '\\') { vec!['\\', c] } else { vec![c] }).collect();
+                            ctx.out.push_str(&format!("{k}=\"{escaped}\"; export {k};\n"));
+                        }
                         (None, false) => ctx.out.push_str(&format!("-{k}\n")),
                         (None, true) => ctx.out.push_str(&format!("unset {k};\n")),
                     }
@@ -3090,48 +3578,99 @@ impl Server {
                     self.run_hook(sid, &base, ctx.clone());
                     return Ok(Flow::Next);
                 }
-                let map = if o.has('g') || self.resolve_session(ctx, t).is_err() { &mut self.hooks } else { &mut self.sessions.get_mut(&self.resolve_session(ctx, t)?).unwrap().hooks };
-                if o.has('u') {
-                    map.remove(&base);
-                    return Ok(Flow::Next);
-                }
-                let command = o.rest.get(1).ok_or("set-hook needs a command")?.clone();
-                let e = map.entry(base).or_default();
-                if o.has('a') {
-                    e.push(command);
-                } else {
-                    *e = vec![command];
+                // otherwise set-hook is set-option (cmd_set_option_exec): option names are
+                // checked, name[N] sets that element, and an @ name is a user option that
+                // show-hooks then lists (hooks_add_event)
+                self.cmd_set_option(false, &o, ctx)?;
+                if name.starts_with('@') && !o.has('u') && o.rest.len() > 1 {
+                    self.hook_events.insert(name);
                 }
                 Ok(Flow::Next)
             }
             "show-hooks" => {
-                let map = if o.has('g') { self.hooks.clone() } else { self.resolve_session(ctx, t).ok().map(|s| self.sessions[&s].hooks.clone()).unwrap_or_default() };
+                // a named hook (or any option) is shown as show-options shows it
+                if !o.rest.is_empty() {
+                    return self.cmd_show_options(false, true, &o, ctx).map(|_| Flow::Next);
+                }
+                // options_scope_from_flags: -p ignores -g
+                let global = o.has('g') && !o.has('p');
+                let level = if global { Ok(HookLevel::Global) } else if o.has('p') {
+                    self.resolve_pane(ctx, t).ok().and_then(|t| t.pane).map(HookLevel::Pane).ok_or_else(|| t.map_or_else(|| "no current pane".to_string(), |t| format!("no such pane: {t}")))
+                } else if o.has('w') {
+                    self.resolve_window(ctx, t).ok().and_then(|t| t.wid).map(HookLevel::Window).ok_or_else(|| t.map_or_else(|| "no current window".to_string(), |t| format!("no such window: {t}")))
+                } else {
+                    self.resolve_session(ctx, t).map(HookLevel::Session).map_err(|_| t.map_or_else(|| "no current session".to_string(), |t| format!("no such session: {t}")))
+                };
+                let map = self.hook_map(level?).cloned().unwrap_or_default();
                 let ft = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
-                for (k, v) in map {
-                    if o.rest.first().is_some_and(|n| n.split('[').next() != Some(k.as_str())) {
-                        continue;
-                    }
-                    for (i, c) in v.iter().enumerate().filter(|(_, c)| !c.is_empty()) {
+                let aliases = self.command_aliases();
+                // cmd_show_options_all: user hooks, then the table's hooks of the scope (-p
+                // pane hooks, -w window and pane hooks, else session hooks; global pane
+                // options don't exist); global options hold every table hook, so an
+                // empty one is shown by name
+                use crate::options::{Scope, HOOKS};
+                let in_scope = |sc: Scope| if o.has('p') { sc == Scope::Pane } else if o.has('w') { sc != Scope::Session } else { sc == Scope::Session };
+                // user options made hooks by set-hook come first, as plain options
+                let scope = if o.has('p') { Scope::Pane } else if o.has('w') { Scope::Window } else { Scope::Session };
+                if let Ok(tt) = self.option_target(scope, global, ctx, t) && let Some(store) = self.store(scope, global, tt) {
+                    for (k, v) in store.0.iter().filter(|(k, _)| self.hook_events.contains(*k)) {
                         match o.get('F') {
                             Some(f) => {
                                 let vars = HashMap::from([
                                     ("option_name".to_string(), k.clone()),
-                                    ("option_value".to_string(), c.clone()),
-                                    ("option_value_only".to_string(), "0".to_string()),
-                                    ("option_is_parent".to_string(), "0".to_string()),
-                                    ("option_is_array".to_string(), "1".to_string()),
+                                    ("option_value".to_string(), v.clone()),
+                                    ("option_is_user".to_string(), "1".to_string()),
                                     ("option_is_string".to_string(), "1".to_string()),
-                                    ("option_is_hook".to_string(), "1".to_string()),
-                                    ("option_is_user".to_string(), (k.starts_with('@') as u8).to_string()),
                                     ("option_has_value".to_string(), "1".to_string()),
-                                    ("option_has_array_key".to_string(), "1".to_string()),
-                                    ("option_array_key".to_string(), i.to_string()),
+                                    ("hook_fire_count".to_string(), "0".to_string()),
                                 ]);
                                 let line = self.expand_extra(ft, ctx.client, f, vars);
                                 ctx.out.push_str(&line);
                                 ctx.out.push('\n');
                             }
-                            None => ctx.out.push_str(&format!("{k}[{i}] {c}\n")),
+                            None => ctx.out.push_str(&format!("{k} {}\n", options::print_value(k, v))),
+                        }
+                    }
+                }
+                let names: Vec<String> = HOOKS.iter().filter(|(_, sc)| in_scope(*sc)).map(|(n, _)| n.to_string()).collect();
+                let only: Option<usize> = None;
+                for k in names {
+                    let items: Vec<(usize, &String)> = map.get(&k).map(|v| v.iter().enumerate().filter(|(i, c)| !c.is_empty() && only.is_none_or(|o| o == *i)).collect()).unwrap_or_default();
+                    let empty = items.is_empty();
+                    if empty && !(global && only.is_none() && crate::options::hook_scope(&k).is_some()) {
+                        continue;
+                    }
+                    let rows: Vec<(Option<usize>, String)> = if empty {
+                        vec![(None, String::new())]
+                    } else {
+                        items.into_iter().map(|(i, c)| (Some(i), print_command_string(c, &aliases, false))).collect()
+                    };
+                    for (i, value) in rows {
+                        match o.get('F') {
+                            Some(f) => {
+                                let vars = HashMap::from([
+                                    ("option_name".to_string(), k.clone()),
+                                    ("option_value".to_string(), value),
+                                    ("option_value_only".to_string(), "0".to_string()),
+                                    ("option_is_parent".to_string(), "0".to_string()),
+                                    ("option_is_array".to_string(), "1".to_string()),
+                                    ("option_is_string".to_string(), "0".to_string()),
+                                    ("option_is_hook".to_string(), (!k.starts_with('@') as u8).to_string()),
+                                    ("option_is_user".to_string(), (k.starts_with('@') as u8).to_string()),
+                                    ("option_has_value".to_string(), (i.is_some() as u8).to_string()),
+                                    ("option_has_array_key".to_string(), (i.is_some() as u8).to_string()),
+                                    ("option_array_key".to_string(), i.map(|i| i.to_string()).unwrap_or_default()),
+                                    // only monitor hooks count their firings
+                                    ("hook_fire_count".to_string(), "0".to_string()),
+                                ]);
+                                let line = self.expand_extra(ft, ctx.client, f, vars);
+                                ctx.out.push_str(&line);
+                                ctx.out.push('\n');
+                            }
+                            None => match i {
+                                Some(i) => ctx.out.push_str(&format!("{k}[{i}] {value}\n")),
+                                None => ctx.out.push_str(&format!("{k}\n")),
+                            },
                         }
                     }
                 }
@@ -3161,10 +3700,15 @@ impl Server {
                         let parsed = {
                             let cond = |c: &str| truthy(&self.expand(self.current(ctx), ctx.client, c));
                             let env = |n: &str| self.env.get(n).cloned().flatten();
-                            cmdparse::parse_with_env(&text, &cond, &env)
+                            cmdparse::parse_with_env_lines(&text, &cond, &env)
                         };
                         self.cur_file = saved_file;
-                        let cmds = parsed.map_err(|e| format!("{f}:{e}"))?;
+                        let (cmds, lines) = parsed.map_err(|e| format!("{f}:{e}"))?;
+                        // cmd_parse_from_file: the whole file is checked before any of
+                        // it runs; an error names the file and line
+                        for (c, line) in cmds.iter().zip(&lines) {
+                            check_command(c).map_err(|e| format!("{f}:{line}: {e}"))?;
+                        }
                         if o.has('n') {
                             continue;
                         }
@@ -3268,13 +3812,18 @@ impl Server {
                 Err(format!("\0wait\0{ch}"))
             }
             "list-commands" => {
-                for (n, a, b, v) in COMMANDS {
+                let rank = |n: &str| USAGE.iter().position(|(u, _)| *u == n).unwrap_or(usize::MAX);
+                let mut cmds: Vec<_> = COMMANDS.iter().collect();
+                cmds.sort_by_key(|(n, ..)| rank(n));
+                for (n, a, b, v) in cmds {
                     if o.rest.first().is_some_and(|x| x != n && x != a) {
                         continue;
                     }
                     let alias = if a.is_empty() { String::new() } else { format!(" ({a})") };
-                    let flags = if b.is_empty() { String::new() } else { format!(" [-{b}]") };
-                    let vals: String = v.chars().map(|c| format!(" [-{c} arg]")).collect();
+                    let (flags, vals) = match USAGE.iter().find(|(u, _)| u == n) {
+                        Some((_, usage)) => (format!(" {usage}"), String::new()),
+                        None => (if b.is_empty() { String::new() } else { format!(" [-{b}]") }, v.chars().map(|c| format!(" [-{c} arg]")).collect()),
+                    };
                     match o.get('F') {
                         Some(f) => {
                             let vars = HashMap::from([
@@ -3414,7 +3963,17 @@ impl Server {
             Some(n) if n.is_empty() || n.contains([':', '.']) => return err(format!("invalid session: {n}")),
             Some(n) if self.sessions.values().any(|s| s.name == n) => return err(format!("duplicate session: {n}")),
             Some(n) => n,
-            None => (0..).map(|i: u32| i.to_string()).find(|n| !self.sessions.values().any(|s| &s.name == n)).unwrap(),
+            // grouped sessions are named by the group (or target) and their id
+            None => {
+                let group = self.sessions[&tsid].group;
+                let prefix = group.and_then(|g| self.sessions.values().filter(|x| x.group == Some(g)).min_by_key(|x| x.created).map(|x| x.name.clone()))
+                    .unwrap_or_else(|| self.sessions[&tsid].name.clone());
+                loop {
+                    let n = format!("{prefix}-{}", self.next_session_id);
+                    if !self.sessions.values().any(|s| s.name == n) { break n; }
+                    self.next_session_id += 1;
+                }
+            }
         };
         let gid = match self.sessions[&tsid].group {
             Some(g) => g,
@@ -3425,7 +3984,7 @@ impl Server {
                 g
             }
         };
-        let sid = self.id();
+        let sid = self.new_session_id();
         let now = now_secs();
         let t = &self.sessions[&tsid];
         let session = Session {
@@ -3442,6 +4001,7 @@ impl Server {
             hooks: BTreeMap::new(),
             created: now,
             activity: now,
+            activity_seq: super::activity_seq(),
             last_attached: 0,
             alerts: BTreeMap::new(),
             group: Some(gid),
@@ -3456,12 +4016,12 @@ impl Server {
         let cid = ctx.reply.or(ctx.client);
         let attachable = cid.and_then(|c| self.clients.get(&c)).is_some_and(|c| c.attached || c.ident.as_ref().is_some_and(|i| i.tty));
         if !detached && attachable {
-            return self.attach_or_switch(ctx, sid, false, false, false);
+            return self.attach_or_switch(ctx, sid, false, false, false, None);
         }
         Ok(Flow::Next)
     }
 
-    fn attach_or_switch(&mut self, ctx: &mut Ctx, sid: SessId, detach_others: bool, readonly: bool, _no_env: bool) -> Result<Flow, String> {
+    fn attach_or_switch(&mut self, ctx: &mut Ctx, sid: SessId, detach_others: bool, readonly: bool, no_env: bool, flags: Option<&str>) -> Result<Flow, String> {
         let cid = ctx.reply.or(ctx.client).ok_or("no client")?;
         let c = self.clients.get(&cid).ok_or("no client")?;
         if !c.attached {
@@ -3480,10 +4040,15 @@ impl Server {
                 self.detach_client(o, &format!("[detached (from session {name})]"));
             }
         }
+        // -f sets client flags; -r is read-only,ignore-size
+        if let Some(f) = flags {
+            self.control_flags(cid, f)?;
+        }
         if let Some(c) = self.clients.get_mut(&cid) {
             c.readonly |= readonly || c.acl_readonly;
+            c.ctl.ignore_size |= readonly;
         }
-        self.switch_client(cid, sid);
+        self.switch_client_env(cid, sid, !no_env);
         Ok(Flow::Next)
     }
 
@@ -3547,42 +4112,76 @@ impl Server {
         }
     }
 
-    fn command_aliases(&self) -> Vec<String> {
+    pub(crate) fn command_aliases(&self) -> Vec<String> {
         self.opts_server.array_items("command-alias").into_iter().map(|(_, v)| v).collect()
     }
 
-    /// The hook map a hook option lives in: the server's with -g, otherwise the
-    /// target session's (pwsh-tmux keeps window and pane hooks per session).
-    fn hook_level(&self, o: &Opts, ctx: &Ctx) -> Result<Option<SessId>, String> {
-        if o.has('g') { return Ok(None); }
+    /// The level a hook option lives at, as options_scope_from_name: session hooks in
+    /// the session (the global options with -g), window and pane hooks in the window
+    /// (with -p the pane, which ignores -g; with -g the global window options).
+    fn hook_level(&self, o: &Opts, ctx: &Ctx, base: &str) -> Result<HookLevel, String> {
         let t = o.get('t');
-        self.resolve_session(ctx, t).map(Some)
-            .map_err(|_| t.map_or_else(|| "no current session".to_string(), |t| format!("no such session: {t}")))
+        let cause = |what: &str| t.map_or_else(|| format!("no current {what}"), |t| format!("no such {what}: {t}"));
+        Ok(match options::hook_scope(base) {
+            Some(Scope::Pane) if o.has('p') => HookLevel::Pane(self.resolve_pane(ctx, t).ok().and_then(|t| t.pane).ok_or_else(|| cause("pane"))?),
+            Some(Scope::Pane | Scope::Window) if o.has('g') => HookLevel::Global,
+            Some(Scope::Pane | Scope::Window) => HookLevel::Window(self.resolve_window(ctx, t).ok().and_then(|t| t.wid).ok_or_else(|| cause("window"))?),
+            _ if o.has('g') => HookLevel::Global,
+            _ => HookLevel::Session(self.resolve_session(ctx, t).map_err(|_| cause("session"))?),
+        })
+    }
+
+    /// The hooks of a level.
+    pub(crate) fn hook_map(&self, level: HookLevel) -> Option<&BTreeMap<String, Vec<String>>> {
+        match level {
+            HookLevel::Global => Some(&self.hooks),
+            HookLevel::Session(s) => self.sessions.get(&s).map(|s| &s.hooks),
+            HookLevel::Window(w) => self.windows.get(&w).map(|w| &w.hooks),
+            HookLevel::Pane(p) => self.panes.get(&p).map(|p| &p.hooks),
+        }
+    }
+
+    fn hook_map_mut(&mut self, level: HookLevel) -> Result<&mut BTreeMap<String, Vec<String>>, String> {
+        match level {
+            HookLevel::Global => Ok(&mut self.hooks),
+            HookLevel::Session(s) => self.sessions.get_mut(&s).map(|s| &mut s.hooks).ok_or_else(|| "no such session".into()),
+            HookLevel::Window(w) => self.windows.get_mut(&w).map(|w| &mut w.hooks).ok_or_else(|| "no such window".into()),
+            HookLevel::Pane(p) => self.panes.get_mut(&p).map(|p| &mut p.hooks).ok_or_else(|| "no such pane".into()),
+        }
+    }
+
+    /// The level above (show-options -A): pane -> window -> global.
+    fn hook_parent(&self, level: HookLevel) -> Option<HookLevel> {
+        match level {
+            HookLevel::Global => None,
+            HookLevel::Pane(p) => self.window_of(p).map(HookLevel::Window),
+            _ => Some(HookLevel::Global),
+        }
     }
 
     /// A hook's commands at a level: the global level holds every hook (an empty
-    /// array by default), a session only those set on it.
-    fn hook_values(&self, sid: Option<SessId>, base: &str) -> Option<&[String]> {
-        match sid {
-            None => Some(self.hooks.get(base).map_or(&[][..], |v| v.as_slice())),
-            Some(s) => self.sessions.get(&s)?.hooks.get(base).map(|v| v.as_slice()),
+    /// array by default), the others only those set on them.
+    fn hook_values(&self, level: HookLevel, base: &str) -> Option<&[String]> {
+        match level {
+            HookLevel::Global => Some(self.hooks.get(base).map_or(&[][..], |v| v.as_slice())),
+            l => self.hook_map(l)?.get(base).map(|v| v.as_slice()),
         }
     }
 
     /// set-option on a hook: an array of command lists. Unset elements are kept as
     /// "" so the other keys stay put (string keys are not supported).
     fn set_hook_option(&mut self, o: &Opts, ctx: &Ctx, name: &str, arg: &str, value: Option<String>) -> Result<(), String> {
-        let sid = match self.hook_level(o, ctx) {
-            Ok(s) => s,
-            Err(_) if o.has('q') => return Ok(()),
-            Err(e) => return err(e),
-        };
         let (base, key) = match name.split_once('[') {
             Some((b, k)) => {
                 let k = k.trim_end_matches(']');
                 (b, Some(k.parse::<usize>().map_err(|_| format!("bad array key: {k}"))?))
             }
             None => (name, None),
+        };
+        let sid = match self.hook_level(o, ctx, base) {
+            Ok(s) => s,
+            Err(_) if o.has('q') => return Ok(()),
+            Err(e) => return err(e),
         };
         let already = self.hook_values(sid, base).is_some_and(|v| key.is_none_or(|i| v.get(i).is_some_and(|c| !c.is_empty())));
         if o.has('o') && !o.has('u') && already {
@@ -3593,10 +4192,7 @@ impl Server {
             None => return err("empty value"),
             Some(v) => Some(command_list_string(v, &self.command_aliases())),
         };
-        let map = match sid {
-            None => &mut self.hooks,
-            Some(s) => &mut self.sessions.get_mut(&s).ok_or("no such session")?.hooks,
-        };
+        let map = self.hook_map_mut(sid)?;
         let Some(cmd) = cmd else {
             match key {
                 None => { map.remove(base); }
@@ -3740,7 +4336,8 @@ impl Server {
         }
     }
 
-    fn cmd_show_options(&mut self, window_cmd: bool, o: &Opts, ctx: &mut Ctx) -> Result<(), String> {
+    /// show-options, show-window-options and (`hooks_cmd`) show-hooks with a name.
+    fn cmd_show_options(&mut self, window_cmd: bool, hooks_cmd: bool, o: &Opts, ctx: &mut Ctx) -> Result<(), String> {
         let named = match o.rest.first() {
             Some(arg) => match self.option_name(o, ctx, arg)? { Some(n) => Some(n), None => return Ok(()) },
             None => None,
@@ -3761,9 +4358,12 @@ impl Server {
                 let def = options::def(base);
                 let is_hook = options::hook_scope(base).is_some();
                 let is_array = is_hook || def.is_some_and(|d| d.kind == options::Kind::Array);
-                let is_string = is_hook || def.is_none_or(|d| matches!(d.kind, options::Kind::Str | options::Kind::Style | options::Kind::Array));
+                // OPTIONS_IS_STRING: user options and string-typed ones (styles and string
+                // arrays), not commands (hooks), colours or numbers
+                let is_string = !is_hook && def.is_none_or(|d| matches!(d.kind, options::Kind::Str | options::Kind::Style)
+                    || (d.kind == options::Kind::Array && d.name != "pane-colours"));
                 let b = |v: bool| if v { "1".to_string() } else { "0".to_string() };
-                let vars = HashMap::from([
+                let mut vars = HashMap::from([
                     ("option_name".to_string(), base.to_string()),
                     ("option_value".to_string(), value.unwrap_or("").to_string()),
                     ("option_value_only".to_string(), b(o.has('v'))),
@@ -3776,6 +4376,10 @@ impl Server {
                     ("option_has_array_key".to_string(), b(akey.is_some())),
                     ("option_array_key".to_string(), akey.unwrap_or("").to_string()),
                 ]);
+                // only monitor hooks count their firings
+                if hooks_cmd {
+                    vars.insert("hook_fire_count".to_string(), "0".to_string());
+                }
                 out.push_str(&self.expand_extra(ft, ctx.client, f, vars));
                 out.push('\n');
                 return;
@@ -3788,22 +4392,27 @@ impl Server {
             }
         };
         // hooks live in the hook maps: the session's (if not -g), then the global one
-        let hook_sid = match self.hook_level(o, ctx) {
+        let hook_sid = match self.hook_level(o, ctx, name.map_or("", |n| n.split('[').next().unwrap_or(n))) {
             Ok(s) => s,
             Err(_) if o.has('q') && hook => return Ok(()),
             Err(e) if hook => return err(e),
-            Err(_) => None,
+            Err(_) => HookLevel::Global,
         };
         let show_hook = |out: &mut String, name: &str, named: bool| {
             let (base, key) = match name.split_once('[') {
                 Some((b, k)) => (b, Some(k.trim_end_matches(']'))),
                 None => (name, None),
             };
-            let (values, parent) = match self.hook_values(hook_sid, base) {
-                Some(v) => (v, false),
-                None if o.has('A') => (self.hook_values(None, base).unwrap_or_default(), true),
-                None => return,
-            };
+            let mut found = self.hook_values(hook_sid, base).map(|v| (v, false));
+            let mut level = hook_sid;
+            while found.is_none() && o.has('A') && let Some(up) = self.hook_parent(level) {
+                found = self.hook_values(up, base).map(|v| (v, true));
+                level = up;
+            }
+            let Some((values, parent)) = found else { return };
+            // set-hook keeps the command as given; it is shown as tmux prints it
+            let aliases = self.command_aliases();
+            let values: Vec<String> = values.iter().map(|v| if v.is_empty() { String::new() } else { print_command_string(v, &aliases, false) }).collect();
             match key {
                 Some(k) => print(out, name, Some(k.parse::<usize>().ok().and_then(|i| values.get(i)).map_or("", String::as_str)), parent),
                 None if values.iter().all(String::is_empty) => print(out, base, None, parent && !named),
@@ -3871,7 +4480,8 @@ impl Server {
             }
             None => {
                 // user options of this level first, then the table in tmux order
-                for (k, v) in store.0.iter().filter(|(k, _)| k.starts_with('@')) {
+                // (user options made hooks by set-hook only with -H)
+                for (k, v) in store.0.iter().filter(|(k, _)| k.starts_with('@') && (o.has('H') || !self.hook_events.contains(*k))) {
                     print(&mut out, k, Some(v), false);
                 }
                 let wanted = |s: Scope| s == scope || (s == Scope::Pane && scope == Scope::Window);
@@ -3910,15 +4520,34 @@ impl Server {
         }
     }
 
+    /// CMD_RETURN_WAIT for a prompt just opened (unless `background`): the queue goes
+    /// on when that prompt is closed.
+    fn prompt_wait(&self, cid: ClientId, background: bool) -> Result<Flow, String> {
+        match self.clients.get(&cid) {
+            Some(c) if !background && c.prompt.is_some() => Ok(Flow::WaitPrompt(cid, c.prompt_epoch)),
+            _ => Ok(Flow::Next),
+        }
+    }
+
     pub fn open_prompt(&mut self, cid: ClientId, kind: PromptKind, prompts: Vec<(String, String)>, template: String, pane: Option<PaneId>, numeric: bool, single: bool) {
         let (label, init) = prompts.first().cloned().unwrap_or_default();
         let input: Vec<char> = init.chars().collect();
         let cursor = input.len();
         if let Some(c) = self.clients.get_mut(&cid) {
-            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false, confirm: ('y', false) });
+            c.prompt_epoch = c.prompt_epoch.wrapping_add(1);
+            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false, confirm: ('y', false), search: false });
             c.dirty = true;
         }
     }
+}
+
+/// Where a hook is set: the global options, a session, a window or a pane.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HookLevel {
+    Global,
+    Session(SessId),
+    Window(WinId),
+    Pane(PaneId),
 }
 
 /// Commands a read-only (server-access -r) client may run.
@@ -3928,8 +4557,233 @@ const READ_ONLY_OK: &[&str] = &[
     "capture-pane", "refresh-client", "switch-client", "server-access",
 ];
 
+/// tmux 3.8's argument counts (args_parse's lower and upper; -1 is no limit).
+const ARG_COUNTS: &[(&str, i32, i32)] = &[
+    ("attach-session", 0, 0),
+    ("bind-key", 1, -1),
+    ("break-pane", 0, 0),
+    ("capture-pane", 0, 0),
+    ("choose-buffer", 0, 1),
+    ("choose-client", 0, 1),
+    ("choose-tree", 0, 1),
+    ("clear-history", 0, 0),
+    ("clear-prompt-history", 0, 0),
+    ("clock-mode", 0, 0),
+    ("command-prompt", 0, 1),
+    ("confirm-before", 1, 1),
+    ("copy-mode", 0, 0),
+    ("customize-mode", 0, 0),
+    ("delete-buffer", 0, 0),
+    ("detach-client", 0, 0),
+    ("display-menu", 1, -1),
+    ("display-message", 0, 1),
+    ("display-popup", 0, -1),
+    ("display-panes", 0, 1),
+    ("find-window", 1, 1),
+    ("has-session", 0, 0),
+    ("if-shell", 2, 3),
+    ("join-pane", 0, 0),
+    ("kill-pane", 0, 0),
+    ("kill-server", 0, 0),
+    ("kill-session", 0, 0),
+    ("kill-window", 0, 0),
+    ("last-pane", 0, 0),
+    ("last-window", 0, 0),
+    ("link-window", 0, 0),
+    ("list-buffers", 0, 0),
+    ("list-clients", 0, 0),
+    ("list-commands", 0, 1),
+    ("list-keys", 0, 1),
+    ("list-panes", 0, 0),
+    ("list-sessions", 0, 0),
+    ("list-windows", 0, 0),
+    ("load-buffer", 1, 1),
+    ("lock-client", 0, 0),
+    ("lock-server", 0, 0),
+    ("lock-session", 0, 0),
+    ("move-pane", 0, 0),
+    ("move-window", 0, 0),
+    ("new-pane", 0, -1),
+    ("new-session", 0, -1),
+    ("new-window", 0, -1),
+    ("next-layout", 0, 0),
+    ("next-window", 0, 0),
+    ("paste-buffer", 0, 0),
+    ("pipe-pane", 0, 1),
+    ("previous-layout", 0, 0),
+    ("previous-window", 0, 0),
+    ("refresh-client", 0, 1),
+    ("rename-session", 1, 1),
+    ("rename-window", 1, 1),
+    ("resize-pane", 0, 1),
+    ("resize-window", 0, 1),
+    ("respawn-pane", 0, -1),
+    ("respawn-window", 0, -1),
+    ("rotate-window", 0, 0),
+    ("run-shell", 0, -1),
+    ("save-buffer", 1, 1),
+    ("select-layout", 0, 1),
+    ("select-pane", 0, 0),
+    ("select-window", 0, 0),
+    ("send-keys", 0, -1),
+    ("send-prefix", 0, 0),
+    ("server-access", 0, 1),
+    ("set-buffer", 0, 1),
+    ("set-environment", 1, 2),
+    ("set-hook", 0, 2),
+    ("set-option", 1, 2),
+    ("set-window-option", 1, 2),
+    ("show-buffer", 0, 0),
+    ("show-environment", 0, 1),
+    ("show-hooks", 0, 1),
+    ("show-messages", 0, 0),
+    ("show-options", 0, 1),
+    ("show-prompt-history", 0, 0),
+    ("show-window-options", 0, 1),
+    ("source-file", 1, -1),
+    ("split-window", 0, -1),
+    ("start-server", 0, 0),
+    ("suspend-client", 0, 0),
+    ("swap-pane", 0, 0),
+    ("swap-window", 0, 0),
+    ("switch-client", 0, 0),
+    ("switch-mode", 0, 1),
+    ("unbind-key", 0, 1),
+    ("unlink-window", 0, 0),
+    ("wait-for", 1, 1),
+];
+
+/// tmux 3.8's usage strings, in cmd_table order (list-commands prints them in this order).
+const USAGE: &[(&str, &str)] = &[
+    ("attach-session", "[-dErx] [-c working-directory] [-f flags] [-t target-session]"),
+    ("bind-key", "[-nr] [-T key-table] [-N note] key [command [argument ...]]"),
+    ("break-pane", "[-abdPW] [-F format] [-n window-name] [-s src-pane] [-t dst-window] [-x width] [-y height] [-X x-position] [-Y y-position]"),
+    ("capture-pane", "[-aCeFHIJLMNpPqRT] [-b buffer-name] [-E end-line] [-S start-line] [-t target-pane]"),
+    ("choose-buffer", "[-kNrZ] [-F format] [-f filter] [-K key-format] [-O sort-order] [-t target-pane] [template]"),
+    ("choose-client", "[-hikNrZ] [-F format] [-f filter] [-K key-format] [-O sort-order] [-t target-pane] [template]"),
+    ("choose-tree", "[-GhkNrswZ] [-F format] [-f filter] [-K key-format] [-O sort-order] [-t target-pane] [template]"),
+    ("clear-history", "[-H] [-t target-pane]"),
+    ("clear-prompt-history", "[-T prompt-type]"),
+    ("clock-mode", "[-t target-pane]"),
+    ("command-prompt", "[-1CbeFiklNP] [-I inputs] [-p prompts] [-t target-client] [-T prompt-type] [template]"),
+    ("confirm-before", "[-by] [-c confirm-key] [-p prompt] [-t target-client] command"),
+    ("copy-mode", "[-dekHMqSu] [-s src-pane] [-t target-pane]"),
+    ("customize-mode", "[-kNZ] [-F format] [-f filter] [-t target-pane]"),
+    ("delete-buffer", "[-b buffer-name]"),
+    ("detach-client", "[-aP] [-E shell-command] [-s target-session] [-t target-client]"),
+    ("display-menu", "[-MO] [-b border-lines] [-c target-client] [-C starting-choice] [-H selected-style] [-s style] [-S border-style] [-t target-pane] [-T title] [-x position] [-y position] name [key] [command] ..."),
+    ("display-message", "[-aCIjlNpv] [-c target-client] [-d delay] [-F format] [-t target-pane] [message]"),
+    ("display-popup", "[-BCEkN] [-b border-lines] [-c target-client] [-d start-directory] [-e environment] [-h height] [-s style] [-S border-style] [-t target-pane] [-T title] [-w width] [-x position] [-y position] [shell-command [argument ...]]"),
+    ("display-panes", "[-kNZ] [-d duration] [-s source-window] [-t target-pane] [template]"),
+    ("find-window", "[-CiNrTZ] [-t target-pane] match-string"),
+    ("has-session", "[-t target-session]"),
+    ("if-shell", "[-bF] [-t target-pane] shell-command command [command]"),
+    ("join-pane", "[-bdfhv] [-l size] [-s src-pane] [-t dst-pane]"),
+    ("kill-pane", "[-a] [-f filter] [-t target-pane]"),
+    ("kill-server", ""),
+    ("kill-session", "[-aCg] [-f filter] [-t target-session]"),
+    ("kill-window", "[-a] [-f filter] [-t target-window]"),
+    ("last-pane", "[-deZ] [-t target-window]"),
+    ("last-window", "[-t target-session]"),
+    ("link-window", "[-abdk] [-s src-window] [-t dst-window]"),
+    ("list-buffers", "[-F format] [-f filter] [-O order]"),
+    ("list-clients", "[-F format] [-f filter] [-O order][-t target-session]"),
+    ("list-commands", "[-F format] [command]"),
+    ("list-keys", "[-1aNr] [-F format] [-O order] [-P prefix-string][-T key-table] [key]"),
+    ("list-panes", "[-asr] [-F format] [-f filter] [-O order][-t target-window]"),
+    ("list-sessions", "[-r] [-F format] [-f filter] [-O order]"),
+    ("list-windows", "[-ar] [-F format] [-f filter] [-O order][-t target-session]"),
+    ("load-buffer", "[-b buffer-name] [-t target-client] path"),
+    ("lock-client", "[-t target-client]"),
+    ("lock-server", ""),
+    ("lock-session", "[-t target-session]"),
+    ("move-pane", "[-bdfhMv] [-D lines] [-l size] [-L columns] [-P position] [-R columns] [-s src-pane] [-t dst-pane] [-U lines] [-X x-position] [-Y y-position] [-z z-index]"),
+    ("move-window", "[-abdkr] [-s src-window] [-t dst-window]"),
+    ("new-pane", "[-AbCDefhIkKLMOPvWZ] [-B border-lines] [-c start-directory] [-e environment] [-F format] [-l size] [-m message] [-p percentage] [-s style] [-S active-border-style] [-R inactive-border-style] [-T title] [-x width] [-y height] [-X x-position] [-Y y-position] [-t target-pane] [shell-command [argument ...]]"),
+    ("new-session", "[-AdDEPX] [-c start-directory] [-e environment] [-F format] [-f flags] [-n window-name] [-s session-name] [-t target-session] [-x width] [-y height] [shell-command [argument ...]]"),
+    ("new-window", "[-abdEkPS] [-c start-directory] [-e environment] [-F format] [-n window-name] [-t target-window] [shell-command [argument ...]]"),
+    ("next-layout", "[-t target-window]"),
+    ("next-window", "[-a] [-t target-session]"),
+    ("paste-buffer", "[-dprS] [-s separator] [-b buffer-name] [-t target-pane]"),
+    ("pipe-pane", "[-IOo] [-t target-pane] [shell-command]"),
+    ("previous-layout", "[-t target-window]"),
+    ("previous-window", "[-a] [-t target-session]"),
+    ("refresh-client", "[-cDlLRSU] [-A pane:state] [-B name:what:format] [-C XxY] [-f flags] [-r pane:report] [-t target-client] [adjustment]"),
+    ("rename-session", "[-t target-session] new-name"),
+    ("rename-window", "[-t target-window] new-name"),
+    ("resize-pane", "[-MTZ] [-D lines] [-L columns] [-R columns] [-U lines] [-x width] [-y height] [-t target-pane]"),
+    ("resize-window", "[-aADLRU] [-x width] [-y height] [-t target-window] [adjustment]"),
+    ("respawn-pane", "[-Ek] [-c start-directory] [-e environment] [-t target-pane] [shell-command [argument ...]]"),
+    ("respawn-window", "[-Ek] [-c start-directory] [-e environment] [-t target-window] [shell-command [argument ...]]"),
+    ("rotate-window", "[-DUZ] [-t target-window]"),
+    ("run-shell", "[-bCE] [-c start-directory] [-d delay] [-t target-pane] [shell-command [argument ...]]"),
+    ("save-buffer", "[-a] [-b buffer-name] path"),
+    ("select-layout", "[-Enop] [-t target-pane] [layout-name]"),
+    ("select-pane", "[-DdeLlMmRUZ] [-T title] [-t target-pane]"),
+    ("select-window", "[-lnpT] [-t target-window]"),
+    ("send-keys", "[-FHKlMRX] [-c target-client] [-N repeat-count] [-t target-pane] [key ...]"),
+    ("send-prefix", "[-2] [-t target-pane]"),
+    ("server-access", "[-adglrw] [-t target-pane] [user|group]"),
+    ("set-buffer", "[-aw] [-b buffer-name] [-n new-buffer-name] [-t target-client] [data]"),
+    ("set-environment", "[-Fhgru] [-t target-session] variable [value]"),
+    ("set-hook", "[-agpERTuw] [-B name:what:format] [-t target-pane] [hook] [command]"),
+    ("set-option", "[-aFgopqsuUw] [-t target-pane] option [value]"),
+    ("set-window-option", "[-aFgoqu] [-t target-window] option [value]"),
+    ("show-buffer", "[-b buffer-name]"),
+    ("show-environment", "[-hgs] [-t target-session] [variable]"),
+    ("show-hooks", "[-Bgpw] [-F format] [-t target-pane] [hook]"),
+    ("show-messages", "[-JT] [-t target-client]"),
+    ("show-options", "[-AgHpqsvw] [-F format] [-t target-pane] [option]"),
+    ("show-prompt-history", "[-T prompt-type]"),
+    ("show-window-options", "[-gv] [-F format] [-t target-window] [option]"),
+    ("source-file", "[-Fnqv] [-t target-pane] path ..."),
+    ("split-window", "[-bdefhIklPvWZ] [-B border-lines] [-c start-directory] [-e environment] [-F format] [-l size] [-m message] [-p percentage] [-s style] [-S active-border-style] [-R inactive-border-style] [-T title] [-t target-pane] [shell-command [argument ...]]"),
+    ("start-server", ""),
+    ("suspend-client", "[-t target-client]"),
+    ("swap-pane", "[-dDUZ] [-s src-pane] [-t dst-pane]"),
+    ("swap-window", "[-d] [-s src-window] [-t dst-window]"),
+    ("switch-client", "[-ElnprZ] [-c target-client] [-t target-session] [-T key-table] [-O order]"),
+    ("switch-mode", "[-kswZ] [-F format] [-t target-pane] [command]"),
+    ("unbind-key", "[-anq] [-T key-table] key"),
+    ("unlink-window", "[-k] [-t target-window]"),
+    ("wait-for", "[-ELSUlv] [-F format] [-w waiter] name"),
+];
+
 pub fn truthy(s: &str) -> bool {
     !s.is_empty() && s != "0"
+}
+
+/// b64_pton: whitespace is skipped, '=' ends the data; None for anything invalid.
+pub fn base64_decode(data: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let (mut acc, mut bits) = (0u32, 0u32);
+    let mut padding = false;
+    for &b in data {
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => {
+                padding = true;
+                continue;
+            }
+            b if b.is_ascii_whitespace() => continue,
+            _ => return None,
+        };
+        if padding {
+            return None;
+        }
+        acc = acc << 6 | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
 }
 
 pub fn base64(data: &[u8]) -> String {
@@ -3949,8 +4803,20 @@ pub fn base64(data: &[u8]) -> String {
     out
 }
 
+/// paste_make_sample: the first 200 bytes vis-encoded, cut at 200 bytes with "..." when
+/// the buffer or its encoding is longer.
+pub fn buffer_sample(data: &[u8]) -> String {
+    const WIDTH: usize = 200;
+    let mut v = vis::strvis(&data[..data.len().min(WIDTH)], vis::OCTAL | vis::CSTYLE | vis::TAB | vis::NL);
+    if data.len() > WIDTH || v.len() > WIDTH {
+        v.truncate(WIDTH);
+        v.extend_from_slice(b"...");
+    }
+    String::from_utf8_lossy(&v).into_owned()
+}
+
 pub fn buffer_vars(b: &Buffer) -> HashMap<String, String> {
-    let sample: String = String::from_utf8_lossy(&b.data).chars().take(50).map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let sample = buffer_sample(&b.data);
     HashMap::from([
         ("buffer_name".to_string(), b.name.clone()),
         ("buffer_size".to_string(), b.data.len().to_string()),
@@ -4053,6 +4919,14 @@ fn capture_grid(screen: &vt100::Screen, limit: usize) -> String {
     out
 }
 
+/// The variables window_copy_formats adds while a pane is in copy mode.
+pub const COPY_VAR_NAMES: &[&str] = &[
+    "copy_cursor_hyperlink", "copy_cursor_line", "copy_cursor_word", "copy_cursor_x", "copy_cursor_y", "copy_line_numbers",
+    "copy_position", "copy_position_limit", "rectangle_toggle", "scroll_position", "search_count", "search_count_partial",
+    "search_match", "search_present", "search_timed_out", "selection_active", "selection_end_x", "selection_end_y",
+    "selection_mode", "selection_present", "selection_start_x", "selection_start_y", "top_line_time",
+];
+
 pub const VAR_NAMES: &[&str] = &[
     // tmux 3.8's format_table, which display-message -a lists
     "active_window_index", "alternate_on", "alternate_saved_x", "alternate_saved_y", "bracket_paste_flag", "buffer_created", "buffer_full",
@@ -4094,6 +4968,10 @@ mod tests {
     fn helpers() {
         assert_eq!(base64(b"hello"), "aGVsbG8=");
         assert_eq!(base64(b"ab"), "YWI=");
+        assert_eq!(base64_decode(b"aGVs\nbG8="), Some(b"hello".to_vec()));
+        assert_eq!(base64_decode(b"YWI"), Some(b"ab".to_vec()));
+        assert_eq!(base64_decode(b"a*b"), None);
+        assert_eq!(base64_decode(b"YQ==YQ"), None);
         assert!(fnmatch("*.conf", "a.conf") && !fnmatch("a?", "abc"));
         assert_eq!(canonical("neww"), Some("new-window"));
         assert_eq!(canonical("list-k"), Some("list-keys"));

@@ -99,21 +99,40 @@ pub struct Modes {
 }
 
 pub fn draw_box(f: &mut Frame, x: u16, y: u16, w: u16, h: u16, style: Style, title: &str) {
+    draw_box_lines(f, x, y, w, h, style, title, "single");
+}
+
+/// Box characters for menu-border-lines / popup-border-lines: horizontal, vertical,
+/// corners (tl, tr, bl, br) and the left and right ends of a menu separator.
+pub fn box_lines(lines: &str) -> [&'static str; 8] {
+    match lines {
+        "rounded" => ["─", "│", "╭", "╮", "╰", "╯", "├", "┤"],
+        "double" => ["═", "║", "╔", "╗", "╚", "╝", "╠", "╣"],
+        "heavy" => ["━", "┃", "┏", "┓", "┗", "┛", "┣", "┫"],
+        "simple" => ["-", "|", "+", "+", "+", "+", "+", "+"],
+        "padded" | "none" => [" "; 8],
+        _ => ["─", "│", "┌", "┐", "└", "┘", "├", "┤"],
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn draw_box_lines(f: &mut Frame, x: u16, y: u16, w: u16, h: u16, style: Style, title: &str, lines: &str) {
     if w < 2 || h < 2 {
         return;
     }
+    let [hz, vt, tl, tr, bl, br, _, _] = box_lines(lines);
     for i in x + 1..x + w - 1 {
-        f.set(i, y, Cell { text: "─".into(), style });
-        f.set(i, y + h - 1, Cell { text: "─".into(), style });
+        f.set(i, y, Cell { text: hz.into(), style });
+        f.set(i, y + h - 1, Cell { text: hz.into(), style });
     }
     for j in y + 1..y + h - 1 {
-        f.set(x, j, Cell { text: "│".into(), style });
-        f.set(x + w - 1, j, Cell { text: "│".into(), style });
+        f.set(x, j, Cell { text: vt.into(), style });
+        f.set(x + w - 1, j, Cell { text: vt.into(), style });
     }
-    f.set(x, y, Cell { text: "┌".into(), style });
-    f.set(x + w - 1, y, Cell { text: "┐".into(), style });
-    f.set(x, y + h - 1, Cell { text: "└".into(), style });
-    f.set(x + w - 1, y + h - 1, Cell { text: "┘".into(), style });
+    f.set(x, y, Cell { text: tl.into(), style });
+    f.set(x + w - 1, y, Cell { text: tr.into(), style });
+    f.set(x, y + h - 1, Cell { text: bl.into(), style });
+    f.set(x + w - 1, y + h - 1, Cell { text: br.into(), style });
     if !title.is_empty() && w > 4 {
         let spans = format::spans(title, style);
         let cells = spans_cells(&spans, w.saturating_sub(4) as usize, style);
@@ -213,8 +232,12 @@ const BORDER_SETS: [(&str, [&str; 11]); 4] = [
 ];
 
 impl Server {
-    fn expand_status_time(&self, t: Target, cid: ClientId, template: &str) -> String {
-        format::expand_status_time(template, &vars::VarCtx { srv: self, t, client: Some(cid), extra: HashMap::new() })
+    /// A status line format. As status.c's format_defaults(ft, c, NULL, NULL, NULL), its
+    /// type is unknown (the window list entries are window formats); the target only
+    /// fills in what the client's session would.
+    fn expand_status_time(&self, t: Target, cid: ClientId, template: &str, ftype: &str) -> String {
+        let extra = HashMap::from([(vars::FORMAT_TYPE.to_string(), ftype.to_string())]);
+        format::expand_status_time(template, &vars::VarCtx { srv: self, t, client: Some(cid), extra })
     }
 
     pub fn render_all(&mut self) {
@@ -229,6 +252,18 @@ impl Server {
     fn style_option(&self, value: &str, base: Style, t: Target, cid: Option<ClientId>) -> Option<Style> {
         let ctx = vars::VarCtx { srv: self, t, client: cid, extra: HashMap::new() };
         format::parse_style_with(value, base, Some(&ctx)).ok().map(|p| p.style)
+    }
+
+    /// A display-menu/display-popup -s/-S/-H style over the option's style, as
+    /// menu_reapply_styles: it is parsed from the default cell and both its colours
+    /// replace the option's (a colour it does not give becomes the default).
+    fn flag_style(&self, value: Option<&str>, base: Style, t: Target, cid: ClientId) -> Style {
+        let Some(value) = value else { return base };
+        let ctx = vars::VarCtx { srv: self, t, client: Some(cid), extra: HashMap::new() };
+        match format::parse_style_from(value, Style::default(), base, Some(&ctx)) {
+            Ok(p) => Style { fg: p.style.fg, bg: p.style.bg, ..base },
+            Err(_) => base,
+        }
     }
 
     /// The target of a session's current pane, which status and message styles are expanded for.
@@ -259,8 +294,8 @@ impl Server {
         let cur = Target { sid: Some(sid), idx: Some(s.active), wid: Some(s.active_window()), pane: Some(self.windows[&s.active_window()].active) };
         let left_style = self.style_option(&self.opt_session(Some(sid), "status-left-style"), base, cur, Some(cid)).unwrap_or(base);
         let right_style = self.style_option(&self.opt_session(Some(sid), "status-right-style"), base, cur, Some(cid)).unwrap_or(base);
-        let left = self.expand_status_time(cur, cid, &self.opt_session(Some(sid), "status-left"));
-        let right = self.expand_status_time(cur, cid, &self.opt_session(Some(sid), "status-right"));
+        let left = self.expand_status_time(cur, cid, &self.opt_session(Some(sid), "status-left"), "");
+        let right = self.expand_status_time(cur, cid, &self.opt_session(Some(sid), "status-right"), "");
         let left_len = self.opt_session_num(Some(sid), "status-left-length").max(0) as usize;
         let right_len = self.opt_session_num(Some(sid), "status-right-length").max(0) as usize;
         let lcells = spans_cells(&format::spans(&left, left_style), left_len.min(width), base);
@@ -292,7 +327,7 @@ impl Server {
             } else if alerts & (ALERT_ACTIVITY | ALERT_SILENCE) != 0 {
                 st = wst("window-status-activity-style", st);
             }
-            let text = self.expand_status_time(t, cid, &fmt);
+            let text = self.expand_status_time(t, cid, &fmt, "W");
             let start = wcells.len();
             wcells.extend(spans_cells(&format::spans(&text, st), usize::MAX, st));
             wtags.resize(wcells.len(), Some(format::Range::Window(*idx)));
@@ -593,19 +628,27 @@ impl Server {
                     let st = ost("menu-style", st);
                     let bst = ost("menu-border-style", bst);
                     let selected = ost("menu-selected-style", Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() });
-                    m.draw(&mut f, st, bst, selected);
+                    // display-menu -s -S -H -b
+                    let given = |v: &Option<String>, base: Style| self.flag_style(v.as_deref(), base, active_target, cid);
+                    let (st, bst, selected) = (given(&m.look.style, st), given(&m.look.border_style, bst), given(&m.look.selected_style, selected));
+                    let lines = m.look.lines.clone().unwrap_or_else(|| self.opt_window(Some(wid), "menu-border-lines"));
+                    m.draw(&mut f, st, bst, selected, &lines);
                     cursor = None;
                 }
                 Overlay::Popup(pp) => {
                     let st = self.style_option(&self.opt_window(Some(wid), "popup-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
                     let bst = self.style_option(&self.opt_window(Some(wid), "popup-border-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
+                    // display-popup -s -S -b; popup_reapply_styles drops the attributes
+                    let given = |v: &Option<String>, base: Style| Style { attrs: 0, ..self.flag_style(v.as_deref(), base, active_target, cid) };
+                    let (st, bst) = (given(&pp.look.style, st), given(&pp.look.border_style, bst));
+                    let lines = pp.look.lines.clone().unwrap_or_else(|| self.opt_window(Some(wid), "popup-border-lines"));
                     for y in pp.y..pp.y + pp.h {
                         for x in pp.x..pp.x + pp.w {
                             f.set(x, y, Cell { text: " ".into(), style: st });
                         }
                     }
                     if pp.border {
-                        draw_box(&mut f, pp.x, pp.y, pp.w, pp.h, bst, &pp.title);
+                        draw_box_lines(&mut f, pp.x, pp.y, pp.w, pp.h, bst, &pp.title, &lines);
                     }
                     let (ix, iy, iw, ih) = pp.inner();
                     cursor = None;
@@ -647,7 +690,7 @@ impl Server {
                 let (line, tags) = if !custom.is_empty() && !(i == 0 && custom == options::STATUS_FORMATS[0]) {
                     let base = self.status_style(sid, cid);
                     let cur = Target { sid: Some(sid), idx: Some(s.active), wid: Some(wid), pane: Some(win.active) };
-                    let text = self.expand_status_time(cur, cid, custom);
+                    let text = self.expand_status_time(cur, cid, custom, "");
                     format::layout_line_ranged(&format::spans(&text, base), cw as usize, base)
                 } else if i == 0 {
                     self.status_line(cid, sid, cw)

@@ -817,7 +817,7 @@ fn is_word_separator(ws: &str, c: Option<&crate::cells::Cell>) -> bool {
 }
 
 /// The word around (x, y), following wrapped lines (format_grid_word).
-fn grid_word(get: impl Fn(usize) -> Option<Line>, rows: usize, mut x: usize, mut y: usize, ws: &str) -> Option<String> {
+pub(crate) fn grid_word(get: impl Fn(usize) -> Option<Line>, rows: usize, mut x: usize, mut y: usize, ws: &str) -> Option<String> {
     let mut line = get(y)?;
     let mut found = false;
     loop {
@@ -872,7 +872,7 @@ fn grid_word(get: impl Fn(usize) -> Option<Line>, rows: usize, mut x: usize, mut
 }
 
 /// The text of a line (format_grid_line).
-fn grid_line(l: &Line) -> Option<String> {
+pub(crate) fn grid_line(l: &Line) -> Option<String> {
     let s: String = l.cells[..line_length(l)].iter().filter(|c| !c.is_continuation()).map(|c| c.text.as_str()).collect();
     (!s.is_empty()).then_some(s)
 }

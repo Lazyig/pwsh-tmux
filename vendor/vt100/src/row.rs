@@ -5,14 +5,53 @@ use alloc::string::String;
 pub struct Row {
     cells: crate::row_cells::RowCells,
     wrapped: bool,
+    /// When the row entered the history (seconds since the epoch), 0 if it
+    /// has not or the time was not set (tmux's grid_line time).
+    time: u64,
+    /// ROW_START_PROMPT / ROW_START_OUTPUT (tmux's GRID_LINE_START_* flags).
+    flags: u8,
 }
+
+/// The line has the start of a shell prompt (OSC 133;A, N or P).
+pub const ROW_START_PROMPT: u8 = 1;
+/// The line has the start of command output (OSC 133;C).
+pub const ROW_START_OUTPUT: u8 = 2;
 
 impl Row {
     pub fn new(cols: u16) -> Self {
         Self {
             cells: crate::row_cells::RowCells::new(cols),
             wrapped: false,
+            time: 0,
+            flags: 0,
         }
+    }
+
+    pub fn flags(&self) -> u8 {
+        self.flags
+    }
+
+    pub fn set_flags(&mut self, flags: u8) {
+        self.flags = flags;
+    }
+
+    /// Whether a cell needs more than tmux's compact cell entry (multi-byte or
+    /// wide characters, RGB colours: GRID_LINE_EXTENDED).
+    pub fn extended(&self) -> bool {
+        self.cells().any(|c| {
+            c.contents().len() > 1
+                || c.is_wide()
+                || matches!(c.fgcolor(), crate::Color::Rgb(..))
+                || matches!(c.bgcolor(), crate::Color::Rgb(..))
+        })
+    }
+
+    pub fn time(&self) -> u64 {
+        self.time
+    }
+
+    pub fn set_time(&mut self, time: u64) {
+        self.time = time;
     }
 
     fn cols(&self) -> u16 {
@@ -28,11 +67,14 @@ impl Row {
             cell.clear(attrs);
         }
         self.wrapped = false;
+        self.flags = 0;
     }
 
     pub fn reset(&mut self) {
         self.cells.dense_mut().fill(crate::Cell::new());
         self.wrapped = false;
+        self.time = 0;
+        self.flags = 0;
     }
 
     fn cells(&self) -> impl Iterator<Item = &crate::Cell> {

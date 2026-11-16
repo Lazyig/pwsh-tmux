@@ -154,6 +154,33 @@ impl Screen {
     /// Preserve cleared normal-screen rows in history, as tmux does.
     pub fn set_scroll_on_clear(&mut self, enabled: bool) { self.scroll_on_clear = enabled; }
 
+    /// The current time (seconds since the epoch) recorded on rows as they
+    /// enter the history; 0 records no time.
+    pub fn set_time(&mut self, now: u64) {
+        self.grid.set_now(now);
+        self.alternate_grid.set_now(now);
+    }
+
+    /// Marks the cursor's line (OSC 133 prompt and output starts).
+    pub fn mark_cursor_row(&mut self, flag: u8) {
+        let row = self.grid_mut().current_row_mut();
+        row.set_flags(row.flags() | flag);
+    }
+
+    /// The marks of row `index` (counted as for [`Screen::history_row`]) and
+    /// whether it holds extended cells.
+    #[must_use]
+    pub fn history_row_flags(&self, index: usize) -> (u8, bool) {
+        self.grid().absolute_row(index).map_or((0, false), |r| (r.flags(), r.extended()))
+    }
+
+    /// When row `index` (counted as for [`Screen::history_row`]) entered the
+    /// history, 0 if it has not or no time was set.
+    #[must_use]
+    pub fn history_row_time(&self, index: usize) -> u64 {
+        self.grid().absolute_row(index).map_or(0, crate::row::Row::time)
+    }
+
     /// Resizes the screen **without calling** the [`on_scroll`] callback.
     ///
     /// This method behaves the same as [`Parser::set_size`] but does not call
@@ -1428,12 +1455,14 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
     pub fn ris(&mut self) {
         let scroll_on_clear = self.screen.scroll_on_clear;
         let counters = self.screen.grid.history_counters();
+        let now = self.screen.grid.now();
         self.screen = Screen::new(
             self.screen.grid.size(),
             self.screen.grid.scrollback_capacity(),
         );
         self.screen.scroll_on_clear = scroll_on_clear;
         self.screen.grid.set_history_counters(counters);
+        self.screen.set_time(now);
     }
 
     // csi codes

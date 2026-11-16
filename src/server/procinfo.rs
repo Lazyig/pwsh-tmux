@@ -102,8 +102,10 @@ pub fn job_command(command: &str) -> std::process::Command {
     }
     #[cfg(unix)]
     {
+        // job_run: argv[0] is the shell's name (shell_argv0)
+        use std::os::unix::process::CommandExt;
         let mut c = std::process::Command::new("/bin/sh");
-        c.args(["-c", command]);
+        c.arg0("sh").args(["-c", command]);
         c
     }
 }

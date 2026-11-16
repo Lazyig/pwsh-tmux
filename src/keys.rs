@@ -344,6 +344,20 @@ fn parse_esc(buf: &[u8], force: bool) -> Res {
         };
     }
     let escape = || Res::Done(key_tok(Key::plain(KeyCode::Escape), &buf[..1]), 1);
+    // An OSC 52 clipboard reply (to refresh-client -l) is passed on whole as Unknown, as
+    // tty_keys_clipboard takes it: ESC ] 5 2 ; ... ended by BEL or ST.
+    const OSC52: &[u8] = b"\x1b]52;";
+    if !force && buf.len() < OSC52.len() && OSC52.starts_with(buf) {
+        return Res::Incomplete;
+    }
+    if buf.starts_with(OSC52) {
+        let end = (OSC52.len()..buf.len()).find(|&i| buf[i] == 0x07 || (i > OSC52.len() && buf[i - 1] == ESC && buf[i] == b'\\'));
+        match end {
+            Some(i) => return Res::Done(unknown_tok(&buf[..=i]), i + 1),
+            None if !force && buf.len() <= MAX_PASTE => return Res::Incomplete,
+            None => {}
+        }
+    }
     match buf[1] {
         b'[' => match parse_csi(buf) {
             Csi::Done(tok, n) => Res::Done(tok, n),
@@ -2200,5 +2214,23 @@ mod tests {
                 assert_eq!(key1(&bytes), key, "{n} app={app} {bytes:?}");
             }
         }
+    }
+
+    #[test]
+    fn osc52_clipboard_reply() {
+        // whole, ended by BEL or ST, also when split anywhere
+        for seq in [&b"\x1b]52;c;aGk=\x07"[..], &b"\x1b]52;;aGk=\x1b\\"[..]] {
+            assert_eq!(all(seq), vec![Input::Unknown(seq.to_vec())]);
+            for split in 1..seq.len() {
+                let mut p = Parser::new();
+                let mut v = p.feed(&seq[..split]);
+                assert!(v.is_empty(), "{split}: {v:?}");
+                v.extend(p.feed(&seq[split..]));
+                assert_eq!(v, vec![Input::Unknown(seq.to_vec())], "{split}");
+            }
+        }
+        // a key after it, and M-] typed on its own
+        assert_eq!(all(b"\x1b]52;;\x07x"), vec![Input::Unknown(b"\x1b]52;;\x07".to_vec()), Input::Key(ch('x'), b"x".to_vec())]);
+        assert_eq!(key1(b"\x1b]"), meta(KeyCode::Char(']')));
     }
 }

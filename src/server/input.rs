@@ -44,12 +44,12 @@ pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
         ("$", "command-prompt -I '#S' { rename-session -- '%%' }", false, "Rename current session"),
         ("%", "split-window -h", false, "Split window horizontally"),
         ("&", "confirm-before -p \"kill-window #W? (y/n)\" kill-window", false, "Kill current window"),
-        ("'", "command-prompt -T window-target -p index { select-window -t ':%%' }", false, "Prompt for window index to select"),
+        ("'", "command-prompt -p index { select-window -t ':%%' }", false, "Prompt for window index to select"),
         ("(", "switch-client -p", false, "Switch to previous client"),
         (")", "switch-client -n", false, "Switch to next client"),
         (",", "command-prompt -I '#W' { rename-window -- '%%' }", false, "Rename current window"),
         ("-", "delete-buffer", false, "Delete the most recent paste buffer"),
-        (".", "command-prompt -T target { move-window -t '%%' }", false, "Move the current window"),
+        (".", "command-prompt { move-window -t '%%' }", false, "Move the current window"),
         ("/", "command-prompt -k -p key { list-keys -1N '%%' }", false, "Describe key binding"),
         (":", "command-prompt", false, "Prompt for a command"),
         (";", "last-pane", false, "Move to the previously active pane"),
@@ -204,6 +204,18 @@ impl Server {
     }
 
     pub fn dispatch_input(&mut self, cid: ClientId, input: Input) {
+        if let Input::Unknown(raw) = &input {
+            if raw.starts_with(b"\x1b]52;") {
+                self.clipboard_reply(cid, raw);
+                return;
+            }
+            // focus reports set the client's focus (also for read-only clients)
+            if raw == b"\x1b[I" || raw == b"\x1b[O" {
+                if let Some(c) = self.clients.get_mut(&cid) {
+                    c.focused = raw == b"\x1b[I";
+                }
+            }
+        }
         if self.client_is_readonly(Some(cid)) && !matches!(&input, Input::Key(_, _)) {
             return;
         }
@@ -238,6 +250,26 @@ impl Server {
                     }
                 }
             }
+        }
+    }
+
+    /// tty_keys_clipboard: the terminal's OSC 52 reply makes a buffer if refresh-client -l
+    /// asked for it in the last few seconds.
+    fn clipboard_reply(&mut self, cid: ClientId, raw: &[u8]) {
+        let Some(c) = self.clients.get_mut(&cid) else { return };
+        if c.clipboard_query.take().is_none_or(|d| Instant::now() >= d) {
+            return;
+        }
+        let body = &raw[5..];
+        let body = body.strip_suffix(b"\x07").or_else(|| body.strip_suffix(b"\x1b\\")).unwrap_or(body);
+        // skip the selection argument
+        let Some(pos) = body.iter().position(|&b| b == b';') else { return };
+        let data = &body[pos + 1..];
+        if data.is_empty() {
+            return;
+        }
+        if let Some(data) = super::cmds::base64_decode(data).filter(|d| !d.is_empty()) {
+            self.add_buffer(None, data, false);
         }
     }
 
@@ -291,7 +323,7 @@ impl Server {
         }
     }
 
-    fn handle_key(&mut self, cid: ClientId, k: Key, raw: Vec<u8>) {
+    pub(super) fn handle_key(&mut self, cid: ClientId, k: Key, raw: Vec<u8>) {
         let name = keys::key_name(&k);
         let Some(c) = self.clients.get(&cid) else { return };
         if c.is_readonly() && (c.prompt.is_some() || c.overlay.is_some()) { return; }
@@ -331,8 +363,11 @@ impl Server {
             }
             Some(Overlay::Popup(p)) => {
                 let pane = p.pane;
-                if self.panes.get(&pane).is_some_and(|x| x.dead.is_some()) {
-                    // any key closes a popup whose command has exited
+                let dead = self.panes.get(&pane).is_none_or(|x| x.dead.is_some());
+                // popup_key_cb: Escape and C-c close it unless it closes when its command
+                // exits (and that is still running); -k: any key once the command exited
+                let esc = (k.code == KeyCode::Escape && k.mods.is_empty()) || (k.code == KeyCode::Char('c') && k.mods.ctrl && !k.mods.meta);
+                if (esc && (!p.close_on_exit || dead)) || (dead && p.any_key) {
                     let c = self.clients.get_mut(&cid).unwrap();
                     c.overlay = None;
                     c.dirty = true;
@@ -377,7 +412,7 @@ impl Server {
                         c.key_table = "root".into();
                     }
                     c.dirty = true;
-                    self.run_string(cid, &cmd, pane);
+                    self.run_key_string(cid, &cmd, pane, &name);
                     return;
                 }
                 None if table != "root" => {
@@ -402,9 +437,22 @@ impl Server {
         self.send_key_to_pane(cid, pane, &k, raw);
     }
 
+    /// Runs a key binding's commands for a client: the message log names the key (or,
+    /// for send-keys -K, the client that sent it).
+    pub fn run_key_string(&mut self, cid: ClientId, cmd: &str, pane: Option<PaneId>, key: &str) {
+        match crate::cmdparse::parse(cmd).and_then(|c| c.iter().try_for_each(|c| super::cmds::check_command(c)).map(|_| c)) {
+            Ok(cmds) => {
+                let ctx = Ctx { client: Some(cid), pane, from_key: true, key: Some(key.to_string()), log_client: self.key_origin, ..Ctx::default() };
+                self.run_queue(Queue { cmds: cmds.into(), ctx , soft: 0 });
+            }
+            Err(e) => self.set_message(cid, &e),
+        }
+    }
+
     /// Runs a command string for a client (key bindings, prompts, menus).
     pub fn run_string(&mut self, cid: ClientId, cmd: &str, pane: Option<PaneId>) {
-        match crate::cmdparse::parse(cmd) {
+        // cmd_parse_from_string: the whole list is checked before any of it runs
+        match crate::cmdparse::parse(cmd).and_then(|c| c.iter().try_for_each(|c| super::cmds::check_command(c)).map(|_| c)) {
             Ok(cmds) => {
                 let ctx = Ctx { client: Some(cid), pane, from_key: true, ..Ctx::default() };
                 self.run_queue(Queue { cmds: cmds.into(), ctx , soft: 0 });
@@ -570,6 +618,13 @@ impl Server {
                     // the pane is the prompt's context target (a %id in the template would read as %N)
                     let template = format!("send-keys -X {command} '%%'");
                     self.open_prompt(c, PromptKind::Command, vec![(label, String::new())], template, Some(pane), false, false);
+                    // tmux's copy-mode bindings use command-prompt -T search: the answers
+                    // go in the search history
+                    if command.starts_with("search-") {
+                        if let Some(pr) = self.clients.get_mut(&c).and_then(|c| c.prompt.as_mut()) {
+                            pr.search = true;
+                        }
+                    }
                     if command.ends_with("-incremental") {
                         if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
                             cm.begin_incremental_search();
@@ -589,7 +644,8 @@ impl Server {
     // ---- prompt ----------------------------------------------------------------------
 
     fn prompt_key(&mut self, cid: ClientId, k: &Key, name: &str) {
-        let hist_len = self.prompt_history.len();
+        let search = self.clients.get(&cid).and_then(|c| c.prompt.as_ref()).is_some_and(|p| p.search);
+        let hist_len = if search { self.prompt_history_search.len() } else { self.prompt_history.len() };
         let c = self.clients.get_mut(&cid).unwrap();
         c.dirty = true;
         let pr = c.prompt.as_mut().unwrap();
@@ -616,22 +672,24 @@ impl Server {
         match &k.code {
             KeyCode::Enter => {
                 let mut pr = c.prompt.take().unwrap();
+                let input: String = pr.input.iter().collect();
+                // status_prompt_add_history: every non-empty answer, by prompt type
+                if !input.is_empty() && (search || !pr.template.starts_with("send-keys -X ")) {
+                    let lim = self.opt_server_num("prompt-history-limit").max(1) as usize;
+                    let history = if search { &mut self.prompt_history_search } else { &mut self.prompt_history };
+                    history.retain(|h| h != &input);
+                    history.push(input.clone());
+                    while history.len() > lim {
+                        history.remove(0);
+                    }
+                }
                 if let Some((pane, _)) = incremental {
                     if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
                         cm.finish_incremental_search(false);
                     }
                     return;
                 }
-                let input: String = pr.input.iter().collect();
                 pr.answers.push(input.clone());
-                if !input.is_empty() && !pr.template.starts_with("send-keys -X ") {
-                    self.prompt_history.retain(|h| h != &input);
-                    self.prompt_history.push(input);
-                    let lim = self.opt_server_num("prompt-history-limit").max(1) as usize;
-                    while self.prompt_history.len() > lim {
-                        self.prompt_history.remove(0);
-                    }
-                }
                 if pr.answers.len() < pr.prompts.len() {
                     let (label, init) = pr.prompts[pr.answers.len()].clone();
                     pr.label = label;
@@ -705,7 +763,7 @@ impl Server {
                 if hist_len > 0 {
                     let pos = pr.history_pos.map(|p| p.min(hist_len).saturating_sub(1)).unwrap_or(hist_len - 1);
                     pr.history_pos = Some(pos);
-                    pr.input = self.prompt_history[pos].chars().collect();
+                    pr.input = if search { &self.prompt_history_search } else { &self.prompt_history }[pos].chars().collect();
                     pr.cursor = pr.input.len();
                 }
             }
@@ -713,7 +771,7 @@ impl Server {
                 if let Some(p) = pr.history_pos.map(|p| p.min(hist_len)) {
                     if p + 1 < hist_len {
                         pr.history_pos = Some(p + 1);
-                        pr.input = self.prompt_history[p + 1].chars().collect();
+                        pr.input = if search { &self.prompt_history_search } else { &self.prompt_history }[p + 1].chars().collect();
                     } else {
                         pr.history_pos = None;
                         pr.input.clear();

@@ -12,6 +12,10 @@ pub struct Target {
     pub pane: Option<PaneId>,
 }
 
+/// An `extra` entry naming the format's type (format_defaults' ft->type): "S", "W", "P" or
+/// "" for none; without it the type is the most specific part of the target.
+pub const FORMAT_TYPE: &str = "\u{1}format_type";
+
 pub struct VarCtx<'a> {
     pub srv: &'a Server,
     pub t: Target,
@@ -156,7 +160,7 @@ impl Vars for VarCtx<'_> {
             'S' => {
                 let mut sessions: Vec<_> = self.srv.sessions.values().collect();
                 if flags.contains('n') { sessions.sort_by(|a, b| a.name.cmp(&b.name)); }
-                else if flags.contains('t') { sessions.sort_by_key(|s| (std::cmp::Reverse(s.activity), s.id)); }
+                else if flags.contains('t') { sessions.sort_by_key(|s| std::cmp::Reverse(s.activity_seq)); }
                 for s in sessions {
                     let wid = s.links.get(&s.active).copied();
                     let pane = wid.and_then(|w| self.srv.windows.get(&w)).map(|w| w.active);
@@ -188,8 +192,11 @@ impl Vars for VarCtx<'_> {
             targets.sort_by_key(|(t, _)| std::cmp::Reverse(self.srv.windows[&t.wid.unwrap()].activity));
         }
         if flags.contains('r') { targets.reverse(); }
+        // the loops' format_defaults pass the session, the winlink, or the pane
+        let mut extra = self.extra.clone();
+        extra.insert(FORMAT_TYPE.to_string(), match kind { 'S' => "S", 'W' => "W", _ => "P" }.to_string());
         targets.into_iter().map(|(t, active)| {
-            let ctx: Box<dyn Vars + '_> = Box::new(VarCtx { srv: self.srv, t, client: self.client, extra: self.extra.clone() });
+            let ctx: Box<dyn Vars + '_> = Box::new(VarCtx { srv: self.srv, t, client: self.client, extra: extra.clone() });
             (ctx, active)
         }).collect()
     }
@@ -244,11 +251,30 @@ impl Vars for VarCtx<'_> {
             return Some(v.clone());
         }
         let srv = self.srv;
-        let t = self.t;
+        let mut t = self.t;
+        let client = self.client.and_then(|c| srv.clients.get(&c));
+        let ftype = match self.extra.get(FORMAT_TYPE) {
+            Some(ty) => ty.as_str(),
+            None if t.pane.is_some() => "P",
+            None if t.wid.is_some() => "W",
+            None if t.sid.is_some() => "S",
+            None => "",
+        };
+        // format_defaults: the client's session, the session's current window and the
+        // window's active pane stand in for what the target leaves out
+        if t.sid.is_none() {
+            t.sid = client.and_then(|c| c.session).filter(|s| srv.sessions.contains_key(s));
+        }
+        if t.wid.is_none() && let Some(s) = t.sid.and_then(|s| srv.sessions.get(&s)) {
+            t.idx = Some(s.active);
+            t.wid = s.links.get(&s.active).copied();
+        }
+        if t.pane.is_none() {
+            t.pane = t.wid.and_then(|w| srv.windows.get(&w)).map(|w| w.active);
+        }
         let sess = t.sid.and_then(|s| srv.sessions.get(&s));
         let win = t.wid.and_then(|w| srv.windows.get(&w));
         let pane = t.pane.and_then(|p| srv.panes.get(&p));
-        let client = self.client.and_then(|c| srv.clients.get(&c));
         let v: Option<String> = match name {
             "host" => Some(srv.host.clone()),
             "host_short" => Some(srv.host.split('.').next().unwrap_or("").to_string()),
@@ -260,7 +286,7 @@ impl Vars for VarCtx<'_> {
             "start_time" => Some(srv.start_time.to_string()),
             "server_sessions" => Some(srv.sessions.len().to_string()),
             // session, window and pane ids share one counter here
-            "next_session_id" => Some(format!("${}", srv.next_id + 1)),
+            "next_session_id" => Some(format!("${}", srv.next_session_id)),
             "config_files" => Some(srv.cfg_files.join(",")),
             "sixel_support" => Some("0".into()),
             "uid" => Some(ipc::own_user_id()),
@@ -303,7 +329,8 @@ impl Vars for VarCtx<'_> {
             "session_grouped" => sess.map(|s| b(s.group.is_some())),
             "session_group" | "session_group_size" | "session_group_list" | "session_group_attached" => {
                 let s = sess?;
-                let Some(g) = s.group else { return Some(if name == "session_group_size" || name == "session_group_attached" { "0".into() } else { String::new() }) };
+                // no value outside a group
+                let g = s.group?;
                 let members: Vec<&Session> = srv.sessions.values().filter(|x| x.group == Some(g)).collect();
                 Some(match name {
                     // tmux names a group after its first session
@@ -313,7 +340,7 @@ impl Vars for VarCtx<'_> {
                     _ => members.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(","),
                 })
             }
-            "session_format" => Some(b(sess.is_some())),
+            "session_format" => Some(b(ftype == "S")),
             "session_active" => sess.zip(client).map(|(s, c)| b(c.session == Some(s.id))),
             "session_activity_flag" | "session_bell_flag" | "session_silence_flag" => sess.map(|s| {
                 let flag = match name { "session_activity_flag" => ALERT_ACTIVITY, "session_bell_flag" => ALERT_BELL, _ => ALERT_SILENCE };
@@ -368,7 +395,8 @@ impl Vars for VarCtx<'_> {
             "window_end_flag" => Some(b(sess.zip(t.idx).is_some_and(|(s, i)| s.links.keys().next_back() == Some(&i)))),
             "window_linked" => win.map(|w| b(srv.links_of(w.id).len() > 1)),
             "window_linked_sessions" => win.map(|w| srv.links_of(w.id).len().to_string()),
-            "window_bigger" => Some("0".into()),
+            // windows always fit their clients here (no offset)
+            "window_bigger" => client.map(|_| "0".into()),
             "window_active_clients" | "window_active_clients_list" => win.map(|w| {
                 let names: Vec<String> = srv.clients.values()
                     .filter(|c| c.attached && c.session.and_then(|s| srv.sessions.get(&s)).is_some_and(|s| s.links.get(&s.active) == Some(&w.id)))
@@ -391,8 +419,9 @@ impl Vars for VarCtx<'_> {
             }),
             // no floating panes yet, so never a modal one
             "window_modal_pane" => None,
-            "window_offset_x" | "window_offset_y" => Some("0".into()),
-            "window_format" => Some(b(win.is_some())),
+            // only set while the client shows part of a larger window, which never happens here
+            "window_offset_x" | "window_offset_y" => None,
+            "window_format" => Some(b(ftype == "W")),
             // pane
             "pane_index" => win.zip(t.pane).and_then(|(w, p)| {
                 let base = srv.opt_window_num(Some(w.id), "pane-base-index").max(0) as usize;
@@ -402,7 +431,8 @@ impl Vars for VarCtx<'_> {
             "pane_title" => pane.map(|p| p.title.clone()),
             "pane_current_path" => pane.map(|p| p.current_path.clone()),
             "pane_current_command" => pane.map(|p| p.current_cmd.clone()),
-            "pane_start_command" => pane.map(|p| p.start_cmd.clone()),
+            // cmd_stringify_argv: each argument escaped as args_print does
+            "pane_start_command" => pane.map(|p| p.track.argv.iter().map(|a| options::escape_arg(a)).collect::<Vec<_>>().join(" ")),
             "pane_start_path" => pane.map(|p| p.start_path.clone()),
             "pane_pid" => pane.and_then(|p| p.pid).map(|p| p.to_string()),
             // the pty's device on Unix; a ConPTY has no name
@@ -419,16 +449,17 @@ impl Vars for VarCtx<'_> {
             "pane_dead" => pane.map(|p| b(p.dead.is_some())),
             "pane_dead_status" => pane.and_then(|p| p.dead).and_then(|d| d.0).map(|s| s.to_string()),
             "pane_dead_time" => pane.and_then(|p| p.dead).map(|d| d.1.to_string()),
-            "pane_dead_signal" => Some(String::new()),
+            // the exit signal is not tracked, and only a signalled pane has one
+            "pane_dead_signal" => None,
             "pane_in_mode" => pane.map(|p| b(p.mode.is_some())),
-            "pane_mode" => pane.map(|p| match &p.mode {
-                Some(PaneMode::Copy(_)) => "copy-mode".into(),
-                Some(PaneMode::Clock) => "clock-mode".into(),
-                Some(PaneMode::Tree(_)) => "tree-mode".into(),
-                None => String::new(),
+            "pane_mode" => pane.and_then(|p| match &p.mode {
+                Some(PaneMode::Copy(_)) => Some("copy-mode".into()),
+                Some(PaneMode::Clock) => Some("clock-mode".into()),
+                Some(PaneMode::Tree(_)) => Some("tree-mode".into()),
+                None => None,
             }),
             "pane_synchronized" => t.pane.map(|p| b(options::is_on(&srv.opt_pane(p, "synchronize-panes")))),
-            "pane_format" => Some(b(pane.is_some())),
+            "pane_format" => Some(b(ftype == "P")),
             "pane_created" => pane.map(|p| p.created.to_string()),
             "pane_flags" => win.zip(pane).map(|(w, p)| {
                 let mut f = String::new();
@@ -535,7 +566,31 @@ impl Vars for VarCtx<'_> {
                 _ => None,
             }),
             "selection_present" => pane.and_then(|p| match &p.mode {
-                Some(PaneMode::Copy(c)) => Some(b(c.selection_active())),
+                Some(PaneMode::Copy(c)) => Some(b(c.selection_nonempty())),
+                _ => None,
+            }),
+            // window_copy_formats: only while the pane is in copy mode
+            "selection_active" | "selection_mode" | "rectangle_toggle" | "copy_line_numbers" | "copy_position"
+            | "copy_position_limit" | "top_line_time" | "search_present" | "search_timed_out" | "search_count"
+            | "search_count_partial" | "search_match" | "copy_cursor_word" | "copy_cursor_line" | "copy_cursor_hyperlink" => pane.and_then(|p| match &p.mode {
+                Some(PaneMode::Copy(c)) => Some(match name {
+                    "selection_active" => b(c.selection_active()),
+                    "selection_mode" => c.selection_mode().to_string(),
+                    "rectangle_toggle" => b(c.rectangle()),
+                    // no line numbers: the position is the scroll offset
+                    "copy_line_numbers" | "search_timed_out" | "search_count_partial" | "top_line_time" => "0".to_string(),
+                    "copy_position" => c.scroll_offset().to_string(),
+                    "copy_position_limit" => c.history_size().to_string(),
+                    "search_present" => b(c.search_present()),
+                    "search_count" => c.search_count().to_string(),
+                    "search_match" => c.search_match().unwrap_or_default(),
+                    "copy_cursor_word" => {
+                        let (y, x) = c.cursor_abs();
+                        super::mouse::grid_word(|i| c.line(i).cloned(), c.line_count(), x, y, c.word_separators()).unwrap_or_default()
+                    }
+                    "copy_cursor_line" => c.line(c.cursor_abs().0).and_then(super::mouse::grid_line).unwrap_or_default(),
+                    _ => String::new(),
+                }),
                 _ => None,
             }),
             "mouse_x" | "mouse_y" | "mouse_word" | "mouse_line" | "mouse_hyperlink" | "mouse_status_line" | "mouse_status_range" | "mouse_pane" => {
@@ -623,7 +678,7 @@ impl Vars for VarCtx<'_> {
             "client_user" => client.and_then(|c| c.user.as_ref()).map(|u| ipc::user_name_for_id(u)),
             "client_created" => client.map(|c| c.created.to_string()),
             "client_activity" => client.map(|c| c.activity.to_string()),
-            "client_utf8" => Some("1".into()),
+            "client_utf8" => client.map(|_| "1".into()),
             "client_control_mode" => client.map(|c| b(c.control > 0)),
             "client_written" => client.map(|c| c.io.written.load(std::sync::atomic::Ordering::Relaxed).to_string()),
             "client_discarded" => client.map(|c| c.io.discarded.load(std::sync::atomic::Ordering::Relaxed).to_string()),
@@ -636,7 +691,29 @@ impl Vars for VarCtx<'_> {
             }),
             // dark/light detection (OSC 11 / mode 2031) is not done: unknown, as tmux shows it
             "client_theme" => None,
-            "client_flags" => client.map(|c| if c.attached { "attached".into() } else { String::new() }),
+            // server_client_get_flags (focus is not tracked)
+            "client_flags" => client.map(|c| {
+                let pause = c.ctl.pause_after.map(|d| format!("pause-after={}", d.as_secs()));
+                [
+                    (c.attached, "attached"),
+                    (c.focused, "focused"),
+                    (c.control > 0, "control-mode"),
+                    (c.ctl.ignore_size, "ignore-size"),
+                    (c.ctl.no_detach_on_destroy, "no-detach-on-destroy"),
+                    (c.ctl.no_output, "no-output"),
+                    (c.ctl.wait_exit, "wait-exit"),
+                    (c.ctl.new_layouts, "new-layouts"),
+                    (pause.is_some(), pause.as_deref().unwrap_or("")),
+                    (c.is_readonly(), "read-only"),
+                    (c.suspended, "suspended"),
+                    (true, "UTF-8"),
+                ]
+                .iter()
+                .filter(|(on, _)| *on)
+                .map(|(_, n)| *n)
+                .collect::<Vec<_>>()
+                .join(",")
+            }),
             "client_cwd" => client.and_then(|c| c.ident.as_ref()).map(|i| i.cwd.clone()),
             _ => None,
         };
@@ -711,6 +788,7 @@ impl Vars for VarCtx<'_> {
         let srv = self.srv;
         if kind == 'V' {
             // V or V/s: the session environment, V/g: global, V/c: the client's.
+            let level = match flags { "" | "s" => self.t.sid.unwrap_or(u32::MAX), "g" => super::GLOBAL_ENV, _ => u32::MAX };
             let mut env: Vec<(String, Option<String>)> = match flags {
                 "" | "s" => self.t.sid.and_then(|s| srv.sessions.get(&s)).map(|s| s.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default(),
                 "g" => srv.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -721,10 +799,10 @@ impl Vars for VarCtx<'_> {
             env.sort();
             env.dedup_by(|a, b| a.0 == b.0);
             return env.into_iter().map(|(name, value)| HashMap::from([
+                ("environ_hidden".into(), b(srv.env_hidden.contains(&(level, name.clone())))),
                 ("environ_name".into(), name),
                 ("environ_removed".into(), b(value.is_none())),
                 ("environ_value".into(), value.unwrap_or_default()),
-                ("environ_hidden".into(), "0".into()),
             ])).collect();
         }
         if kind != 'O' {
@@ -748,30 +826,68 @@ impl Vars for VarCtx<'_> {
         };
         let Some(opts) = opts else { return Vec::new() };
         // Array items (name[index]) follow their option in index order.
-        let mut items: Vec<(&str, Option<&str>, &String)> = opts.0.iter().map(|(key, value)| {
+        let mut items: Vec<(String, Option<String>, String)> = opts.0.iter().map(|(key, value)| {
             match key.split_once('[') {
-                Some((name, index)) => (name, Some(index.trim_end_matches(']')), value),
-                None => (key.as_str(), None, value),
+                Some((name, index)) => (name.to_string(), Some(index.trim_end_matches(']').to_string()), value.clone()),
+                None => (key.clone(), None, value.clone()),
             }
         }).collect();
-        let index_key = |i: Option<&str>| i.map(|i| (i.parse::<u64>().unwrap_or(u64::MAX), i.to_string()));
-        items.sort_by(|a, b| a.0.cmp(b.0).then_with(|| index_key(a.1).cmp(&index_key(b.1))));
-        items.iter().enumerate().map(|(i, &(name, index, value))| {
-            let is_array = index.is_some() || options::def(name).is_some_and(|d| d.kind == options::Kind::Array);
-            let count = items.iter().filter(|o| o.0 == name && o.1.is_some()).count();
-            let first = index.is_none() || i == 0 || items[i - 1].0 != name;
-            let last = index.is_none() || items.get(i + 1).is_none_or(|o| o.0 != name);
+        // Hooks are options too (kept apart here): global options hold every hook of
+        // their scope, a session's only those set there.
+        use super::cmds::HookLevel;
+        let level = if flags.contains('v') {
+            None
+        } else if flags.contains('p') {
+            if global { None } else { self.t.pane.map(HookLevel::Pane) }
+        } else if global {
+            Some(HookLevel::Global)
+        } else if flags.contains('w') {
+            self.t.wid.map(HookLevel::Window)
+        } else if flags.contains('s') {
+            self.t.sid.map(HookLevel::Session)
+        } else {
+            None
+        };
+        let hooks = level.and_then(|l| srv.hook_map(l)).map(|m| (m, flags.contains('w') || flags.contains('p')));
+        if let Some((map, window)) = hooks {
+            let aliases = srv.command_aliases();
+            for (name, scope) in options::HOOKS {
+                if (*scope == options::Scope::Session) == window || (flags.contains('p') && *scope != options::Scope::Pane) {
+                    continue;
+                }
+                let cmds: Vec<(usize, &String)> = map.get(*name).map(|v| v.iter().enumerate().filter(|(_, c)| !c.is_empty()).collect()).unwrap_or_default();
+                if cmds.is_empty() {
+                    if global {
+                        items.push((name.to_string(), None, String::new()));
+                    }
+                    continue;
+                }
+                for (i, c) in cmds {
+                    items.push((name.to_string(), Some(i.to_string()), super::cmds::print_command_string(c, &aliases, false)));
+                }
+            }
+        }
+        // an array with items is shown by its items only
+        let with_items: std::collections::HashSet<String> = items.iter().filter(|o| o.1.is_some()).map(|o| o.0.clone()).collect();
+        items.retain(|o| o.1.is_some() || !with_items.contains(&o.0));
+        let index_key = |i: &Option<String>| i.as_ref().map(|i| (i.parse::<u64>().unwrap_or(u64::MAX), i.clone()));
+        items.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| index_key(&a.1).cmp(&index_key(&b.1))));
+        items.iter().enumerate().map(|(i, (name, index, value))| {
+            let is_hook = options::hook_scope(name).is_some();
+            let is_array = index.is_some() || is_hook || options::def(name).is_some_and(|d| d.kind == options::Kind::Array);
+            let count = items.iter().filter(|o| &o.0 == name && o.1.is_some()).count();
+            let first = index.is_none() || i == 0 || &items[i - 1].0 != name;
+            let last = index.is_none() || items.get(i + 1).is_none_or(|o| &o.0 != name);
             HashMap::from([
-                ("option_name".into(), name.to_string()),
+                ("option_name".into(), name.clone()),
                 ("option_value".into(), value.clone()),
                 ("option_is_array".into(), b(is_array)),
-                ("option_array_key".into(), index.unwrap_or("").to_string()),
-                ("option_array_index".into(), index.unwrap_or("").to_string()),
+                ("option_array_key".into(), index.clone().unwrap_or_default()),
+                ("option_array_index".into(), index.clone().unwrap_or_default()),
                 ("option_array_count".into(), count.to_string()),
                 ("option_array_first".into(), b(is_array && first)),
                 ("option_array_last".into(), b(is_array && last)),
-                // Hooks are not kept as options here.
-                ("option_is_hook".into(), "0".into()),
+                ("option_is_hook".into(), b(is_hook)),
                 ("option_is_user".into(), b(name.starts_with('@'))),
             ])
         }).collect()

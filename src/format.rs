@@ -94,6 +94,15 @@ pub fn expand_status_time(template: &str, vars: &dyn Vars) -> String {
     Expander { time: true, ..Expander::top(vars, Local::now(), Some(ms), &budget) }.expand(template, 0)
 }
 
+/// display-message -v: expand_time, also returning the steps as tmux's FORMAT_VERBOSE logs
+/// them (each line starts with `#` and is indented by the nesting level).
+pub fn expand_time_verbose(template: &str, vars: &dyn Vars) -> (String, Vec<String>) {
+    let budget = std::cell::Cell::new(MAX_FORMAT_WORK);
+    let log = std::cell::RefCell::new(Vec::new());
+    let out = Expander { time: true, log: Some(&log), ..Expander::top(vars, Local::now(), None, &budget) }.expand(template, 0);
+    (out, log.into_inner())
+}
+
 fn expand_time_at(template: &str, vars: &dyn Vars, now: DateTime<Local>) -> String {
     let budget = std::cell::Cell::new(MAX_FORMAT_WORK);
     Expander { time: true, ..Expander::top(vars, now, None, &budget) }.expand(template, 0)
@@ -114,6 +123,8 @@ struct Expander<'a> {
     /// strftime(3) is applied to every format expanded (tmux's FORMAT_EXPAND_TIME), so
     /// also to E: values and other nested formats.
     time: bool,
+    /// FORMAT_VERBOSE: where the expansion steps are logged.
+    log: Option<&'a std::cell::RefCell<Vec<String>>>,
 }
 
 /// Animation frame period in milliseconds (FORMAT_CYCLE_PERIOD).
@@ -261,12 +272,29 @@ fn bool_str(b: bool) -> String {
 
 impl<'a> Expander<'a> {
     fn top(vars: &'a dyn Vars, now: DateTime<Local>, cycle: Option<u64>, budget: &'a std::cell::Cell<usize>) -> Self {
-        Expander { vars, now, budget, cycle, nojobs: false, time: false }
+        Expander { vars, now, budget, cycle, nojobs: false, time: false, log: None }
     }
 
     /// An expander for a nested context (loop row) sharing this one's budget and state.
     fn with<'b>(&'b self, vars: &'b dyn Vars) -> Expander<'b> {
-        Expander { vars, now: self.now, budget: self.budget, cycle: self.cycle, nojobs: self.nojobs, time: self.time }
+        Expander { vars, now: self.now, budget: self.budget, cycle: self.cycle, nojobs: self.nojobs, time: self.time, log: self.log }
+    }
+
+    /// format_log: one verbose line, indented by the nesting level.
+    fn log(&self, depth: usize, line: impl FnOnce() -> String) {
+        if let Some(log) = self.log {
+            log.borrow_mut().push(format!("#{}{}", " ".repeat(depth / 2 + 1), line()));
+        }
+    }
+
+    /// lookup, logged as format_find is.
+    fn lookup_logged(&self, name: &str, time: bool, depth: usize) -> Option<String> {
+        let v = self.lookup(name, time);
+        self.log(depth, || match &v {
+            Some(v) => format!("format '{name}' found: {v}"),
+            None => format!("format '{name}' not found"),
+        });
+        v
     }
 
     /// format_find: a variable or option, then (unless for the t modifier) the session and
@@ -282,6 +310,16 @@ impl<'a> Expander<'a> {
     }
 
     fn expand(&self, s: &str, depth: usize) -> String {
+        if self.log.is_none() || s.is_empty() {
+            return self.expand_inner(s, depth);
+        }
+        self.log(depth, || format!("expanding format: {s}"));
+        let out = self.expand_inner(s, depth);
+        self.log(depth, || format!("result is: {out}"));
+        out
+    }
+
+    fn expand_inner(&self, s: &str, depth: usize) -> String {
         if depth > MAX_DEPTH || s.len() > MAX_FORMAT_BYTES || s.len().saturating_add(1) > self.budget.get() {
             return String::new();
         }
@@ -289,6 +327,9 @@ impl<'a> Expander<'a> {
         let timed;
         let s = if self.time && s.contains('%') {
             timed = strftime(s, &self.now);
+            if timed != s {
+                self.log(depth, || format!("after time expanded: {timed}"));
+            }
             timed.as_str()
         } else {
             s
@@ -340,13 +381,20 @@ impl<'a> Expander<'a> {
                         }
                         j += 1;
                     }
-                    if j < b.len() && !self.nojobs {
+                    if j < b.len() {
+                        self.log(depth, || format!("found #(): {}", &s[i + 2..j]));
+                    }
+                    if j < b.len() && self.nojobs {
+                        self.log(depth, || "#() is disabled".to_string());
+                    } else if j < b.len() {
                         // As format_job_get, the command and then its output are expanded, with
                         // no further jobs and no animation.
                         let inner = Expander { cycle: None, nojobs: true, time: false, ..self.with(self.vars) };
-                        let command = inner.expand(&s[i + 2..j], depth + 1);
+                        let command = inner.expand(&s[i + 2..j], depth + 2);
                         let output = self.vars.shell(&command).unwrap_or_default();
-                        out.push_str(&inner.expand(output.trim_end_matches(['\r', '\n']), depth + 1));
+                        let result = inner.expand(output.trim_end_matches(['\r', '\n']), depth + 2);
+                        self.log(depth, || format!("#() result: {result}"));
+                        out.push_str(&result);
                     }
                     i = (j + 1).min(b.len());
                 }
@@ -356,6 +404,7 @@ impl<'a> Expander<'a> {
                         // `#[`, `##[`, `###[` ...: a style, left (with all its `#`s) for
                         // format_draw.
                         style_end = skip(s, i, b"]");
+                        self.log(depth, || format!("found #*{run}["));
                         out.push_str(&s[i..=i + run]);
                         i += run + 1;
                     } else {
@@ -365,11 +414,20 @@ impl<'a> Expander<'a> {
                     }
                 }
                 b',' | b'}' => {
+                    self.log(depth, || format!("found #{}", c as char));
                     out.push(c as char);
                     i += 2;
                 }
                 _ => {
                     match alias(c).filter(|_| style_end.is_none_or(|e| i + 2 > e)) {
+                        Some(name) if self.log.is_some() => {
+                            // format_replace on the alias's name, logged as such
+                            self.log(depth, || format!("found #{}: {name}", c as char));
+                            let v = self.replace_inner(name, depth + 1).unwrap_or_default();
+                            self.log(depth + 1, || format!("replaced '{name}' with '{v}'"));
+                            out.push_str(&v);
+                            i += 2;
+                        }
                         Some(name) => {
                             out.push_str(&self.lookup(name, false).unwrap_or_default());
                             i += 2;
@@ -395,11 +453,29 @@ impl<'a> Expander<'a> {
     /// search, repeat, boolean operators, comparisons, conditionals, expressions, then a
     /// variable) gives the value, which E/T, s, =, p, n and w then modify in that order.
     fn replace(&self, content: &str, depth: usize) -> Option<String> {
+        if self.log.is_none() {
+            return self.replace_inner(content, depth);
+        }
+        self.log(depth, || format!("found #{{}}: {content}"));
+        let v = self.replace_inner(content, depth);
+        if let Some(v) = &v {
+            self.log(depth, || format!("replaced '{content}' with '{v}'"));
+        }
+        v
+    }
+
+    fn replace_inner(&self, content: &str, depth: usize) -> Option<String> {
         let (mut mods, copy) = parse_modifiers(content).unwrap_or((Vec::new(), content));
         // Arguments are unescaped and expanded once, when the modifiers are built.
         for m in &mut mods {
             for a in &mut m.args {
                 *a = self.expand(&unescape_format(a), depth + 1);
+            }
+        }
+        for (i, m) in mods.iter().enumerate() {
+            self.log(depth, || format!("modifier {i} is {}", m.name));
+            for (j, a) in m.args.iter().enumerate() {
+                self.log(depth, || format!("modifier {i} argument {j}: {a}"));
             }
         }
         // format_replace walks the modifiers in order, so of a repeated modifier the last one
@@ -426,8 +502,11 @@ impl<'a> Expander<'a> {
             self.vars.client_info(kind, copy).unwrap_or_default()
         } else if get("A").is_some() {
             let count = last_args("A").and_then(|m| strtonum(&m.args[0])).filter(|n| (1..=100).contains(n)).unwrap_or(1) as u64;
-            self.cycle(copy, count)
+            let v = self.cycle(copy, count);
+            self.log(depth, || format!("cycle '{copy}' is: {v}"));
+            v
         } else if get("l").is_some() {
+            self.log(depth, || format!("literal string is '{copy}'"));
             unescape_format(copy)
         } else if get("a").is_some() {
             strtonum(&ex(copy))
@@ -472,10 +551,17 @@ impl<'a> Expander<'a> {
             }
             parts.push(rest);
             let or = m.name == "||";
-            bool_str(if or { parts.iter().any(|p| truthy(&ex(p))) } else { parts.iter().all(|p| truthy(&ex(p))) })
+            let operand = |p: &&str| {
+                let v = ex(p);
+                self.log(depth, || format!("operator {} has operand: {v}", m.name));
+                truthy(&v)
+            };
+            bool_str(if or { parts.iter().any(operand) } else { parts.iter().all(operand) })
         } else if let Some(m) = compare {
             let (a, b) = split2(copy)?;
             let (a, b) = (ex(a), ex(b));
+            self.log(depth, || format!("compare {} left is: {a}", m.name));
+            self.log(depth, || format!("compare {} right is: {b}", m.name));
             match m.name {
                 "==" => bool_str(a == b),
                 "!=" => bool_str(a != b),
@@ -499,13 +585,21 @@ impl<'a> Expander<'a> {
             let mut i = 0;
             let mut chosen = None;
             while i + 1 < parts.len() {
+                self.log(depth, || format!("condition is: {}", parts[i]));
                 let cond = match self.lookup(parts[i], time) {
-                    Some(v) => v,
+                    Some(v) => {
+                        self.log(depth, || format!("condition '{}' found: {v}", parts[i]));
+                        v
+                    }
                     None => {
                         let e = ex(parts[i]);
-                        if e == parts[i] { String::new() } else { e }
+                        if e == parts[i] {
+                            self.log(depth, || format!("condition '{}' not found; assuming false", parts[i]));
+                            String::new()
+                        } else { e }
                     }
                 };
+                self.log(depth, || format!("condition '{}' is {}", parts[i], if truthy(&cond) { "true" } else { "false" }));
                 if truthy(&cond) {
                     chosen = Some(parts[i + 1]);
                     break;
@@ -513,18 +607,42 @@ impl<'a> Expander<'a> {
                 i += 2;
             }
             if chosen.is_none() && i < parts.len() && parts.len() % 2 == 1 {
+                self.log(depth, || format!("no condition matched in '{rest}'; using last arg"));
                 chosen = Some(parts[parts.len() - 1]);
+            } else if chosen.is_none() {
+                self.log(depth, || format!("no condition matched in '{rest}'; using empty string"));
             }
             chosen.map(ex).unwrap_or_default()
         } else if let Some(m) = mods.iter().rev().find(|m| m.name == "e" && (1..=3).contains(&m.args.len())) {
             // A bad expression (no comma too) is empty but does not stop the expansion.
-            split2(copy).and_then(|(a, b)| arith(&m.args, &ex(a), &ex(b))).unwrap_or_default()
+            split2(copy).and_then(|(a, b)| {
+                let (a, b) = (ex(a), ex(b));
+                let v = arith(&m.args, &a, &b)?;
+                if self.log.is_some() {
+                    let float = m.args.get(1).is_some_and(|f| f.contains('f'));
+                    let prec = match m.args.get(2).and_then(|p| strtonum(p)) { Some(n) if n < 0 => 6, Some(n) => n as usize, None => if float { 2 } else { 0 } };
+                    let side = |x: &str| strtod(x).map(|x| if float { x } else { x.trunc() }).unwrap_or(0.0);
+                    self.log(depth, || format!("expression left side is: {:.prec$}", side(&a)));
+                    self.log(depth, || format!("expression right side is: {:.prec$}", side(&b)));
+                    self.log(depth, || format!("expression result is {v}"));
+                }
+                Some(v)
+            }).unwrap_or_default()
         } else if copy.contains("#{") {
             // As tmux, a name containing a format is expanded instead, and t, b, d and q do
             // not apply to it.
+            self.log(depth, || format!("expanding inner format '{copy}'"));
             ex(copy)
+        } else if time {
+            // format_find formats the time before it is logged
+            let v = self.lookup(copy, time).and_then(|v| self.format_time(&v, &mods));
+            self.log(depth, || match &v {
+                Some(v) => format!("format '{copy}' found: {v}"),
+                None => format!("format '{copy}' not found"),
+            });
+            v.unwrap_or_default()
         } else {
-            match self.lookup(copy, time) {
+            match self.lookup_logged(copy, time, depth) {
                 None => String::new(),
                 Some(v) if time => self.format_time(&v, &mods).unwrap_or_default(),
                 Some(mut v) => {
@@ -573,7 +691,9 @@ impl<'a> Expander<'a> {
         for m in mods.iter().filter(|m| m.name == "s" && m.args.len() >= 2) {
             // tmux expands substitution arguments a second time.
             let flags = m.args.get(2).map(String::as_str).unwrap_or("");
-            value = regex_substitute(&ex(&m.args[0]), &ex(&m.args[1]), &value, flags.contains('i'));
+            let (left, right) = (ex(&m.args[0]), ex(&m.args[1]));
+            value = regex_substitute(&left, &right, &value, flags.contains('i'));
+            self.log(depth, || format!("substitute '{left}' to '{right}': {value}"));
         }
         // Widths outside -10000..10000 are ignored.
         let width_arg = |n: &str| last_args(n).and_then(|m| strtonum(&m.args[0])).filter(|n| n.unsigned_abs() <= 10000).unwrap_or(0);
@@ -585,6 +705,7 @@ impl<'a> Expander<'a> {
             if fmt_width(&value) > n {
                 value = if limit > 0 { trim_left(&value, n) + marker } else { marker.to_string() + &trim_right(&value, n) };
             }
+            self.log(depth, || format!("applied length limit {limit}: {value}"));
         }
         // utf8_padcstr measures the raw string: `#[...]` and `##` count as text here.
         let pad = width_arg("p");
@@ -593,11 +714,16 @@ impl<'a> Expander<'a> {
             let fill = " ".repeat(pad.unsigned_abs() as usize - w);
             value = if pad > 0 { value + &fill } else { fill + &value };
         }
+        if pad != 0 {
+            self.log(depth, || format!("applied padding width {pad}: {value}"));
+        }
         if get("n").is_some() {
             value = value.len().to_string();
+            self.log(depth, || format!("replacing with length: {value}"));
         }
         if get("w").is_some() {
             value = fmt_width(&value).to_string();
+            self.log(depth, || format!("replacing with width: {value}"));
         }
         if value.len() > MAX_FORMAT_BYTES { return None; }
         Some(value)
@@ -665,6 +791,21 @@ impl<'a> Expander<'a> {
             if self.budget.get() == 0 { break; }
             extra.insert("loop_index".into(), i.to_string());
             extra.insert("loop_last_flag".into(), bool_str(i + 1 == n));
+            if self.log.is_some() {
+                let g = |n: &str| base.get(n).or_else(|| extra.get(n).cloned()).unwrap_or_default();
+                let line = match kind {
+                    'S' => format!("session loop: {}", g("session_id")),
+                    'W' => format!("window loop: {} {}", g("window_index"), g("window_id")),
+                    'P' => format!("pane loop: {}", g("pane_id")),
+                    'L' => format!("client loop: {}", g("client_name")),
+                    'V' => format!("environment loop: {}", g("environ_name")),
+                    _ => match extra.get("option_array_key").filter(|k| !k.is_empty()) {
+                        Some(k) => format!("option loop: {}[{k}]", g("option_name")),
+                        None => format!("option loop: {}", g("option_name")),
+                    },
+                };
+                self.log(depth, || line);
+            }
             let ctx = Overlay { base, extra };
             let template = if is_active { active.unwrap_or(all) } else { all };
             let value = self.with(&ctx).expand(template, depth + 1);
@@ -1795,9 +1936,14 @@ pub struct ParsedStyle {
 /// `#{` is expanded as a format first (so colours can be formats), and theme colour names
 /// resolve through the context's client.
 pub fn parse_style_with(s: &str, base: Style, vars: Option<&dyn Vars>) -> Result<ParsedStyle, String> {
+    parse_style_from(s, base, base, vars)
+}
+
+/// style_parse into a style that starts as `start` ("default" still means `base`).
+pub fn parse_style_from(s: &str, start: Style, base: Style, vars: Option<&dyn Vars>) -> Result<ParsedStyle, String> {
     let expanded = vars.filter(|_| s.contains("#{")).map(|v| expand(s, v));
     let s = expanded.as_deref().unwrap_or(s);
-    let mut result = ParsedStyle { style: base, dim: 0, link: None };
+    let mut result = ParsedStyle { style: start, dim: 0, link: None };
     let mut align = Align::Left;
     for word in style_words(s) {
         apply_word(word, &mut result.style, &mut align, base, vars)?;
@@ -2103,6 +2249,17 @@ pub fn layout_line_ranged(spans: &[Span], width: usize, fill: Style) -> (Vec<Cel
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn style_parsed_from_another_start() {
+        // menu_reapply_styles: a flag style starts from the default cell, so the
+        // colour it does not give is the default, while "default" means the base
+        let base = parse_style("fg=red,bg=blue", Style::default()).unwrap();
+        let st = parse_style_from("bg=green", Style::default(), base, None).unwrap().style;
+        assert_eq!((st.fg, st.bg), (Color::Default, parse_color("green").unwrap()));
+        let st = parse_style_from("fg=default", Style::default(), base, None).unwrap().style;
+        assert_eq!((st.fg, st.bg), (base.fg, Color::Default));
+    }
     use super::*;
     use crate::cells::{BLINK, BOLD, DIM, INVERSE, ITALIC, STRIKE, UNDERLINE};
 

@@ -347,12 +347,14 @@ fn format_loops_and_utf8_length() {
     ctx.ok(&["new-session", "-d", "-s", "z"]);
     ctx.ok(&["new-session", "-d", "-s", "a"]);
     ctx.ok(&["split-window", "-d", "-t", "z:0.0"]);
-    assert_eq!(ctx.fmt("z", "#{S:#S;}"), "z;a;");
-    assert_eq!(ctx.fmt("z", "#{S/n:#S;}"), "a;z;");
-    assert_eq!(ctx.fmt("z", "#{P:#P,[#P]}"), "[0]1");
-    assert_eq!(ctx.fmt("z", "#{S:#{W:#{P:#S:#I.#P;}}}"), "z:0.0;z:0.1;a:0.0;");
+    // "z:" not "z": a bare name tries the current session's windows first, and the
+    // shell's window (e.g. "zsh") would match it, as in tmux
+    assert_eq!(ctx.fmt("z:", "#{S:#S;}"), "z;a;");
+    assert_eq!(ctx.fmt("z:", "#{S/n:#S;}"), "a;z;");
+    assert_eq!(ctx.fmt("z:", "#{P:#P,[#P]}"), "[0]1");
+    assert_eq!(ctx.fmt("z:", "#{S:#{W:#{P:#S:#I.#P;}}}"), "z:0.0;z:0.1;a:0.0;");
     ctx.ok(&["set", "-g", "@text", "가나"]);
-    assert_eq!(ctx.fmt("z", "#{n:@text} #{s/./X/:@text}"), "6 XX");
+    assert_eq!(ctx.fmt("z:", "#{n:@text} #{s/./X/:@text}"), "6 XX");
 }
 
 #[test]
@@ -401,7 +403,9 @@ fn layouts_swaps_and_moves() {
     // kill-pane -a keeps only the target
     ctx.ok(&["kill-pane", "-a", "-t", &first]);
     assert_eq!(ids(&ctx, "l"), vec![first.clone()]);
-    // select-pane -T sets the title, -m marks
+    // select-pane -T sets the title, -m marks (after the shell has started: a
+    // prompt that sets the title by OSC 2 would overwrite it)
+    ctx.wait_prompt(&first);
     ctx.ok(&["select-pane", "-t", &first, "-T", "my title"]);
     assert_eq!(ctx.fmt(&first, "#{pane_title}"), "my title");
     ctx.ok(&["select-pane", "-m", "-t", &first]);
@@ -521,7 +525,7 @@ fn keys_config_and_capture() {
     ctx.ok(&["source-file", &conf.to_string_lossy()]);
     let _ = std::fs::remove_file(&conf);
     assert_eq!(ctx.fmt("k", "#{@conf} #{@cond}"), "loaded yes");
-    assert!(ctx.ok(&["list-keys", "-T", "root", "F5"]).contains("set -g @f5 pressed"));
+    assert!(ctx.ok(&["list-keys", "-T", "root", "F5"]).contains("set-option -g @f5 pressed"));
     ctx.fails(&["source-file", "/no/such/file.conf"]);
     ctx.ok(&["source-file", "-q", "/no/such/file.conf"]);
     // #{current_file} and assignments used by the next lines, as theme plugins
@@ -637,10 +641,11 @@ fn review_regressions() {
     assert_eq!(ctx.fmt("r", "#{window_panes}"), "2");
     // run-shell / if-shell inside a sourced file run (asynchronously) in order
     let conf = std::env::temp_dir().join(format!("pt-rv-{}.conf", std::process::id()));
-    std::fs::write(&conf, "if-shell 'exit 0' 'set -g @rv yes' 'set -g @rv no'\nset -g @after 1\nnot-a-command\nset -g @tail ok\n").unwrap();
-    let (_, out) = ctx.cmd(&["source-file", &conf.to_string_lossy()]);
+    // (a file with an unknown command runs none of its commands: tmux 3.8 parses the
+    // whole file first)
+    std::fs::write(&conf, "if-shell 'exit 0' 'set -g @rv yes' 'set -g @rv no'\nset -g @after 1\nset -g @tail ok\n").unwrap();
+    ctx.ok(&["source-file", &conf.to_string_lossy()]);
     let _ = std::fs::remove_file(&conf);
-    assert!(out.contains("unknown command"), "{out}");
     assert_eq!(ctx.fmt("r", "#{@rv} #{@after} #{@tail}"), "yes 1 ok");
     // load-buffer - reads stdin
     let mut child = ctx.command().args(["load-buffer", "-b", "stdin", "-"]).stdin(std::process::Stdio::piped()).spawn().unwrap();
@@ -974,14 +979,14 @@ fn list_keys_layout_format_and_order() {
     ctx.ok(&["bind-key", "-T", "mytab", "#", "display", "hash"]);
     ctx.ok(&["bind-key", "-N", "a note", "-T", "mytab", "\"", "display", "q"]);
     // tmux 3.8: padded table and key columns, keys in key-code order, quoted keys
-    assert_eq!(ctx.ok(&["list-keys", "-T", "mytab"]), "bind-key    -T mytab \\\" display q\nbind-key    -T mytab \\# display hash\nbind-key -r -T mytab x display hi\n");
-    assert_eq!(ctx.ok(&["lsk", "-T", "mytab", "-O", "name", "-r"]).lines().next(), Some("bind-key -r -T mytab x display hi"));
-    assert_eq!(ctx.ok(&["lsk", "-1", "-T", "mytab"]), "bind-key  -T mytab \\\" display q\n");
+    assert_eq!(ctx.ok(&["list-keys", "-T", "mytab"]), "bind-key    -T mytab \\\" display-message q\nbind-key    -T mytab \\# display-message hash\nbind-key -r -T mytab x display-message hi\n");
+    assert_eq!(ctx.ok(&["lsk", "-T", "mytab", "-O", "name", "-r"]).lines().next(), Some("bind-key -r -T mytab x display-message hi"));
+    assert_eq!(ctx.ok(&["lsk", "-1", "-T", "mytab"]), "bind-key  -T mytab \\\" display-message q\n");
     assert_eq!(
         ctx.ok(&["lsk", "-T", "mytab", "-F", "#{key_table}|#{key_string}|#{key_repeat}|#{key_note}|#{key_command}|#{key_string_width}|#{key_has_repeat}"]),
-        "mytab|\"|0|a note|display q|1|1\nmytab|#|0||display hash|1|1\nmytab|x|1||display hi|1|1\n"
+        "mytab|\"|0|a note|display-message q|1|1\nmytab|#|0||display-message hash|1|1\nmytab|x|1||display-message hi|1|1\n"
     );
-    assert_eq!(ctx.ok(&["lsk", "-T", "mytab", "x"]), "bind-key -r -T mytab x display hi\n");
+    assert_eq!(ctx.ok(&["lsk", "-T", "mytab", "x"]), "bind-key -r -T mytab x display-message hi\n");
     assert!(ctx.fails(&["lsk", "-T", "mytab", "y"]).contains("unknown key: y"));
     assert!(ctx.fails(&["lsk", "-T", "mytab", "zzz"]).contains("invalid key: zzz"));
     assert!(ctx.fails(&["lsk", "-T", "nosuch"]).contains("table nosuch doesn't exist"));
@@ -1004,8 +1009,21 @@ fn show_options_and_hooks_formats() {
     assert_eq!(ctx.ok(&["showw", "-g", "-F", "#{option_name}:#{option_value}", "mode-keys"]), "mode-keys:emacs\n");
     assert_eq!(ctx.ok(&["show", "-gv", "-F", "V=#{option_value}#{option_value_only}", "status-left"]), "V=L R1\n");
     ctx.ok(&["set-hook", "-g", "session-renamed", "display hi"]);
-    assert_eq!(ctx.ok(&["show-hooks", "-g", "-F", "#{option_name}[#{option_array_key}] #{option_value} #{option_is_hook}", "session-renamed"]), "session-renamed[0] display hi 1\n");
-    assert_eq!(ctx.ok(&["show-hooks", "-g", "client-attached"]), "");
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "-F", "#{option_name}[#{option_array_key}] #{option_value} #{option_is_hook}", "session-renamed"]), "session-renamed[0] display-message hi 1\n");
+    // global options hold every hook of their scope: empty ones are shown by name
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "client-attached"]), "client-attached\n");
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "-F", "#{option_name}:#{option_has_value}:#{option_is_array}:#{hook_fire_count}", "after-new-window"]), "after-new-window:0:1:0\n");
+    let all = ctx.ok(&["show-hooks", "-g"]);
+    assert!(all.starts_with("after-bind-key\nafter-capture-pane\n") && all.contains("\nsession-renamed[0] display-message hi\n") && all.ends_with("\nwindow-unlinked\n"), "{all}");
+    assert_eq!(all.lines().count(), 62);
+    let win = ctx.ok(&["show-hooks", "-gw"]);
+    assert!(win.starts_with("pane-activity\n") && win.ends_with("\nwindow-zoomed\n") && win.lines().count() == 27, "{win}");
+    assert_eq!(ctx.ok(&["show-hooks", "-gp"]), "");
+    // a session's options only hold the hooks set there, -w lists window hooks only
+    ctx.ok(&["set-hook", "-t", "o", "session-renamed", "display s"]);
+    ctx.ok(&["set-hook", "-w", "-t", "o", "pane-focus-in", "display w"]);
+    assert_eq!(ctx.ok(&["show-hooks", "-t", "o"]), "session-renamed[0] display-message s\n");
+    assert_eq!(ctx.ok(&["show-hooks", "-w", "-t", "o"]), "pane-focus-in[0] display-message w\n");
 }
 
 #[test]
@@ -1020,6 +1038,17 @@ fn run_shell_paste_and_display_flags() {
         assert_eq!(ctx.ok(&["run-shell", both]).trim(), "out");
         let shown = ctx.ok(&["run-shell", "-E", both]);
         assert!(shown.contains("out") && shown.contains("err"), "{shown}");
+        // the shell is "sh"; a failure is printed after the output and the client
+        // exits with the command's status (signals as 128 + the signal)
+        assert_eq!(ctx.ok(&["run-shell", "echo $0"]).trim(), "sh");
+        let out = ctx.command().args(["run-shell", "echo out; exit 3", ";", "display", "-p", "after"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "out\n'echo out; exit 3' returned 3\nafter\n");
+        assert!(out.stderr.is_empty(), "{out:?}");
+        let out = ctx.command().args(["run-shell", "kill -9 $$"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(137));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "'kill -9 $$' terminated by signal 9\n");
+        assert_eq!(ctx.command().args(["run-shell", "-b", "exit 4"]).output().unwrap().status.code(), Some(0));
     }
     assert_eq!(ctx.ok(&["run", "-d", "0.1", "-s", "x", "echo delayed"]).trim(), "delayed");
     // display-message -l/-F/-j
@@ -1094,10 +1123,17 @@ fn pane_and_target_flags() {
     assert_eq!(ctx.ok(&["select-pane", "-g", "-t", "p:0.0"]), "bg=red\n");
     assert_eq!(ctx.fmt("p", "#{pane_index}"), "0");
     // {current}/{active} need an attached client
-    assert!(ctx.fails(&["display-message", "-p", "-t", "p", "-c", "nope", "x"]).contains("can't find client"));
+    // display-message's -c can fail (CMD_CLIENT_CANFAIL)
+    assert_eq!(ctx.ok(&["display-message", "-p", "-t", "p", "-c", "nope", "x"]), "x\n");
     assert!(ctx.fails(&["select-window", "-t", "{current}"]).contains("no current client"));
     assert!(ctx.fails(&["kill-pane", "-t", "@"]).contains("no current client"));
     assert_eq!(ctx.ok(&["list-commands", "-F", "#{command_list_name}|#{command_list_alias}", "list-keys"]), "list-keys|lsk\n");
+    // tmux's usage strings, in its command table order
+    assert_eq!(ctx.ok(&["lscm", "display-message"]), "display-message (display) [-aCIjlNpv] [-c target-client] [-d delay] [-F format] [-t target-pane] [message]\n");
+    assert_eq!(ctx.ok(&["lscm", "-F", "#{command_list_usage}|", "kill-server"]), "|\n");
+    let names: Vec<String> = ctx.ok(&["lscm", "-F", "#{command_list_name}"]).lines().map(String::from).collect();
+    let pos = |n: &str| names.iter().position(|x| x == n).unwrap();
+    assert!(pos("display-popup") < pos("display-panes") && pos("attach-session") == 0, "{names:?}");
 }
 
 #[cfg(unix)]
@@ -1138,4 +1174,546 @@ fn format_option_environment_and_window_loops() {
     // No attached client: no client loop rows, client information or animation.
     assert_eq!(ctx.fmt("f", "[#{L:x}#{I/f:RGB}#{A:a,b}]"), "[]");
     assert_eq!(ctx.fmt("f", "#{c:red}#{c/f:themered}#{R:ab,2}"), "800000\x1b[31mabab");
+}
+
+#[test]
+fn display_all_samples_and_printed_commands() {
+    let ctx = Ctx::new("p1fix-print");
+    ctx.ok(&["new-session", "-d", "-s", "d", "sleep 100"]);
+    ctx.ok(&["new-window", "-d", "-t", "d", "sleep", "99"]);
+    // display -a leaves out variables without a value and adds the command name
+    let all = ctx.ok(&["display-message", "-a", "-t", "d:0"]);
+    assert!(all.contains("session_name=d\n") && all.ends_with("command=display-message\n"), "{all}");
+    for absent in ["pane_dead_status=", "pane_dead_signal=", "pane_mode=", "buffer_name=", "session_group=", "window_offset_x="] {
+        assert!(!all.contains(&format!("\n{absent}")), "{absent} in {all}");
+    }
+    assert_eq!(ctx.fmt("d:0", "#{command}"), "display-message");
+    // cmd_stringify_argv: each argument escaped
+    assert_eq!(ctx.fmt("d:0", "#{pane_start_command}"), "\"sleep 100\"");
+    assert_eq!(ctx.fmt("d:1", "#{pane_start_command}"), "sleep 99");
+    // paste_make_sample: 200 bytes, vis-encoded, "..." when cut
+    let long = format!("a\tb\u{1}\"c\" {}", "0".repeat(300));
+    ctx.ok(&["set-buffer", "-b", "long", &long]);
+    let sample = ctx.ok(&["list-buffers", "-F", "#{buffer_name}=#{buffer_sample}", "-f", "#{==:#{buffer_name},long}"]);
+    let want = format!("a\\tb\\001\"c\" {}...", "0".repeat(200 - 12));
+    assert_eq!(sample.trim_end(), format!("long={want}"));
+    // list-keys and show-hooks print commands as tmux does
+    ctx.ok(&["bind", "x", "display", "hi;there"]);
+    ctx.ok(&["bind", "y", "display a ; display b"]);
+    // blocks of a parsed command stay blocks; "{" and "}" arguments are plain strings,
+    // and the command is checked when it is bound
+    ctx.ok(&["if", "-F", "1", "bind z if -F 1 { display a } { display b ; display c }"]);
+    assert_eq!(ctx.fails(&["bind", "v", "if", "-F", "1", "{", "display", "a", "}"]).trim(), "command if-shell: too many arguments (need at most 3)");
+    assert_eq!(ctx.fails(&["bind", "v", "nosuchcmd"]).trim(), "unknown command: nosuchcmd");
+    assert_eq!(ctx.fails(&["bind", "v", "splitw -Q"]).trim(), "command split-window: unknown flag -Q");
+    assert_eq!(ctx.fails(&["bind", "v", "kill-session", "-t", "x", "y"]).trim(), "command kill-session: too many arguments (need at most 0)");
+    assert!(ctx.fails(&["list-keys", "-T", "prefix", "v"]).contains("unknown key: v"));
+    ctx.ok(&["if", "-F", "1", "bind -n F3 { display x ; display y }"]);
+    assert_eq!(ctx.ok(&["list-keys", "-T", "root", "F3"]).trim_end(), "bind-key  -T root F3 display-message x \\; display-message y");
+    ctx.ok(&["bind", "w", "send-keys", "-X", "copy-pipe", "cat >/dev/null"]);
+    let keys = |k: &str| ctx.ok(&["list-keys", "-T", "prefix", k]).trim_end().to_string();
+    assert_eq!(keys("x"), "bind-key  -T prefix x display-message \"hi;there\"");
+    assert_eq!(keys("y"), "bind-key  -T prefix y display-message a \\; display-message b");
+    assert_eq!(keys("z"), "bind-key  -T prefix z if-shell -F 1 { display-message a } { display-message b ; display-message c }");
+    assert_eq!(keys("w"), "bind-key  -T prefix w send-keys -X copy-pipe \"cat >/dev/null\"");
+    assert_eq!(keys("$"), "bind-key  -T prefix \\$ command-prompt -I \"#S\" { rename-session \"%%\" }");
+    assert_eq!(ctx.ok(&["list-keys", "-T", "prefix", "-F", "#{key_command}", "y"]).trim_end(), "display-message a \\; display-message b");
+    ctx.ok(&["set-hook", "-g", "after-new-window", "display \"hi #{window_name}\" ; set -g @x 1"]);
+    ctx.ok(&["set-hook", "-g", "-a", "after-new-window", "if -F 1 { display a ; display b } { display c }"]);
+    let hook0 = "after-new-window[0] display-message \"hi #{window_name}\" ; set-option -g @x 1";
+    let hook1 = "after-new-window[1] if-shell -F 1 { display-message a ; display-message b } { display-message c }";
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "after-new-window"]), format!("{hook0}\n{hook1}\n"));
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "after-new-window[1]"]), format!("{hook1}\n"));
+    assert_eq!(ctx.ok(&["show-options", "-gH", "after-new-window"]), format!("{hook0}\n{hook1}\n"));
+    // OPTIONS_IS_STRING: hooks, colours and numbers are not strings
+    let is_string = |args: &[&str]| ctx.ok(&[&["show-options", "-F", "#{option_is_string}"], args].concat()).lines().next().unwrap_or("").to_string();
+    assert_eq!(is_string(&["-gH", "after-new-window"]), "0");
+    assert_eq!(is_string(&["-gw", "pane-colours"]), "0");
+    assert_eq!(is_string(&["-g", "update-environment"]), "1");
+    assert_eq!(is_string(&["-g", "status-style"]), "1");
+    assert_eq!(is_string(&["-g", "display-time"]), "0");
+}
+
+#[test]
+fn hidden_environment_variables() {
+    let ctx = Ctx::new("p1fix-env");
+    ctx.ok(&["new-session", "-d", "-s", "e"]);
+    ctx.ok(&["set-environment", "-g", "-h", "P1FIX_HID", "sec$ret \"x\" `y` \\z"]);
+    ctx.ok(&["set-environment", "-g", "P1FIX_VIS", "visible"]);
+    ctx.ok(&["set-environment", "-t", "e", "-h", "P1FIX_HID2", "two"]);
+    // hidden variables show only with -h, and -h shows only hidden ones
+    assert_eq!(ctx.ok(&["show-environment", "-g", "P1FIX_HID"]), "");
+    assert_eq!(ctx.ok(&["show-environment", "-gh"]), "P1FIX_HID=sec$ret \"x\" `y` \\z\n");
+    assert_eq!(ctx.ok(&["show-environment", "-gh", "-s"]), "P1FIX_HID=\"sec\\$ret \\\"x\\\" \\`y\\` \\\\z\"; export P1FIX_HID;\n");
+    assert_eq!(ctx.ok(&["show-environment", "-t", "e", "-h"]), "P1FIX_HID2=two\n");
+    assert!(!ctx.ok(&["show-environment", "-t", "e"]).contains("P1FIX_HID2"));
+    assert!(ctx.fails(&["show-environment", "-t", "e", "NOPE"]).contains("unknown variable: NOPE"));
+    // still a format variable, and #{environ_hidden}
+    assert_eq!(ctx.fmt("e:", "#{P1FIX_HID2}"), "two");
+    assert_eq!(ctx.fmt("e:", "#{V/g:#{?#{m:P1FIX_*,#{environ_name}},#{environ_name}=#{environ_hidden};,}}"), "P1FIX_HID=1;P1FIX_VIS=0;");
+    // not passed to new processes
+    let out = std::env::temp_dir().join(format!("p1fix-env-{}", std::process::id()));
+    let cmd = format!("env > '{}'; sleep 30", out.display());
+    #[cfg(unix)]
+    {
+        ctx.ok(&["new-window", "-d", "-t", "e", &cmd]);
+        wait_for("child environment", || std::fs::read_to_string(&out).is_ok_and(|s| s.contains("P1FIX_VIS=")));
+        let env = std::fs::read_to_string(&out).unwrap();
+        let _ = std::fs::remove_file(&out);
+        assert!(!env.contains("P1FIX_HID"), "{env}");
+    }
+    let _ = cmd;
+    // setting without -h shows it again; errors as tmux reports them
+    ctx.ok(&["set-environment", "-g", "P1FIX_HID", "shown"]);
+    assert_eq!(ctx.ok(&["show-environment", "-g", "P1FIX_HID"]), "P1FIX_HID=shown\n");
+    assert!(ctx.fails(&["set-environment", "-g", "", "x"]).contains("empty variable name"));
+    assert!(ctx.fails(&["set-environment", "-g", "A=B", "x"]).contains("variable name contains ="));
+    assert!(ctx.fails(&["set-environment", "-g", "-u", "P1FIX_VIS", "x"]).contains("can't specify a value with -u"));
+}
+
+#[test]
+fn message_log_jobs_and_prompt_history_types() {
+    let ctx = Ctx::new("p1fix-msgs");
+    ctx.ok(&["new-session", "-d", "-s", "m"]);
+    // without -p and with no client to show it on, the message goes nowhere
+    assert_eq!(ctx.ok(&["display-message", "hello msg"]), "");
+    // commands from clients are logged, newest first
+    let log = ctx.ok(&["show-messages"]);
+    let lines: Vec<&str> = log.lines().collect();
+    assert!(lines[0].ends_with(" command: show-messages"), "{log}");
+    assert!(lines[1].ends_with(" command: display-message \"hello msg\""), "{log}");
+    // -J: running jobs
+    ctx.ok(&["run-shell", "-b", "sleep 5"]);
+    let jobs = ctx.ok(&["show-messages", "-J"]);
+    assert!(jobs.starts_with("Job 0: sleep 5 [fd="), "{jobs}");
+    // the descriptor its output is read from
+    let fd: i64 = jobs.split("fd=").nth(1).and_then(|r| r.split(',').next()).and_then(|n| n.parse().ok()).unwrap();
+    assert!(if cfg!(unix) { fd >= 0 } else { fd == -1 }, "{jobs}");
+    // no attached clients: -T lists no terminals
+    assert_eq!(ctx.ok(&["show-messages", "-T"]), "");
+    // tmux 3.8 has a command and a search history
+    assert_eq!(ctx.ok(&["show-prompt-history"]), "History for command:\n\n\nHistory for search:\n\n\n");
+    assert_eq!(ctx.ok(&["show-prompt-history", "-T", "search"]), "History for search:\n\n\n");
+    assert!(ctx.fails(&["show-prompt-history", "-T", "window-target"]).contains("invalid type: window-target"));
+    ctx.ok(&["clear-prompt-history", "-T", "command"]);
+    assert!(ctx.fails(&["clear-prompt-history", "-T", "bogus"]).contains("invalid type: bogus"));
+}
+
+#[cfg(unix)]
+#[test]
+fn capture_pane_history_times() {
+    let ctx = Ctx::new("p1fix-capi");
+    let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    ctx.ok(&["new-session", "-d", "-s", "c", "-x", "40", "-y", "10", "seq 1 30; sleep 100"]);
+    wait_for("output", || ctx.capture("c").contains("30"));
+    let out = ctx.ok(&["capture-pane", "-p", "-I", "-L", "-S", "-", "-t", "c"]);
+    let rows: Vec<(i64, u64, String)> = out.lines().map(|l| {
+        let mut w = l.splitn(3, ' ');
+        (w.next().unwrap().parse().unwrap(), w.next().unwrap().parse().unwrap(), w.next().unwrap_or("").to_string())
+    }).collect();
+    // history lines carry the time they entered the history, screen lines 0
+    assert_eq!(rows[0].0, -21);
+    assert_eq!(rows[0].2, "1");
+    for (n, time, _) in &rows {
+        if *n < 0 { assert!(*time >= before && *time <= before + 60, "{out}"); } else { assert_eq!(*time, 0, "{out}"); }
+    }
+}
+
+#[test]
+fn display_message_verbose() {
+    let ctx = Ctx::new("p1fix-dv");
+    ctx.ok(&["new-session", "-d", "-s", "v", "sleep 100"]);
+    // -v: the expansion steps as tmux's format_log prints them, then the result
+    let out = ctx.ok(&["display-message", "-p", "-v", "-t", "v", "#{session_name} #{?#{==:a,a},y,n}"]);
+    let want = "# expanding format: #{session_name} #{?#{==:a,a},y,n}\n\
+# found #{}: session_name\n\
+# format 'session_name' found: v\n\
+# replaced 'session_name' with 'v'\n\
+# found #{}: ?#{==:a,a},y,n\n\
+# condition is: #{==:a,a}\n\
+#  expanding format: #{==:a,a}\n\
+#  found #{}: ==:a,a\n\
+#  modifier 0 is ==\n\
+#   expanding format: a\n\
+#   result is: a\n\
+#   expanding format: a\n\
+#   result is: a\n\
+#  compare == left is: a\n\
+#  compare == right is: a\n\
+#  replaced '==:a,a' with '1'\n\
+#  result is: 1\n\
+# condition '#{==:a,a}' is true\n";
+    assert!(out.starts_with(want), "{out}");
+    assert!(out.ends_with("# result is: v y\nv y\n"), "{out}");
+}
+
+#[test]
+fn current_session_is_the_last_used() {
+    let ctx = Ctx::new("p1fix-cur");
+    ctx.ok(&["new-session", "-d", "-s", "a", "sleep 100"]);
+    ctx.ok(&["new-session", "-d", "-s", "b", "sleep 100"]);
+    // created in the same second: the newer session is the current one
+    assert_eq!(ctx.ok(&["display-message", "-p", "#S"]), "b\n");
+    // selecting a window is not activity (session_set_current)
+    ctx.ok(&["select-window", "-t", "a:0"]);
+    assert_eq!(ctx.ok(&["display-message", "-p", "#S"]), "b\n");
+    assert_eq!(ctx.ok(&["list-sessions", "-O", "activity", "-F", "#S"]), "b\na\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn capture_pane_line_flags() {
+    let ctx = Ctx::new("p1fix-capf");
+    ctx.ok(&["new-session", "-d", "-s", "f", "-x", "20", "-y", "8",
+        "printf 'plain\\n\\033]133;A\\033\\\\$ cmd\\n\\033]133;C\\033\\\\out\\n\\033[38;2;1;2;3mrgb\\033[m\\n%025d\\nend'; sleep 100"]);
+    wait_for("output", || ctx.capture("f").contains("end"));
+    // -F: start of prompt (P) and output (O) from OSC 133, wrapped (W), extended cells (X)
+    let out = ctx.ok(&["capture-pane", "-p", "-F", "-E", "6", "-t", "f"]);
+    assert_eq!(out, format!("- plain\nP $ cmd\nO out\nX rgb\nW {}\n- 00000\n- end\n", "0".repeat(20)));
+}
+
+#[test]
+fn capture_pane_marks_survive_erasing_the_line() {
+    let ctx = Ctx::new("p1fix-capf2");
+    ctx.ok(&["new-session", "-d", "-s", "f", "-x", "20", "-y", "4",
+        "printf '\\033]133;C\\033\\\\c\\033[2Kd'; sleep 100"]);
+    wait_for("output", || ctx.capture("f").contains('d'));
+    // screen_write_clearline keeps the line's OSC 133 flags
+    assert_eq!(ctx.ok(&["capture-pane", "-p", "-F", "-E", "0", "-t", "f"]), "O  d\n");
+}
+
+#[test]
+fn option_loop_hooks_and_session_default_size() {
+    let ctx = Ctx::new("p1fix-oloop");
+    // -x/-y set the session's default-size, its only local option here
+    ctx.ok(&["new-session", "-d", "-s", "m", "-x", "80", "-y", "24", "sleep 100"]);
+    assert_eq!(ctx.ok(&["show-options", "-t", "m"]), "default-size 80x24\n");
+    ctx.ok(&["set-hook", "-g", "after-new-window", "display a"]);
+    ctx.ok(&["set-hook", "-t", "m", "session-renamed", "display c"]);
+    // O loops over hooks too: a session's set ones, every global one of the scope
+    assert_eq!(ctx.fmt("m", "#{O:#{option_name}=#{option_value}|}"), "default-size=80x24|session-renamed=display-message c|");
+    let g = ctx.fmt("m", "#{O/g:#{option_name}[#{option_array_key}]#{option_is_hook}#{option_array_count}=#{option_value}|}");
+    assert!(g.starts_with("activity-action[]00=other|after-bind-key[]10=|"), "{g}");
+    assert!(g.contains("|after-new-window[0]11=display-message a|"), "{g}");
+    // an array with items is listed by its items only
+    assert!(g.contains("|update-environment[0]013=DISPLAY|") && !g.contains("update-environment[]"), "{g}");
+    let w = ctx.fmt("m", "#{O/gw:#{option_name}|}");
+    assert!(w.contains("|pane-activity|") && w.contains("|window-zoomed|") && !w.contains("after-bind-key"), "{w}");
+}
+
+#[test]
+fn argument_counts_and_parse_errors() {
+    let ctx = Ctx::new("p1fix-argc");
+    ctx.ok(&["new-session", "-d", "-s", "a", "sleep 100"]);
+    // args_parse limits, reported as cmd_parse does
+    assert_eq!(ctx.fails(&["show-options", "-g", "base-index", "status"]).trim(), "command show-options: too many arguments (need at most 1)");
+    assert_eq!(ctx.fails(&["set-environment"]).trim(), "command set-environment: too few arguments (need at least 1)");
+    assert_eq!(ctx.fails(&["if-shell", "true"]).trim(), "command if-shell: too few arguments (need at least 2)");
+    assert_eq!(ctx.fails(&["show-hooks", "-v"]).trim(), "command show-hooks: unknown flag -v");
+    assert_eq!(ctx.fails(&["display-message", "-t"]).trim(), "command display-message: -t expects an argument");
+    assert_eq!(ctx.ok(&["display-message", "-p", "-t", "a", "#S"]), "a\n");
+}
+
+#[test]
+fn cmd_find_errors_and_canfail_targets() {
+    let ctx = Ctx::new("p1fix-find");
+    ctx.ok(&["new-session", "-d", "-s", "s0", "-x", "80", "-y", "24", "sleep 100"]);
+    // an unknown @id used to recurse until the server's stack overflowed
+    for cmd in ["select-pane", "select-window", "has-session", "list-windows"] {
+        assert_eq!(ctx.fails(&[cmd, "-t", "@99"]).trim(), "can't find window: @99", "{cmd}");
+    }
+    assert_eq!(ctx.ok(&["display-message", "-p", "-t", "@99", "[#S]"]), "[]\n");
+    ctx.ok(&["has-session", "-t", "s0"]);
+    // the failing part, as cmd_find_target reports it
+    for (cmd, t, e) in [
+        ("select-pane", "nosuch", "can't find pane: nosuch"),
+        ("select-window", "nosuch", "can't find window: nosuch"),
+        ("has-session", "nosuch", "can't find session: nosuch"),
+        ("has-session", "nosuch:", "can't find session: nosuch"),
+        ("has-session", ":nosuch", "can't find window: nosuch"),
+        ("has-session", "s0:9", "can't find window: 9"),
+        ("select-window", "s0:0.9", "can't find pane: 9"),
+        ("select-window", "%99", "can't find pane: %99"),
+        ("has-session", "$99", "can't find session: $99"),
+        ("select-pane", "nosuch.1", "can't find window: nosuch"),
+        ("select-pane", "=s", "can't find pane: =s"),
+        ("has-session", "=s", "can't find session: s"),
+    ] {
+        assert_eq!(ctx.fails(&[cmd, "-t", t]).trim(), e, "{cmd} -t {t}");
+    }
+    ctx.ok(&["select-window", "-t", "=s"]);
+    // display-message's target can fail: what was found stays, the rest is empty
+    assert_eq!(ctx.ok(&["display-message", "-p", "-t", "nosuch", "[#S:#I]"]), "[:]\n");
+    assert_eq!(ctx.ok(&["display-message", "-p", "-t", "s0:7", "#{session_format}#{window_format}#{pane_format} [#S:#I.#P]"]), "100 [s0:0.0]\n");
+    assert_eq!(ctx.ok(&["display-message", "-p", "-t", "s0:0.5", "#{session_format}#{window_format}#{pane_format} [#S:#I.#P]"]), "010 [s0:0.0]\n");
+    assert_eq!(ctx.fails(&["display-message", "-d", "abc", "hi"]).trim(), "delay invalid");
+    assert_eq!(ctx.fails(&["display-message", "-d", "-1", "-p", "hi"]).trim(), "delay too small");
+}
+
+#[test]
+fn format_type_follows_the_target() {
+    let ctx = Ctx::new("p1fix-ftype");
+    ctx.ok(&["new-session", "-d", "-s", "s0", "sleep 100"]);
+    ctx.ok(&["new-window", "-d", "sleep 100"]);
+    let f = "#{session_format}#{window_format}#{pane_format}";
+    assert_eq!(ctx.ok(&["display-message", "-p", f]), "001\n");
+    assert_eq!(ctx.ok(&["list-windows", "-F", f]), "010\n010\n");
+    assert_eq!(ctx.ok(&["list-sessions", "-F", f]), "100\n");
+    assert_eq!(ctx.ok(&["list-panes", "-F", f]), "001\n");
+    assert_eq!(ctx.ok(&["display-message", "-p", &format!("#{{S:{f}}} #{{W:{f}}} #{{P:{f}}}")]), "100 010010 001\n");
+    // format_defaults fills in the session's current pane
+    assert_eq!(ctx.ok(&["list-sessions", "-F", "#{pane_index}"]), "0\n");
+}
+
+#[test]
+fn bind_key_splits_separate_arguments_like_cmd_parse_from_arguments() {
+    let ctx = Ctx::new("p1fix-bindsplit");
+    ctx.ok(&["new-session", "-d", "-s", "s1", "sleep 100"]);
+    let dir = std::env::temp_dir().join(format!("pt-bindsplit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let conf = dir.join("c.conf");
+    std::fs::write(&conf, concat!(
+        "bind F4 resize-pane -U 5 \\; select-pane -t '{last}'\n",
+        "bind F5 display a \\; display b\n",
+        "bind F6 send -l '\\;'\n",
+        "bind F7 send -l ';'\n",
+        "bind F8 send -l 'a;'\n",
+        "bind F9 send -l \\;x\n",
+        "bind -n M-z resize-pane -Z \\; set -g @z 1\n",
+        "bind F10 source-file /dev/null \\; display \"Reloaded!\"\n",
+    )).unwrap();
+    // the config's \; reaches bind-key as a ";" argument, which ends a command
+    assert_eq!(ctx.ok(&["source-file", conf.to_str().unwrap()]), "");
+    for (k, want) in [
+        ("F4", "resize-pane -U 5 \\; select-pane -t \"{last}\""),
+        ("F5", "display-message a \\; display-message b"),
+        ("F6", "send-keys -l \\;"),
+        ("F7", "send-keys -l"),
+        ("F8", "send-keys -l a"),
+        ("F9", "send-keys -l \";x\""),
+        ("F10", "source-file /dev/null \\; display-message Reloaded!"),
+    ] {
+        assert_eq!(ctx.ok(&["list-keys", k]).trim(), format!("bind-key  -T prefix {k} {want}"), "{k}");
+    }
+    assert_eq!(ctx.ok(&["list-keys", "-T", "root", "M-z"]).trim(), r"bind-key  -T root M-z resize-pane -Z \; set-option -g @z 1");
+    // both commands run
+    ctx.ok(&["bind-key", "F3", "set", "-g", "@a", "1;", "set", "-g", "@b", "2"]);
+    assert_eq!(ctx.ok(&["list-keys", "F3"]).trim(), r"bind-key  -T prefix F3 set-option -g @a 1 \; set-option -g @b 2");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn set_hook_is_set_option_and_show_hooks_scopes() {
+    let ctx = Ctx::new("p1fix-hooks");
+    ctx.ok(&["new-session", "-d", "-s", "m", "sleep 100"]);
+    ctx.ok(&["new-session", "-d", "-s", "f", "sleep 100"]);
+    // name[N] is that element; -a uses the first free index; -u name[N] removes it
+    ctx.ok(&["set-hook", "-g", "pane-died[3]", "run \"echo hi\""]);
+    ctx.ok(&["set-hook", "-g", "pane-died[1]", "display died"]);
+    ctx.ok(&["set-hook", "-ag", "pane-died", "display app"]);
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "pane-died"]), "pane-died[0] display-message app\npane-died[1] display-message died\npane-died[3] run-shell \"echo hi\"\n");
+    ctx.ok(&["set-hook", "-ug", "pane-died[3]"]);
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "pane-died"]), "pane-died[0] display-message app\npane-died[1] display-message died\n");
+    ctx.ok(&["set-hook", "-t", "f", "session-renamed[3]", "neww"]);
+    assert_eq!(ctx.ok(&["show-hooks", "-t", "f", "session-renamed"]), "session-renamed[3] new-window\n");
+    // names are checked as option names; values as option values
+    assert_eq!(ctx.fails(&["set-hook", "-g", "nosuch-hook", "display x"]).trim(), "invalid option: nosuch-hook");
+    assert_eq!(ctx.fails(&["set-hook", "-g", "status", "display x"]).trim(), "unknown value: display x");
+    assert_eq!(ctx.fails(&["set-hook", "-g", "client-attached"]).trim(), "empty value");
+    assert_eq!(ctx.fails(&["show-hooks", "-g", "nosuch"]).trim(), "invalid option: nosuch");
+    assert_eq!(ctx.fails(&["show-hooks", "-g", "@x"]).trim(), "invalid option: @x");
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "status"]), "status on\n");
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "after-new-window[2]"]), "after-new-window[2] \n");
+    // an @ name is a user option, listed by show-hooks (and show-options only with -H)
+    ctx.ok(&["set-hook", "-g", "@u", "neww"]);
+    assert_eq!(ctx.fmt("m", "#{@u}"), "neww");
+    assert_eq!(ctx.ok(&["show-options", "-gv", "@u"]), "neww\n");
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "@u"]), "@u neww\n");
+    assert!(ctx.ok(&["show-hooks", "-g"]).starts_with("@u neww\n"));
+    assert!(!ctx.ok(&["show-options", "-g"]).contains("@u"));
+    assert!(ctx.ok(&["show-options", "-gH"]).contains("@u neww"));
+    // pane hooks live on the pane (-p ignores -g), window hooks on the window
+    ctx.ok(&["set-hook", "-p", "-t", "m", "pane-exited", "display x"]);
+    assert_eq!(ctx.ok(&["show-hooks", "-w", "-t", "m"]), "");
+    assert_eq!(ctx.ok(&["show-hooks", "-p", "-t", "m"]), "pane-exited[0] display-message x\n");
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "-p", "-t", "m"]), "pane-exited[0] display-message x\n");
+    assert_eq!(ctx.fmt("m", "#{O/p:#{option_name};}"), "pane-exited;");
+    assert_eq!(ctx.ok(&["show-hooks", "-p", "-t", "f"]), "");
+    ctx.ok(&["set-hook", "-w", "-t", "m", "window-renamed", "set -g @wr yes"]);
+    assert_eq!(ctx.ok(&["show-hooks", "-w", "-t", "m"]), "window-renamed[0] set-option -g @wr yes\n");
+    assert_eq!(ctx.ok(&["show-hooks", "-w", "-t", "f"]), "");
+    ctx.ok(&["rename-window", "-t", "f:0", "other"]);
+    ctx.fails(&["show-options", "-gv", "@wr"]);
+    ctx.ok(&["rename-window", "-t", "m:0", "zz"]);
+    wait_for("window hook", || ctx.cmd(&["show-options", "-gv", "@wr"]).1 == "yes\n");
+}
+
+#[test]
+fn sessions_windows_and_panes_have_their_own_ids() {
+    let ctx = Ctx::new("p1fix-ids");
+    ctx.ok(&["new-session", "-d", "-s", "s1", "sleep 100"]);
+    assert_eq!(ctx.ok(&["list-panes", "-a", "-F", "#{pane_id} #{window_id} #{session_id}"]), "%0 @0 $0\n");
+    assert_eq!(ctx.fmt("s1", "#{next_session_id}"), "$1");
+    ctx.ok(&["new-window", "-d", "sleep 100"]);
+    ctx.ok(&["split-window", "-d", "-t", "s1:1", "sleep 100"]);
+    assert_eq!(ctx.ok(&["list-panes", "-a", "-F", "#{pane_id} #{window_id}"]), "%0 @0\n%1 @1\n%2 @1\n");
+    ctx.ok(&["new-session", "-d", "-s", "s2", "sleep 100"]);
+    assert_eq!(ctx.fmt("s1", "#{next_session_id}"), "$2");
+    // an unnamed session is named by its id; a grouped one by its group and id
+    ctx.ok(&["new-session", "-d", "sleep 100"]);
+    ctx.ok(&["new-session", "-d", "-t", "s1"]);
+    assert_eq!(ctx.ok(&["list-sessions", "-F", "#{session_name} #{session_id}"]), "2 $2\ns1 $0\ns1-3 $3\ns2 $1\n");
+    // the global environment is not session $0's
+    ctx.ok(&["set-environment", "-g", "G1", "x"]);
+    ctx.ok(&["set-environment", "-t", "s1", "S1", "y"]);
+    assert_eq!(ctx.ok(&["show-environment", "-g", "G1"]), "G1=x\n");
+    ctx.fails(&["show-environment", "-g", "S1"]);
+    assert_eq!(ctx.ok(&["show-environment", "-t", "s1", "S1"]), "S1=y\n");
+}
+
+#[test]
+fn client_lookup_send_keys_and_refresh_client_errors() {
+    let ctx = Ctx::new("p1fix-clients");
+    ctx.ok(&["new-session", "-d", "-s", "s1", "sleep 100"]);
+    // CMD_CLIENT_CANFAIL: an unknown client is no error (a session name is not a client)
+    assert_eq!(ctx.ok(&["display-message", "-p", "-c", "nosuch", "#{session_name}"]), "s1\n");
+    assert_eq!(ctx.ok(&["display-message", "-p", "-c", "s1", "#{session_name}"]), "s1\n");
+    ctx.ok(&["display-message", "-c", "bogus", "msg"]);
+    ctx.ok(&["show-messages", "-t", "bogus"]);
+    ctx.ok(&["send-keys", "-c", "bogus", "-t", "s1", "x"]);
+    assert_eq!(ctx.fails(&["switch-client", "-c", "s1", "-t", "s1"]).trim(), "can't find client: s1");
+    assert_eq!(ctx.fails(&["refresh-client", "-t", "s1:"]).trim(), "can't find client: s1:");
+    // cmd_send_keys_exec's checks
+    assert_eq!(ctx.fails(&["send-keys", "-t", "s1", "-X", "cancel"]).trim(), "not in a mode");
+    assert_eq!(ctx.fails(&["send-keys", "-t", "s1", "-N", "0", "x"]).trim(), "repeat count too small");
+    assert_eq!(ctx.fails(&["send-keys", "-t", "s1", "-N", "abc", "x"]).trim(), "repeat count invalid");
+    ctx.ok(&["send-keys", "-t", "s1", "-N", "2"]);
+    ctx.ok(&["copy-mode", "-t", "s1"]);
+    ctx.ok(&["send-keys", "-t", "s1", "-N", "2", "-X", "cursor-up"]);
+    ctx.ok(&["send-keys", "-t", "s1", "-X", "cancel"]);
+    assert_eq!(ctx.fmt("s1", "#{pane_in_mode}"), "0");
+}
+
+#[test]
+fn whole_command_lists_are_checked_before_running() {
+    let ctx = Ctx::new("p1fix-precheck");
+    ctx.ok(&["new-session", "-d", "-s", "s1", "sleep 100"]);
+    // from the command line: nothing runs when any command is bad
+    assert_eq!(ctx.fails(&["set", "-g", "@x", "1", ";", "neww", "-Q"]).trim(), "command new-window: unknown flag -Q");
+    assert_eq!(ctx.fails(&["set", "-g", "@y", "1", ";", "nosuch"]).trim(), "unknown command: nosuch");
+    ctx.fails(&["show-options", "-gv", "@x"]);
+    ctx.fails(&["show-options", "-gv", "@y"]);
+    // a file: the error has its file and line, and none of the file runs
+    let dir = std::env::temp_dir().join(format!("pt-precheck-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let conf = dir.join("c.conf");
+    std::fs::write(&conf, "set -g @a 1\n\nneww -Q\nset -g @b 1\n").unwrap();
+    let path = conf.to_str().unwrap();
+    assert_eq!(ctx.fails(&["source-file", path]).trim(), format!("{path}:3: command new-window: unknown flag -Q"));
+    ctx.fails(&["show-options", "-gv", "@a"]);
+    ctx.fails(&["show-options", "-gv", "@b"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_shell_status_and_new_session_sizes() {
+    let ctx = Ctx::new("p1fix-rsds");
+    ctx.ok(&["new-session", "-d", "-s", "f", "-x", "80", "-y", "24", "sleep 100"]);
+    // the last run-shell gives the exit status
+    assert_eq!(ctx.cmd(&["run-shell", "exit 3", ";", "run-shell", "true"]), (true, "'exit 3' returned 3\n".to_string()));
+    let (ok, out) = ctx.cmd(&["run-shell", "true", ";", "run-shell", "exit 4"]);
+    assert!(!ok && out == "'exit 4' returned 4\n", "{out}");
+    // a -b job's failure is shown in a pane too
+    ctx.ok(&["run-shell", "-b", "exit 5"]);
+    wait_for("view mode", || ctx.fmt("f", "#{pane_in_mode}") == "1");
+    // -x/-y: the default size as given, the other side from default-size
+    ctx.ok(&["new-session", "-d", "-s", "d1", "-x", "50", "sleep 100"]);
+    assert_eq!(ctx.ok(&["show-options", "-t", "d1", "default-size"]), "default-size 50x24\n");
+    assert_eq!(ctx.fmt("d1", "#{window_width}x#{window_height}"), "50x24");
+    assert_eq!(ctx.fails(&["new-session", "-d", "-y", "0"]).trim(), "height too small");
+    assert_eq!(ctx.fails(&["new-session", "-d", "-x", "abc"]).trim(), "width invalid");
+}
+
+#[test]
+fn copy_mode_format_variables() {
+    let ctx = Ctx::new("p1fix-copyvars");
+    ctx.ok(&["new-session", "-d", "-s", "s1", "-x", "60", "-y", "16", "printf 'hello world\\nworld two\\n'; sleep 100"]);
+    wait_for("output", || ctx.capture("s1").contains("two"));
+    // not in copy mode: no values, and display -a has none of them
+    assert_eq!(ctx.fmt("s1", "[#{copy_cursor_word}#{selection_mode}]"), "[]");
+    ctx.ok(&["copy-mode", "-t", "s1"]);
+    ctx.ok(&["send-keys", "-t", "s1", "-X", "history-top"]);
+    assert_eq!(ctx.fmt("s1", "#{copy_cursor_word}|#{copy_cursor_line}|#{selection_mode}|#{search_present}|#{search_count}"), "hello|hello world|char|0|0");
+    let all = ctx.ok(&["display-message", "-a", "-t", "s1"]);
+    for v in ["copy_cursor_hyperlink=", "copy_position=0", "copy_position_limit=0", "rectangle_toggle=0", "search_match=", "selection_active=0", "top_line_time=0"] {
+        assert!(all.lines().any(|l| l == v), "{v} in display -a");
+    }
+    ctx.ok(&["send-keys", "-t", "s1", "-X", "search-forward", "wor"]);
+    assert_eq!(ctx.fmt("s1", "#{search_present}|#{search_count}|#{search_match}"), "1|2|wor");
+    ctx.ok(&["send-keys", "-t", "s1", "-X", "select-word"]);
+    assert_eq!(ctx.fmt("s1", "#{selection_mode}|#{selection_active}|#{selection_present}"), "word|1|1");
+    ctx.ok(&["send-keys", "-t", "s1", "-X", "rectangle-toggle"]);
+    ctx.ok(&["send-keys", "-t", "s1", "-X", "select-line"]);
+    assert_eq!(ctx.fmt("s1", "#{selection_mode}|#{rectangle_toggle}"), "line|0");
+}
+
+#[test]
+fn display_message_verbose_loops_aliases_and_modifiers() {
+    let ctx = Ctx::new("p1fix-dv2");
+    ctx.ok(&["new-session", "-d", "-s", "m", "sleep 100"]);
+    ctx.ok(&["set", "-g", "@a", "#{session_name}"]);
+    // the whole format_log trace of tmux 3.8 for these
+    let out = ctx.ok(&["display-message", "-v", "-p", "-t", "m", "#{E:@a}|#{W:#I}|#{=3:session_name}|#{s/m/M/:session_name}|#{nosuch}"]);
+    assert_eq!(out, "# expanding format: #{E:@a}|#{W:#I}|#{=3:session_name}|#{s/m/M/:session_name}|#{nosuch}\n\
+# found #{}: E:@a\n\
+# modifier 0 is E\n\
+# format '@a' found: #{session_name}\n\
+#  expanding format: #{session_name}\n\
+#  found #{}: session_name\n\
+#  format 'session_name' found: m\n\
+#  replaced 'session_name' with 'm'\n\
+#  result is: m\n\
+# replaced 'E:@a' with 'm'\n\
+# found #{}: W:#I\n\
+# modifier 0 is W\n\
+# window loop: 0 @0\n\
+#  expanding format: #I\n\
+#  found #I: window_index\n\
+#  format 'window_index' found: 0\n\
+#  replaced 'window_index' with '0'\n\
+#  result is: 0\n\
+# replaced 'W:#I' with '0'\n\
+# found #{}: =3:session_name\n\
+#  expanding format: 3\n\
+#  result is: 3\n\
+# modifier 0 is =\n\
+# modifier 0 argument 0: 3\n\
+# format 'session_name' found: m\n\
+# applied length limit 3: m\n\
+# replaced '=3:session_name' with 'm'\n\
+# found #{}: s/m/M/:session_name\n\
+#  expanding format: m\n\
+#  result is: m\n\
+#  expanding format: M\n\
+#  result is: M\n\
+# modifier 0 is s\n\
+# modifier 0 argument 0: m\n\
+# modifier 0 argument 1: M\n\
+# format 'session_name' found: m\n\
+#  expanding format: m\n\
+#  result is: m\n\
+#  expanding format: M\n\
+#  result is: M\n\
+# substitute 'm' to 'M': M\n\
+# replaced 's/m/M/:session_name' with 'M'\n\
+# found #{}: nosuch\n\
+# format 'nosuch' not found\n\
+# replaced 'nosuch' with ''\n\
+# result is: m|0|m|M|\n\
+m|0|m|M|\n");
+    let out = ctx.ok(&["display-message", "-v", "-p", "-t", "m", "#{l:#{x}}|#{?#{==:1,2},a,#{?1,b,c}}|#{p7:session_name}|#{n:session_name}"]);
+    for want in ["# literal string is '#{x}'", "# no condition matched in '#{==:1,2},a,#{?1,b,c}'; using last arg",
+        "#  condition '1' not found; assuming false", "# applied padding width 7: m      ", "# replacing with length: 1"] {
+        assert!(out.lines().any(|l| l == want), "{want}: {out}");
+    }
 }

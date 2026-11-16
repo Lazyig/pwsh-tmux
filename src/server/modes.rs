@@ -415,7 +415,21 @@ pub struct Menu {
     pub nomouse: bool,
     /// -O: releasing the button does not close the menu (MENU_STAYOPEN).
     pub stayopen: bool,
+    pub look: OverlayLook,
 }
+
+/// Styles and border lines given to display-menu (-s -H -S -b) or display-popup
+/// (-s -S -b); unset ones come from the menu-* / popup-* options.
+#[derive(Default, Clone)]
+pub struct OverlayLook {
+    pub style: Option<String>,
+    pub selected_style: Option<String>,
+    pub border_style: Option<String>,
+    pub lines: Option<String>,
+}
+
+/// The values of menu-border-lines and popup-border-lines.
+pub const BOX_LINES: [&str; 7] = ["single", "rounded", "double", "heavy", "simple", "padded", "none"];
 
 pub enum MenuAction {
     None,
@@ -456,7 +470,7 @@ impl Menu {
                 }
             })
         };
-        Menu { title, items, sel, x, y, w, h, pane, nomouse, stayopen }
+        Menu { title, items, sel, x, y, w, h, pane, nomouse, stayopen, look: OverlayLook::default() }
     }
 
     /// Run the selected item (tmux menu_key_cb "chosen").
@@ -495,7 +509,7 @@ impl Menu {
         let mx = pos(x, cw, w, mouse.map(|m| m.0));
         let my = if y == Some("C") { ((ch.saturating_sub(1)) / 2).saturating_sub(h.div_ceil(2)) } else { pos(y, ch, h, mouse.map(|m| m.1)) };
         let sel = items.iter().position(|i| !i.cmd.is_empty());
-        Menu { title, items, sel, x: mx, y: my, w, h, pane, nomouse: true, stayopen: false }
+        Menu { title, items, sel, x: mx, y: my, w, h, pane, nomouse: true, stayopen: false, look: OverlayLook::default() }
     }
 
     fn step(&mut self, dir: isize) {
@@ -532,9 +546,10 @@ impl Menu {
         }
     }
 
-    pub fn draw(&self, f: &mut super::render::Frame, style: Style, border: Style, selected_style: Style) {
+    pub fn draw(&self, f: &mut super::render::Frame, style: Style, border: Style, selected_style: Style, lines: &str) {
         let (x0, y0, w, h) = (self.x, self.y, self.w, self.h);
-        super::render::draw_box(f, x0, y0, w, h, border, &self.title);
+        let set = super::render::box_lines(lines);
+        super::render::draw_box_lines(f, x0, y0, w, h, border, &self.title, lines);
         for (i, it) in self.items.iter().enumerate() {
             let y = y0 + 1 + i as u16;
             if y + 1 >= y0 + h {
@@ -547,10 +562,10 @@ impl Menu {
             }
             if it.name.is_empty() {
                 for x in x0 + 1..x0 + w - 1 {
-                    f.set(x, y, Cell { text: "─".into(), style: border });
+                    f.set(x, y, Cell { text: set[0].into(), style: border });
                 }
-                f.set(x0, y, Cell { text: "├".into(), style: border });
-                f.set(x0 + w - 1, y, Cell { text: "┤".into(), style: border });
+                f.set(x0, y, Cell { text: set[6].into(), style: border });
+                f.set(x0 + w - 1, y, Cell { text: set[7].into(), style: border });
                 continue;
             }
             let dim = Style { attrs: style.attrs | crate::cells::DIM, ..st };
@@ -575,6 +590,9 @@ pub struct Popup {
     pub border: bool,
     pub close_on_exit: bool,
     pub title: String,
+    /// -k: any key closes the popup once its command has exited.
+    pub any_key: bool,
+    pub look: OverlayLook,
 }
 
 impl Popup {

@@ -29,6 +29,8 @@ pub const S_SUSPEND: u8 = 14;
 pub const S_SHELL: u8 = 15;
 /// Text to print on the client's stdout while it is not attached (e.g. command output before a reply).
 pub const S_STDOUT: u8 = 16;
+/// detach-client -E: leave and run this command instead; payload "command\0shell".
+pub const S_EXEC: u8 = 17;
 
 const MAX_FRAME: usize = 64 << 20;
 pub const MAX_CLIENT_FRAME: usize = 1 << 20;
