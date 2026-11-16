@@ -3358,6 +3358,10 @@ fn buffer_and_size_messages() {
     assert_eq!(ctx.fails(&["join-pane", "-d", "-v", "-s", "s:0.0", "-t", "s:0.2"]).trim_end(), "size or position no space for a new pane");
 }
 
+// tty_term_create's check needs the terminal's terminfo entry; the Windows server reads
+// none (it draws for any console without terminfo, see terminfo::missing_required), even
+// when Git Bash puts an infocmp on PATH
+#[cfg(unix)]
 #[test]
 fn terminals_without_clear_cannot_attach() {
     if !std::process::Command::new("infocmp").arg("xterm-256color").output().is_ok_and(|o| o.status.success()) {
