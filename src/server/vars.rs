@@ -428,7 +428,14 @@ impl Vars for VarCtx<'_> {
             "window_start_flag" => Some(b(sess.zip(t.idx).is_some_and(|(s, i)| s.links.keys().next() == Some(&i)))),
             "window_end_flag" => Some(b(sess.zip(t.idx).is_some_and(|(s, i)| s.links.keys().next_back() == Some(&i)))),
             "window_linked" => win.map(|w| b(srv.links_of(w.id).len() > 1)),
-            "window_linked_sessions" => win.map(|w| srv.links_of(w.id).len().to_string()),
+            // a session group counts once
+            "window_linked_sessions" => win.map(|w| {
+                let mut keys: Vec<(bool, u32)> = srv.links_of(w.id).into_iter()
+                    .map(|(s, _)| srv.sessions[&s].group.map_or((false, s), |g| (true, g))).collect();
+                keys.sort_unstable();
+                keys.dedup();
+                keys.len().to_string()
+            }),
             // the format client's view of its current window (tty_window_offset)
             "window_bigger" => client.map(|c| b(srv.view_offset(c.id).bigger)),
             "window_active_clients" | "window_active_clients_list" => win.map(|w| {
@@ -438,11 +445,11 @@ impl Vars for VarCtx<'_> {
                 if name == "window_active_clients" { names.len().to_string() } else { names.join(",") }
             }).filter(|v| !v.is_empty()),
             "window_active_sessions" | "window_active_sessions_list" => win.map(|w| {
-                let names: Vec<String> = srv.links_of(w.id).into_iter()
+                let names: Vec<String> = srv.winlinks_of(w.id).into_iter()
                     .filter(|(s, i)| srv.sessions[s].active == *i).map(|(s, _)| srv.sessions[&s].name.clone()).collect();
                 if name == "window_active_sessions" { names.len().to_string() } else { names.join(",") }
             }).filter(|v| !v.is_empty()),
-            "window_linked_sessions_list" => win.map(|w| srv.links_of(w.id).into_iter().map(|(s, _)| srv.sessions[&s].name.clone()).collect::<Vec<_>>().join(",")).filter(|v| !v.is_empty()),
+            "window_linked_sessions_list" => win.map(|w| srv.winlinks_of(w.id).into_iter().map(|(s, _)| srv.sessions[&s].name.clone()).collect::<Vec<_>>().join(",")).filter(|v| !v.is_empty()),
             "window_stack_index" => sess.zip(t.idx).map(|(s, i)| s.last.iter().position(|x| *x == i).map_or(0, |n| n + 1).to_string()),
             // tmux's default cell size when the terminal does not report pixels
             "window_cell_width" => win.map(|_| "16".into()),

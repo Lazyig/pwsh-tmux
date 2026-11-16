@@ -1619,6 +1619,14 @@ impl Server {
         v
     }
 
+    /// links_of in w->winlinks order: the order the links were made.
+    pub fn winlinks_of(&self, wid: WinId) -> Vec<(SessId, u32)> {
+        let mut v = self.links_of(wid);
+        let seq = &self.ev.seen.link_seq;
+        v.sort_by_key(|k| seq.get(k).filter(|(w, _)| *w == wid).map_or(u64::MAX, |(_, n)| *n));
+        v
+    }
+
     pub fn session_of_pane(&self, pane: PaneId) -> Option<(SessId, u32)> {
         let wid = self.window_of(pane)?;
         let links = self.links_of(wid);

@@ -227,6 +227,10 @@ pub struct Seen {
     pub windows: HashMap<WinId, WinSeen>,
     pub panes: HashMap<PaneId, PaneSeen>,
     pub sessions: BTreeMap<SessId, SessSeen>,
+    /// When each winlink was linked (tmux appends to w->winlinks), for window_linked_sessions_list
+    /// and the alert order.
+    pub link_seq: HashMap<(SessId, u32), (WinId, u64)>,
+    pub link_next: u64,
 }
 
 /// A spawned pane waiting to be placed before pane-created fires.
@@ -405,6 +409,11 @@ impl Server {
         self.fire(name, p);
     }
     pub fn fire_winlink(&mut self, name: &str, sid: SessId, idx: u32, wid: WinId) {
+        if name == "window-linked" {
+            let seen = &mut self.ev.seen;
+            seen.link_next += 1;
+            seen.link_seq.insert((sid, idx), (wid, seen.link_next));
+        }
         let p = self.payload_winlink(sid, idx, wid);
         self.fire(name, p);
     }
