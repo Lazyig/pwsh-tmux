@@ -3437,6 +3437,7 @@ impl Server {
             s.cols = c;
             s.rows = r.saturating_add(status);
         }
+        self.mark_session_dirty(sid);
     }
 
     /// recalculate_size: a new size is applied at once with `now` or for a manual size,
@@ -4094,6 +4095,33 @@ fn strip_delay(cmd: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod input_tests;
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    // select-window and swap-window redraw through update_session_size alone
+    #[test]
+    fn session_size_recalculation_marks_its_clients_dirty() {
+        let (mut srv, _events) = super::security_tests::fixture();
+        let c = srv.clients.get_mut(&1).unwrap();
+        c.readonly = false;
+        c.acl_readonly = false;
+        srv.exec(vec!["new-session".into(), "-d".into(), "-s".into(), "size".into()], &mut Ctx::default()).unwrap();
+        let sid = *srv.sessions.keys().next().unwrap();
+        srv.attach_client(1, sid);
+        srv.clients.get_mut(&1).unwrap().dirty = false;
+        // the size does not change, so no window is marked dirty by a resize
+        srv.update_session_size(sid);
+        assert!(srv.clients[&1].dirty);
+        srv.clients.get_mut(&1).unwrap().dirty = false;
+        srv.update_session_size_now(sid);
+        assert!(srv.clients[&1].dirty);
+        for p in srv.panes.values_mut() {
+            p.kill();
+        }
+    }
+}
 
 /// A child's exit status as tmux reports it: the exit code, or minus the signal
 /// number when a signal ended it (pane_dead_signal, pane_dead_status empty).
