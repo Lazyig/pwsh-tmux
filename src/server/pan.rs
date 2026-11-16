@@ -255,6 +255,23 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn a_cursor_off_the_pan_is_hidden_at_the_top_left() {
+        let (mut srv, _evs, _) = bigger();
+        let st = srv.compose(1).unwrap();
+        assert!(st.cursor.is_some() && !st.park);
+        // server_client_reset_state: the cursor (row 19) is off the rows shown
+        ok(&mut srv, &["refresh-client", "-U", "100"]);
+        let st = srv.compose(1).unwrap();
+        assert!(st.cursor.is_none() && st.park);
+        // in copy mode its cursor counts
+        ok(&mut srv, &["copy-mode"]);
+        ok(&mut srv, &["send", "-X", "history-top"]);
+        let st = srv.compose(1).unwrap();
+        assert!(st.cursor.is_some() && !st.park);
+        kill(&mut srv);
+    }
+
+    #[test]
     fn a_panned_window_ends_its_separators_on_the_window_not_the_client() {
         let (mut srv, _evs, top) = bigger();
         ok(&mut srv, &["set", "-g", "pane-border-status", "bottom"]);

@@ -92,27 +92,38 @@ fn border_char(mask: u8) -> &'static str {
     }
 }
 
+/// The border lines of a w x h screen, kept only for rows `rows` (the rows drawn, and one
+/// more each side for the joins): a huge pane's screen does not get a w x h map.
 struct BorderMap {
     w: usize,
     h: usize,
+    rows: std::ops::Range<usize>,
     m: Vec<u8>,
 }
 
 impl BorderMap {
+    fn new(w: usize, h: usize, shown: &std::ops::Range<usize>) -> BorderMap {
+        let rows = shown.start.saturating_sub(1)..(shown.end + 1).min(h);
+        BorderMap { w, h, m: vec![0; w * rows.len()], rows }
+    }
+    fn index(&self, x: i32, y: i32) -> Option<usize> {
+        (x >= 0 && y >= 0 && (x as usize) < self.w && self.rows.contains(&(y as usize))).then(|| (y as usize - self.rows.start) * self.w + x as usize)
+    }
     fn mark(&mut self, x: i32, y: i32, mask: u8) {
-        if x >= 0 && y >= 0 && (x as usize) < self.w && (y as usize) < self.h {
-            self.m[y as usize * self.w + x as usize] |= mask;
+        if let Some(i) = self.index(x, y) {
+            self.m[i] |= mask;
         }
     }
     fn get(&self, x: i32, y: i32) -> u8 {
-        if x >= 0 && y >= 0 && (x as usize) < self.w && (y as usize) < self.h { self.m[y as usize * self.w + x as usize] } else { 0 }
+        self.index(x, y).map_or(0, |i| self.m[i])
     }
     fn vline(&mut self, x: i32, y: i32, y2: i32) {
         if x < 0 || x as usize >= self.w || y2 <= y {
             return;
         }
         let (y, y2) = (y.max(0), y2.min(self.h as i32));
-        for yy in y..y2 {
+        // the mask depends on the line's ends, so only the rows kept are walked
+        for yy in y.max(self.rows.start as i32)..y2.min(self.rows.end as i32) {
             let mut mask = 0;
             if yy > y {
                 mask |= BORDER_U;
@@ -124,7 +135,7 @@ impl BorderMap {
         }
     }
     fn hline(&mut self, x: i32, x2: i32, y: i32) {
-        if y < 0 || y as usize >= self.h || x2 <= x {
+        if y < 0 || y as usize >= self.h || !self.rows.contains(&(y as usize)) || x2 <= x {
             return;
         }
         let (x, x2) = (x.max(0), x2.min(self.w as i32));
@@ -389,7 +400,7 @@ impl Panes {
         }
 
         // window_panes_draw_borders
-        let mut bm = BorderMap { w: wu, h: hu, m: vec![0; wu * hu] };
+        let mut bm = BorderMap::new(wu, hu, &shown);
         let mx = |v: u16| map(v, osx, w) as i32;
         let my = |v: u16| map(v, osy, h) as i32;
         for s in &seps {
@@ -438,7 +449,7 @@ impl Panes {
         let bstyle = mode_style(srv, &srv.opt_window(owner_t.wid, "display-panes-border-style"), Style::default(), t);
         for y in shown.clone() {
             for x in 0..wu {
-                let m = bm.m[y * wu + x];
+                let m = bm.get(x as i32, y as i32);
                 if m != 0 {
                     grid[y][x] = Cell { text: border_char(m).into(), style: bstyle };
                 }
@@ -455,14 +466,14 @@ impl Panes {
             if let Some((x, y, sx, sy)) = area {
                 draw_pane(&mut grid, (p, x, y, sx, sy));
             }
-            let mut fm = BorderMap { w: wu, h: hu, m: vec![0; wu * hu] };
+            let mut fm = BorderMap::new(wu, hu, &shown);
             fm.hline(bx, bx2 + 1, by);
             fm.hline(bx, bx2 + 1, by2);
             fm.vline(bx, by, by2 + 1);
             fm.vline(bx2, by, by2 + 1);
             for y in shown.clone() {
                 for x in 0..wu {
-                    let m = fm.m[y * wu + x];
+                    let m = fm.get(x as i32, y as i32);
                     if m != 0 {
                         grid[y][x] = Cell { text: border_char(m).into(), style: bstyle };
                     }
@@ -538,5 +549,21 @@ mod tests {
         assert!(row(1).starts_with("row55 abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH"), "{}", row(1));
         assert!(row(2).starts_with("IJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuv"), "{}", row(2));
         kill(&mut srv);
+    }
+}
+
+#[cfg(test)]
+mod border_map_tests {
+    use super::*;
+
+    #[test]
+    fn a_border_map_keeps_only_the_rows_drawn_and_their_neighbours() {
+        let mut bm = BorderMap::new(10, 1000, &(5..7));
+        assert_eq!(bm.m.len(), 10 * 4);
+        bm.vline(3, 0, 1000);
+        bm.hline(0, 10, 6);
+        bm.hline(0, 10, 500);
+        assert_eq!((bm.get(3, 4), bm.get(3, 5), bm.get(3, 3), bm.get(0, 500)), (BORDER_U | BORDER_D, BORDER_U | BORDER_D, 0, 0));
+        assert_eq!(bm.get(3, 6), BORDER_U | BORDER_D | BORDER_L | BORDER_R);
     }
 }

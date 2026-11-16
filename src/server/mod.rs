@@ -842,6 +842,9 @@ pub enum Overlay {
 pub struct RenderState {
     pub frame: render::Frame,
     pub cursor: Option<(u16, u16)>,
+    /// The hidden cursor goes to the top left (the active pane's cursor is outside the
+    /// part of a bigger window shown).
+    pub park: bool,
     pub modes: render::Modes,
     /// Mouse range of every cell of each status line (tmux status entry ranges).
     pub status_ranges: Vec<Vec<Option<crate::format::Range>>>,

@@ -668,8 +668,9 @@ fn review_regressions() {
     }
     assert!(child.wait().unwrap().success());
     assert_eq!(ctx.ok(&["show-buffer", "-b", "stdin"]), "from stdin");
-    // absurd sizes are clamped instead of exhausting memory
-    ctx.ok(&["resize-window", "-t", "r", "-x", "60000", "-y", "60000"]);
+    // sizes past tmux's limit are refused, big ones are clamped instead of exhausting memory
+    assert_eq!(ctx.fails(&["resize-window", "-t", "r", "-x", "60000", "-y", "60000"]).trim(), "width too large");
+    ctx.ok(&["resize-window", "-t", "r", "-x", "10000", "-y", "10000"]);
     assert_eq!(ctx.fmt("r", "#{window_width}x#{window_height}"), "1000x1000");
     ctx.ok(&["resize-window", "-A", "-t", "r"]);
 }

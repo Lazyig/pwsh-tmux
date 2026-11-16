@@ -112,6 +112,9 @@ pub struct Modes {
     pub appesc: bool,
     /// modifyOtherKeys level requested from the outer terminal (extended-keys).
     pub extkeys: u8,
+    /// While composing: the active pane's cursor is outside the part of a bigger window
+    /// shown (moved into RenderState::park).
+    pub park: bool,
 }
 
 /// Box characters for the *-border-lines options: horizontal, vertical, the corners
@@ -862,9 +865,16 @@ impl Server {
                 }
             }
         }
+        // server_client_reset_state: a cursor off the part of the window shown (the edges
+        // count as on it)
+        let off_view = |cx: u16, cy: u16| {
+            let (ax, ay) = (x0 + cx as i32, y0 + cy as i32);
+            ax < 0 || ay < 0 || ax > clip.0 as i32 || ay > clip.1 as i32
+        };
         if is_active {
             match &mode_lines {
                 Some((_, Some((cx, cy)))) => {
+                    modes.park = off_view(*cx, *cy);
                     if *cx < w && *cy < h {
                         *cursor = vis(*cx, *cy).map(|(x, y)| (x, oy + y));
                     }
@@ -878,11 +888,10 @@ impl Server {
                     let colour = p.parser.callbacks().osc.cursor_colour.clone().unwrap_or_else(|| self.opt_pane(id, "cursor-colour"));
                     // a colour option, not a format (OPTIONS_TABLE_IS_COLOUR)
                     modes.cursor_colour = format::parse_color(&colour).filter(|c| *c != vt100::Color::Default);
-                    if !scr.hide_cursor() {
-                        let (cy, cx) = scr.cursor_position();
-                        if cx < w && cy < h {
-                            *cursor = vis(cx, cy).map(|(x, y)| (x, oy + y));
-                        }
+                    let (cy, cx) = scr.cursor_position();
+                    modes.park = off_view(cx, cy);
+                    if !scr.hide_cursor() && cx < w && cy < h {
+                        *cursor = vis(cx, cy).map(|(x, y)| (x, oy + y));
                     }
                 }
             }
@@ -1308,10 +1317,13 @@ impl Server {
             }
         }
 
+        // server_client_reset_state: when the active pane's cursor is outside the part of a
+        // bigger window shown, the hidden cursor is moved to the top left
+        let park = std::mem::take(&mut modes.park) && cursor.is_none() && view.bigger && c.prompt.is_none() && c.overlay.is_none() && !self.menus.contains_key(&wid);
         modes.appesc = c.features.has("appesc");
         modes.app_cursor = true;
         modes.bracketed_paste = c.features.has("bpaste");
-        Some(RenderState { frame: f, cursor, modes, status_ranges })
+        Some(RenderState { frame: f, cursor, park, modes, status_ranges })
     }
 
     /// prompt_draw: while a prompt has the cursor it takes prompt-cursor-style and
@@ -1519,7 +1531,7 @@ impl Server {
         }
         let pm = prev.map(|p| p.modes);
         let modes_changed = pm != Some(next.modes);
-        let cursor_changed = prev.is_none_or(|p| p.cursor != next.cursor);
+        let cursor_changed = prev.is_none_or(|p| p.cursor != next.cursor || p.park != next.park);
         if let Some(t) = title_update {
             // tty_set_title: tsl and fsl, from the title feature unless overridden
             let _ = write!(out, "{}{}{}", features::string_capability(&c.term_caps, "tsl", "\x1b]0;", &[]), t, features::string_capability(&c.term_caps, "fsl", "\x07", &[]));
@@ -1572,6 +1584,8 @@ impl Server {
         }
         if let Some((x, y)) = next.cursor {
             let _ = write!(out, "\x1b[{};{}H\x1b[?25h", y + 1, x + 1);
+        } else if next.park {
+            out.push_str("\x1b[H");
         }
         if feats.has("sync") {
             // synchronized output: the terminal shows the whole frame at once
@@ -1775,6 +1789,7 @@ mod huge_float_tests {
 
     #[test]
     fn a_huge_floating_pane_draws_only_the_rows_of_its_mode_on_the_client() {
+        let _huge = super::super::float::HUGE_PANES.lock().unwrap_or_else(|e| e.into_inner());
         let (mut srv, _) = clients((80, 24), None);
         run(&mut srv, 1, &["new-session", "-d", "-s", "s", "-x", "80", "-y", "23"]).unwrap();
         let sid = *srv.sessions.keys().next().unwrap();

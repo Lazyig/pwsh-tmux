@@ -2320,10 +2320,12 @@ impl Server {
                     None => 1,
                     Some(v) => options::strtonum(v, 1, i32::MAX as i64).map_err(|e| format!("adjustment {e}"))?,
                 };
-                let dim = |f: char, what: &str| o.get(f).map(|v| options::strtonum(v, 1, MAX_SIZE as i64).map(|n| n as u16).map_err(|e| format!("{what} {e}"))).transpose();
+                // tmux's limits (WINDOW_MINIMUM, WINDOW_MAXIMUM); the size is then kept to
+                // MAX_SIZE
+                let dim = |f: char, what: &str| o.get(f).map(|v| options::strtonum(v, 1, 10000).map(|n| n as i64).map_err(|e| format!("{what} {e}"))).transpose();
                 let (x, y) = (dim('x', "width")?, dim('y', "height")?);
                 let w = &self.windows[&wid];
-                let (mut sx, mut sy) = (x.unwrap_or(w.sx) as i64, y.unwrap_or(w.sy) as i64);
+                let (mut sx, mut sy) = (x.unwrap_or(w.sx as i64), y.unwrap_or(w.sy as i64));
                 if o.has('L') {
                     if sx >= adjust { sx -= adjust; }
                 } else if o.has('R') {

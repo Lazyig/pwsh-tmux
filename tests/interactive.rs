@@ -18,7 +18,7 @@ fn readonly_terminal_blocks_keys_paste_mouse_and_shared_resize() {
     ctx.wait_prompt("ro");
     ctx.ok(&["split-window", "-h", "-t", "ro"]);
     ctx.ok(&["set-option", "-g", "mouse", "on"]);
-    let before = ctx.fmt("ro", "#{pane_id}:#{window_width}x#{window_height}:#{session_windows}");
+    let before = ctx.fmt("ro", "#{pane_id}:#{session_windows}");
     let mut t = Term::attach(&ctx, &["attach-session", "-r", "-t", "ro"], 60, 20);
     t.wait_screen("readonly attach", |s| s.contains("[ro]"));
     t.send(b"echo READONLY_TYPED\r");
@@ -38,7 +38,10 @@ fn readonly_terminal_blocks_keys_paste_mouse_and_shared_resize() {
     wait_for("writable input barrier", || ctx.ok(&["capture-pane", "-p", "-J", "-t", "ro"]).matches("WRITABLE_BARRIER").count() >= 2);
     let capture = ctx.ok(&["capture-pane", "-p", "-t", "ro", "-S", "-"]);
     assert!(!capture.contains("READONLY_TYPED") && !capture.contains("READONLY_PASTED"), "{capture}");
-    assert_eq!(ctx.fmt("ro", "#{pane_id}:#{window_width}x#{window_height}:#{session_windows}"), before);
+    assert_eq!(ctx.fmt("ro", "#{pane_id}:#{session_windows}"), before);
+    // the only client attached sizes the window though it is read-only and ignore-size
+    // (ignore_client_size)
+    assert_eq!(ctx.fmt("ro", "#{window_width}x#{window_height}"), "60x19");
     assert_eq!(ctx.fmt("ro", "#{window_panes}"), "2");
     t.prefix(b"d");
     t.wait_exit();

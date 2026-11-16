@@ -1210,6 +1210,11 @@ impl Server {
     }
 }
 
+/// Tests that allocate huge panes take this, so that one measuring the process's memory
+/// does not run beside another.
+#[cfg(test)]
+pub(crate) static HUGE_PANES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1622,6 +1627,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn huge_floating_panes_stay_small() {
+        let _huge = HUGE_PANES.lock().unwrap_or_else(|e| e.into_inner());
         let rss = || {
             let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
             statm.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() * 4096

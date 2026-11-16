@@ -2126,7 +2126,8 @@ impl CopyMode {
             }
             out.push(line);
         }
-        if self.show_position && rows.contains(&0) {
+        // window_copy_write_line: not with a one line screen (rupper < rlower)
+        if self.show_position && self.height > 1 && rows.contains(&0) {
             self.draw_position(&mut out[0], st, text_x, content);
         }
         // a cursor past the last column shows as a '$'
@@ -4642,7 +4643,7 @@ mod tests {
 
     #[test]
     fn position_format_overlays_only_its_cells() {
-        let cm = CopyMode::new(lines(&["hello world"]), W, 1, (0, 0), false);
+        let cm = CopyMode::new(lines(&["hello world", ""]), W, 2, (0, 0), false);
         let pos = Style { fg: Color::Idx(4), ..Style::default() };
         let st = RenderStyle { position: pos, position_text: Some("#[align=right]<#[fg=red]x>".into()), ..RenderStyle::default() };
         let (view, _) = cm.render_with(&st);
@@ -4650,6 +4651,9 @@ mod tests {
         assert_eq!(view[0].cells[17].style.fg, Color::Idx(4));
         assert_eq!(view[0].cells[18].style.fg, Color::Idx(1));
         assert_eq!(view[0].cells[16].style, Style::default());
+        // a one line screen has no indicator (window_copy_write_line: rupper < rlower)
+        let cm = CopyMode::new(lines(&["hello world"]), W, 1, (0, 0), false);
+        assert_eq!(text_of(&cm.render_with(&st).0[0]).trim_end(), "hello world");
     }
 
     #[test]
