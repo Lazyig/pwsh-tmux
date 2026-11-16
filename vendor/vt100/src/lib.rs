@@ -177,6 +177,12 @@ mod metadata_tests {
         let mut t = alloc::string::String::new();
         p.screen().history_row(0).unwrap().write_plain(&mut t, 20);
         assert_eq!(t, "abcde   f");
+        // DECRC restores the saved link, SGR 0 keeps it
+        let mut p = parser(3, 20);
+        p.process(b"\x1b]8;;http://s\x07\x1b7\x1b]8;;\x07A\x1b8B\x1b[0mC\x1b]8;;\x07D");
+        let row = p.screen().history_row(0).unwrap();
+        let links: alloc::vec::Vec<_> = (0..4).map(|x| row.cell_metadata(x).and_then(|m| m.hyperlink.as_ref()).map(|l| l.uri.as_str())).collect();
+        assert_eq!(links, [Some("http://s"), Some("http://s"), None, None]);
         // clear-history -H: every link goes, tabs stay
         let mut p = parser(3, 20);
         p.process(b"\x1b]8;;http://a\x07ab\r\n\x1b]8;;\x07\tc\r\n\r\n\r\n\x1b]8;;http://b\x07d");

@@ -117,7 +117,10 @@ pub struct Screen {
     alternate_saved_attrs: crate::attrs::Attrs,
     /// Tab stops when changed by HTS/TBC; None means one every 8 columns.
     tabs: Option<Vec<bool>>,
+    /// The OSC 8 link of new text, the one DECSC saved, and named links by
+    /// (id, URI) so the same pair gets the same link.
     hyperlink: Option<alloc::sync::Arc<crate::Hyperlink>>,
+    saved_hyperlink: Option<alloc::sync::Arc<crate::Hyperlink>>,
     hyperlinks: alloc::collections::BTreeMap<(String, String), alloc::sync::Weak<crate::Hyperlink>>,
 
 }
@@ -156,7 +159,7 @@ impl Screen {
 
             alternate_saved: None,
             alternate_saved_attrs: crate::attrs::Attrs::default(),
-            tabs: None, hyperlink: None, hyperlinks: Default::default(),
+            tabs: None, hyperlink: None, saved_hyperlink: None, hyperlinks: Default::default(),
         }
     }
 
@@ -224,6 +227,7 @@ impl Screen {
     /// the current one is forgotten.
     pub fn reset_hyperlinks(&mut self) {
         self.hyperlink = None;
+        self.saved_hyperlink = None;
         self.hyperlinks.clear();
         self.grid.for_each_row_mut(crate::row::Row::clear_hyperlinks);
         self.alternate_grid.for_each_row_mut(crate::row::Row::clear_hyperlinks);
@@ -1052,11 +1056,14 @@ impl Screen {
     fn save_cursor(&mut self) {
         self.grid_mut().save_cursor();
         self.saved_attrs = self.attrs;
+        self.saved_hyperlink = self.hyperlink.clone();
     }
 
     fn restore_cursor(&mut self) {
         self.grid_mut().restore_cursor();
         self.attrs = self.saved_attrs;
+        // input_restore_state: the saved cell has its link
+        self.hyperlink = self.saved_hyperlink.clone();
     }
 
     fn set_mode(&mut self, mode: u8) {
