@@ -618,6 +618,13 @@ impl Server {
                     // the pane is the prompt's context target (a %id in the template would read as %N)
                     let template = format!("send-keys -X {command} '%%'");
                     self.open_prompt(c, PromptKind::Command, vec![(label, String::new())], template, Some(pane), false, false);
+                    // tmux's copy-mode bindings use command-prompt -T search: the answers
+                    // go in the search history
+                    if command.starts_with("search-") {
+                        if let Some(pr) = self.clients.get_mut(&c).and_then(|c| c.prompt.as_mut()) {
+                            pr.search = true;
+                        }
+                    }
                     if command.ends_with("-incremental") {
                         if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
                             cm.begin_incremental_search();
@@ -665,23 +672,24 @@ impl Server {
         match &k.code {
             KeyCode::Enter => {
                 let mut pr = c.prompt.take().unwrap();
+                let input: String = pr.input.iter().collect();
+                // status_prompt_add_history: every non-empty answer, by prompt type
+                if !input.is_empty() && (search || !pr.template.starts_with("send-keys -X ")) {
+                    let lim = self.opt_server_num("prompt-history-limit").max(1) as usize;
+                    let history = if search { &mut self.prompt_history_search } else { &mut self.prompt_history };
+                    history.retain(|h| h != &input);
+                    history.push(input.clone());
+                    while history.len() > lim {
+                        history.remove(0);
+                    }
+                }
                 if let Some((pane, _)) = incremental {
                     if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
                         cm.finish_incremental_search(false);
                     }
                     return;
                 }
-                let input: String = pr.input.iter().collect();
                 pr.answers.push(input.clone());
-                if !input.is_empty() && !pr.template.starts_with("send-keys -X ") {
-                    let lim = self.opt_server_num("prompt-history-limit").max(1) as usize;
-                    let history = if search { &mut self.prompt_history_search } else { &mut self.prompt_history };
-                    history.retain(|h| h != &input);
-                    history.push(input);
-                    while history.len() > lim {
-                        history.remove(0);
-                    }
-                }
                 if pr.answers.len() < pr.prompts.len() {
                     let (label, init) = pr.prompts[pr.answers.len()].clone();
                     pr.label = label;

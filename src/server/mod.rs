@@ -597,6 +597,9 @@ pub struct Client {
     pub prompt: Option<Prompt>,
     pub overlay: Option<Overlay>,
     pub overlay_epoch: u64,
+    /// Counts the prompts opened on this client (a waiting command-prompt is done when
+    /// its prompt is closed or replaced).
+    pub prompt_epoch: u64,
     pub message: Option<(String, Instant)>,
     pub prev: Option<RenderState>,
     pub dirty: bool,
@@ -780,6 +783,8 @@ pub struct Queue {
 pub enum Flow {
     Next,
     WaitOverlay(ClientId, u64),
+    /// command-prompt and confirm-before without -b: the queue waits for the prompt.
+    WaitPrompt(ClientId, u64),
     /// Run these commands next, before the rest of the queue (source-file, if-shell -F, run-shell -C).
     /// With `soft`, their errors are reported but don't stop the queue (like config files).
     Inject(Vec<Vec<String>>, bool),
@@ -839,6 +844,7 @@ pub struct Server {
     /// wait-for channels signalled while nobody waited (the next wait returns at once).
     pub waits_woken: std::collections::HashSet<String>,
     pub overlay_waits: Vec<(ClientId, u64, String, Queue)>,
+    pub prompt_waits: Vec<(ClientId, u64, String, Queue)>,
     /// Copy-mode panes scrolling while a selection drag rests at an edge.
     pub copy_drag_timers: HashMap<PaneId, Instant>,
     /// A lookup of what the panes run is in progress (at most one at a time).
@@ -985,6 +991,7 @@ impl Server {
             waits: HashMap::new(),
             waits_woken: Default::default(),
             overlay_waits: Vec::new(),
+            prompt_waits: Vec::new(),
             copy_drag_timers: HashMap::new(),
             pane_info_busy: false,
             delayed: Vec::new(),
@@ -1299,6 +1306,7 @@ impl Server {
                 prompt: None,
                 overlay: None,
                 overlay_epoch: 0,
+                prompt_epoch: 0,
                 message: None,
                 prev: None,
                 dirty: false,
@@ -1786,6 +1794,15 @@ impl Server {
             self.delayed = rest;
             for (_, q) in due {
                 self.run_queue(q);
+            }
+        }
+        let waiting = std::mem::take(&mut self.prompt_waits);
+        for (cid, epoch, name, queue) in waiting {
+            if self.clients.get(&cid).is_none_or(|c| c.prompt.is_none() || c.prompt_epoch != epoch) {
+                self.after_command(&name, &queue.ctx);
+                self.run_queue(queue);
+            } else {
+                self.prompt_waits.push((cid, epoch, name, queue));
             }
         }
         let waiting = std::mem::take(&mut self.overlay_waits);
@@ -2560,6 +2577,10 @@ impl Server {
                 }
                 Ok(Flow::WaitOverlay(cid, epoch)) => {
                     self.overlay_waits.push((cid, epoch, name, q));
+                    return;
+                }
+                Ok(Flow::WaitPrompt(cid, epoch)) => {
+                    self.prompt_waits.push((cid, epoch, name, q));
                     return;
                 }
                 Ok(Flow::Next) => self.after_command(&name, &q.ctx),

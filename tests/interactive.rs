@@ -30,7 +30,10 @@ fn readonly_terminal_blocks_keys_paste_mouse_and_shared_resize() {
     t.mouse(0, 1, 1, true);
     // A writable input/output barrier ensures these checks run after the input.
     // -J: a long shell prompt wraps the command line in the half-width pane.
-    ctx.ok(&["send-keys", "-t", "ro", "echo WRITABLE_BARRIER", "Enter"]);
+    // (send-keys itself is refused: its target client, the current one, is read-only)
+    assert_eq!(ctx.fails(&["send-keys", "-t", "ro", "x"]).trim(), "client is read-only");
+    ctx.ok(&["set-buffer", "-b", "barrier", "echo WRITABLE_BARRIER\n"]);
+    ctx.ok(&["paste-buffer", "-d", "-b", "barrier", "-t", "ro"]);
     wait_for("writable input barrier", || ctx.ok(&["capture-pane", "-p", "-J", "-t", "ro"]).matches("WRITABLE_BARRIER").count() >= 2);
     let capture = ctx.ok(&["capture-pane", "-p", "-t", "ro", "-S", "-"]);
     assert!(!capture.contains("READONLY_TYPED") && !capture.contains("READONLY_PASTED"), "{capture}");
@@ -425,13 +428,25 @@ fn prompt_types_keep_separate_histories() {
     let ctx = Ctx::new("prompt-types");
     let t = start(&ctx, "h");
     let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
-    ctx.ok(&["command-prompt", "-t", &client, "-T", "search", "set -g @searched '%%'"]);
+    ctx.ok(&["command-prompt", "-b", "-t", &client, "-T", "search", "set -g @searched '%%'"]);
     t.send(b"needle\r");
     wait_for("search prompt ran", || ctx.fmt("h", "#{@searched}") == "needle");
-    ctx.ok(&["command-prompt", "-t", &client, "set -g @typed '%%'"]);
+    // without -b the command waits for the prompt (CMD_RETURN_WAIT)
+    let mut waiting = ctx.command().args(["command-prompt", "-t", &client, "set -g @typed '%%'"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+    wait_for("prompt open", || t.row(29).starts_with("(set)"));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(waiting.try_wait().unwrap().is_none(), "command-prompt returned before the prompt closed");
     t.send(b"typed\r");
     wait_for("command prompt ran", || ctx.fmt("h", "#{@typed}") == "typed");
-    assert_eq!(ctx.ok(&["show-prompt-history", "-T", "search"]), "History for search:\n\n1: needle\n\n");
+    wait_for("command-prompt returns", || waiting.try_wait().unwrap().is_some());
+    // copy-mode searches go in the search history too
+    ctx.ok(&["copy-mode", "-t", "h"]);
+    t.send(b"\x13");
+    t.wait_screen("search prompt", |s| s.contains("(search down)"));
+    t.send(b"other\r");
+    wait_for("search history", || ctx.ok(&["show-prompt-history", "-T", "search"]).contains("2: other"));
+    ctx.ok(&["send-keys", "-t", "h", "-X", "cancel"]);
+    assert_eq!(ctx.ok(&["show-prompt-history", "-T", "search"]), "History for search:\n\n1: needle\n2: other\n\n");
     assert_eq!(ctx.ok(&["show-prompt-history", "-T", "command"]), "History for command:\n\n1: typed\n\n");
     assert!(ctx.fails(&["command-prompt", "-t", &client, "-T", "window-target", "x"]).contains("unknown type: window-target"));
     // commands run from the prompt are logged for its client

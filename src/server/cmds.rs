@@ -2913,6 +2913,10 @@ impl Server {
             // ---------------------------------------------------------------- prompts & messages
             "command-prompt" => {
                 let cid = self.resolve_client(ctx, t)?;
+                // a client shows one prompt at a time
+                if self.clients.get(&cid).is_some_and(|c| c.prompt.is_some()) {
+                    return Ok(Flow::Next);
+                }
                 let tt = self.current(&Ctx { client: Some(cid), ..ctx.clone() });
                 let template = o.rest.first().cloned().unwrap_or_else(|| "%1".into());
                 // -F: the template is a format, expanded now
@@ -2942,7 +2946,8 @@ impl Server {
                     pr.bspace_exit = o.has('e') && !o.has('1') && !o.has('N') && !o.has('i') && !o.has('k');
                     pr.search = search;
                 }
-                Ok(Flow::Next)
+                // without -b (or -i) the command waits until the prompt is done
+                self.prompt_wait(cid, o.has('b') || o.has('i'))
             }
             "confirm-before" => {
                 let cid = self.resolve_client(ctx, t)?;
@@ -2968,7 +2973,7 @@ impl Server {
                 if let Some(pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
                     pr.confirm = (key, o.has('y'));
                 }
-                Ok(Flow::Next)
+                self.prompt_wait(cid, o.has('b'))
             }
             "display-message" => {
                 let tt = self.cmd_find(ctx, t, Find::Pane, FIND_CANFAIL)?;
@@ -4500,11 +4505,21 @@ impl Server {
         }
     }
 
+    /// CMD_RETURN_WAIT for a prompt just opened (unless `background`): the queue goes
+    /// on when that prompt is closed.
+    fn prompt_wait(&self, cid: ClientId, background: bool) -> Result<Flow, String> {
+        match self.clients.get(&cid) {
+            Some(c) if !background && c.prompt.is_some() => Ok(Flow::WaitPrompt(cid, c.prompt_epoch)),
+            _ => Ok(Flow::Next),
+        }
+    }
+
     pub fn open_prompt(&mut self, cid: ClientId, kind: PromptKind, prompts: Vec<(String, String)>, template: String, pane: Option<PaneId>, numeric: bool, single: bool) {
         let (label, init) = prompts.first().cloned().unwrap_or_default();
         let input: Vec<char> = init.chars().collect();
         let cursor = input.len();
         if let Some(c) = self.clients.get_mut(&cid) {
+            c.prompt_epoch = c.prompt_epoch.wrapping_add(1);
             c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false, confirm: ('y', false), search: false });
             c.dirty = true;
         }

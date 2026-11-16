@@ -27,6 +27,7 @@ fn fixture() -> (Server, mpsc::Receiver<Event>) {
             prompt: None,
             overlay: None,
             overlay_epoch: 0,
+            prompt_epoch: 0,
             message: None,
             prev: None,
             dirty: false,
