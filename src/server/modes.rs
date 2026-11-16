@@ -13,7 +13,7 @@ pub mod prompt;
 mod switch;
 mod tree;
 
-pub use panes::{Panes, DEFAULT_TEMPLATE as PANES_DEFAULT_TEMPLATE};
+pub use panes::{Panes, Preview as PanesPreview, DEFAULT_TEMPLATE as PANES_DEFAULT_TEMPLATE};
 pub use switch::Switch;
 pub use tree::{Collapse, Preview, Sort, Tree, TreeKind};
 

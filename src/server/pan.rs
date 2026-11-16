@@ -167,6 +167,15 @@ pub(super) mod tests {
         f.row(y).iter().map(|c| c.text.as_str()).collect()
     }
 
+    fn ok_out(srv: &mut Server, args: &[&str]) -> String {
+        run(srv, 1, args).unwrap_or_else(|e| panic!("{args:?}: {e}"))
+    }
+
+    fn vars_of(srv: &Server, fmt: &str) -> String {
+        let t = srv.target_for_session(srv.clients[&1].session.unwrap());
+        srv.expand(t, Some(1), fmt)
+    }
+
     fn vars(srv: &Server) -> String {
         let t = srv.target_for_session(srv.clients[&1].session.unwrap());
         srv.expand(t, Some(1), "#{window_bigger} #{window_offset_x} #{window_offset_y}")
@@ -260,6 +269,118 @@ pub(super) mod tests {
         assert_eq!(cell(&srv, 13), "│");
         ok(&mut srv, &["refresh-client", "-D", "1"]);
         assert_eq!(cell(&srv, 13), "┴");
+        kill(&mut srv);
+    }
+
+    fn size_of(srv: &Server, name: &str) -> String {
+        srv.windows.values().find(|w| w.name == name).map(|w| format!("{}x{}", w.sx, w.sy)).unwrap()
+    }
+
+    fn session(srv: &Server, name: &str) -> SessId {
+        srv.sessions.values().find(|s| s.name == name).unwrap().id
+    }
+
+    #[test]
+    fn resize_window_a_sizes_once_and_keeps_the_window_manual() {
+        let (mut srv, _evs) = clients((80, 24), Some((50, 12)));
+        ok(&mut srv, &["new-session", "-d", "-s", "a", "-x", "80", "-y", "24", "-n", "w0"]);
+        let a = session(&srv, "a");
+        srv.attach_client(1, a);
+        srv.attach_client(2, a);
+        ok(&mut srv, &["resize-window", "-x", "30", "-y", "10"]);
+        assert_eq!(size_of(&srv, "w0"), "30x10");
+        // the largest client, then manual at that size
+        ok(&mut srv, &["resize-window", "-A"]);
+        assert_eq!(size_of(&srv, "w0"), "80x23");
+        assert_eq!(ok_out(&mut srv, &["show-options", "-w", "window-size"]), "window-size manual\n");
+        assert_eq!(vars_of(&srv, "#{window_manual_width}x#{window_manual_height}"), "80x23");
+        ok(&mut srv, &["resize-window", "-a"]);
+        assert_eq!(size_of(&srv, "w0"), "50x11");
+        srv.update_latest(1);
+        assert_eq!(size_of(&srv, "w0"), "50x11");
+        kill(&mut srv);
+    }
+
+    #[test]
+    fn window_size_manual_takes_the_manual_size_and_new_windows_default_size() {
+        let (mut srv, _evs) = clients((70, 15), None);
+        ok(&mut srv, &["new-session", "-d", "-s", "s", "-x", "70", "-y", "15", "-n", "w0"]);
+        srv.attach_client(1, session(&srv, "s"));
+        assert_eq!(size_of(&srv, "w0"), "70x14");
+        // the size the window was made at
+        ok(&mut srv, &["set", "-g", "window-size", "manual"]);
+        assert_eq!(size_of(&srv, "w0"), "70x15");
+        // new windows: the session's default-size (new-session -x/-y set it)
+        ok(&mut srv, &["new-window", "-d", "-n", "w1"]);
+        assert_eq!(size_of(&srv, "w1"), "70x15");
+        ok(&mut srv, &["set", "default-size", "40x8"]);
+        ok(&mut srv, &["new-window", "-d", "-n", "w2"]);
+        assert_eq!(size_of(&srv, "w2"), "40x8");
+        ok(&mut srv, &["set", "-g", "window-size", "latest"]);
+        ok(&mut srv, &["new-window", "-d", "-n", "w3"]);
+        assert_eq!(size_of(&srv, "w3"), "70x14");
+        kill(&mut srv);
+    }
+
+    #[test]
+    fn ignore_size_clients_count_when_no_other_client_is_attached() {
+        let (mut srv, _evs) = clients((70, 15), Some((90, 20)));
+        ok(&mut srv, &["new-session", "-d", "-s", "s", "-x", "120", "-y", "40", "-n", "w0"]);
+        let s = session(&srv, "s");
+        srv.clients.get_mut(&1).unwrap().ctl.ignore_size = true;
+        srv.attach_client(1, s);
+        assert_eq!(size_of(&srv, "w0"), "70x14");
+        srv.attach_client(2, s);
+        assert_eq!(size_of(&srv, "w0"), "90x19");
+        srv.detach_client(2, "");
+        assert_eq!(size_of(&srv, "w0"), "70x14");
+        // read-only alone does not ignore the size
+        srv.clients.get_mut(&2).unwrap().readonly = true;
+        srv.attach_client(2, s);
+        ok(&mut srv, &["set", "-g", "window-size", "smallest"]);
+        assert_eq!(size_of(&srv, "w0"), "90x19");
+        srv.clients.get_mut(&2).unwrap().size = (50, 10);
+        srv.update_session_size(s);
+        assert_eq!(size_of(&srv, "w0"), "50x9");
+        kill(&mut srv);
+    }
+
+    #[test]
+    fn a_window_whose_latest_client_goes_takes_the_most_active_other_one() {
+        let (mut srv, mut evs) = clients((80, 24), Some((50, 12)));
+        let (mut other, ev) = super::super::security_tests::fixture();
+        let mut c = other.clients.remove(&1).unwrap();
+        (c.id, c.size, c.readonly, c.acl_readonly) = (3, (70, 18), false, false);
+        srv.clients.insert(3, c);
+        evs.push(ev);
+        ok(&mut srv, &["new-session", "-d", "-s", "a", "-x", "80", "-y", "24", "-n", "w0"]);
+        let a = session(&srv, "a");
+        for c in [1, 2, 3] {
+            srv.attach_client(c, a);
+            srv.clients.get_mut(&c).unwrap().activity_seq = c as u64;
+        }
+        assert_eq!(size_of(&srv, "w0"), "70x17");
+        srv.detach_client(3, "");
+        assert_eq!(size_of(&srv, "w0"), "50x11");
+        kill(&mut srv);
+    }
+
+    #[test]
+    fn a_window_unlinked_from_a_session_is_sized_for_the_clients_left() {
+        let (mut srv, _evs) = clients((80, 24), Some((50, 12)));
+        ok(&mut srv, &["new-session", "-d", "-s", "a", "-x", "80", "-y", "24", "-n", "w0"]);
+        ok(&mut srv, &["new-window", "-d", "-t", "a:1", "-n", "w1"]);
+        ok(&mut srv, &["new-session", "-d", "-s", "b", "-x", "80", "-y", "24", "-n", "b0"]);
+        ok(&mut srv, &["set", "-g", "window-size", "smallest"]);
+        ok(&mut srv, &["link-window", "-d", "-s", "a:1", "-t", "b:5"]);
+        srv.attach_client(1, session(&srv, "a"));
+        srv.attach_client(2, session(&srv, "b"));
+        ok(&mut srv, &["select-window", "-t", "a:1"]);
+        assert_eq!(size_of(&srv, "w1"), "50x11");
+        ok(&mut srv, &["unlink-window", "-t", "b:5"]);
+        assert_eq!(size_of(&srv, "w1"), "80x23");
+        ok(&mut srv, &["link-window", "-d", "-s", "a:1", "-t", "b:5"]);
+        assert_eq!(size_of(&srv, "w1"), "50x11");
         kill(&mut srv);
     }
 

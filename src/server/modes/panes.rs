@@ -24,6 +24,39 @@ pub struct Panes {
     pub zoomed: Option<bool>,
     pub kill: bool,
     pub client: Option<ClientId>,
+    /// The pane's screen from before the mode zoomed it (window_panes_set_preview).
+    pub preview: Option<Preview>,
+}
+
+/// A copy of a pane's screen (window_panes_set_preview): its size, cursor and cells.
+/// Only the part a drawing can show is kept: the whole screen up to the window's size,
+/// round the cursor for a bigger (floating) pane.
+pub struct Preview {
+    size: (u16, u16),
+    cursor: (u16, u16),
+    hidden: bool,
+    origin: (u16, u16),
+    rows: Vec<Vec<Cell>>,
+}
+
+impl Preview {
+    pub fn new(pane: &Pane, (wsx, wsy): (u16, u16)) -> Preview {
+        let scr = pane.screen();
+        let (pw, ph) = pane.size;
+        let (cy, cx) = scr.cursor_position();
+        let hidden = scr.hide_cursor();
+        // screen_write_preview's start for an area as big as the window
+        let start = |c: u16, n: u16, size: u16| if hidden || n >= size { 0 } else { c.saturating_sub(n / 3).min(size - n) };
+        let (nx, ny) = (wsx.max(1).min(pw), wsy.max(1).min(ph));
+        let origin = (start(cx, nx, pw), start(cy, ny, ph));
+        let rows = (0..ny).map(|y| (0..nx).map(|x| scr.cell(origin.1 + y, origin.0 + x).map(crate::cells::cell_from_vt).unwrap_or_default()).collect()).collect();
+        Preview { size: (pw, ph), cursor: (cx, cy), hidden, origin, rows }
+    }
+
+    fn cell(&self, y: u16, x: u16) -> Cell {
+        let (Some(y), Some(x)) = (y.checked_sub(self.origin.1), x.checked_sub(self.origin.0)) else { return Cell::default() };
+        self.rows.get(y as usize).and_then(|r| r.get(x as usize)).cloned().unwrap_or_default()
+    }
 }
 
 const BORDER_L: u8 = 1;
@@ -228,11 +261,23 @@ impl Panes {
         let format = srv.opt_window(owner_t.wid, "display-panes-format");
         let draw_pane = |grid: &mut Vec<Vec<Cell>>, (p, x, y, sx, sy): Area| {
             let Some(pane) = srv.panes.get(&p) else { return };
-            // the pane's content: the top left, or the area around the cursor when scaled
+            // the mode's own pane is drawn from its screen before the zoom, when that is big
+            // enough (window_panes_draw_pane)
+            let preview = self.preview.as_ref().filter(|v| p == self.owner && sx <= v.size.0 && sy <= v.size.1);
             let scr = pane.screen();
-            let (cy, cx) = scr.cursor_position();
-            let (pw, ph) = (pane.size.0, pane.size.1);
-            let (px, py) = if !scaled || scr.hide_cursor() {
+            let ((cx, cy), hidden, (pw, ph)) = match preview {
+                Some(v) => (v.cursor, v.hidden, v.size),
+                None => {
+                    let (cy, cx) = scr.cursor_position();
+                    ((cx, cy), scr.hide_cursor(), pane.size)
+                }
+            };
+            let cell_at = |y: u16, x: u16| match preview {
+                Some(v) => v.cell(y, x),
+                None => scr.cell(y, x).map(crate::cells::cell_from_vt).unwrap_or_default(),
+            };
+            // the pane's content: the top left, or the area around the cursor when scaled
+            let (px, py) = if !scaled || hidden {
                 (0, 0)
             } else {
                 let px = cx.saturating_sub(sx / 3);
@@ -246,7 +291,7 @@ impl Panes {
                     continue;
                 }
                 for xx in 0..sx {
-                    let cell = scr.cell(py + yy, px + xx).map(crate::cells::cell_from_vt).unwrap_or_default();
+                    let cell = cell_at(py + yy, px + xx);
                     if let Some(row) = grid.get_mut((y + yy) as usize) {
                         if let Some(c) = row.get_mut((x + xx) as usize) {
                             *c = if cell.text.is_empty() && xx == 0 { Cell { text: " ".into(), ..cell } } else { cell };
@@ -255,7 +300,7 @@ impl Panes {
                 }
             }
             // screen_write_preview marks the cursor with reverse (borders may cover it later)
-            if scaled && !scr.hide_cursor() && cx >= px && cy >= py {
+            if scaled && !hidden && cx >= px && cy >= py {
                 if let Some(c) = grid.get_mut((y + cy - py) as usize).and_then(|r| r.get_mut((x + cx - px) as usize)) {
                     if c.text.is_empty() {
                         c.text = " ".into();
@@ -467,5 +512,31 @@ impl Panes {
             Some((p, ..)) if srv.panes.contains_key(&p) => self.run(p),
             _ => ModeAction::None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::server::pan::tests::{clients, kill, run};
+
+    #[test]
+    fn the_mode_pane_is_drawn_from_its_screen_before_the_zoom() {
+        let (mut srv, _) = clients((100, 21), None);
+        run(&mut srv, 1, &["new-session", "-d", "-s", "s", "-x", "100", "-y", "20"]).unwrap();
+        let sid = *srv.sessions.keys().next().unwrap();
+        srv.attach_client(1, sid);
+        let pane = srv.client_active_pane(1).unwrap();
+        let g = srv.panes[&pane].generation;
+        let text: String = (1..=60).map(|i| format!("row{i:02} abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz\r\n")).collect();
+        srv.pane_data(pane, g, format!("{text}TOP").as_bytes());
+        run(&mut srv, 1, &["split-window", "-h", "-d"]).unwrap();
+        run(&mut srv, 1, &["display-panes", "-d", "0"]).unwrap();
+        // the pane is zoomed to 100 columns, but shows its 50 column lines
+        assert_eq!(srv.panes[&pane].size.0, 100);
+        let f = srv.compose(1).unwrap().frame;
+        let row = |y: u16| -> String { f.row(y).iter().map(|c| c.text.as_str()).collect() };
+        assert!(row(1).starts_with("row55 abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH"), "{}", row(1));
+        assert!(row(2).starts_with("IJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuv"), "{}", row(2));
+        kill(&mut srv);
     }
 }

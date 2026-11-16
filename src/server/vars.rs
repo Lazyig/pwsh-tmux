@@ -400,8 +400,6 @@ impl Vars for VarCtx<'_> {
             "session_stack" => sess.map(|s| std::iter::once(&s.active).chain(s.last.iter()).map(|i| i.to_string()).collect::<Vec<_>>().join(",")),
             "active_window_index" => sess.map(|s| s.active.to_string()),
             "last_window_index" => sess.and_then(|s| s.links.keys().next_back()).map(|i| i.to_string()),
-            "session_width" => sess.map(|s| s.cols.to_string()),
-            "session_height" => sess.map(|s| s.rows.to_string()),
             // window
             "window_index" => t.idx.map(|i| i.to_string()),
             "window_name" => win.map(|w| w.name.clone()),
@@ -447,7 +445,7 @@ impl Vars for VarCtx<'_> {
             "window_cell_height" => win.map(|_| "32".into()),
             "window_manual_width" | "window_manual_height" => win.map(|w| {
                 if srv.opt_window(Some(w.id), "window-size") != "manual" { String::new() }
-                else if name == "window_manual_width" { w.sx.to_string() } else { w.sy.to_string() }
+                else if name == "window_manual_width" { w.manual_sx.to_string() } else { w.manual_sy.to_string() }
             }),
             "window_modal_pane" => win.and_then(|w| w.modal).map(|m| format!("%{m}")),
             // only set while the client shows part of a larger window
