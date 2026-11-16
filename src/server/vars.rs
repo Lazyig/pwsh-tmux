@@ -340,7 +340,8 @@ impl Vars for VarCtx<'_> {
             "session_many_attached" => sess.map(|s| b(srv.clients.values().filter(|c| c.attached && c.session == Some(s.id)).count() > 1)),
             "session_created" => sess.map(|s| s.created.to_string()),
             "session_activity" => sess.map(|s| s.activity.to_string()),
-            "session_last_attached" => sess.map(|s| s.last_attached.to_string()),
+            // a zero time is empty (format_cb_session_last_attached)
+            "session_last_attached" => sess.filter(|s| s.last_attached != 0).map(|s| s.last_attached.to_string()),
             "session_path" => sess.map(|s| s.cwd.clone()),
             "session_alerts" => sess.map(|s| {
                 s.alerts
