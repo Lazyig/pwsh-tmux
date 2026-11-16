@@ -1230,9 +1230,15 @@ pub struct Server {
     pub pipe_acl: Option<Vec<String>>,
     /// Configuration files tried at startup (config_files).
     pub cfg_files: Vec<String>,
+    /// The working directory of the client that started the server: relative paths in
+    /// the startup configuration resolve against it (cfg_client's cwd).
+    pub cfg_cwd: Option<String>,
     /// Queues waiting for a pane's command to exit (new-pane -W).
     pub pane_waits: HashMap<PaneId, Vec<(Vec<String>, Queue)>>,
 }
+
+/// Set by the client that starts the server to its working directory.
+pub const CFG_CWD_ENV: &str = "PWSH_TMUX_CFG_CWD";
 
 pub fn run(config: Option<String>) -> io::Result<()> {
     // stderr is /dev/null for the detached server: keep panics in the log
@@ -1247,6 +1253,7 @@ pub fn run(config: Option<String>) -> io::Result<()> {
     if srv.owner.is_empty() {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "cannot determine server owner"));
     }
+    srv.cfg_cwd = std::env::var(CFG_CWD_ENV).ok().filter(|d| !d.is_empty());
     // config first: its server-access lines decide who may open the Windows pipe
     srv.load_config(config);
     srv.load_prompt_history();
@@ -1326,7 +1333,7 @@ impl Server {
     fn new(tx: mpsc::SyncSender<Event>) -> Self {
         let mut env = BTreeMap::new();
         for (k, v) in std::env::vars() {
-            if k != "PWSH_TMUX" && k != "PWSH_TMUX_PANE" {
+            if k != "PWSH_TMUX" && k != "PWSH_TMUX_PANE" && k != CFG_CWD_ENV {
                 env.insert(k, Some(v));
             }
         }
@@ -1379,6 +1386,7 @@ impl Server {
             acl: Vec::new(),
             pipe_acl: None,
             cfg_files: Vec::new(),
+            cfg_cwd: None,
             pane_waits: HashMap::new(),
         };
         srv.opts_session.set("default-shell", procinfo::default_shell());

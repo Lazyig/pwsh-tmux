@@ -40,6 +40,10 @@ fn spawn_server(config: Option<&str>) -> std::io::Result<()> {
             c.arg(f);
         }
         c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).env_remove("PWSH_TMUX").env_remove("PWSH_TMUX_PANE");
+        // the startup configuration's relative paths resolve against our cwd
+        if let Ok(d) = std::env::current_dir() {
+            c.env(crate::server::CFG_CWD_ENV, d);
+        }
         // Don't pin the client's cwd for the server's lifetime.
         let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
         if let Some(h) = std::env::var_os(home) {
@@ -85,7 +89,8 @@ fn win_spawn_detached(exe: &std::path::Path, config: Option<&str>) -> std::io::R
     let mut cmdline: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
     // environment block without our nesting markers
     let mut env: Vec<u16> = Vec::new();
-    for (k, v) in std::env::vars_os() {
+    let cwd = std::env::current_dir().ok().map(|d| (std::ffi::OsString::from(crate::server::CFG_CWD_ENV), d.into_os_string()));
+    for (k, v) in std::env::vars_os().filter(|(k, _)| k.to_str() != Some(crate::server::CFG_CWD_ENV)).chain(cwd) {
         if k == "PWSH_TMUX" || k == "PWSH_TMUX_PANE" {
             continue;
         }

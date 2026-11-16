@@ -3062,3 +3062,16 @@ fn control_mode_argument_errors_are_parse_errors() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[test]
+fn startup_config_source_file_resolves_against_the_client_directory() {
+    let ctx = Ctx::new("wq-cfg-rel");
+    let dir = std::env::temp_dir().join(format!("{}-dir", ctx.socket));
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("a.conf"), "source-file sub/b.conf\n").unwrap();
+    std::fs::write(dir.join("sub/b.conf"), "set -g @rel 1\n").unwrap();
+    let result = ctx.command().current_dir(&dir).args(["-f", "a.conf", "new-session", "-d", "sleep 100"]).output().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    assert_eq!(ctx.ok(&["show-options", "-gv", "@rel"]).trim(), "1");
+}

@@ -4432,11 +4432,12 @@ impl Server {
         if std::path::Path::new(&p).is_absolute() {
             return p;
         }
-        let base = ctx
+        // server_client_get_cwd: while the configuration loads, the starting client's
+        let base = self.cfg_cwd.clone().filter(|_| !self.cfg_finished).or_else(|| ctx
             .reply
             .and_then(|c| self.clients.get(&c))
             .and_then(|c| c.ident.as_ref())
-            .map(|i| i.cwd.clone())
+            .map(|i| i.cwd.clone()))
             .or_else(|| self.current(ctx).sid.map(|s| self.sessions[&s].cwd.clone()))
             .or_else(procinfo::home_dir)
             .unwrap_or_default();
