@@ -1922,9 +1922,10 @@ impl Server {
         if c.attached {
             if let Some(sid) = c.session {
                 self.update_session_size(sid);
-                self.check_destroy_unattached(sid);
             }
         }
+        // any client lost, a command client too (server_client_lost)
+        self.check_destroy_unattached();
     }
 
     /// server-access: let the owner, root/SYSTEM and allowed users in.
@@ -3150,9 +3151,27 @@ impl Server {
         }
     }
 
-    fn check_destroy_unattached(&mut self, sid: SessId) {
-        if self.opt_session_on(Some(sid), "destroy-unattached") && !self.clients.values().any(|c| c.attached && c.session == Some(sid)) {
-            self.kill_session(sid, false);
+    /// server_check_unattached: every unattached session (in name order) whose
+    /// destroy-unattached says so goes. keep-last keeps the last session of a group and
+    /// sessions not in a group; keep-group keeps only the last session of a group.
+    fn check_destroy_unattached(&mut self) {
+        let mut order: Vec<(String, SessId)> = self.sessions.values().map(|s| (s.name.clone(), s.id)).collect();
+        order.sort();
+        for (_, sid) in order {
+            let Some(group) = self.sessions.get(&sid).map(|s| s.group) else { continue };
+            if self.clients.values().any(|c| c.attached && c.session == Some(sid)) {
+                continue;
+            }
+            let count = group.map(|g| self.sessions.values().filter(|s| s.group == Some(g)).count());
+            let destroy = match self.opt_session(Some(sid), "destroy-unattached").as_str() {
+                "on" => true,
+                "keep-last" => count.is_some_and(|n| n > 1),
+                "keep-group" => count != Some(1),
+                _ => false,
+            };
+            if destroy {
+                self.kill_session(sid, false);
+            }
         }
     }
 
@@ -3227,6 +3246,9 @@ impl Server {
         self.fire("client-session-changed", p);
         if !was_attached {
             self.fire_client("client-attached", cid);
+            // server_client_set_session checks every session (switch_client_env does
+            // this after the old session's size is updated)
+            self.check_destroy_unattached();
         }
     }
 
@@ -3245,7 +3267,7 @@ impl Server {
         self.attach_client_env(cid, sid, update_env);
         if let Some(o) = old.filter(|o| *o != sid) {
             self.update_session_size(o);
-            self.check_destroy_unattached(o);
+            self.check_destroy_unattached();
         }
     }
 
@@ -3280,7 +3302,7 @@ impl Server {
             self.latest_lost(cid);
             self.update_session_size(sid);
             self.fire("client-detached", events::Payload { readonly, ..detached });
-            self.check_destroy_unattached(sid);
+            self.check_destroy_unattached();
         }
     }
 
@@ -3993,6 +4015,9 @@ impl Server {
                 }
                 None => c.send(S_REPLY, &encode_reply(0, &ctx.out)),
             }
+            // the command client is lost next (server_client_lost); check now so the
+            // next command sees the result
+            self.check_destroy_unattached();
             return;
         }
         if let Some(e) = &err {
