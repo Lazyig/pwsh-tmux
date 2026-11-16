@@ -576,3 +576,28 @@ fn status_line_formats_have_no_pane_type() {
     // format_defaults(ft, c, NULL, NULL, NULL); window entries are window formats
     t.wait_screen("status formats", |s| s.contains("L[000]W[010]") && s.contains("R[000]"));
 }
+
+#[test]
+fn message_log_names_keys_messages_and_errors() {
+    let ctx = Ctx::new("p1fix-msglog");
+    let t = start(&ctx, "s1");
+    ctx.ok(&["bind-key", "-n", "F5", "set", "-g", "@f5", "1"]);
+    t.send(b"\x1b[15~");
+    wait_for("F5 binding", || ctx.cmd(&["show-options", "-gv", "@f5"]).1 == "1\n");
+    ctx.ok(&["display-message", "hello"]);
+    ctx.fails(&["nosuch"]);
+    ctx.fails(&["new-window", "-Q"]);
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    // send-keys -K: the bound commands are logged for the client that sent the keys
+    ctx.ok(&["bind-key", "-n", "F6", "set", "-g", "@f6", "1"]);
+    ctx.ok(&["send-keys", "-K", "-c", &client, "F6"]);
+    let log: Vec<String> = ctx.ok(&["show-messages"]).lines().map(|l| l.split_once(' ').map_or(l, |x| x.1).to_string()).collect();
+    let has = |want: &str| log.iter().any(|l| l == want);
+    assert!(has(&format!("{client} key F5: set-option -g @f5 1")), "{log:?}");
+    assert!(has(&format!("{client} message: hello")), "{log:?}");
+    assert!(log.iter().any(|l| l.ends_with(" message: unknown command: nosuch") && l.starts_with("client-")), "{log:?}");
+    assert!(log.iter().any(|l| l.ends_with(" message: command new-window: unknown flag -Q")), "{log:?}");
+    let f6 = log.iter().find(|l| l.ends_with("command: set-option -g @f6 1")).expect("F6 logged");
+    assert!(!f6.starts_with(&format!("{client} ")), "{f6}");
+    drop(t);
+}

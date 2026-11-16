@@ -1291,13 +1291,18 @@ impl Server {
         if ctx.readonly {
             self.check_readonly_command(full, &o, ctx)?;
         }
-        // cmdq_add_message: commands from clients go in the message log (show-messages)
-        if let Some(c) = ctx.client.or(ctx.reply).and_then(|c| self.clients.get(&c)) {
+        // cmdq_add_message: each command goes in the message log (show-messages) once
+        // the configuration is loaded, by key for a bound command of an attached client
+        if self.cfg_finished {
             let words = std::iter::once(full.to_string()).chain(args.iter().cloned())
                 .map(|a| match a.strip_prefix(cmdparse::BLOCK_MARK) { Some(b) => (b.to_string(), true), None => (a, false) }).collect();
             let printed = print_parsed_command(words, &[], false).ok().and_then(|v| v.into_iter().next())
                 .unwrap_or_else(|| std::iter::once(full).chain(args.iter().map(String::as_str)).collect::<Vec<_>>().join(" "));
-            let msg = format!("{} command: {printed}", c.name());
+            let msg = match ctx.log_client.or(ctx.client).or(ctx.reply).and_then(|c| self.clients.get(&c)) {
+                Some(c) if c.attached && c.session.is_some() && ctx.key.is_some() => format!("{} key {}: {printed}", c.name(), ctx.key.as_deref().unwrap_or("")),
+                Some(c) => format!("{} command: {printed}", c.name()),
+                None => format!("command: {printed}"),
+            };
             self.add_message(&msg);
         }
         self.command(full, o, env, ctx)
@@ -3323,11 +3328,14 @@ impl Server {
                             None => list.extend(text.chars().filter_map(|c| keys::parse_key_name(&c.to_string()))),
                         }
                     }
+                    // the bound commands are the sending client's (cmdq_insert_after)
+                    let saved = self.key_origin.replace(ctx.client.or(ctx.reply).unwrap_or(cid));
                     for _ in 0..n {
                         for key in &list {
                             self.handle_key(cid, key.clone(), keys::encode_key(key, app));
                         }
                     }
+                    self.key_origin = saved;
                     return Ok(Flow::Next);
                 }
                 if o.has('R') {

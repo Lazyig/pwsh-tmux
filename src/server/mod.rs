@@ -756,6 +756,11 @@ pub struct Ctx {
     pub files: Vec<String>,
     /// The exit status for the command-line client (c->retval: run-shell sets it).
     pub retval: i32,
+    /// The key a bound command runs for (the message log names it).
+    pub key: Option<String>,
+    /// The client the message log names when it is not `client` (send-keys -K: the
+    /// client that ran send-keys).
+    pub log_client: Option<ClientId>,
 }
 
 /// Queue markers source-file puts around a file's commands (never typed: they start with NUL).
@@ -818,6 +823,11 @@ pub struct Server {
     pub hooks: BTreeMap<String, Vec<String>>,
     /// User options set with set-hook (hooks_add_event): show-hooks lists them.
     pub hook_events: std::collections::BTreeSet<String>,
+    /// The configuration has been loaded (cfg_finished): commands are logged from then.
+    pub cfg_finished: bool,
+    /// While send-keys -K types keys: the client that ran it (key_bindings_dispatch
+    /// queues the bound commands for that client).
+    pub key_origin: Option<ClientId>,
     pub buffers: Vec<Buffer>,
     pub buffer_seq: u32,
     pub bindings: BTreeMap<String, BTreeMap<String, Binding>>,
@@ -963,6 +973,8 @@ impl Server {
             env_hidden: std::collections::HashSet::new(),
             hooks: BTreeMap::new(),
             hook_events: Default::default(),
+            cfg_finished: false,
+            key_origin: None,
             buffers: Vec::new(),
             buffer_seq: 0,
             bindings: input::default_bindings(),
@@ -1040,6 +1052,7 @@ impl Server {
             let ctx = Ctx::default();
             self.run_queue(Queue { cmds: VecDeque::from([args]), ctx , soft: 0 });
         }
+        self.cfg_finished = true;
     }
 
     pub fn add_message(&mut self, msg: &str) {
@@ -1147,7 +1160,11 @@ impl Server {
 
     pub fn set_message(&mut self, cid: ClientId, msg: &str) {
         let ms = self.client_session(cid).map(|s| self.opt_session_num(Some(s), "display-time")).unwrap_or(750).max(1) as u64;
-        self.add_message(msg);
+        // status_message_set
+        match self.clients.get(&cid).map(|c| c.name()) {
+            Some(n) => self.add_message(&format!("{n} message: {msg}")),
+            None => self.add_message(&format!("message: {msg}")),
+        }
         if let Some(c) = self.clients.get_mut(&cid) {
             c.message = Some((msg.to_string(), Instant::now() + Duration::from_millis(ms)));
             c.dirty = true;
@@ -2537,7 +2554,7 @@ impl Server {
                 }
                 Err(e) if soft && !e.starts_with('\0') => {
                     log(&format!("{e}"));
-                    self.add_message(&e);
+                    self.log_error(q.ctx.client.or(q.ctx.reply), &e);
                     q.ctx.out.push_str(&e);
                     q.ctx.out.push('\n');
                 }
@@ -2630,6 +2647,11 @@ impl Server {
                 }
                 return;
             }
+            if let Some(e) = &err {
+                let msg = format!("{} message: {e}", c.name());
+                self.add_message(&msg);
+            }
+            let Some(c) = self.clients.get(&rc) else { return };
             match err {
                 Some(e) => c.send(S_REPLY, &encode_reply(1, &format!("{}{e}", &*ctx.out))),
                 // the output goes to stdout even when the exit status is not 0
@@ -2643,11 +2665,17 @@ impl Server {
         }
         if let Some(e) = &err {
             log(&format!("command error: {e}"));
-            self.add_message(e);
+            if !attached {
+                self.log_error(None, e);
+            }
         }
         if attached {
             let cid = ctx.client.unwrap();
             if let Some(e) = err {
+                // cmdq_error: an attached client shows it as a status message,
+                // capitalised
+                let mut chars = e.chars();
+                let e: String = chars.next().map(|f| f.to_uppercase().chain(chars).collect()).unwrap_or_default();
                 self.set_message(cid, &e);
             } else if !ctx.out.is_empty() {
                 if ctx.readonly || self.client_is_readonly(Some(cid)) {
@@ -2656,6 +2684,14 @@ impl Server {
                     self.view_output(p, &ctx.out);
                 }
             }
+        }
+    }
+
+    /// cmdq_error's message log entry for a client that shows no status line (or none).
+    pub fn log_error(&mut self, client: Option<ClientId>, e: &str) {
+        match client.and_then(|c| self.clients.get(&c)).map(|c| c.name()) {
+            Some(n) => self.add_message(&format!("{n} message: {e}")),
+            None => self.add_message(&format!("message: {e}")),
         }
     }
 

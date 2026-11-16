@@ -412,7 +412,7 @@ impl Server {
                         c.key_table = "root".into();
                     }
                     c.dirty = true;
-                    self.run_string(cid, &cmd, pane);
+                    self.run_key_string(cid, &cmd, pane, &name);
                     return;
                 }
                 None if table != "root" => {
@@ -435,6 +435,18 @@ impl Server {
             return;
         }
         self.send_key_to_pane(cid, pane, &k, raw);
+    }
+
+    /// Runs a key binding's commands for a client: the message log names the key (or,
+    /// for send-keys -K, the client that sent it).
+    pub fn run_key_string(&mut self, cid: ClientId, cmd: &str, pane: Option<PaneId>, key: &str) {
+        match crate::cmdparse::parse(cmd).and_then(|c| c.iter().try_for_each(|c| super::cmds::check_command(c)).map(|_| c)) {
+            Ok(cmds) => {
+                let ctx = Ctx { client: Some(cid), pane, from_key: true, key: Some(key.to_string()), log_client: self.key_origin, ..Ctx::default() };
+                self.run_queue(Queue { cmds: cmds.into(), ctx , soft: 0 });
+            }
+            Err(e) => self.set_message(cid, &e),
+        }
     }
 
     /// Runs a command string for a client (key bindings, prompts, menus).
