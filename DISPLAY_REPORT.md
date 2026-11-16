@@ -50,8 +50,8 @@ Differences that were left to other packages are fixed since the integration: `p
 scrolls by height-2 (scrollbar clicks too), searches leave the cursor where tmux does
 (emacs at the match end), `send -X` outside a mode is an error, `clear` pushes the
 screen into history with `scroll-on-clear`, choose-tree draws as in 3.8, and menus belong
-to the window (every client showing it sees them). `copy-mode-position-format`'s line
-time (`top_line_time`) is still 0: the terminal does not record history line times yet.
+to the window (every client showing it sees them). `copy-mode-position-format` gets the
+line time from the terminal's history line times (`top_line_time`).
 
 ## Second verification round
 

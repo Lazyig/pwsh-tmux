@@ -3396,7 +3396,8 @@ fn spawn_without_c_uses_the_command_clients_directory() {
     let (a, b) = (base.join("a"), base.join("b"));
     std::fs::create_dir_all(a.join("sub")).unwrap();
     std::fs::create_dir_all(&b).unwrap();
-    let canon = |p: &std::path::Path| p.canonicalize().unwrap().to_string_lossy().into_owned();
+    // the real directory on Unix (osdep_get_cwd); on Windows the directory as spawned
+    let canon = |p: &std::path::Path| if cfg!(unix) { p.canonicalize().unwrap().to_string_lossy().into_owned() } else { p.to_string_lossy().into_owned() };
     let run = |dir: &std::path::Path, args: &[&str]| {
         let out = ctx.command().current_dir(dir).args(args).output().unwrap();
         assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
@@ -3413,12 +3414,10 @@ fn spawn_without_c_uses_the_command_clients_directory() {
         let got = ctx.ok(&["list-panes", "-t", "s:6", "-F", "#{pane_index} #{pane_current_path}"]);
         got.trim_end() == want
     });
-    #[cfg(unix)]
-    assert_eq!(run(&b, &["run-shell", "pwd"]).trim_end(), canon(&b));
+    assert_eq!(run(&b, &["run-shell", sh("pwd", "(Get-Location).Path")]).trim_end(), canon(&b));
     let _ = std::fs::remove_dir_all(&base);
 }
 
-#[cfg(unix)]
 #[test]
 fn run_shell_t_shows_waited_output_in_view_mode() {
     // cmd_run_shell_print: with -t the output goes to the pane in view mode, also
@@ -3490,7 +3489,6 @@ fn control_causes(ctx: &Ctx, args: &[&str]) -> Vec<String> {
     text.lines().filter(|l| l.starts_with("%config-error") || l.starts_with("%session-changed") || l.starts_with("%sessions-changed")).map(String::from).collect()
 }
 
-#[cfg(unix)]
 #[test]
 fn first_control_client_gets_causes_and_its_own_session_notifications() {
     // the first client is a control client: cfg_done gives it the causes before its
@@ -3510,7 +3508,6 @@ fn first_control_client_gets_causes_and_its_own_session_notifications() {
     let _ = std::fs::remove_file(&conf);
 }
 
-#[cfg(unix)]
 #[test]
 fn startup_config_waits_on_its_jobs_and_uses_the_starting_directory() {
     // start_cfg: the config runs in one queue that waits on run-shell and if-shell; the
@@ -3520,11 +3517,21 @@ fn startup_config_waits_on_its_jobs_and_uses_the_starting_directory() {
     let ctx = Ctx::new("cfgwait");
     let dir = std::env::temp_dir().join(format!("{}-cwd", ctx.socket));
     std::fs::create_dir_all(&dir).unwrap();
-    let dir = std::fs::canonicalize(&dir).unwrap();
+    // the real directory on Unix; on Windows the directory as given (canonicalize
+    // would add \\?\)
+    let dir = if cfg!(unix) { std::fs::canonicalize(&dir).unwrap() } else { dir };
     let d = dir.to_string_lossy().into_owned();
+    // paths in the file with / (a backslash is an escape in a config line); PowerShell 5.1's
+    // `>` writes UTF-16
+    let dc = d.replace('\\', "/");
     let conf = dir.join("c.conf");
+    let (job, wait) = if cfg!(windows) {
+        (format!("Start-Sleep -Milliseconds 300; [IO.File]::WriteAllText('{dc}/cfgrun', (Get-Location).Path)"), "Start-Sleep -Milliseconds 200")
+    } else {
+        (format!("sleep 0.3; pwd -P > {dc}/cfgrun"), "sleep 0.2")
+    };
     std::fs::write(&conf, format!(
-        "display a\nrun-shell \"sleep 0.3; pwd -P > {d}/cfgrun\"\nset -g base-index 5\nif-shell \"sleep 0.2\" \"display fromif\"\nnew -d -s cfgs\ndisplay b\n"
+        "display a\nrun-shell \"{job}\"\nset -g base-index 5\nif-shell \"{wait}\" \"display fromif\"\nnew -d -s cfgs\ndisplay b\n"
     )).unwrap();
     let f = conf.to_string_lossy().into_owned();
     let out = ctx.command().current_dir(&dir).args(["-f", &f, "new-session", "-d", "-s", "s"]).output().unwrap();
@@ -3552,7 +3559,8 @@ fn startup_config_waits_on_its_jobs_and_uses_the_starting_directory() {
     // "strerror: path" for a nested one); kill-server lets a new server start at once
     ctx.ok(&["kill-server"]);
     let missing = dir.join("none.conf").to_string_lossy().into_owned();
-    std::fs::write(&conf, format!("source-file {missing}\n")).unwrap();
+    let missing_cfg = missing.replace('\\', "/");
+    std::fs::write(&conf, format!("source-file {missing_cfg}\n")).unwrap();
     ctx.ok(&["-f", &missing, "new-session", "-d", "-s", "s"]);
     assert_eq!(control_attach_causes(&ctx, "s"), vec![
         "%session-changed $0 s".to_string(),
@@ -3562,25 +3570,28 @@ fn startup_config_waits_on_its_jobs_and_uses_the_starting_directory() {
     ctx.ok(&["-f", &f, "new-session", "-d", "-s", "s"]);
     assert_eq!(control_attach_causes(&ctx, "s"), vec![
         "%session-changed $0 s".to_string(),
-        format!("%config-error {f}:1: No such file or directory: {missing}"),
+        format!("%config-error {f}:1: No such file or directory: {missing_cfg}"),
     ]);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[cfg(unix)]
 #[test]
 fn run_shell_target_that_fails_prints_and_view_output_is_parsed() {
     // run-shell's target is CANFAIL: one that does not resolve leaves no pane and the
     // output goes to the command-line client; output in view mode is parsed
     // (window_copy_add with parse: CR and BS apply)
     let ctx = Ctx::new("runcanfail");
-    ctx.ok(&["-f", "/dev/null", "new-session", "-d", "-s", "s", "-x", "80", "-y", "24", "sleep 100"]);
-    assert_eq!(ctx.ok(&["run-shell", "-t", "nosuch", "echo y"]), "y\n");
+    ctx.ok(&["-f", sh("/dev/null", "NUL"), "new-session", "-d", "-s", "s", "-x", "80", "-y", "24", "sleep 100"]);
+    // (PowerShell ends its lines with CR LF)
+    assert_eq!(ctx.ok(&["run-shell", "-t", "nosuch", "echo y"]).replace("\r\n", "\n"), "y\n");
     let out = ctx.command().args(["run-shell", "-t", "s:7", "echo z; exit 4"]).output().unwrap();
     assert_eq!(out.status.code(), Some(4));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "z\n'echo z; exit 4' returned 4\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"), "z\n'echo z; exit 4' returned 4\n");
     assert_eq!(ctx.fmt("s", "#{pane_mode}"), "");
-    ctx.ok(&["run-shell", "-t", "s:0", "printf 'abc\\rX\\n12345\\b\\bY\\n\\033[31mred\\033[0m\\n'"]);
+    ctx.ok(&["run-shell", "-t", "s:0", sh(
+        "printf 'abc\\rX\\n12345\\b\\bY\\n\\033[31mred\\033[0m\\n'",
+        "$e = [string][char]27; [Console]::Out.Write('abc' + [char]13 + 'X' + [char]10 + '12345' + [char]8 + [char]8 + 'Y' + [char]10 + $e + '[31mred' + $e + '[0m' + [char]10)",
+    )]);
     let cap = ctx.ok(&["capture-pane", "-p", "-M", "-t", "s:0"]);
     assert_eq!(cap.lines().filter(|l| !l.is_empty()).collect::<Vec<_>>(), ["Xbc", "123Y5", "red"]);
 }
@@ -3605,35 +3616,41 @@ fn resize_window_is_never_smaller_than_the_layout() {
     assert_eq!(ctx.fmt("s:0", "#{window_width}x#{window_height} #{window_zoomed_flag}"), "5x3 1");
 }
 
-#[cfg(unix)]
 #[test]
 fn spawn_directories_fall_back_to_home_and_resolve() {
     // spawn: a -c directory that cannot be entered gives home; pane_current_path is the
-    // process's real directory
+    // process's real directory (osdep_get_cwd, on Unix only: Windows keeps the
+    // directory as spawned)
     let ctx = Ctx::new("spawncwd");
-    let dir = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("{}-d", ctx.socket));
+    let tmp = std::env::temp_dir();
+    let dir = if cfg!(unix) { std::fs::canonicalize(tmp).unwrap() } else { tmp }.join(format!("{}-d", ctx.socket));
     std::fs::create_dir_all(dir.join("sub")).unwrap();
     let d = dir.to_string_lossy().into_owned();
-    let home = std::fs::canonicalize(std::env::var("HOME").unwrap()).unwrap().to_string_lossy().into_owned();
-    ctx.ok(&["-f", "/dev/null", "new-session", "-d", "-s", "s", "-c", &d, "sleep 100"]);
+    let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap();
+    let home = if cfg!(unix) { std::fs::canonicalize(home).unwrap().to_string_lossy().into_owned() } else { home };
+    ctx.ok(&["-f", sh("/dev/null", "NUL"), "new-session", "-d", "-s", "s", "-c", &d, "sleep 100"]);
     ctx.ok(&["new-window", "-d", "-n", "nx", "-c", &format!("{d}/nope"), "sleep 100"]);
     assert_eq!(ctx.fmt("s:nx", "#{pane_current_path}"), home);
     // relative to the command client's directory
     assert!(ctx.command().current_dir(&dir).args(["split-window", "-d", "-t", "s:0", "-c", "sub/..", "sleep 100"]).status().unwrap().success());
     ctx.ok(&["new-window", "-d", "-n", "dot", "-c", &format!("{d}/."), "sleep 100"]);
-    assert_eq!(ctx.ok(&["list-panes", "-t", "s:0", "-F", "#{pane_current_path}"]), format!("{d}\n{d}\n"));
-    assert_eq!(ctx.fmt("s:dot", "#{pane_current_path}"), d);
+    if cfg!(unix) {
+        assert_eq!(ctx.ok(&["list-panes", "-t", "s:0", "-F", "#{pane_current_path}"]), format!("{d}\n{d}\n"));
+        assert_eq!(ctx.fmt("s:dot", "#{pane_current_path}"), d);
+    } else {
+        let sub = dir.join("sub/..").to_string_lossy().into_owned();
+        assert_eq!(ctx.ok(&["list-panes", "-t", "s:0", "-F", "#{pane_current_path}"]), format!("{d}\n{sub}\n"));
+    }
     // new-window's index error names the failed create (spawn_window's cause)
     assert!(ctx.fails(&["new-window", "-d", "-t", "s:0", "sleep 100"]).contains("create window failed: index 0 in use"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[cfg(unix)]
 #[test]
 fn respawn_keeps_the_pane_history() {
     // screen_reinit clears only the visible lines: the history stays
     let ctx = Ctx::new("respawnhist");
-    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "40", "-y", "6", "seq 20; sleep 100"]);
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "40", "-y", "6", sh("seq 20; sleep 100", "1..20; sleep 100")]);
     wait_for("history", || ctx.fmt("s", "#{history_size}") == "15");
     for cmd in ["respawn-pane", "respawn-window"] {
         ctx.ok(&[cmd, "-k", "-t", "s", "echo x; sleep 100"]);
@@ -3676,26 +3693,36 @@ fn zoomed_resize_layout_change_uses_the_clients_layout_format() {
     let _ = child.wait();
 }
 
-#[cfg(unix)]
 #[test]
 fn send_keys_reaches_synchronized_panes() {
     // window_pane_key copies each key send-keys injects to the other synchronized panes,
-    // encoded for each (application cursor keys in the last pane); -l and -H too
+    // encoded for each (application cursor keys in the last pane); -l and -H too. On
+    // Windows ConPTY encodes cursor keys itself, so only the other keys are checked there.
     let ctx = Ctx::new("syncsend");
-    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "80", "-y", "24", "stty -echo; printf 'ready\\n'; exec cat -v"]);
-    ctx.ok(&["split-window", "-d", "-t", "s:0.0", "stty -echo; printf 'ready\\n'; exec cat -v"]);
+    let ready = |ckm: bool| if cfg!(windows) {
+        format!("[Console]::WriteLine('ready'); {CAT_V}")
+    } else {
+        format!("stty -echo; printf '{}ready\\n'; exec cat -v", if ckm { "\\033[?1h" } else { "" })
+    };
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "80", "-y", "24", &ready(false)]);
+    ctx.ok(&["split-window", "-d", "-t", "s:0.0", &ready(false)]);
     // inserted after pane 0: this one is s:0.1
-    ctx.ok(&["split-window", "-d", "-t", "s:0.0", "stty -echo; printf '\\033[?1hready\\n'; exec cat -v"]);
+    ctx.ok(&["split-window", "-d", "-t", "s:0.0", &ready(true)]);
     wait_for("panes ready", || (0..3).all(|i| ctx.capture(&format!("s:0.{i}")).contains("ready")));
     ctx.ok(&["set", "-w", "-t", "s:0", "synchronize-panes", "on"]);
-    ctx.ok(&["send-keys", "-t", "s:0.0", "Down", "b", "Enter"]);
+    if cfg!(unix) {
+        ctx.ok(&["send-keys", "-t", "s:0.0", "Down"]);
+    }
+    ctx.ok(&["send-keys", "-t", "s:0.0", "b", "Enter"]);
     ctx.ok(&["send-keys", "-l", "-t", "s:0.1", "lit"]);
     ctx.ok(&["send-keys", "-H", "-t", "s:0.2", "41", "0d"]);
     let lines = |i: usize| ctx.capture(&format!("s:0.{i}")).lines().filter(|l| !l.is_empty() && *l != "ready").map(String::from).collect::<Vec<_>>();
-    let want = |down: &str| vec![format!("{down}b"), "litA".to_string()];
+    let want = |down: &str| vec![format!("{}b", if cfg!(unix) { down } else { "" }), "litA".to_string()];
     wait_for("all panes", || lines(0) == want("^[[B") && lines(1) == want("^[OB") && lines(2) == want("^[[B"));
 }
 
+// Unix only: whether ConPTY passes a pane's OSC 52 on is not known (the decoding itself
+// is unit-tested in helpers)
 #[cfg(unix)]
 #[test]
 fn osc52_data_is_decoded_like_b64_pton() {

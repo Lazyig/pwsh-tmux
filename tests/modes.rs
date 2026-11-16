@@ -773,14 +773,14 @@ fn mode_tree_right_click_menus_send_keys_to_the_mode() {
     wait_for("cancelled", || ctx.fmt("mm", "#{pane_in_mode}") == "0");
 }
 
-#[cfg(unix)]
 #[test]
 fn mode_editor_runs_in_a_modal_floating_pane() {
     // spawn_editor: a modal floating pane 9/10 of the window in its middle, gone when
     // the editor exits
     let ctx = Ctx::new("editor-modal");
     let t = start(&ctx, "em");
-    ctx.ok(&["set", "-s", "editor", "sleep 1; printf 'edited\\n' >"]);
+    // the file's path is put after the editor (quoted, and | Out-Null for PowerShell)
+    ctx.ok(&["set", "-s", "editor", sh("sleep 1; printf 'edited\\n' >", "Start-Sleep 1; Set-Content -NoNewline -Value edited -Path")]);
     ctx.ok(&["setb", "-b", "one", "old"]);
     ctx.ok(&["choose-buffer", "-t", "em", "-F", "x"]);
     t.wait_screen("buffers", |s| s.contains("(0) one"));

@@ -136,7 +136,7 @@ fn copy_mode_keys_and_paste() {
     assert_eq!(ctx.ok(&["show-buffer"]), "alpha");
     // OSC 52 was sent to the outer terminal
     // with an empty selection parameter, as window_copy_copy_buffer sends it
-    assert!(t.raw_text().contains("\x1b]52;;YWxwaGE="));
+    assert!(t.sent_text().contains("\x1b]52;;YWxwaGE="));
     // C-b ] pastes it
     t.send(b"\x15echo ");
     t.prefix(b"]");
@@ -156,7 +156,7 @@ fn copy_mode_count_then_rebound_or_unbound_key() {
     let ctx = Ctx::new("copycount");
     let t = start(&ctx, "n");
     ctx.ok(&["set", "-g", "mode-keys", "vi"]);
-    t.send(b"clear; seq 1 60\r");
+    t.send(sh("clear; seq 1 60\r", "clear; 1..60\r").as_bytes());
     wait_for("output", || ctx.capture("n").contains("60"));
     ctx.ok(&["bind", "-T", "copy-mode-vi", "J", "send", "-X", "cursor-down"]);
     ctx.ok(&["unbind", "-T", "copy-mode-vi", "K"]);
@@ -181,7 +181,7 @@ fn copy_mode_repeat_count_shows_the_numeric_pane_prompt() {
     let ctx = Ctx::new("copyrepeat");
     let t = start(&ctx, "r");
     ctx.ok(&["set", "-g", "mode-keys", "vi"]);
-    t.send(b"clear; seq 1 60\r");
+    t.send(sh("clear; seq 1 60\r", "clear; 1..60\r").as_bytes());
     wait_for("output", || ctx.capture("r").contains("60"));
     t.prefix(b"[");
     wait_for("copy mode", || ctx.fmt("r", "#{pane_in_mode}") == "1");
@@ -1612,7 +1612,7 @@ fn display_popup_modifies_an_open_popup() {
     let _ = popup.wait();
     // -EE (POPUP_CLOSEEXITZERO) replaces -E: a failing command leaves the popup open,
     // and a new -EE popup closes when its command succeeds
-    let mut popup = ctx.command().args(["display-popup", "-c", &client, "-E", "-w", "30", "-h", "6", "echo failing; read x; exit 3"]).spawn().unwrap();
+    let mut popup = ctx.command().args(["display-popup", "-c", &client, "-E", "-w", "30", "-h", "6", sh("echo failing; read x; exit 3", "echo failing; $x = [Console]::ReadLine(); exit 3")]).spawn().unwrap();
     t.wait_screen("-E popup", |s| s.contains("failing"));
     ctx.ok(&["display-popup", "-c", &client, "-EE"]);
     t.send(b"\r");
@@ -1621,13 +1621,15 @@ fn display_popup_modifies_an_open_popup() {
     t.send(b"\x1b");
     t.wait_screen("closed by Escape", |s| !s.contains("failing"));
     let _ = popup.wait();
-    let mut popup = ctx.command().args(["display-popup", "-c", &client, "-EE", "-w", "30", "-h", "6", "echo zero; read x"]).spawn().unwrap();
+    let mut popup = ctx.command().args(["display-popup", "-c", &client, "-EE", "-w", "30", "-h", "6", sh("echo zero; read x", "echo zero; $x = [Console]::ReadLine()")]).spawn().unwrap();
     t.wait_screen("-EE popup", |s| s.contains("zero"));
     t.send(b"\r");
     t.wait_screen("closed on status 0", |s| !s.contains("zero"));
     let _ = popup.wait();
 }
 
+// Unix only: ConPTY encodes cursor keys for the pane itself (DECCKM), so the encoding
+// pwsh-tmux picks for each pane cannot be seen on Windows
 #[cfg(unix)]
 #[test]
 fn synchronize_panes_encodes_the_key_for_each_pane() {
