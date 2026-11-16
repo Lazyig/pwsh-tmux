@@ -220,6 +220,15 @@ impl Screen {
         self.hyperlink = Some(link);
     }
 
+    /// screen_reset_hyperlinks (clear-history -H): every cell loses its link and
+    /// the current one is forgotten.
+    pub fn reset_hyperlinks(&mut self) {
+        self.hyperlink = None;
+        self.hyperlinks.clear();
+        self.grid.for_each_row_mut(crate::row::Row::clear_hyperlinks);
+        self.alternate_grid.for_each_row_mut(crate::row::Row::clear_hyperlinks);
+    }
+
     /// Resizes the screen **without calling** the [`on_scroll`] callback.
     ///
     /// This method behaves the same as [`Parser::set_size`] but does not call
@@ -1427,21 +1436,24 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
         self.screen.grid_mut().col_dec(1);
     }
 
+    /// HT (input_c0_dispatch): over blank cells that look alike (up to 32) a
+    /// tab is kept (GRID_FLAG_TAB) with the first cell's style and link, so
+    /// capture-pane and copy mode give back the tab; otherwise the cursor just moves.
     pub fn tab(&mut self) {
         let col = self.screen.grid().pos().col;
         let last = self.screen.grid().size().cols() - 1;
         if col >= last { return; }
         let next = (col + 1..=last).find(|&i| self.screen.tabs.as_ref().map_or(i % 8 == 0, |t| t.get(usize::from(i)).copied().unwrap_or(false))).unwrap_or(last);
-        let hyperlink = self.screen.hyperlink.clone();
         let row = self.screen.grid_mut().current_row_mut();
         let first = row.get(col).unwrap().clone();
-        let blank = |c: &crate::Cell| !c.has_contents() || c.contents() == " ";
-        if next - col <= 32 && blank(&first) && (col..next).all(|x| row.get(x).is_some_and(|c| blank(c) && c.attrs() == first.attrs())) {
+        let link = |x: u16| row.cell_metadata(x).and_then(|m| m.hyperlink.as_ref()).map(|l| l.inner);
+        let blank = |x: u16| row.get(x).is_some_and(|c| (!c.has_contents() || c.contents() == " ") && !c.is_wide_continuation() && c.attrs() == first.attrs() && link(x) == link(col));
+        if next - col <= 32 && (col..next).all(blank) {
+            let hyperlink = row.cell_metadata(col).and_then(|m| m.hyperlink.clone());
             for x in col..next { row.get_mut(x).unwrap().set(' ', *first.attrs()); }
             row.set_metadata(col, crate::CellMetadata { tab_width: next - col, hyperlink });
         }
         self.screen.grid_mut().col_set(next);
-
     }
 
     // ESC H

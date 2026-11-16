@@ -8,8 +8,9 @@ pub struct Row {
     /// When the row entered the history (seconds since the epoch), 0 if it
     /// has not or the time was not set (tmux's grid_line time).
     time: u64,
-    /// ROW_START_PROMPT / ROW_START_OUTPUT (tmux's GRID_LINE_START_* flags).
+    /// ROW_* (tmux's GRID_LINE_* flags).
     flags: u8,
+    /// Hyperlinks and tabs by column, only for rows that have any.
     metadata: Option<alloc::boxed::Box<alloc::collections::BTreeMap<u16, crate::CellMetadata>>>,
 }
 
@@ -17,9 +18,10 @@ pub struct Row {
 pub const ROW_START_PROMPT: u8 = 1;
 /// The line has the start of command output (OSC 133;C).
 pub const ROW_START_OUTPUT: u8 = 2;
-/// A line has contained hyperlink cells (sticky until the line is cleared).
+/// The line has had a hyperlink cell (GRID_LINE_HYPERLINK, kept until the
+/// line is cleared).
 pub const ROW_HYPERLINK: u8 = 4;
-/// A line has contained extended metadata cells.
+/// The line has had a hyperlink or tab cell (part of GRID_LINE_EXTENDED).
 pub const ROW_EXTENDED: u8 = 8;
 /// OSC 133 B/I command start.
 pub const ROW_START_COMMAND: u8 = 16;
@@ -48,9 +50,9 @@ impl Row {
     }
 
     /// Whether a cell needs more than tmux's compact cell entry (multi-byte or
-    /// wide characters, RGB colours: GRID_LINE_EXTENDED).
+    /// wide characters, RGB colours, hyperlinks and tabs: GRID_LINE_EXTENDED).
     pub fn extended(&self) -> bool {
-        self.flags & ROW_EXTENDED != 0 || self.metadata.as_ref().is_some_and(|m| m.values().any(|c| c.tab_width != 0 || c.hyperlink.is_some())) || self.cells().any(|c| {
+        self.flags & ROW_EXTENDED != 0 || self.cells().any(|c| {
             c.contents().len() > 1
                 || c.is_wide()
                 || matches!(c.fgcolor(), crate::Color::Rgb(..))
@@ -115,15 +117,32 @@ impl Row {
         }
     }
 
-    fn invalidate(&mut self, col: u16) {
+    /// The metadata of the cell at `col`.
+    pub fn cell_metadata(&self, col: u16) -> Option<&crate::CellMetadata> {
+        self.metadata.as_ref()?.get(&col)
+    }
+
+    /// Drops the hyperlinks of every cell (screen_reset_hyperlinks leaves the
+    /// cells' links unresolvable); tabs and the line's flags stay.
+    pub fn clear_hyperlinks(&mut self) {
         if let Some(m) = &mut self.metadata {
-            m.retain(|&x, v| {
-                if x <= col && col < x.saturating_add(v.tab_width) { v.tab_width = 0; }
-                if x == col { v.hyperlink = None; }
-                *v != crate::CellMetadata::default()
-            });
+            m.retain(|_, v| { v.hyperlink = None; v.tab_width != 0 });
             if m.is_empty() { self.metadata = None; }
         }
+    }
+
+    /// Cell `col` is rewritten: its own metadata goes and a tab covering it
+    /// becomes plain spaces.
+    fn invalidate(&mut self, col: u16) {
+        let Some(m) = &mut self.metadata else { return };
+        m.remove(&col);
+        if let Some((&x, v)) = m.range_mut(..col).next_back() {
+            if col < x.saturating_add(v.tab_width) {
+                v.tab_width = 0;
+                if v.hyperlink.is_none() { m.remove(&x); }
+            }
+        }
+        if m.is_empty() { self.metadata = None; }
     }
 
     pub fn get_mut_untracked(&mut self, col: u16) -> Option<&mut crate::Cell> { self.cells.get_mut(usize::from(col)) }

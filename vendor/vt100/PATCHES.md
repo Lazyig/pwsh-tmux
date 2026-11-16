@@ -46,11 +46,15 @@ every 8 columns when the width changes), and exposes `origin_mode` and
 `scroll_region`. `Grid` counts rows added to and dropped from history and history
 clears/rewraps (`history_counters`); RIS keeps those counts.
 
-Local addition: OSC 133 marks are parsed in vt100, with callbacks still receiving
-OSC 133 for pane events. Rows retain marks and their existing history timestamps.
-OSC 8 links and original HT spans use an optional boxed map on each row; normal
-cells remain 32 bytes, and ordinary rows allocate no metadata. Link strings and
-identities are shared with Arc; named links use a weak lookup table, anonymous
-links do not allocate lookup entries. RowContents exposes metadata to snapshots,
-capture and rendering. Edits invalidate/shift entries and history compaction and
-reflow retain them. Parser regressions are in lib.rs::metadata_tests.
+Local addition: tmux 3.8 grid metadata. OSC 133 A/N/P, B/I, C and D set the
+cursor row's ROW_* flags (GRID_LINE_START_PROMPT and friends; callbacks still get
+OSC 133 for the pane events); erasing a row keeps them, reflow keeps them on the
+row a line starts on. OSC 8 links (hyperlinks.c: named links shared by id and
+URI, anonymous links always new, URIs over 1024 bytes dropped) and HT tab cells
+(GRID_FLAG_TAB: HT over up to 32 blank cells that look alike keeps the tab with
+the first cell's style and link) live in an optional boxed map per row, so normal
+cells stay 32 bytes and ordinary rows allocate nothing. Rewriting a cell drops its
+entry and turns a tab covering it into spaces; inserts/deletes shift entries;
+reflow moves a tab as one cell. ROW_HYPERLINK / ROW_EXTENDED stay set until the
+row is cleared, as tmux's line flags. `Screen::reset_hyperlinks` is
+screen_reset_hyperlinks (clear-history -H). Tests: lib.rs::metadata_tests.

@@ -136,4 +136,47 @@ mod metadata_tests {
         p.process(b"\x1b[2J");
         for y in p.screen().scrollback_len()..p.screen().history_rows_len() { assert_eq!(p.screen().history_row(y).unwrap().metadata().count(), 0); }
     }
+    #[test]
+    fn tabs_keep_the_cell_link_move_whole_on_reflow_and_links_reset() {
+        let tabs = |p: &Parser, y: usize| -> alloc::vec::Vec<(u16, u16)> { p.screen().history_row(y).unwrap().metadata().filter(|(_, m)| m.tab_width > 0).map(|(x, m)| (x, m.tab_width)).collect() };
+        // HT over text or differently styled cells only moves the cursor
+        let mut p = parser(4, 20);
+        p.process(b"abcdefghij\r\tX\r\n\x1b[41m \x1b[0m\r\tY");
+        assert_eq!(tabs(&p, 0), []);
+        assert_eq!(tabs(&p, 1), []);
+        // the tab takes the link of the cells it is written over, not the current one
+        let mut p = parser(4, 20);
+        p.process(b"\x1b]8;;http://a\x07 \r\tX\r\n\x1b]8;;http://a\x07        \x1b]8;;http://b\x07\r\tZ");
+        assert_eq!(tabs(&p, 0), []);
+        p.process(b"\x1b[H\x1b[M");
+        let row = p.screen().history_row(0).unwrap();
+        let m = row.cell_metadata(0).unwrap();
+        assert_eq!((m.tab_width, m.hyperlink.as_ref().unwrap().uri.as_str()), (8, "http://a"));
+        assert_eq!(row.cell_metadata(8).unwrap().hyperlink.as_ref().unwrap().uri, "http://b");
+        // writing inside a tab turns it into spaces
+        p.process(b"\x1b[1;4H-");
+        assert_eq!(p.screen().history_row(0).unwrap().cell_metadata(0).map(|m| m.tab_width), Some(0));
+        // reflow moves a tab as one cell: it goes to the next row when it does not fit
+        let mut p = parser(3, 20);
+        p.process(b"abcde\tf");
+        assert_eq!(tabs(&p, 0), [(5, 3)]);
+        p.set_size(NonZeroU16::new(3).unwrap(), NonZeroU16::new(6).unwrap());
+        let s = p.screen();
+        let text: alloc::vec::Vec<_> = (0..s.history_rows_len()).map(|y| { let mut t = alloc::string::String::new(); s.history_row(y).unwrap().write_plain(&mut t, 6); t }).collect();
+        assert_eq!(text[0], "abcde");
+        assert!(text[0..].iter().any(|t| t.starts_with("   f")), "{text:?}");
+        let y = text.iter().position(|t| t.starts_with("   f")).unwrap();
+        assert_eq!(tabs(&p, y), [(0, 3)]);
+        // clear-history -H: every link goes, tabs stay
+        let mut p = parser(3, 20);
+        p.process(b"\x1b]8;;http://a\x07ab\r\n\x1b]8;;\x07\tc\r\n\r\n\r\n\x1b]8;;http://b\x07d");
+        p.screen_mut().reset_hyperlinks();
+        let s = p.screen();
+        assert!((0..s.history_rows_len()).all(|y| s.history_row(y).unwrap().metadata().all(|(_, m)| m.hyperlink.is_none())));
+        assert_eq!(tabs(&p, 1), [(0, 8)]);
+        assert_eq!(s.history_row_flags(0).0 & ROW_HYPERLINK, ROW_HYPERLINK);
+        p.process(b"e");
+        let y = p.screen().history_rows_len() - 3;
+        assert!(p.screen().history_row(y).unwrap().cell_metadata(1).is_none());
+    }
 }

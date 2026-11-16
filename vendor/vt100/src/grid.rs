@@ -212,21 +212,29 @@ impl Grid {
             let mut x = 0u16;
             while let Some(cell) = old.get(x) {
                 if cell.is_wide_continuation() { x += 1; continue; }
-                let width = if cell.is_wide() { 2 } else { 1 };
+                let metadata = old.cell_metadata(x);
+                let tab = metadata.map_or(0, |m| m.tab_width);
+                // a tab moves as one cell of its width (GRID_FLAG_TAB)
+                let width = if tab > 1 && tab <= size.cols() { tab } else if cell.is_wide() { 2 } else { 1 };
                 if col + width > size.cols() {
                     row.wrap(true);
                     emit(row, &mut out, &mut produced);
                     row = crate::row::Row::new(size.cols());
                     col = 0;
                 }
-                if index == cursor_row && self.pos.col >= x && self.pos.col < x + width { cursor = (produced,col); }
-                if index == saved_row && self.saved_pos.col >= x && self.saved_pos.col < x + width { saved = (produced,col); }
+                // a cursor inside a tab keeps its offset, on a wide character its first half
+                let within = |c: u16| if tab > 1 { c - x } else { 0 };
+                if index == cursor_row && self.pos.col >= x && self.pos.col < x + width { cursor = (produced,col + within(self.pos.col)); }
+                if index == saved_row && self.saved_pos.col >= x && self.saved_pos.col < x + width { saved = (produced,col + within(self.saved_pos.col)); }
                 // A two-column glyph cannot fit in a one-column terminal.
                 if width <= size.cols() {
-                    *row.get_mut_untracked(col).unwrap() = cell.clone();
-                    if let Some((_, metadata)) = old.metadata().find(|(at, _)| *at == x) { row.set_metadata(col, metadata.clone()); }
-                    if width == 2 {
-                        if let Some(next) = old.get(x+1) { *row.get_mut_untracked(col+1).unwrap() = next.clone(); }
+                    for i in 0..width {
+                        if let Some(c) = old.get(x + i) { *row.get_mut_untracked(col + i).unwrap() = c.clone(); }
+                    }
+                    if let Some(m) = metadata {
+                        let mut m = m.clone();
+                        if m.tab_width != width { m.tab_width = 0; }
+                        row.set_metadata(col, m);
                     }
                     col += width;
                 }
@@ -381,6 +389,12 @@ impl Grid {
         } else {
             self.rows.get(index - history)
         }
+    }
+
+    /// Every history and screen row.
+    pub fn for_each_row_mut(&mut self, f: impl FnMut(&mut crate::row::Row)) {
+        let history = self.scrollback.iter_mut().flat_map(|s| s.rows.iter_mut());
+        history.chain(self.rows.iter_mut()).for_each(f);
     }
 
     pub fn scrollback_capacity(&self) -> usize {

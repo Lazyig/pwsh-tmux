@@ -56,7 +56,9 @@ pub struct RowContents<'a>(pub(crate) &'a crate::row::Row);
 impl RowContents<'_> {
     /// Sparse cell metadata in column order.
     pub fn metadata(&self) -> impl Iterator<Item = (u16, &crate::CellMetadata)> { self.0.metadata() }
-    /// Shell prompt/output marks.
+    /// The metadata of the cell at `col`.
+    pub fn cell_metadata(&self, col: u16) -> Option<&crate::CellMetadata> { self.0.cell_metadata(col) }
+    /// The row's ROW_* flags (OSC 133 marks, hyperlinks).
     pub fn flags(&self) -> u8 { self.0.flags() }
     /// Time this row entered history.
     pub fn time(&self) -> u64 { self.0.time() }
