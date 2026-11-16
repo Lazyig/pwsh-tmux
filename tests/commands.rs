@@ -1236,7 +1236,9 @@ fn format_option_environment_and_window_loops() {
 fn display_all_samples_and_printed_commands() {
     let ctx = Ctx::new("p1fix-print");
     ctx.ok(&["new-session", "-d", "-s", "d", "sleep 100"]);
-    ctx.ok(&["new-window", "-d", "-t", "d", "sleep", "99"]);
+    // words run as a program, without a shell
+    let sleep99 = sleep_argv("99");
+    ctx.ok(&[&["new-window", "-d", "-t", "d"][..], &sleep99].concat());
     // display -a leaves out variables without a value and adds the command name
     let all = ctx.ok(&["display-message", "-a", "-t", "d:0"]);
     assert!(all.contains("session_name=d\n") && all.ends_with("command=display-message\n"), "{all}");
@@ -1246,7 +1248,7 @@ fn display_all_samples_and_printed_commands() {
     assert_eq!(ctx.fmt("d:0", "#{command}"), "display-message");
     // cmd_stringify_argv: each argument escaped
     assert_eq!(ctx.fmt("d:0", "#{pane_start_command}"), "\"sleep 100\"");
-    assert_eq!(ctx.fmt("d:1", "#{pane_start_command}"), "sleep 99");
+    assert_eq!(ctx.fmt("d:1", "#{pane_start_command}"), sleep99.join(" "));
     // paste_make_sample: 200 bytes, vis-encoded, "..." when cut
     let long = format!("a\tb\u{1}\"c\" {}", "0".repeat(300));
     ctx.ok(&["set-buffer", "-b", "long", &long]);
@@ -1681,8 +1683,9 @@ fn run_shell_status_and_new_session_sizes() {
     let ctx = Ctx::new("p1fix-rsds");
     ctx.ok(&["new-session", "-d", "-s", "f", "-x", "80", "-y", "24", "sleep 100"]);
     // the last run-shell gives the exit status
-    assert_eq!(ctx.cmd(&["run-shell", "exit 3", ";", "run-shell", "true"]), (true, "'exit 3' returned 3\n".to_string()));
-    let (ok, out) = ctx.cmd(&["run-shell", "true", ";", "run-shell", "exit 4"]);
+    let t = sh("true", "exit 0");
+    assert_eq!(ctx.cmd(&["run-shell", "exit 3", ";", "run-shell", t]), (true, "'exit 3' returned 3\n".to_string()));
+    let (ok, out) = ctx.cmd(&["run-shell", t, ";", "run-shell", "exit 4"]);
     assert!(!ok && out == "'exit 4' returned 4\n", "{out}");
     // a -b job's failure is shown in a pane too
     ctx.ok(&["run-shell", "-b", "exit 5"]);
@@ -1698,7 +1701,9 @@ fn run_shell_status_and_new_session_sizes() {
 #[test]
 fn copy_mode_format_variables() {
     let ctx = Ctx::new("p1fix-copyvars");
-    ctx.ok(&["new-session", "-d", "-s", "s1", "-x", "60", "-y", "16", "printf 'hello world\\nworld two\\n'; sleep 100"]);
+    ctx.ok(&["new-session", "-d", "-s", "s1", "-x", "60", "-y", "16", sh(
+        "printf 'hello world\\nworld two\\n'; sleep 100",
+        "[Console]::WriteLine('hello world'); [Console]::WriteLine('world two'); Start-Sleep 100")]);
     wait_for("output", || ctx.capture("s1").contains("two"));
     // not in copy mode: no values, and display -a has none of them
     assert_eq!(ctx.fmt("s1", "[#{copy_cursor_word}#{selection_mode}]"), "[]");
@@ -1883,14 +1888,14 @@ fn remain_on_exit_format_is_styled_on_bottom_line_and_empty_is_silent() {
     ctx.ok(&["new-session", "-d", "-s", "s", "-x", "60", "-y", "10"]);
     ctx.ok(&["set", "-p", "-t", "s", "remain-on-exit", "on"]);
     ctx.ok(&["set", "-p", "-t", "s", "remain-on-exit-format", "#[fg=red]EXIT=#{pane_dead_status}"]);
-    ctx.ok(&["respawn-pane", "-k", "-t", "s", "sh", "-c", "exit 7"]);
+    ctx.ok(&[&["respawn-pane", "-k", "-t", "s"][..], &shell_argv("exit 7", "exit 7")].concat());
     wait_for("dead pane", || ctx.fmt("s", "#{pane_dead}") == "1");
     let captured = ctx.ok(&["capture-pane", "-pe", "-t", "s"]);
     assert!(captured.lines().last().unwrap().contains("EXIT=7"), "{captured:?}");
     assert!(!captured.contains("#[fg="));
     assert!(captured.contains("\x1b["));
     ctx.ok(&["set", "-p", "-t", "s", "remain-on-exit-format", ""]);
-    ctx.ok(&["respawn-pane", "-k", "-t", "s", "sh", "-c", "printf marker; exit 0"]);
+    ctx.ok(&[&["respawn-pane", "-k", "-t", "s"][..], &shell_argv("printf marker; exit 0", "[Console]::Write('marker'); exit 0")].concat());
     // the exit can be seen before the pane's last output is read
     wait_for("empty dead format", || ctx.fmt("s", "#{pane_dead}") == "1" && ctx.capture("s").starts_with("marker"));
     let captured = ctx.capture("s");
@@ -1955,7 +1960,9 @@ fn copy_mode_live_word_separators_and_kill_flag() {
 #[test]
 fn copy_mode_command_arguments_like_tmux() {
     let ctx = Ctx::new("copyargs");
-    ctx.ok(&["new", "-d", "-s", "c", "-x", "30", "-y", "6", "printf 'foo bar\n-baz foo\nfob\nend\n'; sleep 100"]);
+    ctx.ok(&["new", "-d", "-s", "c", "-x", "30", "-y", "6", sh(
+        "printf 'foo bar\n-baz foo\nfob\nend\n'; sleep 100",
+        "'foo bar', '-baz foo', 'fob', 'end' | ForEach-Object { [Console]::WriteLine($_) }; Start-Sleep 100")]);
     wait_for("copy text", || ctx.capture("c").contains("end"));
     // send -X outside a mode fails (cmd-send-keys.c), and -N is checked first
     let e = ctx.fails(&["send", "-t", "c", "-X", "cursor-up"]);
@@ -1975,7 +1982,7 @@ fn copy_mode_command_arguments_like_tmux() {
     // the buffer name prefix and the pipe command are formats
     ctx.ok(&["send", "-t", "c", "-X", "copy-line", "P#{pane_index}x"]);
     ctx.ok(&["send", "-t", "c", "-X", "copy-line", "-X"]);
-    ctx.ok(&["send", "-t", "c", "-X", "copy-pipe-line", "cat", "Q#{window_index}y"]);
+    ctx.ok(&["send", "-t", "c", "-X", "copy-pipe-line", sh("cat", "$input | Out-Null"), "Q#{window_index}y"]);
     let names = ctx.ok(&["list-buffers", "-F", "#{buffer_name}"]);
     assert_eq!(names.lines().collect::<Vec<_>>(), ["Q0y1", "P0x0"], "{names}");
 }
@@ -1988,7 +1995,9 @@ fn copy_mode_buffer_prefix_and_append_selection() {
     use std::io::{BufRead, BufReader};
     use std::sync::{Arc, Mutex};
     let ctx = Ctx::new("copyappend");
-    ctx.ok(&["new", "-d", "-s", "c", "-x", "30", "-y", "6", "printf 'foo bar\nbaz\n'; sleep 100"]);
+    ctx.ok(&["new", "-d", "-s", "c", "-x", "30", "-y", "6", sh(
+        "printf 'foo bar\nbaz\n'; sleep 100",
+        "[Console]::WriteLine('foo bar'); [Console]::WriteLine('baz'); Start-Sleep 100")]);
     wait_for("copy text", || ctx.capture("c").contains("baz"));
     let mut child = ctx.command().args(["-C", "attach", "-t", "c"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
     let out = Arc::new(Mutex::new(String::new()));
@@ -3086,9 +3095,11 @@ fn startup_config_source_file_resolves_against_the_client_directory() {
     std::fs::write(dir.join("a.conf"), "source-file sub/b.conf\n").unwrap();
     std::fs::write(dir.join("sub/b.conf"), "set -g @rel 1\n").unwrap();
     let result = ctx.command().current_dir(&dir).args(["-f", "a.conf", "new-session", "-d", "sleep 100"]).output().unwrap();
-    std::fs::remove_dir_all(&dir).unwrap();
     assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
     assert_eq!(ctx.ok(&["show-options", "-gv", "@rel"]).trim(), "1");
+    // the pane runs in the directory (on Windows a process's directory cannot be removed)
+    ctx.ok(&["kill-server"]);
+    wait_for("directory removed", || std::fs::remove_dir_all(&dir).is_ok());
 }
 
 #[test]

@@ -87,6 +87,18 @@ pub fn sh<'a>(unix: &'a str, windows: &'a str) -> &'a str {
     if cfg!(windows) { windows } else { unix }
 }
 
+/// argv that runs a script without default-shell: separate words are run as a program
+/// (`sh -c` on Unix; Windows has no POSIX programs, but always has Windows PowerShell).
+pub fn shell_argv<'a>(unix: &'a str, windows: &'a str) -> Vec<&'a str> {
+    if cfg!(windows) { vec!["powershell", "-NoProfile", "-Command", windows] } else { vec!["sh", "-c", unix] }
+}
+
+/// argv that sleeps `secs` seconds, run without a shell; each word is a plain one, so
+/// #{pane_start_command} is the words joined by spaces.
+pub fn sleep_argv(secs: &str) -> Vec<&str> {
+    if cfg!(windows) { vec!["powershell", "-NoProfile", "-Command", "Start-Sleep", secs] } else { vec!["sleep", secs] }
+}
+
 /// Like `cat` on a terminal: shows what is typed, control keys as ^X (a tty's echoctl).
 pub const CAT: &str = if cfg!(windows) { ECHO_KEYS } else { "cat" };
 /// Like `cat -v`: the same for the keys these tests type.
