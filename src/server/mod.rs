@@ -2175,26 +2175,30 @@ impl Server {
                 if !background {
                     queue.ctx.retval = if status < 0 { 128 - status } else { status };
                 }
-                if !output.is_empty() && !background {
+                // cmd_run_shell_print: a -t pane always gets the output in view mode,
+                // even when the command waits (a command-line client prints nothing)
+                let target = pane.filter(|p| self.panes.contains_key(p));
+                if let Some(p) = target.filter(|_| !output.is_empty()) {
+                    self.view_output(p, &output);
+                } else if !output.is_empty() && !background {
                     if queue.ctx.reply.is_some_and(|c| !self.clients.get(&c).is_some_and(|c| c.attached)) {
                         queue.ctx.out.push_str(&output);
-                    } else if let (Some(cid), Some(_), None) = (queue.ctx.client, queue.ctx.control_seq, pane) {
+                    } else if let (Some(cid), Some(_)) = (queue.ctx.client, queue.ctx.control_seq) {
                         // cmdq_print to a control client: bare lines after its %end
                         let mut text = output.clone();
                         if !text.ends_with('\n') {
                             text.push('\n');
                         }
                         self.ev.ctl_queue.entry(cid).or_default().push_str(&text);
-                    } else if let Some(p) = pane.or(queue.ctx.pane) {
+                    } else if let Some(p) = queue.ctx.pane {
                         self.view_output(p, &output);
                     }
                 } else if !output.is_empty() {
-                    // cmd_run_shell_print without a queue item: the -t pane, else the
-                    // target client's current pane, else the current one
+                    // cmd_run_shell_print without a queue item: the target client's
+                    // current pane, else the current one
                     let tc = queue.ctx.client.filter(|c| self.clients.get(c).is_some_and(|c| c.attached))
                         .or_else(|| self.resolve_client(&queue.ctx, None).ok());
-                    let p = pane.filter(|p| self.panes.contains_key(p))
-                        .or_else(|| tc.and_then(|c| self.client_active_pane(c)))
+                    let p = tc.and_then(|c| self.client_active_pane(c))
                         .or_else(|| self.current(&queue.ctx).pane);
                     if let Some(p) = p {
                         self.view_output(p, &output);
@@ -2225,8 +2229,15 @@ impl Server {
     pub fn view_output(&mut self, pane: PaneId, text: &str) {
         let Some(p) = self.panes.get_mut(&pane) else { return };
         let (w, h) = p.size;
-        let mut lines: Vec<Line> = match &mut p.mode {
-            Some(PaneMode::Copy(_)) => Vec::new(),
+        // window_copy_add: output for a pane already in view mode goes after what it shows
+        let mut lines: Vec<Line> = match &p.mode {
+            Some(PaneMode::Copy(c)) if c.is_view_mode() => {
+                let mut old = c.backing_screen().0.to_vec();
+                while old.last().is_some_and(|l| !l.wrapped && l.cells.iter().all(|c| c.text.is_empty() || c.text == " ")) {
+                    old.pop();
+                }
+                old
+            }
             _ => Vec::new(),
         };
         for l in text.trim_end_matches('\n').split('\n') {

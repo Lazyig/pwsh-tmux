@@ -3015,3 +3015,21 @@ fn spawn_without_c_uses_the_command_clients_directory() {
     assert_eq!(run(&b, &["run-shell", "pwd"]).trim_end(), canon(&b));
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[cfg(unix)]
+#[test]
+fn run_shell_t_shows_waited_output_in_view_mode() {
+    // cmd_run_shell_print: with -t the output goes to the pane in view mode, also
+    // without -b (the command-line client prints nothing but keeps the exit status)
+    let ctx = Ctx::new("runshellt");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "80", "-y", "24"]);
+    assert_eq!(ctx.ok(&["run-shell", "-t", "s:0", "echo hello"]), "");
+    assert_eq!(ctx.fmt("s:0", "#{pane_mode}"), "view-mode");
+    let mode = || ctx.ok(&["capture-pane", "-p", "-M", "-t", "s:0"]);
+    assert!(mode().contains("hello"));
+    let (ok, text) = ctx.cmd(&["run-shell", "-t", "s:0", "echo two; exit 3"]);
+    assert!(!ok && text.is_empty(), "{text}");
+    // window_copy_add: added after the output already in view
+    wait_for("failure shown", || mode().contains("hello\ntwo\n'echo two; exit 3' returned 3"));
+    assert_eq!(ctx.ok(&["run-shell", "echo cli"]).trim_end(), "cli");
+}
