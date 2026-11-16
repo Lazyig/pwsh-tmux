@@ -89,18 +89,18 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("server-access", "", "adglrw", ""),
     ("set-buffer", "setb", "aw", "bnt"),
     ("set-environment", "setenv", "Fhgru", "t"),
-    ("set-hook", "", "agpRuw", "t"),
+    ("set-hook", "", "agpERTuw", "Bt"),
     ("set-option", "set", "aFgopqsuUw", "t"),
     ("set-window-option", "setw", "aFgoqu", "t"),
     ("show-buffer", "showb", "", "b"),
     ("show-environment", "showenv", "hgs", "t"),
-    ("show-hooks", "", "gpw", "Ft"),
+    ("show-hooks", "", "Bgpw", "Ft"),
     ("show-messages", "showmsgs", "JT", "t"),
     ("show-options", "show", "AgHpqsvw", "Ft"),
     ("show-prompt-history", "showphist", "", "T"),
     ("show-window-options", "showw", "gv", "Ft"),
     ("source-file", "source", "Fnqv", "t"),
-    ("split-window", "splitw", "bdEfhIvPZ", "cefFlt"),
+    ("split-window", "splitw", "bdEfhIvPZ", "cefFltT"),
     ("start-server", "start", "", ""),
     ("suspend-client", "suspendc", "", "t"),
     ("swap-pane", "swapp", "dDUZ", "st"),
@@ -108,8 +108,13 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("switch-client", "switchc", "EFlnprZ", "cOtT"),
     ("unbind-key", "unbind", "anq", "T"),
     ("unlink-window", "unlinkw", "k", "t"),
-    ("wait-for", "wait", "LSU", ""),
+    ("wait-for", "wait", "ELSUlv", "Fw"),
 ];
+
+/// A command's flags without and with a value.
+pub fn command_flags(full: &str) -> (&'static str, &'static str) {
+    COMMANDS.iter().find(|c| c.0 == full).map_or(("", ""), |c| (c.2, c.3))
+}
 
 pub fn canonical(name: &str) -> Option<&'static str> {
     if let Some(c) = COMMANDS.iter().find(|c| c.0 == name || (!c.1.is_empty() && c.1 == name)) {
@@ -122,6 +127,14 @@ pub fn canonical(name: &str) -> Option<&'static str> {
 
 /// The command given to spawn_pane for a pane without a process (-E, or an empty command).
 pub const EMPTY_PANE: &str = "\u{1}empty-pane";
+/// An empty pane from a single empty argument: its argv stays [""] (pane-created's
+/// pane_command is `''`).
+pub const EMPTY_PANE_ARG: &str = "\u{1}empty-pane-arg";
+
+/// Whether a spawn command is one of the empty pane markers.
+pub fn is_empty_pane(cmd: &[String]) -> bool {
+    matches!(cmd, [one] if one == EMPTY_PANE || one == EMPTY_PANE_ARG)
+}
 
 /// The command for a new pane: -E (or a single empty argument, or `input` for split-window
 /// -I) makes an empty pane, which can't also be given a command.
@@ -131,7 +144,11 @@ fn spawn_command(o: &Opts, input: bool) -> Result<Vec<String>, String> {
     if empty && !o.rest.is_empty() && !empty_arg {
         return err("command cannot be given for empty pane");
     }
-    Ok(if empty { vec![EMPTY_PANE.to_string()] } else { o.rest.clone() })
+    Ok(match (empty, empty_arg) {
+        (true, true) => vec![EMPTY_PANE_ARG.to_string()],
+        (true, false) => vec![EMPTY_PANE.to_string()],
+        _ => o.rest.clone(),
+    })
 }
 
 /// The checks cmd_parse_build_commands makes before anything runs: the command
@@ -163,7 +180,7 @@ pub fn check_command(argv: &[String]) -> Result<(), String> {
 /// it with cmd_parse_from_string and prints it with cmd_list_print: command-alias
 /// entries expanded, unknown commands and flags rejected, flags sorted as
 /// args_print does, { } blocks kept as command lists, commands joined by " ; ".
-fn command_list_string(v: &str, aliases: &[String]) -> Result<String, String> {
+pub(super) fn command_list_string(v: &str, aliases: &[String]) -> Result<String, String> {
     // errors of a string parse have no file:line prefix
     let cmds = cmdparse::parse_blocks(v).map_err(|e| match e.split_once(": ") {
         Some((l, rest)) if l.starts_with("line ") => rest.to_string(),
@@ -216,7 +233,8 @@ fn optional_value_flag(cmd: &str, c: char) -> bool {
 fn takes_commands(cmd: &str, idx: usize, flags: &[char]) -> bool {
     match cmd {
         "if-shell" => idx == 1 || idx == 2,
-        "set-option" | "set-window-option" | "set-hook" => idx == 1,
+        "set-option" | "set-window-option" => idx == 1,
+        "set-hook" => idx == 1 || flags.contains(&'B'),
         "run-shell" => flags.contains(&'C'),
         "bind-key" | "confirm-before" | "command-prompt" | "display-menu" | "choose-tree" | "choose-client"
         | "choose-buffer" | "customize-mode" | "switch-mode" | "display-panes" => true,
@@ -407,6 +425,9 @@ impl Server {
 
     /// The default target for a command context.
     pub fn current(&self, ctx: &Ctx) -> Target {
+        if let Some(t) = ctx.target.filter(|t| t.pane == ctx.pane && self.target_is_valid(*t)) {
+            return t;
+        }
         if let Some(p) = ctx.pane.filter(|p| self.panes.contains_key(p) && self.window_of(*p).is_some()) {
             // A key binding or CLI from inside a pane: but prefer the client's current
             // window when the pane's window isn't the one shown.
@@ -977,7 +998,6 @@ impl Server {
                 last_active: None,
                 zoomed: false,
                 options: Options::default(),
-                hooks: BTreeMap::new(),
                 alerts: 0,
                 layout_cycle: None,
                 old_layout: None,
@@ -1066,7 +1086,6 @@ impl Server {
                 cwd: cwd.clone(),
                 options: Options::default(),
                 env: senv,
-                hooks: BTreeMap::new(),
                 created: now,
                 activity: now,
                 activity_seq: super::activity_seq(),
@@ -1093,7 +1112,10 @@ impl Server {
         self.sessions.get_mut(&sid).unwrap().active = idx;
         self.link(sid, idx, wid, true);
         self.had_session = true;
-        self.run_hook(Some(sid), "session-created", Ctx { client: ctx.client, ..Ctx::default() });
+        let _ = ctx;
+        // its window's events come first (spawn_window), then session-created
+        self.detect_changes(None);
+        self.fire_session("session-created", sid);
         Ok(sid)
     }
 
@@ -1112,19 +1134,15 @@ impl Server {
         // keys from its clients count
         s.alerts.remove(&idx);
         self.mark_session_dirty(sid);
-        self.run_hook(Some(sid), "session-window-changed", Ctx::default());
     }
 
     pub fn select_pane(&mut self, wid: WinId, pane: PaneId) {
-        let w = self.windows.get_mut(&wid).unwrap();
-        if w.active != pane {
+        if self.windows[&wid].active != pane {
+            // window_push_zoom: the unzoom's events come first
+            self.unzoom_window(wid);
+            let w = self.windows.get_mut(&wid).unwrap();
             w.last_active = Some(w.active);
             w.active = pane;
-            if w.zoomed {
-                w.zoomed = false;
-                self.apply_layout(wid);
-            }
-            self.run_hook(None, "window-pane-changed", Ctx { pane: Some(pane), ..Ctx::default() });
         }
         self.mark_window_dirty(wid);
     }
@@ -1158,6 +1176,8 @@ impl Server {
     pub fn split_pane(&mut self, t: Target, horizontal: bool, before: bool, size: Option<u16>, full: bool, cwd: Option<String>, cmd: &[String], env: &[(String, String)]) -> Result<PaneId, String> {
         let wid = t.wid.ok_or("no window")?;
         let target = t.pane.ok_or("no pane")?;
+        // window_push_zoom: unzoomed (with its events) before splitting
+        self.unzoom_window(wid);
         let area = self.window_area(wid);
         let (rects, _) = self.rects(wid);
         let r = if full { area } else { rects.iter().find(|(p, _)| *p == target).map(|(_, r)| *r).ok_or("pane not visible")? };
@@ -1241,35 +1261,44 @@ impl Server {
 
     // ---- buffers ---------------------------------------------------------------------------
 
-    pub fn add_buffer(&mut self, name: Option<String>, data: Vec<u8>, append: bool) {
+    /// paste_set / paste_add. A named buffer is replaced by a new one (the old one is
+    /// freed first, firing paste-buffer-deleted); `append` keeps the old data in front.
+    /// tmux appends only to a named buffer: without -b a new automatic one is added.
+    pub fn add_buffer(&mut self, name: Option<String>, mut data: Vec<u8>, append: bool) {
         if let Some(n) = &name {
-            if let Some(b) = self.buffers.iter_mut().find(|b| &b.name == n) {
+            if let Some(pos) = self.buffers.iter().position(|b| &b.name == n) {
+                let old = self.buffers.remove(pos);
                 if append {
-                    b.data.extend(data);
-                } else {
-                    b.data = data;
+                    let mut joined = old.data;
+                    joined.extend(data);
+                    data = joined;
                 }
+                self.buffer_event(&old.name, true);
+                self.buffers.insert(0, Buffer { name: n.clone(), data, automatic: false, created: now_secs() });
+                self.buffer_event(n, false);
                 return;
             }
-        } else if append {
-            if let Some(b) = self.buffers.first_mut() {
-                b.data.extend(data);
-                return;
-            }
+        }
+        if data.is_empty() {
+            return;
         }
         let automatic = name.is_none();
-        let name = name.unwrap_or_else(|| {
+        let name = name.unwrap_or_else(|| loop {
             let n = format!("buffer{}", self.buffer_seq);
             self.buffer_seq += 1;
-            n
-        });
-        self.buffers.insert(0, Buffer { name, data, automatic, created: now_secs() });
-        let limit = self.opt_server_num("buffer-limit").max(1) as usize;
-        while self.buffers.iter().filter(|b| b.automatic).count() > limit {
-            if let Some(pos) = self.buffers.iter().rposition(|b| b.automatic) {
-                self.buffers.remove(pos);
+            if !self.buffers.iter().any(|b| b.name == n) {
+                break n;
             }
+        });
+        let limit = self.opt_server_num("buffer-limit").max(1) as usize;
+        // paste_add frees the oldest automatic buffers first
+        while self.buffers.iter().filter(|b| b.automatic).count() >= limit && automatic {
+            let Some(pos) = self.buffers.iter().rposition(|b| b.automatic) else { break };
+            let old = self.buffers.remove(pos);
+            self.buffer_event(&old.name, true);
         }
+        self.buffers.insert(0, Buffer { name: name.clone(), data, automatic, created: now_secs() });
+        self.buffer_event(&name, false);
     }
 
     pub fn paste(&mut self, pane: PaneId, data: &[u8], bracket: bool, raw_lf: bool, sep: Option<&str>) {
@@ -1292,6 +1321,7 @@ impl Server {
     // ---- the dispatcher ---------------------------------------------------------------------
 
     pub fn exec(&mut self, argv: Vec<String>, ctx: &mut Ctx) -> Result<Flow, String> {
+        ctx.skip_after = false;
         ctx.readonly |= self.readonly_context.get() || self.client_is_readonly(ctx.client) || self.client_is_readonly(ctx.reply);
         let previous = self.readonly_context.replace(ctx.readonly);
         // Resolve each alias once; arguments belong to its last command (cmd-parse.y).
@@ -1456,7 +1486,7 @@ impl Server {
                 }
                 if o.has('P') {
                     let fmt = o.get('F').unwrap_or("#{session_name}:");
-                    let s = self.expand(Target { sid: Some(sid), ..Target::default() }, None, fmt);
+                    let s = self.expand(self.target_for_session(sid), None, fmt);
                     ctx.out.push_str(&s);
                     ctx.out.push('\n');
                 }
@@ -1616,9 +1646,11 @@ impl Server {
                 if self.sessions.values().any(|s| s.id != sid && s.name == name) {
                     return err(format!("duplicate session: {name}"));
                 }
-                self.sessions.get_mut(&sid).unwrap().name = name;
+                let old = std::mem::replace(&mut self.sessions.get_mut(&sid).unwrap().name, name.clone());
                 self.mark_session_dirty(sid);
-                self.run_hook(Some(sid), "session-renamed", Ctx::default());
+                let mut p = self.payload_session(sid);
+                p.str("old_name", old).str("new_name", name);
+                self.fire("session-renamed", p);
                 Ok(Flow::Next)
             }
             "list-sessions" => {
@@ -1809,7 +1841,7 @@ impl Server {
                 let cwd = o.get('c').map(|c| self.expand(self.current(ctx), ctx.client, c)).or_else(|| Some(s.cwd.clone()));
                 let pane = self.spawn_pane(Some(sid), sx, sy, &command, cwd.as_deref(), &env)?;
                 let name = o.get('n').map(|n| self.expand(self.current(ctx), ctx.client, n));
-                let named = if command.first().is_some_and(|c| c == EMPTY_PANE) { &[][..] } else { &command[..] };
+                let named = if is_empty_pane(&command) { &[][..] } else { &command[..] };
                 let wname = name.clone().unwrap_or_else(|| self.window_name_for(named, Some(sid)));
                 let wid = self.new_window_obj(wname, pane, sx, sy);
                 if name.is_some() {
@@ -1828,7 +1860,6 @@ impl Server {
                     ctx.out.push('\n');
                 }
                 ctx.pane = Some(pane);
-                self.run_hook(Some(sid), "window-linked", Ctx::default());
                 Ok(Flow::Next)
             }
             "kill-window" => {
@@ -1949,8 +1980,13 @@ impl Server {
                 let (wa, wb) = (src.wid.unwrap(), dst.wid.unwrap());
                 self.sessions.get_mut(&a.0).unwrap().links.insert(a.1, wb);
                 self.sessions.get_mut(&b.0).unwrap().links.insert(b.1, wa);
-                if !o.has('d') {
+                // the winlinks stay current with the windows swapped inside; -d
+                // selects the target (and source) index, keeping the window
+                if o.has('d') {
                     self.select_window(b.0, b.1);
+                    if a.0 != b.0 {
+                        self.select_window(a.0, a.1);
+                    }
                 }
                 self.update_session_size(a.0);
                 self.update_session_size(b.0);
@@ -1964,7 +2000,6 @@ impl Server {
                 w.name = name;
                 w.options.set("automatic-rename", "off".into());
                 self.mark_window_dirty(wt.wid.unwrap());
-                self.run_hook(wt.sid, "window-renamed", Ctx { pane: wt.wid.and_then(|w| self.windows.get(&w)).map(|w| w.active), ..Ctx::default() });
                 Ok(Flow::Next)
             }
             "select-window" | "next-window" | "previous-window" | "last-window" => {
@@ -2081,11 +2116,19 @@ impl Server {
                 self.spawn_into(pane, generation, tt.sid, size.0, size.1, &cmdv, Some(&cwd), &env)?;
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
+                // spawn_window without SPAWN_DETACHED selects the respawned window
+                if let (true, Some(sid), Some(idx)) = (cmd == "respawn-window", tt.sid, tt.idx) {
+                    if self.sessions.get(&sid).is_some_and(|s| s.links.get(&idx) == Some(&wid)) {
+                        self.select_window(sid, idx);
+                    }
+                }
                 Ok(Flow::Next)
             }
             "rotate-window" => {
                 let wt = self.resolve_window(ctx, t)?;
                 let wid = wt.wid.unwrap();
+                // window_push_zoom: unzoomed (with its events); -Z zooms it again
+                let zoomed = self.unzoom_window(wid);
                 let w = self.windows.get_mut(&wid).unwrap();
                 let order = w.panes();
                 let mut rotated = order.clone();
@@ -2093,16 +2136,28 @@ impl Server {
                 // Replace via temporary ids so cycles do not overwrite one another.
                 for (i, p) in order.iter().enumerate() { w.layout.replace(*p, PaneId::MAX - i as u32); }
                 for (i, p) in rotated.iter().enumerate() { w.layout.replace(PaneId::MAX - i as u32, *p); }
+                // the pane now in the active pane's place becomes active (TAILQ_NEXT /
+                // TAILQ_PREV of the old active pane in the rotated list)
+                if let Some(i) = order.iter().position(|p| *p == w.active) {
+                    if rotated[i] != w.active {
+                        w.last_active = Some(w.active);
+                        w.active = rotated[i];
+                    }
+                }
                 w.pane_order = rotated;
-                // -Z keeps a zoomed window zoomed
-                w.zoomed = w.zoomed && o.has('Z');
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
+                if zoomed && o.has('Z') {
+                    self.detect_changes(Some("rotate-window"));
+                    self.rezoom_window(wid);
+                }
                 Ok(Flow::Next)
             }
             "select-layout" | "next-layout" | "previous-layout" => {
                 let wt = if cmd == "select-layout" { self.resolve_pane(ctx, t)? } else { self.resolve_window(ctx, t)? };
                 let wid = wt.wid.unwrap();
+                // server_unzoom_window, with its events, first
+                self.unzoom_window(wid);
                 let area = self.window_area(wid);
                 // args_string_percentage(value, 0, total, total): anything over the
                 // available size is an error, and the layout uses its default
@@ -2128,7 +2183,7 @@ impl Server {
                     w.zoomed = false;
                     self.apply_layout(wid);
                     self.mark_window_dirty(wid);
-                    self.run_hook(wt.sid, "window-layout-changed", Ctx { pane: wt.wid.and_then(|w| self.windows.get(&w)).map(|w| w.active), ..Ctx::default() });
+                    self.ev.layout_fired.push((wid, 1));
                     return Ok(Flow::Next);
                 } else {
                     o.rest.first().cloned().or_else(|| {
@@ -2159,7 +2214,8 @@ impl Server {
                 w.zoomed = false;
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
-                self.run_hook(wt.sid, "window-layout-changed", Ctx { pane: wt.wid.and_then(|w| self.windows.get(&w)).map(|w| w.active), ..Ctx::default() });
+                // layout_set_select and layout_parse fire it too, with panes to lay out
+                self.ev.layout_fired.push((wid, if panes.len() > 1 { 2 } else { 1 }));
                 Ok(Flow::Next)
             }
             "resize-window" => {
@@ -2233,6 +2289,13 @@ impl Server {
                 let command = spawn_command(&o, o.has('I'))?;
                 let new = self.split_pane(tt, o.has('h'), o.has('b'), size, o.has('f'), cwd, &command, &env)?;
                 let wid = tt.wid.unwrap();
+                if let Some(title) = o.get('T') {
+                    let title = self.expand(tt, ctx.client, title);
+                    self.panes.get_mut(&new).unwrap().title = title.clone();
+                    let mut p = self.payload_pane(new);
+                    p.str("new_title", title);
+                    self.fire("pane-title-changed", p);
+                }
                 if !o.has('d') {
                     self.select_pane(wid, new);
                 }
@@ -2272,17 +2335,24 @@ impl Server {
                 Ok(Flow::Next)
             }
             "select-pane" => {
+                ctx.skip_after = true;
                 let tt = self.resolve_pane(ctx, t)?;
                 let wid = tt.wid.unwrap();
                 let pane = tt.pane.unwrap();
                 if o.has('m') || o.has('M') {
+                    let last = self.marked.filter(|p| self.panes.contains_key(p));
                     self.marked = if o.has('M') || self.marked == Some(pane) { None } else { Some(pane) };
                     self.mark_all_dirty();
+                    self.fire_marked_changed(pane, last);
                     return Ok(Flow::Next);
                 }
                 if let Some(title) = o.get('T') {
                     let title = self.expand(tt, ctx.client, title);
-                    self.panes.get_mut(&pane).unwrap().title = title;
+                    let p = self.panes.get_mut(&pane).unwrap();
+                    p.title = title.clone();
+                    let mut ev = self.payload_pane(pane);
+                    ev.str("new_title", title);
+                    self.fire("pane-title-changed", ev);
                     self.mark_window_dirty(wid);
                     return Ok(Flow::Next);
                 }
@@ -2307,11 +2377,14 @@ impl Server {
                 }
                 if let Some((_, d)) = DIRS.iter().find(|(c, _)| o.has(*c)) {
                     let zoomed = self.windows[&wid].zoomed;
+                    let active = self.windows[&wid].active;
                     self.select_dir(tt, *d)?;
+                    ctx.pane = Some(self.windows[&wid].active);
+                    ctx.skip_after = ctx.pane == Some(active);
                     if o.has('Z') && zoomed {
-                        let w = self.windows.get_mut(&wid).unwrap();
-                        w.zoomed = true;
-                        self.apply_layout(wid);
+                        // window_pop_zoom, after window-pane-changed
+                        self.flush_active_pane(wid);
+                        self.rezoom_window(wid);
                     }
                     return Ok(Flow::Next);
                 }
@@ -2319,20 +2392,25 @@ impl Server {
                     let w = &self.windows[&wid];
                     let last = w.last_active.filter(|p| w.panes().contains(p)).ok_or("no last pane")?;
                     self.select_pane(wid, last);
+                    ctx.pane = Some(last);
                     return Ok(Flow::Next);
                 }
-                if let (Some(sid), Some(idx)) = (tt.sid, tt.idx) {
-                    if self.sessions.get(&sid).is_some_and(|s| s.active != idx) {
-                        self.select_window(sid, idx);
-                    }
-                }
-                // hooks run by select_window may have removed the pane
+                // the pane becomes active in its window; the session's current window
+                // stays (cmd-select-pane.c selects no window)
                 if self.windows.get(&wid).is_some_and(|w| w.panes().contains(&pane)) {
+                    ctx.skip_after = self.windows[&wid].active == pane;
+                    let zoomed = self.windows[&wid].zoomed && !ctx.skip_after;
                     self.select_pane(wid, pane);
+                    ctx.pane = Some(pane);
+                    if o.has('Z') && zoomed {
+                        self.flush_active_pane(wid);
+                        self.rezoom_window(wid);
+                    }
                 }
                 Ok(Flow::Next)
             }
             "last-pane" => {
+                ctx.skip_after = true;
                 let wt = self.resolve_window(ctx, t)?;
                 let wid = wt.wid.unwrap();
                 let w = &self.windows[&wid];
@@ -2344,6 +2422,7 @@ impl Server {
                 }
                 let zoomed = self.windows[&wid].zoomed;
                 self.select_pane(wid, last);
+                ctx.pane = Some(last);
                 if o.has('Z') && zoomed {
                     self.windows.get_mut(&wid).unwrap().zoomed = true;
                     self.apply_layout(wid);
@@ -2394,6 +2473,9 @@ impl Server {
                 };
                 let x = o.get('x').and_then(|v| parse_size(v, area.w));
                 let y = o.get('y').and_then(|v| parse_size(v, area.h));
+                // server_unzoom_window first
+                self.unzoom_window(wid);
+                let before = self.windows[&wid].layout.to_layout_string(area);
                 let w = self.windows.get_mut(&wid).unwrap();
                 if x.is_some() || y.is_some() {
                     w.layout.set_size(pane, x, y, area);
@@ -2404,9 +2486,11 @@ impl Server {
                         w.layout.resize(pane, d, n, area);
                     }
                 }
+                let moved = self.windows[&wid].layout.to_layout_string(area) != before;
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
-                self.run_hook(tt.sid, "window-layout-changed", Ctx { pane: tt.wid.and_then(|w| self.windows.get(&w)).map(|w| w.active), ..Ctx::default() });
+                // as does layout_resize_pane, when there is a cell to resize
+                self.ev.layout_fired.push((wid, if moved { 2 } else { 1 }));
                 Ok(Flow::Next)
             }
             "swap-pane" => {
@@ -2428,9 +2512,17 @@ impl Server {
                     };
                     (src.wid.unwrap(), src.pane.unwrap())
                 };
+                // window_push_zoom on both windows (their events first); -Z zooms them
+                // again at the end
+                let dzoom = self.unzoom_window(dwid);
+                let szoom = swid != dwid && self.unzoom_window(swid);
                 if spane == dpane {
+                    if o.has('Z') && dzoom {
+                        self.rezoom_window(dwid);
+                    }
                     return Ok(Flow::Next);
                 }
+                self.ev.pane_move_order.extend([spane, dpane]);
                 if swid == dwid {
                     let w = self.windows.get_mut(&dwid).unwrap();
                     w.pane_order = w.panes();
@@ -2469,11 +2561,17 @@ impl Server {
                     self.apply_layout(swid);
                     self.mark_window_dirty(swid);
                 }
-                if !o.has('Z') {
-                    self.windows.get_mut(&dwid).unwrap().zoomed = false;
-                }
                 self.apply_layout(dwid);
                 self.mark_window_dirty(dwid);
+                if o.has('Z') && (dzoom || szoom) {
+                    // window_pop_zoom after the swap's own events
+                    self.detect_changes(Some("swap-pane"));
+                    for (wid, z) in [(swid, if swid == dwid { dzoom } else { szoom }), (dwid, dzoom && swid != dwid)] {
+                        if z {
+                            self.rezoom_window(wid);
+                        }
+                    }
+                }
                 Ok(Flow::Next)
             }
             "break-pane" => {
@@ -2496,6 +2594,10 @@ impl Server {
                     }
                     return Ok(Flow::Next);
                 }
+                // cmd-break-pane.c: server_unzoom_window, window_lost_pane (the new
+                // active pane), layout_close_pane, then the new window is attached,
+                // laid out and created, and the pane moved
+                self.unzoom_window(swid);
                 let w = self.windows.get_mut(&swid).unwrap();
                 let l = std::mem::replace(&mut w.layout, Node::Leaf(PaneId::MAX));
                 w.layout = l.remove(pane).unwrap();
@@ -2505,6 +2607,8 @@ impl Server {
                 w.last_active = None;
                 w.zoomed = false;
                 self.apply_layout(swid);
+                self.flush_active_pane(swid);
+                self.flush_window_layout(swid);
                 let (sx, sy) = (self.windows[&swid].sx, self.windows[&swid].sy);
                 let wname = name.clone().unwrap_or_else(|| self.panes.get(&pane).map(|p| p.current_cmd.clone()).unwrap_or_default());
                 let nwid = self.new_window_obj(wname, pane, sx, sy);
@@ -2519,7 +2623,11 @@ impl Server {
                     didx.filter(|i| !self.sessions[&dsid].links.contains_key(i)).unwrap_or_else(|| self.next_index(dsid, None))
                 };
                 self.link(dsid, idx, nwid, !o.has('d'));
+                self.link_now(dsid, idx, nwid);
                 self.apply_layout(nwid);
+                self.pane_resized_now(pane);
+                self.detect_window_created(nwid);
+                self.pane_moved_now(pane);
                 self.mark_all_dirty();
                 if o.has('P') {
                     let fmt = o.get('F').unwrap_or("#{session_name}:#{window_index}.#{pane_index}");
@@ -2537,6 +2645,9 @@ impl Server {
                 let dst = self.resolve_pane(ctx, t)?;
                 let (swid, spane) = (src.wid.unwrap(), src.pane.unwrap());
                 let (dwid, dpane) = (dst.wid.unwrap(), dst.pane.unwrap());
+                // server_unzoom_window on both, with their events
+                self.unzoom_window(dwid);
+                self.unzoom_window(swid);
                 if spane == dpane {
                     return err("source and target panes must be different");
                 }
@@ -2570,8 +2681,15 @@ impl Server {
                         sw.last_active = sw.last_active.filter(|p| *p != spane);
                         sw.zoomed = false;
                         self.apply_layout(swid);
+                        // layout_close_pane, then window_lost_pane
+                        self.flush_window_layout(swid);
+                        if swid != dwid {
+                            self.flush_active_pane(swid);
+                        }
                     }
                     None => {
+                        self.fire_window("window-layout-changed", swid);
+                        let sw = self.windows.get_mut(&swid).unwrap();
                         // source window becomes empty: unlink it everywhere (sessions, clients and
                         // hooks handled normally) without killing the moved pane
                         sw.layout = Node::Leaf(PaneId::MAX);
@@ -2600,6 +2718,27 @@ impl Server {
                 }
                 self.apply_layout(dwid);
                 self.mark_all_dirty();
+                // layout_assign_pane resizes the panes; the new active pane and window,
+                // pane-moved, then the layouts of both windows (cmd-join-pane.c)
+                for p in self.windows[&dwid].panes() {
+                    self.pane_resized_now(p);
+                }
+                if !o.has('d') {
+                    self.flush_active_pane(dwid);
+                    if let (Some(sid), Some(idx)) = (dst.sid, dst.idx) {
+                        self.select_window(sid, idx);
+                        self.detect_current_window(sid, false);
+                    }
+                }
+                self.pane_moved_now(spane);
+                if self.windows.contains_key(&swid) {
+                    self.layout_changed_now(swid);
+                } else {
+                    // server_kill_window for the emptied source comes first
+                    self.seen_layout_now(dwid);
+                    self.detect_changes(Some("join-pane"));
+                }
+                self.layout_changed_now(dwid);
                 Ok(Flow::Next)
             }
             "list-panes" => {
@@ -3153,14 +3292,24 @@ impl Server {
                 };
                 let msg = if o.has('j') { json::normalize(&msg)? } else { msg };
                 let attached_client = cid.filter(|c| self.clients.get(c).is_some_and(|c| c.attached));
-                // without -p the message needs a client to show it on; with none, tmux
-                // shows nothing (a command without any client, as from the configuration,
-                // reports it as an error)
-                if o.has('p') || (attached_client.is_none() && ctx.client.is_none() && ctx.reply.is_none()) {
+                if ctx.client.is_none() && ctx.reply.is_none() && self.cfg_finished {
+                    // no client at all after startup (a hook with nobody attached):
+                    // cmdq_error logs it
+                    self.add_message(&format!("message: {msg}"));
+                } else if o.has('p') || (attached_client.is_none() && ctx.client.is_none() && ctx.reply.is_none()) {
+                    // -p, or a command without any client (the configuration, where
+                    // cmdq_error reports it as an error); without -p the message needs a
+                    // client to show it on, with none tmux shows nothing
                     ctx.out.push_str(&msg);
                     ctx.out.push('\n');
                 } else if let Some(c) = attached_client.filter(|c| self.is_control(*c)) {
-                    self.control_write(c, &format!("%message {msg}\n"));
+                    // server_client_print: inside the block of the control client's own
+                    // command, else straight to that client
+                    if ctx.reply == Some(c) || ctx.client == Some(c) {
+                        ctx.out.push_str(&format!("%message {msg}\n"));
+                    } else {
+                        self.control_write(c, &format!("%message {msg}\n"));
+                    }
                 } else if let Some(c) = attached_client {
                     self.set_message_for(c, &msg, delay.map(|d| d as u64), o.has('N'));
                 }
@@ -3506,13 +3655,31 @@ impl Server {
             "set-buffer" => {
                 let name = o.get('b').map(String::from);
                 if let Some(newname) = o.get('n') {
-                    let b = match &name {
-                        Some(n) => self.buffers.iter_mut().find(|b| &b.name == n),
-                        None => self.buffers.first_mut(),
+                    let pos = match &name {
+                        Some(n) => self.buffers.iter().position(|b| &b.name == n).ok_or_else(|| format!("unknown buffer: {n}"))?,
+                        None if self.buffers.is_empty() => return err("no buffer"),
+                        None => 0,
+                    };
+                    if newname.is_empty() {
+                        return err("new name is empty");
                     }
-                    .ok_or("no buffer")?;
-                    b.name = newname.to_string();
+                    if self.buffers[pos].name == newname {
+                        return Ok(Flow::Next);
+                    }
+                    // paste_rename frees a buffer that already has the new name
+                    let mut pos = pos;
+                    if let Some(other) = self.buffers.iter().position(|b| b.name == newname) {
+                        let gone = self.buffers.remove(other);
+                        self.buffer_event(&gone.name, true);
+                        if other < pos {
+                            pos -= 1;
+                        }
+                    }
+                    let b = &mut self.buffers[pos];
+                    let old = std::mem::replace(&mut b.name, newname.to_string());
                     b.automatic = false;
+                    self.buffer_event(&old, true);
+                    self.buffer_event(newname, false);
                     return Ok(Flow::Next);
                 }
                 let data = o.rest.first().ok_or("no data specified")?.clone();
@@ -3527,13 +3694,15 @@ impl Server {
                 match o.get('b') {
                     Some(n) => {
                         let pos = self.buffers.iter().position(|b| b.name == n).ok_or_else(|| format!("unknown buffer: {n}"))?;
-                        self.buffers.remove(pos);
+                        let old = self.buffers.remove(pos);
+                        self.buffer_event(&old.name, true);
                     }
                     None => {
                         if self.buffers.is_empty() {
                             return err("no buffer");
                         }
-                        self.buffers.remove(0);
+                        let old = self.buffers.remove(0);
+                        self.buffer_event(&old.name, true);
                     }
                 }
                 Ok(Flow::Next)
@@ -3615,13 +3784,14 @@ impl Server {
                 let data = if o.has('S') { data } else { vis::strvis(&data, vis::SAFE | vis::NOSLASH) };
                 self.paste(tt.pane.unwrap(), &data, o.has('p'), o.has('r'), o.get('s'));
                 if o.has('d') {
-                    self.buffers.remove(idx);
+                    let old = self.buffers.remove(idx);
+                    self.buffer_event(&old.name, true);
                 }
                 Ok(Flow::Next)
             }
             // ---------------------------------------------------------------- options & env
             "set-option" | "set-window-option" => self.cmd_set_option(cmd == "set-window-option", &o, ctx).map(|_| Flow::Next),
-            "show-options" | "show-window-options" => self.cmd_show_options(cmd == "show-window-options", false, &o, ctx).map(|_| Flow::Next),
+            "show-options" | "show-window-options" => self.cmd_show_options(cmd == "show-window-options", &o, ctx).map(|_| Flow::Next),
             "set-environment" => {
                 let name = o.rest.first().ok_or("set-environment needs a name")?.clone();
                 let value = o.rest.get(1).map(|v| if o.has('F') { self.expand(self.current(ctx), ctx.client, v) } else { v.clone() });
@@ -3672,111 +3842,10 @@ impl Server {
                 Ok(Flow::Next)
             }
             "set-hook" => {
-                let name = o.rest.first().ok_or("set-hook needs a hook name")?.clone();
-                let base = name.split('[').next().unwrap().to_string();
-                if o.has('R') {
-                    let sid = self.current(ctx).sid;
-                    self.run_hook(sid, &base, ctx.clone());
-                    return Ok(Flow::Next);
-                }
-                // otherwise set-hook is set-option (cmd_set_option_exec): option names are
-                // checked, name[N] sets that element, and an @ name is a user option that
-                // show-hooks then lists (hooks_add_event)
-                self.cmd_set_option(false, &o, ctx)?;
-                if name.starts_with('@') && !o.has('u') && o.rest.len() > 1 {
-                    self.hook_events.insert(name);
-                }
-                Ok(Flow::Next)
-            }
-            "show-hooks" => {
-                // a named hook (or any option) is shown as show-options shows it
-                if !o.rest.is_empty() {
-                    return self.cmd_show_options(false, true, &o, ctx).map(|_| Flow::Next);
-                }
-                // options_scope_from_flags: -p ignores -g
-                let global = o.has('g') && !o.has('p');
-                let level = if global { Ok(HookLevel::Global) } else if o.has('p') {
-                    self.resolve_pane(ctx, t).ok().and_then(|t| t.pane).map(HookLevel::Pane).ok_or_else(|| t.map_or_else(|| "no current pane".to_string(), |t| format!("no such pane: {t}")))
-                } else if o.has('w') {
-                    self.resolve_window(ctx, t).ok().and_then(|t| t.wid).map(HookLevel::Window).ok_or_else(|| t.map_or_else(|| "no current window".to_string(), |t| format!("no such window: {t}")))
-                } else {
-                    self.resolve_session(ctx, t).map(HookLevel::Session).map_err(|_| t.map_or_else(|| "no current session".to_string(), |t| format!("no such session: {t}")))
-                };
-                let map = self.hook_map(level?).cloned().unwrap_or_default();
-                let ft = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
                 let aliases = self.command_aliases();
-                // cmd_show_options_all: user hooks, then the table's hooks of the scope (-p
-                // pane hooks, -w window and pane hooks, else session hooks; global pane
-                // options don't exist); global options hold every table hook, so an
-                // empty one is shown by name
-                use crate::options::{Scope, HOOKS};
-                let in_scope = |sc: Scope| if o.has('p') { sc == Scope::Pane } else if o.has('w') { sc != Scope::Session } else { sc == Scope::Session };
-                // user options made hooks by set-hook come first, as plain options
-                let scope = if o.has('p') { Scope::Pane } else if o.has('w') { Scope::Window } else { Scope::Session };
-                if let Ok(tt) = self.option_target(scope, global, ctx, t) && let Some(store) = self.store(scope, global, tt) {
-                    for (k, v) in store.0.iter().filter(|(k, _)| self.hook_events.contains(*k)) {
-                        match o.get('F') {
-                            Some(f) => {
-                                let vars = HashMap::from([
-                                    ("option_name".to_string(), k.clone()),
-                                    ("option_value".to_string(), v.clone()),
-                                    ("option_is_user".to_string(), "1".to_string()),
-                                    ("option_is_string".to_string(), "1".to_string()),
-                                    ("option_has_value".to_string(), "1".to_string()),
-                                    ("hook_fire_count".to_string(), "0".to_string()),
-                                ]);
-                                let line = self.expand_extra(ft, ctx.client, f, vars);
-                                ctx.out.push_str(&line);
-                                ctx.out.push('\n');
-                            }
-                            None => ctx.out.push_str(&format!("{k} {}\n", options::print_value(k, v))),
-                        }
-                    }
-                }
-                let names: Vec<String> = HOOKS.iter().filter(|(_, sc)| in_scope(*sc)).map(|(n, _)| n.to_string()).collect();
-                let only: Option<usize> = None;
-                for k in names {
-                    let items: Vec<(usize, &String)> = map.get(&k).map(|v| v.iter().enumerate().filter(|(i, c)| !c.is_empty() && only.is_none_or(|o| o == *i)).collect()).unwrap_or_default();
-                    let empty = items.is_empty();
-                    if empty && !(global && only.is_none() && crate::options::hook_scope(&k).is_some()) {
-                        continue;
-                    }
-                    let rows: Vec<(Option<usize>, String)> = if empty {
-                        vec![(None, String::new())]
-                    } else {
-                        items.into_iter().map(|(i, c)| (Some(i), print_command_string(c, &aliases, false))).collect()
-                    };
-                    for (i, value) in rows {
-                        match o.get('F') {
-                            Some(f) => {
-                                let vars = HashMap::from([
-                                    ("option_name".to_string(), k.clone()),
-                                    ("option_value".to_string(), value),
-                                    ("option_value_only".to_string(), "0".to_string()),
-                                    ("option_is_parent".to_string(), "0".to_string()),
-                                    ("option_is_array".to_string(), "1".to_string()),
-                                    ("option_is_string".to_string(), "0".to_string()),
-                                    ("option_is_hook".to_string(), (!k.starts_with('@') as u8).to_string()),
-                                    ("option_is_user".to_string(), (k.starts_with('@') as u8).to_string()),
-                                    ("option_has_value".to_string(), (i.is_some() as u8).to_string()),
-                                    ("option_has_array_key".to_string(), (i.is_some() as u8).to_string()),
-                                    ("option_array_key".to_string(), i.map(|i| i.to_string()).unwrap_or_default()),
-                                    // only monitor hooks count their firings
-                                    ("hook_fire_count".to_string(), "0".to_string()),
-                                ]);
-                                let line = self.expand_extra(ft, ctx.client, f, vars);
-                                ctx.out.push_str(&line);
-                                ctx.out.push('\n');
-                            }
-                            None => match i {
-                                Some(i) => ctx.out.push_str(&format!("{k}[{i}] {value}\n")),
-                                None => ctx.out.push_str(&format!("{k}\n")),
-                            },
-                        }
-                    }
-                }
-                Ok(Flow::Next)
+                self.cmd_set_hook(&o, ctx, &aliases)
             }
+            "show-hooks" => self.cmd_show_hooks(&o, ctx),
             // ---------------------------------------------------------------- scripting
             "source-file" => {
                 let mut injected = Vec::new();
@@ -3864,54 +3933,11 @@ impl Server {
                 }
                 let cwd = o.get('c').map(|c| self.expand(tt, ctx.client, c)).or_else(|| tt.pane.and_then(|p| self.panes.get(&p)).map(|p| p.current_path.clone()));
                 let flags = format!("{}{}", if o.has('b') { "b" } else { "" }, if o.has('E') { "E" } else { "" });
-                Err(format!("\0job-run\0{command}\0{}\0{flags}\0{}", cwd.unwrap_or_default(), tt.pane.map(|p| p.to_string()).unwrap_or_default()))
+                // output goes to a pane only with -t (cdata->wp_id), else to the client
+                let out_pane = tt.pane.filter(|_| o.has('t'));
+                Err(format!("\0job-run\0{command}\0{}\0{flags}\0{}", cwd.unwrap_or_default(), out_pane.map(|p| p.to_string()).unwrap_or_default()))
             }
-            "wait-for" => {
-                let ch = o.rest.first().ok_or("wait-for needs a channel")?.clone();
-                if o.has('S') {
-                    let locked = self.waits.get(&ch).is_some_and(|e| e.0);
-                    let waiters = self.waits.get_mut(&ch).map(|e| std::mem::take(&mut e.1)).unwrap_or_default();
-                    if !locked {
-                        self.waits.remove(&ch);
-                    }
-                    if waiters.is_empty() {
-                        // like tmux: a signal nobody is waiting for is kept for the next wait-for
-                        if !locked {
-                            self.waits_woken.insert(ch);
-                        }
-                        return Ok(Flow::Next);
-                    }
-                    for q in waiters {
-                        self.run_queue(q);
-                    }
-                    return Ok(Flow::Next);
-                }
-                if o.has('L') {
-                    let e = self.waits.entry(ch.clone()).or_insert((false, Vec::new()));
-                    if !e.0 {
-                        e.0 = true;
-                        return Ok(Flow::Next);
-                    }
-                    return Err(format!("\0wait\0{ch}"));
-                }
-                if o.has('U') {
-                    let Some(e) = self.waits.get_mut(&ch) else { return err(format!("channel {ch} not locked")) };
-                    if !e.0 {
-                        return err(format!("channel {ch} not locked"));
-                    }
-                    if e.1.is_empty() {
-                        e.0 = false;
-                    } else {
-                        let q = e.1.remove(0);
-                        self.run_queue(q);
-                    }
-                    return Ok(Flow::Next);
-                }
-                if self.waits_woken.remove(&ch) {
-                    return Ok(Flow::Next); // already signalled
-                }
-                Err(format!("\0wait\0{ch}"))
-            }
+            "wait-for" => self.cmd_wait_for(&o, ctx),
             "list-commands" => {
                 let rank = |n: &str| USAGE.iter().position(|(u, _)| *u == n).unwrap_or(usize::MAX);
                 let mut cmds: Vec<_> = COMMANDS.iter().collect();
@@ -4076,6 +4102,52 @@ impl Server {
                 }
             }
         };
+        let sid = self.new_session_id();
+        let now = now_secs();
+        let t = &self.sessions[&tsid];
+        let (tcols, trows, tactive) = (t.cols, t.rows, t.active);
+        let (sx, sy) = self.windows.get(&t.active_window()).map(|w| (w.sx, w.sy)).unwrap_or((80, 24));
+        let session = Session {
+            id: sid,
+            name,
+            links: BTreeMap::new(),
+            active: 0,
+            last: Vec::new(),
+            cols: tcols,
+            rows: trows,
+            cwd: t.cwd.clone(),
+            options: Options::default(),
+            env: t.env.clone(),
+            created: now,
+            activity: now,
+            activity_seq: super::activity_seq(),
+            last_attached: 0,
+            alerts: BTreeMap::new(),
+            group: None,
+        };
+        let cwd = session.cwd.clone();
+        self.sessions.insert(sid, session);
+        // cmd-new-session.c spawns the session's own first window, then
+        // session_group_synchronize_to replaces it with the group's windows: its
+        // pane and window are created, linked, unlinked and closed (with no process
+        // here: it never runs)
+        if let Ok(pane) = self.spawn_pane(Some(sid), sx, sy, &[EMPTY_PANE.to_string()], Some(&cwd), &[]) {
+            if let Some(sp) = self.ev.spawned.iter_mut().find(|sp| sp.pane == pane) {
+                sp.empty = false;
+            }
+            let wname = self.window_name_for(&[], Some(sid));
+            let wid = self.new_window_obj(wname, pane, sx, sy);
+            let idx = self.next_index(sid, None);
+            self.sessions.get_mut(&sid).unwrap().active = idx;
+            self.link(sid, idx, wid, true);
+            self.detect_changes(None);
+            self.sessions.get_mut(&sid).unwrap().links.clear();
+            if let Some(w) = self.windows.remove(&wid) {
+                for p in w.panes() {
+                    self.destroy_pane(p);
+                }
+            }
+        }
         let gid = match self.sessions[&tsid].group {
             Some(g) => g,
             None => {
@@ -4085,32 +4157,21 @@ impl Server {
                 g
             }
         };
-        let sid = self.new_session_id();
-        let now = now_secs();
-        let t = &self.sessions[&tsid];
-        let session = Session {
-            id: sid,
-            name,
-            links: t.links.clone(),
-            active: t.active,
-            last: Vec::new(),
-            cols: t.cols,
-            rows: t.rows,
-            cwd: t.cwd.clone(),
-            options: Options::default(),
-            env: t.env.clone(),
-            hooks: BTreeMap::new(),
-            created: now,
-            activity: now,
-            activity_seq: super::activity_seq(),
-            last_attached: 0,
-            alerts: BTreeMap::new(),
-            group: Some(gid),
-        };
-        self.sessions.insert(sid, session);
-        self.run_hook(Some(sid), "session-created", Ctx { client: ctx.client, ..Ctx::default() });
+        let links = self.sessions[&tsid].links.clone();
+        let s = self.sessions.get_mut(&sid).unwrap();
+        // the lowest window is current (session_select of RB_MIN): no
+        // session-window-changed
+        s.active = links.keys().next().copied().unwrap_or(tactive);
+        s.links = links;
+        s.group = Some(gid);
+        self.seen_active_now(sid);
+        // session_group_add, then every group window linked and the first one unlinked
+        self.detect_groups();
+        self.detect_group_sync(sid);
+        self.detect_changes(None);
+        self.fire_session("session-created", sid);
         if print {
-            let s = self.expand(Target { sid: Some(sid), ..Target::default() }, None, fmt.unwrap_or("#{session_name}:"));
+            let s = self.expand(self.target_for_session(sid), None, fmt.unwrap_or("#{session_name}:"));
             ctx.out.push_str(&s);
             ctx.out.push('\n');
         }
@@ -4230,117 +4291,12 @@ impl Server {
         cmds.iter().try_for_each(|c| check_command(c))
     }
 
-    /// The level a hook option lives at, as options_scope_from_name: session hooks in
-    /// the session (the global options with -g), window and pane hooks in the window
-    /// (with -p the pane, which ignores -g; with -g the global window options).
-    fn hook_level(&self, o: &Opts, ctx: &Ctx, base: &str) -> Result<HookLevel, String> {
-        let t = o.get('t');
-        let cause = |what: &str| t.map_or_else(|| format!("no current {what}"), |t| format!("no such {what}: {t}"));
-        Ok(match options::hook_scope(base) {
-            Some(Scope::Pane) if o.has('p') => HookLevel::Pane(self.resolve_pane(ctx, t).ok().and_then(|t| t.pane).ok_or_else(|| cause("pane"))?),
-            Some(Scope::Pane | Scope::Window) if o.has('g') => HookLevel::Global,
-            Some(Scope::Pane | Scope::Window) => HookLevel::Window(self.resolve_window(ctx, t).ok().and_then(|t| t.wid).ok_or_else(|| cause("window"))?),
-            _ if o.has('g') => HookLevel::Global,
-            _ => HookLevel::Session(self.resolve_session(ctx, t).map_err(|_| cause("session"))?),
-        })
-    }
-
-    /// The hooks of a level.
-    pub(crate) fn hook_map(&self, level: HookLevel) -> Option<&BTreeMap<String, Vec<String>>> {
-        match level {
-            HookLevel::Global => Some(&self.hooks),
-            HookLevel::Session(s) => self.sessions.get(&s).map(|s| &s.hooks),
-            HookLevel::Window(w) => self.windows.get(&w).map(|w| &w.hooks),
-            HookLevel::Pane(p) => self.panes.get(&p).map(|p| &p.hooks),
-        }
-    }
-
-    fn hook_map_mut(&mut self, level: HookLevel) -> Result<&mut BTreeMap<String, Vec<String>>, String> {
-        match level {
-            HookLevel::Global => Ok(&mut self.hooks),
-            HookLevel::Session(s) => self.sessions.get_mut(&s).map(|s| &mut s.hooks).ok_or_else(|| "no such session".into()),
-            HookLevel::Window(w) => self.windows.get_mut(&w).map(|w| &mut w.hooks).ok_or_else(|| "no such window".into()),
-            HookLevel::Pane(p) => self.panes.get_mut(&p).map(|p| &mut p.hooks).ok_or_else(|| "no such pane".into()),
-        }
-    }
-
-    /// The level above (show-options -A): pane -> window -> global.
-    fn hook_parent(&self, level: HookLevel) -> Option<HookLevel> {
-        match level {
-            HookLevel::Global => None,
-            HookLevel::Pane(p) => self.window_of(p).map(HookLevel::Window),
-            _ => Some(HookLevel::Global),
-        }
-    }
-
-    /// A hook's commands at a level: the global level holds every hook (an empty
-    /// array by default), the others only those set on them.
-    fn hook_values(&self, level: HookLevel, base: &str) -> Option<&[String]> {
-        match level {
-            HookLevel::Global => Some(self.hooks.get(base).map_or(&[][..], |v| v.as_slice())),
-            l => self.hook_map(l)?.get(base).map(|v| v.as_slice()),
-        }
-    }
-
-    /// set-option on a hook: an array of command lists. Unset elements are kept as
-    /// "" so the other keys stay put (string keys are not supported).
-    fn set_hook_option(&mut self, o: &Opts, ctx: &Ctx, name: &str, arg: &str, value: Option<String>) -> Result<(), String> {
-        let (base, key) = match name.split_once('[') {
-            Some((b, k)) => {
-                let k = k.trim_end_matches(']');
-                (b, Some(k.parse::<usize>().map_err(|_| format!("bad array key: {k}"))?))
-            }
-            None => (name, None),
-        };
-        let sid = match self.hook_level(o, ctx, base) {
-            Ok(s) => s,
-            Err(_) if o.has('q') => return Ok(()),
-            Err(e) => return err(e),
-        };
-        let already = self.hook_values(sid, base).is_some_and(|v| key.is_none_or(|i| v.get(i).is_some_and(|c| !c.is_empty())));
-        if o.has('o') && !o.has('u') && already {
-            return if o.has('q') { Ok(()) } else { err(format!("already set: {arg}")) };
-        }
-        let cmd = match &value {
-            _ if o.has('u') || o.has('U') => None,
-            None => return err("empty value"),
-            Some(v) => Some(command_list_string(v, &self.command_aliases())),
-        };
-        let map = self.hook_map_mut(sid)?;
-        let Some(cmd) = cmd else {
-            match key {
-                None => { map.remove(base); }
-                Some(i) => {
-                    if let Some(v) = map.get_mut(base) && i < v.len() {
-                        v[i].clear();
-                        while v.last().is_some_and(String::is_empty) { v.pop(); }
-                    }
-                }
-            }
-            return Ok(());
-        };
-        // the level gets the (empty) array even when the command does not parse
-        let v = map.entry(base.to_string()).or_default();
-        let cmd = cmd?;
-        let i = match key {
-            None => {
-                if !o.has('a') { v.clear(); }
-                // options_array_assign adds nothing for an empty value, else uses the first free key
-                if value.as_deref().unwrap_or("").is_empty() { return Ok(()); }
-                v.iter().position(String::is_empty).unwrap_or(v.len())
-            }
-            Some(i) => i,
-        };
-        if v.len() <= i { v.resize(i + 1, String::new()); }
-        v[i] = cmd;
-        Ok(())
-    }
-
-    fn cmd_set_option(&mut self, window_cmd: bool, o: &Opts, ctx: &Ctx) -> Result<(), String> {
+    pub(super) fn cmd_set_option(&mut self, window_cmd: bool, o: &Opts, ctx: &Ctx) -> Result<(), String> {
         let Some((name, arg)) = self.option_name(o, ctx, o.rest.first().ok_or("missing argument")?)? else { return Ok(()) };
         let value = o.rest.get(1).map(|v| if o.has('F') { self.expand(self.current(ctx), ctx.client, v) } else { v.clone() });
         if options::hook_scope(&name).is_some() {
-            return self.set_hook_option(o, ctx, &name, &arg, value);
+            let aliases = self.command_aliases();
+            return self.set_hook_option(o, ctx, &name, &arg, value, &aliases);
         }
         let scope = Self::option_scope(window_cmd, o, Some(&name));
         // -g has no meaning for server options and is ignored with -p
@@ -4420,7 +4376,6 @@ impl Server {
             "mode-keys" => {}
             _ => {}
         }
-        self.run_hook(None, "option-changed", Ctx::default());
         self.copy_sync_all();
         self.mark_all_dirty();
         for c in self.clients.values_mut() {
@@ -4451,8 +4406,7 @@ impl Server {
         }
     }
 
-    /// show-options, show-window-options and (`hooks_cmd`) show-hooks with a name.
-    fn cmd_show_options(&mut self, window_cmd: bool, hooks_cmd: bool, o: &Opts, ctx: &mut Ctx) -> Result<(), String> {
+    pub(super) fn cmd_show_options(&mut self, window_cmd: bool, o: &Opts, ctx: &mut Ctx) -> Result<(), String> {
         let named = match o.rest.first() {
             Some(arg) => match self.option_name(o, ctx, arg)? { Some(n) => Some(n), None => return Ok(()) },
             None => None,
@@ -4478,7 +4432,7 @@ impl Server {
                 let is_string = !is_hook && def.is_none_or(|d| matches!(d.kind, options::Kind::Str | options::Kind::Style)
                     || (d.kind == options::Kind::Array && d.name != "pane-colours"));
                 let b = |v: bool| if v { "1".to_string() } else { "0".to_string() };
-                let mut vars = HashMap::from([
+                let vars = HashMap::from([
                     ("option_name".to_string(), base.to_string()),
                     ("option_value".to_string(), value.unwrap_or("").to_string()),
                     ("option_value_only".to_string(), b(o.has('v'))),
@@ -4491,10 +4445,6 @@ impl Server {
                     ("option_has_array_key".to_string(), b(akey.is_some())),
                     ("option_array_key".to_string(), akey.unwrap_or("").to_string()),
                 ]);
-                // only monitor hooks count their firings
-                if hooks_cmd {
-                    vars.insert("hook_fire_count".to_string(), "0".to_string());
-                }
                 out.push_str(&self.expand_extra(ft, ctx.client, f, vars));
                 out.push('\n');
                 return;
@@ -4506,41 +4456,34 @@ impl Server {
                 None => out.push_str(&format!("{key}{star}\n")),
             }
         };
-        // hooks live in the hook maps: the session's (if not -g), then the global one
-        let hook_sid = match self.hook_level(o, ctx, name.map_or("", |n| n.split('[').next().unwrap_or(n))) {
-            Ok(s) => s,
-            Err(_) if o.has('q') && hook => return Ok(()),
-            Err(e) if hook => return err(e),
-            Err(_) => HookLevel::Global,
-        };
-        let show_hook = |out: &mut String, name: &str, named: bool| {
-            let (base, key) = match name.split_once('[') {
-                Some((b, k)) => (b, Some(k.trim_end_matches(']'))),
-                None => (name, None),
-            };
-            let mut found = self.hook_values(hook_sid, base).map(|v| (v, false));
-            let mut level = hook_sid;
-            while found.is_none() && o.has('A') && let Some(up) = self.hook_parent(level) {
-                found = self.hook_values(up, base).map(|v| (v, true));
-                level = up;
-            }
-            let Some((values, parent)) = found else { return };
-            // set-hook keeps the command as given; it is shown as tmux prints it
-            let aliases = self.command_aliases();
-            let values: Vec<String> = values.iter().map(|v| if v.is_empty() { String::new() } else { print_command_string(v, &aliases, false) }).collect();
-            match key {
-                Some(k) => print(out, name, Some(k.parse::<usize>().ok().and_then(|i| values.get(i)).map_or("", String::as_str)), parent),
-                None if values.iter().all(String::is_empty) => print(out, base, None, parent && !named),
-                None => {
-                    for (i, v) in values.iter().enumerate().filter(|(_, v)| !v.is_empty()) {
-                        print(out, &format!("{base}[{i}]"), Some(v), parent);
-                    }
+        // hooks are array options of their level; -A falls back to the parent levels
+        let show_hook = |out: &mut String, level: events::Level, name: &str, named: bool| {
+            let base = name.split('[').next().unwrap_or(name);
+            let (lvl, parent) = if self.level_holds(level, base) {
+                (level, false)
+            } else if o.has('A') {
+                match self.hook_parents(level).into_iter().find(|l| self.level_holds(*l, base)) {
+                    Some(l) => (l, true),
+                    None => return,
                 }
+            } else {
+                return;
+            };
+            let mut lines = Vec::new();
+            self.hook_lines(lvl, name, &mut lines);
+            for (k, v, _) in lines {
+                let empty = v.is_none() && !name.contains('[');
+                print(out, &k, v.as_deref(), parent && !(named && empty));
             }
         };
         if let Some((n, _)) = named.as_ref().filter(|_| hook) {
+            let level = match self.hook_scope_level(o, ctx, n.split('[').next().unwrap_or(n)) {
+                Ok(l) => l,
+                Err(_) if o.has('q') => return Ok(()),
+                Err(e) => return err(e),
+            };
             let mut out = String::new();
-            show_hook(&mut out, n, true);
+            show_hook(&mut out, level, n, true);
             ctx.out.push_str(&out);
             return Ok(());
         }
@@ -4594,10 +4537,19 @@ impl Server {
                 }
             }
             None => {
-                // user options of this level first, then the table in tmux order
-                // (user options made hooks by set-hook only with -H)
-                for (k, v) in store.0.iter().filter(|(k, _)| k.starts_with('@') && (o.has('H') || !self.hook_events.contains(*k))) {
-                    print(&mut out, k, Some(v), false);
+                // user options of this level first (@ hooks only with -H), then the table in tmux order
+                let level = match (scope, global) {
+                    (Scope::Server, _) => None,
+                    (Scope::Session, true) => Some(events::Level::GlobalSession),
+                    (Scope::Session, false) => tt.sid.map(events::Level::Session),
+                    (_, true) => Some(events::Level::GlobalWindow),
+                    (Scope::Window, false) => tt.wid.map(events::Level::Window),
+                    (Scope::Pane, false) => tt.pane.map(events::Level::Pane),
+                };
+                for (k, v) in store.0.iter().filter(|(k, _)| k.starts_with('@')) {
+                    if o.has('H') || level.is_none_or(|l| !self.is_user_hook(l, k)) {
+                        print(&mut out, k, Some(v), false);
+                    }
                 }
                 let wanted = |s: Scope| s == scope || (s == Scope::Pane && scope == Scope::Window);
                 for d in options::DEFS.iter().filter(|d| wanted(d.scope)) {
@@ -4606,9 +4558,9 @@ impl Server {
                     }
                 }
                 // hooks come last in the table and only show with -H
-                if o.has('H') && scope != Scope::Server {
+                if let Some(level) = level.filter(|_| o.has('H')) {
                     for (h, _) in options::HOOKS.iter().filter(|h| wanted(h.1)) {
-                        show_hook(&mut out, h, false);
+                        show_hook(&mut out, level, h, false);
                     }
                 }
             }
@@ -4679,15 +4631,6 @@ impl Server {
         }
         id
     }
-}
-
-/// Where a hook is set: the global options, a session, a window or a pane.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum HookLevel {
-    Global,
-    Session(SessId),
-    Window(WinId),
-    Pane(PaneId),
 }
 
 /// Commands a read-only (server-access -r) client may run.

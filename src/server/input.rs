@@ -256,7 +256,10 @@ impl Server {
         c.send(S_OUTPUT, features::string_capability(&c.term_caps, "Ms", "\x1b]52;%p1%s;%p2%s\x07", &[clip, &encoded]).as_bytes());
     }
 
-    pub(crate) fn pane_input_requests(&mut self, pane: PaneId, queries: Vec<(Vec<u8>, bool)>, sets: Vec<(Vec<u8>, Vec<u8>)>, passthrough: Vec<Vec<u8>>) {
+    /// The OSC 52 queries, sets and passthrough of one read of output; returns
+    /// whether each set reached the clipboard (pane-set-clipboard fires for those).
+    pub(crate) fn pane_input_requests(&mut self, pane: PaneId, queries: Vec<(Vec<u8>, bool)>, sets: Vec<(Vec<u8>, Vec<u8>)>, passthrough: Vec<Vec<u8>>) -> Vec<bool> {
+        let mut set = vec![false; sets.len()];
         // Clients showing the pane (screen_write_set_client_cb).
         let showing = |srv: &Self| -> Vec<ClientId> {
             srv.clients.values().filter(|c| c.attached && !c.suspended && c.control == 0 && c.session.is_some_and(|s| {
@@ -266,13 +269,12 @@ impl Server {
         };
         // input_osc_52_parse: only with set-clipboard on; the selector keeps its allowed characters.
         if self.opt_server("set-clipboard") == "on" {
-            for (selector, data) in sets {
+            for (i, (selector, data)) in sets.into_iter().enumerate() {
                 if data.is_empty() { continue; }
                 let Ok(decoded) = decode_osc52(&data) else { continue };
                 let clip = clipboard_selector(&selector);
                 for cid in showing(self) { self.set_selection(cid, &clip, &decoded); }
-                let ctx = Ctx { pane: Some(pane), ..Ctx::default() };
-                self.run_hook(self.session_of_pane(pane).map(|x| x.0), "pane-set-clipboard", ctx);
+                set[i] = true;
                 self.add_buffer(None, decoded, false);
             }
             for (selector, bel) in queries {
@@ -312,6 +314,7 @@ impl Server {
                 if linked && (allow == "all" || visible) { for data in &passthrough { c.send(S_OUTPUT, data); } }
             }
         }
+        set
     }
 
     /// tty_keys_clipboard: the terminal's OSC 52 reply answers the panes' get-clipboard
@@ -435,8 +438,9 @@ impl Server {
                     }
                     return;
                 }
-                // focus reports are only forwarded when the pane asked for them
+                // focus reports reach panes through pane-focus-in/out (only those that asked)
                 if raw == b"\x1b[I" || raw == b"\x1b[O" {
+                    self.client_focus(cid, raw == b"\x1b[I");
                     return;
                 }
                 if let Some(t) = self.input_target(cid) {

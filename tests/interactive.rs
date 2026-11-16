@@ -1197,3 +1197,34 @@ fn display_prompt_cursor_style_and_colour() {
     wait_for("command mode cursor", || t.raw_text().contains("\x1b[3 q") && t.raw_text().contains("\x1b]12;rgb:00/00/80\x07"));
     t.send(b"\x03");
 }
+
+/// A terminal client resizes once attached (client-resized with the same size), and
+/// select-window updates focus before session-window-changed; only the windows told
+/// about change their focus (a stale focused pane is not reported).
+#[test]
+fn attach_resize_and_focus_order() {
+    let ctx = Ctx::new("attfocus");
+    ctx.ok(&["new-session", "-d", "-s", "f", "-x", "70", "-y", "20"]);
+    ctx.ok(&["split-window", "-d", "-t", "f:0"]);
+    ctx.ok(&["new-window", "-d", "-t", "f:1"]);
+    ctx.ok(&["set", "-g", "focus-events", "on"]);
+    for h in ["client-resized", "pane-focus-in", "pane-focus-out", "session-window-changed", "window-pane-changed"] {
+        ctx.ok(&["set-hook", "-g", h, &format!("set -gaF @log '{h} '")]);
+    }
+    let mut t = Term::attach(&ctx, &["attach", "-t", "f"], 70, 21);
+    t.wait_screen("attached", |s| s.contains("[f]"));
+    wait_for("resized", || ctx.cmd(&["show", "-gqv", "@log"]).1.contains("client-resized"));
+    ctx.ok(&["set", "-g", "@log", ""]);
+    ctx.ok(&["select-window", "-t", "f:1"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@log"]).trim(), "pane-focus-out pane-focus-in session-window-changed");
+    // focus-events off: selecting updates no focus; on again, only the two panes
+    // select-pane changes are updated (f:0's pane keeps its stale focus)
+    ctx.ok(&["set", "-g", "focus-events", "off"]);
+    ctx.ok(&["select-window", "-t", "f:0"]);
+    ctx.ok(&["set", "-g", "focus-events", "on"]);
+    ctx.ok(&["set", "-g", "@log", ""]);
+    ctx.ok(&["select-pane", "-t", "f:0.1"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@log"]).trim(), "pane-focus-in window-pane-changed");
+    drop(t.child.kill());
+    t.wait_exit();
+}

@@ -7,6 +7,7 @@
 mod cmds;
 mod control;
 mod copy;
+mod events;
 pub mod features;
 mod termcap;
 mod input;
@@ -105,6 +106,9 @@ pub struct PaneCb {
     pub title: Option<String>,
     /// ESC k name ST, for allow-rename.
     pub rename: Option<String>,
+    pub current_title: String,
+    pub title_stack: VecDeque<String>,
+    pub suppress_title: bool,
     pub cwd: Option<String>,
     /// The pane's extended key mode (0, 1 or 2: tmux's MODE_KEYS_EXTENDED and _2), set by
     /// CSI > 4 ; n m and CSI > 4 n, and by extended-keys always at a reset.
@@ -117,6 +121,8 @@ pub struct PaneCb {
     pub passthrough: Vec<Vec<u8>>,
     /// State reported for formats (pane_path, cursor_colour, pane_pb_*, pane_command_*).
     pub osc: OscState,
+    /// Output events in parsing order, with the state or data each carried.
+    pub events: Vec<events::OutputEvent>,
 }
 
 /// What a pane's application reported through OSC sequences that tmux keeps.
@@ -201,6 +207,11 @@ pub fn ext_keys_option(v: &str) -> u8 {
     match v { "always" => 2, "on" => 1, _ => 0 }
 }
 
+/// The signal number in a pane's exit status (see exit_status).
+pub fn exit_signal(status: i32) -> Option<i32> {
+    (cfg!(unix) && status < 0).then_some(-status)
+}
+
 /// The exit status in OSC 133 "D;status[;key=value...]": 0 when absent or a key=value, 255
 /// when not a number from 0 to 255 (tmux's input_osc_133_exit_status).
 fn osc133_exit_status(arg: &str) -> i32 {
@@ -209,6 +220,8 @@ fn osc133_exit_status(arg: &str) -> i32 {
     if field.is_empty() || field.contains('=') {
         return 0;
     }
+    // strtonum (strtoll) skips leading white space
+    let field = field.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
     field.parse::<i32>().ok().filter(|n| (0..=255).contains(n)).unwrap_or(255)
 }
 
@@ -304,7 +317,11 @@ impl vt100::Callbacks for PaneCb {
         self.clipboard_queries.push((ty.to_vec(), bel));
     }
     fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
-        if self.clipboard_sets.len() < 16 { self.clipboard_sets.push((ty.to_vec(), data.to_vec())); }
+        // its place among the output events (pane-set-clipboard); input_osc_52 sets it
+        if self.clipboard_sets.len() < 16 {
+            self.clipboard_sets.push((ty.to_vec(), data.to_vec()));
+            self.events.push(events::OutputEvent::Clipboard);
+        }
     }
     fn dcs(&mut self, _: &mut vt100::Screen, payload: &[u8]) {
         // the parser already turned the doubled ESC bytes back into one
@@ -314,9 +331,16 @@ impl vt100::Callbacks for PaneCb {
     }
     fn audible_bell(&mut self, _: &mut vt100::Screen) {
         self.bell = true;
+        self.events.push(events::OutputEvent::Osc("pane-bell", self.osc.clone()));
     }
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
-        self.title = Some(String::from_utf8_lossy(title).into_owned());
+        if self.suppress_title {
+            return;
+        }
+        let title = String::from_utf8_lossy(title).into_owned();
+        self.current_title = title.clone();
+        self.events.push(events::OutputEvent::Title(title.clone()));
+        self.title = Some(title);
     }
     fn reset(&mut self, _: &mut vt100::Screen) {
         // screen_write_reset: extended-keys always puts the pane back in mode 1
@@ -333,13 +357,25 @@ impl vt100::Callbacks for PaneCb {
         self.osc.osc(params);
         match params {
             // input_osc_133: the cursor's line starts a prompt (a continuation prompt,
-            // P;k=s, does not count) or command output; capture-pane -F shows them
-            [b"133", arg, rest @ ..] => match arg.first() {
-                Some(b'A' | b'N') => screen.mark_cursor_row(vt100::ROW_START_PROMPT),
-                Some(b'P') if !rest.contains(&&b"k=s"[..]) => screen.mark_cursor_row(vt100::ROW_START_PROMPT),
-                Some(b'C') => screen.mark_cursor_row(vt100::ROW_START_OUTPUT),
-                _ => {}
-            },
+            // P;k=s, does not count) or command output; capture-pane -F shows them, and
+            // A/N, C and D fire pane-shell-prompt, pane-command-started and -finished
+            [b"133", arg, rest @ ..] => {
+                match arg.first() {
+                    Some(b'A' | b'N') => screen.mark_cursor_row(vt100::ROW_START_PROMPT),
+                    Some(b'P') if !rest.contains(&&b"k=s"[..]) => screen.mark_cursor_row(vt100::ROW_START_PROMPT),
+                    Some(b'C') => screen.mark_cursor_row(vt100::ROW_START_OUTPUT),
+                    _ => {}
+                }
+                let name = match arg.first() {
+                    Some(b'A' | b'N') => Some("pane-shell-prompt"),
+                    Some(b'C') => Some("pane-command-started"),
+                    Some(b'D') => Some("pane-command-finished"),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    self.events.push(events::OutputEvent::Osc(name, self.osc.clone()));
+                }
+            }
             [b"7", url, ..] => self.cwd = decode_file_url(&String::from_utf8_lossy(url)),
             [b"9", b"9", path, ..] => self.cwd = Some(String::from_utf8_lossy(path).trim_matches('"').to_string()),
             _ => {}
@@ -352,6 +388,20 @@ impl vt100::Callbacks for PaneCb {
                 self.replies.extend(format!("\x1b[?2031;{}$y", if screen.theme_updates() { 1 } else { 2 }).bytes());
             }
             (Some(b'?'), 'n', 996) => self.colours.report(&mut self.replies),
+            (None, 't', 22) if params.get(1).and_then(|p| p.first()).is_some_and(|p| matches!(p, 0 | 2)) => {
+                if self.title_stack.len() == 10 {
+                    self.title_stack.pop_front();
+                }
+                self.title_stack.push_back(self.current_title.clone());
+            }
+            (None, 't', 23) if params.get(1).and_then(|p| p.first()).is_some_and(|p| matches!(p, 0 | 2)) => {
+                if let Some(title) = self.title_stack.pop_back() {
+                    self.current_title = title;
+                }
+                let title = self.current_title.clone();
+                self.title = Some(title.clone());
+                self.events.push(events::OutputEvent::Title(title));
+            }
             (None, 'n', 6) => {
                 let (r, c) = screen.cursor_position();
                 self.replies.extend(format!("\x1b[{};{}R", r + 1, c + 1).bytes());
@@ -394,8 +444,6 @@ pub struct Pane {
     /// command-prompt -P: a prompt drawn on the pane's last line.
     pub prompt: Option<Prompt>,
     pub options: Options,
-    /// Hooks set on the pane (set-hook -p).
-    pub hooks: BTreeMap<String, Vec<String>>,
     pub pipe: Option<Sender<Vec<u8>>>,
     pub last_output: Instant,
     pub created: u64,
@@ -508,8 +556,6 @@ pub struct Window {
     pub last_active: Option<PaneId>,
     pub zoomed: bool,
     pub options: Options,
-    /// Hooks set on the window (window and pane hooks without -g).
-    pub hooks: BTreeMap<String, Vec<String>>,
     #[allow(dead_code)]
     pub alerts: u8,
     pub layout_cycle: Option<usize>,
@@ -557,7 +603,6 @@ pub struct Session {
     pub cwd: String,
     pub options: Options,
     pub env: BTreeMap<String, Option<String>>,
-    pub hooks: BTreeMap<String, Vec<String>>,
     pub created: u64,
     pub activity: u64,
     /// activity_seq() at the last activity update.
@@ -730,7 +775,6 @@ pub struct Client {
     /// Size set with refresh-client -C (control clients don't size windows otherwise).
     pub control_size: Option<(u16, u16)>,
     pub control_seq: u64,
-    pub seen: control::Seen,
     /// What the client's terminal supports (terminal-features, -T).
     pub features: features::Features,
     /// refresh-client -l: until when a clipboard reply from the terminal makes a buffer
@@ -762,12 +806,12 @@ pub struct ClientIo {
 }
 
 #[cfg(unix)]
-fn exit_signal(s: &std::process::ExitStatus) -> Option<i32> {
+fn process_exit_signal(s: &std::process::ExitStatus) -> Option<i32> {
     std::os::unix::process::ExitStatusExt::signal(s)
 }
 
 #[cfg(not(unix))]
-fn exit_signal(_: &std::process::ExitStatus) -> Option<i32> {
+fn process_exit_signal(_: &std::process::ExitStatus) -> Option<i32> {
     None
 }
 
@@ -820,28 +864,40 @@ impl Client {
         Duration::from_millis(now_ms().saturating_sub(self.backlog_since.load(Ordering::SeqCst)))
     }
 
-    /// Ends an attached client; control clients get %exit first.
+    /// Ends an attached client; control clients get %exit first, after the reply
+    /// of the command that is running (server_client_check_exit).
     pub fn send_exit(&self, msg: &str) {
         if self.control > 0 {
-            let reason = msg.trim_matches(['[', ']']);
-            let line = if reason.is_empty() { "%exit\n".to_string() } else { format!("%exit {reason}\n") };
-            self.send(S_OUTPUT, line.as_bytes());
-            if self.ctl.wait_exit {
-                // wait-exit: the client leaves after its next line
-                self.ctl.exiting.set(true);
-                return;
-            }
+            self.ctl.deferred_exit.borrow_mut().get_or_insert_with(|| msg.to_string());
+            return;
         }
         // detach and session exit clear `attached` first; the reset depends only on what the
         // terminal was given, which is nothing for a command client
-        if self.control == 0 {
-            let reset = self.tty_stop_sequence();
-            if !reset.is_empty() { self.send(S_OUTPUT, reset.as_bytes()); }
+        let reset = self.tty_stop_sequence();
+        if !reset.is_empty() { self.send(S_OUTPUT, reset.as_bytes()); }
+        self.send(S_EXIT, msg.as_bytes());
+    }
+
+    /// Sends a control client's deferred exit.
+    pub fn finish_exit(&self) {
+        let Some(msg) = self.ctl.deferred_exit.borrow_mut().take() else { return };
+        // a control client is never attached in its client process: detaching and
+        // other exits print a bare %exit; only messages the server provides
+        // (client_dispatch_exit_message) are shown
+        let reason = msg.trim_matches(['[', ']']);
+        let reason = if matches!(reason, "access not allowed" | "too far behind") { reason } else { "" };
+        let line = if reason.is_empty() { "%exit\n".to_string() } else { format!("%exit {reason}\n") };
+        self.send(S_OUTPUT, line.as_bytes());
+        if self.ctl.wait_exit {
+            // wait-exit: the client leaves after its next line
+            self.ctl.exiting.set(true);
+            return;
         }
         self.send(S_EXIT, msg.as_bytes());
     }
     pub fn name(&self) -> String {
-        format!("client-{}", self.id)
+        let id = self.ident.as_ref().filter(|i| !i.tty && i.pid != 0).map_or(self.id, |i| i.pid);
+        format!("client-{id}")
     }
 }
 
@@ -868,6 +924,11 @@ pub struct Ctx {
     pub pane: Option<PaneId>,
     pub mouse: Option<input::MouseCtx>,
     pub out: output::Output,
+    /// Errors of config file lines for a command client: its stderr, exit status 1
+    /// (cmdq_error sets the client's retval).
+    pub soft_err: String,
+    /// 1: commands of a hook (no after-* hooks); 2: run from the global queue, so the
+    /// events they cause run no hooks at all (CMDQ_STATE_NOHOOKS).
     pub hook_depth: u8,
     /// True when run from a key binding (output goes to view mode).
     pub from_key: bool,
@@ -884,11 +945,38 @@ pub struct Ctx {
     /// The client the message log names when it is not `client` (send-keys -K: the
     /// client that ran send-keys).
     pub log_client: Option<ClientId>,
+    /// Formats added by a hook (hook, hook_*), seen by its commands.
+    pub formats: Option<Arc<HashMap<String, String>>>,
+    /// Typed by a control client (its reply's %begin flags are 1).
+    pub control_line: bool,
+    /// A hook's current state (cmd_find_state): its session and winlink as well as
+    /// `pane`, used while `pane` is still that pane.
+    pub target: Option<vars::Target>,
+    /// A control client's reply blocks were written item by item.
+    pub control_done: bool,
+    /// The queue waits inside a control client's command: its block is not written yet.
+    pub control_open: bool,
+    /// Hook context stack survives async commands that park the queue.
+    pub hook_saved: events::HookSaved,
+    pub command_error: Option<String>,
+    pub hook_error: Option<String>,
+    pub skip_after: bool,
 }
 
-/// Queue markers source-file puts around a file's commands (never typed: they start with NUL).
-pub const FILE_PUSH: &str = "\0file-push";
-pub const FILE_POP: &str = "\0file-pop";
+/// Queue markers source-file puts around a file's commands. A parsed command can hold any
+/// bytes (a NUL in a config file too), so each marker carries a nonce chosen at startup.
+pub fn internal_mark(name: &str) -> String {
+    use std::hash::{BuildHasher, Hasher};
+    static NONCE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+        h.write_u32(std::process::id());
+        h.finish()
+    });
+    format!("\0{name}\0{:016x}", *NONCE)
+}
+pub static FILE_PUSH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("file-push"));
+pub static FILE_POP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("file-pop"));
 
 /// The tmux release whose behaviour this server matches (`#{version}`).
 pub const TMUX_VERSION: &str = "3.8";
@@ -947,14 +1035,13 @@ pub struct Server {
     /// Hidden environment variables (set-environment -h, %hidden): (session or 0 for
     /// the global environment, name). Not given to new processes.
     pub env_hidden: std::collections::HashSet<(SessId, String)>,
-    pub hooks: BTreeMap<String, Vec<String>>,
-    /// User options set with set-hook (hooks_add_event): show-hooks lists them.
-    pub hook_events: std::collections::BTreeSet<String>,
     /// The configuration has been loaded (cfg_finished): commands are logged from then.
     pub cfg_finished: bool,
     /// While send-keys -K types keys: the client that ran it (key_bindings_dispatch
     /// queues the bound commands for that client).
     pub key_origin: Option<ClientId>,
+    /// Events: hook bookkeeping, wait-for -E, monitors, change detection.
+    pub ev: events::State,
     pub buffers: Vec<Buffer>,
     pub buffer_seq: u32,
     pub bindings: BTreeMap<String, BTreeMap<String, Binding>>,
@@ -962,12 +1049,11 @@ pub struct Server {
     /// Prompt history per type (command, search).
     pub prompt_history: [Vec<String>; 2],
     pub jobs: HashMap<u32, Parked>,
-    pub waits: HashMap<String, (bool, Vec<Queue>)>,
-    /// wait-for channels signalled while nobody waited (the next wait returns at once).
-    pub waits_woken: std::collections::HashSet<String>,
-    pub overlay_waits: Vec<(ClientId, u64, String, Queue)>,
-    /// Queues waiting for a prompt to close: (client, prompt id, command, queue).
-    pub prompt_waits: Vec<(ClientId, u64, String, Queue)>,
+    pub waits: HashMap<String, events::Channel>,
+    /// Queues waiting for an overlay to close, with the command's argv (its after hook).
+    pub overlay_waits: Vec<(ClientId, u64, Vec<String>, Queue)>,
+    /// Queues waiting for a prompt to close: (client, prompt id, the command's argv, queue).
+    pub prompt_waits: Vec<(ClientId, u64, Vec<String>, Queue)>,
     /// The last prompt id given out (Server::next_prompt_id).
     pub prompt_ids: u64,
     /// Copy-mode panes scrolling while a selection drag rests at an edge.
@@ -1043,25 +1129,37 @@ pub fn run(config: Option<String>) -> io::Result<()> {
     });
 
     let started = Instant::now();
+    let mut last_detect = Instant::now();
     loop {
         let timeout = srv.next_timeout();
+        // a turn with only pane output changes nothing change detection looks at (its
+        // events fire where the output is read); others are checked every turn
+        let mut output_only = true;
         match rx.recv_timeout(timeout) {
             Ok(ev) => {
+                output_only &= matches!(ev, Event::PaneData(..));
                 srv.handle(ev);
                 // Coalesce bursts of output into one render.
                 let deadline = Instant::now() + Duration::from_millis(4);
                 while let Ok(ev) = rx.try_recv() {
+                    output_only &= matches!(ev, Event::PaneData(..));
                     srv.handle(ev);
                     if Instant::now() > deadline {
                         break;
                     }
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Timeout) => output_only = false,
             Err(RecvTimeoutError::Disconnected) => break,
         }
         srv.sync_groups();
         srv.timers();
+        if !output_only || last_detect.elapsed() >= Duration::from_millis(50) {
+            last_detect = Instant::now();
+            srv.detect_changes(None);
+        }
+        srv.drain_hooks();
+        srv.ev.activity.clear();
         srv.control_notify();
         srv.render_all();
         let exit_empty = options::is_on(srv.opts_server.get("exit-empty").unwrap_or("on"));
@@ -1104,10 +1202,9 @@ impl Server {
             opts_window: Options::defaults(Scope::Window),
             env,
             env_hidden: std::collections::HashSet::new(),
-            hooks: BTreeMap::new(),
-            hook_events: Default::default(),
             cfg_finished: false,
             key_origin: None,
+            ev: Default::default(),
             buffers: Vec::new(),
             buffer_seq: 0,
             bindings: input::default_bindings(),
@@ -1115,7 +1212,6 @@ impl Server {
             prompt_history: Default::default(),
             jobs: HashMap::new(),
             waits: HashMap::new(),
-            waits_woken: Default::default(),
             overlay_waits: Vec::new(),
             prompt_waits: Vec::new(),
             prompt_ids: 0,
@@ -1478,7 +1574,6 @@ impl Server {
                 control: 0,
                 control_size: None,
                 control_seq: 0,
-                seen: Default::default(),
                 features: Default::default(),
                 clipboard_query: None,
                 focused: false,
@@ -1510,15 +1605,26 @@ impl Server {
     }
 
     fn client_gone(&mut self, cid: ClientId) {
+        let Some(c) = self.clients.get(&cid) else { return };
+        // server_client_lost: client-detached if attached, client-closed for terminals
+        let detached = ((c.attached && c.session.is_some()) || self.ev.lost_attached.remove(&cid)).then(|| self.payload_client(cid));
+        let closed = (c.control > 0 || c.ident.as_ref().is_some_and(|i| i.tty)).then(|| self.payload_client(cid));
         let Some(c) = self.clients.remove(&cid) else { return };
         c.closed.store(true, std::sync::atomic::Ordering::SeqCst);
         let readonly = c.is_readonly();
+        self.wait_for_client_lost(cid);
+        self.ev.ctl_queue.remove(&cid);
         if let Some(Overlay::Popup(p)) = c.overlay {
             self.destroy_pane(p.pane);
         }
+        if let Some(p) = detached {
+            self.fire("client-detached", events::Payload { readonly, ..p });
+        }
+        if let Some(p) = closed {
+            self.fire("client-closed", events::Payload { readonly, ..p });
+        }
         if c.attached {
             if let Some(sid) = c.session {
-                self.run_hook(Some(sid), "client-detached", Ctx { readonly, ..Ctx::default() });
                 self.update_session_size(sid);
                 self.check_destroy_unattached(sid);
             }
@@ -1571,6 +1677,7 @@ impl Server {
                 let overrides = self.opts_server.array_items("terminal-overrides").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
                 let caps = features::overrides(&ident.term, &overrides, &mut features);
                 let vt100 = theme::vt100_like(&ident.term, &overrides);
+                let terminal = control > 0 || ident.tty;
                 if let Some(c) = self.clients.get_mut(&cid) {
                     c.term_caps = caps;
                     c.control = control;
@@ -1578,6 +1685,9 @@ impl Server {
                     c.terminal.vt100 = vt100;
                     c.size = (ident.cols.max(1), ident.rows.max(1));
                     c.ident = Some(ident);
+                }
+                if terminal {
+                    self.fire_client("client-created", cid);
                 }
             }
             C_COMMAND => {
@@ -1621,15 +1731,34 @@ impl Server {
                     s.activity_seq = activity_seq();
                 }
                 self.handle_input(cid, &payload);
+                // a focus-out report does not make the client the latest
+                if payload != b"\x1b[O" && !self.client_is_readonly(Some(cid)) {
+                    self.update_latest(cid);
+                }
             }
             C_RESIZE => {
                 let Some((cols, rows)) = decode_size(&payload) else { return };
                 let Some(c) = self.clients.get_mut(&cid) else { return };
+                let old = c.size;
                 c.size = (cols.clamp(1, MAX_SIZE), rows.clamp(1, MAX_SIZE));
                 c.prev = None;
                 c.dirty = true;
-                if let Some(sid) = c.session {
-                    self.update_session_size(sid);
+                let (new, control, session) = (c.size, c.control > 0, c.session);
+                if control {
+                    return;
+                }
+                // the resize a client sends once attached changes nothing (but fires)
+                if new != old {
+                    self.update_latest(cid);
+                    if let Some(sid) = session {
+                        self.update_session_size(sid);
+                    }
+                }
+                // MSG_RESIZE fires it even when the size is the same (as after attach)
+                if session.is_some() {
+                    let mut p = self.payload_client(cid);
+                    p.int("width", new.0 as i64).int("height", new.1 as i64).int("old_width", old.0 as i64).int("old_height", old.1 as i64);
+                    self.fire("client-resized", p);
                 }
                 self.repeat_terminal_queries(cid);
             }
@@ -1667,6 +1796,7 @@ impl Server {
         let input_limit = self.opt_server_num("input-buffer-size") as usize;
         let ext_option = ext_keys_option(&self.opt_server("extended-keys"));
         let colours = self.pane_colours(id);
+        let allow_title = options::is_on(&self.opt_pane(id, "allow-set-title"));
         let p = self.panes.get_mut(&id).unwrap();
         p.parser.callbacks_mut().ext_option = ext_option;
         p.parser.set_input_buffer_size(input_limit);
@@ -1677,6 +1807,8 @@ impl Server {
         p.parser.screen_mut().set_scroll_on_clear(scroll_on_clear);
         // capture-pane -I: rows entering the history record when
         p.parser.screen_mut().set_time(now_secs());
+        p.parser.callbacks_mut().current_title = p.title.clone();
+        p.parser.callbacks_mut().suppress_title = !allow_title;
         p.parser.process(data);
         p.last_output = Instant::now();
         if !data.is_empty() {
@@ -1704,12 +1836,13 @@ impl Server {
         let queries = std::mem::take(&mut cb.clipboard_queries);
         let sets = std::mem::take(&mut cb.clipboard_sets);
         let passthrough = std::mem::take(&mut cb.passthrough);
+        let osc_events = std::mem::take(&mut cb.events);
         if let Some(cwd) = cb.cwd.take() {
             p.current_path = cwd;
             p.cwd_seq += 1;
         }
         p.send(replies);
-        self.pane_input_requests(id, queries, sets, passthrough);
+        let clip_set = self.pane_input_requests(id, queries, sets, passthrough);
         if let Some(t) = title.filter(|_| options::is_on(&self.opt_pane(id, "allow-set-title"))) {
             self.panes.get_mut(&id).unwrap().title = t;
         }
@@ -1743,6 +1876,7 @@ impl Server {
         if let Some(w) = self.windows.get_mut(&wid) {
             w.activity = now_secs();
         }
+        self.pane_output_events(id, osc_events, clip_set);
         if bell && self.opt_window_on(Some(wid), "monitor-bell") {
             self.alert(wid, ALERT_BELL);
         }
@@ -1795,7 +1929,9 @@ impl Server {
                     }
                 }
             }
-            self.run_hook(Some(sid), hook, Ctx::default());
+            if let Some(w) = self.sessions.get(&sid).and_then(|s| s.links.get(&idx)).copied() {
+                self.fire_winlink(hook, sid, idx, w);
+            }
             self.mark_session_dirty(sid);
         }
     }
@@ -1825,6 +1961,7 @@ impl Server {
             if let Some(p) = self.panes.get_mut(&id) {
                 p.dead = Some((status, now_secs()));
             }
+            self.fire_pane_exit("pane-died", id, status);
             let msg = self.expand_for_pane(id, &fmt);
             if let Some(p) = self.panes.get_mut(&id) {
                 if !fmt.is_empty() {
@@ -1840,9 +1977,12 @@ impl Server {
             }
             return;
         }
-        let ctx = Ctx { pane: Some(id), ..Ctx::default() };
-        let sid = self.session_of_pane(id).map(|(s, _)| s);
-        self.run_hook(sid, "pane-exited", ctx);
+        self.fire_pane_exit("pane-exited", id, status);
+        // server_destroy_pane closes the pane's layout cell (window-layout-changed)
+        // before killing a window left empty; other windows' changes are found later
+        if let Some(wid) = self.window_of(id).filter(|w| self.windows.get(w).is_some_and(|w| w.panes() == [id])) {
+            self.fire_window("window-layout-changed", wid);
+        }
         self.kill_pane(id);
     }
 
@@ -1869,6 +2009,13 @@ impl Server {
                 if !output.is_empty() && !background {
                     if queue.ctx.reply.is_some_and(|c| !self.clients.get(&c).is_some_and(|c| c.attached)) {
                         queue.ctx.out.push_str(&output);
+                    } else if let (Some(cid), Some(_), None) = (queue.ctx.client, queue.ctx.control_seq, pane) {
+                        // cmdq_print to a control client: bare lines after its %end
+                        let mut text = output.clone();
+                        if !text.ends_with('\n') {
+                            text.push('\n');
+                        }
+                        self.ev.ctl_queue.entry(cid).or_default().push_str(&text);
                     } else if let Some(p) = pane.or(queue.ctx.pane) {
                         self.view_output(p, &output);
                     }
@@ -2019,21 +2166,29 @@ impl Server {
             }
         }
         let waiting = std::mem::take(&mut self.prompt_waits);
-        for (cid, epoch, name, queue) in waiting {
+        for (cid, epoch, argv, queue) in waiting {
             if !self.prompt_open(epoch) {
-                self.after_command(&name, &queue.ctx);
+                let mut queue = queue;
+                self.after_command(&argv, &queue.ctx);
+                for c in std::mem::take(&mut self.ev.inject).into_iter().rev() {
+                    queue.cmds.push_front(c);
+                }
                 self.run_queue(queue);
             } else {
-                self.prompt_waits.push((cid, epoch, name, queue));
+                self.prompt_waits.push((cid, epoch, argv, queue));
             }
         }
         let waiting = std::mem::take(&mut self.overlay_waits);
-        for (cid, epoch, name, queue) in waiting {
+        for (cid, epoch, argv, queue) in waiting {
             if self.clients.get(&cid).is_none_or(|c| c.overlay.is_none() || c.overlay_epoch != epoch) {
-                self.after_command(&name, &queue.ctx);
+                let mut queue = queue;
+                self.after_command(&argv, &queue.ctx);
+                for c in std::mem::take(&mut self.ev.inject).into_iter().rev() {
+                    queue.cmds.push_front(c);
+                }
                 self.run_queue(queue);
             } else {
-                self.overlay_waits.push((cid, epoch, name, queue));
+                self.overlay_waits.push((cid, epoch, argv, queue));
             }
         }
         // Animation cycles request a one-shot status redraw every 100ms.
@@ -2053,6 +2208,7 @@ impl Server {
 
     fn tick_second(&mut self) {
         self.control_subscriptions();
+        self.check_monitors();
         self.request_pane_info();
         self.automatic_rename();
         let wids: Vec<WinId> = self.windows.keys().copied().collect();
@@ -2165,6 +2321,7 @@ impl Server {
         for c in self.clients.values() {
             if c.attached {
                 c.send_exit("[server exited]");
+                c.finish_exit();
             } else {
                 c.send(S_REPLY, &encode_reply(0, ""));
             }
@@ -2206,7 +2363,8 @@ impl Server {
     pub fn spawn_into(&mut self, id: PaneId, generation: u32, sid: Option<SessId>, cols: u16, rows: u16, cmd: &[String], cwd: Option<&str>, extra_env: &[(String, String)]) -> Result<(), String> {
         let (cols, rows) = (cols.max(1), rows.max(1));
         // an empty pane (new-window -E and friends) gets a terminal but no process
-        let empty = matches!(cmd, [one] if one == cmds::EMPTY_PANE);
+        let empty = cmds::is_empty_pane(cmd);
+        let empty_arg = empty && cmd[0] == cmds::EMPTY_PANE_ARG;
         let cmd: &[String] = if empty { &[] } else { cmd };
         let shell = self.opt_session(sid, "default-shell");
         let shell = if shell.is_empty() { procinfo::default_shell() } else { shell };
@@ -2246,6 +2404,7 @@ impl Server {
             .or_else(procinfo::home_dir)
             .unwrap_or_else(|| ".".into());
         cb.cwd(&dir);
+        let dir_for_event = dir.clone();
         let label = format!("{},{},{}", ipc::describe(), std::process::id(), sid.unwrap_or(0));
         cb.env("PWSH_TMUX", label);
         cb.env("PWSH_TMUX_PANE", format!("%{id}"));
@@ -2298,7 +2457,6 @@ impl Server {
         let now = now_secs();
         let prog = procinfo::program_name(&argv[0]);
         let existing_opts = self.panes.get(&id).map(|p| p.options.clone()).unwrap_or_default();
-        let existing_hooks = self.panes.get(&id).map(|p| p.hooks.clone()).unwrap_or_default();
         let title = self.panes.get(&id).map(|p| p.title.clone()).unwrap_or_else(|| self.host.clone());
         let previous = self.panes.insert(
             id,
@@ -2322,7 +2480,6 @@ impl Server {
                 mode: None,
                 prompt: None,
                 options: existing_opts,
-                hooks: existing_hooks,
                 pipe: None,
                 last_output: Instant::now(),
                 created: now,
@@ -2333,9 +2490,21 @@ impl Server {
                 track: PaneTrack { argv: start_argv, ..Default::default() },
             },
         );
+        let respawn = previous.is_some();
         if let Some(old) = previous {
             release(old); // respawn: the old pty
         }
+        // pane-created fires once the pane is in a window (popups never are)
+        let command = if empty_arg {
+            events::stringify_argv(&[String::new()])
+        } else if !cmd.is_empty() {
+            events::stringify_argv(cmd)
+        } else if !default_cmd.is_empty() {
+            default_cmd
+        } else {
+            shell
+        };
+        self.ev.spawned.push(events::Spawned { pane: id, respawn, empty, command, cwd: dir_for_event });
         Ok(())
     }
 
@@ -2353,6 +2522,10 @@ impl Server {
     /// Kills a pane and removes it from its window (closing the window/session if empty).
     pub fn kill_pane(&mut self, id: PaneId) {
         let wid = self.window_of(id);
+        // server_kill_pane: unzoom (with its events) before closing the pane's cell
+        if let Some(wid) = wid.filter(|w| self.windows.get(w).is_some_and(|w| w.panes().len() > 1)) {
+            self.unzoom_window(wid);
+        }
         self.destroy_pane(id);
         let Some(wid) = wid else { return };
         let w = self.windows.get_mut(&wid).unwrap();
@@ -2368,6 +2541,9 @@ impl Server {
                 w.zoomed = false;
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
+                // layout_close_pane fires window-layout-changed before window_remove_pane
+                // picks the new active pane
+                self.flush_window_layout(wid);
             }
             None => self.kill_window(wid),
         }
@@ -2406,8 +2582,6 @@ impl Server {
                 self.renumber(sid);
             }
             self.mark_session_dirty(sid);
-            let ctx = Ctx::default();
-            self.run_hook(Some(sid), "window-unlinked", ctx);
         }
         if self.links_of(wid).is_empty() {
             if let Some(w) = self.windows.remove(&wid) {
@@ -2424,16 +2598,21 @@ impl Server {
         let gids: Vec<u32> = self.groups.keys().copied().collect();
         for gid in gids {
             let members: Vec<SessId> = self.sessions.values().filter(|s| s.group == Some(gid)).map(|s| s.id).collect();
-            if members.len() < 2 {
-                for m in &members {
-                    self.sessions.get_mut(m).unwrap().group = None;
-                }
+            if members.is_empty() {
                 self.groups.remove(&gid);
+                continue;
+            }
+            if members.len() == 1 {
+                self.groups.insert(gid, self.sessions[&members[0]].links.clone());
                 continue;
             }
             let canonical = self.groups[&gid].clone();
             let Some(changed) = members.iter().find(|m| self.sessions[m].links != canonical).copied() else { continue };
             let links = self.sessions[&changed].links.clone();
+            // session_group_synchronize_from: the others are linked again, oldest first
+            let mut others: Vec<(u64, SessId)> = members.iter().filter(|m| **m != changed).map(|m| (self.sessions[m].created, *m)).collect();
+            others.sort_unstable();
+            self.ev.synced.push((changed, others.into_iter().map(|o| o.1).collect()));
             for m in &members {
                 let s = self.sessions.get_mut(m).unwrap();
                 if s.links == links {
@@ -2488,7 +2667,14 @@ impl Server {
     }
 
     pub fn kill_session(&mut self, sid: SessId, _empty: bool) {
+        // session-closed fires with the session's unlinks once the change is seen
+        // (session_destroy), after what the command did before
+        let closed = self.sessions.contains_key(&sid).then(|| self.payload_session(sid));
         let Some(s) = self.sessions.remove(&sid) else { return };
+        if let Some(mut p) = closed {
+            p.target = vars::Target::default();
+            self.ev.closed.push((sid, p));
+        }
         let detach_mode = s.options.get("detach-on-destroy").map(String::from).unwrap_or_else(|| self.opt_session(None, "detach-on-destroy"));
         for (_, wid) in &s.links {
             if self.links_of(*wid).is_empty() {
@@ -2517,7 +2703,10 @@ impl Server {
                 None => {
                     if let Some(c) = self.clients.get_mut(&cid) {
                         c.session = None;
-                        c.attached = false;
+                        // still attached when it is lost: client-detached then
+                        if std::mem::replace(&mut c.attached, false) {
+                            self.ev.lost_attached.insert(cid);
+                        }
                         c.send_exit("[exited]");
                     }
                 }
@@ -2528,8 +2717,6 @@ impl Server {
                 c.last_session = None;
             }
         }
-        let ctx = Ctx::default();
-        self.run_hook(None, "session-closed", ctx);
     }
 
     fn check_destroy_unattached(&mut self, sid: SessId) {
@@ -2549,6 +2736,7 @@ impl Server {
         let Some(c) = self.clients.get_mut(&cid) else { return };
         let was_attached = c.attached;
         c.focused = true;
+        let old_session = c.session.filter(|_| was_attached);
         if c.session != Some(sid) {
             c.last_session = c.session;
         }
@@ -2577,10 +2765,25 @@ impl Server {
             if writable { s.alerts.remove(&active); }
         }
         self.update_session_size(sid);
+        // server_client_set_session: the client is focused (set above) and its window's latest
+        if let Some((_, wid)) = self.session_window(sid) {
+            self.ev.latest.insert(wid, cid);
+        }
+        // the old session's current window, then the new one's
+        for s in [old_session, Some(sid)].into_iter().flatten() {
+            if let Some((_, wid)) = self.session_window(s) {
+                self.update_window_focus(wid);
+            }
+        }
+        let mut p = self.payload_client(cid);
+        p.set("new_session", p.get("session").cloned().unwrap_or(events::Val::Session(sid, String::new())));
+        if let Some(old) = old_session.filter(|o| self.sessions.contains_key(o)) {
+            let name = self.sessions[&old].name.clone();
+            p.set("old_session", events::Val::Session(old, name));
+        }
+        self.fire("client-session-changed", p);
         if !was_attached {
-            self.run_hook(Some(sid), "client-attached", Ctx { client: Some(cid), ..Ctx::default() });
-        } else {
-            self.run_hook(Some(sid), "client-session-changed", Ctx { client: Some(cid), ..Ctx::default() });
+            self.fire_client("client-attached", cid);
         }
     }
 
@@ -2616,16 +2819,23 @@ impl Server {
             return;
         }
         let sid = c.session;
+        let readonly = c.is_readonly();
+        let detached = self.payload_client(cid);
+        let Some(c) = self.clients.get_mut(&cid) else { return };
         c.attached = false;
         c.session = None;
         match exec.filter(|e| !e.is_empty() && c.control == 0) {
             Some(cmd) => c.send(S_EXEC, format!("{cmd}\0{shell}").as_bytes()),
             None => c.send_exit(msg),
         }
-        let readonly = c.is_readonly();
+        // a detached client answers MSG_EXITING, which takes its focus away; a
+        // control client's empty line just exits
+        if !msg.is_empty() || exec.is_some_and(|e| !e.is_empty()) {
+            self.update_focus();
+        }
         if let Some(sid) = sid {
             self.update_session_size(sid);
-            self.run_hook(Some(sid), "client-detached", Ctx { readonly, ..Ctx::default() });
+            self.fire("client-detached", events::Payload { readonly, ..detached });
             self.check_destroy_unattached(sid);
         }
     }
@@ -2699,12 +2909,13 @@ impl Server {
     pub fn update_session_size(&mut self, sid: SessId) {
         let Some(s) = self.sessions.get(&sid) else { return };
         let status = self.status_lines(Some(sid));
-        // control clients only count once they set a size (refresh-client -C)
+        // control clients only count once they set a size (refresh-client -C), and
+        // have no status line (status_line_size): their size is all window
         let clients: Vec<(u64, (u16, u16))> = self
             .clients
             .values()
             .filter(|c| c.attached && c.session == Some(sid) && !c.is_readonly() && !c.ctl.ignore_size)
-            .filter_map(|c| if c.control > 0 { c.control_size.map(|s| (c.activity, s)) } else { Some((c.activity, c.size)) })
+            .filter_map(|c| if c.control > 0 { c.control_size.map(|s| (c.activity, (s.0, s.1.saturating_add(status)))) } else { Some((c.activity, c.size)) })
             .collect();
         let latest = clients.iter().max_by_key(|c| c.0).map(|c| c.1);
         let smallest = clients.iter().map(|c| c.1).reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)));
@@ -2740,71 +2951,162 @@ impl Server {
 
     // ---- hooks & queue ---------------------------------------------------------------------
 
-    pub fn run_hook(&mut self, sid: Option<SessId>, name: &str, ctx: Ctx) {
-        if ctx.hook_depth > 4 || ctx.readonly || self.readonly_context.get() || self.client_is_readonly(ctx.client) {
-            return;
-        }
-        // session hooks: the session, then the global options; window and pane hooks:
-        // the pane, its window, then the global window options
-        let session_hook = crate::options::hook_scope(name).is_none_or(|s| s == crate::options::Scope::Session);
-        let pane = ctx.pane.filter(|p| self.panes.contains_key(p))
-            .or_else(|| sid.and_then(|s| self.sessions.get(&s)).and_then(|s| s.links.get(&s.active)).and_then(|w| self.windows.get(w)).map(|w| w.active));
-        let local = if session_hook {
-            sid.and_then(|s| self.sessions.get(&s)).and_then(|s| s.hooks.get(name))
-        } else {
-            pane.and_then(|p| self.panes.get(&p)).and_then(|p| p.hooks.get(name))
-                .or_else(|| pane.and_then(|p| self.window_of(p)).and_then(|w| self.windows.get(&w)).and_then(|w| w.hooks.get(name)))
-        };
-        let cmds = local
-            .or_else(|| self.hooks.get(name))
-            .cloned()
-            .unwrap_or_default();
-        if cmds.is_empty() {
-            return;
-        }
-        let mut list = VecDeque::new();
-        for c in cmds {
-            match crate::cmdparse::parse(&c) {
-                Ok(v) => list.extend(v),
-                Err(e) => log(&format!("hook {name}: {e}")),
-            }
-        }
-        let ctx = Ctx { reply: None, out: Default::default(), hook_depth: ctx.hook_depth + 1, ..ctx };
-        self.run_queue(Queue { cmds: list, ctx , soft: 0 });
-    }
-
-    fn after_command(&mut self, name: &str, ctx: &Ctx) {
+    /// After a command: the after-<command> hook, inserted after it (cmdq_insert_hook).
+    fn after_command(&mut self, argv: &[String], ctx: &Ctx) {
         self.sync_groups();
-        if ctx.hook_depth == 0 {
-            if let Some(full) = cmds::canonical(name) {
-                let sid = ctx.pane.and_then(|p| self.session_of_pane(p)).map(|(s,_)|s)
-                    .or_else(|| ctx.client.and_then(|c| self.client_session(c)));
-                self.run_hook(sid, &format!("after-{full}"), Ctx {
-                    client: ctx.client, pane: ctx.pane, readonly: ctx.readonly, ..Ctx::default()
-                });
+        if ctx.hook_depth == 0 && !ctx.skip_after {
+            if let Some(full) = argv.first().and_then(|n| cmds::canonical(n)) {
+                let mut argv = argv.to_vec();
+                argv[0] = full.to_string();
+                let hook = match full {
+                    "next-window" | "previous-window" | "last-window" => "select-window",
+                    _ => full,
+                };
+                self.command_hook(&format!("after-{hook}"), &argv, ctx);
             }
         }
     }
 
-    pub fn run_queue(&mut self, mut q: Queue) {
+    /// Runs a command queue, then the hooks its commands' events queued.
+    pub fn run_queue(&mut self, q: Queue) {
+        if q.ctx.control_seq.is_some() {
+            if let Some(c) = q.ctx.client.and_then(|c| self.clients.get_mut(&c)) {
+                c.ctl.command_waiting = true;
+            }
+        }
+        self.run_queue_inner(q);
+        self.drain_hooks();
+    }
+
+    /// A control client's reply for the item just run (cmdq_guard): each command,
+    /// including those of hooks, gets its own %begin/%end (or %error) block, and the
+    /// notifications it caused are written before the next one.
+    fn control_item_done(&mut self, q: &mut Queue, err: Option<&str>) {
+        let (Some(seq), Some(cid)) = (q.ctx.control_seq, q.ctx.client) else { return };
+        q.ctx.control_open = false;
+        let out = std::mem::take(&mut q.ctx.out);
+        // hook commands run with a new state, without CMDQ_STATE_CONTROL
+        let typed = q.ctx.control_line && q.ctx.hook_depth == 0;
+        self.control_block(cid, seq, typed, &out, err);
+        self.control_flush(cid);
+        q.ctx.control_done = true;
+        if let Some(c) = self.clients.get_mut(&cid) {
+            c.control_seq += 1;
+            q.ctx.control_seq = Some(c.control_seq);
+        }
+    }
+
+    /// Drops the rest of the hook command list an error happened in (cmdq_remove_group
+    /// for the hook's item): up to and including its closing mark.
+    fn skip_hook_list(q: &mut Queue, saved: &mut events::HookSaved) {
+        let mut depth = 0usize;
+        while let Some(cmd) = q.cmds.pop_front() {
+            match events::hook_mark_kind(&cmd) {
+                Some(true) => depth += 1,
+                Some(false) if depth == 0 => {
+                    events::apply_hook_mark(&cmd, &mut q.ctx, saved, &mut q.soft);
+                    return;
+                }
+                Some(false) => depth -= 1,
+                None => q.soft = q.soft.saturating_sub(1),
+            }
+        }
+    }
+
+    fn run_queue_inner(&mut self, mut q: Queue) {
+        let mut hook_saved = std::mem::take(&mut q.ctx.hook_saved);
+        // an error whose command-error hook runs first
+        let mut failed = q.ctx.command_error.take();
+        // the first error of a hook's commands: it ends only that hook's list
+        let mut hook_failed = q.ctx.hook_error.take();
+        if q.ctx.control_open {
+            // the command the queue waited in is done
+            self.control_item_done(&mut q, None);
+        }
         while let Some(cmd) = q.cmds.pop_front() {
             let name = cmd.first().map(|s| s.strip_prefix("\0alias:").unwrap_or(s).to_string()).unwrap_or_default();
+            if events::hook_mark_kind(&cmd).is_some() {
+                events::apply_hook_mark(&cmd, &mut q.ctx, &mut hook_saved, &mut q.soft);
+                continue;
+            }
             let soft = q.soft > 0;
             q.soft = q.soft.saturating_sub(1);
-            if name == FILE_PUSH {
+            if name == *FILE_PUSH {
                 q.ctx.files.push(cmd.get(1).cloned().unwrap_or_default());
                 continue;
             }
-            if name == FILE_POP {
+            if name == *FILE_POP {
                 q.ctx.files.pop();
                 continue;
             }
             let delay_cmd = (cmds::canonical(&name) == Some("run-shell")).then(|| cmd.clone());
+            // the command's arguments for its hooks: an alias's command under its own name
+            let mut argv = cmd.clone();
+            if let Some(first) = argv.first_mut() {
+                *first = name.clone();
+            }
             let saved_mouse = std::mem::replace(&mut self.cur_mouse, q.ctx.mouse.clone());
             let saved_file = std::mem::replace(&mut self.cur_file, q.ctx.files.last().cloned());
+            let saved_formats = std::mem::replace(&mut self.ev.cur_formats, q.ctx.formats.clone());
+            let saved_hook = std::mem::replace(&mut self.ev.in_hook, q.ctx.hook_depth > 1);
             let result = self.exec(cmd, &mut q.ctx);
+            // events for what the command changed, as its own (groups synchronized)
+            self.sync_groups();
+            let readonly = self.readonly_context.replace(q.ctx.readonly);
+            self.detect_changes(cmds::canonical(&name));
+            self.readonly_context.set(readonly);
+            if let Err(e) = &result && !e.starts_with('\0') && !soft && !hook_saved.is_empty() {
+                // a hook command: the error ends that hook's list, the rest goes on
+                self.cur_mouse = saved_mouse;
+                self.cur_file = saved_file;
+                self.ev.cur_formats = saved_formats;
+                self.ev.in_hook = saved_hook;
+                if q.ctx.control_seq.is_some() {
+                    self.control_item_done(&mut q, Some(e));
+                } else if hook_failed.is_none() {
+                    hook_failed = Some(e.clone());
+                }
+                Self::skip_hook_list(&mut q, &mut hook_saved);
+                continue;
+            }
+            if let Err(e) = &result && !e.starts_with('\0') {
+                self.command_hook("command-error", &argv, &q.ctx);
+                let hooks = std::mem::take(&mut self.ev.inject);
+                if q.ctx.control_seq.is_some() && !soft {
+                    // %error first, then the hook as items of their own; the rest of
+                    // the command list is removed
+                    self.cur_mouse = saved_mouse;
+                    self.cur_file = saved_file;
+                    self.ev.cur_formats = saved_formats;
+                    self.ev.in_hook = saved_hook;
+                    self.control_item_done(&mut q, Some(e));
+                    q.cmds.clear();
+                    q.soft = 0;
+                    q.cmds.extend(hooks);
+                    continue;
+                }
+                if !hooks.is_empty() && failed.is_none() {
+                    // the hook runs in place of the rest of the command list
+                    if !soft {
+                        q.cmds.clear();
+                        failed = Some(e.clone());
+                    }
+                    for c in hooks.into_iter().rev() {
+                        q.cmds.push_front(c);
+                    }
+                    if !soft {
+                        self.cur_mouse = saved_mouse;
+                        self.cur_file = saved_file;
+                        self.ev.cur_formats = saved_formats;
+                        self.ev.in_hook = saved_hook;
+                        continue;
+                    }
+                }
+            }
             self.cur_mouse = saved_mouse;
             self.cur_file = saved_file;
+            self.ev.cur_formats = saved_formats;
+            self.ev.in_hook = saved_hook;
             match result {
                 Ok(Flow::Inject(cmds, soft_errors)) => {
                     let n = cmds.len();
@@ -2812,22 +3114,51 @@ impl Server {
                         q.cmds.push_front(c);
                     }
                     q.soft = if soft_errors { q.soft + n } else { q.soft };
+                    // the after hook is inserted straight after the command, before these
+                    self.after_command(&argv, &q.ctx);
+                    for c in std::mem::take(&mut self.ev.inject).into_iter().rev() {
+                        q.cmds.push_front(c);
+                    }
+                    self.control_item_done(&mut q, None);
                 }
                 Err(e) if soft && !e.starts_with('\0') => {
                     log(&format!("{e}"));
                     self.log_error(q.ctx.client.or(q.ctx.reply), &e);
-                    q.ctx.out.push_str(&e);
-                    q.ctx.out.push('\n');
+                    let cli = q.ctx.control_seq.is_none() && q.ctx.reply.and_then(|r| self.clients.get(&r)).is_some_and(|c| !c.attached);
+                    if cli {
+                        q.ctx.soft_err.push_str(&e);
+                        q.ctx.soft_err.push('\n');
+                    } else {
+                        q.ctx.out.push_str(&e);
+                        q.ctx.out.push('\n');
+                    }
+                    self.control_item_done(&mut q, None);
                 }
                 Ok(Flow::WaitOverlay(cid, epoch)) => {
-                    self.overlay_waits.push((cid, epoch, name, q));
+                    q.ctx.control_open = q.ctx.control_seq.is_some();
+                    q.ctx.hook_saved = hook_saved;
+                    q.ctx.command_error = failed;
+                    q.ctx.hook_error = hook_failed;
+                    self.overlay_waits.push((cid, epoch, argv, q));
                     return;
                 }
                 Ok(Flow::WaitPrompt(cid, epoch)) => {
-                    self.prompt_waits.push((cid, epoch, name, q));
+                    q.ctx.control_open = q.ctx.control_seq.is_some();
+                    q.ctx.hook_saved = hook_saved;
+                    q.ctx.command_error = failed;
+                    q.ctx.hook_error = hook_failed;
+                    self.prompt_waits.push((cid, epoch, argv, q));
                     return;
                 }
-                Ok(Flow::Next) => self.after_command(&name, &q.ctx),
+                Ok(Flow::Next) => {
+                    let saved_hook = std::mem::replace(&mut self.ev.in_hook, q.ctx.hook_depth > 1);
+                    self.after_command(&argv, &q.ctx);
+                    self.ev.in_hook = saved_hook;
+                    for c in std::mem::take(&mut self.ev.inject).into_iter().rev() {
+                        q.cmds.push_front(c);
+                    }
+                    self.control_item_done(&mut q, None);
+                }
                 Err(e) if e.starts_with('\0') => {
                     // async commands: park the rest of the queue
                     let parts: Vec<String> = e.split('\0').map(String::from).collect();
@@ -2836,10 +3167,16 @@ impl Server {
                         "job-if" => {
                             let kind = JobKind::IfShell { then: get(3), otherwise: Some(get(4)).filter(|s| !s.is_empty()) };
                             if get(5) == "b" {
-                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: Default::default(), ..q.ctx.clone() }, soft: 0 };
+                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: Default::default(), control_seq: None, ..q.ctx.clone() }, soft: 0 };
                                 self.spawn_job(&get(2), None, kind, sub);
+                                self.control_item_done(&mut q, None);
                                 continue;
                             }
+                            // CMD_RETURN_WAIT: the reply block ends now (cmdq_fire_command)
+                            self.control_item_done(&mut q, None);
+                            q.ctx.hook_saved = hook_saved;
+                            q.ctx.command_error = failed;
+                            q.ctx.hook_error = hook_failed;
                             self.spawn_job(&get(2), None, kind, q);
                             return;
                         }
@@ -2849,19 +3186,51 @@ impl Server {
                             let cwd = Some(get(3)).filter(|s| !s.is_empty());
                             let kind = JobKind::RunShell { pane, background, stderr: get(4).contains('E') };
                             if background {
-                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: Default::default(), ..q.ctx.clone() }, soft: 0 };
+                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: Default::default(), control_seq: None, ..q.ctx.clone() }, soft: 0 };
                                 self.spawn_job(&get(2), cwd, kind, sub);
+                                self.control_item_done(&mut q, None);
                                 continue;
                             }
+                            // CMD_RETURN_WAIT: the reply block ends now (cmdq_fire_command)
+                            self.control_item_done(&mut q, None);
+                            q.ctx.hook_saved = hook_saved;
+                            q.ctx.command_error = failed;
+                            q.ctx.hook_error = hook_failed;
                             self.spawn_job(&get(2), cwd, kind, q);
                             return;
                         }
                         "wait" => {
-                            self.waits.entry(get(2)).or_insert((false, Vec::new())).1.push(q);
+                            // cmdq_fire_command writes %end as soon as wait-for waits
+                            self.control_item_done(&mut q, None);
+                            q.ctx.hook_saved = hook_saved;
+                            q.ctx.command_error = failed;
+                            q.ctx.hook_error = hook_failed;
+                            self.waits.entry(get(2)).or_default().waiters.push(q);
+                            return;
+                        }
+                        "lock" => {
+                            // cmdq_fire_command writes %end as soon as wait-for waits
+                            self.control_item_done(&mut q, None);
+                            q.ctx.hook_saved = hook_saved;
+                            q.ctx.command_error = failed;
+                            q.ctx.hook_error = hook_failed;
+                            self.waits.entry(get(2)).or_default().lockers.push(q);
+                            return;
+                        }
+                        "wait-event" => {
+                            // cmdq_fire_command writes %end as soon as wait-for waits
+                            self.control_item_done(&mut q, None);
+                            q.ctx.hook_saved = hook_saved;
+                            q.ctx.command_error = failed;
+                            q.ctx.hook_error = hook_failed;
+                            self.park_event_waiter(get(2), (get(5) == "F").then(|| get(3)), get(4) == "v", q);
                             return;
                         }
                         "delay" => {
                             // run-shell -d: the rest of the queue (and the command) runs later
+                            q.ctx.hook_saved = hook_saved;
+                            q.ctx.command_error = failed;
+                            q.ctx.hook_error = hook_failed;
                             let ms: u64 = get(2).parse().unwrap_or(0);
                             if let Some(c) = delay_cmd.as_ref().map(|c| strip_delay(c)) {
                                 q.cmds.push_front(c);
@@ -2876,19 +3245,28 @@ impl Server {
                     }
                 }
                 Err(e) => {
-                    self.finish_queue(q, Some(e));
+                    self.finish_queue(q, Some(failed.unwrap_or(e)));
                     return;
                 }
             }
         }
-        self.finish_queue(q, None);
+        self.finish_queue(q, failed.or(hook_failed));
     }
 
     pub fn finish_queue(&mut self, q: Queue, mut err: Option<String>) {
         let ctx = q.ctx;
         if ctx.out.overflowed() { err = Some("command output limit exceeded".into()); }
         if let (Some(seq), Some(cid)) = (ctx.control_seq, ctx.client) {
-            self.control_block(cid, seq, &ctx.out, err.as_deref());
+            if let Some(c) = self.clients.get_mut(&cid) {
+                c.ctl.command_waiting = false;
+            }
+            if !ctx.control_done || !ctx.out.is_empty() || err.is_some() {
+                self.control_block(cid, seq, ctx.control_line && ctx.hook_depth == 0, &ctx.out, err.as_deref());
+            }
+            self.control_flush(cid);
+            if let Some(c) = self.clients.get(&cid) {
+                c.finish_exit();
+            }
             // a one-shot `pwsh-tmux -C command` that didn't attach ends here
             if let Some(c) = ctx.reply.and_then(|r| self.clients.get(&r)).filter(|c| !c.attached) {
                 c.send(S_OUTPUT, b"%exit\n");
@@ -2897,6 +3275,24 @@ impl Server {
             return;
         }
         let attached = ctx.client.and_then(|c| self.clients.get(&c)).is_some_and(|c| c.attached);
+        if ctx.reply.is_none() && ctx.client.is_some_and(|c| self.is_control(c)) {
+            // a control client outside a command block (a hook's best client): bare
+            // lines, after the notifications so far (server_client_print, cmdq_error)
+            let cid = ctx.client.unwrap();
+            self.control_flush(cid);
+            let mut text = ctx.out.to_string();
+            if let Some(e) = &err {
+                self.add_message(&format!("{} message: {e}", self.clients[&cid].name()));
+                text.push_str(e);
+            }
+            if !text.is_empty() {
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                self.control_write(cid, &text);
+            }
+            return;
+        }
         if let Some(rc) = ctx.reply {
             let Some(c) = self.clients.get(&rc) else { return };
             if c.attached {
@@ -2917,9 +3313,20 @@ impl Server {
                 self.add_message(&msg);
             }
             let Some(c) = self.clients.get(&rc) else { return };
+            // config file errors go to stderr too and make the exit status 1
+            let err = match (err, ctx.soft_err.trim_end_matches('\n')) {
+                (e, "") => e,
+                (Some(e), soft) => Some(format!("{soft}\n{e}")),
+                (None, soft) => Some(soft.to_string()),
+            };
             match err {
-                Some(e) => c.send(S_REPLY, &encode_reply(1, &format!("{}{e}", &*ctx.out))),
-                // the output goes to stdout even when the exit status is not 0
+                Some(e) => {
+                    // output goes to stdout, the error to stderr
+                    if !ctx.out.is_empty() {
+                        c.send(S_STDOUT, ctx.out.as_bytes());
+                    }
+                    c.send(S_REPLY, &encode_reply(1, &e));
+                }
                 None if ctx.retval != 0 => {
                     c.send(S_STDOUT, ctx.out.as_bytes());
                     c.send(S_REPLY, &encode_reply(ctx.retval as u8, ""));
@@ -2986,7 +3393,7 @@ impl Server {
         thread::spawn(move || {
             let (status, out) = match child.and_then(|c| c.wait_with_output()) {
                 // a signal is passed on as its negated number
-                Ok(o) => (o.status.code().or_else(|| exit_signal(&o.status).map(|s| -s)).unwrap_or(1), String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr)),
+                Ok(o) => (o.status.code().or_else(|| process_exit_signal(&o.status).map(|s| -s)).unwrap_or(1), String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr)),
                 Err(e) => (127, format!("{e}\n")),
             };
             let _ = tx.send(Event::Job(id, status, out));

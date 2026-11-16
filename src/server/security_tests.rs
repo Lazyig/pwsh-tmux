@@ -49,7 +49,6 @@ pub(super) fn fixture() -> (Server, mpsc::Receiver<Event>) {
             control: 0,
             control_size: None,
             control_seq: 0,
-            seen: Default::default(),
             features: Default::default(),
             clipboard_query: None,
             focused: false,
@@ -226,7 +225,7 @@ fn overlay_queue_waits_for_close_and_rechecks_access() {
         cmds: VecDeque::from([vec!["set-option".into(), "-g".into(), "@overlay-result".into(), "written".into()]]),
         ctx: Ctx { client: Some(1), ..Ctx::default() }, soft: 0,
     };
-    srv.overlay_waits.push((1, 7, "display-menu".into(), queue));
+    srv.overlay_waits.push((1, 7, vec!["display-menu".into()], queue));
     srv.timers();
     assert_eq!(srv.overlay_waits.len(), 1);
     assert!(!srv.opts_session.0.contains_key("@overlay-result"));
@@ -248,14 +247,12 @@ fn replacing_overlay_resumes_the_previous_queue() {
     client.overlay = Some(Overlay::DisplayPanes {
         until: Instant::now() + Duration::from_secs(30), template: String::new(),
     });
-    srv.overlay_waits.push((1, 7, "display-menu".into(), Queue {
+    srv.overlay_waits.push((1, 7, vec!["display-menu".into()], Queue {
         cmds: VecDeque::from([vec!["set-option".into(), "-g".into(), "@overlay-result".into(), "written".into()]]),
         ctx: Ctx { client: Some(1), ..Ctx::default() }, soft: 0,
     }));
-    srv.hooks.insert("after-display-menu".into(), vec!["set-option -g @overlay-hook called".into()]);
     srv.timers();
     assert!(srv.overlay_waits.is_empty());
-    assert_eq!(srv.opts_session.0.get("@overlay-hook").map(String::as_str), Some("called"));
     assert_eq!(srv.opts_session.0.get("@overlay-result").map(String::as_str), Some("written"));
     assert!(srv.clients[&1].overlay.is_some(), "replacement stays open");
 }
@@ -271,26 +268,15 @@ fn flag_option_formats_are_numeric_and_false_when_off() {
 #[test]
 fn readonly_hook_context_cannot_become_owner_context() {
     let (mut srv, events) = fixture();
-    srv.hooks.insert(
-        "security-hook".into(),
-        vec!["run-shell echo forbidden".into()],
-    );
-    srv.run_hook(
-        None,
-        "security-hook",
-        Ctx {
-            client: Some(1),
-            ..Ctx::default()
-        },
-    );
-    srv.run_hook(
-        None,
-        "security-hook",
-        Ctx {
-            readonly: true,
-            ..Ctx::default()
-        },
-    );
+    srv.opts_session.set("session-renamed[0]", "run-shell 'echo forbidden'".into());
+    // set-hook -R from the read-only client, or from a read-only request
+    srv.run_hook_now("session-renamed", Target::default(), Some(1), false);
+    srv.run_hook_now("session-renamed", Target::default(), None, true);
+    // an event fired while a read-only request runs queues no hook
+    srv.readonly_context.set(true);
+    srv.fire("session-renamed", super::events::Payload::default());
+    srv.readonly_context.set(false);
+    srv.drain_hooks();
     assert!(srv.jobs.is_empty());
     assert!(events.try_recv().is_err());
 }

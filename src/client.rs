@@ -357,6 +357,9 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                         let _ = out.write_all(format!("\x1b[{};1H{}\x1b[H", rows, "\r\n".repeat(rows as usize + 1)).as_bytes());
                     }
                     let _ = out.flush();
+                    // tmux's client answers MSG_READY with MSG_RESIZE (client-resized)
+                    let (c, r) = term::size();
+                    post(C_RESIZE, &encode_size(c, r));
                     let input_post = post.clone();
                     let paused = paused.clone();
                     thread::spawn(move || {

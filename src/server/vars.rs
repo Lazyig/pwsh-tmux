@@ -4,6 +4,17 @@ use super::*;
 use crate::cells::Color;
 use crate::format::{self, Vars};
 
+/// #{pane_mode}: the name of the pane's current mode, empty without one.
+pub fn pane_mode_name(p: &Pane) -> &'static str {
+    match &p.mode {
+        Some(PaneMode::Copy(c)) if c.is_view_mode() => "view-mode",
+        Some(PaneMode::Copy(_)) => "copy-mode",
+        Some(PaneMode::Clock) => "clock-mode",
+        Some(PaneMode::Tree(_)) => "tree-mode",
+        None => "",
+    }
+}
+
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Target {
     pub sid: Option<SessId>,
@@ -261,6 +272,10 @@ impl Vars for VarCtx<'_> {
         if let Some(v) = self.extra.get(name) {
             return Some(v.clone());
         }
+        // a hook's commands see its formats (hook, hook_*)
+        if let Some(v) = self.srv.ev.cur_formats.as_ref().and_then(|f| f.get(name)) {
+            return Some(v.clone());
+        }
         let srv = self.srv;
         let mut t = self.t;
         let client = self.client.and_then(|c| srv.clients.get(&c));
@@ -353,7 +368,7 @@ impl Vars for VarCtx<'_> {
                 let members: Vec<&Session> = srv.sessions.values().filter(|x| x.group == Some(g)).collect();
                 Some(match name {
                     // tmux names a group after its first session
-                    "session_group" => members.iter().min_by_key(|x| x.created).map(|x| x.name.clone()).unwrap_or_default(),
+                    "session_group" => srv.group_name(g),
                     "session_group_size" => members.len().to_string(),
                     "session_group_attached" => members.iter().map(|x| srv.clients.values().filter(|c| c.attached && c.session == Some(x.id)).count()).sum::<usize>().to_string(),
                     _ => members.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(","),
@@ -403,7 +418,12 @@ impl Vars for VarCtx<'_> {
             "window_zoomed_flag" => win.map(|w| b(w.zoomed)),
             "window_width" => win.map(|w| w.sx.to_string()),
             "window_height" => win.map(|w| w.sy.to_string()),
-            "window_layout" | "window_visible_layout" => win.map(|w| w.layout.to_layout_string(srv.window_area(w.id))),
+            "window_layout" => win.map(|w| w.layout.to_layout_string(srv.window_area(w.id))),
+            // a zoomed window shows only its zoomed pane (layout_root while zoomed)
+            "window_visible_layout" => win.map(|w| {
+                let area = srv.window_area(w.id);
+                if w.zoomed { crate::layout::Node::Leaf(w.active).to_layout_string(area) } else { w.layout.to_layout_string(area) }
+            }),
             "window_activity" => win.map(|w| w.activity.to_string()),
             "window_created" => win.map(|w| w.created.to_string()),
             "window_activity_flag" => Some(b(sess.zip(t.idx).is_some_and(|(s, i)| s.alerts.get(&i).is_some_and(|a| a & ALERT_ACTIVITY != 0)))),
@@ -466,18 +486,12 @@ impl Vars for VarCtx<'_> {
             "pane_marked" => Some(b(t.pane.is_some() && srv.marked == t.pane)),
             "pane_marked_set" => Some(b(srv.marked.is_some())),
             "pane_dead" => pane.map(|p| b(p.dead.is_some())),
-            // a negative status is the signal that ended the pane
-            "pane_dead_status" => pane.and_then(|p| p.dead).and_then(|d| d.0).filter(|s| *s >= 0).map(|s| s.to_string()),
+            "pane_dead_status" => pane.and_then(|p| p.dead).and_then(|d| d.0).filter(|s| super::exit_signal(*s).is_none()).map(|s| s.to_string()),
             "pane_dead_time" => pane.and_then(|p| p.dead).map(|d| d.1.to_string()),
             // only a pane ended by a signal has one (sig2name: the number here)
-            "pane_dead_signal" => pane.and_then(|p| p.dead).and_then(|d| d.0).filter(|s| *s < 0).map(|s| (-s).to_string()),
+            "pane_dead_signal" => pane.and_then(|p| p.dead).and_then(|d| d.0).and_then(super::exit_signal).map(|s| s.to_string()),
             "pane_in_mode" => pane.map(|p| b(p.mode.is_some())),
-            "pane_mode" => pane.and_then(|p| match &p.mode {
-                Some(PaneMode::Copy(c)) => Some(if c.is_view_mode() { "view-mode" } else { "copy-mode" }.into()),
-                Some(PaneMode::Clock) => Some("clock-mode".into()),
-                Some(PaneMode::Tree(_)) => Some("tree-mode".into()),
-                None => None,
-            }),
+            "pane_mode" => pane.map(pane_mode_name).filter(|m| !m.is_empty()).map(String::from),
             "pane_synchronized" => t.pane.map(|p| b(options::is_on(&srv.opt_pane(p, "synchronize-panes")))),
             "pane_format" => Some(b(ftype == "P")),
             "pane_created" => pane.map(|p| p.created.to_string()),
@@ -803,38 +817,13 @@ impl Vars for VarCtx<'_> {
                 None => (key.clone(), None, value.clone()),
             }
         }).collect();
-        // Hooks are options too (kept apart here): global options hold every hook of
-        // their scope, a session's only those set there.
-        use super::cmds::HookLevel;
-        let level = if flags.contains('v') {
-            None
-        } else if flags.contains('p') {
-            if global { None } else { self.t.pane.map(HookLevel::Pane) }
-        } else if global {
-            Some(HookLevel::Global)
-        } else if flags.contains('w') {
-            self.t.wid.map(HookLevel::Window)
-        } else if flags.contains('s') {
-            self.t.sid.map(HookLevel::Session)
-        } else {
-            None
-        };
-        let hooks = level.and_then(|l| srv.hook_map(l)).map(|m| (m, flags.contains('w') || flags.contains('p')));
-        if let Some((map, window)) = hooks {
-            let aliases = srv.command_aliases();
+        // Hooks are array options of their level (already among the options); the
+        // global levels always hold every table hook of their scope, empty by default.
+        if global && !flags.contains('v') && !flags.contains('p') {
+            let window = flags.contains('w');
             for (name, scope) in options::HOOKS {
-                if (*scope == options::Scope::Session) == window || (flags.contains('p') && *scope != options::Scope::Pane) {
-                    continue;
-                }
-                let cmds: Vec<(usize, &String)> = map.get(*name).map(|v| v.iter().enumerate().filter(|(_, c)| !c.is_empty()).collect()).unwrap_or_default();
-                if cmds.is_empty() {
-                    if global {
-                        items.push((name.to_string(), None, String::new()));
-                    }
-                    continue;
-                }
-                for (i, c) in cmds {
-                    items.push((name.to_string(), Some(i.to_string()), super::cmds::print_command_string(c, &aliases, false)));
+                if (*scope == options::Scope::Session) != window && !items.iter().any(|o| o.0 == *name) {
+                    items.push((name.to_string(), None, String::new()));
                 }
             }
         }
@@ -1048,6 +1037,8 @@ mod tests {
         assert_eq!(super::super::osc133_exit_status("D;3;aid=1"), 3);
         assert_eq!(super::super::osc133_exit_status("D;err=x"), 0);
         assert_eq!(super::super::osc133_exit_status("D;256"), 255);
+        assert_eq!(super::super::osc133_exit_status("D; 3"), 3);
+        assert_eq!(super::super::osc133_exit_status("D;3 "), 255);
     }
 
     #[test]
