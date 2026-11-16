@@ -688,7 +688,9 @@ impl Vars for VarCtx<'_> {
             "client_key_table" => client.map(|c| c.key_table.clone()),
             "client_prefix" => client.map(|c| b(c.key_table == "prefix")),
             "client_readonly" => client.map(|c| b(c.is_readonly())),
-            "client_termname" | "client_termtype" => client.and_then(|c| c.ident.as_ref()).map(|i| i.term.clone()),
+            "client_termname" => client.and_then(|c| c.ident.as_ref()).map(|i| i.term.clone()),
+            // the terminal's XTVERSION reply, empty without one
+            "client_termtype" => client.map(|c| c.term_type.clone()),
             "client_termfeatures" => client.map(|c| c.features.list()),
             "client_user" => client.and_then(|c| c.user.as_ref()).map(|u| ipc::user_name_for_id(u)),
             "client_created" => client.map(|c| c.created.to_string()),
@@ -776,8 +778,14 @@ impl Vars for VarCtx<'_> {
         Some(match kind {
             'e' => ident.env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()).unwrap_or_default(),
             'f' => b(c.features.list().split(',').any(|f| f == name)),
-            // No terminfo database is kept, so no capability is known.
-            _ => "0".into(),
+            // tty_term_has_name: the capability in the client's terminal description
+            // (show-messages -T), after terminal-overrides and the features
+            _ => {
+                use super::terminfo::{describe, Value, CODES};
+                let overrides: Vec<String> = self.srv.opts_server.array_items("terminal-overrides").into_iter().map(|(_, v)| v).collect();
+                b(CODES.iter().position(|c| c.0 == name)
+                    .is_some_and(|i| describe(&ident.term, &overrides, &c.features)[i] != Value::Missing))
+            }
         })
     }
 

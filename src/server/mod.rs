@@ -999,6 +999,8 @@ pub struct Client {
     pub keyp: keys::Parser,
     pub input_state: input::InputState,
     pub term_caps: BTreeMap<String, String>,
+    /// What the terminal called itself in its XTVERSION reply (c->term_type).
+    pub term_type: String,
     pub esc_deadline: Option<Instant>,
     pub prompt: Option<Prompt>,
     pub overlay: Option<Overlay>,
@@ -1937,6 +1939,7 @@ impl Server {
                 keyp: keys::Parser::new(),
                 input_state: Default::default(),
                 term_caps: Default::default(),
+                term_type: String::new(),
                 esc_deadline: None,
                 prompt: None,
                 overlay: None,

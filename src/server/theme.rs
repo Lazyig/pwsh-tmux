@@ -353,6 +353,9 @@ impl Server {
             let bit = if raw.starts_with(b"\x1bP>|") { HAVE_XDA } else if raw.starts_with(b"\x1b[>") { HAVE_DA2 } else { 0 };
             if bit != 0 && !c.denied && c.terminal.waiting(bit) && c.features.device_report(raw) {
                 c.terminal.received(bit);
+                if let Some(body) = raw.strip_prefix(b"\x1bP>|").and_then(|s| s.strip_suffix(b"\x1b\\")) {
+                    c.term_type = String::from_utf8_lossy(body).into_owned();
+                }
                 c.prev = None;
                 c.dirty = true;
                 return true;
@@ -541,6 +544,7 @@ mod tests {
             keyp: keys::Parser::new(),
             input_state: Default::default(),
             term_caps: Default::default(),
+            term_type: String::new(),
             esc_deadline: None,
             prompt: None,
             overlay: None,
