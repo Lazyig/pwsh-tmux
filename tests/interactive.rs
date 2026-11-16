@@ -586,9 +586,13 @@ fn client_focus_flag_follows_focus_reports() {
     let t = start(&ctx, "fo");
     let flags = || ctx.ok(&["list-clients", "-F", "#{client_flags}"]);
     assert_eq!(flags(), "attached,focused,UTF-8\n");
-    // a terminal reports focus once asked to (Enfcs); ConPTY drops the reports before
-    ctx.ok(&["set", "-g", "focus-events", "on"]);
-    t.wait("focus reports asked for", || t.sent_text().contains("\x1b[?1004h"));
+    // tmux handles focus reports whatever focus-events says; a Windows console client only
+    // reports focus once asked to (Enfcs): ConPTY drops the reports before and the console's
+    // own focus records come whether or not the terminal was asked
+    if cfg!(windows) {
+        ctx.ok(&["set", "-g", "focus-events", "on"]);
+        t.wait("focus reports asked for", || t.sent_text().contains("\x1b[?1004h"));
+    }
     t.send(b"\x1b[O");
     t.wait("focus out", || flags() == "attached,UTF-8\n");
     t.send(b"\x1b[I");
@@ -1244,6 +1248,8 @@ fn floating_and_modal_panes_on_screen() {
     let ctx = Ctx::new("float-ui");
     let t = start(&ctx, "fu");
     ctx.ok(&["set", "-g", "pane-border-status", "top-floating"]);
+    // ConPTY sets the console title (the shell's path) when the pane starts, replacing -T
+    ctx.ok(&["set", "-g", "allow-set-title", "off"]);
     let f = ctx.ok(&["new-pane", "-P", "-F", "#{pane_id}", "-t", "fu", "-x", "30", "-y", "8", "-X", "10", "-Y", "5", "-T", "flt-title", "-B", "double", CAT]).trim().to_string();
     // the border is drawn around the content with the pane's lines and its title on top
     t.wait_screen("floating pane border", |s| s.contains("flt-title"));
