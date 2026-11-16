@@ -3119,3 +3119,26 @@ fn session_names_follow_check_name_and_clean_name() {
     ctx.ok(&["rename-session", "-t", "n", ""]);
     assert!(ctx.ok(&["list-sessions", "-F", "[#{session_name}]"]).contains("[]\n"));
 }
+
+#[test]
+fn show_messages_terminals_lists_every_capability() {
+    let ctx = Ctx::new("wq-term-caps");
+    ctx.ok(&["new-session", "-d", "-s", "t", "-x", "80", "-y", "24", "sleep 100"]);
+    let _t = Term::attach(&ctx, &["attach", "-t", "t"], 80, 24);
+    wait_for("client", || ctx.ok(&["list-clients", "-F", "x"]).contains('x'));
+    let out = ctx.ok(&["show-messages", "-T"]);
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[0].starts_with("Terminal 0: xterm-256color for ") && lines[0].ends_with(':'), "{out}");
+    // tty_term_describe: every tty_term_codes entry, numbered in tmux's order
+    assert_eq!(lines.len(), 237, "{out}");
+    assert!(lines[6].starts_with("   5: Bidi: "), "{out}");
+    assert!(lines[236].starts_with(" 235: XT: "), "{out}");
+    // xterm* features (clipboard, ccolour, cstyle, focus, title) add their capabilities
+    assert!(out.contains("\n  14: Cr: (string) \\033]112\\a\n"), "{out}");
+    assert!(out.contains("\n 196: Ms: (string) \\033]52;%p1%s;%p2%s\\a\n"), "{out}");
+    ctx.ok(&["set", "-as", "terminal-overrides", ",xterm-256color:Smol=\\E[53m:Ms@"]);
+    let _t2 = Term::attach(&ctx, &["attach", "-t", "t"], 80, 24);
+    wait_for("second client", || ctx.ok(&["show-messages", "-T"]).contains("Terminal 1:"));
+    let out = ctx.ok(&["show-messages", "-T"]);
+    assert!(out.contains(" 221: Smol: (string) \\033[53m\n") && out.contains(" 196: Ms: [missing]\n"), "{out}");
+}

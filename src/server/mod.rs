@@ -13,6 +13,7 @@ mod float;
 pub use cmds::json::{parse as json_parse, Node as Json};
 pub mod features;
 mod termcap;
+mod terminfo;
 mod input;
 mod modes;
 mod mouse;

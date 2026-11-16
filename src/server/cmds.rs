@@ -3524,11 +3524,12 @@ impl Server {
                 Ok(Flow::Next)
             }
             "show-messages" => {
-                // -T: the clients' terminals (there is no terminfo description to list,
-                // only which terminal each client has), -J: the running jobs
+                // -T: the clients' terminals with every capability (tty_term_describe),
+                // -J: the running jobs
                 let mut blank = false;
                 if o.has('T') {
                     let only = o.get('t').and_then(|t| self.resolve_client_canfail(ctx, Some(t)));
+                    let overrides = self.opts_server.array_items("terminal-overrides").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
                     let mut n = 0;
                     for c in self.clients.values().filter(|c| c.attached && c.control == 0 && only.is_none_or(|o| o == c.id)) {
                         let term = c.ident.as_ref().map(|i| i.term.as_str()).unwrap_or("");
@@ -3537,7 +3538,12 @@ impl Server {
                         // always VT100-like
                         let f = |name: &str, bit: u32| if c.features.has(name) { bit } else { 0 };
                         let flags = f("256", 0x1) | f("margins", 0x4) | f("rectfill", 0x8) | f("RGB", 0x11) | 0x20;
-                        ctx.out.push_str(&format!("Terminal {n}: {term} for {}, flags=0x{flags:x}:\n", c.name()));
+                        // tmux names a client by its tty
+                        let tty = c.ident.as_ref().filter(|i| i.tty).and_then(|i| super::terminfo::tty_path(i.pid)).unwrap_or_else(|| c.name());
+                        ctx.out.push_str(&format!("Terminal {n}: {term} for {tty}, flags=0x{flags:x}:\n"));
+                        for (i, v) in super::terminfo::describe(term, &overrides, &c.features).into_iter().enumerate() {
+                            ctx.out.push_str(&describe_capability(i, &v));
+                        }
                         n += 1;
                     }
                     blank = n != 0;
@@ -5214,6 +5220,29 @@ pub fn buffer_vars(b: &Buffer) -> HashMap<String, String> {
     ])
 }
 
+/// One line of show-messages -T (tty_term_describe): strings strnvis'd into 128 bytes.
+fn describe_capability(i: usize, v: &super::terminfo::Value) -> String {
+    use super::terminfo::{Value, CODES};
+    let name = CODES[i].0;
+    match v {
+        Value::Missing => format!("{i:4}: {name}: [missing]\n"),
+        Value::Str(s) => {
+            let b = s.as_bytes();
+            let mut out = Vec::new();
+            for (j, &c) in b.iter().enumerate() {
+                let mut one = Vec::new();
+                vis::vis(&mut one, c, vis::OCTAL | vis::CSTYLE | vis::TAB | vis::NL, b.get(j + 1).copied().unwrap_or(0));
+                if out.len() + one.len() > 127 {
+                    break;
+                }
+                out.extend(one);
+            }
+            format!("{i:4}: {name}: (string) {}\n", String::from_utf8_lossy(&out))
+        }
+        Value::Num(n) => format!("{i:4}: {name}: (number) {n}\n"),
+        Value::Flag(f) => format!("{i:4}: {name}: (flag) {f}\n"),
+    }
+}
 
 /// tmux's check_name (utf8_isvalid): printable ASCII and complete UTF-8 characters.
 fn check_name(name: &str) -> bool {
