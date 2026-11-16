@@ -33,9 +33,11 @@ fn spawn_server(config: Option<&str>) -> std::io::Result<()> {
     }).transpose()?;
     let config = config.as_deref();
     let exe = std::env::current_exe()?;
+    // the configuration's spawns start in the client's directory (cfg_client's cwd)
+    let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let make = || {
         let mut c = Command::new(&exe);
-        c.arg("__server");
+        c.arg("__server").arg("-c").arg(&cwd);
         if let Some(f) = config {
             c.arg(f);
         }
@@ -50,7 +52,7 @@ fn spawn_server(config: Option<&str>) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         let _ = make;
-        win_spawn_detached(&exe, config)
+        win_spawn_detached(&exe, config, &cwd)
     }
     #[cfg(unix)]
     {
@@ -70,14 +72,37 @@ fn spawn_server(config: Option<&str>) -> std::io::Result<()> {
 /// inheritance, which leaks whatever inheritable handles the client got from its parent
 /// (e.g. sshd's session pipes, keeping `ssh host pwsh-tmux new -d` from ever returning).
 #[cfg(windows)]
-fn win_spawn_detached(exe: &std::path::Path, config: Option<&str>) -> std::io::Result<()> {
+fn win_spawn_detached(exe: &std::path::Path, config: Option<&str>, cwd: &str) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, PROCESS_INFORMATION, STARTUPINFOW,
     };
-    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\\\""));
-    let mut cmdline = format!("{} __server", quote(&exe.to_string_lossy()));
+    // CommandLineToArgvW quoting: backslashes are doubled before a quote and at the end
+    let quote = |s: &str| {
+        let mut out = String::from("\"");
+        let mut slashes = 0;
+        for ch in s.chars() {
+            match ch {
+                '\\' => slashes += 1,
+                '"' => {
+                    out.push_str(&"\\".repeat(slashes * 2 + 1));
+                    slashes = 0;
+                }
+                _ => {
+                    out.push_str(&"\\".repeat(slashes));
+                    slashes = 0;
+                }
+            }
+            if ch != '\\' {
+                out.push(ch);
+            }
+        }
+        out.push_str(&"\\".repeat(slashes * 2));
+        out.push('"');
+        out
+    };
+    let mut cmdline = format!("{} __server -c {}", quote(&exe.to_string_lossy()), quote(cwd));
     if let Some(f) = config {
         cmdline.push(' ');
         cmdline.push_str(&quote(f));

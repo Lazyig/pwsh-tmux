@@ -348,9 +348,10 @@ impl Server {
     }
 
     /// Control clients that get notifications (CONTROL_SHOULD_NOTIFY_CLIENT): not
-    /// those already exiting.
+    /// those already exiting. One without a session gets them too (its control_state
+    /// starts when it identifies), e.g. %sessions-changed for its own new-session.
     fn notify_clients(&self) -> Vec<(ClientId, Option<SessId>)> {
-        self.clients.values().filter(|c| c.control > 0 && c.attached && !c.ctl.exiting.get() && c.ctl.deferred_exit.borrow().is_none())
+        self.clients.values().filter(|c| c.control > 0 && c.ident.is_some() && !c.ctl.exiting.get() && c.ctl.deferred_exit.borrow().is_none())
             .map(|c| (c.id, c.session.filter(|s| self.sessions.contains_key(s)))).collect()
     }
 

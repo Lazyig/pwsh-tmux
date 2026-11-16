@@ -3051,8 +3051,6 @@ fn startup_config_causes_go_to_the_first_attach() {
     // cmdq_error without a client while the configuration loads is a config cause
     // (display-message too, even with -p); a control client gets %config-error after
     // %session-changed, once
-    use std::io::{BufRead, BufReader, Write};
-    use std::sync::{Arc, Mutex};
     let ctx = Ctx::new("cfgcause");
     let conf = std::env::temp_dir().join(format!("{}.conf", ctx.socket));
     std::fs::write(&conf, "display \"from config\"\nset -g @cfg 1\nset -g nosuchopt 1\ndisplay -p printed\n").unwrap();
@@ -3061,36 +3059,147 @@ fn startup_config_causes_go_to_the_first_attach() {
     assert_eq!(ctx.ok(&["show", "-gv", "@cfg"]).trim_end(), "1");
     // nobody is attached yet: the causes wait
     assert_eq!(ctx.fmt("s", "#{pane_mode}"), "");
-    let attach = || {
-        let mut child = ctx.command().args(["-C", "attach", "-t", "s"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
-        let out = Arc::new(Mutex::new(String::new()));
-        let o = out.clone();
-        let stdout = child.stdout.take().unwrap();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                o.lock().unwrap().push_str(&(line + "\n"));
-            }
-        });
-        wait_for("attached", || out.lock().unwrap().contains("%session-changed $"));
-        let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(b"display -p done\n").unwrap();
-        stdin.flush().unwrap();
-        wait_for("reply", || out.lock().unwrap().contains("\ndone\n"));
-        drop(stdin);
-        let _ = child.wait();
-        let text = out.lock().unwrap().clone();
-        text.lines().filter(|l| l.starts_with("%config-error") || l.starts_with("%session-changed")).map(String::from).collect::<Vec<_>>()
-    };
     let f = conf_s.as_str();
-    assert_eq!(attach(), vec![
+    assert_eq!(control_attach_causes(&ctx, "s"), vec![
         "%session-changed $0 s".to_string(),
         format!("%config-error {f}:1: from config"),
         format!("%config-error {f}:3: invalid option: nosuchopt"),
         format!("%config-error {f}:4: printed"),
     ]);
-    assert_eq!(attach(), vec!["%session-changed $0 s".to_string()]);
+    assert_eq!(control_attach_causes(&ctx, "s"), vec!["%session-changed $0 s".to_string()]);
     let _ = std::fs::remove_file(&conf);
+}
+
+/// A control client attaching to `target`: its %session-changed and %config-error lines.
+fn control_attach_causes(ctx: &Ctx, target: &str) -> Vec<String> {
+    control_causes(ctx, &["-C", "attach", "-t", target])
+}
+
+/// A control client running `args`: its %session(s)-changed and %config-error lines.
+fn control_causes(ctx: &Ctx, args: &[&str]) -> Vec<String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::{Arc, Mutex};
+    let mut child = ctx.command().args(args).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let out = Arc::new(Mutex::new(String::new()));
+    let o = out.clone();
+    let stdout = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            o.lock().unwrap().push_str(&(line + "\n"));
+        }
+    });
+    wait_for("attached", || out.lock().unwrap().contains("%session-changed $"));
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"display -p done\n").unwrap();
+    stdin.flush().unwrap();
+    wait_for("reply", || out.lock().unwrap().contains("\ndone\n"));
+    drop(stdin);
+    let _ = child.wait();
+    let text = out.lock().unwrap().clone();
+    text.lines().filter(|l| l.starts_with("%config-error") || l.starts_with("%session-changed") || l.starts_with("%sessions-changed")).map(String::from).collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn first_control_client_gets_causes_and_its_own_session_notifications() {
+    // the first client is a control client: cfg_done gives it the causes before its
+    // command runs; a control client without a session is notified too (its
+    // control_state starts when it identifies)
+    let ctx = Ctx::new("cfgfirstctl");
+    let conf = std::env::temp_dir().join(format!("{}.conf", ctx.socket));
+    std::fs::write(&conf, "set -g nosuch 1\n").unwrap();
+    let f = conf.to_string_lossy().into_owned();
+    assert_eq!(control_causes(&ctx, &["-f", &f, "-C", "new-session", "-s", "p"]), vec![
+        format!("%config-error {f}:1: invalid option: nosuch"),
+        "%sessions-changed".to_string(),
+        "%session-changed $0 p".to_string(),
+    ]);
+    let out = ctx.command().args(["-C", "new-session", "-d", "-s", "x"]).stdin(Stdio::null()).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("\n%sessions-changed\n"), "{out:?}");
+    let _ = std::fs::remove_file(&conf);
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_config_waits_on_its_jobs_and_uses_the_starting_directory() {
+    // start_cfg: the config runs in one queue that waits on run-shell and if-shell; the
+    // first client's command waits for cfg_done, so it sees the whole config, and the
+    // causes after the wait are kept. While it loads, spawns and jobs start in the
+    // directory of the client that started the server (server_client_get_cwd).
+    let ctx = Ctx::new("cfgwait");
+    let dir = std::env::temp_dir().join(format!("{}-cwd", ctx.socket));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = std::fs::canonicalize(&dir).unwrap();
+    let d = dir.to_string_lossy().into_owned();
+    let conf = dir.join("c.conf");
+    std::fs::write(&conf, format!(
+        "display a\nrun-shell \"sleep 0.3; pwd -P > {d}/cfgrun\"\nset -g base-index 5\nif-shell \"sleep 0.2\" \"display fromif\"\nnew -d -s cfgs\ndisplay b\n"
+    )).unwrap();
+    let f = conf.to_string_lossy().into_owned();
+    let out = ctx.command().current_dir(&dir).args(["-f", &f, "new-session", "-d", "-s", "s"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(std::fs::read_to_string(dir.join("cfgrun")).unwrap().trim_end(), d);
+    // base-index came before new-session
+    assert_eq!(ctx.fmt("s", "#{window_index}"), "5");
+    assert_eq!(ctx.fmt("cfgs", "#{session_path}"), d);
+    assert_eq!(ctx.fmt("cfgs", "#{pane_current_path}"), d);
+    assert_eq!(control_attach_causes(&ctx, "s"), vec![
+        "%session-changed $1 s".to_string(),
+        format!("%config-error {f}:1: a"),
+        format!("%config-error {f}:4: fromif"),
+        format!("%config-error {f}:6: b"),
+    ]);
+    // a parse error in the file is a cause too (cfg.c: cfg_add_cause(pr->error))
+    let ctx = Ctx::new("cfgparse");
+    std::fs::write(&conf, "set -g @a 1\nbogus-cmd\n").unwrap();
+    ctx.ok(&["-f", &f, "new-session", "-d", "-s", "s"]);
+    assert_eq!(control_attach_causes(&ctx, "s"), vec![
+        "%session-changed $0 s".to_string(),
+        format!("%config-error {f}:2: unknown command: bogus-cmd"),
+    ]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn run_shell_target_that_fails_prints_and_view_output_is_parsed() {
+    // run-shell's target is CANFAIL: one that does not resolve leaves no pane and the
+    // output goes to the command-line client; output in view mode is parsed
+    // (window_copy_add with parse: CR and BS apply)
+    let ctx = Ctx::new("runcanfail");
+    ctx.ok(&["-f", "/dev/null", "new-session", "-d", "-s", "s", "-x", "80", "-y", "24", "sleep 100"]);
+    assert_eq!(ctx.ok(&["run-shell", "-t", "nosuch", "echo y"]), "y\n");
+    let out = ctx.command().args(["run-shell", "-t", "s:7", "echo z; exit 4"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "z\n'echo z; exit 4' returned 4\n");
+    assert_eq!(ctx.fmt("s", "#{pane_mode}"), "");
+    ctx.ok(&["run-shell", "-t", "s:0", "printf 'abc\\rX\\n12345\\b\\bY\\n\\033[31mred\\033[0m\\n'"]);
+    let cap = ctx.ok(&["capture-pane", "-p", "-M", "-t", "s:0"]);
+    assert_eq!(cap.lines().filter(|l| !l.is_empty()).collect::<Vec<_>>(), ["Xbc", "123Y5", "red"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_directories_fall_back_to_home_and_resolve() {
+    // spawn: a -c directory that cannot be entered gives home; pane_current_path is the
+    // process's real directory
+    let ctx = Ctx::new("spawncwd");
+    let dir = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("{}-d", ctx.socket));
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    let d = dir.to_string_lossy().into_owned();
+    let home = std::fs::canonicalize(std::env::var("HOME").unwrap()).unwrap().to_string_lossy().into_owned();
+    ctx.ok(&["-f", "/dev/null", "new-session", "-d", "-s", "s", "-c", &d, "sleep 100"]);
+    ctx.ok(&["new-window", "-d", "-n", "nx", "-c", &format!("{d}/nope"), "sleep 100"]);
+    assert_eq!(ctx.fmt("s:nx", "#{pane_current_path}"), home);
+    // relative to the command client's directory
+    assert!(ctx.command().current_dir(&dir).args(["split-window", "-d", "-t", "s:0", "-c", "sub/..", "sleep 100"]).status().unwrap().success());
+    ctx.ok(&["new-window", "-d", "-n", "dot", "-c", &format!("{d}/."), "sleep 100"]);
+    assert_eq!(ctx.ok(&["list-panes", "-t", "s:0", "-F", "#{pane_current_path}"]), format!("{d}\n{d}\n"));
+    assert_eq!(ctx.fmt("s:dot", "#{pane_current_path}"), d);
+    // new-window's index error names the failed create (spawn_window's cause)
+    assert!(ctx.fails(&["new-window", "-d", "-t", "s:0", "sleep 100"]).contains("create window failed: index 0 in use"));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(unix)]

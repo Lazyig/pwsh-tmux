@@ -1090,11 +1090,8 @@ impl Server {
         };
         let sid = self.new_session_id();
         let now = now_secs();
-        let cwd = cwd
-            .filter(|d| !d.is_empty())
-            .or_else(|| ctx.client.and_then(|c| self.clients.get(&c)).and_then(|c| c.ident.as_ref()).map(|i| i.cwd.clone()))
-            .or_else(procinfo::home_dir)
-            .unwrap_or_default();
+        // without -c: server_client_get_cwd(c, NULL)
+        let cwd = cwd.filter(|d| !d.is_empty()).unwrap_or_else(|| self.client_cwd(ctx, None));
         let mut senv = BTreeMap::new();
         if let Some(ident) = ctx.client.and_then(|c| self.clients.get(&c)).and_then(|c| c.ident.as_ref()) {
             senv.extend(environ_update(&self.opt_array(None, "update-environment"), &ident.env));
@@ -1250,6 +1247,13 @@ impl Server {
     /// server_client_get_cwd: a command client without a session (the CLI) gives its own
     /// directory, else the target session's, else the client's session's, else home.
     pub fn client_cwd(&self, ctx: &Ctx, sid: Option<SessId>) -> String {
+        if !self.cfg_finished {
+            // while the configuration loads: cfg_client's directory
+            let first = self.cfg_client.and_then(|c| self.clients.get(&c)).and_then(|c| c.ident.as_ref()).map(|i| i.cwd.clone());
+            if let Some(d) = first.or_else(|| self.cfg_cwd.clone()).filter(|d| !d.is_empty()) {
+                return d;
+            }
+        }
         let client = ctx.client.and_then(|c| self.clients.get(&c));
         if let Some(i) = client.filter(|c| c.session.is_none()).and_then(|c| c.ident.as_ref()).filter(|i| !i.cwd.is_empty()) {
             return i.cwd.clone();
@@ -1950,7 +1954,7 @@ impl Server {
                 } else if let Some(i) = base_idx {
                     if self.sessions[&sid].links.contains_key(&i) {
                         if !o.has('k') {
-                            return err(format!("index in use: {i}"));
+                            return err(format!("create window failed: index {i} in use"));
                         }
                         // replaced after the new window is linked: unlinking first would
                         // leave (or destroy) a session with no windows
@@ -4162,8 +4166,9 @@ impl Server {
                     let pat = if o.has('F') { self.expand(self.current(ctx), ctx.client, pat) } else { pat.clone() };
                     let path = self.resolve_path(ctx, &pat);
                     let files = glob_files(&path);
+                    // cmd_source_file: "%s: %s", strerror, path
                     if files.is_empty() && !o.has('q') {
-                        return err(format!("{path}: No such file or directory"));
+                        return err(format!("No such file or directory: {pat}"));
                     }
                     for f in files {
                         let text = match std::fs::read_to_string(&f) {
@@ -4172,7 +4177,11 @@ impl Server {
                                 let _ = e;
                                 continue;
                             }
-                            Err(e) => return err(format!("{f}: {e}")),
+                            Err(e) => {
+                                let e = e.to_string();
+                                let e = e.split(" (os error").next().unwrap_or_default();
+                                return err(format!("{e}: {f}"));
+                            }
                         };
                         // #{current_file} is this file while its %if lines are evaluated
                         let saved_file = self.cur_file.replace(f.clone());
@@ -4226,7 +4235,9 @@ impl Server {
                 Err(format!("\0job-if\0{cond}\0{then}\0{}\0{}", otherwise.unwrap_or_default(), if o.has('b') { "b" } else { "" }))
             }
             "run-shell" => {
-                let tt = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
+                // the target is CMD_FIND_CANFAIL: one that does not resolve leaves no pane
+                let resolved = self.resolve_pane(ctx, t).ok();
+                let tt = resolved.unwrap_or_else(|| self.current(ctx));
                 if o.has('C') {
                     let c = o.rest.first().ok_or("run-shell -C needs a command")?;
                     let cmds = cmdparse::parse(&self.expand(tt, ctx.client, c))?;
@@ -4246,7 +4257,7 @@ impl Server {
                 let cwd = Some(o.get('c').map(|c| self.expand(tt, ctx.client, c)).unwrap_or_else(|| self.client_cwd(ctx, tt.sid)));
                 let flags = format!("{}{}", if o.has('b') { "b" } else { "" }, if o.has('E') { "E" } else { "" });
                 // output goes to a pane only with -t (cdata->wp_id), else to the client
-                let out_pane = tt.pane.filter(|_| o.has('t'));
+                let out_pane = resolved.and_then(|r| r.pane).filter(|_| o.has('t'));
                 Err(format!("\0job-run\0{command}\0{}\0{flags}\0{}", cwd.unwrap_or_default(), out_pane.map(|p| p.to_string()).unwrap_or_default()))
             }
             "wait-for" => self.cmd_wait_for(&o, ctx),
