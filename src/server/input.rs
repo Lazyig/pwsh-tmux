@@ -411,6 +411,8 @@ impl Server {
         }
     }
 
+    /// tty_keys_clipboard: the terminal's OSC 52 reply answers the panes' get-clipboard
+    /// requests, and makes a buffer if refresh-client -l asked for it in the last few seconds.
     fn clipboard_reply(&mut self, cid: ClientId, raw: &[u8]) {
         let Some(body) = raw.strip_prefix(b"\x1b]52;").and_then(|s| s.strip_suffix(b"\x07").or_else(|| s.strip_suffix(b"\x1b\\"))) else { return };
         let Some(at) = body.iter().position(|b| *b == b';') else { return };
@@ -419,15 +421,18 @@ impl Server {
         let Ok(data) = decode_osc52(&body[at + 1..]) else { return };
         let Some(c) = self.clients.get_mut(&cid) else { return };
         let requests = std::mem::take(&mut c.input_state.clipboard);
-        if requests.is_empty() { return; }
+        let query = c.clipboard_query.take().is_some_and(|d| Instant::now() < d);
         let setting = self.opt_server("get-clipboard");
-        if !matches!(setting.as_str(), "request" | "both") { return; }
-        for (pane, at, bel) in requests {
-            if at.elapsed() <= Duration::from_secs(5) {
-                if let Some(p) = self.panes.get(&pane) { p.send(clipboard_reply_bytes(clip, &data, bel)); }
+        if !requests.is_empty() && matches!(setting.as_str(), "request" | "both") {
+            for (pane, at, bel) in requests {
+                if at.elapsed() <= Duration::from_secs(5) {
+                    if let Some(p) = self.panes.get(&pane) { p.send(clipboard_reply_bytes(clip, &data, bel)); }
+                    // input_request_clipboard_reply: both also makes a buffer for each request
+                    if setting == "both" { self.add_buffer(None, data.clone(), false); }
+                }
             }
         }
-        if setting == "both" { self.add_buffer(None, data, false); }
+        if query && !data.is_empty() { self.add_buffer(None, data, false); }
     }
 
     pub fn handle_input(&mut self, cid: ClientId, data: &[u8]) {
@@ -511,7 +516,6 @@ impl Server {
                 }
             }
             Input::Unknown(raw) => {
-                if raw.starts_with(b"\x1b]52;") { self.clipboard_reply(cid, &raw); return; }
                 // tty_keys_sync: the DECRPM reply to the attach-time DECRQM 2026
                 if let Some(status) = raw.strip_prefix(b"\x1b[?2026;").and_then(|r| r.strip_suffix(b"$y")).filter(|r| r.len() == 1 && (b'0'..=b'4').contains(&r[0])) {
                     if let Some(c) = self.clients.get_mut(&cid) {
@@ -533,26 +537,6 @@ impl Server {
                     }
                 }
             }
-        }
-    }
-
-    /// tty_keys_clipboard: the terminal's OSC 52 reply makes a buffer if refresh-client -l
-    /// asked for it in the last few seconds.
-    fn clipboard_reply(&mut self, cid: ClientId, raw: &[u8]) {
-        let Some(c) = self.clients.get_mut(&cid) else { return };
-        if c.clipboard_query.take().is_none_or(|d| Instant::now() >= d) {
-            return;
-        }
-        let body = &raw[5..];
-        let body = body.strip_suffix(b"\x07").or_else(|| body.strip_suffix(b"\x1b\\")).unwrap_or(body);
-        // skip the selection argument
-        let Some(pos) = body.iter().position(|&b| b == b';') else { return };
-        let data = &body[pos + 1..];
-        if data.is_empty() {
-            return;
-        }
-        if let Some(data) = super::cmds::base64_decode(data).filter(|d| !d.is_empty()) {
-            self.add_buffer(None, data, false);
         }
     }
 
@@ -847,7 +831,7 @@ impl Server {
     /// Runs a key binding's commands for a client: the message log names the key (or,
     /// for send-keys -K, the client that sent it).
     pub fn run_key_string(&mut self, cid: ClientId, cmd: &str, pane: Option<PaneId>, key: &str) {
-        match crate::cmdparse::parse(cmd).and_then(|c| c.iter().try_for_each(|c| super::cmds::check_command(c)).map(|_| c)) {
+        match crate::cmdparse::parse(cmd).and_then(|c| c.iter().try_for_each(|c| self.check_parsed(c)).map(|_| c)) {
             Ok(cmds) => {
                 let ctx = Ctx { client: Some(cid), pane, from_key: true, key: Some(key.to_string()), log_client: self.key_origin, ..Ctx::default() };
                 self.run_queue(Queue { cmds: cmds.into(), ctx , soft: 0 });
@@ -868,7 +852,7 @@ impl Server {
     /// Runs a command string for a client (key bindings, prompts, menus).
     pub fn run_string(&mut self, cid: ClientId, cmd: &str, pane: Option<PaneId>) {
         // cmd_parse_from_string: the whole list is checked before any of it runs
-        match crate::cmdparse::parse(cmd).and_then(|c| c.iter().try_for_each(|c| super::cmds::check_command(c)).map(|_| c)) {
+        match crate::cmdparse::parse(cmd).and_then(|c| c.iter().try_for_each(|c| self.check_parsed(c)).map(|_| c)) {
             Ok(cmds) => {
                 let ctx = Ctx { client: Some(cid), pane, from_key: true, ..Ctx::default() };
                 self.run_queue(Queue { cmds: cmds.into(), ctx , soft: 0 });
@@ -1360,9 +1344,9 @@ fn clipboard_selector(selector: &[u8]) -> String {
     clip
 }
 
+/// OSC 52 data is decoded with b64_pton (whitespace skipped).
 fn decode_osc52(data: &[u8]) -> Result<Vec<u8>, String> {
-    let text = std::str::from_utf8(data).map_err(|e| e.to_string())?;
-    decode_stdin_buffer(&format!("{STDIN_BUFFER_PREFIX}{text}"))
+    super::cmds::base64_decode(data).ok_or_else(|| "invalid base64".to_string())
 }
 
 /// input_reply_clipboard: `ESC ] 52 ; [clip] ; base64 terminator`.

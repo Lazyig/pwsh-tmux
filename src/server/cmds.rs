@@ -3699,7 +3699,7 @@ impl Server {
                         // cmd_parse_from_file: the whole file is checked before any of
                         // it runs; an error names the file and line
                         for (c, line) in cmds.iter().zip(&lines) {
-                            check_command(c).map_err(|e| format!("{f}:{line}: {e}"))?;
+                            self.check_parsed(c).map_err(|e| format!("{f}:{line}: {e}"))?;
                         }
                         if o.has('n') {
                             continue;
@@ -4108,6 +4108,18 @@ impl Server {
         self.opts_server.array_items("command-alias").into_iter().map(|(_, v)| v).collect()
     }
 
+    /// check_command after cmd_parse_expand_alias: an alias expands first (its last
+    /// command takes the arguments) and the commands it gives are checked, not expanded again.
+    pub(crate) fn check_parsed(&self, argv: &[String]) -> Result<(), String> {
+        let Some(name) = argv.first() else { return Ok(()) };
+        let aliases = self.command_aliases();
+        let Some(alias) = aliases.iter().find_map(|a| a.split_once('=').filter(|(n, _)| n == name).map(|(_, v)| v)) else {
+            return check_command(argv);
+        };
+        let mut cmds = cmdparse::parse(alias)?;
+        if let Some(last) = cmds.last_mut() { last.extend(argv[1..].iter().cloned()); }
+        cmds.iter().try_for_each(|c| check_command(c))
+    }
 
     /// The level a hook option lives at, as options_scope_from_name: session hooks in
     /// the session (the global options with -g), window and pane hooks in the window

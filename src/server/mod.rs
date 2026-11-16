@@ -1521,7 +1521,7 @@ impl Server {
                 });
                 let ctx = Ctx { client: Some(cid), reply: Some(cid), pane, control_seq, ..Ctx::default() };
                 // cmd_parse_from_arguments: every command is checked before any runs
-                if let Some(e) = cmds.iter().find_map(|c| cmds::check_command(c).err()) {
+                if let Some(e) = cmds.iter().find_map(|c| self.check_parsed(c).err()) {
                     self.finish_queue(Queue { cmds: VecDeque::new(), ctx, soft: 0 }, Some(e));
                     return;
                 }

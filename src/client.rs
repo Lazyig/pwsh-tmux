@@ -404,7 +404,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
             Ok((S_EXEC, p)) => {
                 // detach-client -E: the shell command replaces the client
                 drop(raw.take());
-                restore(&mut out);
+                restore(&mut out, alternate);
                 let p = String::from_utf8_lossy(&p).into_owned();
                 let (cmd, shell) = p.split_once('\0').unwrap_or((p.as_str(), ""));
                 let shell = if shell.is_empty() { crate::server::procinfo::default_shell() } else { shell.to_string() };
