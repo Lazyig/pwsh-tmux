@@ -222,7 +222,7 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
                             .clipboard_query(&mut self.screen, ty, bel_terminated);
                     }
                     (true, data)
-                        if data.iter().all(|c| BASE64.contains(c)) =>
+                        if data.iter().all(|c| BASE64.contains(c) || c.is_ascii_whitespace()) =>
                     {
                         self.callbacks.copy_to_clipboard(
                             &mut self.screen,

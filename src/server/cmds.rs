@@ -4072,7 +4072,7 @@ impl Server {
             }
             "show-buffer" => {
                 let b = match o.get('b') {
-                    Some(n) => self.buffers.iter().find(|b| b.name == n).ok_or_else(|| format!("unknown buffer: {n}"))?,
+                    Some(n) => self.buffers.iter().find(|b| b.name == n).ok_or_else(|| format!("no buffer {n}"))?,
                     None => self.buffers.first().ok_or("no buffers")?,
                 };
                 ctx.out.push_str(&String::from_utf8_lossy(&b.data));
@@ -4080,7 +4080,7 @@ impl Server {
             }
             "save-buffer" => {
                 let b = match o.get('b') {
-                    Some(n) => self.buffers.iter().find(|b| b.name == n).ok_or_else(|| format!("unknown buffer: {n}"))?,
+                    Some(n) => self.buffers.iter().find(|b| b.name == n).ok_or_else(|| format!("no buffer {n}"))?,
                     None => self.buffers.first().ok_or("no buffers")?,
                 };
                 let path = o.rest.first().ok_or("save-buffer needs a path")?;
@@ -4112,7 +4112,7 @@ impl Server {
             "paste-buffer" => {
                 let tt = self.resolve_pane(ctx, t)?;
                 let idx = match o.get('b') {
-                    Some(n) => self.buffers.iter().position(|b| b.name == n).ok_or_else(|| format!("unknown buffer: {n}"))?,
+                    Some(n) => self.buffers.iter().position(|b| b.name == n).ok_or_else(|| format!("no buffer {n}"))?,
                     None => {
                         if self.buffers.is_empty() {
                             return Ok(Flow::Next);
@@ -5402,9 +5402,15 @@ mod tests {
         assert_eq!(base64(b"hello"), "aGVsbG8=");
         assert_eq!(base64(b"ab"), "YWI=");
         assert_eq!(base64_decode(b"aGVs\nbG8="), Some(b"hello".to_vec()));
-        assert_eq!(base64_decode(b"YWI"), Some(b"ab".to_vec()));
-        assert_eq!(base64_decode(b"a*b"), None);
-        assert_eq!(base64_decode(b"YQ==YQ"), None);
+        assert_eq!(base64_decode(b"YWI="), Some(b"ab".to_vec()));
+        assert_eq!(base64_decode(b"YQ=="), Some(b"a".to_vec()));
+        assert_eq!(base64_decode(b"aGVs bG8= \n"), Some(b"hello".to_vec()));
+        assert_eq!(base64_decode(b"YQ= ="), Some(b"a".to_vec()));
+        assert_eq!(base64_decode(b""), Some(Vec::new()));
+        // b64_pton: unpadded, short padding, data after it and nonzero slop bits fail
+        for bad in [&b"YWI"[..], b"aGVsbG8", b"aGVsbA", b"aGVsbA=", b"a*b", b"YQ==YQ", b"aGVsbG8=x", b"Y===", b"=", b"YR=="] {
+            assert_eq!(base64_decode(bad), None, "{}", String::from_utf8_lossy(bad));
+        }
         assert!(fnmatch("*.conf", "a.conf") && !fnmatch("a?", "abc"));
         assert_eq!(canonical("neww"), Some("new-window"));
         assert_eq!(canonical("list-k"), Some("list-keys"));

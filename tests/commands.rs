@@ -3289,3 +3289,19 @@ fn send_keys_reaches_synchronized_panes() {
     let want = |down: &str| vec![format!("{down}b"), "litA".to_string()];
     wait_for("all panes", || lines(0) == want("^[[B") && lines(1) == want("^[OB") && lines(2) == want("^[[B"));
 }
+
+#[cfg(unix)]
+#[test]
+fn osc52_data_is_decoded_like_b64_pton() {
+    // input_osc_52 uses b64_pton: whitespace inside is skipped, unpadded or short-padded
+    // data is refused
+    let ctx = Ctx::new("osc52pton");
+    ctx.ok(&["new-session", "-d", "-s", "s", "sleep 100"]);
+    ctx.ok(&["set", "-s", "set-clipboard", "on"]);
+    ctx.ok(&["respawn-pane", "-k", "-t", "s", "printf '\\033]52;c;aGVsbG8\\007\\033]52;c;aGVsbA=\\007\\033]52;c;aGVs bG8=\\007'; sleep 100"]);
+    wait_for("buffer", || ctx.ok(&["list-buffers", "-F", "#{buffer_sample}"]) == "hello\n");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(ctx.ok(&["list-buffers", "-F", "#{buffer_sample}"]), "hello\n");
+    // cmd_save_buffer_exec's error for a missing name
+    assert!(ctx.fails(&["show-buffer", "-b", "nosuch"]).contains("no buffer nosuch"));
+}

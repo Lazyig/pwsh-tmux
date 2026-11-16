@@ -69,12 +69,15 @@ pub fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-/// b64_pton: whitespace is skipped, '=' ends the data; None for anything invalid.
+/// b64_pton: whitespace is skipped and the input must be whole groups of four, a
+/// last group padded with "=" or "==" (whitespace may sit between and after them)
+/// and with the bits past the last byte zero; None for anything else.
 pub fn base64_decode(data: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
-    let (mut acc, mut bits) = (0u32, 0u32);
-    let mut padding = false;
-    for &b in data {
+    let (mut acc, mut state) = (0u32, 0u8);
+    let mut rest = data.iter();
+    let mut pad = false;
+    for &b in rest.by_ref() {
         let v = match b {
             b'A'..=b'Z' => b - b'A',
             b'a'..=b'z' => b - b'a' + 26,
@@ -82,23 +85,40 @@ pub fn base64_decode(data: &[u8]) -> Option<Vec<u8>> {
             b'+' => 62,
             b'/' => 63,
             b'=' => {
-                padding = true;
-                continue;
+                pad = true;
+                break;
             }
             b if b.is_ascii_whitespace() => continue,
             _ => return None,
         };
-        if padding {
-            return None;
-        }
         acc = acc << 6 | v as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-            acc &= (1 << bits) - 1;
+        state = (state + 1) % 4;
+        if state == 0 {
+            out.extend_from_slice(&[(acc >> 16) as u8, (acc >> 8) as u8, acc as u8]);
+            acc = 0;
         }
     }
+    if !pad {
+        // ended on a byte boundary
+        return (state == 0).then_some(out);
+    }
+    let mut rest = rest.copied().filter(|b| !b.is_ascii_whitespace());
+    match state {
+        // one byte of data needs a second "="
+        2 if rest.next() == Some(b'=') => {}
+        3 => {}
+        _ => return None,
+    }
+    if rest.next().is_some() {
+        return None;
+    }
+    // the bits that slop past the last whole byte are zero
+    let slop = if state == 2 { 4 } else { 2 };
+    if acc & ((1 << slop) - 1) != 0 {
+        return None;
+    }
+    let bytes = (acc >> slop).to_be_bytes();
+    out.extend_from_slice(&bytes[4 - (state as usize - 1)..]);
     Some(out)
 }
 
