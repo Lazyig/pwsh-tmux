@@ -8,12 +8,20 @@ match wins, and an unbound user key is never written to a pane (`send-keys UserN
 sends nothing). An unmodified BSpace writes one byte for a `backspace` key with no
 modifiers or only Ctrl, and nothing otherwise. Extended keys follow tmux's modes:
 mode 1 (`CSI > 4;1 m`, or `extended-keys always`) keeps Meta keys and Ctrl with
-Space, `/`, `2`-`8` or `@`-`~` in their standard form. A key with no standard form
+Space, `/`, `2`-`8` or `@`-`~` in their standard form. The mode belongs to the pane:
+an application's request is ignored while `extended-keys` is off, and `always`
+puts a pane in mode 1 when its screen is created or reset (RIS), not when the option
+changes. A key the terminal sends in extended form (`CSI n;m u`, `CSI 27;m;n ~`) is
+written to the pane as the key tmux parses, so C-i, C-m, C-@, C-[ and C-S-a stay
+distinct from Tab, Enter, C-Space, Escape and C-a in mode 2. Forms tmux does not
+parse (kitty's `CSI n u` without modifiers, `:` fields, `CSI 1;2 Z`, `ESC O 5 A`)
+are M-[ or M-O followed by the rest as typed text, as in tmux. KPEnter is LF outside
+application keypad mode. A key with no standard form
 (C-BSpace with extended keys off) is sent by `send-keys` as its name. Only
 `ESC ] 5 2 ;` is held back as an OSC 52 reply; any other `ESC ]` is M-].
-C-[ is the same key as Escape here (an extended-keys `CSI 91;5u` decodes to Escape and
-`bind C-[` binds Escape), which gives tmux 3.8's "C-[ has the bindings of Escape" everywhere;
-unlike tmux, `list-keys` shows such a binding as Escape.
+For key bindings C-[ is the same key as Escape here (an extended-keys `CSI 91;5u`
+decodes to Escape and `bind C-[` binds Escape), which gives tmux 3.8's "C-[ has the
+bindings of Escape" everywhere; unlike tmux, `list-keys` shows such a binding as Escape.
 Bracketed-paste terminals do not
 use paste guessing. Unterminated pastes recover after five seconds, and partial
 paste end markers receive at least 500ms before their escape timer expires.
@@ -25,7 +33,8 @@ feature and keeps later entries from adding it back, and an unknown name ends th
 list. `client_termfeatures` lists features in tmux's table order. Features read
 from the outer terminal's device attributes in tmux come from `TERM_PROGRAM` (or a
 WezTerm/Ghostty TERM) here, using tmux's tty_default_features table; pwsh-tmux sends
-no DA/XDA queries. Clients are UTF-8 with `-u`, inside tmux (`$TMUX`), with a UTF-8
+no DA/XDA queries. It does send tmux's `CSI ? 2026 $ p` (DECRQM) on attach, and a
+DECRPM reply of 1 to 3 adds the `sync` feature. Clients are UTF-8 with `-u`, inside tmux (`$TMUX`), with a UTF-8
 locale (LC_ALL, LC_CTYPE, LANG) or on Windows; the `utf8` feature also turns it on,
 and `utf8@` never turns it off. A non-UTF-8 client gets line drawing through the
 ACS charset and underscores for other characters. `appesc` enables application

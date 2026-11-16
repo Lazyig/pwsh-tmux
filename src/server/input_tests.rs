@@ -738,7 +738,7 @@ fn pasted_input_never_reaches_a_pane_in_a_mode() {
     f.opts_session.set("assume-paste-time", "1000".into());
     run(&mut f, &["copy-mode"]);
     f.pane_input.try_iter().for_each(drop);
-    f.handle_input(1, b"abcdef");
+    f.handle_input(1, b"abcdefq");
     f.handle_input(1, b"\x1b[200~hello\x1b[201~");
     assert!(f.pane_input.try_recv().is_err());
     assert!(f.panes[&pane].mode.is_some());
