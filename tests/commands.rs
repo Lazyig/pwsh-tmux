@@ -1543,9 +1543,10 @@ fn bind_key_splits_separate_arguments_like_cmd_parse_from_arguments() {
         assert_eq!(ctx.ok(&["list-keys", k]).trim(), format!("bind-key  -T prefix {k} {want}"), "{k}");
     }
     assert_eq!(ctx.ok(&["list-keys", "-T", "root", "M-z"]).trim(), r"bind-key  -T root M-z resize-pane -Z \; set-option -g @z 1");
-    // both commands run
+    // from the command line "1;" already ends bind-key (tmux 3.8): the second command runs now
     ctx.ok(&["bind-key", "F3", "set", "-g", "@a", "1;", "set", "-g", "@b", "2"]);
-    assert_eq!(ctx.ok(&["list-keys", "F3"]).trim(), r"bind-key  -T prefix F3 set-option -g @a 1 \; set-option -g @b 2");
+    assert_eq!(ctx.ok(&["list-keys", "F3"]).trim(), r"bind-key  -T prefix F3 set-option -g @a 1");
+    assert_eq!(ctx.ok(&["show-options", "-gv", "@b"]).trim(), "2");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2982,4 +2983,19 @@ fn floating_panes_from_the_cli() {
         // it waits silently: no (empty) error line on stderr
         assert!(out.stderr.is_empty(), "{:?}", String::from_utf8_lossy(&out.stderr));
     }
+}
+
+#[test]
+fn command_line_semicolons_split_like_cmd_parse_from_arguments() {
+    let ctx = Ctx::new("wq-cli-semi");
+    ctx.ok(&["new-session", "-d", "-s", "s", "sleep 100"]);
+    // the shell's '\;' reaches tmux as \; : a literal ";" argument of bind-key, which its own
+    // split then takes as a separator (tmux 3.8 stores both commands)
+    ctx.ok(&["bind", "-T", "copy-mode-vi", "K", "send", "-X", "cursor-up", "\\;", "send", "-X", "cursor-up"]);
+    assert_eq!(ctx.ok(&["list-keys", "-T", "copy-mode-vi", "K"]).trim_end(), "bind-key  -T copy-mode-vi K send-keys -X cursor-up \\; send-keys -X cursor-up");
+    ctx.ok(&["bind", "y", "display", "\\;"]);
+    assert_eq!(ctx.ok(&["list-keys", "-T", "prefix", "y"]).trim_end(), "bind-key  -T prefix y display-message");
+    // outside bind-key it stays a ";" argument; "x;" ends a command
+    assert_eq!(ctx.ok(&["display", "-p", "\\;"]), ";\n");
+    assert_eq!(ctx.ok(&["display", "-p", "a;", "display", "-p", "b"]), "a\nb\n");
 }

@@ -80,33 +80,13 @@ pub fn parse_blocks(input: &str) -> Result<Vec<Vec<(String, bool)>>, String> {
     Ok(out)
 }
 
-/// Split an already-tokenized argv (e.g. from the OS command line, or a bind-key's
-/// stored command) on arguments that are exactly ";" into separate commands.
-/// An argument ending in "\;" is treated as that argument (without "\;") followed by a separator.
-/// Empty commands are dropped.
+/// Split an already-tokenized argv (the OS command line, or a stored command) into
+/// commands as cmd_parse_from_arguments does: an argument ending in ";" ends a command
+/// (an argument that was only ";" goes away), and a trailing "\;" is a literal ";" (so
+/// `tmux bind K send -X a '\;' send -X b` gives bind-key a ";" argument, which its own
+/// split then treats as a separator). Empty commands are dropped.
 pub fn split_commands(args: &[String]) -> Vec<Vec<String>> {
-    let mut out = Vec::new();
-    let mut cur: Vec<String> = Vec::new();
-    for a in args {
-        if a == ";" {
-            if !cur.is_empty() {
-                out.push(std::mem::take(&mut cur));
-            }
-        } else if let Some(stripped) = a.strip_suffix("\\;") {
-            if !stripped.is_empty() {
-                cur.push(stripped.to_string());
-            }
-            if !cur.is_empty() {
-                out.push(std::mem::take(&mut cur));
-            }
-        } else {
-            cur.push(a.clone());
-        }
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
+    split_arguments(args)
 }
 
 /// Split already-separated arguments into commands as cmd_parse_from_arguments does
@@ -1212,11 +1192,16 @@ if-shell 'test -n "$SSH_CLIENT"' {
                 v(&["select-pane", "-L"])
             ]
         );
-        let a = v(&["new", "-d\\;", "split", "\\;", "x"]);
+        // "x;" ends a command; a trailing "\;" is a literal ";" (cmd_parse_from_arguments)
+        let a = v(&["new", "-d;", "split", "\\;", "x"]);
         assert_eq!(
             split_commands(&a),
-            vec![v(&["new", "-d"]), v(&["split"]), v(&["x"])]
+            vec![v(&["new", "-d"]), v(&["split", ";", "x"])]
         );
+        let a = v(&["bind", "-T", "copy-mode-vi", "K", "send", "-X", "cursor-up", "\\;", "send", "-X", "cursor-up"]);
+        let cmds = split_commands(&a);
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(split_arguments(&cmds[0][4..]), vec![v(&["send", "-X", "cursor-up"]), v(&["send", "-X", "cursor-up"])]);
         assert!(split_commands(&[]).is_empty());
         // Round trip with bind-key style stored command.
         let bound = &p(r"bind x split-window \; select-pane -L")[0][2..];

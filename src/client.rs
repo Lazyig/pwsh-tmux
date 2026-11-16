@@ -167,18 +167,19 @@ fn terminal_name(term: String, windows_console: bool) -> String {
 fn prepare_stdin_buffers(args: &mut [String], input: &mut impl Read) -> std::io::Result<()> {
     let mut start = 0;
     for index in 0..args.len() {
+        // command boundaries as split_commands finds them: ";" alone, or "x;" (not "x\;")
         let separate = args[index] == ";";
-        let suffixed = args[index].ends_with("\\;");
+        let suffixed = !separate && args[index].ends_with(';') && !args[index].ends_with("\\;");
         if !separate && !suffixed && index + 1 != args.len() { continue; }
         let end = if separate { index } else { index + 1 };
         if end > start + 1 && matches!(args[start].as_str(), "load-buffer" | "loadb") {
             let last = end - 1;
-            let path = args[last].strip_suffix("\\;").unwrap_or(&args[last]);
+            let path = if suffixed { &args[last][..args[last].len() - 1] } else { &args[last] };
             if path == "-" {
                 let mut data = Vec::new();
                 input.take(MAX_STDIN_BUFFER as u64 + 1).read_to_end(&mut data)?;
                 if data.len() > MAX_STDIN_BUFFER { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "stdin buffer exceeds command frame limit")); }
-                let separator = if args[last].ends_with("\\;") { "\\;" } else { "" };
+                let separator = if suffixed { ";" } else { "" };
                 args[last] = encode_stdin_buffer(&data) + separator;
             }
         }
@@ -216,7 +217,7 @@ mod tests {
         let mut input = std::io::Cursor::new(b"not consumed");
         prepare_stdin_buffers(&mut argv, &mut input).unwrap();
         assert_eq!(input.position(), 0);
-        let mut argv = ["load-buffer", "-\\;", "load-buffer", "-"].map(String::from);
+        let mut argv = ["load-buffer", "-;", "load-buffer", "-"].map(String::from);
         prepare_stdin_buffers(&mut argv, &mut &b"data"[..]).unwrap();
         let commands = crate::cmdparse::split_commands(&argv);
         assert_eq!(decode_stdin_buffer(&commands[0][1]).unwrap(), b"data");
