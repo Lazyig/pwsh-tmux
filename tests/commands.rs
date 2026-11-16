@@ -3246,7 +3246,9 @@ fn source_file_goes_on_after_errors() {
     assert_eq!(ctx.fails(&["source-file", "/nonexist-wq/a", &ok]).trim_end(), "No such file or directory: /nonexist-wq/a");
     assert_eq!(ctx.ok(&["show-options", "-gv", "@ok"]).trim_end(), "1");
     // file_read: a directory is an I/O error
-    assert_eq!(ctx.fails(&["source-file", "/"]).trim_end(), "I/O error: /");
+    // ("/" has no drive on Windows, so it is resolved there: use an absolute directory)
+    let root = if cfg!(windows) { std::env::temp_dir().to_string_lossy().into_owned() } else { "/".to_string() };
+    assert_eq!(ctx.fails(&["source-file", &root]).trim_end(), format!("I/O error: {root}"));
     // a parse error is a cause, printed on stdout once the command is done; the other
     // files still run
     let bad = conf_file(&ctx, "bad.conf", "set -g @x 1 2 3\n");
@@ -3265,11 +3267,14 @@ fn startup_config_runs_in_the_client_directory_and_keeps_its_errors() {
     // relative paths after an asynchronous command still resolve against the client's
     // directory (cfg_finished is set when the whole queue is done), and so do run-shell's
     // and new-session's directories; a failed command drops only the rest of its line
-    std::fs::write(dir.join("a.conf"), "set -g nosuchopt 1\nrun-shell 'pwd > runpwd.txt'\nsource-file sub/c.conf\nnew -d -s cfg 'sleep 100'\nset -g @x 1 ; set -g nosuch 2 ; set -g @y 1\nset -g @z 1\n").unwrap();
+    // (PowerShell 5.1's `pwd >` writes a UTF-16 table, so Windows writes the path itself)
+    let pwd = sh("run-shell 'pwd > runpwd.txt'", "run-shell \"[IO.File]::WriteAllText('runpwd.txt', (Get-Location).Path)\"");
+    std::fs::write(dir.join("a.conf"), format!("set -g nosuchopt 1\n{pwd}\nsource-file sub/c.conf\nnew -d -s cfg 'sleep 100'\nset -g @x 1 ; set -g nosuch 2 ; set -g @y 1\nset -g @z 1\n")).unwrap();
     std::fs::write(dir.join("sub/c.conf"), "set -g @c 1\n").unwrap();
     let result = ctx.command().current_dir(&dir).args(["-f", "a.conf", "new-session", "-d", "-s", "s", "sleep 100"]).output().unwrap();
     assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
-    let real = std::fs::canonicalize(&dir).unwrap().to_string_lossy().into_owned();
+    // sh's pwd resolves links; Windows has no canonical form without \\?\
+    let real = if cfg!(windows) { dir.to_string_lossy().into_owned() } else { std::fs::canonicalize(&dir).unwrap().to_string_lossy().into_owned() };
     assert_eq!(std::fs::read_to_string(dir.join("runpwd.txt")).unwrap().trim_end(), real);
     assert_eq!(ctx.ok(&["show-options", "-gv", "@c"]).trim_end(), "1");
     assert_eq!(ctx.fmt("cfg", "#{pane_current_path}"), dir.to_string_lossy());
@@ -3277,7 +3282,7 @@ fn startup_config_runs_in_the_client_directory_and_keeps_its_errors() {
     assert!(ctx.ok(&["show-options", "-gqv", "@y"]).is_empty());
     assert_eq!(ctx.ok(&["show-options", "-gv", "@z"]).trim_end(), "1");
     // the server's own variable does not reach jobs
-    assert_eq!(ctx.ok(&["run-shell", "env | grep -c PWSH_TMUX_CFG_CWD || true"]).trim_end(), "0");
+    assert_eq!(ctx.ok(&["run-shell", sh("env | grep -c PWSH_TMUX_CFG_CWD || true", "@(Get-ChildItem env: | Where-Object Name -eq 'PWSH_TMUX_CFG_CWD').Count")]).trim_end(), "0");
     // the configuration's errors wait, named as given, until source-file prints them
     let ok = conf_file(&ctx, "ok.conf", "set -g @ok 1\n");
     let out = ctx.command().args(["source-file", &ok]).output().unwrap();
