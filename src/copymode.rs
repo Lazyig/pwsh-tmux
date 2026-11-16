@@ -422,7 +422,6 @@ fn internal(cmd: &str) -> Option<Internal<'_>> {
 }
 
 type Pos = (usize, usize);
-type SearchOrigin = (Pos, usize, Option<(String, bool)>);
 
 /// tmux WHITESPACE.
 const WHITESPACE: &str = "\t ";
@@ -507,7 +506,9 @@ pub struct CopyMode {
     dragging: bool,
     /// Last search: (text, forward).
     search: Option<(String, bool)>,
-    incremental_origin: Option<SearchOrigin>,
+    /// The open incremental prompt's last text and direction (what it last sent).
+    incremental_prompt: Option<(String, bool)>,
+    /// tmux's searchx/searchy/searcho: where incremental searches restart from.
     incremental_command_origin: Option<(Pos, usize)>,
     search_regex: bool,
     search_cache: std::cell::RefCell<(String, bool, Option<fancy_regex::Regex>)>,
@@ -582,7 +583,7 @@ impl CopyMode {
             sel_mode: SelMode::Char,
             dragging: false,
             search: None,
-            incremental_origin: None,
+            incremental_prompt: None,
             incremental_command_origin: None,
             search_regex: true,
             search_cache: std::cell::RefCell::new((String::new(), false, None)),
@@ -786,11 +787,20 @@ impl CopyMode {
         self.size_changed();
     }
 
-    /// window_copy_size_changed: the selection and search marks go.
+    /// window_copy_size_changed: the selection goes; search marks are found again in the
+    /// new content (unless the last search timed out), and incremental searches restart
+    /// from here.
     fn size_changed(&mut self) {
+        let search = self.search_marks;
         self.clear_selection();
         self.clear_marks();
         self.mark.0 = self.mark.0.min(self.lines.len() - 1);
+        if let Some((needle, _)) = self.search.clone().filter(|(t, _)| search && !t.is_empty() && !self.search_timed_out) {
+            self.search_marks = true;
+            let started = std::time::Instant::now();
+            self.count_search_matches(&needle, false, || started.elapsed().as_millis());
+        }
+        self.incremental_command_origin = Some(((self.cy, self.cx), self.top));
     }
 
     /// Cursor position within the view: (row, column).
@@ -1162,27 +1172,30 @@ impl CopyMode {
         self.pinned.filter(|p| p.0 == (self.cy, self.cx) && self.anchor.is_some() && self.frozen.is_none()).map(|p| (p.1, p.2))
     }
 
-    pub fn begin_incremental_search(&mut self) {
-        self.incremental_origin = Some(((self.cy, self.cx), self.top, self.search.clone()));
+    /// prompt_incremental_start: the prompt opens empty and sends "=".
+    pub fn begin_incremental_search(&mut self, forward: bool) {
+        self.incremental_prompt = Some((String::new(), forward));
+        self.run_incremental(forward, "=");
     }
 
+    /// An edit in the incremental prompt sends "=" and its text (prompt_key's changed:).
     pub fn preview_search(&mut self, text: &str, forward: bool) {
-        let Some((pos, top, search)) = self.incremental_origin.clone() else { return };
-        self.set_cursor(pos.0, pos.1);
-        self.top = top;
-        self.search = search;
-        self.search_timed_out = false;
-        if !text.is_empty() {
-            let pattern = literal_search_pattern(text);
-            self.search_regex = false;
-            self.search = Some((pattern.clone(), forward));
-            self.do_search(&pattern, forward, 1);
-        } else { self.clear_marks(); }
+        if self.incremental_prompt.as_ref().is_some_and(|(t, f)| t == text && *f == forward) {
+            return;
+        }
+        self.incremental_prompt = Some((text.to_string(), forward));
+        self.run_incremental(forward, &format!("={text}"));
     }
 
-    pub fn finish_incremental_search(&mut self, cancel: bool) {
-        if cancel { self.preview_search("", true); }
-        self.incremental_origin = None;
+    /// Enter or cancel closes the prompt; nothing is sent (cmd_command_prompt_callback
+    /// ignores PROMPT_KEY_CLOSE for incremental prompts), so the cursor stays.
+    pub fn finish_incremental_search(&mut self, _cancel: bool) {
+        self.incremental_prompt = None;
+    }
+
+    fn run_incremental(&mut self, forward: bool, arg: &str) {
+        let name = if forward { "search-forward-incremental" } else { "search-backward-incremental" };
+        self.run(name, &[arg.to_string()]);
     }
 
     pub fn resize(&mut self, width: u16, height: u16) {
@@ -1354,11 +1367,12 @@ impl CopyMode {
         }
         let action = self.run_inner(command, args);
         // window_copy_command: most commands clear the search marks (emacs only for motion)
-        if !command.ends_with("-incremental") { self.incremental_command_origin = None; }
         if !command.starts_with("search-") && self.search_marks {
             let clear = COMMANDS.iter().find(|c| c.0 == command).map_or(Clear::Never, |c| c.2);
             if clear == Clear::Always || (clear == Clear::EmacsOnly && !self.vi) {
                 self.clear_marks();
+                // searchx = searchy = -1
+                self.incremental_command_origin = None;
             }
         }
         action
@@ -1651,10 +1665,13 @@ impl CopyMode {
                 if let Some(arg) = arg.filter(|a| !a.is_empty()) {
                     let (prefix, text) = arg.split_at(arg.chars().next().unwrap().len_utf8());
                     let pattern = literal_search_pattern(text);
+                    // a changed string starts again from the saved row, at its end
+                    let ss = if self.search_regex { text } else { pattern.as_str() };
                     if let Some((pos, top)) = self.incremental_command_origin {
-                        if self.last_search() != Some(pattern.as_str()) {
-                            self.set_cursor(pos.0, pos.1);
+                        if self.last_search().is_some_and(|l| l != ss) {
                             self.top = top;
+                            self.cy = pos.0.min(self.lines.len() - 1);
+                            self.cx = self.limit(self.cy, false);
                         }
                     } else {
                         self.incremental_command_origin = Some(((self.cy, self.cx), self.top));
@@ -3970,27 +3987,46 @@ mod tests {
 
     #[test]
     fn incremental_search_preview_commit_and_cancel() {
+        // as tmux 3.8: each edit sends "=text"; a changed string restarts from the first
+        // search's row at its end; Enter and cancel send nothing
         let mut cm = CopyMode::new(lines(&["foo", "food", "finish"]), W, 3, (2, 3), false);
-        let origin = pos(&cm);
-        cm.begin_incremental_search();
+        cm.begin_incremental_search(false);
         cm.preview_search("f", false);
         assert_eq!(pos(&cm), (2, 0));
         cm.preview_search("foo", false);
         assert_eq!(pos(&cm), (1, 0));
         cm.preview_search("food", false);
-        assert_eq!(pos(&cm), (1, 0), "typing extends the search from its original position");
+        assert_eq!(pos(&cm), (1, 0), "typing extends the search from its original row");
         cm.preview_search("", false);
-        assert_eq!(pos(&cm), origin, "deleting the query restores the cursor");
+        assert_eq!(pos(&cm), (2, 6), "deleting the query goes back to the end of the first row");
+        assert!(!cm.search_present());
         cm.preview_search("foo", false);
         cm.finish_incremental_search(true);
-        assert_eq!(pos(&cm), origin, "cancel restores the original cursor");
-        cm.begin_incremental_search();
-        cm.preview_search("foo", false);
+        assert_eq!(pos(&cm), (1, 0), "cancel keeps the cursor");
+        // reopening sends "=": the string changed, so the cursor goes back and the marks go
+        cm.begin_incremental_search(false);
+        assert_eq!((pos(&cm), cm.search_present()), ((2, 6), false));
         cm.finish_incremental_search(false);
-        assert_eq!(pos(&cm), (1, 0), "accept must not advance to the next match");
+        cm.run("search-again", &[]);
+        assert_eq!(pos(&cm), (1, 0));
         cm.run("search-again", &[]);
         assert_eq!(pos(&cm), (0, 0));
+        // a command that clears the marks forgets the restart position
+        assert!(cm.incremental_command_origin.is_some());
+        cm.run("cursor-down", &[]);
+        assert!(cm.incremental_command_origin.is_none());
     }
+
+    #[test]
+    fn refresh_keeps_search_marks() {
+        let mut cm = CopyMode::new(lines(&["foo", "bar foo", "x"]), W, 3, (2, 0), true);
+        cm.run("search-backward", &["foo".into()]);
+        assert_eq!(cm.search_count(), Some(2));
+        cm.refresh(lines(&["foo", "bar foo", "x", "foo"]));
+        assert!(cm.search_present());
+        assert_eq!(cm.search_count(), Some(3));
+    }
+
 
     #[test]
     fn matching_brackets_and_default_keys() {

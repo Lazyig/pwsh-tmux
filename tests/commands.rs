@@ -1167,6 +1167,34 @@ fn copy_mode_live_word_separators_and_kill_flag() {
 }
 
 #[test]
+fn copy_mode_command_arguments_like_tmux() {
+    let ctx = Ctx::new("copyargs");
+    ctx.ok(&["new", "-d", "-s", "c", "-x", "30", "-y", "6", "printf 'foo bar\n-baz foo\nfob\nend\n'; sleep 100"]);
+    wait_for("copy text", || ctx.capture("c").contains("end"));
+    // send -X outside a mode fails (cmd-send-keys.c), and -N is checked first
+    let e = ctx.fails(&["send", "-t", "c", "-X", "cursor-up"]);
+    assert!(e.contains("not in a mode"), "{e}");
+    let e = ctx.fails(&["send", "-t", "c", "-N", "0", "-X", "cursor-up"]);
+    assert!(e.contains("repeat count too small"), "{e}");
+    ctx.ok(&["copy-mode", "-t", "c"]);
+    let at = || ctx.fmt("c", "#{copy_cursor_x},#{copy_cursor_y}");
+    // an argument that looks like flags is parsed as flags, so the command does not run
+    ctx.ok(&["send", "-t", "c", "-X", "search-backward", "-baz"]);
+    assert_eq!(at(), "0,4");
+    ctx.ok(&["send", "-t", "c", "-X", "search-backward", "--", "-baz"]);
+    assert_eq!(at(), "0,1");
+    ctx.ok(&["send", "-t", "c", "-X", "search-backward-incremental", "=foo"]);
+    ctx.ok(&["send", "-t", "c", "-X", "search-backward-incremental", "-foo"]);
+    assert_eq!(at(), "0,0");
+    // the buffer name prefix and the pipe command are formats
+    ctx.ok(&["send", "-t", "c", "-X", "copy-line", "P#{pane_index}x"]);
+    ctx.ok(&["send", "-t", "c", "-X", "copy-line", "-X"]);
+    ctx.ok(&["send", "-t", "c", "-X", "copy-pipe-line", "cat", "Q#{window_index}y"]);
+    let names = ctx.ok(&["list-buffers", "-F", "#{buffer_name}"]);
+    assert_eq!(names.lines().collect::<Vec<_>>(), ["Q0y1", "P0x0"], "{names}");
+}
+
+#[test]
 #[cfg(unix)]
 fn copy_mode_automatic_refresh_waits_for_selection() {
     let ctx = Ctx::new("copyrefresh");

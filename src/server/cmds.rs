@@ -2896,14 +2896,22 @@ impl Server {
                 }
                 // -N sets the repeat count of a mode (with -X, or with no keys at all)
                 let in_copy = matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(_)));
+                // the count is checked whatever the pane is doing (args_strtonum_and_expand);
+                // -X needs a mode with commands
+                let count = match o.get('N') {
+                    Some(n) => Some(match n.parse::<i64>() {
+                        Ok(v) if v < 1 => return err("repeat count too small"),
+                        Ok(v) if v > u32::MAX as i64 => return err("repeat count too large"),
+                        Ok(v) => v as usize,
+                        Err(_) => return err("repeat count invalid"),
+                    }),
+                    None => None,
+                };
+                if o.has('X') && !matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(_) | PaneMode::Tree(_))) {
+                    return err("not in a mode");
+                }
                 if in_copy && (o.has('X') || o.rest.is_empty()) {
-                    if let Some(n) = o.get('N') {
-                        let n: usize = match n.parse::<i64>() {
-                            Ok(v) if v < 1 => return err("repeat count too small"),
-                            Ok(v) if v > u32::MAX as i64 => return err("repeat count too large"),
-                            Ok(v) => v as usize,
-                            Err(_) => return err("repeat count invalid"),
-                        };
+                    if let Some(n) = count {
                         if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
                             cm.set_count(n);
                         }

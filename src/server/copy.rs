@@ -157,27 +157,39 @@ impl Server {
             return;
         }
         self.copy_sync_options(pane);
-        // the copy commands take -C (no clipboard) and -P (no paste buffer)
+        // args_parse with the command's flags: the copy commands take -C (no clipboard) and
+        // -P (no paste buffer), next-prompt and previous-prompt -o; an unknown flag means the
+        // command is not run (window_copy_command ignores the parse error), "--" ends flags
         let mut args = args.to_vec();
         let mut flags = (false, false);
         let copying = name.starts_with("copy-") || name.starts_with("append-");
-        while copying && args.first().is_some_and(|a| a.len() > 1 && a.starts_with('-') && a[1..].chars().all(|c| c == 'C' || c == 'P')) {
-            let a = args.remove(0);
-            flags.0 |= a.contains('C');
-            flags.1 |= a.contains('P');
+        let allowed = if name.starts_with("copy-") { "CP" } else if matches!(name, "next-prompt" | "previous-prompt") { "o" } else { "" };
+        if copymode::is_command(name) {
+            while let Some(a) = args.first().filter(|a| a.len() > 1 && a.starts_with('-')).cloned() {
+                args.remove(0);
+                if a == "--" {
+                    break;
+                }
+                if !a[1..].chars().all(|c| allowed.contains(c)) {
+                    return;
+                }
+                flags.0 |= a.contains('C');
+                flags.1 |= a.contains('P');
+            }
         }
         // copy-pipe without a command uses copy-command
         let piped = name.starts_with("copy-pipe") || name.starts_with("pipe");
         let pipe = if !piped {
             None
         } else if !args.is_empty() && !args[0].is_empty() {
-            Some(args[0].clone())
+            Some(self.expand(self.target_for_pane(pane), cid, &args[0]))
         } else {
             Some(self.opt_server("copy-command")).filter(|c| !c.is_empty())
         };
         let run_args: Vec<String> = if piped && !args.is_empty() { args[1..].to_vec() } else { args.clone() };
         // copy commands: the optional prefix names the new buffer
-        let prefix = if copying { run_args.first().cloned().filter(|p| !p.is_empty()) } else { None };
+        // the command and the prefix are formats (format_single)
+        let prefix = if copying { run_args.first().filter(|p| !p.is_empty()).map(|p| self.expand(self.target_for_pane(pane), cid, p)) } else { None };
         let action = match self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
             Some(PaneMode::Copy(cm)) => cm.run(name, &run_args),
             _ => return,
@@ -239,11 +251,12 @@ impl Server {
             Action::Prompt { label, command } => {
                 if let Some(c) = cid {
                     // the pane is the prompt's context target (a %id in the template would read as %N)
-                    let template = format!("send-keys -X {command} '%%'");
+                    let template = format!("send-keys -X {command} -- '%%'");
                     self.open_prompt(c, PromptKind::Command, vec![(label, String::new())], template, Some(pane), false, false);
                     if command.ends_with("-incremental") {
+                        self.copy_sync_options(pane);
                         if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
-                            cm.begin_incremental_search();
+                            cm.begin_incremental_search(command.starts_with("search-forward"));
                         }
                         if let Some(pr) = self.clients.get_mut(&c).and_then(|c| c.prompt.as_mut()) {
                             pr.copy_incremental = Some((pane, command.starts_with("search-forward")));
