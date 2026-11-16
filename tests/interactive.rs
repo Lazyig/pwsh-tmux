@@ -682,7 +682,7 @@ fn client_focus_flag_follows_focus_reports() {
 #[test]
 fn readonly_client_send_keys_and_refresh_client_control_flags() {
     let ctx = Ctx::new("p1fix-rosend");
-    ctx.ok(&["new-session", "-d", "-s", "s1", "-x", "80", "-y", "24", "cat"]);
+    ctx.ok(&["new-session", "-d", "-s", "s1", "-x", "80", "-y", "24", CAT]);
     let t = Term::attach(&ctx, &["attach-session", "-r", "-t", "s1"], 80, 24);
     t.wait_screen("readonly attach", |s| s.contains("[s1]"));
     let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
@@ -1376,7 +1376,7 @@ fn pane_prompt_keys_after_capture_and_on_floating_panes() {
     let tiled = ctx.fmt("fp", "#{pane_id}");
     ctx.ok(&["command-prompt", "-b", "-P", "-t", &c, "-p", "PP", "set -g @p '%%'"]);
     t.wait_screen("tiled prompt", |s| s.contains("PP"));
-    let k = ctx.ok(&["new-pane", "-O", "-K", "-D", "-P", "-F", "#{pane_id}", "-t", "fp", "cat -v"]).trim().to_string();
+    let k = ctx.ok(&["new-pane", "-O", "-K", "-D", "-P", "-F", "#{pane_id}", "-t", "fp", CAT_V]).trim().to_string();
     wait_for("modal pane", || ctx.fmt("fp", "#{window_modal_pane}") == k);
     t.send(b"abc");
     wait_for("keys to the -K pane", || ctx.capture(&k).contains("abc"));
@@ -1385,7 +1385,7 @@ fn pane_prompt_keys_after_capture_and_on_floating_panes() {
     t.send(b"\x1b");
     t.wait_screen("tiled prompt closed", |s| !s.contains("PP"));
     assert!(!ctx.cmd(&["show", "-gv", "@p"]).0);
-    let f = ctx.ok(&["new-pane", "-P", "-F", "#{pane_id}", "-t", "fp", "-x", "30", "-y", "8", "-X", "10", "-Y", "5", "cat"]).trim().to_string();
+    let f = ctx.ok(&["new-pane", "-P", "-F", "#{pane_id}", "-t", "fp", "-x", "30", "-y", "8", "-X", "10", "-Y", "5", CAT]).trim().to_string();
     wait_for("floating pane active", || ctx.fmt("fp", "#{pane_id}") == f);
     ctx.ok(&["command-prompt", "-b", "-P", "-t", &c, "-p", "FP", "set -g @f '%%'"]);
     t.wait_screen("floating prompt", |s| s.contains("FP"));
@@ -1400,7 +1400,7 @@ fn floating_panes_follow_mouse_drags() {
     let t = start(&ctx, "fd");
     ctx.ok(&["set", "-g", "mouse", "on"]);
     ctx.ok(&["bind", "-n", "M-MouseDrag1Pane", "move-pane", "-M"]);
-    let f = ctx.ok(&["new-pane", "-P", "-F", "#{pane_id}", "-t", "fd", "-x", "30", "-y", "8", "-X", "10", "-Y", "5", "cat"]).trim().to_string();
+    let f = ctx.ok(&["new-pane", "-P", "-F", "#{pane_id}", "-t", "fd", "-x", "30", "-y", "8", "-X", "10", "-Y", "5", CAT]).trim().to_string();
     t.wait_screen("floating pane", |s| s.contains('┌'));
     // dragging the right border (column 39) resizes it (MouseDrag1Border runs resize-pane -M)
     t.mouse(0, 39, 8, false);
@@ -1444,7 +1444,7 @@ fn pane_status_lines_fit_what_floating_panes_leave_visible() {
     ctx.ok(&["set", "-g", "pane-border-status", "top"]);
     ctx.ok(&["set", "-g", "pane-border-format", "#[align=left]L#{pane_index}#[align=right]R#{pane_index}"]);
     // clipped by the window edge: formatted to the last column but one (its border)
-    ctx.ok(&["new-pane", "-t", "sw", "-x", "16", "-y", "4", "-X", "90", "-Y", "4", "cat"]);
+    ctx.ok(&["new-pane", "-t", "sw", "-x", "16", "-y", "4", "-X", "90", "-Y", "4", CAT]);
     t.wait_screen("clipped floating status", |_| t.row(4).ends_with("┌──L1──R1─"));
     // covering the right end of the tiled status line: R0 moves left of it
     ctx.ok(&["move-pane", "-t", "sw", "-X", "90", "-Y", "0"]);
@@ -1469,8 +1469,8 @@ fn modal_panes_keep_their_drags_and_status_clicks() {
     let t = start(&ctx, "mm");
     ctx.ok(&["set", "-g", "mouse", "on"]);
     t.wait_screen("mouse mode on", |_| t.raw_text().contains("\x1b[?1006h"));
-    ctx.ok(&["new-window", "-d", "-t", "mm:1", "-n", "other", "cat"]);
-    let m = ctx.ok(&["new-pane", "-O", "-C", "-P", "-F", "#{pane_id}", "-t", "mm:0", "-x", "30", "-y", "8", "-X", "20", "-Y", "6", "cat"]).trim().to_string();
+    ctx.ok(&["new-window", "-d", "-t", "mm:1", "-n", "other", CAT]);
+    let m = ctx.ok(&["new-pane", "-O", "-C", "-P", "-F", "#{pane_id}", "-t", "mm:0", "-x", "30", "-y", "8", "-X", "20", "-Y", "6", CAT]).trim().to_string();
     t.wait_screen("modal pane", |s| s.contains('┌'));
     // a fast drag of the top border leaves the modal pane but still moves it (modal_drag)
     t.mouse(0, 29, 6, false);
@@ -1501,7 +1501,7 @@ fn floating_pane_default_mouse_bindings_and_pane_list() {
     ctx.ok(&["set", "-g", "mouse", "on"]);
     t.wait_screen("mouse mode on", |_| t.raw_text().contains("\x1b[?1006h"));
     ctx.ok(&["select-pane", "-T", "t0"]);
-    ctx.ok(&["split-window", "-h", "-t", "fb", "cat"]);
+    ctx.ok(&["split-window", "-h", "-t", "fb", CAT]);
     ctx.ok(&["select-pane", "-T", "t1"]);
     assert_eq!(ctx.fmt("fb", "#{pane_width} #{pane_x}"), "49 51");
     // C-drag (C-MouseDrag1Pane: new-pane -M) makes a floating pane between the two corners
@@ -1549,7 +1549,7 @@ fn kept_dead_panes_close_on_a_key() {
     let t = start(&ctx, "dk");
     // new-pane -k keeps the pane once its command exits, until a key is pressed (tmux
     // remain-on-exit key and server_client_handle_dead_key); the key goes nowhere else
-    let f = ctx.ok(&["new-pane", "-k", "-P", "-F", "#{pane_id}", "-t", "dk", "-x", "40", "-y", "8", "true"]).trim().to_string();
+    let f = ctx.ok(&["new-pane", "-k", "-P", "-F", "#{pane_id}", "-t", "dk", "-x", "40", "-y", "8", sh("true", "exit 0")]).trim().to_string();
     wait_for("dead floating pane", || ctx.fmt(&f, "#{pane_dead}") == "1");
     assert_eq!(ctx.fmt(&f, "#{remain-on-exit} #{pane_floating_flag}"), "key 1");
     t.send(b"x");
