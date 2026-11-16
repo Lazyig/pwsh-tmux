@@ -1855,9 +1855,14 @@ pub struct ParsedStyle {
 /// `#{` is expanded as a format first (so colours can be formats), and theme colour names
 /// resolve through the context's client.
 pub fn parse_style_with(s: &str, base: Style, vars: Option<&dyn Vars>) -> Result<ParsedStyle, String> {
+    parse_style_from(s, base, base, vars)
+}
+
+/// style_parse into a style that starts as `start` ("default" still means `base`).
+pub fn parse_style_from(s: &str, start: Style, base: Style, vars: Option<&dyn Vars>) -> Result<ParsedStyle, String> {
     let expanded = vars.filter(|_| s.contains("#{")).map(|v| expand(s, v));
     let s = expanded.as_deref().unwrap_or(s);
-    let mut result = ParsedStyle { style: base, dim: 0, link: None };
+    let mut result = ParsedStyle { style: start, dim: 0, link: None };
     let mut align = Align::Left;
     for word in style_words(s) {
         apply_word(word, &mut result.style, &mut align, base, vars)?;
@@ -2163,6 +2168,17 @@ pub fn layout_line_ranged(spans: &[Span], width: usize, fill: Style) -> (Vec<Cel
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn style_parsed_from_another_start() {
+        // menu_reapply_styles: a flag style starts from the default cell, so the
+        // colour it does not give is the default, while "default" means the base
+        let base = parse_style("fg=red,bg=blue", Style::default()).unwrap();
+        let st = parse_style_from("bg=green", Style::default(), base, None).unwrap().style;
+        assert_eq!((st.fg, st.bg), (Color::Default, parse_color("green").unwrap()));
+        let st = parse_style_from("fg=default", Style::default(), base, None).unwrap().style;
+        assert_eq!((st.fg, st.bg), (base.fg, Color::Default));
+    }
     use super::*;
     use crate::cells::{BLINK, BOLD, DIM, INVERSE, ITALIC, STRIKE, UNDERLINE};
 

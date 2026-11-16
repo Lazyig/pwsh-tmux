@@ -250,6 +250,18 @@ impl Server {
         format::parse_style_with(value, base, Some(&ctx)).ok().map(|p| p.style)
     }
 
+    /// A display-menu/display-popup -s/-S/-H style over the option's style, as
+    /// menu_reapply_styles: it is parsed from the default cell and both its colours
+    /// replace the option's (a colour it does not give becomes the default).
+    fn flag_style(&self, value: Option<&str>, base: Style, t: Target, cid: ClientId) -> Style {
+        let Some(value) = value else { return base };
+        let ctx = vars::VarCtx { srv: self, t, client: Some(cid), extra: HashMap::new() };
+        match format::parse_style_from(value, Style::default(), base, Some(&ctx)) {
+            Ok(p) => Style { fg: p.style.fg, bg: p.style.bg, ..base },
+            Err(_) => base,
+        }
+    }
+
     /// The target of a session's current pane, which status and message styles are expanded for.
     fn session_target(&self, sid: SessId) -> Target {
         let s = &self.sessions[&sid];
@@ -613,7 +625,7 @@ impl Server {
                     let bst = ost("menu-border-style", bst);
                     let selected = ost("menu-selected-style", Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() });
                     // display-menu -s -S -H -b
-                    let given = |v: &Option<String>, base: Style| v.as_deref().and_then(|v| self.style_option(v, base, active_target, Some(cid))).unwrap_or(base);
+                    let given = |v: &Option<String>, base: Style| self.flag_style(v.as_deref(), base, active_target, cid);
                     let (st, bst, selected) = (given(&m.look.style, st), given(&m.look.border_style, bst), given(&m.look.selected_style, selected));
                     let lines = m.look.lines.clone().unwrap_or_else(|| self.opt_window(Some(wid), "menu-border-lines"));
                     m.draw(&mut f, st, bst, selected, &lines);
@@ -622,8 +634,8 @@ impl Server {
                 Overlay::Popup(pp) => {
                     let st = self.style_option(&self.opt_window(Some(wid), "popup-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
                     let bst = self.style_option(&self.opt_window(Some(wid), "popup-border-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
-                    // display-popup -s -S -b
-                    let given = |v: &Option<String>, base: Style| v.as_deref().and_then(|v| self.style_option(v, base, active_target, Some(cid))).unwrap_or(base);
+                    // display-popup -s -S -b; popup_reapply_styles drops the attributes
+                    let given = |v: &Option<String>, base: Style| Style { attrs: 0, ..self.flag_style(v.as_deref(), base, active_target, cid) };
                     let (st, bst) = (given(&pp.look.style, st), given(&pp.look.border_style, bst));
                     let lines = pp.look.lines.clone().unwrap_or_else(|| self.opt_window(Some(wid), "popup-border-lines"));
                     for y in pp.y..pp.y + pp.h {

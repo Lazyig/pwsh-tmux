@@ -756,17 +756,20 @@ impl Server {
     }
 
     /// Target client for commands with -c/-t client: a client name, or the context's client.
+    /// The target client of a CMD_CLIENT_CANFAIL command: a client that is not found
+    /// is no error, there is just no target client.
+    pub fn resolve_client_canfail(&self, ctx: &Ctx, t: Option<&str>) -> Option<ClientId> {
+        self.resolve_client(ctx, t).ok()
+    }
+
     pub fn resolve_client(&self, ctx: &Ctx, t: Option<&str>) -> Result<ClientId, String> {
         match t {
             Some(name) => {
-                if let Some(c) = self.clients.values().find(|c| c.attached && (c.name() == name || c.id.to_string() == name)) {
+                // cmd_find_client: one trailing ':' is trimmed, then only client names
+                // match (a session name is not a client)
+                let n = name.strip_suffix(':').unwrap_or(name);
+                if let Some(c) = self.clients.values().find(|c| c.attached && (c.name() == n || c.id.to_string() == n)) {
                     return Ok(c.id);
-                }
-                // a session name → its most recent client
-                if let Ok(sid) = self.find_session(ctx, name.trim_end_matches(':')) {
-                    if let Some(c) = self.clients.values().filter(|c| c.attached && c.session == Some(sid)).max_by_key(|c| c.activity_seq) {
-                        return Ok(c.id);
-                    }
                 }
                 err(format!("can't find client: {name}"))
             }
@@ -891,7 +894,7 @@ impl Server {
     }
 
     pub fn new_window_obj(&mut self, name: String, pane: PaneId, sx: u16, sy: u16) -> WinId {
-        let wid = self.id();
+        let wid = self.new_window_id();
         let now = now_secs();
         self.windows.insert(
             wid,
@@ -904,6 +907,7 @@ impl Server {
                 last_active: None,
                 zoomed: false,
                 options: Options::default(),
+                hooks: BTreeMap::new(),
                 alerts: 0,
                 layout_cycle: None,
                 old_layout: None,
@@ -958,9 +962,14 @@ impl Server {
             Some(n) if n.is_empty() || n.contains([':', '.']) => return err(format!("invalid session: {n}")),
             Some(n) if self.sessions.values().any(|s| s.name == n) => return err(format!("duplicate session: {n}")),
             Some(n) => n,
-            None => (0..).map(|i: u32| i.to_string()).find(|n| !self.sessions.values().any(|s| &s.name == n)).unwrap(),
+            // session_create: an unnamed session is named by its id (the next free one)
+            None => loop {
+                let n = self.next_session_id.to_string();
+                if !self.sessions.values().any(|s| s.name == n) { break n; }
+                self.next_session_id += 1;
+            },
         };
-        let sid = self.id();
+        let sid = self.new_session_id();
         let now = now_secs();
         let cwd = cwd
             .filter(|d| !d.is_empty())
@@ -1610,6 +1619,25 @@ impl Server {
                     }
                     return Ok(Flow::Next);
                 }
+                // -f/-F apply first; -A, -B and -C are for control clients only (checked
+                // before their argument)
+                if let Some(f) = o.get('F') {
+                    self.control_flags(cid, f)?;
+                }
+                if let Some(f) = o.get('f') {
+                    self.control_flags(cid, f)?;
+                }
+                if (o.has('A') || o.has('B') || o.has('C')) && !self.is_control(cid) {
+                    return err("not a control client");
+                }
+                if let Some(a) = o.get('A') {
+                    self.control_pane_action(cid, a)?;
+                    return Ok(Flow::Next);
+                }
+                if let Some(b) = o.get('B') {
+                    self.control_subscribe(cid, b)?;
+                    return Ok(Flow::Next);
+                }
                 if let Some(size) = o.get('C') {
                     // control clients: -C WxH (or W,H)
                     let (w, h) = size.split_once(['x', ',']).ok_or_else(|| format!("bad size: {size}"))?;
@@ -1620,22 +1648,6 @@ impl Server {
                     if let Some(sid) = self.client_session(cid) {
                         self.update_session_size(sid);
                     }
-                    return Ok(Flow::Next);
-                }
-                let mut handled = false;
-                if let Some(a) = o.get('A') {
-                    self.control_pane_action(cid, a)?;
-                    handled = true;
-                }
-                if let Some(b) = o.get('B') {
-                    self.control_subscribe(cid, b)?;
-                    handled = true;
-                }
-                if let Some(f) = o.get('f').or(o.get('F')) {
-                    self.control_flags(cid, f)?;
-                    handled = true;
-                }
-                if handled {
                     return Ok(Flow::Next);
                 }
                 if o.has('S') {
@@ -1858,7 +1870,7 @@ impl Server {
                 w.name = name;
                 w.options.set("automatic-rename", "off".into());
                 self.mark_window_dirty(wt.wid.unwrap());
-                self.run_hook(wt.sid, "window-renamed", Ctx::default());
+                self.run_hook(wt.sid, "window-renamed", Ctx { pane: wt.wid.and_then(|w| self.windows.get(&w)).map(|w| w.active), ..Ctx::default() });
                 Ok(Flow::Next)
             }
             "select-window" | "next-window" | "previous-window" | "last-window" => {
@@ -2016,7 +2028,7 @@ impl Server {
                     w.zoomed = false;
                     self.apply_layout(wid);
                     self.mark_window_dirty(wid);
-                    self.run_hook(wt.sid, "window-layout-changed", Ctx::default());
+                    self.run_hook(wt.sid, "window-layout-changed", Ctx { pane: wt.wid.and_then(|w| self.windows.get(&w)).map(|w| w.active), ..Ctx::default() });
                     return Ok(Flow::Next);
                 } else {
                     o.rest.first().cloned().or_else(|| {
@@ -2041,7 +2053,7 @@ impl Server {
                 w.zoomed = false;
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
-                self.run_hook(wt.sid, "window-layout-changed", Ctx::default());
+                self.run_hook(wt.sid, "window-layout-changed", Ctx { pane: wt.wid.and_then(|w| self.windows.get(&w)).map(|w| w.active), ..Ctx::default() });
                 Ok(Flow::Next)
             }
             "resize-window" => {
@@ -2288,7 +2300,7 @@ impl Server {
                 }
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
-                self.run_hook(tt.sid, "window-layout-changed", Ctx::default());
+                self.run_hook(tt.sid, "window-layout-changed", Ctx { pane: tt.wid.and_then(|w| self.windows.get(&w)).map(|w| w.active), ..Ctx::default() });
                 Ok(Flow::Next)
             }
             "swap-pane" => {
@@ -2810,8 +2822,9 @@ impl Server {
                     border_style: o.get('S').map(String::from),
                     lines: o.get('b').map(String::from),
                 };
-                let epoch = self.replace_overlay(cid, Some(Overlay::Menu(menu)))?;
-                Ok(Flow::WaitOverlay(cid, epoch))
+                // cmd_display_menu_exec returns at once (only display-popup waits)
+                self.replace_overlay(cid, Some(Overlay::Menu(menu)))?;
+                Ok(Flow::Next)
             }
             "display-popup" => {
                 let cid = self.resolve_client(ctx, o.get('c'))?;
@@ -2917,9 +2930,12 @@ impl Server {
             }
             "display-message" => {
                 let tt = self.cmd_find(ctx, t, Find::Pane, FIND_CANFAIL)?;
-                let cid = o.get('c').map(|c| self.resolve_client(ctx, Some(c))).transpose()?
-                    .or_else(|| ctx.client.filter(|id| self.clients.get(id).is_some_and(|c| c.attached)))
-                    .or_else(|| self.resolve_client(ctx, None).ok());
+                // CMD_CLIENT_CANFAIL: a -c that is not found leaves no target client
+                let cid = match o.get('c') {
+                    Some(c) => self.resolve_client_canfail(ctx, Some(c)),
+                    None => ctx.client.filter(|id| self.clients.get(id).is_some_and(|c| c.attached))
+                        .or_else(|| self.resolve_client(ctx, None).ok()),
+                };
                 // the formats use -c (or the current client) if it shows the target session,
                 // else the best client of that session, or of any if it has none attached
                 let fc = match tt.sid {
@@ -2998,7 +3014,7 @@ impl Server {
                 // only which terminal each client has), -J: the running jobs
                 let mut blank = false;
                 if o.has('T') {
-                    let only = o.get('t').map(|t| self.resolve_client(ctx, Some(t))).transpose()?;
+                    let only = o.get('t').and_then(|t| self.resolve_client_canfail(ctx, Some(t)));
                     let mut n = 0;
                     for c in self.clients.values().filter(|c| c.attached && c.control == 0 && only.is_none_or(|o| o == c.id)) {
                         let term = c.ident.as_ref().map(|i| i.term.as_str()).unwrap_or("");
@@ -3063,10 +3079,9 @@ impl Server {
                 // command come marked and stay blocks
                 let block = |a: &str| a.strip_prefix(cmdparse::BLOCK_MARK).map(str::to_string);
                 let command = if args.len() == 1 { block(&args[0]).unwrap_or_else(|| args[0].clone()) } else {
-                    args.iter().map(|a| match a.as_str() {
-                        ";" => "\\;".into(),
-                        _ => block(a).map_or_else(|| cmdparse::quote(a), |b| format!("{{ {b} }}")),
-                    }).collect::<Vec<_>>().join(" ")
+                    cmdparse::split_arguments(&args).iter().map(|c| {
+                        c.iter().map(|a| block(a).map_or_else(|| cmdparse::quote(a), |b| format!("{{ {b} }}"))).collect::<Vec<_>>().join(" ")
+                    }).collect::<Vec<_>>().join(" ; ")
                 };
                 if command.is_empty() {
                     return err("bind-key needs a command");
@@ -3210,10 +3225,28 @@ impl Server {
                     }
                     return Ok(Flow::Next);
                 }
+                // cmd_send_keys_exec: the target client (-c, CANFAIL, or the current one)
+                // must not be read-only unless -X; -N is a count from 1; -X (and -N with
+                // no keys in a mode) needs a mode with commands (only copy mode has them)
+                let tc = match o.get('c') {
+                    Some(c) => self.resolve_client_canfail(ctx, Some(c)),
+                    None => ctx.client.filter(|id| self.clients.get(id).is_some_and(|c| c.attached)).or_else(|| self.resolve_client(ctx, None).ok()),
+                };
+                if !o.has('X') && tc.is_some() && self.client_is_readonly(tc) {
+                    return err("client is read-only");
+                }
+                let n: usize = match o.get('N') {
+                    Some(v) => options::strtonum(&self.expand(tt, ctx.client, v), 1, u32::MAX as i64).map_err(|e| format!("repeat count {e}"))? as usize,
+                    None => 1,
+                };
+                let has_commands = self.panes.get(&pane).is_some_and(|p| matches!(p.mode, Some(PaneMode::Copy(_))));
+                let in_any_mode = self.panes.get(&pane).is_some_and(|p| p.mode.is_some());
+                if (o.has('X') && !has_commands) || (o.has('N') && in_any_mode && !has_commands && o.rest.is_empty()) {
+                    return err("not in a mode");
+                }
                 if o.has('X') {
                     let name = o.rest.first().ok_or("send-keys -X needs a command")?.clone();
                     let rest: Vec<String> = o.rest[1..].iter().map(|a| if o.has('F') { self.expand(tt, ctx.client, a) } else { a.clone() }).collect();
-                    let n: usize = o.get('N').and_then(|v| v.parse().ok()).unwrap_or(1);
                     if let Some(m) = ctx.mouse.clone() {
                         // from a mouse binding: the cursor goes to the mouse first, and
                         // begin-selection starts a drag (window_copy_command)
@@ -3253,7 +3286,6 @@ impl Server {
                             None => list.extend(text.chars().filter_map(|c| keys::parse_key_name(&c.to_string()))),
                         }
                     }
-                    let n: usize = o.get('N').and_then(|v| v.parse().ok()).unwrap_or(1);
                     for _ in 0..n {
                         for key in &list {
                             self.handle_key(cid, key.clone(), keys::encode_key(key, app));
@@ -3267,7 +3299,9 @@ impl Server {
                     }
                     self.mark_window_dirty(tt.wid.unwrap());
                 }
-                let n: usize = o.get('N').and_then(|v| v.parse().ok()).unwrap_or(1);
+                if o.rest.is_empty() && (o.has('N') || o.has('R')) {
+                    return Ok(Flow::Next);
+                }
                 let app = self.panes.get(&pane).is_some_and(|p| p.screen().application_cursor());
                 let mut data = Vec::new();
                 for k in &o.rest {
@@ -3432,8 +3466,8 @@ impl Server {
                 let value = o.rest.get(1).map(|v| if o.has('F') { self.expand(self.current(ctx), ctx.client, v) } else { v.clone() });
                 if name.is_empty() { return err("empty variable name"); }
                 if name.contains('=') { return err("variable name contains ="); }
-                let level = if o.has('g') { 0 } else { self.resolve_session(ctx, t)? };
-                let map = if level == 0 { &mut self.env } else { &mut self.sessions.get_mut(&level).unwrap().env };
+                let level = if o.has('g') { GLOBAL_ENV } else { self.resolve_session(ctx, t)? };
+                let map = if level == GLOBAL_ENV { &mut self.env } else { &mut self.sessions.get_mut(&level).unwrap().env };
                 if o.has('u') {
                     if value.is_some() { return err("can't specify a value with -u"); }
                     map.remove(&name);
@@ -3450,8 +3484,8 @@ impl Server {
                 Ok(Flow::Next)
             }
             "show-environment" => {
-                let level = if o.has('g') { 0 } else { self.resolve_session(ctx, t)? };
-                let map = if level == 0 { self.env.clone() } else { self.sessions[&level].env.clone() };
+                let level = if o.has('g') { GLOBAL_ENV } else { self.resolve_session(ctx, t)? };
+                let map = if level == GLOBAL_ENV { self.env.clone() } else { self.sessions[&level].env.clone() };
                 if let Some(n) = o.rest.first().filter(|n| !map.contains_key(*n)) {
                     return err(format!("unknown variable: {n}"));
                 }
@@ -3484,22 +3518,30 @@ impl Server {
                     self.run_hook(sid, &base, ctx.clone());
                     return Ok(Flow::Next);
                 }
-                let map = if o.has('g') || self.resolve_session(ctx, t).is_err() { &mut self.hooks } else { &mut self.sessions.get_mut(&self.resolve_session(ctx, t)?).unwrap().hooks };
-                if o.has('u') {
-                    map.remove(&base);
-                    return Ok(Flow::Next);
-                }
-                let command = o.rest.get(1).ok_or("set-hook needs a command")?.clone();
-                let e = map.entry(base).or_default();
-                if o.has('a') {
-                    e.push(command);
-                } else {
-                    *e = vec![command];
+                // otherwise set-hook is set-option (cmd_set_option_exec): option names are
+                // checked, name[N] sets that element, and an @ name is a user option that
+                // show-hooks then lists (hooks_add_event)
+                self.cmd_set_option(false, &o, ctx)?;
+                if name.starts_with('@') && !o.has('u') && o.rest.len() > 1 {
+                    self.hook_events.insert(name);
                 }
                 Ok(Flow::Next)
             }
             "show-hooks" => {
-                let map = if o.has('g') { self.hooks.clone() } else { self.resolve_session(ctx, t).ok().map(|s| self.sessions[&s].hooks.clone()).unwrap_or_default() };
+                // a named hook (or any option) is shown as show-options shows it
+                if !o.rest.is_empty() {
+                    return self.cmd_show_options(false, &o, ctx).map(|_| Flow::Next);
+                }
+                // options_scope_from_flags: -p ignores -g
+                let global = o.has('g') && !o.has('p');
+                let level = if global { Ok(HookLevel::Global) } else if o.has('p') {
+                    self.resolve_pane(ctx, t).ok().and_then(|t| t.pane).map(HookLevel::Pane).ok_or_else(|| t.map_or_else(|| "no current pane".to_string(), |t| format!("no such pane: {t}")))
+                } else if o.has('w') {
+                    self.resolve_window(ctx, t).ok().and_then(|t| t.wid).map(HookLevel::Window).ok_or_else(|| t.map_or_else(|| "no current window".to_string(), |t| format!("no such window: {t}")))
+                } else {
+                    self.resolve_session(ctx, t).map(HookLevel::Session).map_err(|_| t.map_or_else(|| "no current session".to_string(), |t| format!("no such session: {t}")))
+                };
+                let map = self.hook_map(level?).cloned().unwrap_or_default();
                 let ft = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
                 let aliases = self.command_aliases();
                 // cmd_show_options_all: user hooks, then the table's hooks of the scope (-p
@@ -3507,19 +3549,35 @@ impl Server {
                 // options don't exist); global options hold every table hook, so an
                 // empty one is shown by name
                 use crate::options::{Scope, HOOKS};
-                let in_scope = |sc: Scope| if o.has('p') { sc == Scope::Pane && !o.has('g') } else if o.has('w') { sc != Scope::Session } else { sc == Scope::Session };
-                let names: Vec<String> = match o.rest.first() {
-                    Some(n) => vec![n.split('[').next().unwrap_or(n).to_string()],
-                    None => map.keys().filter(|k| k.starts_with('@')).cloned()
-                        .chain(HOOKS.iter().filter(|(_, sc)| in_scope(*sc)).map(|(n, _)| n.to_string()))
-                        .collect(),
-                };
-                // hook[N] shows only that element
-                let only: Option<usize> = o.rest.first().and_then(|n| n.split_once('[')).and_then(|(_, i)| i.trim_end_matches(']').parse().ok());
+                let in_scope = |sc: Scope| if o.has('p') { sc == Scope::Pane } else if o.has('w') { sc != Scope::Session } else { sc == Scope::Session };
+                // user options made hooks by set-hook come first, as plain options
+                let scope = if o.has('p') { Scope::Pane } else if o.has('w') { Scope::Window } else { Scope::Session };
+                if let Ok(tt) = self.option_target(scope, global, ctx, t) && let Some(store) = self.store(scope, global, tt) {
+                    for (k, v) in store.0.iter().filter(|(k, _)| self.hook_events.contains(*k)) {
+                        match o.get('F') {
+                            Some(f) => {
+                                let vars = HashMap::from([
+                                    ("option_name".to_string(), k.clone()),
+                                    ("option_value".to_string(), v.clone()),
+                                    ("option_is_user".to_string(), "1".to_string()),
+                                    ("option_is_string".to_string(), "1".to_string()),
+                                    ("option_has_value".to_string(), "1".to_string()),
+                                    ("hook_fire_count".to_string(), "0".to_string()),
+                                ]);
+                                let line = self.expand_extra(ft, ctx.client, f, vars);
+                                ctx.out.push_str(&line);
+                                ctx.out.push('\n');
+                            }
+                            None => ctx.out.push_str(&format!("{k} {}\n", options::print_value(k, v))),
+                        }
+                    }
+                }
+                let names: Vec<String> = HOOKS.iter().filter(|(_, sc)| in_scope(*sc)).map(|(n, _)| n.to_string()).collect();
+                let only: Option<usize> = None;
                 for k in names {
                     let items: Vec<(usize, &String)> = map.get(&k).map(|v| v.iter().enumerate().filter(|(i, c)| !c.is_empty() && only.is_none_or(|o| o == *i)).collect()).unwrap_or_default();
                     let empty = items.is_empty();
-                    if empty && !(o.has('g') && only.is_none() && crate::options::hook_scope(&k).is_some()) {
+                    if empty && !(global && only.is_none() && crate::options::hook_scope(&k).is_some()) {
                         continue;
                     }
                     let rows: Vec<(Option<usize>, String)> = if empty {
@@ -3840,7 +3898,17 @@ impl Server {
             Some(n) if n.is_empty() || n.contains([':', '.']) => return err(format!("invalid session: {n}")),
             Some(n) if self.sessions.values().any(|s| s.name == n) => return err(format!("duplicate session: {n}")),
             Some(n) => n,
-            None => (0..).map(|i: u32| i.to_string()).find(|n| !self.sessions.values().any(|s| &s.name == n)).unwrap(),
+            // grouped sessions are named by the group (or target) and their id
+            None => {
+                let group = self.sessions[&tsid].group;
+                let prefix = group.and_then(|g| self.sessions.values().filter(|x| x.group == Some(g)).min_by_key(|x| x.created).map(|x| x.name.clone()))
+                    .unwrap_or_else(|| self.sessions[&tsid].name.clone());
+                loop {
+                    let n = format!("{prefix}-{}", self.next_session_id);
+                    if !self.sessions.values().any(|s| s.name == n) { break n; }
+                    self.next_session_id += 1;
+                }
+            }
         };
         let gid = match self.sessions[&tsid].group {
             Some(g) => g,
@@ -3851,7 +3919,7 @@ impl Server {
                 g
             }
         };
-        let sid = self.id();
+        let sid = self.new_session_id();
         let now = now_secs();
         let t = &self.sessions[&tsid];
         let session = Session {
@@ -3983,38 +4051,72 @@ impl Server {
         self.opts_server.array_items("command-alias").into_iter().map(|(_, v)| v).collect()
     }
 
-    /// The hook map a hook option lives in: the server's with -g, otherwise the
-    /// target session's (pwsh-tmux keeps window and pane hooks per session).
-    fn hook_level(&self, o: &Opts, ctx: &Ctx) -> Result<Option<SessId>, String> {
-        if o.has('g') { return Ok(None); }
+    /// The level a hook option lives at, as options_scope_from_name: session hooks in
+    /// the session (the global options with -g), window and pane hooks in the window
+    /// (with -p the pane, which ignores -g; with -g the global window options).
+    fn hook_level(&self, o: &Opts, ctx: &Ctx, base: &str) -> Result<HookLevel, String> {
         let t = o.get('t');
-        self.resolve_session(ctx, t).map(Some)
-            .map_err(|_| t.map_or_else(|| "no current session".to_string(), |t| format!("no such session: {t}")))
+        let cause = |what: &str| t.map_or_else(|| format!("no current {what}"), |t| format!("no such {what}: {t}"));
+        Ok(match options::hook_scope(base) {
+            Some(Scope::Pane) if o.has('p') => HookLevel::Pane(self.resolve_pane(ctx, t).ok().and_then(|t| t.pane).ok_or_else(|| cause("pane"))?),
+            Some(Scope::Pane | Scope::Window) if o.has('g') => HookLevel::Global,
+            Some(Scope::Pane | Scope::Window) => HookLevel::Window(self.resolve_window(ctx, t).ok().and_then(|t| t.wid).ok_or_else(|| cause("window"))?),
+            _ if o.has('g') => HookLevel::Global,
+            _ => HookLevel::Session(self.resolve_session(ctx, t).map_err(|_| cause("session"))?),
+        })
+    }
+
+    /// The hooks of a level.
+    pub(crate) fn hook_map(&self, level: HookLevel) -> Option<&BTreeMap<String, Vec<String>>> {
+        match level {
+            HookLevel::Global => Some(&self.hooks),
+            HookLevel::Session(s) => self.sessions.get(&s).map(|s| &s.hooks),
+            HookLevel::Window(w) => self.windows.get(&w).map(|w| &w.hooks),
+            HookLevel::Pane(p) => self.panes.get(&p).map(|p| &p.hooks),
+        }
+    }
+
+    fn hook_map_mut(&mut self, level: HookLevel) -> Result<&mut BTreeMap<String, Vec<String>>, String> {
+        match level {
+            HookLevel::Global => Ok(&mut self.hooks),
+            HookLevel::Session(s) => self.sessions.get_mut(&s).map(|s| &mut s.hooks).ok_or_else(|| "no such session".into()),
+            HookLevel::Window(w) => self.windows.get_mut(&w).map(|w| &mut w.hooks).ok_or_else(|| "no such window".into()),
+            HookLevel::Pane(p) => self.panes.get_mut(&p).map(|p| &mut p.hooks).ok_or_else(|| "no such pane".into()),
+        }
+    }
+
+    /// The level above (show-options -A): pane -> window -> global.
+    fn hook_parent(&self, level: HookLevel) -> Option<HookLevel> {
+        match level {
+            HookLevel::Global => None,
+            HookLevel::Pane(p) => self.window_of(p).map(HookLevel::Window),
+            _ => Some(HookLevel::Global),
+        }
     }
 
     /// A hook's commands at a level: the global level holds every hook (an empty
-    /// array by default), a session only those set on it.
-    fn hook_values(&self, sid: Option<SessId>, base: &str) -> Option<&[String]> {
-        match sid {
-            None => Some(self.hooks.get(base).map_or(&[][..], |v| v.as_slice())),
-            Some(s) => self.sessions.get(&s)?.hooks.get(base).map(|v| v.as_slice()),
+    /// array by default), the others only those set on them.
+    fn hook_values(&self, level: HookLevel, base: &str) -> Option<&[String]> {
+        match level {
+            HookLevel::Global => Some(self.hooks.get(base).map_or(&[][..], |v| v.as_slice())),
+            l => self.hook_map(l)?.get(base).map(|v| v.as_slice()),
         }
     }
 
     /// set-option on a hook: an array of command lists. Unset elements are kept as
     /// "" so the other keys stay put (string keys are not supported).
     fn set_hook_option(&mut self, o: &Opts, ctx: &Ctx, name: &str, arg: &str, value: Option<String>) -> Result<(), String> {
-        let sid = match self.hook_level(o, ctx) {
-            Ok(s) => s,
-            Err(_) if o.has('q') => return Ok(()),
-            Err(e) => return err(e),
-        };
         let (base, key) = match name.split_once('[') {
             Some((b, k)) => {
                 let k = k.trim_end_matches(']');
                 (b, Some(k.parse::<usize>().map_err(|_| format!("bad array key: {k}"))?))
             }
             None => (name, None),
+        };
+        let sid = match self.hook_level(o, ctx, base) {
+            Ok(s) => s,
+            Err(_) if o.has('q') => return Ok(()),
+            Err(e) => return err(e),
         };
         let already = self.hook_values(sid, base).is_some_and(|v| key.is_none_or(|i| v.get(i).is_some_and(|c| !c.is_empty())));
         if o.has('o') && !o.has('u') && already {
@@ -4025,10 +4127,7 @@ impl Server {
             None => return err("empty value"),
             Some(v) => Some(command_list_string(v, &self.command_aliases())),
         };
-        let map = match sid {
-            None => &mut self.hooks,
-            Some(s) => &mut self.sessions.get_mut(&s).ok_or("no such session")?.hooks,
-        };
+        let map = self.hook_map_mut(sid)?;
         let Some(cmd) = cmd else {
             match key {
                 None => { map.remove(base); }
@@ -4223,22 +4322,24 @@ impl Server {
             }
         };
         // hooks live in the hook maps: the session's (if not -g), then the global one
-        let hook_sid = match self.hook_level(o, ctx) {
+        let hook_sid = match self.hook_level(o, ctx, name.map_or("", |n| n.split('[').next().unwrap_or(n))) {
             Ok(s) => s,
             Err(_) if o.has('q') && hook => return Ok(()),
             Err(e) if hook => return err(e),
-            Err(_) => None,
+            Err(_) => HookLevel::Global,
         };
         let show_hook = |out: &mut String, name: &str, named: bool| {
             let (base, key) = match name.split_once('[') {
                 Some((b, k)) => (b, Some(k.trim_end_matches(']'))),
                 None => (name, None),
             };
-            let (values, parent) = match self.hook_values(hook_sid, base) {
-                Some(v) => (v, false),
-                None if o.has('A') => (self.hook_values(None, base).unwrap_or_default(), true),
-                None => return,
-            };
+            let mut found = self.hook_values(hook_sid, base).map(|v| (v, false));
+            let mut level = hook_sid;
+            while found.is_none() && o.has('A') && let Some(up) = self.hook_parent(level) {
+                found = self.hook_values(up, base).map(|v| (v, true));
+                level = up;
+            }
+            let Some((values, parent)) = found else { return };
             // set-hook keeps the command as given; it is shown as tmux prints it
             let aliases = self.command_aliases();
             let values: Vec<String> = values.iter().map(|v| if v.is_empty() { String::new() } else { print_command_string(v, &aliases, false) }).collect();
@@ -4309,7 +4410,8 @@ impl Server {
             }
             None => {
                 // user options of this level first, then the table in tmux order
-                for (k, v) in store.0.iter().filter(|(k, _)| k.starts_with('@')) {
+                // (user options made hooks by set-hook only with -H)
+                for (k, v) in store.0.iter().filter(|(k, _)| k.starts_with('@') && (o.has('H') || !self.hook_events.contains(*k))) {
                     print(&mut out, k, Some(v), false);
                 }
                 let wanted = |s: Scope| s == scope || (s == Scope::Pane && scope == Scope::Window);
@@ -4357,6 +4459,15 @@ impl Server {
             c.dirty = true;
         }
     }
+}
+
+/// Where a hook is set: the global options, a session, a window or a pane.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HookLevel {
+    Global,
+    Session(SessId),
+    Window(WinId),
+    Pane(PaneId),
 }
 
 /// Commands a read-only (server-access -r) client may run.

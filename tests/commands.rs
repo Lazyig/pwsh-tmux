@@ -1449,3 +1449,132 @@ fn format_type_follows_the_target() {
     // format_defaults fills in the session's current pane
     assert_eq!(ctx.ok(&["list-sessions", "-F", "#{pane_index}"]), "0\n");
 }
+
+#[test]
+fn bind_key_splits_separate_arguments_like_cmd_parse_from_arguments() {
+    let ctx = Ctx::new("p1fix-bindsplit");
+    ctx.ok(&["new-session", "-d", "-s", "s1", "sleep 100"]);
+    let dir = std::env::temp_dir().join(format!("pt-bindsplit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let conf = dir.join("c.conf");
+    std::fs::write(&conf, concat!(
+        "bind F4 resize-pane -U 5 \\; select-pane -t '{last}'\n",
+        "bind F5 display a \\; display b\n",
+        "bind F6 send -l '\\;'\n",
+        "bind F7 send -l ';'\n",
+        "bind F8 send -l 'a;'\n",
+        "bind F9 send -l \\;x\n",
+        "bind -n M-z resize-pane -Z \\; set -g @z 1\n",
+        "bind F10 source-file /dev/null \\; display \"Reloaded!\"\n",
+    )).unwrap();
+    // the config's \; reaches bind-key as a ";" argument, which ends a command
+    assert_eq!(ctx.ok(&["source-file", conf.to_str().unwrap()]), "");
+    for (k, want) in [
+        ("F4", "resize-pane -U 5 \\; select-pane -t \"{last}\""),
+        ("F5", "display-message a \\; display-message b"),
+        ("F6", "send-keys -l \\;"),
+        ("F7", "send-keys -l"),
+        ("F8", "send-keys -l a"),
+        ("F9", "send-keys -l \";x\""),
+        ("F10", "source-file /dev/null \\; display-message Reloaded!"),
+    ] {
+        assert_eq!(ctx.ok(&["list-keys", k]).trim(), format!("bind-key  -T prefix {k} {want}"), "{k}");
+    }
+    assert_eq!(ctx.ok(&["list-keys", "-T", "root", "M-z"]).trim(), r"bind-key  -T root M-z resize-pane -Z \; set-option -g @z 1");
+    // both commands run
+    ctx.ok(&["bind-key", "F3", "set", "-g", "@a", "1;", "set", "-g", "@b", "2"]);
+    assert_eq!(ctx.ok(&["list-keys", "F3"]).trim(), r"bind-key  -T prefix F3 set-option -g @a 1 \; set-option -g @b 2");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn set_hook_is_set_option_and_show_hooks_scopes() {
+    let ctx = Ctx::new("p1fix-hooks");
+    ctx.ok(&["new-session", "-d", "-s", "m", "sleep 100"]);
+    ctx.ok(&["new-session", "-d", "-s", "f", "sleep 100"]);
+    // name[N] is that element; -a uses the first free index; -u name[N] removes it
+    ctx.ok(&["set-hook", "-g", "pane-died[3]", "run \"echo hi\""]);
+    ctx.ok(&["set-hook", "-g", "pane-died[1]", "display died"]);
+    ctx.ok(&["set-hook", "-ag", "pane-died", "display app"]);
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "pane-died"]), "pane-died[0] display-message app\npane-died[1] display-message died\npane-died[3] run-shell \"echo hi\"\n");
+    ctx.ok(&["set-hook", "-ug", "pane-died[3]"]);
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "pane-died"]), "pane-died[0] display-message app\npane-died[1] display-message died\n");
+    ctx.ok(&["set-hook", "-t", "f", "session-renamed[3]", "neww"]);
+    assert_eq!(ctx.ok(&["show-hooks", "-t", "f", "session-renamed"]), "session-renamed[3] new-window\n");
+    // names are checked as option names; values as option values
+    assert_eq!(ctx.fails(&["set-hook", "-g", "nosuch-hook", "display x"]).trim(), "invalid option: nosuch-hook");
+    assert_eq!(ctx.fails(&["set-hook", "-g", "status", "display x"]).trim(), "unknown value: display x");
+    assert_eq!(ctx.fails(&["set-hook", "-g", "client-attached"]).trim(), "empty value");
+    assert_eq!(ctx.fails(&["show-hooks", "-g", "nosuch"]).trim(), "invalid option: nosuch");
+    assert_eq!(ctx.fails(&["show-hooks", "-g", "@x"]).trim(), "invalid option: @x");
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "status"]), "status on\n");
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "after-new-window[2]"]), "after-new-window[2] \n");
+    // an @ name is a user option, listed by show-hooks (and show-options only with -H)
+    ctx.ok(&["set-hook", "-g", "@u", "neww"]);
+    assert_eq!(ctx.fmt("m", "#{@u}"), "neww");
+    assert_eq!(ctx.ok(&["show-options", "-gv", "@u"]), "neww\n");
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "@u"]), "@u neww\n");
+    assert!(ctx.ok(&["show-hooks", "-g"]).starts_with("@u neww\n"));
+    assert!(!ctx.ok(&["show-options", "-g"]).contains("@u"));
+    assert!(ctx.ok(&["show-options", "-gH"]).contains("@u neww"));
+    // pane hooks live on the pane (-p ignores -g), window hooks on the window
+    ctx.ok(&["set-hook", "-p", "-t", "m", "pane-exited", "display x"]);
+    assert_eq!(ctx.ok(&["show-hooks", "-w", "-t", "m"]), "");
+    assert_eq!(ctx.ok(&["show-hooks", "-p", "-t", "m"]), "pane-exited[0] display-message x\n");
+    assert_eq!(ctx.ok(&["show-hooks", "-g", "-p", "-t", "m"]), "pane-exited[0] display-message x\n");
+    assert_eq!(ctx.fmt("m", "#{O/p:#{option_name};}"), "pane-exited;");
+    assert_eq!(ctx.ok(&["show-hooks", "-p", "-t", "f"]), "");
+    ctx.ok(&["set-hook", "-w", "-t", "m", "window-renamed", "set -g @wr yes"]);
+    assert_eq!(ctx.ok(&["show-hooks", "-w", "-t", "m"]), "window-renamed[0] set-option -g @wr yes\n");
+    assert_eq!(ctx.ok(&["show-hooks", "-w", "-t", "f"]), "");
+    ctx.ok(&["rename-window", "-t", "f:0", "other"]);
+    ctx.fails(&["show-options", "-gv", "@wr"]);
+    ctx.ok(&["rename-window", "-t", "m:0", "zz"]);
+    wait_for("window hook", || ctx.cmd(&["show-options", "-gv", "@wr"]).1 == "yes\n");
+}
+
+#[test]
+fn sessions_windows_and_panes_have_their_own_ids() {
+    let ctx = Ctx::new("p1fix-ids");
+    ctx.ok(&["new-session", "-d", "-s", "s1", "sleep 100"]);
+    assert_eq!(ctx.ok(&["list-panes", "-a", "-F", "#{pane_id} #{window_id} #{session_id}"]), "%0 @0 $0\n");
+    assert_eq!(ctx.fmt("s1", "#{next_session_id}"), "$1");
+    ctx.ok(&["new-window", "-d", "sleep 100"]);
+    ctx.ok(&["split-window", "-d", "-t", "s1:1", "sleep 100"]);
+    assert_eq!(ctx.ok(&["list-panes", "-a", "-F", "#{pane_id} #{window_id}"]), "%0 @0\n%1 @1\n%2 @1\n");
+    ctx.ok(&["new-session", "-d", "-s", "s2", "sleep 100"]);
+    assert_eq!(ctx.fmt("s1", "#{next_session_id}"), "$2");
+    // an unnamed session is named by its id; a grouped one by its group and id
+    ctx.ok(&["new-session", "-d", "sleep 100"]);
+    ctx.ok(&["new-session", "-d", "-t", "s1"]);
+    assert_eq!(ctx.ok(&["list-sessions", "-F", "#{session_name} #{session_id}"]), "2 $2\ns1 $0\ns1-3 $3\ns2 $1\n");
+    // the global environment is not session $0's
+    ctx.ok(&["set-environment", "-g", "G1", "x"]);
+    ctx.ok(&["set-environment", "-t", "s1", "S1", "y"]);
+    assert_eq!(ctx.ok(&["show-environment", "-g", "G1"]), "G1=x\n");
+    ctx.fails(&["show-environment", "-g", "S1"]);
+    assert_eq!(ctx.ok(&["show-environment", "-t", "s1", "S1"]), "S1=y\n");
+}
+
+#[test]
+fn client_lookup_send_keys_and_refresh_client_errors() {
+    let ctx = Ctx::new("p1fix-clients");
+    ctx.ok(&["new-session", "-d", "-s", "s1", "sleep 100"]);
+    // CMD_CLIENT_CANFAIL: an unknown client is no error (a session name is not a client)
+    assert_eq!(ctx.ok(&["display-message", "-p", "-c", "nosuch", "#{session_name}"]), "s1\n");
+    assert_eq!(ctx.ok(&["display-message", "-p", "-c", "s1", "#{session_name}"]), "s1\n");
+    ctx.ok(&["display-message", "-c", "bogus", "msg"]);
+    ctx.ok(&["show-messages", "-t", "bogus"]);
+    ctx.ok(&["send-keys", "-c", "bogus", "-t", "s1", "x"]);
+    assert_eq!(ctx.fails(&["switch-client", "-c", "s1", "-t", "s1"]).trim(), "can't find client: s1");
+    assert_eq!(ctx.fails(&["refresh-client", "-t", "s1:"]).trim(), "can't find client: s1:");
+    // cmd_send_keys_exec's checks
+    assert_eq!(ctx.fails(&["send-keys", "-t", "s1", "-X", "cancel"]).trim(), "not in a mode");
+    assert_eq!(ctx.fails(&["send-keys", "-t", "s1", "-N", "0", "x"]).trim(), "repeat count too small");
+    assert_eq!(ctx.fails(&["send-keys", "-t", "s1", "-N", "abc", "x"]).trim(), "repeat count invalid");
+    ctx.ok(&["send-keys", "-t", "s1", "-N", "2"]);
+    ctx.ok(&["copy-mode", "-t", "s1"]);
+    ctx.ok(&["send-keys", "-t", "s1", "-N", "2", "-X", "cursor-up"]);
+    ctx.ok(&["send-keys", "-t", "s1", "-X", "cancel"]);
+    assert_eq!(ctx.fmt("s1", "#{pane_in_mode}"), "0");
+}

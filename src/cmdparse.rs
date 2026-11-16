@@ -101,6 +101,39 @@ pub fn split_commands(args: &[String]) -> Vec<Vec<String>> {
     out
 }
 
+/// Split already-separated arguments into commands as cmd_parse_from_arguments does
+/// (bind-key with several arguments): an argument ending in ";" ends a command (the
+/// ";" is dropped, and an argument that was only ";" goes away), but "\;" at the end
+/// is a literal ";". Arguments starting with [`BLOCK_MARK`] are { } blocks and are kept.
+pub fn split_arguments(args: &[String]) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    for a in args {
+        let mut end = false;
+        let mut a = a.clone();
+        if !a.starts_with(BLOCK_MARK) && a.ends_with(';') {
+            a.pop();
+            if a.ends_with('\\') {
+                a.pop();
+                a.push(';');
+            } else {
+                end = true;
+            }
+        }
+        if !end || !a.is_empty() {
+            cur.push(a);
+        }
+        if end {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out.retain(|c| !c.is_empty());
+    out
+}
+
 /// Quote one argument so `parse` returns it unchanged (used by list-keys / show-options output).
 pub fn quote(arg: &str) -> String {
     if arg.is_empty() {
@@ -1161,6 +1194,20 @@ if-shell 'test -n "$SSH_CLIENT"' {
             split_commands(bound),
             vec![v(&["split-window"]), v(&["select-pane", "-L"])]
         );
+    }
+
+    #[test]
+    fn split_arguments_like_cmd_parse_from_arguments() {
+        let a = |x: &[&str]| split_arguments(&v(x));
+        assert_eq!(a(&["a", "1", ";", "b"]), vec![v(&["a", "1"]), v(&["b"])]);
+        assert_eq!(a(&["a", "1;", "b"]), vec![v(&["a", "1"]), v(&["b"])]);
+        // a trailing \\; is a literal ";"
+        assert_eq!(a(&["send", "-l", "\\;"]), vec![v(&["send", "-l", ";"])]);
+        assert_eq!(a(&["send", "-l", ";"]), vec![v(&["send", "-l"])]);
+        assert_eq!(a(&["send", ";x"]), vec![v(&["send", ";x"])]);
+        // blocks are kept as they are
+        let blk = format!("{BLOCK_MARK}x;");
+        assert_eq!(a(&["if", "1", &blk]), vec![v(&["if", "1", &blk])]);
     }
 
     #[test]

@@ -286,7 +286,7 @@ impl Vars for VarCtx<'_> {
             "start_time" => Some(srv.start_time.to_string()),
             "server_sessions" => Some(srv.sessions.len().to_string()),
             // session, window and pane ids share one counter here
-            "next_session_id" => Some(format!("${}", srv.next_id + 1)),
+            "next_session_id" => Some(format!("${}", srv.next_session_id)),
             "config_files" => Some(srv.cfg_files.join(",")),
             "sixel_support" => Some("0".into()),
             "uid" => Some(ipc::own_user_id()),
@@ -764,7 +764,7 @@ impl Vars for VarCtx<'_> {
         let srv = self.srv;
         if kind == 'V' {
             // V or V/s: the session environment, V/g: global, V/c: the client's.
-            let level = match flags { "" | "s" => self.t.sid.unwrap_or(u32::MAX), "g" => 0, _ => u32::MAX };
+            let level = match flags { "" | "s" => self.t.sid.unwrap_or(u32::MAX), "g" => super::GLOBAL_ENV, _ => u32::MAX };
             let mut env: Vec<(String, Option<String>)> = match flags {
                 "" | "s" => self.t.sid.and_then(|s| srv.sessions.get(&s)).map(|s| s.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default(),
                 "g" => srv.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -810,19 +810,25 @@ impl Vars for VarCtx<'_> {
         }).collect();
         // Hooks are options too (kept apart here): global options hold every hook of
         // their scope, a session's only those set there.
-        let hooks = if flags.contains('v') || flags.contains('p') {
+        use super::cmds::HookLevel;
+        let level = if flags.contains('v') {
             None
+        } else if flags.contains('p') {
+            if global { None } else { self.t.pane.map(HookLevel::Pane) }
         } else if global {
-            Some((&srv.hooks, flags.contains('w')))
+            Some(HookLevel::Global)
+        } else if flags.contains('w') {
+            self.t.wid.map(HookLevel::Window)
         } else if flags.contains('s') {
-            self.t.sid.and_then(|s| srv.sessions.get(&s)).map(|s| (&s.hooks, false))
+            self.t.sid.map(HookLevel::Session)
         } else {
             None
         };
+        let hooks = level.and_then(|l| srv.hook_map(l)).map(|m| (m, flags.contains('w') || flags.contains('p')));
         if let Some((map, window)) = hooks {
             let aliases = srv.command_aliases();
             for (name, scope) in options::HOOKS {
-                if (*scope == options::Scope::Session) == window {
+                if (*scope == options::Scope::Session) == window || (flags.contains('p') && *scope != options::Scope::Pane) {
                     continue;
                 }
                 let cmds: Vec<(usize, &String)> = map.get(*name).map(|v| v.iter().enumerate().filter(|(_, c)| !c.is_empty()).collect()).unwrap_or_default();

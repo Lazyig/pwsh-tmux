@@ -466,11 +466,13 @@ fn menu_and_popup_lines_styles_and_closing_keys() {
     let ctx = Ctx::new("menu-look");
     let t = start(&ctx, "m");
     let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
-    // menus and popups make the command wait until they close
+    // popups make the command wait until they close; display-menu returns at once
     let bg = |args: &[&str]| ctx.command().args(args).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
     assert!(ctx.fails(&["display-menu", "-c", &client, "-b", "wavy", "x", "x", "display x"]).contains("menu-border-lines unknown value: wavy"));
     let mut w1 = bg(&["display-menu", "-c", &client, "-b", "double", "-x", "0", "-y", "10", "-T", "T", "First", "f", "display first"]);
     t.wait_screen("double menu border", |s| s.contains('╔') && s.contains("First"));
+    wait_for("display-menu returns while the menu is open", || w1.try_wait().unwrap().is_some());
+    assert!(t.contents().contains('╔'));
     t.send(b"\x1b");
     t.wait_screen("menu closed", |s| !s.contains('╔'));
     assert!(ctx.fails(&["display-popup", "-c", &client, "-b", "wavy", "true"]).contains("popup-border-lines unknown value: wavy"));
@@ -487,7 +489,7 @@ fn menu_and_popup_lines_styles_and_closing_keys() {
     t.wait_screen("heavy popup", |s| s.contains('┏') && s.contains("POPUP-K"));
     t.send(b"x");
     t.wait_screen("popup closed by any key", |s| !s.contains('┏'));
-    for w in [&mut w1, &mut w2, &mut w3] {
+    for w in [&mut w2, &mut w3] {
         wait_for("waiting command", || w.try_wait().unwrap().is_some());
     }
 }
@@ -540,4 +542,24 @@ fn client_focus_flag_follows_focus_reports() {
     wait_for("focus out", || flags() == "attached,UTF-8\n");
     t.send(b"\x1b[I");
     wait_for("focus in", || flags() == "attached,focused,UTF-8\n");
+}
+
+#[test]
+fn readonly_client_send_keys_and_refresh_client_control_flags() {
+    let ctx = Ctx::new("p1fix-rosend");
+    ctx.ok(&["new-session", "-d", "-s", "s1", "-x", "80", "-y", "24", "cat"]);
+    let t = Term::attach(&ctx, &["attach-session", "-r", "-t", "s1"], 80, 24);
+    t.wait_screen("readonly attach", |s| s.contains("[s1]"));
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    // the target client of send-keys may not be read-only (except for -X)
+    assert_eq!(ctx.fails(&["send-keys", "-c", &client, "-t", "s1", "abc"]).trim(), "client is read-only");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!ctx.capture("s1").contains("abc"));
+    // a trailing ':' is trimmed from a client name
+    assert_eq!(ctx.ok(&["display-message", "-p", "-c", &format!("{client}:"), "#{client_name}"]).trim(), client);
+    // -A, -B and -C are for control clients, checked first
+    for args in [["-C", "90x20"], ["-B", "x"], ["-A", "%0:on"]] {
+        assert_eq!(ctx.fails(&["refresh-client", "-t", &client, args[0], args[1]]).trim(), "not a control client", "{args:?}");
+    }
+    drop(t);
 }

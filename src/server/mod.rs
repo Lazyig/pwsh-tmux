@@ -41,6 +41,8 @@ pub type PaneId = u32;
 pub type WinId = u32;
 pub type SessId = u32;
 pub type ClientId = u32;
+/// The environment level of the global environment (session ids start at 0).
+pub const GLOBAL_ENV: SessId = SessId::MAX - 1;
 
 pub fn log(msg: &str) {
     if let Ok(dir) = ipc::runtime_dir() {
@@ -325,6 +327,8 @@ pub struct Pane {
     pub dead: Option<(Option<i32>, u64)>,
     pub mode: Option<PaneMode>,
     pub options: Options,
+    /// Hooks set on the pane (set-hook -p).
+    pub hooks: BTreeMap<String, Vec<String>>,
     pub pipe: Option<Sender<Vec<u8>>>,
     pub last_output: Instant,
     pub created: u64,
@@ -437,6 +441,8 @@ pub struct Window {
     pub last_active: Option<PaneId>,
     pub zoomed: bool,
     pub options: Options,
+    /// Hooks set on the window (window and pane hooks without -g).
+    pub hooks: BTreeMap<String, Vec<String>>,
     #[allow(dead_code)]
     pub alerts: u8,
     pub layout_cycle: Option<usize>,
@@ -797,6 +803,11 @@ pub struct Server {
     pub panes: HashMap<PaneId, Pane>,
     pub clients: BTreeMap<ClientId, Client>,
     pub next_id: u32,
+    /// Sessions, windows and panes are numbered apart, each from 0 (next_session_id,
+    /// next_window_id, next_window_pane_id).
+    pub next_session_id: SessId,
+    pub next_window_id: WinId,
+    pub next_pane_id: PaneId,
     pub opts_server: Options,
     pub opts_session: Options,
     pub opts_window: Options,
@@ -805,6 +816,8 @@ pub struct Server {
     /// the global environment, name). Not given to new processes.
     pub env_hidden: std::collections::HashSet<(SessId, String)>,
     pub hooks: BTreeMap<String, Vec<String>>,
+    /// User options set with set-hook (hooks_add_event): show-hooks lists them.
+    pub hook_events: std::collections::BTreeSet<String>,
     pub buffers: Vec<Buffer>,
     pub buffer_seq: u32,
     pub bindings: BTreeMap<String, BTreeMap<String, Binding>>,
@@ -940,12 +953,16 @@ impl Server {
             panes: HashMap::new(),
             clients: BTreeMap::new(),
             next_id: 0,
+            next_session_id: 0,
+            next_window_id: 0,
+            next_pane_id: 0,
             opts_server: Options::defaults(Scope::Server),
             opts_session: Options::defaults(Scope::Session),
             opts_window: Options::defaults(Scope::Window),
             env,
             env_hidden: std::collections::HashSet::new(),
             hooks: BTreeMap::new(),
+            hook_events: Default::default(),
             buffers: Vec::new(),
             buffer_seq: 0,
             bindings: input::default_bindings(),
@@ -983,6 +1000,21 @@ impl Server {
     pub fn id(&mut self) -> u32 {
         self.next_id += 1;
         self.next_id
+    }
+
+    pub fn new_session_id(&mut self) -> SessId {
+        self.next_session_id += 1;
+        self.next_session_id - 1
+    }
+
+    pub fn new_window_id(&mut self) -> WinId {
+        self.next_window_id += 1;
+        self.next_window_id - 1
+    }
+
+    pub fn new_pane_id(&mut self) -> PaneId {
+        self.next_pane_id += 1;
+        self.next_pane_id - 1
     }
 
     fn load_config(&mut self, explicit: Option<String>) {
@@ -1872,7 +1904,7 @@ impl Server {
     pub fn session_env(&self, sid: Option<SessId>) -> Vec<(String, Option<String>)> {
         let mut env: BTreeMap<String, Option<String>> = BTreeMap::new();
         for (k, v) in &self.env {
-            if !self.env_hidden.contains(&(0, k.clone())) {
+            if !self.env_hidden.contains(&(GLOBAL_ENV, k.clone())) {
                 env.insert(k.clone(), v.clone());
             }
         }
@@ -1890,7 +1922,7 @@ impl Server {
 
     /// Spawns a process in a new pty. `cmd`: empty = default-command / shell; one arg = via shell; more = argv.
     pub fn spawn_pane(&mut self, sid: Option<SessId>, cols: u16, rows: u16, cmd: &[String], cwd: Option<&str>, extra_env: &[(String, String)]) -> Result<PaneId, String> {
-        let id = self.id();
+        let id = self.new_pane_id();
         self.spawn_into(id, 0, sid, cols, rows, cmd, cwd, extra_env)?;
         Ok(id)
     }
@@ -1991,6 +2023,7 @@ impl Server {
         let now = now_secs();
         let prog = procinfo::program_name(&argv[0]);
         let existing_opts = self.panes.get(&id).map(|p| p.options.clone()).unwrap_or_default();
+        let existing_hooks = self.panes.get(&id).map(|p| p.hooks.clone()).unwrap_or_default();
         let title = self.panes.get(&id).map(|p| p.title.clone()).unwrap_or_else(|| self.host.clone());
         let previous = self.panes.insert(
             id,
@@ -2008,6 +2041,7 @@ impl Server {
                 dead: None,
                 mode: None,
                 options: existing_opts,
+                hooks: existing_hooks,
                 pipe: None,
                 last_output: Instant::now(),
                 created: now,
@@ -2413,9 +2447,18 @@ impl Server {
         if ctx.hook_depth > 4 || ctx.readonly || self.readonly_context.get() || self.client_is_readonly(ctx.client) {
             return;
         }
-        let cmds = sid
-            .and_then(|s| self.sessions.get(&s))
-            .and_then(|s| s.hooks.get(name))
+        // session hooks: the session, then the global options; window and pane hooks:
+        // the pane, its window, then the global window options
+        let session_hook = crate::options::hook_scope(name).is_none_or(|s| s == crate::options::Scope::Session);
+        let pane = ctx.pane.filter(|p| self.panes.contains_key(p))
+            .or_else(|| sid.and_then(|s| self.sessions.get(&s)).and_then(|s| s.links.get(&s.active)).and_then(|w| self.windows.get(w)).map(|w| w.active));
+        let local = if session_hook {
+            sid.and_then(|s| self.sessions.get(&s)).and_then(|s| s.hooks.get(name))
+        } else {
+            pane.and_then(|p| self.panes.get(&p)).and_then(|p| p.hooks.get(name))
+                .or_else(|| pane.and_then(|p| self.window_of(p)).and_then(|w| self.windows.get(&w)).and_then(|w| w.hooks.get(name)))
+        };
+        let cmds = local
             .or_else(|| self.hooks.get(name))
             .cloned()
             .unwrap_or_default();
