@@ -1074,7 +1074,6 @@ impl Server {
     #[allow(clippy::too_many_arguments)]
     pub fn create_session(&mut self, ctx: &Ctx, name: Option<String>, cols: u16, rows: u16, cwd: Option<String>, win_name: Option<String>, cmd: &[String], env: &[(String, String)]) -> Result<SessId, String> {
         let name = match name {
-            Some(n) if n.is_empty() || n.contains([':', '.']) => return err(format!("invalid session: {n}")),
             Some(n) if self.sessions.values().any(|s| s.name == n) => return err(format!("duplicate session: {n}")),
             Some(n) => n,
             // session_create: an unnamed session is named by its id (the next free one)
@@ -1486,7 +1485,22 @@ impl Server {
         match cmd {
             // ---------------------------------------------------------------- sessions
             "new-session" => {
-                let name = o.get('s').map(String::from);
+                // -s is a format (format_single with the client: its session, if any),
+                // checked and cleaned like any session name
+                let name = match o.get('s') {
+                    Some(n) => {
+                        let tt = match ctx.client.and_then(|c| self.clients.get(&c)).and_then(|c| c.session) {
+                            Some(_) => self.current(ctx),
+                            None => Target::default(),
+                        };
+                        let n = self.expand(tt, ctx.client, n);
+                        if !check_name(&n) {
+                            return err(format!("invalid session name: {n}"));
+                        }
+                        Some(clean_name(&n))
+                    }
+                    None => None,
+                };
                 if let Some(target) = o.get('t') {
                     return self.new_grouped_session(ctx, name, target, o.has('d'), o.has('P'), o.get('F'));
                 }
@@ -1706,9 +1720,15 @@ impl Server {
             "rename-session" => {
                 let sid = self.resolve_session(ctx, t)?;
                 let name = o.rest.first().ok_or("rename-session needs a name")?;
+                // tmux 3.8 check_name: valid UTF-8 without control characters; clean_name
+                // escapes the rest (backslashes); ':', '.' and '' are allowed
                 let name = self.expand(self.current(ctx), ctx.client, name);
-                if name.is_empty() || name.contains([':', '.']) {
-                    return err(format!("invalid session: {name}"));
+                if !check_name(&name) {
+                    return err(format!("invalid session name: {name}"));
+                }
+                let name = clean_name(&name);
+                if self.sessions[&sid].name == name {
+                    return Ok(Flow::Next);
                 }
                 if self.sessions.values().any(|s| s.id != sid && s.name == name) {
                     return err(format!("duplicate session: {name}"));
@@ -4318,7 +4338,6 @@ impl Server {
     fn new_grouped_session(&mut self, ctx: &mut Ctx, name: Option<String>, target: &str, detached: bool, print: bool, fmt: Option<&str>) -> Result<Flow, String> {
         let tsid = self.find_session(ctx, target)?;
         let name = match name {
-            Some(n) if n.is_empty() || n.contains([':', '.']) => return err(format!("invalid session: {n}")),
             Some(n) if self.sessions.values().any(|s| s.name == n) => return err(format!("duplicate session: {n}")),
             Some(n) => n,
             // grouped sessions are named by the group (or target) and their id
@@ -5193,6 +5212,18 @@ pub fn buffer_vars(b: &Buffer) -> HashMap<String, String> {
         ("buffer_sample".to_string(), sample),
         ("buffer_created".to_string(), b.created.to_string()),
     ])
+}
+
+
+/// tmux's check_name (utf8_isvalid): printable ASCII and complete UTF-8 characters.
+fn check_name(name: &str) -> bool {
+    name.chars().all(|c| !c.is_ascii() || (' '..='~').contains(&c))
+}
+
+/// tmux's clean_name for a session (or window) name: vis-escaped with
+/// VIS_OCTAL|VIS_CSTYLE|VIS_TAB|VIS_NL, complete UTF-8 characters kept.
+fn clean_name(name: &str) -> String {
+    String::from_utf8_lossy(&vis::strvis(name.as_bytes(), vis::OCTAL | vis::CSTYLE | vis::TAB | vis::NL)).into_owned()
 }
 
 /// strerror(3) text for an I/O error (without Rust's " (os error N)").

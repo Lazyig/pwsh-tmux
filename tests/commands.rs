@@ -3095,3 +3095,27 @@ fn size_arguments_are_checked_like_args_percentage() {
     assert_eq!(ctx.fails(&["resize-window", "-t", "s", "-y", "20000"]).trim(), "height too large");
     assert_eq!(ctx.fails(&["join-pane", "-l", "abc", "-s", "s:0.1", "-t", "s:0.0"]).trim(), "size or position invalid tiled geometry invalid");
 }
+
+#[test]
+fn session_names_follow_check_name_and_clean_name() {
+    let ctx = Ctx::new("wq-names");
+    ctx.ok(&["new-session", "-d", "-s", "s", "sleep 100"]);
+    // tmux 3.8: ':', '.' and empty names are allowed; control characters are not, and
+    // backslashes are escaped (clean_name)
+    ctx.ok(&["new-session", "-d", "-s", "a:b", "sleep 100"]);
+    ctx.ok(&["new-session", "-d", "-s", "a\\b", "sleep 100"]);
+    assert_eq!(ctx.fails(&["new-session", "-d", "-s", "a\tb"]).trim_end(), "invalid session name: a\tb");
+    assert_eq!(ctx.fails(&["rename-session", "-t", "s", "q\x1b"]).trim_end(), "invalid session name: q\x1b");
+    ctx.ok(&["rename-session", "-t", "s", "x.y"]);
+    // -s is a format; from the command line there is no session in it
+    ctx.ok(&["new-session", "-d", "-s", "#{session_id}n", "sleep 100"]);
+    // renaming a session to its own name does nothing
+    ctx.ok(&["rename-session", "-t", "n", "n"]);
+    let mut names: Vec<String> = ctx.ok(&["list-sessions", "-F", "[#{session_name}]"]).lines().map(String::from).collect();
+    names.sort();
+    assert_eq!(names, ["[a:b]", "[a\\\\b]", "[n]", "[x.y]"]);
+    // and the target syntax still splits at ':' and '.', as cmd-find does
+    assert_eq!(ctx.fails(&["rename-session", "-t", "x.y", ""]).trim_end(), "can't find pane: y");
+    ctx.ok(&["rename-session", "-t", "n", ""]);
+    assert!(ctx.ok(&["list-sessions", "-F", "[#{session_name}]"]).contains("[]\n"));
+}
