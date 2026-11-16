@@ -3265,6 +3265,10 @@ impl Server {
             "pipe-pane" => {
                 let tt = self.resolve_pane(ctx, t)?;
                 let pane = tt.pane.unwrap();
+                // window_pane_exited: nothing to do for a dead pane
+                if self.panes.get(&pane).is_some_and(|p| p.dead.is_some()) {
+                    return err("target pane has exited");
+                }
                 let had = self.panes.get(&pane).is_some_and(|p| p.pipe.is_some());
                 if let Some(p) = self.panes.get_mut(&pane) {
                     p.pipe = None;
@@ -4307,6 +4311,9 @@ impl Server {
             }
             "paste-buffer" => {
                 let tt = self.resolve_pane(ctx, t)?;
+                if tt.pane.and_then(|p| self.panes.get(&p)).is_some_and(|p| p.dead.is_some()) {
+                    return err("target pane has exited");
+                }
                 let idx = match o.get('b') {
                     Some(n) => self.buffers.iter().position(|b| b.name == n).ok_or_else(|| format!("no buffer {n}"))?,
                     None => {
