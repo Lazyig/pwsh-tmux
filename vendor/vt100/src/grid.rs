@@ -743,7 +743,11 @@ impl Grid {
     }
 
     pub fn erase_row(&mut self, attrs: crate::attrs::Attrs) {
-        self.current_row_mut().clear(attrs);
+        // screen_write_clearline: the line's OSC 133 marks survive
+        let row = self.current_row_mut();
+        let flags = row.flags();
+        row.clear(attrs);
+        row.set_flags(flags);
     }
 
     pub fn erase_row_forward(&mut self, attrs: crate::attrs::Attrs) {

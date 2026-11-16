@@ -1368,6 +1368,16 @@ fn capture_pane_line_flags() {
 }
 
 #[test]
+fn capture_pane_marks_survive_erasing_the_line() {
+    let ctx = Ctx::new("p1fix-capf2");
+    ctx.ok(&["new-session", "-d", "-s", "f", "-x", "20", "-y", "4",
+        "printf '\\033]133;C\\033\\\\c\\033[2Kd'; sleep 100"]);
+    wait_for("output", || ctx.capture("f").contains('d'));
+    // screen_write_clearline keeps the line's OSC 133 flags
+    assert_eq!(ctx.ok(&["capture-pane", "-p", "-F", "-E", "0", "-t", "f"]), "O  d\n");
+}
+
+#[test]
 fn option_loop_hooks_and_session_default_size() {
     let ctx = Ctx::new("p1fix-oloop");
     // -x/-y set the session's default-size, its only local option here
@@ -1577,4 +1587,44 @@ fn client_lookup_send_keys_and_refresh_client_errors() {
     ctx.ok(&["send-keys", "-t", "s1", "-N", "2", "-X", "cursor-up"]);
     ctx.ok(&["send-keys", "-t", "s1", "-X", "cancel"]);
     assert_eq!(ctx.fmt("s1", "#{pane_in_mode}"), "0");
+}
+
+#[test]
+fn whole_command_lists_are_checked_before_running() {
+    let ctx = Ctx::new("p1fix-precheck");
+    ctx.ok(&["new-session", "-d", "-s", "s1", "sleep 100"]);
+    // from the command line: nothing runs when any command is bad
+    assert_eq!(ctx.fails(&["set", "-g", "@x", "1", ";", "neww", "-Q"]).trim(), "command new-window: unknown flag -Q");
+    assert_eq!(ctx.fails(&["set", "-g", "@y", "1", ";", "nosuch"]).trim(), "unknown command: nosuch");
+    ctx.fails(&["show-options", "-gv", "@x"]);
+    ctx.fails(&["show-options", "-gv", "@y"]);
+    // a file: the error has its file and line, and none of the file runs
+    let dir = std::env::temp_dir().join(format!("pt-precheck-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let conf = dir.join("c.conf");
+    std::fs::write(&conf, "set -g @a 1\n\nneww -Q\nset -g @b 1\n").unwrap();
+    let path = conf.to_str().unwrap();
+    assert_eq!(ctx.fails(&["source-file", path]).trim(), format!("{path}:3: command new-window: unknown flag -Q"));
+    ctx.fails(&["show-options", "-gv", "@a"]);
+    ctx.fails(&["show-options", "-gv", "@b"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_shell_status_and_new_session_sizes() {
+    let ctx = Ctx::new("p1fix-rsds");
+    ctx.ok(&["new-session", "-d", "-s", "f", "-x", "80", "-y", "24", "sleep 100"]);
+    // the last run-shell gives the exit status
+    assert_eq!(ctx.cmd(&["run-shell", "exit 3", ";", "run-shell", "true"]), (true, "'exit 3' returned 3\n".to_string()));
+    let (ok, out) = ctx.cmd(&["run-shell", "true", ";", "run-shell", "exit 4"]);
+    assert!(!ok && out == "'exit 4' returned 4\n", "{out}");
+    // a -b job's failure is shown in a pane too
+    ctx.ok(&["run-shell", "-b", "exit 5"]);
+    wait_for("view mode", || ctx.fmt("f", "#{pane_in_mode}") == "1");
+    // -x/-y: the default size as given, the other side from default-size
+    ctx.ok(&["new-session", "-d", "-s", "d1", "-x", "50", "sleep 100"]);
+    assert_eq!(ctx.ok(&["show-options", "-t", "d1", "default-size"]), "default-size 50x24\n");
+    assert_eq!(ctx.fmt("d1", "#{window_width}x#{window_height}"), "50x24");
+    assert_eq!(ctx.fails(&["new-session", "-d", "-y", "0"]).trim(), "height too small");
+    assert_eq!(ctx.fails(&["new-session", "-d", "-x", "abc"]).trim(), "width invalid");
 }

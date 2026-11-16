@@ -129,6 +129,31 @@ fn spawn_command(o: &Opts, input: bool) -> Result<Vec<String>, String> {
     Ok(if empty { vec![EMPTY_PANE.to_string()] } else { o.rest.clone() })
 }
 
+/// The checks cmd_parse_build_commands makes before anything runs: the command
+/// exists, its flags parse and the argument count fits (args_parse).
+pub fn check_command(argv: &[String]) -> Result<(), String> {
+    let Some((name, rest)) = argv.split_first() else { return Ok(()) };
+    if !name.starts_with('-') && name.contains('=') && rest.is_empty() {
+        return Ok(());
+    }
+    let full = canonical(name).ok_or_else(|| format!("unknown command: {name}"))?;
+    let spec = COMMANDS.iter().find(|c| c.0 == full).unwrap();
+    let mut args = rest.to_vec();
+    if matches!(full, "new-session" | "new-window" | "split-window" | "respawn-pane" | "respawn-window" | "display-popup") {
+        take_env(&mut args);
+    }
+    let o = getopt(&args, spec.2, spec.3).map_err(|e| format!("command {full}: {e}"))?;
+    if let Some(&(_, min, max)) = ARG_COUNTS.iter().find(|a| a.0 == full) {
+        if (o.rest.len() as i32) < min {
+            return err(format!("command {full}: too few arguments (need at least {min})"));
+        }
+        if max != -1 && o.rest.len() as i32 > max {
+            return err(format!("command {full}: too many arguments (need at most {max})"));
+        }
+    }
+    Ok(())
+}
+
 /// Store a command option (default-client-command, hooks) the way tmux parses
 /// it with cmd_parse_from_string and prints it with cmd_list_print: command-alias
 /// entries expanded, unknown commands and flags rejected, flags sorted as
@@ -1317,26 +1342,38 @@ impl Server {
                 let cid = ctx.reply.or(ctx.client);
                 let ident_size = cid.and_then(|c| self.clients.get(&c)).and_then(|c| c.ident.as_ref()).filter(|i| i.tty).map(|i| (i.cols, i.rows));
                 let default = self.opt_session(None, "default-size");
-                let (dx, dy) = default.split_once('x').map(|(a, b)| (a.parse().unwrap_or(80), b.parse().unwrap_or(24))).unwrap_or((80, 24));
+                let (dx, dy): (u16, u16) = default.split_once('x').map(|(a, b)| (a.parse().unwrap_or(80), b.parse().unwrap_or(24))).unwrap_or((80, 24));
                 let control = cid.is_some_and(|c| self.is_control(c));
                 let detached = o.has('d') || ident_size.is_none() && !control && ctx.client.and_then(|c| self.clients.get(&c)).is_none_or(|c| !c.attached);
                 let ident_size = if control { None } else { ident_size };
-                let (mut cols, mut rows) = if detached { (dx, dy) } else { ident_size.unwrap_or((dx, dy)) };
-                if let Some(x) = o.get('x').and_then(|v| v.parse().ok()) {
-                    cols = x;
-                }
-                if let Some(y) = o.get('y').and_then(|v| v.parse().ok()) {
-                    rows = y;
-                }
-                // Detached/control dimensions describe the pane area; attached
-                // terminal dimensions also include the status line.
-                let (cols, rows) = (cols.min(MAX_SIZE), rows.min(MAX_SIZE));
-                // -x/-y also set the session's default-size (the pane area)
+                // cmd_new_session_exec: -x/-y (or "-" for the client's size) give the
+                // default size; an attached client's session gets the terminal's size
+                // (less a status line), others default-size with -x/-y over it
+                let dim = |f: char, tty: Option<u16>, def: u16, what: &str| -> Result<u16, String> {
+                    match o.get(f) {
+                        Some("-") => Ok(tty.unwrap_or(def)),
+                        Some(v) => options::strtonum(v, 1, u16::MAX as i64).map(|n| n as u16).map_err(|e| format!("{what} {e}")),
+                        None => Ok(def),
+                    }
+                };
+                let dsx = dim('x', ident_size.map(|s| s.0), 80, "width")?;
+                let dsy = dim('y', ident_size.map(|s| s.1), 24, "height")?;
+                let status = self.status_lines(None);
+                let (sx, sy) = if !detached && !control {
+                    let (c, r) = ident_size.unwrap_or((dx, dy.saturating_add(status)));
+                    (c, r.saturating_sub(status))
+                } else {
+                    let (mut sx, mut sy) = if default.split_once('x').is_some_and(|(a, b)| a.parse::<u16>().is_ok() && b.parse::<u16>().is_ok()) { (dx, dy) } else { (dsx, dsy) };
+                    if o.has('x') { sx = dsx; }
+                    if o.has('y') { sy = dsy; }
+                    (sx, sy)
+                };
+                let (sx, sy) = (sx.clamp(1, MAX_SIZE), sy.clamp(1, MAX_SIZE));
+                // -x/-y also set the session's default-size, as given
                 let default_size = (o.has('x') || o.has('y')).then(|| {
-                    let r = if detached || control { rows } else { rows.saturating_sub(self.status_lines(None)) };
-                    format!("{}x{}", cols.max(1), r.max(1))
+                    format!("{}x{}", if o.has('x') { dsx } else { sx }, if o.has('y') { dsy } else { sy })
                 });
-                let rows = if detached || control { rows.saturating_add(self.status_lines(None)) } else { rows };
+                let (cols, rows) = (sx, sy.saturating_add(status));
                 if !detached {
                     // already attached clients switch, CLI clients attach
                     if let Some(c) = cid.and_then(|c| self.clients.get(&c)) {
@@ -3640,10 +3677,15 @@ impl Server {
                         let parsed = {
                             let cond = |c: &str| truthy(&self.expand(self.current(ctx), ctx.client, c));
                             let env = |n: &str| self.env.get(n).cloned().flatten();
-                            cmdparse::parse_with_env(&text, &cond, &env)
+                            cmdparse::parse_with_env_lines(&text, &cond, &env)
                         };
                         self.cur_file = saved_file;
-                        let cmds = parsed.map_err(|e| format!("{f}:{e}"))?;
+                        let (cmds, lines) = parsed.map_err(|e| format!("{f}:{e}"))?;
+                        // cmd_parse_from_file: the whole file is checked before any of
+                        // it runs; an error names the file and line
+                        for (c, line) in cmds.iter().zip(&lines) {
+                            check_command(c).map_err(|e| format!("{f}:{line}: {e}"))?;
+                        }
                         if o.has('n') {
                             continue;
                         }

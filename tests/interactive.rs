@@ -563,3 +563,16 @@ fn readonly_client_send_keys_and_refresh_client_control_flags() {
     }
     drop(t);
 }
+
+#[test]
+fn status_line_formats_have_no_pane_type() {
+    let ctx = Ctx::new("p1fix-stype");
+    ctx.ok(&["new-session", "-d", "-s", "s1", "-x", "60", "-y", "10", "sleep 100"]);
+    let f = "#{session_format}#{window_format}#{pane_format}";
+    ctx.ok(&["set", "-g", "status-left", &format!("L[{f}]")]);
+    ctx.ok(&["set", "-g", "status-right", &format!("R[{f}]")]);
+    ctx.ok(&["set", "-g", "window-status-current-format", &format!("W[{f}]")]);
+    let t = Term::attach(&ctx, &["attach-session", "-t", "s1"], 60, 10);
+    // format_defaults(ft, c, NULL, NULL, NULL); window entries are window formats
+    t.wait_screen("status formats", |s| s.contains("L[000]W[010]") && s.contains("R[000]"));
+}

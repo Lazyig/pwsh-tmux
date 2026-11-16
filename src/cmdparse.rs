@@ -26,6 +26,11 @@ pub fn parse_with(input: &str, cond: &dyn Fn(&str) -> bool) -> Result<Vec<Vec<St
 /// later `${NAME}` in the same file sees it (the `set-environment` commands are still
 /// returned so the server's environment ends up the same).
 pub fn parse_with_env(input: &str, cond: &dyn Fn(&str) -> bool, env: &dyn Fn(&str) -> Option<String>) -> Result<Vec<Vec<String>>, String> {
+    parse_with_env_lines(input, cond, env).map(|(cmds, _)| cmds)
+}
+
+/// Like [`parse_with_env`], also giving the line each command starts on.
+pub fn parse_with_env_lines(input: &str, cond: &dyn Fn(&str) -> bool, env: &dyn Fn(&str) -> Option<String>) -> Result<(Vec<Vec<String>>, Vec<usize>), String> {
     let normalized = input.replace("\r\n", "\n");
     let mut lx = Lexer {
         s: normalized.chars().collect(),
@@ -34,16 +39,17 @@ pub fn parse_with_env(input: &str, cond: &dyn Fn(&str) -> bool, env: &dyn Fn(&st
         env,
         assigned: std::collections::HashMap::new(),
         braces: Vec::new(),
+        lines: Vec::new(),
     };
     let mut cmds = lx.run(cond)?;
     // bind-key keeps its { } blocks as blocks (list-keys prints them so): they reach
     // it with a mark in front
-    for (c, w) in lx.braces {
+    for (c, w) in std::mem::take(&mut lx.braces) {
         if matches!(cmds[c][0].as_str(), "bind-key" | "bind") {
             cmds[c][w].insert_str(0, BLOCK_MARK);
         }
     }
-    Ok(cmds)
+    Ok((cmds, lx.lines))
 }
 
 /// Put in front of a `{ ... }` block argument of bind-key by [`parse_with_env`]
@@ -63,6 +69,7 @@ pub fn parse_blocks(input: &str) -> Result<Vec<Vec<(String, bool)>>, String> {
         env: &env,
         assigned: std::collections::HashMap::new(),
         braces: Vec::new(),
+        lines: Vec::new(),
     };
     let cmds = lx.run(&|c: &str| !c.is_empty() && c != "0")?;
     let mut out: Vec<Vec<(String, bool)>> = cmds.into_iter().map(|c| c.into_iter().map(|w| (w, false)).collect()).collect();
@@ -228,6 +235,8 @@ struct Lexer<'a> {
     assigned: std::collections::HashMap<String, String>,
     /// (command, argument) positions of `{ ... }` blocks.
     braces: Vec<(usize, usize)>,
+    /// The line each command starts on.
+    lines: Vec<usize>,
 }
 
 fn is_blank(c: Option<char>) -> bool {
@@ -275,10 +284,17 @@ impl Lexer<'_> {
         let mut cur: Vec<(String, bool, bool)> = Vec::new();
         let mut stack: Vec<Frame> = Vec::new();
         let mut line_start = true;
+        let mut start = self.line;
 
         loop {
+            while self.lines.len() < cmds.len() {
+                self.lines.push(start);
+            }
             self.skip_blanks();
             let Some(c) = self.peek() else { break };
+            if cur.is_empty() {
+                start = self.line;
+            }
             let active = stack.last().is_none_or(|f| f.active);
             match c {
                 '\n' => {
@@ -319,6 +335,9 @@ impl Lexer<'_> {
         }
         let active = stack.last().is_none_or(|f| f.active);
         finish(&mut cmds, &mut cur, active, &mut self.assigned, &mut self.braces);
+        while self.lines.len() < cmds.len() {
+            self.lines.push(start);
+        }
         if !stack.is_empty() {
             return Err(self.err(self.line, "missing %endif"));
         }

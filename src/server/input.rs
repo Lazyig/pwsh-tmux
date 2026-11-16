@@ -439,7 +439,8 @@ impl Server {
 
     /// Runs a command string for a client (key bindings, prompts, menus).
     pub fn run_string(&mut self, cid: ClientId, cmd: &str, pane: Option<PaneId>) {
-        match crate::cmdparse::parse(cmd) {
+        // cmd_parse_from_string: the whole list is checked before any of it runs
+        match crate::cmdparse::parse(cmd).and_then(|c| c.iter().try_for_each(|c| super::cmds::check_command(c)).map(|_| c)) {
             Ok(cmds) => {
                 let ctx = Ctx { client: Some(cid), pane, from_key: true, ..Ctx::default() };
                 self.run_queue(Queue { cmds: cmds.into(), ctx , soft: 0 });

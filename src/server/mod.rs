@@ -1411,6 +1411,11 @@ impl Server {
                     c.control_seq
                 });
                 let ctx = Ctx { client: Some(cid), reply: Some(cid), pane, control_seq, ..Ctx::default() };
+                // cmd_parse_from_arguments: every command is checked before any runs
+                if let Some(e) = cmds.iter().find_map(|c| cmds::check_command(c).err()) {
+                    self.finish_queue(Queue { cmds: VecDeque::new(), ctx, soft: 0 }, Some(e));
+                    return;
+                }
                 self.run_queue(Queue { cmds: cmds.into_iter().filter(|c| !c.is_empty()).collect(), ctx , soft: 0 });
             }
             C_INPUT => {
@@ -1614,19 +1619,33 @@ impl Server {
                 // cmd_run_shell_callback: a failure is printed after the output, and
                 // a command-line client exits with the status
                 let mut output = output;
-                if status != 0 && !background {
+                if status != 0 {
                     let msg = if status < 0 { format!("'{}' terminated by signal {}", parked.cmd, -status) } else { format!("'{}' returned {status}", parked.cmd) };
                     if !output.is_empty() && !output.ends_with('\n') {
                         output.push('\n');
                     }
                     output.push_str(&msg);
                     output.push('\n');
+                }
+                // each run-shell sets the exit status (the last one wins)
+                if !background {
                     queue.ctx.retval = if status < 0 { 128 - status } else { status };
                 }
                 if !output.is_empty() && !background {
                     if queue.ctx.reply.is_some_and(|c| !self.clients.get(&c).is_some_and(|c| c.attached)) {
                         queue.ctx.out.push_str(&output);
                     } else if let Some(p) = pane.or(queue.ctx.pane) {
+                        self.view_output(p, &output);
+                    }
+                } else if !output.is_empty() {
+                    // cmd_run_shell_print without a queue item: the -t pane, else the
+                    // target client's current pane, else the current one
+                    let tc = queue.ctx.client.filter(|c| self.clients.get(c).is_some_and(|c| c.attached))
+                        .or_else(|| self.resolve_client(&queue.ctx, None).ok());
+                    let p = pane.filter(|p| self.panes.contains_key(p))
+                        .or_else(|| tc.and_then(|c| self.client_active_pane(c)))
+                        .or_else(|| self.current(&queue.ctx).pane);
+                    if let Some(p) = p {
                         self.view_output(p, &output);
                     }
                 }

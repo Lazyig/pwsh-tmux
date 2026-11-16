@@ -232,8 +232,12 @@ const BORDER_SETS: [(&str, [&str; 11]); 4] = [
 ];
 
 impl Server {
-    fn expand_status_time(&self, t: Target, cid: ClientId, template: &str) -> String {
-        format::expand_status_time(template, &vars::VarCtx { srv: self, t, client: Some(cid), extra: HashMap::new() })
+    /// A status line format. As status.c's format_defaults(ft, c, NULL, NULL, NULL), its
+    /// type is unknown (the window list entries are window formats); the target only
+    /// fills in what the client's session would.
+    fn expand_status_time(&self, t: Target, cid: ClientId, template: &str, ftype: &str) -> String {
+        let extra = HashMap::from([(vars::FORMAT_TYPE.to_string(), ftype.to_string())]);
+        format::expand_status_time(template, &vars::VarCtx { srv: self, t, client: Some(cid), extra })
     }
 
     pub fn render_all(&mut self) {
@@ -290,8 +294,8 @@ impl Server {
         let cur = Target { sid: Some(sid), idx: Some(s.active), wid: Some(s.active_window()), pane: Some(self.windows[&s.active_window()].active) };
         let left_style = self.style_option(&self.opt_session(Some(sid), "status-left-style"), base, cur, Some(cid)).unwrap_or(base);
         let right_style = self.style_option(&self.opt_session(Some(sid), "status-right-style"), base, cur, Some(cid)).unwrap_or(base);
-        let left = self.expand_status_time(cur, cid, &self.opt_session(Some(sid), "status-left"));
-        let right = self.expand_status_time(cur, cid, &self.opt_session(Some(sid), "status-right"));
+        let left = self.expand_status_time(cur, cid, &self.opt_session(Some(sid), "status-left"), "");
+        let right = self.expand_status_time(cur, cid, &self.opt_session(Some(sid), "status-right"), "");
         let left_len = self.opt_session_num(Some(sid), "status-left-length").max(0) as usize;
         let right_len = self.opt_session_num(Some(sid), "status-right-length").max(0) as usize;
         let lcells = spans_cells(&format::spans(&left, left_style), left_len.min(width), base);
@@ -323,7 +327,7 @@ impl Server {
             } else if alerts & (ALERT_ACTIVITY | ALERT_SILENCE) != 0 {
                 st = wst("window-status-activity-style", st);
             }
-            let text = self.expand_status_time(t, cid, &fmt);
+            let text = self.expand_status_time(t, cid, &fmt, "W");
             let start = wcells.len();
             wcells.extend(spans_cells(&format::spans(&text, st), usize::MAX, st));
             wtags.resize(wcells.len(), Some(format::Range::Window(*idx)));
@@ -686,7 +690,7 @@ impl Server {
                 let (line, tags) = if !custom.is_empty() && !(i == 0 && custom == options::STATUS_FORMATS[0]) {
                     let base = self.status_style(sid, cid);
                     let cur = Target { sid: Some(sid), idx: Some(s.active), wid: Some(wid), pane: Some(win.active) };
-                    let text = self.expand_status_time(cur, cid, custom);
+                    let text = self.expand_status_time(cur, cid, custom, "");
                     format::layout_line_ranged(&format::spans(&text, base), cw as usize, base)
                 } else if i == 0 {
                     self.status_line(cid, sid, cw)
