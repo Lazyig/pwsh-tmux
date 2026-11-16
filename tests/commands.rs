@@ -3269,3 +3269,23 @@ fn zoomed_resize_layout_change_uses_the_clients_layout_format() {
     drop(stdin);
     let _ = child.wait();
 }
+
+#[cfg(unix)]
+#[test]
+fn send_keys_reaches_synchronized_panes() {
+    // window_pane_key copies each key send-keys injects to the other synchronized panes,
+    // encoded for each (application cursor keys in the last pane); -l and -H too
+    let ctx = Ctx::new("syncsend");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "80", "-y", "24", "stty -echo; printf 'ready\\n'; exec cat -v"]);
+    ctx.ok(&["split-window", "-d", "-t", "s:0.0", "stty -echo; printf 'ready\\n'; exec cat -v"]);
+    // inserted after pane 0: this one is s:0.1
+    ctx.ok(&["split-window", "-d", "-t", "s:0.0", "stty -echo; printf '\\033[?1hready\\n'; exec cat -v"]);
+    wait_for("panes ready", || (0..3).all(|i| ctx.capture(&format!("s:0.{i}")).contains("ready")));
+    ctx.ok(&["set", "-w", "-t", "s:0", "synchronize-panes", "on"]);
+    ctx.ok(&["send-keys", "-t", "s:0.0", "Down", "b", "Enter"]);
+    ctx.ok(&["send-keys", "-l", "-t", "s:0.1", "lit"]);
+    ctx.ok(&["send-keys", "-H", "-t", "s:0.2", "41", "0d"]);
+    let lines = |i: usize| ctx.capture(&format!("s:0.{i}")).lines().filter(|l| !l.is_empty() && *l != "ready").map(String::from).collect::<Vec<_>>();
+    let want = |down: &str| vec![format!("{down}b"), "litA".to_string()];
+    wait_for("all panes", || lines(0) == want("^[[B") && lines(1) == want("^[OB") && lines(2) == want("^[[B"));
+}

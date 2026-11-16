@@ -3910,30 +3910,31 @@ impl Server {
                 if o.rest.is_empty() && (o.has('N') || o.has('R')) {
                     return Ok(Flow::Next);
                 }
-                let app = self.panes.get(&pane).is_some_and(|p| p.screen().application_cursor());
-                let mut data = Vec::new();
-                for k in &o.rest {
-                    let k = if o.has('F') { self.expand(tt, ctx.client, k) } else { k.clone() };
-                    if o.has('H') {
-                        for h in k.split_whitespace() {
-                            data.push(u8::from_str_radix(h, 16).map_err(|_| format!("invalid hex: {h}"))?);
+                // the bytes for one pane: each key encoded for it (input_key_pane)
+                let encode_for = |srv: &Self, q: PaneId| -> Result<Vec<u8>, String> {
+                    let app = srv.panes.get(&q).is_some_and(|p| p.screen().application_cursor());
+                    let mut data = Vec::new();
+                    for k in &o.rest {
+                        let k = if o.has('F') { srv.expand(tt, ctx.client, k) } else { k.clone() };
+                        if o.has('H') {
+                            for h in k.split_whitespace() {
+                                data.push(u8::from_str_radix(h, 16).map_err(|_| format!("invalid hex: {h}"))?);
+                            }
+                            continue;
                         }
-                        continue;
+                        if o.has('l') {
+                            data.extend(k.as_bytes());
+                            continue;
+                        }
+                        match keys::parse_key_name(&k) {
+                            // a key the pane cannot represent goes as its name (window_pane_key failed)
+                            Some(key) if k.chars().count() > 1 || k == " " => data.extend(srv.encode_pane_key(q, &key, keys::encode_key(&key, app)).unwrap_or_else(|| k.as_bytes().to_vec())),
+                            _ => data.extend(k.as_bytes()),
+                        }
                     }
-                    if o.has('l') {
-                        data.extend(k.as_bytes());
-                        continue;
-                    }
-                    match keys::parse_key_name(&k) {
-                        // a key the pane cannot represent goes as its name (window_pane_key failed)
-                        Some(key) if k.chars().count() > 1 || k == " " => data.extend(self.encode_pane_key(pane, &key, keys::encode_key(&key, app)).unwrap_or_else(|| k.as_bytes().to_vec())),
-                        _ => data.extend(k.as_bytes()),
-                    }
-                }
-                let mut all = Vec::new();
-                for _ in 0..n {
-                    all.extend_from_slice(&data);
-                }
+                    Ok(data.repeat(n))
+                };
+                let all = encode_for(self, pane)?;
                 // keys sent to a pane in a mode are interpreted by the mode, one key at a time
                 // (cmd_send_keys_inject_string): -H bytes and -l text, or a string that is
                 // not a key name, go as one key per character
@@ -3981,7 +3982,14 @@ impl Server {
                         }
                     }
                 } else if let Some(p) = self.panes.get(&pane) {
-                    p.send(all);
+                    if p.dead.is_none() && p.options.get("@input-disabled") != Some("on") {
+                        p.send(all);
+                        // window_pane_key copies each key to the synchronized panes
+                        for q in self.sync_peers(pane) {
+                            let bytes = encode_for(self, q)?;
+                            self.panes[&q].send(bytes);
+                        }
+                    }
                 }
                 Ok(Flow::Next)
             }
