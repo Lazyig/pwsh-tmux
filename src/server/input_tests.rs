@@ -475,6 +475,24 @@ fn input_prompt_history_types_paths_and_save_at_exit() {
 }
 
 #[test]
+fn pane_prompts_wait_and_use_the_typed_history() {
+    let mut f = fixture();
+    // command-prompt -P without -b waits like a status line prompt (CMD_RETURN_WAIT)
+    run(&mut f, &["command-prompt", "-P", "-T", "search", "-I", "pane", "set -g @pp '%%'"]);
+    assert_eq!(f.prompt_waits.len(), 1);
+    let pane = f.pane;
+    assert!(f.panes[&pane].prompt.is_some() && f.clients[&1].prompt.is_none());
+    f.timers(); assert_eq!(f.prompt_waits.len(), 1);
+    f.handle_input(1, b"\r");
+    assert_eq!(f.opts_session.get("@pp"), Some("pane"));
+    assert_eq!(f.prompt_history[1], ["pane"]);
+    f.timers(); assert!(f.prompt_waits.is_empty());
+    // with -b nothing waits
+    run(&mut f, &["command-prompt", "-b", "set -g @b '%%'"]);
+    assert!(f.prompt_waits.is_empty() && f.clients[&1].prompt.is_some());
+}
+
+#[test]
 fn input_vi_prompt_command_mode_keys() {
     let mut f = fixture();
     f.opts_session.set("status-keys", "vi".into());

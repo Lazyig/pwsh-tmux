@@ -398,7 +398,7 @@ impl Server {
                     c.repeat_until = Some(Instant::now() + Duration::from_millis(ms));
                 } else {
                     c.repeat_until = None;
-                    c.key_table = default_table.clone();
+                    c.set_key_table(&default_table);
                 }
                 c.dirty = true;
                 match crate::cmdparse::parse(&cmd) {
@@ -416,7 +416,7 @@ impl Server {
             }
             if table != default_table || repeating {
                 let c = self.clients.get_mut(&cid).unwrap();
-                c.key_table = default_table.clone();
+                c.set_key_table(&default_table);
                 c.repeat_until = None;
                 c.dirty = true;
                 if table == default_table {

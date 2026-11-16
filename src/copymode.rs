@@ -242,8 +242,6 @@ impl CopyMode {
         self.separators = s.to_string();
     }
 
-    pub fn history_size(&self) -> usize { self.hsize() }
-
     /// The view for a scrollbar slider at row `y` of a bar `height` rows high (the
     /// inverse of the slider position); the cursor keeps its row in the view.
     pub fn scroll_to_slider(&mut self, y: usize, height: usize) {
