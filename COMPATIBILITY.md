@@ -83,9 +83,9 @@ replaced an overlay already shown (tmux leaves it), and `pane_left`/`pane_top` i
 `pane-border-status` and zoom.
 
 Since then `pane-scrollbars` (with the `Scrollbar*` mouse areas, slider drags and
-`copy-mode -S`) is implemented, and the terminal emulator keeps tmux 3.8's line metadata
-(OSC 133 prompt marks, OSC 8 hyperlinks, tab cells and history line times) for copy mode,
-`capture-pane` and the mouse formats.
+`copy-mode -S`) is implemented. tmux 3.8's line metadata (OSC 133 prompt marks, OSC 8
+hyperlinks, tab cells and history line times, used by copy mode, `capture-pane` and the
+mouse formats) is not recorded by the terminal emulator yet; it is separate work.
 
 ## Differences retained for a reason
 

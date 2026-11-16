@@ -79,13 +79,14 @@ comparison; this CLI fixture does not capture an attached terminal's rendered UI
 
 ## Remaining differences
 
-The differences recorded here earlier are resolved since the integration:
+- next-prompt/previous-prompt have bindings but no movement, and copy_cursor_hyperlink,
+  tab-aware motion and copying and top_line_time lack parity: the terminal parser does
+  not record OSC 133 marks, OSC 8 links, tab cells or history line times yet.
+
+The other differences recorded here earlier are resolved since the integration:
 
 - The scrollbar is drawn and wired: mouse locations are classified, slider drags keep
   the grabbed row per client, and scroll-to-mouse and -S use the tmux arithmetic.
-- next-prompt/previous-prompt, copy_cursor_hyperlink, tab-aware motion and copying and
-  top_line_time use the terminal's line metadata (OSC 133 marks, OSC 8 links, tab cells,
-  history line times).
 - The repeat count is the real numeric pane prompt (`command-prompt -NP -p (repeat)`):
   `(repeat) N` is drawn on the pane's last line, and the key that closes it is looked up
   again with the count (send-keys -N).
