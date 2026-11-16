@@ -626,6 +626,53 @@ impl CopyMode {
         cm
     }
 
+    /// window_copy_clone_screen and window_copy_init: the source pane's lines (`src` is its
+    /// size, `cursor` its cursor as (row, column)) shown in a pane of `size`. With `trim`
+    /// (copy-mode -s) empty lines at the bottom are dropped first; a different width
+    /// rewraps the lines (grid_reflow) and the cursor stays on its character.
+    pub fn clone_from(mut lines: Vec<Line>, src: (u16, u16), cursor: (u16, u16), size: (u16, u16), vi: bool, trim: bool) -> Self {
+        let (sw, sh) = ((src.0 as usize).max(1), (src.1 as usize).max(1));
+        while lines.len() < sh {
+            lines.push(Line::default());
+        }
+        let hsize = lines.len() - sh;
+        if trim {
+            let blank = |l: &Line| !l.wrapped && l.cells.iter().all(|c| *c == Cell::default());
+            while lines.len() > hsize + 1 && lines.last().is_some_and(blank) {
+                lines.pop();
+            }
+        }
+        let rows = lines.len() - hsize;
+        let (mut cx, cy) = if cursor.0 as usize > rows - 1 { (0, rows - 1) } else { (cursor.1 as usize, cursor.0 as usize) };
+        let mut cy = hsize + cy;
+        let width = (size.0 as usize).max(1);
+        // screen_resize_cursor: the height first (history lines come down into a taller
+        // screen, then blank lines are added below), then the reflow
+        while lines.len() < (size.1 as usize).max(1) {
+            lines.push(Line::default());
+        }
+        if width != sw {
+            let (wx, wy) = wrap_position(&lines, cx, cy);
+            lines = reflow(&lines, width);
+            (cx, cy) = unwrap_position(&lines, wx, wy);
+        }
+        let mut cm = CopyMode::new(lines, size.0, size.1, (0, 0), vi);
+        cm.place_cursor(cx, cy);
+        cm.mark = (cm.cy, cm.cx);
+        cm
+    }
+
+    /// The view after the backing changed (window_copy_init, window_copy_resize): a
+    /// cursor in the history is on the top row, otherwise the view is at the bottom.
+    fn place_cursor(&mut self, cx: usize, cy: usize) {
+        let cy = cy.min(self.lines.len() - 1);
+        let hsize = self.hsize();
+        self.top = if cy < hsize { cy } else { hsize };
+        self.cy = cy;
+        self.cx = self.snap(cy, cx);
+        self.lastcx = self.cx;
+    }
+
     /// window_copy_view_init: command output, no line numbers and no refresh.
     pub fn set_view_mode(&mut self) {
         self.view = true;
@@ -1121,26 +1168,10 @@ impl CopyMode {
         self.word_under_cursor()
     }
 
-    /// copy_cursor_line: the line under the cursor.
+    /// copy_cursor_line: the cursor's row (format_grid_line: one grid line, without its
+    /// trailing blanks, even when it wraps).
     pub fn cursor_line(&self) -> String {
-        let mut y = self.cy;
-        while y > 0 && self.wrapped(y - 1) {
-            y -= 1;
-        }
-        let mut out = String::new();
-        loop {
-            let len = self.copy_len(y);
-            for x in 0..len {
-                if let Some(c) = self.cell(y, x) {
-                    out.push_str(&c.text);
-                }
-            }
-            if !self.wrapped(y) || y + 1 >= self.lines.len() {
-                break;
-            }
-            y += 1;
-        }
-        out
+        (0..self.len(self.cy)).filter_map(|x| self.cell(self.cy, x)).map(|c| c.text.as_str()).collect()
     }
 
     /// selection_start_* / selection_end_*: the anchor and the other end as (x, y), y
@@ -1198,14 +1229,26 @@ impl CopyMode {
         self.run(name, &[arg.to_string()]);
     }
 
+    /// window_copy_resize: the backing is rewrapped for a new width with the cursor kept
+    /// on its character, then the view goes to the cursor and size_changed runs.
     pub fn resize(&mut self, width: u16, height: u16) {
-        self.width = (width as usize).max(1);
-        self.height = (height as usize).max(1);
+        let (width, height) = ((width as usize).max(1), (height as usize).max(1));
+        if (width, height) == (self.width, self.height) {
+            return;
+        }
+        let (mut cx, mut cy) = (self.cx, self.cy);
+        // screen_resize_cursor: the height first, then the reflow
+        self.height = height;
         self.pad();
-        self.top = self.top.min(self.hsize());
-        self.cy = self.cy.min(self.lines.len() - 1);
-        self.cx = self.snap(self.cy, self.cx);
-        self.ensure_visible();
+        if width != self.width {
+            let (wx, wy) = wrap_position(&self.lines, cx, cy);
+            self.lines = reflow(&self.lines, width);
+            (cx, cy) = unwrap_position(&self.lines, wx, wy);
+        }
+        self.width = width;
+        self.pad();
+        self.place_cursor(cx, cy);
+        self.size_changed();
     }
 
     /// Replace the content keeping the position relative to the bottom.
@@ -3253,6 +3296,95 @@ impl CopyMode {
     }
 }
 
+/// Cells a row uses (grid_line cellused): all of a wrapped row, up to the last written
+/// cell of another.
+fn cells_used(l: &Line) -> usize {
+    if l.wrapped {
+        l.cells.len()
+    } else {
+        l.cells.iter().rposition(|c| *c != Cell::default()).map_or(0, |i| i + 1)
+    }
+}
+
+/// grid_wrap_position: a position as (offset in its unwrapped line, None past its end;
+/// index of that unwrapped line).
+fn wrap_position(lines: &[Line], px: usize, py: usize) -> (Option<usize>, usize) {
+    let (mut ax, mut ay) = (0, 0);
+    for l in &lines[..py.min(lines.len())] {
+        if l.wrapped {
+            ax += cells_used(l);
+        } else {
+            ax = 0;
+            ay += 1;
+        }
+    }
+    let used = lines.get(py).map_or(0, cells_used);
+    (if px >= used { None } else { Some(ax + px) }, ay)
+}
+
+/// grid_unwrap_position.
+fn unwrap_position(lines: &[Line], wx: Option<usize>, wy: usize) -> (usize, usize) {
+    let last = lines.len().saturating_sub(1);
+    let (mut yy, mut ay) = (0, 0);
+    while yy < last && ay != wy {
+        if !lines[yy].wrapped {
+            ay += 1;
+        }
+        yy += 1;
+    }
+    match wx {
+        None => {
+            while yy < last && lines[yy].wrapped {
+                yy += 1;
+            }
+            (lines.get(yy).map_or(0, cells_used), yy)
+        }
+        Some(mut wx) => {
+            while yy < last && lines[yy].wrapped && wx >= cells_used(&lines[yy]) {
+                wx -= cells_used(&lines[yy]);
+                yy += 1;
+            }
+            (wx, yy)
+        }
+    }
+}
+
+/// grid_reflow: every unwrapped line split again at `w` columns. A wide character that
+/// does not fit goes to the next row, which leaves the row before it short.
+fn reflow(lines: &[Line], w: usize) -> Vec<Line> {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut cells: Vec<Cell> = Vec::new();
+    for l in lines {
+        cells.extend(l.cells[..cells_used(l).min(l.cells.len())].iter().cloned());
+        if l.wrapped {
+            continue;
+        }
+        let mut start = 0;
+        loop {
+            let mut end = (start + w).min(cells.len());
+            while end > start + 1 && end < cells.len() && cells[end].is_continuation() {
+                end -= 1;
+            }
+            let wrapped = end < cells.len();
+            let mut row = cells[start..end].to_vec();
+            if !wrapped {
+                row.resize(w, Cell::default());
+            }
+            out.push(Line { cells: row, wrapped });
+            if !wrapped {
+                break;
+            }
+            start = end;
+        }
+        cells.clear();
+    }
+    if !cells.is_empty() {
+        // a last line that wraps into nothing
+        out.push(Line { cells: std::mem::take(&mut cells), wrapped: false });
+    }
+    out
+}
+
 /// A selection as screen_set_selection keeps it: start (selx, sely) and end, in screen cells.
 struct ScreenSel {
     sx: usize,
@@ -4235,6 +4367,44 @@ mod tests {
         let (view, _) = cm.render();
         assert_eq!(view.len(), 30);
         assert!(view.iter().all(|l| l.cells.len() == 10));
+    }
+
+    #[test]
+    fn clone_trims_resizes_and_rewraps_like_tmux() {
+        let row = |s: &str, w: usize, wrapped: bool| {
+            let mut l = Line { cells: s.chars().map(|c| Cell { text: c.to_string(), style: Style::default() }).collect(), wrapped };
+            l.cells.resize(w, Cell::default());
+            l
+        };
+        let texts = |cm: &CopyMode| -> Vec<String> { cm.render_with(&RenderStyle { position_text: Some(String::new()), ..RenderStyle::default() }).0.iter().map(|l| l.cells.iter().map(|c| c.text.as_str()).collect::<String>().trim_end().to_string()).collect() };
+        // copy-mode -s from a taller pane: the empty rows go, the view is the target's height
+        // (live tmux 3.8: a2 a3 a4, cursor on a4, position 0/1)
+        let src: Vec<Line> = ["a1", "a2", "a3", "a4", "", "", ""].iter().map(|s| row(s, 30, false)).collect();
+        let cm = CopyMode::clone_from(src, (30, 7), (4, 0), (30, 3), true, true);
+        assert_eq!(texts(&cm)[..3], ["a2", "a3", "a4"]);
+        assert_eq!((cm.cursor(), cm.cursor_line(), cm.position()), ((0, 2), "a4".to_string(), (0, 1)));
+        // from a shorter pane: history comes down into the taller view (14..20, cursor on 20)
+        let src: Vec<Line> = (1..=20).map(|i| row(&i.to_string(), 30, false)).chain([row("", 30, false)]).collect();
+        let cm = CopyMode::clone_from(src, (30, 3), (2, 0), (30, 7), true, true);
+        assert_eq!(texts(&cm), ["14", "15", "16", "17", "18", "19", "20"]);
+        assert_eq!((cm.cursor(), cm.position()), ((0, 6), (0, 13)));
+        // a different width rewraps (live: DDEEEEEEEEEE and DONE in view, DDD found at 14,1)
+        let long = "AAAAAAAAAABBBBBBBBBBCCCCCCCCCCDDDDDDDDDDEEEEEEEEEE";
+        let src = vec![row(long, 60, false), row("DONE", 60, false), row("", 60, false)];
+        let mut cm = CopyMode::clone_from(src, (60, 3), (2, 0), (19, 10), false, true);
+        assert_eq!(texts(&cm)[..2], ["DDEEEEEEEEEE", "DONE"]);
+        cm.run("history-top", &[]);
+        cm.run("search-forward", &["DDD".into()]);
+        assert_eq!((cm.cursor(), cm.search_count(), cm.cursor_line()), ((14, 1), Some(3), "BCCCCCCCCCCDDDDDDDD".to_string()));
+        // a resize rewraps around the cursor and joins rows again when wider
+        let src = vec![row(&long[..40], 40, true), row(&long[40..], 40, false), row("x", 40, false)];
+        let mut cm = CopyMode::new(src, 40, 3, (0, 0), true);
+        cm.run("cursor-right", &[]);
+        cm.resize(13, 3);
+        assert_eq!((cm.cursor(), cm.cursor_line()), ((1, 0), "AAAAAAAAAABBB".to_string()));
+        cm.resize(60, 3);
+        assert_eq!(texts(&cm)[0], long);
+        assert_eq!(cm.cursor(), (1, 0));
     }
 
     #[test]

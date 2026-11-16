@@ -959,14 +959,15 @@ impl Server {
         if matches!(p.mode, Some(PaneMode::Copy(_))) {
             return;
         }
-        let (w, h) = p.size;
+        let size = p.size;
         let Some(src) = self.panes.get(&source) else { return };
         let lines = src.snapshot();
         let (cy, cx) = src.screen().cursor_position();
         let wid = self.window_of(pane);
         let vi = self.opt_window(wid, "mode-keys") == "vi";
         let sid = self.session_of_pane(pane).map(|x| x.0);
-        let mut cm = CopyMode::new(lines, w, h, (cy, cx), vi);
+        // window_copy_clone_screen: trimmed and rewrapped for another pane
+        let mut cm = CopyMode::clone_from(lines, src.size, (cy, cx), size, vi, source != pane);
         cm.set_word_separators(&self.opt_session(sid, "word-separators"));
         cm.from_other = source != pane;
         cm.set_pane_search(&p.track.search);
