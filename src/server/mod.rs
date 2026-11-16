@@ -4273,6 +4273,9 @@ fn strip_delay(cmd: &[String]) -> Vec<String> {
 mod input_tests;
 
 #[cfg(test)]
+mod surface_tests;
+
+#[cfg(test)]
 mod size_tests {
     use super::*;
 

@@ -3738,3 +3738,71 @@ fn osc52_data_is_decoded_like_b64_pton() {
     // cmd_save_buffer_exec's error for a missing name
     assert!(ctx.fails(&["show-buffer", "-b", "nosuch"]).contains("no buffer nosuch"));
 }
+
+#[test]
+fn destroy_unattached_keep_last_and_keep_group() {
+    // server_check_unattached runs whenever a client goes, a command client too: in name
+    // order, so the first session of a group goes and the last one stays
+    for (value, left) in [("keep-last", "g2\nsolo\n"), ("keep-group", "g2\n"), ("off", "g1\ng2\nsolo\n")] {
+        let ctx = Ctx::new("destroy");
+        ctx.ok(&["new-session", "-d", "-s", "g1"]);
+        ctx.ok(&["new-session", "-d", "-s", "g2", "-t", "g1"]);
+        ctx.ok(&["new-session", "-d", "-s", "solo"]);
+        ctx.ok(&["set", "-g", "destroy-unattached", value]);
+        assert_eq!(ctx.ok(&["list-sessions", "-F", "#{session_name}"]), left, "{value}");
+    }
+    let ctx = Ctx::new("destroy");
+    ctx.ok(&["new-session", "-d", "-s", "g1"]);
+    ctx.ok(&["new-session", "-d", "-s", "solo"]);
+    ctx.ok(&["set", "-g", "destroy-unattached", "on"]);
+    // every session went, and the server with them
+    wait_for("server exit", || !ctx.cmd(&["list-sessions"]).0);
+}
+
+#[test]
+fn pane_of_another_server_is_not_nested() {
+    let ctx = Ctx::new("nested");
+    ctx.ok(&["new-session", "-d", "-s", "n"]);
+    ctx.ok(&["new-window", "-t", "n"]);
+    let pid = ctx.fmt("n", "#{pid}");
+    let run = |label: &str, args: &[&str]| {
+        let out = ctx.command().env("PWSH_TMUX", label).env("PWSH_TMUX_PANE", "%0").args(args).stdin(Stdio::null()).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
+    };
+    // $PWSH_TMUX names this server (its pid): attaching nests, and %0 is the current pane
+    assert!(run(&format!("/x,{pid},0"), &["attach", "-t", "n"]).contains("sessions should be nested with care"));
+    assert_eq!(run(&format!("/x,{pid},0"), &["display", "-p", "#{pane_id}"]).trim(), "%0");
+    // another server's pane (cmd_find_try_TMUX, server_client_check_nested)
+    let other = format!("/x,{},0", pid.parse::<u32>().unwrap() + 1);
+    assert!(!run(&other, &["attach", "-t", "n"]).contains("nested"));
+    assert_eq!(run(&other, &["display", "-p", "#{pane_id}"]).trim(), "%1");
+}
+
+#[test]
+fn dead_pane_refuses_paste_and_pipe() {
+    let ctx = Ctx::new("deadpane");
+    ctx.ok(&["new-session", "-d", "-s", "d"]);
+    ctx.ok(&["set", "-g", "remain-on-exit", "on"]);
+    ctx.ok(&["split-window", "-d", "-t", "d", "exit 3"]);
+    wait_for("pane dead", || ctx.fmt("d:0.1", "#{pane_dead}") == "1");
+    ctx.ok(&["set-buffer", "x"]);
+    assert!(ctx.fails(&["paste-buffer", "-t", "d:0.1"]).contains("target pane has exited"));
+    assert!(ctx.fails(&["pipe-pane", "-t", "d:0.1", sh("cat", "more")]).contains("target pane has exited"));
+    assert_eq!(ctx.fmt("d:0.1", "#{pane_pipe}"), "0");
+    ctx.ok(&["send-keys", "-t", "d:0.1", "abc"]);
+}
+
+#[test]
+fn theme_options_are_strings_and_empty_lines_have_no_cells() {
+    let ctx = Ctx::new("surface");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "80", "-y", "4", sh("sleep 30", "Start-Sleep 30")]);
+    let shown = ctx.ok(&["show", "-s", "-F", "#{option_name}=#{option_is_string}"]);
+    for line in ["dark-theme-black=1", "light-theme-magenta=1", "default-terminal=1", "escape-time=0"] {
+        assert!(shown.lines().any(|l| l == line), "{line}");
+    }
+    assert_eq!(ctx.ok(&["show", "-gw", "-F", "#{option_name}=#{option_is_string}", "clock-mode-colour"]), "clock-mode-colour=1\n");
+    assert_eq!(ctx.ok(&["show", "-gw", "-F", "#{option_name}=#{option_is_string}", "pane-colours"]), "pane-colours=0\n");
+    // an untouched line is not allocated (gl->cellsize 0)
+    let grid = ctx.ok(&["capture-pane", "-p", "-R", "-t", "s"]);
+    assert!(grid.lines().any(|l| l == "\tL 3 (3) flags=NONE[0] 0/0"), "{grid}");
+}
