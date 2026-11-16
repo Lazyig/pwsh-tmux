@@ -440,6 +440,8 @@ const YELLOW: Color = Color::Idx(3);
 #[derive(Clone, Debug)]
 pub struct RenderStyle {
     pub selection: Style,
+    /// copy-mode-selection-style has noattr: the cells' own attributes are not kept.
+    pub selection_noattr: bool,
     pub matched: Style,
     pub current_match: Style,
     pub mark: Style,
@@ -457,6 +459,7 @@ impl Default for RenderStyle {
         let mode = Style { fg: BLACK, bg: YELLOW, attrs: 0 };
         RenderStyle {
             selection: mode,
+            selection_noattr: true,
             matched: Style { fg: BLACK, bg: CYAN, attrs: 0 },
             current_match: Style { fg: BLACK, bg: MAGENTA, attrs: 0 },
             mark: Style { fg: BLACK, bg: YELLOW, attrs: 0 },
@@ -866,8 +869,8 @@ impl CopyMode {
         if (y, x) == e {
             return Some(false);
         }
-        let (x0, x1) = self.sel_range(y)?;
-        if x < x0 || x >= x1 {
+        let cursor = (self.cy == y && self.cursor_offset(self.cx) == col).then_some(());
+        if cursor.is_none() && !self.screen_selection()?.contains(col, row) {
             return None;
         }
         let w = self.width as i64 + 1;
@@ -1959,6 +1962,7 @@ impl CopyMode {
         let mode = self.line_number_mode();
         let needle = self.search.as_ref().map(|(t, _)| t.as_str()).filter(|t| !t.is_empty() && self.search_marks);
         let cur_row = self.cy - self.top;
+        let screen_sel = self.screen_selection();
         for row in 0..self.height {
             let y = self.top + row;
             let mut line = Line { cells: Vec::with_capacity(self.width), wrapped: false };
@@ -2013,9 +2017,16 @@ impl CopyMode {
                     }
                 }
             }
-            if let Some((x0, x1)) = self.sel_range(y) {
-                for c in line.cells.iter_mut().take(x1.min(content)).skip(x0) {
-                    c.style = st.selection;
+            if let Some(sel) = &screen_sel {
+                // a wide character is selected when its first cell is (screen_write_cell)
+                let mut lead = 0;
+                for (x, c) in line.cells.iter_mut().enumerate() {
+                    if !c.is_continuation() {
+                        lead = x;
+                    }
+                    if sel.contains(lnw + lead, row) {
+                        c.style = select_cell(st, c.style);
+                    }
                 }
             }
             if lnw > 0 {
@@ -3077,28 +3088,28 @@ impl CopyMode {
         e
     }
 
-    /// Selected cell range [x0, x1) on row `y` (x1 may exceed the width).
-    fn sel_range(&self, y: usize) -> Option<(usize, usize)> {
-        let ((sy, sx), (ey, ex)) = self.sel_bounds()?;
-        if y < sy || y > ey {
+    /// window_copy_set_selection: the selection's ends as screen cells (the view's rows,
+    /// columns after the line numbers), ends out of view moved to its edge; None when
+    /// nothing is selected or the whole selection is above or below the view.
+    fn screen_selection(&self) -> Option<ScreenSel> {
+        let (s, e) = self.slots()?;
+        let adjust = |(y, x): Pos| -> (usize, usize, i8) {
+            if y < self.top {
+                (if self.rect { x } else { 0 }, 0, -1)
+            } else if y >= self.top + self.height {
+                (if self.rect { x } else { self.width - 1 }, self.height - 1, 1)
+            } else {
+                (x, y - self.top, 0)
+            }
+        };
+        let (sx, sy, sp) = adjust(s);
+        let (ex, ey, ep) = adjust(e);
+        if sp == ep && sp != 0 {
             return None;
         }
-        if self.line_mode {
-            return Some((0, usize::MAX));
-        }
-        if self.rect {
-            let (ax, cx) = (self.anchor?.1, self.sel_other().1);
-            let (l, r) = (ax.min(cx), ax.max(cx));
-            let r = if self.vi { self.incl_end(y, r) } else { r };
-            return Some((l, r));
-        }
-        let x0 = if y == sy { sx } else { 0 };
-        let x1 = if y == ey {
-            if self.vi { self.incl_end(y, ex) } else { ex }
-        } else {
-            usize::MAX
-        };
-        Some((x0, x1))
+        let lnw = self.line_number_width();
+        let (sx, ex) = if lnw > 0 { (self.cursor_offset(sx), self.cursor_offset(ex)) } else { (sx, ex) };
+        Some(ScreenSel { sx, sy, ex, ey, rect: self.rect, clipx: lnw.min(self.width - 1), vi: self.vi })
     }
 
     /// window_copy_get_selection: the text between the selection's ends (a rectangle
@@ -3191,6 +3202,65 @@ impl CopyMode {
             return Action::None;
         }
         Action::Copy { text, cancel, append: false }
+    }
+}
+
+/// A selection as screen_set_selection keeps it: start (selx, sely) and end, in screen cells.
+struct ScreenSel {
+    sx: usize,
+    sy: usize,
+    ex: usize,
+    ey: usize,
+    rect: bool,
+    clipx: usize,
+    vi: bool,
+}
+
+impl ScreenSel {
+    /// screen_check_selection: emacs keeps the top-left character and drops the bottom-right
+    /// one, vi keeps both; a rectangle includes both columns.
+    fn contains(&self, px: usize, py: usize) -> bool {
+        let ScreenSel { sx, sy, ex, ey, .. } = *self;
+        if px < self.clipx {
+            return false;
+        }
+        if self.rect {
+            if py < sy.min(ey) || py > sy.max(ey) {
+                return false;
+            }
+            return px >= sx.min(ex) && px <= sx.max(ex);
+        }
+        let before_end = |x: usize| if self.vi { x } else { x.saturating_sub(1) };
+        if sy < ey {
+            if py < sy || py > ey || (py == sy && px < sx) {
+                return false;
+            }
+            !(py == ey && px > before_end(ex))
+        } else if sy > ey {
+            if py > sy || py < ey || (py == ey && px < ex) {
+                return false;
+            }
+            // tmux's u_int sx - 1 wraps for a start at column 0: that row is not selected
+            !(py == sy && (sx == 0 || px > before_end(sx)))
+        } else if py != sy {
+            false
+        } else if ex < sx {
+            // tmux computes sx - 1 here even when it wraps (sx is above 0 here)
+            px <= before_end(sx) && px >= ex
+        } else {
+            px >= sx && px <= before_end(ex)
+        }
+    }
+}
+
+/// screen_select_cell: the selection style, with the cell's colours where the style has
+/// none and the cell's attributes added unless the style has noattr.
+fn select_cell(st: &RenderStyle, cell: Style) -> Style {
+    let sel = st.selection;
+    Style {
+        fg: if sel.fg == Color::Default { cell.fg } else { sel.fg },
+        bg: if sel.bg == Color::Default { cell.bg } else { sel.bg },
+        attrs: if st.selection_noattr { sel.attrs } else { sel.attrs | cell.attrs },
     }
 }
 
@@ -3701,8 +3771,54 @@ mod tests {
             cm.press("V");
             cm.render()
         };
-        assert!(view[0].cells[..10].iter().all(|c| c.style.bg == YELLOW && c.style.fg == BLACK));
+        // screen_check_selection: vi selects up to the line's length (one past the text)
+        assert!(view[0].cells[..4].iter().all(|c| c.style.bg == YELLOW && c.style.fg == BLACK));
+        assert!(view[0].cells[4..15].iter().all(|c| c.style.bg != YELLOW));
         assert!(view[1].cells.iter().all(|c| c.style.bg != YELLOW));
+    }
+
+    #[test]
+    fn highlight_follows_screen_check_selection() {
+        let marked = |cm: &CopyMode, row: usize| -> String {
+            let (view, _) = cm.render_with(&RenderStyle { position_text: Some(String::new()), ..RenderStyle::default() });
+            view[row].cells.iter().map(|c| if c.style.bg == YELLOW { c.text.as_str() } else { "." }).collect::<String>().trim_end_matches('.').to_string()
+        };
+        let text = ["abcdefghij", "klmnopqrst", "uvwxyz"];
+        // an emacs rectangle includes both columns, also when dragged leftwards
+        let mut cm = CopyMode::new(lines(&text), 20, 3, (0, 2), false);
+        cm.run("begin-selection", &[]);
+        cm.run("rectangle-on", &[]);
+        cm.run("cursor-down", &[]);
+        (0..3).for_each(|_| { cm.run("cursor-right", &[]); });
+        assert_eq!((marked(&cm, 0), marked(&cm, 1)), ("..cdef".to_string(), "..mnop".to_string()));
+        let mut cm = CopyMode::new(lines(&text), 20, 3, (0, 8), false);
+        cm.run("begin-selection", &[]);
+        cm.run("rectangle-on", &[]);
+        cm.run("cursor-down", &[]);
+        (0..3).for_each(|_| { cm.run("cursor-left", &[]); });
+        assert_eq!((marked(&cm, 0), marked(&cm, 1)), (".....fghi".to_string(), ".....pqrs".to_string()));
+        assert_eq!(copied(cm.run("copy-selection", &[])), "fghi\npqrs");
+        // emacs: an empty selection at column 0 shows that cell, a downward one ending at
+        // column 0 shows it too
+        let mut cm = CopyMode::new(lines(&text), 20, 3, (0, 0), false);
+        cm.run("begin-selection", &[]);
+        assert_eq!(marked(&cm, 0), "a");
+        cm.run("cursor-down", &[]);
+        assert_eq!((marked(&cm, 0), marked(&cm, 1)), ("abcdefghij          ".to_string(), "k".to_string()));
+        // vi upward from column 0: the start row is not shown
+        let mut cm = CopyMode::new(lines(&text), 20, 3, (1, 0), true);
+        cm.run("begin-selection", &[]);
+        cm.run("cursor-up", &[]);
+        assert_eq!((marked(&cm, 0), marked(&cm, 1)), ("abcdefghij          ".to_string(), String::new()));
+        // screen_select_cell: default colours and attributes come from the cell
+        let mut l = line("ab", false);
+        l.cells[0].style = Style { fg: Color::Idx(1), bg: Color::Default, attrs: crate::cells::BOLD };
+        let mut cm = CopyMode::new(vec![l], 20, 1, (0, 0), true);
+        cm.run("begin-selection", &[]);
+        let st = RenderStyle { selection: Style { fg: Color::Default, bg: CYAN, attrs: 0 }, selection_noattr: false, position_text: Some(String::new()), ..RenderStyle::default() };
+        assert_eq!(cm.render_with(&st).0[0].cells[0].style, Style { fg: Color::Idx(1), bg: CYAN, attrs: crate::cells::BOLD });
+        let st = RenderStyle { selection_noattr: true, ..st };
+        assert_eq!(cm.render_with(&st).0[0].cells[0].style, Style { fg: Color::Idx(1), bg: CYAN, attrs: 0 });
     }
 
     #[test]

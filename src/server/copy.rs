@@ -347,8 +347,11 @@ impl Server {
         let current_line = (self.opt_window(wid, "copy-mode-current-line-style") != "default").then(|| style("copy-mode-current-line-style"));
         let show = matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(cm)) if cm.position_shown());
         let position_text = if show { Some(self.expand(t, cid, &self.opt_pane(pane, "copy-mode-position-format"))) } else { None };
+        // noattr is not kept in a Style: look for it in the expanded option
+        let noattr = self.expand(t, cid, &self.opt_window(wid, "copy-mode-selection-style")).split([',', ' ']).any(|a| a.trim() == "noattr");
         RenderStyle {
             selection: style("copy-mode-selection-style"),
+            selection_noattr: noattr,
             matched: style("copy-mode-match-style"),
             current_match: style("copy-mode-current-match-style"),
             mark: style("copy-mode-mark-style"),
