@@ -360,20 +360,14 @@ impl vt100::Callbacks for PaneCb {
     fn rename_window(&mut self, _: &mut vt100::Screen, name: &[u8]) {
         self.rename = Some(String::from_utf8_lossy(name).into_owned());
     }
-    fn unhandled_osc_terminated(&mut self, screen: &mut vt100::Screen, params: &[&[u8]], bel: bool) {
+    fn unhandled_osc_terminated(&mut self, _screen: &mut vt100::Screen, params: &[&[u8]], bel: bool) {
         self.colours.osc(params, bel, &mut self.replies);
         self.osc.osc(params);
         match params {
             // input_osc_133: the cursor's line starts a prompt (a continuation prompt,
             // P;k=s, does not count) or command output; capture-pane -F shows them, and
             // A/N, C and D fire pane-shell-prompt, pane-command-started and -finished
-            [b"133", arg, rest @ ..] => {
-                match arg.first() {
-                    Some(b'A' | b'N') => screen.mark_cursor_row(vt100::ROW_START_PROMPT),
-                    Some(b'P') if !rest.contains(&&b"k=s"[..]) => screen.mark_cursor_row(vt100::ROW_START_PROMPT),
-                    Some(b'C') => screen.mark_cursor_row(vt100::ROW_START_OUTPUT),
-                    _ => {}
-                }
+            [b"133", arg, ..] => {
                 let name = match arg.first() {
                     Some(b'A' | b'N') => Some("pane-shell-prompt"),
                     Some(b'C') => Some("pane-command-started"),
@@ -2131,7 +2125,7 @@ impl Server {
             if let Some(p) = self.panes.get_mut(&id) {
                 if !fmt.is_empty() {
                     let cells = crate::format::layout_line(&crate::format::spans(&msg, Default::default()), p.size.0 as usize, Default::default());
-                    let line = render::line_with_escapes(&Line { cells, wrapped: false });
+                    let line = render::line_with_escapes(&Line { cells, wrapped: false, ..Default::default() });
                     // format_draw leaves the cursor where it started, at the line's start
                     p.parser.process(format!("\x1b[r\x1b[{};1H\r\n\x1b[0m{line}\x1b[0m\r", p.size.1).as_bytes());
                 }
@@ -2239,10 +2233,10 @@ impl Server {
             }
             cells.resize(w as usize, crate::cells::Cell::default());
             cells.truncate(w as usize);
-            lines.push(Line { cells, wrapped: false });
+            lines.push(Line { cells, wrapped: false, ..Default::default() });
         }
         while lines.len() < h as usize {
-            lines.push(Line { cells: vec![crate::cells::Cell::default(); w as usize], wrapped: false });
+            lines.push(Line { cells: vec![crate::cells::Cell::default(); w as usize], wrapped: false, ..Default::default() });
         }
         let vi = self.opt_window(self.window_of(pane), "mode-keys") == "vi";
         let mut cm = CopyMode::new(lines, w, h, (0, 0), vi);

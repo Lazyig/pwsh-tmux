@@ -37,13 +37,53 @@ impl Cell {
 }
 
 /// One terminal row. `wrapped` means the row continues on the next one (soft wrap).
+/// `flags` are vt100's ROW_* line flags (OSC 133 marks, hyperlinks), `time` when the
+/// row entered the history (0 if not), `metadata` the row's hyperlinks and tabs by column.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Line {
     pub cells: Vec<Cell>,
     pub wrapped: bool,
+    pub flags: u8,
+    pub time: u64,
+    pub metadata: std::collections::BTreeMap<u16, vt100::CellMetadata>,
 }
 
 impl Line {
+    /// The tab (GRID_FLAG_TAB) covering column `x`: its first column and width.
+    pub fn tab_at(&self, x: usize) -> Option<(usize, usize)> {
+        let (&at, m) = self.metadata.range(..=u16::try_from(x).ok()?).next_back()?;
+        let (at, w) = (usize::from(at), usize::from(m.tab_width));
+        (x < at + w).then_some((at, w))
+    }
+
+    /// GRID_FLAG_PADDING: the right half of a wide character or the rest of a tab.
+    pub fn is_padding(&self, x: usize) -> bool {
+        self.cells.get(x).is_some_and(Cell::is_continuation) || self.tab_at(x).is_some_and(|(at, _)| at != x)
+    }
+
+    /// What cell `x` gives to copied text: a tab for a tab, nothing for padding.
+    pub fn cell_text(&self, x: usize) -> &str {
+        match self.tab_at(x) {
+            Some((at, _)) if at == x => "\t",
+            Some(_) => "",
+            None => self.cells.get(x).map_or("", |c| c.text.as_str()),
+        }
+    }
+
+    /// Columns up to the end of the last tab (a tab is not a trailing blank).
+    pub fn tabs_end(&self) -> usize {
+        self.metadata.iter().filter(|(_, m)| m.tab_width > 0).map(|(&x, m)| usize::from(x) + usize::from(m.tab_width)).max().unwrap_or(0)
+    }
+
+    /// format_grid_hyperlink: the link of the cell at `x`, from the start of a wide
+    /// character or tab.
+    pub fn hyperlink_at(&self, mut x: usize) -> Option<&std::sync::Arc<vt100::Hyperlink>> {
+        while x > 0 && self.is_padding(x) {
+            x -= 1;
+        }
+        self.metadata.get(&u16::try_from(x).ok()?)?.hyperlink.as_ref()
+    }
+
     /// Text of the row with trailing blanks removed ([`text_at`] is the fast path).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn text(&self) -> String {
@@ -78,16 +118,22 @@ pub fn snapshot(screen: &vt100::Screen) -> Vec<Line> {
 pub fn line_at(screen: &vt100::Screen, index: usize) -> Line {
     let cols = screen.size().1.get();
     match screen.history_row(index) {
-        Some(row) => Line { cells: (0..cols).map(|c| row.cell(c).map(cell_from_vt).unwrap_or_default()).collect(), wrapped: row.wrapped() },
-        None => Line { cells: vec![Cell::default(); cols as usize], wrapped: false },
+        Some(row) => Line { cells: (0..cols).map(|c| row.cell(c).map(cell_from_vt).unwrap_or_default()).collect(), wrapped: row.wrapped(), flags: row.flags(), time: row.time(), metadata: row.metadata().map(|(x,m)| (x,m.clone())).collect() },
+        None => Line { cells: vec![Cell::default(); cols as usize], wrapped: false, ..Default::default() },
     }
 }
 
-/// Plain text of row `index` (trailing blanks removed, as [`Line::text`]) and whether it wraps.
+/// Plain text of row `index` (trailing blanks removed, as [`Line::text`]; a tab as a tab)
+/// and whether it wraps.
 pub fn text_at(screen: &vt100::Screen, index: usize) -> (String, bool) {
     let cols = screen.size().1.get();
     let mut s = String::new();
     let Some(row) = screen.history_row(index) else { return (s, false) };
+    if row.metadata().any(|(_, m)| m.tab_width != 0) {
+        let line = line_at(screen, index);
+        let s: String = (0..line.cells.len()).map(|x| line.cell_text(x)).collect();
+        return (s.trim_end_matches(' ').to_string(), line.wrapped);
+    }
     row.write_plain(&mut s, cols);
     let len = s.trim_end().len();
     s.truncate(len);
@@ -117,6 +163,21 @@ mod tests {
         p.screen_mut().set_scrollback(1);
         let _ = snapshot(p.screen());
         assert_eq!(p.screen().scrollback(), 1);
+    }
+
+    #[test]
+    fn line_metadata_helpers_follow_tabs_wide_characters_and_links() {
+        let nz = |n| NonZeroU16::new(n).unwrap();
+        let mut p = vt100::Parser::new(nz(3), nz(20), 50);
+        p.process("a\tb\x1b]8;;http://w\x07中\x1b]8;;\x07x\t".as_bytes());
+        let line = line_at(p.screen(), 0);
+        assert_eq!((line.tab_at(0), line.tab_at(1), line.tab_at(7), line.tab_at(8)), (None, Some((1, 7)), Some((1, 7)), None));
+        assert_eq!((0..14).filter(|&x| line.is_padding(x)).collect::<Vec<_>>(), [2, 3, 4, 5, 6, 7, 10, 13]);
+        assert_eq!((0..20).map(|x| line.cell_text(x)).collect::<String>().trim_end_matches(' '), "a\tb中x\t");
+        assert_eq!((line.hyperlink_at(9).map(|l| l.uri.as_str()), line.hyperlink_at(10).is_some(), line.hyperlink_at(11)), (Some("http://w"), true, None));
+        // the plain capture path gives the tabs back and keeps a trailing one
+        assert_eq!(text_at(p.screen(), 0), ("a\tb中x\t".to_string(), false));
+        assert_eq!(line.tabs_end(), 16);
     }
 
     #[test]

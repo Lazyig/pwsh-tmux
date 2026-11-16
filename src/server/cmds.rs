@@ -2912,39 +2912,63 @@ impl Server {
                     }
                     let line_at = |i: usize| -> crate::cells::Line {
                         if let Some((l, _)) = &mode_lines {
-                            return l.get(i).cloned().unwrap_or_default();
+                            // the mode's screen is a clone with its own empty hyperlink set,
+                            // so its cells' links do not resolve (-H and -e show none)
+                            let mut l = l.get(i).cloned().unwrap_or_default();
+                            l.metadata.retain(|_, m| { m.hyperlink = None; m.tab_width != 0 });
+                            return l;
                         }
                         if o.has('a') {
                             return screen.saved_row(i as u16).map(|r| row_line(&r, cols)).unwrap_or_default();
                         }
                         crate::cells::line_at(screen, i)
                     };
+                    // -H: the links of each line not listed on an earlier one, at most one
+                    // per column in all (cmd_capture_pane_hyperlinks)
+                    let mut links = std::collections::HashSet::new();
                     for i in a..=b {
-                        let (text, wrapped) = if o.has('H') {
-                            // hyperlinks (OSC 8) are not kept, so no line has any
-                            (String::new(), false)
-                        } else if o.has('e') || o.has('N') || o.has('C') || o.has('a') || mode_lines.is_some() {
-                            let line = line_at(i as usize);
-                            (capture_line(&line, o.has('e'), o.has('N') && !o.has('J'), o.has('T'), o.has('C')), line.wrapped)
-                        } else {
-                            crate::cells::text_at(screen, i as usize)
+                        // plain text does not need the cells
+                        let cells = o.has('e') || o.has('N') || o.has('C') || o.has('a') || o.has('H') || mode_lines.is_some();
+                        let line = cells.then(|| line_at(i as usize));
+                        let (text, wrapped) = match &line {
+                            Some(line) if o.has('H') => {
+                                let mut uris = Vec::new();
+                                for l in line.metadata.values().filter_map(|m| m.hyperlink.as_ref()) {
+                                    if links.contains(&l.inner) {
+                                        continue;
+                                    }
+                                    if links.len() == cols as usize {
+                                        break;
+                                    }
+                                    links.insert(l.inner);
+                                    uris.push(l.uri.as_str());
+                                }
+                                (uris.join(" "), line.wrapped)
+                            }
+                            Some(line) => (capture_line(line, o.has('e'), o.has('N') && !o.has('J'), o.has('T'), o.has('C')), line.wrapped),
+                            None => crate::cells::text_at(screen, i as usize),
                         };
                         if o.has('H') && text.is_empty() {
                             continue;
                         }
+                        let (marks, time) = line.as_ref().map_or_else(|| (screen.history_row_flags(i as usize).0, screen.history_row_time(i as usize)), |l| (l.flags, l.time));
                         if o.has('L') {
                             out.push_str(&format!("{} ", i - hist));
                         }
                         if o.has('I') {
                             // when the line entered the history (0 for screen lines)
-                            let time = if mode_lines.is_some() || o.has('a') { 0 } else { screen.history_row_time(i as usize) };
                             out.push_str(&format!("{time} "));
                         }
                         if o.has('F') {
-                            // the line's marks: start of output (O) or prompt (P), wrapped (W)
-                            // and extended cells (X); hyperlinks (H) are not kept
-                            let (marks, extended) = if mode_lines.is_some() || o.has('a') { (0, false) } else { screen.history_row_flags(i as usize) };
+                            // the line's marks: hyperlinks (H), start of output (O) or prompt
+                            // (P), wrapped (W) and extended cells (X); D (lines a reflow
+                            // left dead) never stays in a grid
+                            let extended = match &line {
+                                Some(line) if mode_lines.is_some() || o.has('a') => marks & vt100::ROW_EXTENDED != 0 || line.cells.iter().any(|c| c.text.len() > 1 || matches!(c.style.fg, vt100::Color::Rgb(..)) || matches!(c.style.bg, vt100::Color::Rgb(..))),
+                                _ => screen.history_row_flags(i as usize).1,
+                            };
                             let mut f = String::new();
+                            if marks & vt100::ROW_HYPERLINK != 0 { f.push('H'); }
                             if marks & vt100::ROW_START_OUTPUT != 0 { f.push('O'); }
                             if marks & vt100::ROW_START_PROMPT != 0 { f.push('P'); }
                             if wrapped { f.push('W'); }
@@ -2972,6 +2996,10 @@ impl Server {
                 let tt = self.resolve_pane(ctx, t)?;
                 if let Some(p) = self.panes.get_mut(&tt.pane.unwrap()) {
                     p.parser.screen_mut().clear_scrollback();
+                    // -H: screen_reset_hyperlinks, the links of the screen too
+                    if o.has('H') {
+                        p.parser.screen_mut().reset_hyperlinks();
+                    }
                 }
                 Ok(Flow::Next)
             }
@@ -5186,7 +5214,7 @@ fn glob_files(path: &str) -> Vec<String> {
 
 /// A history row as cells (see cells::line_at).
 fn row_line(row: &vt100::capture::RowContents, cols: u16) -> crate::cells::Line {
-    crate::cells::Line { cells: (0..cols).map(|c| row.cell(c).map(crate::cells::cell_from_vt).unwrap_or_default()).collect(), wrapped: row.wrapped() }
+    crate::cells::Line { cells: (0..cols).map(|c| row.cell(c).map(crate::cells::cell_from_vt).unwrap_or_default()).collect(), wrapped: row.wrapped(), flags: row.flags(), time: row.time(), metadata: row.metadata().map(|(x,m)| (x,m.clone())).collect() }
 }
 
 /// One captured line: -e adds attribute sequences, `keep` (-N) keeps trailing spaces (up to
@@ -5201,16 +5229,18 @@ fn capture_line(line: &crate::cells::Line, escapes: bool, keep: bool, trim_unuse
         }
     }
     if keep && trim_unused {
-        while line.cells.last().is_some_and(|c| c.text == " " && c.style == crate::cells::Style::default()) {
+        // a tab is used even though its cells are blank
+        let tabs = line.tabs_end();
+        while line.cells.len() > tabs && line.cells.last().is_some_and(|c| c.text == " " && c.style == crate::cells::Style::default()) {
             line.cells.pop();
         }
     }
     let text = if escapes {
         render::line_with_escapes(&line)
     } else {
-        line.cells.iter().map(|c| c.text.as_str()).collect::<String>()
+        (0..line.cells.len()).map(|x| line.cell_text(x)).collect()
     };
-    let text = if escape { text.replace('\x1b', "\\033") } else { text };
+    let text = if escape { text.replace("\x1b\\", "\\033\\\\").replace('\x1b', "\\033") } else { text };
     if keep || escapes { text } else { text.trim_end_matches(' ').to_string() }
 }
 
@@ -5240,24 +5270,35 @@ fn capture_grid(screen: &vt100::Screen, limit: usize) -> String {
         let p = if yy < hsize { "-".to_string() } else { (yy - hsize).to_string() };
         let cells: Vec<Option<&vt100::Cell>> = (0..sx).map(|x| row.cell(x)).collect();
         let used = cells.iter().rposition(|c| c.is_some_and(|c| c.has_contents())).map_or(0, |i| i + 1);
-        let lflags = row.wrapped() as u32;
-        let _ = writeln!(out, "\tL {yy} ({p}) flags={}[{lflags:x}] {used}/{}", names(lflags, &[(1, "WRAPPED")]), cells.len());
+        // GRID_LINE_* from the row's flags (the OSC 133 columns are not kept)
+        let (marks, extended) = screen.history_row_flags(yy);
+        let lflags = row.wrapped() as u32 | (extended as u32) << 1
+            | [(vt100::ROW_START_PROMPT, 0x8), (vt100::ROW_SECOND_PROMPT, 0x10), (vt100::ROW_START_COMMAND, 0x20), (vt100::ROW_START_OUTPUT, 0x40), (vt100::ROW_END_OUTPUT, 0x80), (vt100::ROW_HYPERLINK, 0x100)]
+                .iter().filter(|(m, _)| marks & m != 0).map(|(_, f)| f).sum::<u32>();
+        let _ = writeln!(out, "\tL {yy} ({p}) flags={}[{lflags:x}] {used}/{}", names(lflags, &[(1, "WRAPPED"), (2, "EXTENDED"), (0x8, "START_PROMPT"), (0x10, "SECOND_PROMPT"), (0x20, "START_COMMAND"), (0x40, "START_OUTPUT"), (0x80, "END_OUTPUT"), (0x100, "HYPERLINK")]), cells.len());
+        let mut tab_end = 0;
         for (xx, c) in cells.iter().enumerate() {
+            let meta = row.cell_metadata(xx as u16);
+            let tab = meta.map_or(0, |m| usize::from(m.tab_width));
             let (data, width, padding) = match c {
+                // a tab is one cell of its width, its other cells padding
+                _ if tab > 0 => { tab_end = xx + tab; (" ".repeat(tab), tab, false) }
+                _ if xx < tab_end => ("!".to_string(), 1, true),
                 Some(c) if c.is_wide_continuation() => (String::new(), 0, true),
                 Some(c) if c.has_contents() => (c.contents().to_string(), if c.is_wide() { 2 } else { 1 }, false),
                 _ => (" ".to_string(), 1, false),
             };
+            let (link, linkid) = meta.and_then(|m| m.hyperlink.as_ref()).map_or(("NONE", "NONE"), |l| (l.uri.as_str(), if l.id.is_empty() { "NONE" } else { l.id.as_str() }));
             let (fg, fgv) = colour(c.map_or(vt100::Color::Default, |c| c.fgcolor()));
             let (bg, bgv) = colour(c.map_or(vt100::Color::Default, |c| c.bgcolor()));
             let attr = c.map_or(0, |c| c.bold() as u32 | (c.dim() as u32) << 1 | (c.underline() as u32) << 2 | (c.inverse() as u32) << 4 | (c.italic() as u32) << 6);
-            let flags = (fgv & 0x0100_0000 != 0) as u32 | ((bgv & 0x0100_0000 != 0) as u32) << 1 | (padding as u32) << 2;
+            let flags = (fgv & 0x0100_0000 != 0) as u32 | ((bgv & 0x0100_0000 != 0) as u32) << 1 | (padding as u32) << 2 | ((tab > 0) as u32) << 7;
             let escaped = String::from_utf8_lossy(&vis::strvis(data.as_bytes(), vis::OCTAL | vis::CSTYLE | vis::TAB | vis::NL)).into_owned();
             let _ = writeln!(
                 out,
-                "\t\tC {yy},{xx} data=({width},{},{escaped}) flags={}[{flags:x}] attr={}[{attr:x}] fg={fg}[{fgv:x}] bg={bg}[{bgv:x}] us=default[8] link=NONE linkid=NONE",
+                "\t\tC {yy},{xx} data=({width},{},{escaped}) flags={}[{flags:x}] attr={}[{attr:x}] fg={fg}[{fgv:x}] bg={bg}[{bgv:x}] us=default[8] link={link} linkid={linkid}",
                 data.len(),
-                names(flags, &[(1, "FG256"), (2, "BG256"), (4, "PADDING")]),
+                names(flags, &[(1, "FG256"), (2, "BG256"), (4, "PADDING"), (0x80, "TAB")]),
                 names(attr, &[(1, "BRIGHT"), (2, "DIM"), (4, "UNDERSCORE"), (0x10, "REVERSE"), (0x40, "ITALICS")]),
             );
         }

@@ -215,7 +215,7 @@ impl Panes {
     pub fn render(&self, srv: &Server, w: u16, h: u16) -> Vec<Line> {
         let (wu, hu) = (w as usize, h as usize);
         let mut grid = vec![vec![Cell { text: " ".into(), style: Style::default() }; wu]; hu];
-        let Some((_, seps, osx, osy)) = self.layout(srv) else { return grid.into_iter().map(|cells| Line { cells, wrapped: false }).collect() };
+        let Some((_, seps, osx, osy)) = self.layout(srv) else { return grid.into_iter().map(|cells| Line { cells, wrapped: false, ..Default::default() }).collect() };
         let sid = self.session_of(srv);
         let wid = self.source;
         let idx = sid.and_then(|s| srv.sessions.get(&s)).and_then(|s| s.links.iter().find(|(_, w)| **w == wid).map(|(i, _)| *i));
@@ -418,7 +418,7 @@ impl Panes {
                 }
             }
         }
-        grid.into_iter().map(|cells| Line { cells, wrapped: false }).collect()
+        grid.into_iter().map(|cells| Line { cells, wrapped: false, ..Default::default() }).collect()
     }
 
     /// The pane a key chooses (window_panes_key_pane): 0-9 then a-z, by pane index.

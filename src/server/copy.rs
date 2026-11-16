@@ -187,6 +187,7 @@ impl Server {
         // command is not run (window_copy_command ignores the parse error), "--" ends flags
         let mut args = args.to_vec();
         let mut flags = (false, false);
+        let mut output_prompt = false;
         let copying = name.starts_with("copy-") || name.starts_with("append-");
         let allowed = if name.starts_with("copy-") { "CP" } else if matches!(name, "next-prompt" | "previous-prompt") { "o" } else { "" };
         if copymode::is_command(name) {
@@ -200,6 +201,7 @@ impl Server {
                 }
                 flags.0 |= a.contains('C');
                 flags.1 |= a.contains('P');
+                output_prompt |= a.contains('o');
             }
         }
         // copy-pipe without a command uses copy-command
@@ -211,6 +213,7 @@ impl Server {
         } else {
             Some(self.opt_server("copy-command")).filter(|c| !c.is_empty())
         };
+        if output_prompt { args.insert(0, "-o".into()); }
         let run_args: Vec<String> = if piped && !args.is_empty() { args[1..].to_vec() } else { args.clone() };
         // copy commands: the optional prefix names the new buffer
         // the command and the prefix are formats (format_single)
@@ -435,8 +438,8 @@ impl Server {
             "search_count" => cm.search_count()?.to_string(),
             "search_count_partial" => cm.search_count().map(|_| b(cm.search_count_partial()))?,
             "search_match" => cm.search_match()?,
-            // the time lines entered the history is not kept
-            "top_line_time" => "0".into(),
+            "top_line_time" => cm.top_line_time().to_string(),
+            "copy_cursor_hyperlink" => cm.cursor_hyperlink()?,
             "copy_cursor_word" => {
                 let ws = self.opt_session(self.session_of_pane(pane).map(|s| s.0), "word-separators");
                 super::mouse::grid_word(|i| cm.line(i).cloned(), cm.line_count(), cx, cm.view_top() + cy, &ws)?
