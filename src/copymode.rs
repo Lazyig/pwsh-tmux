@@ -2958,8 +2958,13 @@ impl CopyMode {
     /// Matches starting on rows `first..=y`; where row searches overlap, the marks keep the
     /// first match's cells.
     fn match_spans(&self, first: usize, y: usize, needle: &str) -> Vec<(usize, usize)> {
+        self.all_match_spans(first, y, needle).into_iter().filter(|&(a, b)| a < (y + 1) * self.width && b > y * self.width).collect()
+    }
+
+    /// Every match starting on rows `first..=last`, as absolute cell offsets.
+    fn all_match_spans(&self, first: usize, last: usize, needle: &str) -> Vec<(usize, usize)> {
         let mut marks: Vec<(usize, usize)> = Vec::new();
-        for row in first..=y {
+        for row in first..=last {
             for (x0, x1) in self.row_matches(row, needle) {
                 let start = row * self.width + x0;
                 let end = row * self.width + x1;
@@ -2967,7 +2972,7 @@ impl CopyMode {
                 if start < end { marks.push((start, end)); }
             }
         }
-        marks.into_iter().filter(|&(a, b)| a < (y + 1) * self.width && b > y * self.width).collect()
+        marks
     }
 
     fn visible_matches(&self, y: usize, needle: &str) -> Vec<(usize, usize)> {
@@ -3033,7 +3038,7 @@ impl CopyMode {
             let y = if forward { (self.cy + i) % total } else { (self.cy + total * 2 - i) % total };
             if !line.as_ref().is_some_and(|(a, b, _)| (*a..=*b).contains(&y)) {
                 let (first, last) = (self.logical_start(y), self.logical_end(y));
-                line = Some((first, last, self.match_spans(first, last, needle)));
+                line = Some((first, last, self.all_match_spans(first, last, needle)));
             }
             let spans = &line.as_ref().unwrap().2;
             let matches: Vec<(usize, usize)> = spans.iter().copied().filter(|&(a, b)| a < (y + 1) * self.width && b > y * self.width).collect();
@@ -4746,6 +4751,13 @@ mod tests {
         assert!(!cm.search_present());
         cm.run("search-forward", &["DONE".into()]);
         assert_eq!(cm.cursor(), (0, 23));
+        // a match on an earlier row of a wrapped line is found from its first row
+        let mut cm = CopyMode::new(vec![line("0123ABCD", true), line("abcdEFGH", true), line("ijkl", false), line("DONE", false)], 8, 4, (3, 0), true);
+        cm.run("history-top", &[]);
+        cm.run("search-forward", &["EFGH".into()]);
+        assert_eq!((cm.cursor(), cm.search_count()), ((4, 1), Some(1)));
+        cm.run("search-backward", &["ABCD".into()]);
+        assert_eq!(cm.cursor(), (4, 0));
     }
 
     #[test]
