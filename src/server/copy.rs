@@ -38,27 +38,25 @@ pub(super) fn default_binding_command(cmd: &str) -> String {
     }
 }
 
-/// Splits a key binding's commands: an argument `;` (written `\;`) separates commands, as
-/// when tmux parses bind-key's arguments.
-fn binding_commands(cmd: &str) -> Result<Vec<Vec<String>>, String> {
-    let cmds = crate::cmdparse::parse(cmd)?;
-    if !cmd.contains("\\;") {
-        return Ok(cmds);
-    }
-    Ok(cmds.iter().flat_map(|c| crate::cmdparse::split_commands(c)).collect())
-}
-
-/// Commands a read-only client's key binding may run (CMD_READONLY).
+/// The commands with CMD_READONLY: all a read-only client's key binding may run.
 const READONLY_BINDING_CMDS: &[&str] = &["attach-session", "copy-mode", "detach-client", "list-clients", "send-keys", "switch-client"];
 
-/// key_bindings_dispatch: a read-only client's binding runs only if all its commands may.
-fn binding_allowed_readonly(cmd: &str) -> bool {
-    binding_commands(cmd).is_ok_and(|cmds| {
-        cmds.iter().all(|c| c.first().and_then(|n| super::cmds::canonical(n)).is_some_and(|n| READONLY_BINDING_CMDS.contains(&n)))
-    })
-}
-
 impl Server {
+    /// key_bindings_dispatch: a read-only client's binding runs only if all its commands
+    /// (cmd_list_all_have, with command aliases expanded as the parser does) may.
+    pub(super) fn binding_allowed_readonly(&self, cmd: &str) -> bool {
+        let Ok(cmds) = crate::cmdparse::parse(cmd) else { return false };
+        let aliases = self.command_aliases();
+        let readonly = |c: &[String]| c.first().and_then(|n| super::cmds::canonical(n)).is_some_and(|n| READONLY_BINDING_CMDS.contains(&n));
+        cmds.iter().all(|c| {
+            let alias = c.first().and_then(|name| aliases.iter().find_map(|a| a.split_once('=').filter(|(n, _)| n == name).map(|(_, v)| v.to_string())));
+            match alias {
+                Some(v) => crate::cmdparse::parse(&v).is_ok_and(|cs| cs.iter().all(|c| readonly(c))),
+                None => readonly(c),
+            }
+        })
+    }
+
     /// The copy-mode-line-numbers option for a pane's window.
     fn copy_line_numbers_option(&self, pane: PaneId) -> LineNumbers {
         LineNumbers::parse(&self.opt_window(self.window_of(pane), "copy-mode-line-numbers"))
@@ -106,17 +104,22 @@ impl Server {
         }
         let pending = matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(cm)) if cm.waiting_for_key());
         let binding = self.bindings.get(table).and_then(|t| t.get(name)).map(|b| b.cmd.clone());
-        let default = copymode::CopyMode::default_bindings(vi).iter().find(|(k, _)| keys::parse_key_name(k).map(|k| keys::key_name(&k)).as_deref().unwrap_or(k) == name).map(|(_, c)| default_binding_command(c));
+        let default_raw = copymode::CopyMode::default_bindings(vi).iter().find(|(k, _)| keys::parse_key_name(k).map(|k| keys::key_name(&k)).as_deref().unwrap_or(k) == name).map(|(_, c)| *c);
+        let default = default_raw.map(default_binding_command);
+        // the repeat count bindings open the real numeric pane prompt ("(repeat) N"): it
+        // takes the digits and gives the count to the mode (send-keys -N) when another key
+        // closes it, which is then looked up again
+        let numeric = default_raw.is_some_and(|c| c.starts_with("command-prompt -NP"));
         // a read-only client cannot prompt or run other commands from copy mode
         if let (Some(cmd), Some(c), false) = (&binding, cid, pending) {
-            if self.client_is_readonly(cid) && !binding_allowed_readonly(cmd) {
+            if self.client_is_readonly(cid) && !self.binding_allowed_readonly(cmd) {
                 // key_bindings_dispatch: cmdq_error, which capitalizes a client's message
                 self.set_message(c, "Client is read-only");
                 return;
             }
         }
         match binding {
-            Some(cmd) if !pending && Some(&cmd) != default.as_ref() => {
+            Some(cmd) if !pending && (Some(&cmd) != default.as_ref() || (numeric && cid.is_some())) => {
                 if let Some(c) = cid {
                     self.run_key_string(c, &cmd, Some(pane), name);
                 }
@@ -150,19 +153,6 @@ impl Server {
 
     /// Read-only clients may only move around (WINDOW_COPY_CMD_FLAG_READONLY).
     fn copy_mode_command_inner(&mut self, pane: PaneId, cid: Option<ClientId>, name: &str, args: &[String]) {
-        if let Some(PaneMode::Tree(_)) = self.panes.get(&pane).and_then(|p| p.mode.as_ref()) {
-            // tree mode understands a few -X commands
-            let key = match name {
-                "cursor-up" => "Up",
-                "cursor-down" => "Down",
-                "cancel" => "q",
-                _ => "",
-            };
-            if !key.is_empty() {
-                self.mode_key(pane, cid, key);
-            }
-            return;
-        }
         if !matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(_))) {
             return;
         }
@@ -296,7 +286,7 @@ impl Server {
     }
 
     /// window_copy_copy_buffer's clipboard half (set-clipboard): screen_write_setselection
-    /// on the pane, so the terminals of the attached clients showing its window get the
+    /// on the pane with no selection parameter (OSC 52 ;;), so the terminals of the attached clients showing its window get the
     /// OSC 52 (Ms), whichever client (or command) did the copy.
     fn copy_to_clipboard(&mut self, pane: PaneId, text: &str) {
         if text.is_empty() || self.opt_server("set-clipboard") == "off" {
@@ -307,7 +297,7 @@ impl Server {
         for c in self.clients.values().filter(|c| c.attached && c.control == 0 && c.features.has("clipboard")) {
             let shown = c.session.and_then(|s| self.sessions.get(&s)).and_then(|s| s.links.get(&s.active)).is_some_and(|w| *w == wid);
             if shown {
-                c.send(S_OUTPUT, features::string_capability(&c.term_caps, "Ms", "\x1b]52;%p1%s;%p2%s\x07", &["c", &enc]).as_bytes());
+                c.send(S_OUTPUT, features::string_capability(&c.term_caps, "Ms", "\x1b]52;%p1%s;%p2%s\x07", &["", &enc]).as_bytes());
             }
         }
         // window_copy_copy_buffer
@@ -477,19 +467,5 @@ fn pipe_to(cmd: &str, text: String) {
             }
             let _ = child.wait();
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::binding_allowed_readonly;
-
-    #[test]
-    fn readonly_copy_bindings() {
-        assert!(binding_allowed_readonly("send-keys -X cursor-up"));
-        assert!(binding_allowed_readonly(r"send -X history-top \; copy-mode -q"));
-        // the search and count prompts are not for read-only clients
-        assert!(!binding_allowed_readonly("command-prompt -T search -p \"(search down)\" { send-keys -X search-forward -- \"%%\" }"));
-        assert!(!binding_allowed_readonly(r"send-keys -X cancel \; select-pane -L"));
     }
 }

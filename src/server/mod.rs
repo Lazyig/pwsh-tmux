@@ -43,9 +43,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-/// Largest window/client dimension accepted. tmux allows 10000, but vt100 allocates
-/// every cell up front, so a smaller bound keeps a hostile size from exhausting memory.
-pub const MAX_SIZE: u16 = 1000;
+/// Largest window/client dimension accepted (tmux WINDOW_MAXIMUM). Screen rows are
+/// allocated as they are written, so a large but empty window costs little.
+pub const MAX_SIZE: u16 = 10000;
 /// A message without a timer (delay 0) stays until a key press.
 pub const MESSAGE_FOREVER: Duration = Duration::from_secs(86_400 * 365);
 
@@ -106,6 +106,13 @@ pub struct PaneInfo {
     pub cmd: Option<String>,
     pub path: Option<String>,
 }
+
+/// screen_reinit as terminal input: any sequence in progress is cancelled, the alternate
+/// screen left, the scroll region, modes (origin, insert, cursor keys, keypad, cursor,
+/// wrap, bracketed paste, mouse, focus) and attributes reset and the visible lines
+/// cleared with the cursor at the top left; the history stays.
+const SCREEN_REINIT: &[u8] = b"\x18\x1b[?1049l\x1b[r\x1b[?6l\x1b[4l\x1b[?1l\x1b>\x1b[?25h\x1b[?7h\x1b[?2004l\
+\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1004l\x1b[0m\x1b[H\x1b[2J";
 
 /// Answers terminal queries and collects title / bell / cwd reports from a pane.
 #[derive(Default)]
@@ -648,6 +655,9 @@ pub struct Window {
     /// (manual_sx, manual_sy).
     pub manual_sx: u16,
     pub manual_sy: u16,
+    /// A size waiting until the window is the current window of an attached session
+    /// (WINDOW_RESIZE with new_sx/new_sy).
+    pub new_size: Option<(u16, u16)>,
 }
 
 impl Window {
@@ -741,10 +751,9 @@ pub struct Session {
     pub env: BTreeMap<String, Option<String>>,
     pub created: u64,
     pub activity: u64,
-    /// activity_seq() at the last activity update.
+    /// activity_seq() at the last activity update: the activity order (tmux compares
+    /// activity timevals).
     pub activity_seq: u64,
-    /// activity_time to the microsecond (sort orders).
-    pub activity_us: u64,
     pub last_attached: u64,
     pub alerts: BTreeMap<u32, u8>,
     /// Session group (new-session -t): members share one window list.
@@ -950,6 +959,8 @@ pub struct Client {
 pub struct ClientIo {
     pub written: std::sync::atomic::AtomicU64,
     pub discarded: std::sync::atomic::AtomicU64,
+    /// The client has been sent its reply or exit (CLIENT_EXIT).
+    pub exit_sent: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(unix)]
@@ -979,6 +990,9 @@ impl Client {
 
     pub fn send(&self, kind: u8, payload: &[u8]) {
         use std::sync::atomic::Ordering;
+        if kind == S_REPLY || kind == S_EXIT {
+            self.io.exit_sent.store(true, Ordering::SeqCst);
+        }
         let len = payload.len().saturating_add(5);
         if self.closed.load(Ordering::SeqCst) {
             self.io.discarded.fetch_add(len as u64, Ordering::Relaxed);
@@ -1246,23 +1260,33 @@ pub struct Server {
     pub pipe_acl: Option<Vec<String>>,
     /// Configuration files tried at startup (config_files).
     pub cfg_files: Vec<String>,
-    /// The working directory of the client that started the server: relative paths in
-    /// the startup configuration resolve against it (cfg_client's cwd).
+    /// The working directory of the client that started the server: the configuration
+    /// loads before any client connects, so this stands for cfg_client's cwd until one
+    /// does (relative paths in the startup configuration resolve against it).
     pub cfg_cwd: Option<String>,
-    /// Errors of the startup configuration (cfg_causes), until they are shown.
+    /// Errors (and display-message output) of commands run without a client while the
+    /// configuration loads (cfg_causes), until they are shown.
     pub cfg_causes: Vec<String>,
-    /// Client commands that arrived while the configuration loads: they run after it.
-    pub cfg_waiting: Vec<Queue>,
-    /// The configuration's queue has started and not finished.
-    pub cfg_loading: bool,
+    /// The first client while the configuration loads (cfg_client): its commands wait for
+    /// cfg_done, and spawns without -c use its directory.
+    pub cfg_client: Option<ClientId>,
+    /// The messages of cfg_client held until cfg_done (its cfg_client_done item).
+    pub cfg_held: Vec<(ClientId, u8, Vec<u8>)>,
+    /// load_config has run, and whether a client has sent a command since: the first
+    /// one is the client cfg_done would have seen (start_cfg runs once it identifies).
+    pub cfg_started: bool,
+    pub cfg_client_seen: bool,
+    /// Jobs of the configuration that finished before the first client's command came
+    /// (tmux has that command queued before any job can finish), and until when to wait.
+    pub cfg_jobs_held: Vec<(u32, i32, String)>,
+    pub cfg_jobs_until: Option<Instant>,
     /// Queues waiting for a pane's command to exit (new-pane -W).
     pub pane_waits: HashMap<PaneId, Vec<(Vec<String>, Queue)>>,
+    /// Panes running the editor of a mode (wp->editor) and the client it was opened for.
+    pub editors: HashMap<PaneId, (ClientId, modes::PopupEditor)>,
 }
 
-/// Set by the client that starts the server to its working directory.
-pub const CFG_CWD_ENV: &str = "PWSH_TMUX_CFG_CWD";
-
-pub fn run(config: Option<String>) -> io::Result<()> {
+pub fn run(config: Option<String>, cwd: Option<String>) -> io::Result<()> {
     // stderr is /dev/null for the detached server: keep panics in the log
     std::panic::set_hook(Box::new(|info| log(&format!("panic: {info}"))));
     if ipc::connect().is_ok() {
@@ -1275,13 +1299,9 @@ pub fn run(config: Option<String>) -> io::Result<()> {
     if srv.owner.is_empty() {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "cannot determine server owner"));
     }
-    srv.cfg_cwd = std::env::var(CFG_CWD_ENV).ok().filter(|d| !d.is_empty());
-    // only for the server: jobs and panes started from it must not see it
-    // SAFETY: no other thread of this process reads the environment yet
-    unsafe { std::env::remove_var(CFG_CWD_ENV) };
     // config first: its server-access lines decide who may open the Windows pipe
+    srv.cfg_cwd = cwd.filter(|d| !d.is_empty());
     srv.load_config(config);
-    srv.load_prompt_history();
     let allowed: Vec<String> = srv.acl.iter().map(|a| a.0.clone()).collect();
     let Some(listener) = ipc::listen_exclusive(&allowed)? else {
         return Ok(()); // another server won the race
@@ -1330,6 +1350,7 @@ pub fn run(config: Option<String>) -> io::Result<()> {
         }
         srv.sync_groups();
         srv.timers();
+        srv.check_window_resizes();
         if !output_only || last_detect.elapsed() >= Duration::from_millis(50) {
             last_detect = Instant::now();
             srv.detect_changes(None);
@@ -1358,7 +1379,7 @@ impl Server {
     fn new(tx: mpsc::SyncSender<Event>) -> Self {
         let mut env = BTreeMap::new();
         for (k, v) in std::env::vars() {
-            if k != "PWSH_TMUX" && k != "PWSH_TMUX_PANE" && k != CFG_CWD_ENV {
+            if k != "PWSH_TMUX" && k != "PWSH_TMUX_PANE" {
                 env.insert(k, Some(v));
             }
         }
@@ -1413,9 +1434,14 @@ impl Server {
             cfg_files: Vec::new(),
             cfg_cwd: None,
             cfg_causes: Vec::new(),
-            cfg_waiting: Vec::new(),
-            cfg_loading: false,
+            cfg_client: None,
+            cfg_held: Vec::new(),
+            cfg_started: false,
+            cfg_client_seen: false,
+            cfg_jobs_held: Vec::new(),
+            cfg_jobs_until: None,
             pane_waits: HashMap::new(),
+            editors: HashMap::new(),
         };
         srv.opts_session.set("default-shell", procinfo::default_shell());
         srv
@@ -1456,8 +1482,10 @@ impl Server {
         }
         self.cfg_files = files.iter().map(|f| f.0.clone()).collect();
         // start_cfg/load_cfg: each file is parsed now and its commands go in the global
-        // queue, which goes on after errors; a missing default file is quiet. Errors
-        // name the file as given and wait in cfg_causes.
+        // queue without a client, which goes on after errors, then cfg_done; a command
+        // that waits (run-shell, if-shell) holds back the rest, and the first client's
+        // command waits for cfg_done. Errors name the file as given and wait in
+        // cfg_causes.
         let ctx = Ctx { cfg: true, ..Ctx::default() };
         let mut cmds = VecDeque::new();
         for (f, quiet) in files {
@@ -1465,9 +1493,11 @@ impl Server {
                 Some(d) if std::path::Path::new(&f).is_relative() => std::path::Path::new(d).join(&f).to_string_lossy().into_owned(),
                 _ => f.clone(),
             };
-            if !std::path::Path::new(&path).exists() {
-                if !quiet {
-                    self.cfg_causes.push(format!("{f}: No such file or directory"));
+            // load_cfg: a file that cannot be opened is a cause "path: strerror" (a missing
+            // one is fine when quiet)
+            if let Err(e) = std::fs::File::open(&path) {
+                if !(quiet && e.kind() == io::ErrorKind::NotFound) {
+                    self.cfg_causes.push(format!("{f}: {}", cmds::strerror(&e)));
                 }
                 continue;
             }
@@ -1478,44 +1508,32 @@ impl Server {
         }
         cmds.push_back(vec![CFG_DONE.to_string()]);
         let soft = cmds.len();
-        self.cfg_loading = true;
+        self.cfg_started = true;
+        self.cfg_jobs_until = Some(Instant::now() + Duration::from_secs(5));
         self.run_queue(Queue { cmds, ctx, soft });
     }
 
-    /// cfg_done: the configuration is loaded. Its errors are shown (cfg_show_causes) and
-    /// the client commands that waited for it run.
+    /// The configuration's jobs held for the first client's command finish now.
+    fn cfg_release_jobs(&mut self) {
+        self.cfg_jobs_until = None;
+        for (id, status, output) in std::mem::take(&mut self.cfg_jobs_held) {
+            self.job_done(id, status, output);
+        }
+    }
+
+    /// cfg_done: the configuration has loaded; its causes are shown (cfg_show_causes),
+    /// the first client's held commands run and the prompt history is loaded.
     pub fn cfg_done(&mut self) {
         if self.cfg_finished {
             return;
         }
         self.cfg_finished = true;
-        self.cfg_loading = false;
-        self.show_cfg_causes(None);
-        for q in std::mem::take(&mut self.cfg_waiting) {
-            self.run_queue(q);
+        self.cfg_show_causes(None);
+        self.cfg_client = None;
+        for (cid, kind, payload) in std::mem::take(&mut self.cfg_held) {
+            self.client_msg(cid, kind, payload);
         }
-    }
-
-    /// cfg_show_causes: a control client gets them as %config-error, else they go in
-    /// view mode in the active pane of the session (the first client's, or the first
-    /// one) once it is attached.
-    pub fn show_cfg_causes(&mut self, sid: Option<SessId>) {
-        if self.cfg_causes.is_empty() {
-            return;
-        }
-        let first = self.clients.values().filter(|c| c.ident.is_some()).min_by_key(|c| c.id).map(|c| (c.id, c.control > 0, c.session));
-        if let Some((cid, true, _)) = first {
-            for c in std::mem::take(&mut self.cfg_causes) {
-                self.control_write(cid, &format!("%config-error {c}\n"));
-            }
-            return;
-        }
-        let sid = sid.or(first.and_then(|f| f.2)).or_else(|| self.sessions.values().min_by(|a, b| a.name.cmp(&b.name)).map(|s| s.id));
-        let Some(sid) = sid.filter(|s| self.clients.values().any(|c| c.attached && c.session == Some(*s))) else { return };
-        let wid = self.sessions[&sid].active_window();
-        let pane = self.windows[&wid].active;
-        let text = std::mem::take(&mut self.cfg_causes).join("\n");
-        self.view_output(pane, &format!("{text}\n"));
+        self.load_prompt_history();
     }
 
     /// cmdq_error for a command without a client: during the configuration its error
@@ -1677,13 +1695,22 @@ impl Server {
     fn handle(&mut self, ev: Event) {
         match ev {
             Event::Conn(stream) => self.accept(stream),
-            Event::ClientMsg(cid, kind, payload) => self.client_msg(cid, kind, payload),
+            Event::ClientMsg(cid, kind, payload) => {
+                let first = !self.cfg_client_seen;
+                self.client_msg(cid, kind, payload);
+                if first && self.cfg_client_seen {
+                    self.cfg_release_jobs();
+                }
+            }
             Event::ClientGone(cid) => self.client_gone(cid),
             Event::PaneData(id, generation, data) => self.pane_data(id, generation, &data),
             Event::PaneExit(id, generation, status) => {
                 if self.panes.get(&id).is_some_and(|p| p.generation == generation) {
                     self.pane_exited(id, status);
                 }
+            }
+            Event::Job(id, status, output) if self.cfg_started && !self.cfg_client_seen && self.cfg_jobs_until.is_some_and(|t| Instant::now() < t) => {
+                self.cfg_jobs_held.push((id, status, output));
             }
             Event::Job(id, status, output) => self.job_done(id, status, output),
             Event::ClientUser(cid, user) => self.client_user(cid, user),
@@ -1860,6 +1887,12 @@ impl Server {
         let closed = (c.control > 0 || c.ident.as_ref().is_some_and(|i| i.tty)).then(|| self.payload_client(cid));
         let Some(c) = self.clients.remove(&cid) else { return };
         c.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        if self.cfg_client == Some(cid) {
+            // server_client_lost clears cfg_client; its held commands go with it
+            self.cfg_client = None;
+            self.cfg_cwd = None;
+            self.cfg_held.clear();
+        }
         let readonly = c.is_readonly();
         if c.attached {
             self.latest_lost(cid);
@@ -1904,6 +1937,22 @@ impl Server {
 
     fn client_msg(&mut self, cid: ClientId, kind: u8, payload: Vec<u8>) {
         if self.clients.get(&cid).is_some_and(|c| c.denied) {
+            return;
+        }
+        // cfg_client_done: the first client's commands wait until the configuration has
+        // loaded; later clients go on (they may have been started by it)
+        if self.cfg_started && kind == C_COMMAND && !self.cfg_client_seen {
+            self.cfg_client_seen = true;
+            if self.cfg_finished {
+                // the configuration loaded before any client connected: its causes go
+                // where cfg_done would have put them with this client first
+                self.cfg_show_causes(None);
+            } else {
+                self.cfg_client = Some(cid);
+            }
+        }
+        if self.cfg_started && !self.cfg_finished && self.cfg_client == Some(cid) && matches!(kind, C_COMMAND | C_CONTROL_LINE) {
+            self.cfg_held.push((cid, kind, payload));
             return;
         }
         match kind {
@@ -1970,9 +2019,7 @@ impl Server {
                     self.finish_queue(Queue { cmds: VecDeque::new(), ctx, soft: 0 }, Some(e));
                     return;
                 }
-                let q = Queue { cmds: cmds.into_iter().filter(|c| !c.is_empty()).collect(), ctx , soft: 0 };
-                // cfg_client_done: a client's command waits for the configuration
-                if self.cfg_loading { self.cfg_waiting.push(q) } else { self.run_queue(q) }
+                self.run_queue(Queue { cmds: cmds.into_iter().filter(|c| !c.is_empty()).collect(), ctx , soft: 0 });
             }
             C_INPUT => {
                 if let Some(c) = self.clients.get_mut(&cid) {
@@ -1983,7 +2030,6 @@ impl Server {
                 if let Some(s) = self.clients.get(&cid).filter(|c| c.attached).and_then(|c| c.session).and_then(|s| self.sessions.get_mut(&s)) {
                     s.activity = now_secs();
                     s.activity_seq = activity_seq();
-                    s.activity_us = now_us();
                 }
                 self.handle_input(cid, &payload);
                 // a focus-out report does not make the client the latest
@@ -2207,24 +2253,23 @@ impl Server {
         // popup?
         let popup_owner = self.clients.values().find(|c| matches!(&c.overlay, Some(Overlay::Popup(p)) if p.pane == id)).map(|c| c.id);
         if let Some(cid) = popup_owner {
-            let close = matches!(&self.clients[&cid].overlay, Some(Overlay::Popup(p)) if p.close_on_exit);
+            // popup_job_complete_cb: -E closes it, -EE only for status 0
+            let close = matches!(&self.clients[&cid].overlay, Some(Overlay::Popup(p)) if p.close_on_exit || (p.close_exit_zero && status == Some(0)));
             if let Some(p) = self.panes.get_mut(&id) {
                 p.dead = Some((status, now_secs()));
             }
             if close {
-                let mut editor = None;
                 if let Some(c) = self.clients.get_mut(&cid) {
-                    if let Some(Overlay::Popup(p)) = c.overlay.take() {
-                        editor = p.editor;
-                    }
+                    c.overlay = None;
                     c.dirty = true;
                 }
                 self.destroy_pane(id);
-                if let Some(ed) = editor {
-                    self.editor_done(cid, *ed, status);
-                }
             }
             return;
+        }
+        // server_child_exited: spawn_editor_finish before the pane is destroyed
+        if let Some((cid, ed)) = self.editors.remove(&id) {
+            self.editor_done(cid, ed, status);
         }
         let remain = self.opt_pane(id, "remain-on-exit");
         // "key" and "failed-key" keep it until a key is pressed (see Server::dead_key)
@@ -2279,26 +2324,30 @@ impl Server {
                 if !background {
                     queue.ctx.retval = if status < 0 { 128 - status } else { status };
                 }
-                if !output.is_empty() && !background {
+                // cmd_run_shell_print: a -t pane always gets the output in view mode,
+                // even when the command waits (a command-line client prints nothing)
+                let target = pane.filter(|p| self.panes.contains_key(p));
+                if let Some(p) = target.filter(|_| !output.is_empty()) {
+                    self.view_output(p, &output);
+                } else if !output.is_empty() && !background {
                     if queue.ctx.reply.is_some_and(|c| !self.clients.get(&c).is_some_and(|c| c.attached)) {
                         queue.ctx.out.push_str(&output);
-                    } else if let (Some(cid), Some(_), None) = (queue.ctx.client, queue.ctx.control_seq, pane) {
+                    } else if let (Some(cid), Some(_)) = (queue.ctx.client, queue.ctx.control_seq) {
                         // cmdq_print to a control client: bare lines after its %end
                         let mut text = output.clone();
                         if !text.ends_with('\n') {
                             text.push('\n');
                         }
                         self.ev.ctl_queue.entry(cid).or_default().push_str(&text);
-                    } else if let Some(p) = pane.or(queue.ctx.pane) {
+                    } else if let Some(p) = queue.ctx.pane {
                         self.view_output(p, &output);
                     }
                 } else if !output.is_empty() {
-                    // cmd_run_shell_print without a queue item: the -t pane, else the
-                    // target client's current pane, else the current one
+                    // cmd_run_shell_print without a queue item: the target client's
+                    // current pane, else the current one
                     let tc = queue.ctx.client.filter(|c| self.clients.get(c).is_some_and(|c| c.attached))
                         .or_else(|| self.resolve_client(&queue.ctx, None).ok());
-                    let p = pane.filter(|p| self.panes.contains_key(p))
-                        .or_else(|| tc.and_then(|c| self.client_active_pane(c)))
+                    let p = tc.and_then(|c| self.client_active_pane(c))
                         .or_else(|| self.current(&queue.ctx).pane);
                     if let Some(p) = p {
                         self.view_output(p, &output);
@@ -2325,15 +2374,32 @@ impl Server {
         self.run_queue(queue);
     }
 
-    /// Shows command output in a pane in view mode (copy mode over the text), like tmux.
+    /// Shows command output in a pane in view mode (copy mode over the text), like tmux:
+    /// window_copy_add with parse, so each line's escape sequences, CR and BS apply.
     pub fn view_output(&mut self, pane: PaneId, text: &str) {
+        self.view_add(pane, text, true);
+    }
+
+    /// window_copy_add(wp, parse, ...): `parse` runs each line through the terminal parser
+    /// (input_parse_screen); without it the text is written as it is (cfg_show_causes).
+    pub fn view_add(&mut self, pane: PaneId, text: &str, parse: bool) {
         let Some(p) = self.panes.get_mut(&pane) else { return };
         let (w, h) = p.size;
-        let mut lines: Vec<Line> = match &mut p.mode {
-            Some(PaneMode::Copy(_)) => Vec::new(),
+        // window_copy_add: output for a pane already in view mode goes after what it shows
+        let mut lines: Vec<Line> = match &p.mode {
+            Some(PaneMode::Copy(c)) if c.is_view_mode() => {
+                let mut old = c.backing_screen().0.to_vec();
+                while old.last().is_some_and(|l| !l.wrapped && l.cells.iter().all(|c| c.text.is_empty() || c.text == " ")) {
+                    old.pop();
+                }
+                old
+            }
             _ => Vec::new(),
         };
-        for l in text.trim_end_matches('\n').split('\n') {
+        if parse {
+            lines.extend(Self::parse_view_lines(text.trim_end_matches('\n'), w));
+        }
+        for l in text.trim_end_matches('\n').split('\n').filter(|_| !parse) {
             let mut cells: Vec<crate::cells::Cell> = Vec::new();
             for ch in l.chars() {
                 let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
@@ -2368,6 +2434,23 @@ impl Server {
         }
     }
 
+    /// The rows window_copy_vadd writes for `text` with parse: a CR and LF before each line
+    /// after the first, then the line's bytes through the parser, up to the cursor's row.
+    fn parse_view_lines(text: &str, w: u16) -> Vec<Line> {
+        let nz = |n: u16| std::num::NonZeroU16::new(n.max(1)).unwrap();
+        let rows = text.split('\n').count();
+        let mut parser = vt100::Parser::new(nz(1), nz(w), text.len() + rows + 1);
+        for (i, l) in text.split('\n').enumerate() {
+            if i > 0 {
+                parser.process(b"\r\n");
+            }
+            parser.process(l.as_bytes());
+        }
+        let screen = parser.screen();
+        let last = screen.history_rows_len() - screen.size().0.get() as usize + screen.cursor_position().0 as usize;
+        (0..=last).map(|i| crate::cells::line_at(screen, i)).collect()
+    }
+
     pub fn next_timeout(&self) -> Duration {
         let mut t = Duration::from_millis(1000);
         let now = Instant::now();
@@ -2399,6 +2482,9 @@ impl Server {
 
     fn timers(&mut self) {
         self.input_timers();
+        if self.cfg_jobs_until.is_some_and(|t| Instant::now() >= t) {
+            self.cfg_release_jobs();
+        }
         let now = Instant::now();
         let expired: Vec<_> = self.panes.iter_mut().filter_map(|(id, p)| {
             if p.scrollbar_until.is_some_and(|d| d <= now) { p.scrollbar_until = None; Some(*id) } else { None }
@@ -2682,12 +2768,13 @@ impl Server {
                 cb.env(k, v);
             }
         }
-        let dir = cwd
-            .filter(|d| !d.is_empty() && std::path::Path::new(d).is_dir())
-            .map(String::from)
-            .or_else(|| sid.and_then(|s| self.sessions.get(&s)).map(|s| s.cwd.clone()).filter(|d| std::path::Path::new(d).is_dir()))
-            .or_else(procinfo::home_dir)
-            .unwrap_or_else(|| ".".into());
+        // spawn: a directory that cannot be entered gives home, then the root
+        let is_dir = |d: &String| !d.is_empty() && std::path::Path::new(d).is_dir();
+        let wanted = cwd.map(String::from).filter(|d| !d.is_empty()).or_else(|| sid.and_then(|s| self.sessions.get(&s)).map(|s| s.cwd.clone()));
+        let dir = wanted
+            .filter(is_dir)
+            .or_else(|| procinfo::home_dir().filter(is_dir))
+            .unwrap_or_else(|| if cfg!(windows) { ".".into() } else { "/".into() });
         cb.cwd(&dir);
         let dir_for_event = dir.clone();
         let label = format!("{},{},{}", ipc::describe(), std::process::id(), sid.unwrap_or(0));
@@ -2770,7 +2857,8 @@ impl Server {
                 last_output: Instant::now(),
                 created: now,
                 current_cmd: prog,
-                current_path: dir,
+                // the process's directory (osdep_get_cwd): "sub/.." or "/." resolved
+                current_path: if cfg!(unix) { std::fs::canonicalize(&dir).map(|p| p.to_string_lossy().into_owned()).unwrap_or(dir) } else { dir },
                 cwd_seq: 0,
                 host_pid,
                 track: PaneTrack { argv: start_argv, ..Default::default() },
@@ -2778,7 +2866,22 @@ impl Server {
             },
         );
         let respawn = previous.is_some();
-        if let Some(old) = previous {
+        if let Some(mut old) = previous {
+            // screen_reinit: a respawned pane keeps its screen with the history; only the
+            // visible lines are cleared and the modes, scroll region and cursor reset
+            // (the input parser and its state start again)
+            if let Some(p) = self.panes.get_mut(&id) {
+                std::mem::swap(&mut p.parser, &mut old.parser);
+                let cb = std::mem::replace(old.parser.callbacks_mut(), PaneCb::default());
+                *p.parser.callbacks_mut() = cb;
+                if p.parser.screen().size() != (nz(rows), nz(cols)) {
+                    p.parser.set_size(nz(rows), nz(cols));
+                }
+                p.parser.screen_mut().set_scroll_on_clear(false);
+                p.parser.process(SCREEN_REINIT);
+                p.parser.callbacks_mut().replies.clear();
+                p.parser.callbacks_mut().events.clear();
+            }
             release(old); // respawn: the old pty
         }
         // pane-created fires once the pane is in a window (popups never are)
@@ -2803,6 +2906,10 @@ impl Server {
         if let Some(mut p) = self.panes.remove(&id) {
             p.kill();
             release(p);
+        }
+        // window_pane_destroy: an editor killed with its pane changes nothing
+        if let Some((_, ed)) = self.editors.remove(&id) {
+            let _ = std::fs::remove_file(&ed.path);
         }
         if self.marked == Some(id) {
             self.marked = None;
@@ -3054,7 +3161,6 @@ impl Server {
             s.last_attached = now;
             s.activity = now;
             s.activity_seq = activity_seq();
-            s.activity_us = now_us();
             if writable && update_env {
                 s.env.extend(cmds::environ_update(&names, &env));
             }
@@ -3314,6 +3420,8 @@ impl Server {
         for wid in wids {
             self.recalculate_window_size(wid, &clients, now);
         }
+        // the server loop applies waiting sizes after every command
+        self.check_window_resizes();
         let Some(s) = self.sessions.get(&sid) else { return };
         let mode = self.opt_window(Some(s.active_window()), "window-size");
         // default_window_size without a window: the session's clients
@@ -3329,26 +3437,52 @@ impl Server {
             s.cols = c;
             s.rows = r.saturating_add(status);
         }
-        self.mark_session_dirty(sid);
     }
 
-    /// The new size is applied once the window is the current window of an attached
-    /// session (server_client_check_window_resize); until then it keeps its old size. A
-    /// manual size is applied at once (recalculate_size).
+    /// recalculate_size: a new size is applied at once with `now` or for a manual size,
+    /// and to a window that is the current window of an attached session; any other
+    /// window waits for it (WINDOW_RESIZE) until it is shown (check_window_resizes).
+    /// Without a suitable client the window keeps its size and any size it waits for.
     fn recalculate_window_size(&mut self, wid: WinId, clients: &[(ClientId, SessId, (u16, u16))], now: bool) {
+        let Some(size) = self.window_client_size(wid, clients) else { return };
+        let size = (size.0.clamp(1, MAX_SIZE), size.1.clamp(1, MAX_SIZE));
         let manual = self.opt_window(Some(wid), "window-size") == "manual";
-        let shown = self.clients.values().filter(|c| c.attached).filter_map(|c| c.session).any(|s| self.session_window(s).map(|(_, w)| w) == Some(wid));
-        if !now && !shown && !manual {
+        let shown = self.window_shown(wid);
+        let Some(w) = self.windows.get_mut(&wid) else { return };
+        // unchanged: the size it waits for, else its own
+        if !now && w.new_size.unwrap_or((w.sx, w.sy)) == size {
             return;
         }
-        let Some(size) = self.window_client_size(wid, clients) else { return };
-        self.resize_window(wid, size);
+        if now || manual || shown {
+            self.resize_window(wid, size);
+        } else {
+            w.new_size = Some(size);
+        }
     }
 
-    /// resize_window: lay a window out at a new size.
+    /// The window is the current window of a session with an attached client.
+    fn window_shown(&self, wid: WinId) -> bool {
+        self.clients.values().filter(|c| c.attached).filter_map(|c| c.session).any(|s| self.session_window(s).map(|(_, w)| w) == Some(wid))
+    }
+
+    /// server_client_check_window_resize: a waiting size is applied once the window is
+    /// the current window of an attached session.
+    pub fn check_window_resizes(&mut self) {
+        let waiting: Vec<(WinId, (u16, u16))> = self.windows.iter().filter_map(|(id, w)| w.new_size.map(|s| (*id, s))).collect();
+        for (wid, size) in waiting {
+            if self.window_shown(wid) {
+                self.resize_window(wid, size);
+            }
+        }
+    }
+
+    /// resize_window: lay a window out at a new size; it can be no smaller than the
+    /// layout, and any size it waited for is dropped.
     pub fn resize_window(&mut self, wid: WinId, (cols, rows): (u16, u16)) {
-        let (sx, sy) = (cols.max(1), rows.max(1));
         let Some(w) = self.windows.get_mut(&wid) else { return };
+        w.new_size = None;
+        let (mw, mh) = w.layout.min_size();
+        let (sx, sy) = (cols.max(1).max(mw), rows.max(1).max(mh));
         if (w.sx, w.sy) != (sx, sy) {
             w.sx = sx;
             w.sy = sy;
@@ -3545,7 +3679,8 @@ impl Server {
                 if !hooks.is_empty() && failed.is_none() {
                     // the hook runs in place of the rest of the command list
                     if !soft {
-                        q.cmds.clear();
+                        // (the configuration's cfg_done stays)
+                        q.cmds.retain(|c| c.first() == Some(&*CFG_DONE));
                         failed = Some(e.clone());
                     }
                     for c in hooks.into_iter().rev() {
@@ -3730,11 +3865,16 @@ impl Server {
     }
 
     pub fn finish_queue(&mut self, q: Queue, mut err: Option<String>) {
-        // a configuration queue ended early still ends the configuration
-        if q.cmds.iter().any(|c| c.first() == Some(&*CFG_DONE)) {
-            self.cfg_done();
-        }
+        // the configuration's queue ended early: cfg_done still runs
+        let cfg_done = q.cmds.iter().any(|c| c.first() == Some(&*CFG_DONE));
         let ctx = q.ctx;
+        if cfg_done {
+            if let Some(e) = err.take().filter(|e| !e.starts_with('\0')) {
+                self.no_client_error(&ctx, &e);
+            }
+            self.cfg_done();
+            return;
+        }
         if ctx.out.overflowed() { err = Some("command output limit exceeded".into()); }
         if let (Some(seq), Some(cid)) = (ctx.control_seq, ctx.client) {
             if let Some(c) = self.clients.get_mut(&cid) {
@@ -3835,6 +3975,30 @@ impl Server {
                 }
             }
         }
+    }
+
+    /// cfg_show_causes: the configuration's causes go to the first client if it is a
+    /// control client (%config-error), else into view mode in the active pane of the
+    /// session (or the first client's, or the first one) once it is attached.
+    pub fn cfg_show_causes(&mut self, sid: Option<SessId>) {
+        if self.cfg_causes.is_empty() {
+            return;
+        }
+        // TAILQ_FIRST(&clients): a command client that has been told to exit is gone
+        let first = self.clients.iter().find(|(_, c)| c.ident.is_some() && !c.io.exit_sent.load(std::sync::atomic::Ordering::SeqCst)).map(|(id, _)| *id);
+        if let Some(c) = first.filter(|c| self.is_control(*c)) {
+            for cause in std::mem::take(&mut self.cfg_causes) {
+                self.control_notify_write(c, &format!("%config-error {cause}"));
+            }
+            return;
+        }
+        let sid = sid
+            .or_else(|| first.and_then(|c| self.clients.get(&c)).and_then(|c| c.session))
+            .or_else(|| self.sessions.keys().next().copied());
+        let Some(sid) = sid.filter(|s| self.clients.values().any(|c| c.attached && c.session == Some(*s))) else { return };
+        let Some(pane) = self.sessions.get(&sid).map(|s| self.windows[&s.active_window()].active) else { return };
+        let text = std::mem::take(&mut self.cfg_causes).join("\n");
+        self.view_add(pane, &text, false);
     }
 
     /// cmdq_error's message log entry for a client that shows no status line (or none).

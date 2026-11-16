@@ -379,14 +379,15 @@ pub struct Popup {
     pub h: u16,
     pub border: bool,
     pub close_on_exit: bool,
+    /// -EE (POPUP_CLOSEEXITZERO): it closes when the command exits with status 0.
+    pub close_exit_zero: bool,
     /// -k: after the command exits any key closes the popup.
     pub close_any_key: bool,
     pub title: String,
     pub look: OverlayLook,
-    /// The popup runs the editor for a mode (spawn_editor).
-    pub editor: Option<Box<PopupEditor>>,
 }
 
+/// The editor a mode runs in a modal floating pane (spawn_editor_state).
 pub struct PopupEditor {
     pub path: std::path::PathBuf,
     /// Run with %% replaced by the edited text.

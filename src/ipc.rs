@@ -434,7 +434,13 @@ pub fn set_shared(shared: bool) {
     let _ = shared;
 }
 
+/// Removes the server's socket, once: after kill-server has removed it a new server may
+/// already own the path.
 pub fn cleanup() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     #[cfg(unix)]
     if let Ok(p) = socket_path() {
         let _ = std::fs::remove_file(p);

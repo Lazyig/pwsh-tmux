@@ -1,10 +1,16 @@
 # tmux compatibility investigation
 
-The reference for this investigation is **tmux 3.6a**, using the Linux x86_64
-static binary from the [official tmux builds release](https://github.com/tmux/tmux-builds/releases/tag/v3.6a).
-The archive SHA256 is `c0a772a5e6ca8f129b0111d10029a52e02bcbc8352d5a8c0d3de8466a1e59c2e`.
-The reference runs under WSL; the candidate runs natively on Windows with ConPTY.
-Each comparison creates separate private servers and shuts them down afterward.
+The compatibility reference is now **tmux 3.8**: configs, themes and scripts written for
+3.8 should behave the same. Behaviour is compared against a stock tmux 3.8 build running
+in a separate reference environment, with the same scripts run against a local build, and
+the 3.8 C source is the authority for defaults and edge cases.
+
+The sections below record the original investigation against **tmux 3.6a** (the Linux
+x86_64 static binary from the [official tmux builds release](https://github.com/tmux/tmux-builds/releases/tag/v3.6a),
+archive SHA256 `c0a772a5e6ca8f129b0111d10029a52e02bcbc8352d5a8c0d3de8466a1e59c2e`, run
+under WSL against the candidate on Windows with ConPTY). Each comparison creates separate
+private servers and shuts them down afterward. Where 3.8 changed behaviour, the code
+follows 3.8.
 
 ## Differences corrected
 
@@ -76,8 +82,10 @@ through a client that was no longer connected, `display-menu`/`display-panes`/`d
 replaced an overlay already shown (tmux leaves it), and `pane_left`/`pane_top` ignored
 `pane-border-status` and zoom.
 
-Not implemented: tmux 3.6's `pane-scrollbars` (so the `Scrollbar*` areas and `copy-mode -S`
-never occur) and hyperlink tracking (`mouse_hyperlink` is always empty).
+Since then `pane-scrollbars` (with the `Scrollbar*` mouse areas, slider drags and
+`copy-mode -S`) is implemented. tmux 3.8's line metadata (OSC 133 prompt marks, OSC 8
+hyperlinks, tab cells and history line times, used by copy mode, `capture-pane` and the
+mouse formats) is not recorded by the terminal emulator yet; it is separate work.
 
 ## Differences retained for a reason
 
@@ -87,9 +95,9 @@ never occur) and hyperlink tracking (`mouse_hyperlink` is always empty).
   pipe because its ACL is established when the pipe is created.
 - Windows cannot perform Unix job-control suspension. `suspend-client` has no
   equivalent there. Shell-dependent locking requires a usable `lock-command`.
-- Window dimensions remain capped at 1000 by 1000. The current terminal emulator
-  allocates the screen eagerly; allowing 10000 by 10000 would allocate 100 million
-  cells per pane. Raising the limit requires a different allocation strategy.
+- Window dimensions follow tmux's WINDOW_MAXIMUM of 10000 by 10000. Screen rows are
+  allocated as they are written, so a large window that shows little costs little
+  (an empty 10000 by 10000 pane uses about 11 MB).
 - Configuration, executable and environment variable names use `pwsh-tmux` to
   coexist with stock tmux. The deployed executable may separately be named `tmux.exe`.
 

@@ -363,6 +363,8 @@ impl Server {
                 self.clipboard_reply(cid, raw);
                 return;
             }
+            // terminal replies (device attributes, DECRPM 2026, theme and colours) are
+            // read for every client, read-only ones too (tty_keys_next)
             if self.terminal_report(cid, raw) { return; }
             // focus reports set the client's focus (also for read-only clients)
             if raw == b"\x1b[I" || raw == b"\x1b[O" {
@@ -424,17 +426,6 @@ impl Server {
                 }
             }
             Input::Unknown(raw) => {
-                // tty_keys_sync: the DECRPM reply to the attach-time DECRQM 2026
-                if let Some(status) = raw.strip_prefix(b"\x1b[?2026;").and_then(|r| r.strip_suffix(b"$y")).filter(|r| r.len() == 1 && (b'0'..=b'4').contains(&r[0])) {
-                    if let Some(c) = self.clients.get_mut(&cid) {
-                        if matches!(status[0], b'1'..=b'3') && !c.features.has("sync") {
-                            c.features.parse("sync", &[',']);
-                            c.prev = None;
-                            c.dirty = true;
-                        }
-                    }
-                    return;
-                }
                 // focus reports reach panes through pane-focus-in/out (only those that asked)
                 if raw == b"\x1b[I" || raw == b"\x1b[O" {
                     self.client_focus(cid, raw == b"\x1b[I");
@@ -462,20 +453,31 @@ impl Server {
             return;
         }
         if self.panes.get(&pane).is_none_or(|p| p.options.get("@input-disabled") == Some("on")) { return; }
-        let Some(bytes) = self.encode_pane_key(pane, k, raw) else { return };
-        let wid = self.window_of(pane);
-        if wid.is_some_and(|w| self.opt_window_on(Some(w), "synchronize-panes")) {
-            let panes = self.windows[&wid.unwrap()].panes();
-            for q in panes {
-                if let Some(pp) = self.panes.get(&q) {
-                    if pp.mode.is_none() && pp.options.get("@input-disabled") != Some("on") {
-                        pp.send(bytes.clone());
-                    }
-                }
-            }
-        } else if let Some(p) = self.panes.get(&pane) {
+        let Some(bytes) = self.encode_pane_key(pane, k, raw.clone()) else { return };
+        if let Some(p) = self.panes.get(&pane) {
             p.send(bytes);
         }
+        for q in self.sync_peers(pane) {
+            if let Some(bytes) = self.encode_pane_key(q, k, raw.clone()) {
+                self.panes[&q].send(bytes);
+            }
+        }
+    }
+
+    /// window_pane_copy_key: with synchronize-panes a key also goes to the window's other
+    /// visible panes that have it on and are not in a mode, encoded for each of them
+    /// (input_key_pane: its own cursor, keypad and extended key modes).
+    pub(crate) fn sync_peers(&self, pane: PaneId) -> Vec<PaneId> {
+        let Some(wid) = self.window_of(pane) else { return Vec::new() };
+        if self.opt_pane(pane, "synchronize-panes") != "on" {
+            return Vec::new();
+        }
+        self.windows[&wid].panes().into_iter().filter(|q| {
+            *q != pane
+                && self.panes.get(q).is_some_and(|pp| pp.mode.is_none() && pp.dead.is_none() && pp.options.get("@input-disabled") != Some("on"))
+                && self.pane_visible(wid, *q)
+                && self.opt_pane(*q, "synchronize-panes") == "on"
+        }).collect()
     }
 
     /// window_pane_paste: pasted bytes go to the pane as they are, but not to a pane in a mode
@@ -606,7 +608,7 @@ impl Server {
                 // popup_key_cb: Escape and C-c close the popup unless -E leaves them
                 // to its running command; after the command exits only they (or with
                 // -k any key) do
-                let (pane, close_on_exit, any_key) = (p.pane, p.close_on_exit, p.close_any_key);
+                let (pane, close_on_exit, any_key) = (p.pane, p.close_on_exit || p.close_exit_zero, p.close_any_key);
                 let exited = self.panes.get(&pane).is_none_or(|x| x.dead.is_some());
                 let cancel = name == "Escape" || name == "C-c";
                 if ((!close_on_exit || exited) && cancel) || (exited && any_key) {
@@ -944,12 +946,16 @@ impl Server {
         }
     }
 
-    /// spawn_editor: edit `value` in the editor option's program, in a popup over the client;
-    /// `command` runs with %% replaced by the text when the editor exits successfully.
+    /// spawn_editor: edit `value` in the editor option's program, in a modal floating pane
+    /// 9/10 of the client's window in its middle; `command` runs with %% replaced by the
+    /// text when the editor exits successfully.
     pub fn open_editor(&mut self, cid: ClientId, value: &[u8], command: String, buffer: Option<String>) -> Result<(), String> {
-        if self.clients.get(&cid).is_some_and(|c| c.overlay.is_some()) {
-            return Err("an overlay is already open".into());
+        let wid = self.client_window(cid).ok_or("no current window")?;
+        let w = &self.windows[&wid];
+        if w.modal.is_some() {
+            return Err("window already has a modal pane".into());
         }
+        let (wsx, wsy, active) = (w.sx, w.sy, w.active);
         let text: &[u8] = if value.is_empty() { b"\n" } else { value };
         let path = editor_file(text).map_err(|e| format!("editor: {e}"))?;
         let editor = self.opt_server("editor");
@@ -959,26 +965,32 @@ impl Server {
         let shell = self.opt_session(sid, "default-shell");
         let shell = if shell.is_empty() { procinfo::default_shell() } else { shell };
         let cmd = editor_command(&editor, &quoted, cfg!(windows) && procinfo::is_powershell(&shell));
-        // spawn_editor: a pane 9/10 of the window in its middle (xoff = sx / 2 - w / 2),
-        // here with a border around it
-        let (wsx, wsy) = self.client_window(cid).and_then(|w| self.windows.get(&w)).map_or(self.clients[&cid].size, |w| (w.sx, w.sy));
-        let (pw, ph) = (((wsx as u32 * 9 / 10) as u16).max(1), ((wsy as u32 * 9 / 10) as u16).max(1));
-        let top = self.client_window_top(cid);
-        let (x, y) = ((wsx / 2 - pw / 2).saturating_sub(1), (top + wsy / 2 - ph / 2).saturating_sub(1));
-        let (w, h) = (pw + 2, ph + 2);
-        let pane = match self.spawn_pane(sid, pw, ph, &[cmd], Some(&std::env::temp_dir().display().to_string()), &[]) {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = std::fs::remove_file(&path);
-                return Err(e);
-            }
-        };
-        let editor = Some(Box::new(super::modes::PopupEditor { path, command, buffer }));
-        self.replace_overlay(cid, Some(Overlay::Popup(super::modes::Popup { pane, x, y, w, h, border: true, close_on_exit: true, close_any_key: false, title: String::new(), look: Default::default(), editor })))?;
+        // the layout cell: sx * 9 / 10 by sy * 9 / 10 at sx / 2 - w / 2, sy / 2 - h / 2
+        // (new-pane's -x/-y count the border, -X/-Y place the border)
+        let (pw, ph) = (((wsx as u32 * 9 / 10) as i64).max(1), ((wsy as u32 * 9 / 10) as i64).max(1));
+        let (xoff, yoff) = (wsx as i64 / 2 - pw / 2, wsy as i64 / 2 - ph / 2);
+        let b = i64::from(self.opt_window(Some(wid), "pane-border-lines") != "none");
+        let args: Vec<String> = [
+            "-O".to_string(), "-x".into(), (pw + 2 * b).to_string(), "-y".into(), (ph + 2 * b).to_string(),
+            "-X".into(), (xoff - b).to_string(), "-Y".into(), (yoff - b).to_string(),
+            "-c".into(), std::env::temp_dir().display().to_string(), "-t".into(), format!("%{active}"), cmd,
+        ].into();
+        let (bools, vals) = cmds::command_flags("new-pane");
+        let o = crate::opts::getopt(&args, bools, vals)?;
+        let mut ctx = Ctx { client: Some(cid), ..Default::default() };
+        if let Err(e) = self.cmd_new_pane("new-pane", &o, &[], &mut ctx) {
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
+        }
+        let Some(pane) = ctx.pane else { return Ok(()) };
+        if let Some(p) = self.panes.get_mut(&pane) {
+            p.options.set("remain-on-exit", "off".into());
+        }
+        self.editors.insert(pane, (cid, super::modes::PopupEditor { path, command, buffer }));
         Ok(())
     }
 
-    /// The editor popup closed (spawn_editor_finish): nothing for a failed editor or an
+    /// The editor pane exited (spawn_editor_finish): nothing for a failed editor or an
     /// empty file, else the paste buffer gets the text (window_buffer_edit_close_cb) or the
     /// command runs with it, less a final newline.
     pub fn editor_done(&mut self, cid: ClientId, ed: super::modes::PopupEditor, status: Option<i32>) {

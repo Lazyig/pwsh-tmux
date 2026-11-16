@@ -440,8 +440,14 @@ impl Server {
     /// #{window_layout} (the unzoomed layout) and #{window_visible_layout} (what is shown:
     /// a zoomed window has its zoomed pane and the panes floating above it).
     pub fn window_layout(&self, wid: WinId, visible: bool, client: Option<ClientId>) -> Option<String> {
+        self.windows.get(&wid)?;
+        self.window_layout_at(wid, visible, client, self.window_area(wid))
+    }
+
+    /// The window's layout laid out over `area` (a size it had before a resize), in the
+    /// client's format.
+    pub fn window_layout_at(&self, wid: WinId, visible: bool, client: Option<ClientId>, area: crate::layout::Rect) -> Option<String> {
         let w = self.windows.get(&wid)?;
-        let area = self.window_area(wid);
         let zoomed = self.zoomed_pane(wid).filter(|_| visible);
         let node = match zoomed {
             None => w.layout.clone(),
@@ -703,6 +709,7 @@ impl Server {
             Some(v) => options::validate("pane-border-lines", Some(v), None).map_err(|e| format!("pane-border-lines {e}"))?,
         };
         let cwd = o.get('c').map(|c| self.expand(tt, ctx.client, c));
+        let cwd = Some(self.spawn_cwd(ctx, tt.sid, cwd));
         let new = if floating {
             let lines_none = lines == "none";
             let g = if split {

@@ -412,23 +412,6 @@ impl Server {
     // ---- dispatch ------------------------------------------------------------------------
 
     /// events_fire: control mode notifications, hooks, then wait-for -E waiters.
-    /// The pre-3.8 entry point, kept for callers in other areas: fires `name` as
-    /// an event for the context's client (else the session). window-layout-changed
-    /// and the other change events are found by detect_changes and need no call.
-    #[allow(dead_code)]
-    pub fn run_hook(&mut self, sid: Option<SessId>, name: &str, ctx: Ctx) {
-        if matches!(name, "window-layout-changed" | "window-resized" | "window-zoomed" | "window-unzoomed" | "pane-resized") {
-            return;
-        }
-        let mut p = match (ctx.client.filter(|c| self.clients.contains_key(c)), sid.filter(|s| self.sessions.contains_key(s))) {
-            (Some(c), _) => self.payload_client(c),
-            (None, Some(s)) => self.payload_session(s),
-            (None, None) => Payload::default(),
-        };
-        p.readonly = ctx.readonly;
-        self.fire(name, p);
-    }
-
     pub fn fire(&mut self, name: &str, mut p: Payload) {
         p.items.insert("event".into(), Val::Str(name.into()));
         p.readonly |= self.readonly_context.get();
@@ -1783,7 +1766,7 @@ impl Server {
             if rezoom {
                 self.fire_window("window-unzoomed", wid);
                 let mut p = self.payload_window(wid);
-                p.str("_unzoomed_layout", old.layout.clone());
+                p.int("_unzoomed_sx", old.size.0 as i64).int("_unzoomed_sy", old.size.1 as i64);
                 self.fire("window-layout-changed", p);
                 self.fire_window("window-zoomed", wid);
                 self.fire_window("window-layout-changed", wid);

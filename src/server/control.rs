@@ -343,15 +343,16 @@ impl Server {
     }
 
     /// Control clients that get notifications (CONTROL_SHOULD_NOTIFY_CLIENT): not
-    /// those already exiting.
+    /// those already exiting. One without a session gets them too (its control_state
+    /// starts when it identifies), e.g. %sessions-changed for its own new-session.
     fn notify_clients(&self) -> Vec<(ClientId, Option<SessId>)> {
-        self.clients.values().filter(|c| c.control > 0 && c.attached && !c.ctl.exiting.get() && c.ctl.deferred_exit.borrow().is_none())
+        self.clients.values().filter(|c| c.control > 0 && c.ident.is_some() && !c.ctl.exiting.get() && c.ctl.deferred_exit.borrow().is_none())
             .map(|c| (c.id, c.session.filter(|s| self.sessions.contains_key(s)))).collect()
     }
 
     /// control_notify_write: notifications never go inside a %begin/%end block, so
     /// they wait until the reply of the command that caused them is written.
-    fn control_notify_write(&mut self, cid: ClientId, line: &str) {
+    pub(super) fn control_notify_write(&mut self, cid: ClientId, line: &str) {
         let q = self.ev.ctl_queue.entry(cid).or_default();
         q.push_str(line);
         q.push('\n');
@@ -383,10 +384,13 @@ impl Server {
                     let Some(idx) = in_session(self, *sid, wid) else { continue };
                     let t = Target { sid: *sid, idx: Some(idx), wid: Some(wid), pane: Some(self.windows[&wid].active) };
                     let mut extra = HashMap::new();
-                    // the unzoomed moment of a zoomed window's resize: its old layout
-                    if let Some(Val::Str(layout)) = p.get("_unzoomed_layout") {
+                    // the unzoomed moment of a zoomed window's resize: its layout at the old
+                    // size, in the client's format (new-layouts or not)
+                    if let (Some(Val::Int(sx)), Some(Val::Int(sy))) = (p.get("_unzoomed_sx"), p.get("_unzoomed_sy")) {
+                        let area = crate::layout::Rect { x: 0, y: 0, w: (*sx).max(1) as u16, h: (*sy).max(1) as u16 };
+                        let layout = self.window_layout_at(wid, false, Some(*c), area).unwrap_or_default();
                         let flags = self.expand(t, Some(*c), "#{window_raw_flags}").replace('Z', "");
-                        extra.extend([("window_layout".to_string(), layout.clone()), ("window_visible_layout".to_string(), layout.clone()), ("window_raw_flags".to_string(), flags)]);
+                        extra.extend([("window_layout".to_string(), layout.clone()), ("window_visible_layout".to_string(), layout), ("window_raw_flags".to_string(), flags)]);
                     }
                     let line = self.expand_extra(t, Some(*c), "%layout-change #{window_id} #{window_layout} #{window_visible_layout} #{window_raw_flags}", extra);
                     lines.push((*c, line));

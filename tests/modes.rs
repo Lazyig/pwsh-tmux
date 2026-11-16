@@ -772,3 +772,27 @@ fn mode_tree_right_click_menus_send_keys_to_the_mode() {
     t.mouse(0, col, cancel, true);
     wait_for("cancelled", || ctx.fmt("mm", "#{pane_in_mode}") == "0");
 }
+
+#[cfg(unix)]
+#[test]
+fn mode_editor_runs_in_a_modal_floating_pane() {
+    // spawn_editor: a modal floating pane 9/10 of the window in its middle, gone when
+    // the editor exits
+    let ctx = Ctx::new("editor-modal");
+    let t = start(&ctx, "em");
+    ctx.ok(&["set", "-s", "editor", "sleep 1; printf 'edited\\n' >"]);
+    ctx.ok(&["setb", "-b", "one", "old"]);
+    ctx.ok(&["choose-buffer", "-t", "em", "-F", "x"]);
+    t.wait_screen("buffers", |s| s.contains("(0) one"));
+    let (sx, sy): (u32, u32) = {
+        let s = ctx.fmt("em", "#{window_width} #{window_height}");
+        let (a, b) = s.split_once(' ').unwrap();
+        (a.parse().unwrap(), b.parse().unwrap())
+    };
+    t.send(b"e");
+    let (w, h) = (sx * 9 / 10, sy * 9 / 10);
+    let want = format!("{},{} {w}x{h} 1 1 1", sx / 2 - w / 2, sy / 2 - h / 2);
+    wait_for("editor pane", || ctx.ok(&["list-panes", "-t", "em", "-F", "#{pane_left},#{pane_top} #{pane_width}x#{pane_height} #{pane_modal_flag} #{pane_floating_flag} #{pane_active}"]).lines().any(|l| l == want));
+    wait_for("edited", || ctx.ok(&["show-buffer", "-b", "one"]) == "edited");
+    wait_for("editor pane gone", || ctx.ok(&["list-panes", "-t", "em"]).lines().count() == 1);
+}

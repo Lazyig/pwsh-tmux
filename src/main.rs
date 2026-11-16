@@ -74,8 +74,11 @@ pub mod rawarg {
 fn main() {
     let mut args: Vec<String> = std::env::args_os().skip(1).map(rawarg::from_os).collect();
     if args.first().map(String::as_str) == Some("__server") {
-        let config = args.get(1).cloned();
-        let code = match server::run(config) {
+        // __server [-c CWD] [CONFIG]: CWD is the starting client's directory
+        let mut rest = args[1..].to_vec();
+        let cwd = if rest.first().map(String::as_str) == Some("-c") && rest.len() > 1 { Some(rest.drain(..2).nth(1).unwrap_or_default()) } else { None };
+        let config = rest.first().cloned();
+        let code = match server::run(config, cwd) {
             Ok(()) => 0,
             Err(e) => {
                 server::log(&format!("server failed: {e}"));

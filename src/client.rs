@@ -36,17 +36,15 @@ fn spawn_server(config: Option<&str>) -> std::io::Result<()> {
     });
     let config = config.as_deref();
     let exe = std::env::current_exe()?;
+    // the configuration's spawns start in the client's directory (cfg_client's cwd)
+    let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let make = || {
         let mut c = Command::new(&exe);
-        c.arg("__server");
+        c.arg("__server").arg("-c").arg(&cwd);
         if let Some(f) = config {
             c.arg(f);
         }
         c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).env_remove("PWSH_TMUX").env_remove("PWSH_TMUX_PANE").env_remove(OUTPUT_COPY);
-        // the startup configuration's relative paths resolve against our cwd
-        if let Ok(d) = std::env::current_dir() {
-            c.env(crate::server::CFG_CWD_ENV, d);
-        }
         // Don't pin the client's cwd for the server's lifetime.
         let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
         if let Some(h) = std::env::var_os(home) {
@@ -57,7 +55,7 @@ fn spawn_server(config: Option<&str>) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         let _ = make;
-        win_spawn_detached(&exe, config)
+        win_spawn_detached(&exe, config, &cwd)
     }
     #[cfg(unix)]
     {
@@ -73,18 +71,41 @@ fn spawn_server(config: Option<&str>) -> std::io::Result<()> {
     }
 }
 
+/// One argument quoted for CommandLineToArgvW: backslashes are doubled before a quote
+/// and at the end (a cwd of `C:\\` must not escape the closing quote).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn win_quote(s: &str) -> String {
+    let mut out = String::from("\"");
+    let mut slashes = 0;
+    for ch in s.chars() {
+        match ch {
+            '\\' => {
+                slashes += 1;
+                continue;
+            }
+            '"' => out.push_str(&"\\".repeat(slashes * 2 + 1)),
+            _ => out.push_str(&"\\".repeat(slashes)),
+        }
+        slashes = 0;
+        out.push(ch);
+    }
+    out.push_str(&"\\".repeat(slashes * 2));
+    out.push('"');
+    out
+}
+
 /// Starts the server with CreateProcessW directly: std's Command always enables handle
 /// inheritance, which leaks whatever inheritable handles the client got from its parent
 /// (e.g. sshd's session pipes, keeping `ssh host pwsh-tmux new -d` from ever returning).
 #[cfg(windows)]
-fn win_spawn_detached(exe: &std::path::Path, config: Option<&str>) -> std::io::Result<()> {
+fn win_spawn_detached(exe: &std::path::Path, config: Option<&str>, cwd: &str) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, PROCESS_INFORMATION, STARTUPINFOW,
     };
-    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\\\""));
-    let mut cmdline = format!("{} __server", quote(&exe.to_string_lossy()));
+    let quote = win_quote;
+    let mut cmdline = format!("{} __server -c {}", quote(&exe.to_string_lossy()), quote(cwd));
     if let Some(f) = config {
         cmdline.push(' ');
         cmdline.push_str(&quote(f));
@@ -92,8 +113,7 @@ fn win_spawn_detached(exe: &std::path::Path, config: Option<&str>) -> std::io::R
     let mut cmdline: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
     // environment block without our nesting markers
     let mut env: Vec<u16> = Vec::new();
-    let cwd = std::env::current_dir().ok().map(|d| (std::ffi::OsString::from(crate::server::CFG_CWD_ENV), d.into_os_string()));
-    for (k, v) in std::env::vars_os().filter(|(k, _)| k.to_str() != Some(crate::server::CFG_CWD_ENV)).chain(cwd) {
+    for (k, v) in std::env::vars_os() {
         if k == "PWSH_TMUX" || k == "PWSH_TMUX_PANE" || k == OUTPUT_COPY {
             continue;
         }
@@ -199,6 +219,14 @@ fn prepare_stdin_buffers(args: &mut [String], input: &mut impl Read) -> std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn win_quote_survives_command_line_parsing() {
+        assert_eq!(win_quote(r"C:\Users\a b"), r#""C:\Users\a b""#);
+        assert_eq!(win_quote(r"C:\"), r#""C:\\""#);
+        assert_eq!(win_quote(r#"a\"b"#), r#""a\\\"b""#);
+        assert_eq!(win_quote(""), r#""""#);
+    }
 
     #[test]
     fn native_windows_console_does_not_inherit_dumb_color_capabilities() {

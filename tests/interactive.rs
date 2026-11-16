@@ -135,7 +135,8 @@ fn copy_mode_keys_and_paste() {
     wait_for("left copy mode", || ctx.fmt("c", "#{pane_in_mode}") == "0");
     assert_eq!(ctx.ok(&["show-buffer"]), "alpha");
     // OSC 52 was sent to the outer terminal
-    assert!(t.raw_text().contains("\x1b]52;c;YWxwaGE="));
+    // with an empty selection parameter, as window_copy_copy_buffer sends it
+    assert!(t.raw_text().contains("\x1b]52;;YWxwaGE="));
     // C-b ] pastes it
     t.send(b"\x15echo ");
     t.prefix(b"]");
@@ -171,6 +172,79 @@ fn copy_mode_count_then_rebound_or_unbound_key() {
     assert!(before.ends_with(&ctx.fmt("n", "#{scroll_position}")));
     t.send(b"q");
     wait_for("quit", || ctx.fmt("n", "#{pane_in_mode}") == "0");
+}
+
+#[test]
+fn copy_mode_repeat_count_shows_the_numeric_pane_prompt() {
+    // the digit bindings are command-prompt -NP -p (repeat): the count is drawn on the
+    // pane's last line and given to the next key's command (send-keys -N)
+    let ctx = Ctx::new("copyrepeat");
+    let t = start(&ctx, "r");
+    ctx.ok(&["set", "-g", "mode-keys", "vi"]);
+    t.send(b"clear; seq 1 60\r");
+    wait_for("output", || ctx.capture("r").contains("60"));
+    t.prefix(b"[");
+    wait_for("copy mode", || ctx.fmt("r", "#{pane_in_mode}") == "1");
+    let y: usize = ctx.fmt("r", "#{copy_cursor_y}").parse().unwrap();
+    t.send(b"3");
+    t.wait_screen("(repeat) 3", |s| s.lines().any(|l| l.trim_end() == "(repeat) 3"));
+    t.send(b"2");
+    t.wait_screen("(repeat) 32", |s| s.lines().any(|l| l.trim_end() == "(repeat) 32"));
+    t.send(b"k");
+    t.wait_screen("prompt closed", |s| !s.contains("(repeat)"));
+    wait_for("k moved 32 lines", || ctx.fmt("r", "#{copy_cursor_y} #{scroll_position}") == format!("0 {}", 32 - y));
+    t.send(b"q");
+    wait_for("quit", || ctx.fmt("r", "#{pane_in_mode}") == "0");
+}
+
+#[test]
+fn attach_resizes_only_the_current_window() {
+    // recalculate_size sets WINDOW_RESIZE; the size is applied when the window is the
+    // current window of an attached session (server_client_check_window_resize)
+    let ctx = Ctx::new("attachsize");
+    ctx.ok(&["new-session", "-d", "-s", "z", "-x", "120", "-y", "30"]);
+    ctx.ok(&["new-window", "-d", "-t", "z:1"]);
+    ctx.ok(&["new-window", "-d", "-t", "z:2"]);
+    let t = Term::attach(&ctx, &["attach", "-t", "z"], 70, 15);
+    t.wait_screen("status line", |s| s.contains("[z]"));
+    wait_for("current window resized", || ctx.fmt("z:0", "#{window_width}x#{window_height}") == "70x14");
+    assert_eq!(ctx.ok(&["list-windows", "-t", "z", "-F", "#{window_index} #{window_width}x#{window_height}"]).trim_end(), "0 70x14\n1 120x30\n2 120x30");
+    ctx.ok(&["select-window", "-t", "z:1"]);
+    wait_for("selected window resized", || ctx.fmt("z:1", "#{window_width}x#{window_height}") == "70x14");
+    assert_eq!(ctx.fmt("z:2", "#{window_width}x#{window_height}"), "120x30");
+    drop(t);
+}
+
+#[test]
+fn window_sizes_are_chosen_per_window() {
+    // recalculate_size: each window from the clients whose session has it; with
+    // aggressive-resize only those whose current window it is; latest takes the
+    // window's own latest client (w->latest) and leaves the size when it has none
+    let ctx = Ctx::new("perwinsize");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "120", "-y", "30"]);
+    ctx.ok(&["new-window", "-d", "-t", "s:1"]);
+    ctx.ok(&["new-window", "-d", "-t", "s:2"]);
+    ctx.ok(&["new-session", "-d", "-s", "g", "-t", "s"]);
+    ctx.ok(&["set", "-g", "status", "off"]);
+    let size = |t: &str| ctx.fmt(t, "#{window_width}x#{window_height}");
+    let a = Term::attach(&ctx, &["attach", "-t", "s"], 90, 20);
+    wait_for("s:0 sized for a", || size("s:0") == "90x20");
+    ctx.ok(&["select-window", "-t", "g:2"]);
+    ctx.ok(&["set", "-g", "aggressive-resize", "on"]);
+    let b = Term::attach(&ctx, &["attach", "-t", "g"], 50, 10);
+    wait_for("g:2 sized for b", || size("s:2") == "50x10");
+    assert_eq!(size("s:0"), "90x20");
+    // the option changes recalculate: both clients have window 2 again
+    ctx.ok(&["set", "-g", "window-size", "largest"]);
+    ctx.ok(&["set", "-g", "aggressive-resize", "off"]);
+    wait_for("s:2 largest", || size("s:2") == "90x20");
+    // latest with two clients and no latest client for window 1: it keeps the size it
+    // was given while only a was attached
+    ctx.ok(&["set", "-g", "window-size", "latest"]);
+    ctx.ok(&["select-window", "-t", "s:1"]);
+    wait_for("s:1 shown", || size("s:1") == "90x20");
+    drop(b);
+    drop(a);
 }
 
 #[test]
@@ -1517,4 +1591,55 @@ fn pane_titles_from_osc_0_and_2_keep_windows_backslashes() {
     ctx.ok(&["respawn-pane", "-k", "-t", "tb.1", &set_title(0)]);
     t.wait_screen("title set again by OSC 0", |s| s.matches(want).count() == 2);
     assert_eq!(format!("\"{}\"", ctx.fmt("tb", "#{pane_title}")), want);
+}
+
+#[test]
+fn display_popup_modifies_an_open_popup() {
+    // popup_modify: the title (cleared without -T), border lines and flags change in place
+    let ctx = Ctx::new("popupmod");
+    let t = start(&ctx, "pm");
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    let mut popup = ctx.command().args(["display-popup", "-c", &client, "-T", "first", "-w", "30", "-h", "6", "echo inside; sleep 30"]).spawn().unwrap();
+    t.wait_screen("popup", |s| s.contains("first") && s.contains("inside"));
+    ctx.ok(&["display-popup", "-c", &client, "-T", "second"]);
+    t.wait_screen("retitled", |s| s.contains("─second─") && !s.contains("first"));
+    ctx.ok(&["display-popup", "-c", &client, "-b", "double"]);
+    t.wait_screen("double lines, no title", |s| s.contains("╔════") && !s.contains("second"));
+    ctx.ok(&["display-popup", "-c", &client, "-B", "-T", "x"]);
+    t.wait_screen("no border", |s| !s.contains("╔") && !s.contains("║inside"));
+    ctx.ok(&["display-popup", "-c", &client, "-C"]);
+    t.wait_screen("closed", |s| !s.contains("inside"));
+    let _ = popup.wait();
+    // -EE (POPUP_CLOSEEXITZERO) replaces -E: a failing command leaves the popup open,
+    // and a new -EE popup closes when its command succeeds
+    let mut popup = ctx.command().args(["display-popup", "-c", &client, "-E", "-w", "30", "-h", "6", "echo failing; read x; exit 3"]).spawn().unwrap();
+    t.wait_screen("-E popup", |s| s.contains("failing"));
+    ctx.ok(&["display-popup", "-c", &client, "-EE"]);
+    t.send(b"\r");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(t.contents().contains("failing"), "{}", t.contents());
+    t.send(b"\x1b");
+    t.wait_screen("closed by Escape", |s| !s.contains("failing"));
+    let _ = popup.wait();
+    let mut popup = ctx.command().args(["display-popup", "-c", &client, "-EE", "-w", "30", "-h", "6", "echo zero; read x"]).spawn().unwrap();
+    t.wait_screen("-EE popup", |s| s.contains("zero"));
+    t.send(b"\r");
+    t.wait_screen("closed on status 0", |s| !s.contains("zero"));
+    let _ = popup.wait();
+}
+
+#[cfg(unix)]
+#[test]
+fn synchronize_panes_encodes_the_key_for_each_pane() {
+    // window_pane_copy_key: input_key_pane for each pane, with its own cursor key mode
+    let ctx = Ctx::new("syncenc");
+    let t = start(&ctx, "y");
+    ctx.ok(&["respawn-pane", "-k", "-t", "y", "printf 'ready\\n'; exec cat -v"]);
+    ctx.ok(&["split-window", "-d", "-t", "y", "printf '\\033[?1hready\\n'; exec cat -v"]);
+    wait_for("panes ready", || ctx.capture("y.0").contains("ready") && ctx.capture("y.1").contains("ready"));
+    ctx.ok(&["set", "-w", "-t", "y", "synchronize-panes", "on"]);
+    t.send(b"\x1b[A\r");
+    wait_for("normal cursor keys", || ctx.capture("y.0").contains("^[[A"));
+    wait_for("application cursor keys", || ctx.capture("y.1").contains("^[OA"));
+    assert!(!ctx.capture("y.1").contains("^[[A"));
 }
