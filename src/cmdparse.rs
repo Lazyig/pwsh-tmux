@@ -43,9 +43,10 @@ pub fn parse_with_env_lines(input: &str, cond: &dyn Fn(&str) -> bool, env: &dyn 
     };
     let mut cmds = lx.run(cond)?;
     // bind-key keeps its { } blocks as blocks (list-keys prints them so): they reach
-    // it with a mark in front
+    // it with a mark in front. Any unique abbreviation ("bi", "bind-k", ...) is bind-key.
     for (c, w) in std::mem::take(&mut lx.braces) {
-        if matches!(cmds[c][0].as_str(), "bind-key" | "bind") {
+        let name = cmds[c][0].as_str();
+        if name.len() >= 2 && "bind-key".starts_with(name) {
             cmds[c][w].insert_str(0, BLOCK_MARK);
         }
     }
