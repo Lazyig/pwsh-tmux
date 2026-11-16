@@ -146,6 +146,8 @@ fn leading_number(s: &str) -> &str {
 }
 
 pub struct Monitor {
+    /// Each hook monitor has its own one-second timer, started when it is added.
+    pub created: std::time::Instant,
     pub what: MonitorWhat,
     pub format: String,
     /// -T: only when the format is true.
@@ -1146,6 +1148,7 @@ impl Server {
             _ => self.resolve_pane(ctx, o.get('t')).ok().and_then(|t| t.sid).or_else(|| self.current(ctx).sid),
         };
         self.ev.monitors.insert((level, name), Monitor {
+            created: std::time::Instant::now(),
             what,
             format,
             only_true: o.has('T'),
@@ -1388,16 +1391,10 @@ impl Server {
     /// Checks every set-hook -B monitor (once a second, monitor_timer).
     pub fn check_monitors(&mut self) {
         self.prune_monitors();
-        // monitor_timer: session monitors, single panes and windows, every pane, every
-        // window; by name within each
-        let group = |w: &MonitorWhat| match w {
-            MonitorWhat::Session => 0,
-            MonitorWhat::Pane(_) | MonitorWhat::Window(_) => 1,
-            MonitorWhat::AllPanes => 2,
-            MonitorWhat::AllWindows => 3,
-        };
-        let mut keys: Vec<(u8, (Level, String))> = self.ev.monitors.iter().map(|(k, m)| (group(&m.what), k.clone())).collect();
-        keys.sort_by(|a, b| (a.0, &a.1 .1).cmp(&(b.0, &b.1 .1)));
+        // each hook monitor is its own monitor set with its own timer (hooks_monitor_add):
+        // they are checked in the order they were added
+        let mut keys: Vec<(std::time::Instant, (Level, String))> = self.ev.monitors.iter().map(|(k, m)| (m.created, k.clone())).collect();
+        keys.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1 .1.cmp(&b.1 .1)));
         let keys: Vec<(Level, String)> = keys.into_iter().map(|k| k.1).collect();
         for key in keys {
             let Some(m) = self.ev.monitors.get(&key) else { continue };
