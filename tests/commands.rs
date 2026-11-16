@@ -641,10 +641,11 @@ fn review_regressions() {
     assert_eq!(ctx.fmt("r", "#{window_panes}"), "2");
     // run-shell / if-shell inside a sourced file run (asynchronously) in order
     let conf = std::env::temp_dir().join(format!("pt-rv-{}.conf", std::process::id()));
-    std::fs::write(&conf, "if-shell 'exit 0' 'set -g @rv yes' 'set -g @rv no'\nset -g @after 1\nnot-a-command\nset -g @tail ok\n").unwrap();
-    let (_, out) = ctx.cmd(&["source-file", &conf.to_string_lossy()]);
+    // (a file with an unknown command runs none of its commands: tmux 3.8 parses the
+    // whole file first)
+    std::fs::write(&conf, "if-shell 'exit 0' 'set -g @rv yes' 'set -g @rv no'\nset -g @after 1\nset -g @tail ok\n").unwrap();
+    ctx.ok(&["source-file", &conf.to_string_lossy()]);
     let _ = std::fs::remove_file(&conf);
-    assert!(out.contains("unknown command"), "{out}");
     assert_eq!(ctx.fmt("r", "#{@rv} #{@after} #{@tail}"), "yes 1 ok");
     // load-buffer - reads stdin
     let mut child = ctx.command().args(["load-buffer", "-b", "stdin", "-"]).stdin(std::process::Stdio::piped()).spawn().unwrap();
@@ -1122,7 +1123,8 @@ fn pane_and_target_flags() {
     assert_eq!(ctx.ok(&["select-pane", "-g", "-t", "p:0.0"]), "bg=red\n");
     assert_eq!(ctx.fmt("p", "#{pane_index}"), "0");
     // {current}/{active} need an attached client
-    assert!(ctx.fails(&["display-message", "-p", "-t", "p", "-c", "nope", "x"]).contains("can't find client"));
+    // display-message's -c can fail (CMD_CLIENT_CANFAIL)
+    assert_eq!(ctx.ok(&["display-message", "-p", "-t", "p", "-c", "nope", "x"]), "x\n");
     assert!(ctx.fails(&["select-window", "-t", "{current}"]).contains("no current client"));
     assert!(ctx.fails(&["kill-pane", "-t", "@"]).contains("no current client"));
     assert_eq!(ctx.ok(&["list-commands", "-F", "#{command_list_name}|#{command_list_alias}", "list-keys"]), "list-keys|lsk\n");

@@ -3520,7 +3520,7 @@ impl Server {
             }
             // ---------------------------------------------------------------- options & env
             "set-option" | "set-window-option" => self.cmd_set_option(cmd == "set-window-option", &o, ctx).map(|_| Flow::Next),
-            "show-options" | "show-window-options" => self.cmd_show_options(cmd == "show-window-options", &o, ctx).map(|_| Flow::Next),
+            "show-options" | "show-window-options" => self.cmd_show_options(cmd == "show-window-options", false, &o, ctx).map(|_| Flow::Next),
             "set-environment" => {
                 let name = o.rest.first().ok_or("set-environment needs a name")?.clone();
                 let value = o.rest.get(1).map(|v| if o.has('F') { self.expand(self.current(ctx), ctx.client, v) } else { v.clone() });
@@ -3590,7 +3590,7 @@ impl Server {
             "show-hooks" => {
                 // a named hook (or any option) is shown as show-options shows it
                 if !o.rest.is_empty() {
-                    return self.cmd_show_options(false, &o, ctx).map(|_| Flow::Next);
+                    return self.cmd_show_options(false, true, &o, ctx).map(|_| Flow::Next);
                 }
                 // options_scope_from_flags: -p ignores -g
                 let global = o.has('g') && !o.has('p');
@@ -4336,7 +4336,8 @@ impl Server {
         }
     }
 
-    fn cmd_show_options(&mut self, window_cmd: bool, o: &Opts, ctx: &mut Ctx) -> Result<(), String> {
+    /// show-options, show-window-options and (`hooks_cmd`) show-hooks with a name.
+    fn cmd_show_options(&mut self, window_cmd: bool, hooks_cmd: bool, o: &Opts, ctx: &mut Ctx) -> Result<(), String> {
         let named = match o.rest.first() {
             Some(arg) => match self.option_name(o, ctx, arg)? { Some(n) => Some(n), None => return Ok(()) },
             None => None,
@@ -4362,7 +4363,7 @@ impl Server {
                 let is_string = !is_hook && def.is_none_or(|d| matches!(d.kind, options::Kind::Str | options::Kind::Style)
                     || (d.kind == options::Kind::Array && d.name != "pane-colours"));
                 let b = |v: bool| if v { "1".to_string() } else { "0".to_string() };
-                let vars = HashMap::from([
+                let mut vars = HashMap::from([
                     ("option_name".to_string(), base.to_string()),
                     ("option_value".to_string(), value.unwrap_or("").to_string()),
                     ("option_value_only".to_string(), b(o.has('v'))),
@@ -4375,6 +4376,10 @@ impl Server {
                     ("option_has_array_key".to_string(), b(akey.is_some())),
                     ("option_array_key".to_string(), akey.unwrap_or("").to_string()),
                 ]);
+                // only monitor hooks count their firings
+                if hooks_cmd {
+                    vars.insert("hook_fire_count".to_string(), "0".to_string());
+                }
                 out.push_str(&self.expand_extra(ft, ctx.client, f, vars));
                 out.push('\n');
                 return;
