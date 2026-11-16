@@ -54,6 +54,13 @@ impl BasicFormattedCaptureState {
 pub struct RowContents<'a>(pub(crate) &'a crate::row::Row);
 
 impl RowContents<'_> {
+    /// Sparse cell metadata in column order.
+    pub fn metadata(&self) -> impl Iterator<Item = (u16, &crate::CellMetadata)> { self.0.metadata() }
+    /// Shell prompt/output marks.
+    pub fn flags(&self) -> u8 { self.0.flags() }
+    /// Time this row entered history.
+    pub fn time(&self) -> u64 { self.0.time() }
+
     /// The cell at `col`, or `None` past the stored row width (history rows
     /// may be narrower than the screen).
     #[must_use]

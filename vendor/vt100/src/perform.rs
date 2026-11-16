@@ -201,6 +201,22 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
 
     fn osc_dispatch(&mut self, params: &[&[u8]], bel_terminated: bool) {
         match params {
+            [b"8", options, uri @ ..] if !uri.is_empty() => {
+                let uri = uri.iter().map(|p| alloc::string::String::from_utf8_lossy(p)).collect::<alloc::vec::Vec<_>>().join(";");
+                self.screen.set_hyperlink(&alloc::string::String::from_utf8_lossy(options), &uri);
+            }
+            [b"133", arg, rest @ ..] => {
+                match arg.first() {
+                    Some(b'A' | b'N') => self.screen.mark_cursor_row(crate::ROW_START_PROMPT),
+                    Some(b'P') if !rest.contains(&&b"k=s"[..]) => self.screen.mark_cursor_row(crate::ROW_START_PROMPT),
+                    Some(b'P') => self.screen.mark_cursor_row(crate::ROW_SECOND_PROMPT),
+                    Some(b'B' | b'I') => self.screen.mark_cursor_row(crate::ROW_START_COMMAND),
+                    Some(b'C') => self.screen.mark_cursor_row(crate::ROW_START_OUTPUT),
+                    Some(b'D') => self.screen.mark_cursor_row(crate::ROW_END_OUTPUT),
+                    _ => {}
+                }
+                self.callbacks.unhandled_osc_terminated(&mut self.screen, params, bel_terminated);
+            }
             [b"0", s] => {
                 self.callbacks.set_window_icon_name(&mut self.screen, s);
                 self.callbacks.set_window_title(&mut self.screen, s);

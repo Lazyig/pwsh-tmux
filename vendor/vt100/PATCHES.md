@@ -45,3 +45,12 @@ set with HTS (ESC H) and cleared with TBC (CSI g), which HT now follows (reset t
 every 8 columns when the width changes), and exposes `origin_mode` and
 `scroll_region`. `Grid` counts rows added to and dropped from history and history
 clears/rewraps (`history_counters`); RIS keeps those counts.
+
+Local addition: OSC 133 marks are parsed in vt100, with callbacks still receiving
+OSC 133 for pane events. Rows retain marks and their existing history timestamps.
+OSC 8 links and original HT spans use an optional boxed map on each row; normal
+cells remain 32 bytes, and ordinary rows allocate no metadata. Link strings and
+identities are shared with Arc; named links use a weak lookup table, anonymous
+links do not allocate lookup entries. RowContents exposes metadata to snapshots,
+capture and rendering. Edits invalidate/shift entries and history compaction and
+reflow retain them. Parser regressions are in lib.rs::metadata_tests.

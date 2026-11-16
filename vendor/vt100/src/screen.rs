@@ -117,6 +117,9 @@ pub struct Screen {
     alternate_saved_attrs: crate::attrs::Attrs,
     /// Tab stops when changed by HTS/TBC; None means one every 8 columns.
     tabs: Option<Vec<bool>>,
+    hyperlink: Option<alloc::sync::Arc<crate::Hyperlink>>,
+    hyperlinks: alloc::collections::BTreeMap<(String, String), alloc::sync::Weak<crate::Hyperlink>>,
+
 }
 
 impl Screen {
@@ -153,7 +156,7 @@ impl Screen {
 
             alternate_saved: None,
             alternate_saved_attrs: crate::attrs::Attrs::default(),
-            tabs: None,
+            tabs: None, hyperlink: None, hyperlinks: Default::default(),
         }
     }
 
@@ -194,6 +197,27 @@ impl Screen {
     #[must_use]
     pub fn history_row_time(&self, index: usize) -> u64 {
         self.grid().absolute_row(index).map_or(0, crate::row::Row::time)
+    }
+
+    /// Apply OSC 8, retaining only links referenced by live/history cells.
+    pub fn set_hyperlink(&mut self, params: &str, uri: &str) {
+        let ids: Vec<_> = params.split(':').filter_map(|p| p.strip_prefix("id=")).filter(|s| !s.is_empty()).collect();
+        if ids.len() > 1 { return; }
+        if uri.is_empty() { self.hyperlink = None; return; }
+        if uri.len() > 1024 { self.hyperlink = None; return; }
+        let id = ids.first().copied().unwrap_or("");
+        let key = (id.to_string(), uri.to_string());
+        if !id.is_empty() {
+            if let Some(link) = self.hyperlinks.get(&key).and_then(alloc::sync::Weak::upgrade) {
+                self.hyperlink = Some(link); return;
+            }
+        }
+        if self.hyperlinks.len() >= 5000 { self.hyperlinks.retain(|_, p| p.strong_count() != 0); }
+        static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+        let inner = NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let link = alloc::sync::Arc::new(crate::Hyperlink { inner, id: id.into(), external_id: alloc::format!("tmux{:X}", inner), uri: uri.into() });
+        if !id.is_empty() { self.hyperlinks.insert(key, alloc::sync::Arc::downgrade(&link)); }
+        self.hyperlink = Some(link);
     }
 
     /// Resizes the screen **without calling** the [`on_scroll`] callback.
@@ -1193,7 +1217,7 @@ impl Screen {
         let size = self.grid().size();
         let attrs = self.attrs;
 
-        if base_pos.col > 0 {
+        if base_pos.col > 0 && self.grid().drawing_cell(crate::grid::Pos { row: base_pos.row, col: base_pos.col - 1 }).is_some_and(crate::Cell::is_wide) {
             let prev_cell = self
                 .grid_mut()
                 .drawing_cell_mut(crate::grid::Pos {
@@ -1343,8 +1367,8 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                 col: pos.col - 1,
             };
             if screen
-                .grid_mut()
-                .drawing_cell_mut(base_pos)
+                .grid()
+                .drawing_cell(base_pos)
                 .unwrap()
                 .is_wide_continuation()
             {
@@ -1391,6 +1415,10 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
             screen.grid().drawing_cell(base_pos).unwrap().is_wide();
 
         screen.text_cleanup(base_pos, cell_was_wide, cell_is_wide);
+        let hyperlink = screen.hyperlink.clone();
+        if hyperlink.is_some() {
+            screen.grid_mut().drawing_row_mut(base_pos.row).unwrap().set_metadata(base_pos.col, crate::CellMetadata { hyperlink, tab_width: 0 });
+        }
     }
 
     // control codes
@@ -1400,14 +1428,20 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
     }
 
     pub fn tab(&mut self) {
-        let Some(tabs) = &self.screen.tabs else {
-            self.screen.grid_mut().col_tab();
-            return;
-        };
         let col = self.screen.grid().pos().col;
         let last = self.screen.grid().size().cols() - 1;
-        let next = (col + 1..last).find(|&i| tabs.get(usize::from(i)).copied().unwrap_or(false)).unwrap_or(last);
-        self.screen.grid_mut().col_set(next.max(col));
+        if col >= last { return; }
+        let next = (col + 1..=last).find(|&i| self.screen.tabs.as_ref().map_or(i % 8 == 0, |t| t.get(usize::from(i)).copied().unwrap_or(false))).unwrap_or(last);
+        let hyperlink = self.screen.hyperlink.clone();
+        let row = self.screen.grid_mut().current_row_mut();
+        let first = row.get(col).unwrap().clone();
+        let blank = |c: &crate::Cell| !c.has_contents() || c.contents() == " ";
+        if next - col <= 32 && blank(&first) && (col..next).all(|x| row.get(x).is_some_and(|c| blank(c) && c.attrs() == first.attrs())) {
+            for x in col..next { row.get_mut(x).unwrap().set(' ', *first.attrs()); }
+            row.set_metadata(col, crate::CellMetadata { tab_width: next - col, hyperlink });
+        }
+        self.screen.grid_mut().col_set(next);
+
     }
 
     // ESC H

@@ -10,12 +10,23 @@ pub struct Row {
     time: u64,
     /// ROW_START_PROMPT / ROW_START_OUTPUT (tmux's GRID_LINE_START_* flags).
     flags: u8,
+    metadata: Option<alloc::boxed::Box<alloc::collections::BTreeMap<u16, crate::CellMetadata>>>,
 }
 
 /// The line has the start of a shell prompt (OSC 133;A, N or P).
 pub const ROW_START_PROMPT: u8 = 1;
 /// The line has the start of command output (OSC 133;C).
 pub const ROW_START_OUTPUT: u8 = 2;
+/// A line has contained hyperlink cells (sticky until the line is cleared).
+pub const ROW_HYPERLINK: u8 = 4;
+/// A line has contained extended metadata cells.
+pub const ROW_EXTENDED: u8 = 8;
+/// OSC 133 B/I command start.
+pub const ROW_START_COMMAND: u8 = 16;
+/// OSC 133 D output end.
+pub const ROW_END_OUTPUT: u8 = 32;
+/// OSC 133 P;k=s continuation prompt.
+pub const ROW_SECOND_PROMPT: u8 = 64;
 
 impl Row {
     pub fn new(cols: u16) -> Self {
@@ -24,6 +35,7 @@ impl Row {
             wrapped: false,
             time: 0,
             flags: 0,
+            metadata: None,
         }
     }
 
@@ -38,7 +50,7 @@ impl Row {
     /// Whether a cell needs more than tmux's compact cell entry (multi-byte or
     /// wide characters, RGB colours: GRID_LINE_EXTENDED).
     pub fn extended(&self) -> bool {
-        self.cells().any(|c| {
+        self.flags & ROW_EXTENDED != 0 || self.metadata.as_ref().is_some_and(|m| m.values().any(|c| c.tab_width != 0 || c.hyperlink.is_some())) || self.cells().any(|c| {
             c.contents().len() > 1
                 || c.is_wide()
                 || matches!(c.fgcolor(), crate::Color::Rgb(..))
@@ -72,6 +84,7 @@ impl Row {
         }
         self.wrapped = false;
         self.flags = 0;
+        self.metadata = None;
     }
 
     pub fn reset(&mut self) {
@@ -79,6 +92,7 @@ impl Row {
         self.wrapped = false;
         self.time = 0;
         self.flags = 0;
+        self.metadata = None;
     }
 
     fn cells(&self) -> impl Iterator<Item = &crate::Cell> {
@@ -89,7 +103,33 @@ impl Row {
         self.cells.get(usize::from(col))
     }
 
+    pub fn metadata(&self) -> impl Iterator<Item = (u16, &crate::CellMetadata)> {
+        self.metadata.iter().flat_map(|m| m.iter().map(|(&x, m)| (x, m)))
+    }
+
+    pub fn set_metadata(&mut self, col: u16, value: crate::CellMetadata) {
+        if value != crate::CellMetadata::default() {
+            self.flags |= ROW_EXTENDED;
+            if value.hyperlink.is_some() { self.flags |= ROW_HYPERLINK; }
+            self.metadata.get_or_insert_with(Default::default).insert(col, value);
+        }
+    }
+
+    fn invalidate(&mut self, col: u16) {
+        if let Some(m) = &mut self.metadata {
+            m.retain(|&x, v| {
+                if x <= col && col < x.saturating_add(v.tab_width) { v.tab_width = 0; }
+                if x == col { v.hyperlink = None; }
+                *v != crate::CellMetadata::default()
+            });
+            if m.is_empty() { self.metadata = None; }
+        }
+    }
+
+    pub fn get_mut_untracked(&mut self, col: u16) -> Option<&mut crate::Cell> { self.cells.get_mut(usize::from(col)) }
+
     pub fn get_mut(&mut self, col: u16) -> Option<&mut crate::Cell> {
+        self.invalidate(col);
         self.cells.get_mut(usize::from(col))
     }
 
@@ -112,6 +152,13 @@ impl Row {
             self.get_mut(i).unwrap().set_wide_continuation(false);
         }
 
+        if let Some(m) = self.metadata.take() {
+            for (x, mut v) in *m {
+                if x < i && x.saturating_add(v.tab_width) > i { v.tab_width = 0; }
+                let x = if x >= i { x.saturating_add(count as u16) } else { x };
+                if x < self.cols() { self.set_metadata(x, v); }
+            }
+        }
         // only the stored cells (and the empty ones they move over) shift
         let stored = self.cells.stored_len();
         if usize::from(i) < stored {
@@ -141,6 +188,14 @@ impl Row {
             self.clear_wide(last);
         }
 
+        if let Some(m) = self.metadata.take() {
+            for (x, mut v) in *m {
+                if x < range.start && x.saturating_add(v.tab_width) > range.start { v.tab_width = 0; }
+                if range.contains(&x) { continue; }
+                let x = if x >= range.end { x - (range.end - range.start) } else { x };
+                self.set_metadata(x, v);
+            }
+        }
         let count = usize::from(range.end - range.start);
         let stored = self.cells.stored_len();
         if usize::from(range.start) < stored {
@@ -152,6 +207,7 @@ impl Row {
     }
 
     pub fn erase(&mut self, i: u16, attrs: crate::attrs::Attrs) {
+        self.invalidate(i);
         let wide = self.cells[usize::from(i)].is_wide();
         self.clear_wide(i);
         self.cells[usize::from(i)].clear(attrs);
@@ -165,6 +221,7 @@ impl Row {
     }
 
     pub fn truncate(&mut self, len: u16) {
+        if let Some(m) = &mut self.metadata { m.retain(|&x, v| { if x.saturating_add(v.tab_width) > len { v.tab_width = 0; } x < len }); }
         self.cells.truncate(usize::from(len));
         self.set_truncated();
     }
@@ -232,6 +289,9 @@ impl Row {
 
     pub fn clear_wide(&mut self, col: u16) {
         let col_idx = usize::from(col);
+        let cell = &self.cells[col_idx];
+        let other_col = if cell.is_wide() { col.saturating_add(1) } else if cell.is_wide_continuation() { col.saturating_sub(1) } else { return };
+        self.invalidate(other_col);
         let cell = &self.cells[col_idx];
         let other = if cell.is_wide() {
             let next = col_idx + 1;

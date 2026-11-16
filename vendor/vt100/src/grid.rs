@@ -223,9 +223,10 @@ impl Grid {
                 if index == saved_row && self.saved_pos.col >= x && self.saved_pos.col < x + width { saved = (produced,col); }
                 // A two-column glyph cannot fit in a one-column terminal.
                 if width <= size.cols() {
-                    *row.get_mut(col).unwrap() = cell.clone();
+                    *row.get_mut_untracked(col).unwrap() = cell.clone();
+                    if let Some((_, metadata)) = old.metadata().find(|(at, _)| *at == x) { row.set_metadata(col, metadata.clone()); }
                     if width == 2 {
-                        if let Some(next) = old.get(x+1) { *row.get_mut(col+1).unwrap() = next.clone(); }
+                        if let Some(next) = old.get(x+1) { *row.get_mut_untracked(col+1).unwrap() = next.clone(); }
                     }
                     col += width;
                 }
@@ -753,7 +754,7 @@ impl Grid {
     pub fn erase_row(&mut self, attrs: crate::attrs::Attrs) {
         // screen_write_clearline: the line's OSC 133 marks survive
         let row = self.current_row_mut();
-        let flags = row.flags();
+        let flags = row.flags() & !(crate::ROW_HYPERLINK | crate::ROW_EXTENDED);
         row.clear(attrs);
         row.set_flags(flags);
     }
@@ -1015,12 +1016,6 @@ impl Grid {
 
     pub fn col_dec(&mut self, count: u16) {
         self.pos.col = self.pos.col.saturating_sub(count);
-    }
-
-    pub fn col_tab(&mut self) {
-        self.pos.col -= self.pos.col % 8;
-        self.pos.col = self.pos.col.saturating_add(8);
-        self.col_clamp();
     }
 
     pub fn col_set(&mut self, i: u16) {

@@ -65,8 +65,75 @@ mod term;
 pub use attrs::Color;
 pub use callbacks::Callbacks;
 pub use cell::Cell;
-pub use row::{ROW_START_OUTPUT, ROW_START_PROMPT};
+pub use row::{ROW_START_OUTPUT, ROW_START_PROMPT, ROW_HYPERLINK, ROW_EXTENDED, ROW_START_COMMAND, ROW_END_OUTPUT, ROW_SECOND_PROMPT};
 pub use parser::Parser;
 pub use screen::{
     CursorStyle, MouseProtocolEncoding, MouseProtocolMode, Screen,
 };
+
+/// One OSC 8 link, shared by its cells without increasing the cell size.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hyperlink {
+    /// Unique internal identity (anonymous links are distinct).
+    pub inner: u64,
+    /// Application supplied OSC 8 identifier.
+    pub id: alloc::string::String,
+    /// Identifier emitted to a client terminal.
+    pub external_id: alloc::string::String,
+    /// Link destination.
+    pub uri: alloc::string::String,
+}
+
+/// Sparse metadata for a cell. Ordinary cells have no entry.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CellMetadata {
+    /// OSC 8 link attached to this cell.
+    pub hyperlink: Option<alloc::sync::Arc<Hyperlink>>,
+    /// Number of columns occupied by an original horizontal tab, or zero.
+    pub tab_width: u16,
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use core::num::NonZeroU16;
+    fn parser(rows: u16, cols: u16) -> Parser {
+        Parser::new(NonZeroU16::new(rows).unwrap(), NonZeroU16::new(cols).unwrap(), 100)
+    }
+    #[test]
+    fn osc_marks_links_tabs_and_history() {
+        let mut p = parser(3, 20);
+        p.screen_mut().set_time(123);
+        p.process(b"\x1b]133;A\x07prompt\r\n\x1b]133;C\x07a\tb\r\n\x1b]8;id=x;https://example.org\x07link\x1b]8;;\x07\r\nend");
+        let s = p.screen();
+        assert_eq!(s.history_row_flags(0).0 & ROW_START_PROMPT, ROW_START_PROMPT);
+        assert_eq!(s.history_row_time(0), 123);
+        assert_eq!(s.history_row_flags(1).0 & ROW_START_OUTPUT, ROW_START_OUTPUT);
+        let row = s.history_row(1).unwrap();
+        assert_eq!(row.metadata().find(|(x,_)| *x == 1).unwrap().1.tab_width, 7);
+        let row = s.history_row(2).unwrap();
+        let meta: alloc::vec::Vec<_> = row.metadata().collect();
+        assert_eq!(meta.len(), 4);
+        assert_eq!(meta[0].1.hyperlink.as_ref().unwrap().uri, "https://example.org");
+        assert_eq!(meta[0].1.hyperlink.as_ref().unwrap().inner, meta[3].1.hyperlink.as_ref().unwrap().inner);
+        assert_eq!(core::mem::size_of::<Cell>(), 32);
+    }
+    #[test]
+    fn metadata_edits_reflow_and_anonymous_identity() {
+        let mut p = parser(4, 16);
+        p.process(b"\x1b]8;;https://a\x07ab\x1b]8;;\x07\x1b]8;;https://a\x07cd\x1b]8;;\x07\r\na\tb");
+        let ids: alloc::vec::Vec<_> = p.screen().history_row(0).unwrap().metadata().map(|(_,m)| m.hyperlink.as_ref().unwrap().inner).collect();
+        assert_eq!(ids[0], ids[1]); assert_ne!(ids[1], ids[2]);
+        p.process(b"\x1b[1;2H\x1b[@");
+        assert_eq!(p.screen().history_row(0).unwrap().metadata().map(|(x,_)| x).collect::<alloc::vec::Vec<_>>(), [0,2,3,4]);
+        p.process(b"\x1b[1;3H\x1b[P");
+        assert_eq!(p.screen().history_row(0).unwrap().metadata().map(|(x,_)| x).collect::<alloc::vec::Vec<_>>(), [0,2,3]);
+        p.process(b"\x1b[2;4HX");
+        assert!(p.screen().history_row(1).unwrap().metadata().all(|(_,m)| m.tab_width == 0));
+        p.set_size(NonZeroU16::new(4).unwrap(), NonZeroU16::new(3).unwrap());
+        assert_eq!(p.screen().history_row(0).unwrap().metadata().count(), 2);
+        assert_eq!(p.screen().history_row(1).unwrap().metadata().count(), 1);
+        p.process(b"\x1b[2J");
+        for y in p.screen().scrollback_len()..p.screen().history_rows_len() { assert_eq!(p.screen().history_row(y).unwrap().metadata().count(), 0); }
+    }
+}
