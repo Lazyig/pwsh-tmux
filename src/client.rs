@@ -297,6 +297,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
         let frame = read_frame(&mut &*stream);
         match frame {
             Ok((S_OUTPUT, p)) => {
+                term::note_focus_mode(&p);
                 let _ = out.write_all(&p);
                 let _ = out.flush();
                 if let Some(f) = output_copy.as_mut() {
