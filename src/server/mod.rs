@@ -1971,6 +1971,10 @@ impl Server {
             C_IDENTIFY => {
                 let a = decode_args(&payload);
                 let get = |i: usize| a.get(i).cloned().unwrap_or_default();
+                let env: Vec<(String, String)> = a.iter().skip(10).filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect();
+                // a pane of this server only (cmd_find_try_TMUX: the pid in $TMUX is ours;
+                // server_client_check_nested): a client in another server's pane is not nested
+                let ours = env.iter().find(|(k, _)| k == "PWSH_TMUX").and_then(|(_, v)| v.rsplit(',').nth(1)?.parse::<u32>().ok()) == Some(std::process::id());
                 let ident = Identity {
                     cols: get(0).parse::<u16>().unwrap_or(80).min(MAX_SIZE),
                     rows: get(1).parse::<u16>().unwrap_or(24).min(MAX_SIZE),
@@ -1978,9 +1982,9 @@ impl Server {
                     cwd: get(3),
                     term: get(4),
                     pid: get(5).parse().unwrap_or(0),
-                    ctx_pane: get(6).strip_prefix('%').and_then(|s| s.parse().ok()),
+                    ctx_pane: get(6).strip_prefix('%').and_then(|s| s.parse().ok()).filter(|_| ours),
                     utf8: get(9) != "0",
-                    env: a.iter().skip(10).filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect(),
+                    env,
                 };
                 let control = get(7).parse().unwrap_or(0);
                 let colorterm = ident.env.iter().find(|(k, _)| k == "COLORTERM").map(|(_, v)| v.as_str()).unwrap_or("");
