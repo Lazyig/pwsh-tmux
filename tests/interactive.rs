@@ -1522,3 +1522,19 @@ fn display_popup_modifies_an_open_popup() {
     t.wait_screen("closed", |s| !s.contains("inside"));
     let _ = popup.wait();
 }
+
+#[cfg(unix)]
+#[test]
+fn synchronize_panes_encodes_the_key_for_each_pane() {
+    // window_pane_copy_key: input_key_pane for each pane, with its own cursor key mode
+    let ctx = Ctx::new("syncenc");
+    let t = start(&ctx, "y");
+    ctx.ok(&["respawn-pane", "-k", "-t", "y", "printf 'ready\\n'; exec cat -v"]);
+    ctx.ok(&["split-window", "-d", "-t", "y", "printf '\\033[?1hready\\n'; exec cat -v"]);
+    wait_for("panes ready", || ctx.capture("y.0").contains("ready") && ctx.capture("y.1").contains("ready"));
+    ctx.ok(&["set", "-w", "-t", "y", "synchronize-panes", "on"]);
+    t.send(b"\x1b[A\r");
+    wait_for("normal cursor keys", || ctx.capture("y.0").contains("^[[A"));
+    wait_for("application cursor keys", || ctx.capture("y.1").contains("^[OA"));
+    assert!(!ctx.capture("y.1").contains("^[[A"));
+}

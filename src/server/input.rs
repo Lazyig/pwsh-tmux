@@ -462,19 +462,25 @@ impl Server {
             return;
         }
         if self.panes.get(&pane).is_none_or(|p| p.options.get("@input-disabled") == Some("on")) { return; }
-        let Some(bytes) = self.encode_pane_key(pane, k, raw) else { return };
-        let wid = self.window_of(pane);
-        if wid.is_some_and(|w| self.opt_window_on(Some(w), "synchronize-panes")) {
-            let panes = self.windows[&wid.unwrap()].panes();
-            for q in panes {
-                if let Some(pp) = self.panes.get(&q) {
-                    if pp.mode.is_none() && pp.options.get("@input-disabled") != Some("on") {
-                        pp.send(bytes.clone());
-                    }
-                }
-            }
-        } else if let Some(p) = self.panes.get(&pane) {
+        let Some(bytes) = self.encode_pane_key(pane, k, raw.clone()) else { return };
+        if let Some(p) = self.panes.get(&pane) {
             p.send(bytes);
+        }
+        // window_pane_copy_key: with synchronize-panes the key goes to the window's other
+        // visible panes that have it on and are not in a mode, encoded for each of them
+        // (input_key_pane: its own cursor, keypad and extended key modes)
+        let Some(wid) = self.window_of(pane) else { return };
+        if self.opt_pane(pane, "synchronize-panes") != "on" {
+            return;
+        }
+        for q in self.windows[&wid].panes() {
+            let ok = q != pane
+                && self.panes.get(&q).is_some_and(|pp| pp.mode.is_none() && pp.dead.is_none() && pp.options.get("@input-disabled") != Some("on"))
+                && self.pane_visible(wid, q)
+                && self.opt_pane(q, "synchronize-panes") == "on";
+            if let Some(bytes) = ok.then(|| self.encode_pane_key(q, k, raw.clone())).flatten() {
+                self.panes[&q].send(bytes);
+            }
         }
     }
 
