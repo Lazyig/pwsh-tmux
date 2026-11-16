@@ -494,7 +494,7 @@ impl Tree {
             match order {
                 Sort::Index => a.id.cmp(&b.id),
                 Sort::Creation => (a.created, a.id).cmp(&(b.created, b.id)),
-                Sort::Activity => b.activity_us.cmp(&a.activity_us),
+                Sort::Activity => b.activity_seq.cmp(&a.activity_seq),
                 Sort::Name => a.name.cmp(&b.name),
                 _ => std::cmp::Ordering::Equal,
             }

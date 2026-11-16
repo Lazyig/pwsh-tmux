@@ -749,10 +749,9 @@ pub struct Session {
     pub env: BTreeMap<String, Option<String>>,
     pub created: u64,
     pub activity: u64,
-    /// activity_seq() at the last activity update.
+    /// activity_seq() at the last activity update: the activity order (tmux compares
+    /// activity timevals).
     pub activity_seq: u64,
-    /// activity_time to the microsecond (sort orders).
-    pub activity_us: u64,
     pub last_attached: u64,
     pub alerts: BTreeMap<u32, u8>,
     /// Session group (new-session -t): members share one window list.
@@ -1897,7 +1896,6 @@ impl Server {
                 if let Some(s) = self.clients.get(&cid).filter(|c| c.attached).and_then(|c| c.session).and_then(|s| self.sessions.get_mut(&s)) {
                     s.activity = now_secs();
                     s.activity_seq = activity_seq();
-                    s.activity_us = now_us();
                 }
                 self.handle_input(cid, &payload);
                 // a focus-out report does not make the client the latest
@@ -2992,7 +2990,6 @@ impl Server {
             s.last_attached = now;
             s.activity = now;
             s.activity_seq = activity_seq();
-            s.activity_us = now_us();
             if writable && update_env {
                 s.env.extend(cmds::environ_update(&names, &env));
             }
