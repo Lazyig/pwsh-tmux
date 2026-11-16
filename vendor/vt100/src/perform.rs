@@ -5,13 +5,9 @@ const BASE64: &[u8] =
 
 impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
     fn print(&mut self, c: char) {
-        // tmux shows a byte that is not valid UTF-8, or a character it cannot measure such
-        // as a C1 control, as U+FFFD (input_stop_utf8)
-        if ('\u{80}'..'\u{a0}').contains(&c) {
-            self.text('\u{fffd}');
-        } else {
-            self.text(c);
-        }
+        // a C1 control sent as UTF-8 is a character tmux keeps (utf8_width gives it no
+        // width, so it joins the cell before); lone C1 bytes come through execute()
+        self.text(c);
     }
 
     fn execute(&mut self, b: u8) {

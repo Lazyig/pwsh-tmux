@@ -157,15 +157,98 @@ pub(super) fn spawn_command(o: &Opts, input: bool) -> Result<Vec<String>, String
 /// exists, its flags parse and the argument count fits (args_parse).
 pub fn check_command(argv: &[String]) -> Result<(), String> {
     let Some((name, rest)) = argv.split_first() else { return Ok(()) };
-    if !name.starts_with('-') && name.contains('=') && rest.is_empty() {
-        return Ok(());
-    }
     let full = canonical(name).ok_or_else(|| format!("unknown command: {name}"))?;
     let mut args = rest.to_vec();
     if ENV_COMMANDS.contains(&full) {
         take_env(&mut args);
     }
     parse_args(full, &args).map(|_| ())
+}
+
+/// The commands of a parse once built ([`Server::build_commands`]).
+#[derive(Default)]
+pub(crate) struct Built {
+    pub cmds: Vec<Vec<String>>,
+    /// The line of each command (0 for the assignments in front).
+    pub lines: Vec<usize>,
+    /// source-file -v: each group of commands as cmd_parse_print_commands prints it.
+    pub verbose: Vec<String>,
+}
+
+struct BuildState<'a> {
+    aliases: &'a [String],
+    file: Option<&'a str>,
+    one_group: bool,
+    /// pi->line: the line of the command being built (nested ones change it).
+    line: usize,
+    verbose: Vec<String>,
+}
+
+impl BuildState<'_> {
+    /// cmd_parse_get_error
+    fn error(&self, e: String) -> String {
+        match self.file {
+            Some(f) => format!("{f}:{}: {e}", self.line),
+            None => e,
+        }
+    }
+
+    fn print_group(&mut self, group: &str) {
+        self.verbose.push(match self.file {
+            Some(f) => format!("{f}:{}: {group}", self.line),
+            None => format!("{}: {group}", self.line),
+        });
+    }
+}
+
+/// A command's words with its { } blocks built: their text is their printed commands.
+fn build_words(c: &cmdparse::Cmd, st: &mut BuildState) -> Result<Vec<(String, bool)>, String> {
+    let mut words = Vec::new();
+    for a in &c.args {
+        words.push(match a {
+            cmdparse::Arg::Str(s) => (s.clone(), false),
+            cmdparse::Arg::Block(b) => {
+                let (_, text) = build_list(b, st, &mut |c, st| {
+                    let words = build_words(c, st)?;
+                    let printed = print_built_command(words, st.aliases, true).map_err(|e| st.error(e))?;
+                    Ok(((), printed.join(" ; ")))
+                })?;
+                (text, true)
+            }
+        });
+    }
+    Ok(words)
+}
+
+/// cmd_parse_build_commands over a list: each command is built by `one`, which gives
+/// its result and printed form. Commands on different lines of a file are different
+/// groups (printed with " ;; " between them as cmd_list_print does).
+fn build_list<T>(cmds: &[cmdparse::Cmd], st: &mut BuildState, one: &mut dyn FnMut(&cmdparse::Cmd, &mut BuildState) -> Result<(T, String), String>) -> Result<(Vec<T>, String), String> {
+    let mut items = Vec::new();
+    let (mut text, mut group) = (String::new(), String::new());
+    let mut line = None;
+    for c in cmds {
+        if line.is_some() {
+            if !st.one_group && line != Some(c.line) {
+                st.print_group(&group);
+                group.clear();
+                text.push_str(" ;; ");
+            } else {
+                text.push_str(" ; ");
+                group.push_str(" ; ");
+            }
+        }
+        line = Some(c.line);
+        st.line = c.line;
+        let (item, printed) = one(c, st)?;
+        text.push_str(&printed);
+        group.push_str(&printed);
+        items.push(item);
+    }
+    if line.is_some() {
+        st.print_group(&group);
+    }
+    Ok((items, text))
 }
 
 /// Commands whose `-e VAR=value` flags are taken out before args_parse.
@@ -176,7 +259,7 @@ const ENV_COMMANDS: &[&str] = &["new-session", "new-window", "split-window", "ne
 fn parse_args(full: &str, args: &[String]) -> Result<Opts, String> {
     let spec = COMMANDS.iter().find(|c| c.0 == full).unwrap();
     let optional = if matches!(full, "move-pane" | "resize-pane") { "DLRU" } else { "" };
-    let o = getopt_optional(args, spec.2, spec.3, optional).map_err(|e| format!("command {full}: {e}"))?;
+    let o = getopt_optional(args, spec.2, spec.3, optional).map_err(|e| if e == crate::opts::USAGE_ERROR { usage_error(full) } else { format!("command {full}: {e}") })?;
     if let Some(&(_, min, max)) = ARG_COUNTS.iter().find(|a| a.0 == full) {
         if (o.rest.len() as i32) < min {
             return err(format!("command {full}: too few arguments (need at least {min})"));
@@ -194,10 +277,7 @@ fn parse_args(full: &str, args: &[String]) -> Result<Opts, String> {
 /// args_print does, { } blocks kept as command lists, commands joined by " ; ".
 pub(super) fn command_list_string(v: &str, aliases: &[String]) -> Result<String, String> {
     // errors of a string parse have no file:line prefix
-    let cmds = cmdparse::parse_blocks(v).map_err(|e| match e.split_once(": ") {
-        Some((l, rest)) if l.starts_with("line ") => rest.to_string(),
-        _ => e,
-    })?;
+    let cmds = cmdparse::parse_blocks(v)?;
     let mut out = Vec::new();
     for c in cmds {
         out.extend(print_parsed_command(c, aliases, true)?);
@@ -255,31 +335,41 @@ fn takes_commands(cmd: &str, idx: usize, flags: &[char]) -> bool {
 }
 
 fn print_parsed_command(words: Vec<(String, bool)>, aliases: &[String], expand: bool) -> Result<Vec<String>, String> {
+    // blocks are built before the command itself
+    let words = build_block_words(words, aliases, expand)?;
+    print_built_command(words, aliases, expand)
+}
+
+/// The { } block arguments of a command (given as text) printed as their commands.
+fn build_block_words(words: Vec<(String, bool)>, aliases: &[String], expand: bool) -> Result<Vec<(String, bool)>, String> {
+    words.into_iter().enumerate().map(|(i, (a, brace))| {
+        if !brace || i == 0 { return Ok((a, brace)); }
+        let mut inner = Vec::new();
+        for c in cmdparse::parse_blocks(&a)? {
+            inner.extend(print_parsed_command(c, aliases, expand)?);
+        }
+        Ok((inner.join(" ; "), true))
+    }).collect()
+}
+
+/// cmd_parse_build_command and cmd_print for a command whose { } blocks are already
+/// built (their text is their printed commands): the alias expanded, the command
+/// found, its flags and arguments checked (args_parse) and printed as args_print does.
+fn print_built_command(words: Vec<(String, bool)>, aliases: &[String], expand: bool) -> Result<Vec<String>, String> {
     let Some((name, brace)) = words.first().cloned() else { return Ok(vec![]) };
     if brace { return err("syntax error"); }
     // cmd_parse_expand_alias: the alias's last command takes the arguments
     if expand && let Some(alias) = aliases.iter().find_map(|a| a.split_once('=').filter(|(n, _)| *n == name).map(|(_, v)| v)) {
-        let mut cmds = cmdparse::parse_blocks(alias)?;
+        let mut cmds = cmdparse::parse_blocks(alias)?.into_iter().map(|c| build_block_words(c, aliases, false)).collect::<Result<Vec<_>, _>>()?;
         let Some(last) = cmds.last_mut() else { return Ok(vec![]) };
         last.extend(words.into_iter().skip(1));
         let mut out = Vec::new();
         for c in cmds {
-            out.extend(print_parsed_command(c, aliases, false)?);
+            out.extend(print_built_command(c, aliases, false)?);
         }
         return Ok(out);
     }
-    // blocks are built before the command itself
-    let mut args = Vec::new();
-    for (a, brace) in words.into_iter().skip(1) {
-        let a = if brace {
-            let mut inner = Vec::new();
-            for c in cmdparse::parse_blocks(&a)? {
-                inner.extend(print_parsed_command(c, aliases, expand)?);
-            }
-            format!("{{ {} }}", inner.join(" ; "))
-        } else { a };
-        args.push((a, brace));
-    }
+    let args: Vec<(String, bool)> = words.into_iter().skip(1).map(|(a, brace)| if brace { (format!("{{ {a} }}"), true) } else { (a, false) }).collect();
     let full = canonical(&name).ok_or_else(|| {
         let m: Vec<&str> = COMMANDS.iter().map(|c| c.0).filter(|c| c.starts_with(name.as_str())).collect();
         if m.len() > 1 { format!("ambiguous command: {name}, could be: {}", m.join(", ")) } else { format!("unknown command: {name}") }
@@ -294,6 +384,12 @@ fn print_parsed_command(words: Vec<(String, bool)>, aliases: &[String], expand: 
         if a == "--" { break; }
         let chars: Vec<char> = a[1..].chars().collect();
         for (j, &c) in chars.iter().enumerate() {
+            if c == '?' {
+                return Err(usage_error(full));
+            }
+            if !c.is_ascii_alphanumeric() {
+                return Err(fail(format!("invalid flag -{}", crate::opts::flag_byte(c))));
+            }
             if optional_value_flag(full, c) {
                 // args_parse_flag_argument: the next word is the value unless it looks like a flag
                 let inline: String = chars[j + 1..].iter().collect();
@@ -358,6 +454,14 @@ fn print_parsed_command(words: Vec<(String, bool)>, aliases: &[String], expand: 
         }
     }
     Ok(vec![out.join(" ")])
+}
+
+/// cmd_parse's error when args_parse gives no cause (-?): the command's usage.
+fn usage_error(full: &str) -> String {
+    match USAGE.iter().find(|(n, _)| *n == full) {
+        Some((_, u)) if !u.is_empty() => format!("usage: {full} {u}"),
+        _ => format!("usage: {full} "),
+    }
 }
 
 fn err<T>(s: impl Into<String>) -> Result<T, String> {
@@ -1077,7 +1181,6 @@ impl Server {
     #[allow(clippy::too_many_arguments)]
     pub fn create_session(&mut self, ctx: &Ctx, name: Option<String>, cols: u16, rows: u16, cwd: Option<String>, win_name: Option<String>, cmd: &[String], env: &[(String, String)]) -> Result<SessId, String> {
         let name = match name {
-            Some(n) if n.is_empty() || n.contains([':', '.']) => return err(format!("invalid session: {n}")),
             Some(n) if self.sessions.values().any(|s| s.name == n) => return err(format!("duplicate session: {n}")),
             Some(n) => n,
             // session_create: an unnamed session is named by its id (the next free one)
@@ -1089,11 +1192,13 @@ impl Server {
         };
         let sid = self.new_session_id();
         let now = now_secs();
-        let cwd = cwd
-            .filter(|d| !d.is_empty())
-            .or_else(|| ctx.client.and_then(|c| self.clients.get(&c)).and_then(|c| c.ident.as_ref()).map(|i| i.cwd.clone()))
-            .or_else(procinfo::home_dir)
-            .unwrap_or_default();
+        // -c relative to server_client_get_cwd (spawn_pane), else that directory
+        let base = self.client_cwd(ctx, None);
+        let cwd = match cwd.filter(|d| !d.is_empty()) {
+            Some(d) if std::path::Path::new(&d).is_relative() && !d.starts_with('~') => std::path::Path::new(&base).join(d).to_string_lossy().into_owned(),
+            Some(d) => d,
+            None => base,
+        };
         let mut senv = BTreeMap::new();
         if let Some(ident) = ctx.client.and_then(|c| self.clients.get(&c)).and_then(|c| c.ident.as_ref()) {
             senv.extend(environ_update(&self.opt_array(None, "update-environment"), &ident.env));
@@ -1424,13 +1529,6 @@ impl Server {
 
     fn exec_inner(&mut self, argv: Vec<String>, ctx: &mut Ctx) -> Result<Flow, String> {
         let Some((name, rest)) = argv.split_first() else { return Ok(Flow::Next) };
-        // NAME=value assignments from the command line
-        if !name.starts_with('-') && name.contains('=') && rest.is_empty() {
-            if ctx.readonly { return err("client is read-only"); }
-            let (k, v) = name.split_once('=').unwrap();
-            self.env.insert(k.to_string(), Some(v.to_string()));
-            return Ok(Flow::Next);
-        }
         let full = canonical(name).ok_or_else(|| format!("unknown command: {name}"))?;
         if full == "display-popup" && self.overlay_waits.len() >= 64 {
             return err("too many waiting overlays");
@@ -1489,16 +1587,46 @@ impl Server {
         match cmd {
             // ---------------------------------------------------------------- sessions
             "new-session" => {
-                let name = o.get('s').map(String::from);
-                if let Some(target) = o.get('t') {
-                    return self.new_grouped_session(ctx, name, target, o.has('d'), o.has('P'), o.get('F'));
+                if o.has('t') && (!o.rest.is_empty() || o.has('n')) {
+                    return err("command or window name given with target");
                 }
+                // -n and -s are formats (format_single with the client: its session, if
+                // any), checked and cleaned like any window or session name
+                let tt = match ctx.client.and_then(|c| self.clients.get(&c)).and_then(|c| c.session) {
+                    Some(_) => self.current(ctx),
+                    None => Target::default(),
+                };
+                let checked = |f: char, what: &str| -> Result<Option<String>, String> {
+                    let Some(n) = o.get(f) else { return Ok(None) };
+                    let n = self.expand(tt, ctx.client, n);
+                    if !check_name(&n) {
+                        return err(format!("invalid {what} name: {n}"));
+                    }
+                    Ok(Some(clean_name(&n)))
+                };
+                let wname = checked('n', "window")?;
+                let name = checked('s', "session")?;
                 if o.has('A') {
                     if let Some(n) = &name {
-                        if let Some(sid) = self.sessions.values().find(|s| &s.name == n).map(|s| s.id) {
+                        if self.sessions.values().any(|s| &s.name == n) {
+                            // cmd_attach_session(item, as->name): the name is a target
+                            let sid = self.resolve_session(ctx, Some(n))?;
+                            if n.contains(':') {
+                                let wt = self.resolve_pane(ctx, Some(n))?;
+                                if let (Some(idx), Some(wid), Some(p)) = (wt.idx, wt.wid, wt.pane) {
+                                    self.select_window(sid, idx);
+                                    self.select_pane(wid, p);
+                                }
+                            }
                             return self.attach_or_switch(ctx, sid, o.has('D'), false, o.has('E'), None);
                         }
                     }
+                }
+                if let Some(target) = o.get('t') {
+                    if self.find_session(ctx, target).is_err() && !check_name(target) {
+                        return err(format!("invalid session group name: {target}"));
+                    }
+                    return self.new_grouped_session(ctx, name, target, o.has('d'), o.has('P'), o.get('F'));
                 }
                 let cid = ctx.reply.or(ctx.client);
                 let ident_size = cid.and_then(|c| self.clients.get(&c)).and_then(|c| c.ident.as_ref()).filter(|i| i.tty).map(|i| (i.cols, i.rows));
@@ -1544,7 +1672,7 @@ impl Server {
                     }
                 }
                 let cwd = o.get('c').map(|c| self.expand(self.current(ctx), ctx.client, c));
-                let sid = self.create_session(ctx, name, cols, rows, cwd, o.get('n').map(String::from), &o.rest, &env)?;
+                let sid = self.create_session(ctx, name, cols, rows, cwd, wname, &o.rest, &env)?;
                 if let (Some(ds), Some(s)) = (default_size, self.sessions.get_mut(&sid)) {
                     s.options.set("default-size", ds);
                 }
@@ -1709,9 +1837,16 @@ impl Server {
             "rename-session" => {
                 let sid = self.resolve_session(ctx, t)?;
                 let name = o.rest.first().ok_or("rename-session needs a name")?;
-                let name = self.expand(self.current(ctx), ctx.client, name);
-                if name.is_empty() || name.contains([':', '.']) {
-                    return err(format!("invalid session: {name}"));
+                // tmux 3.8 check_name: valid UTF-8 without control characters; clean_name
+                // escapes the rest (backslashes); ':', '.' and '' are allowed
+                // format_single_from_target: the target session's formats
+                let name = self.expand(self.target_for_session(sid), ctx.client, name);
+                if !check_name(&name) {
+                    return err(format!("invalid session name: {name}"));
+                }
+                let name = clean_name(&name);
+                if self.sessions[&sid].name == name {
+                    return Ok(Flow::Next);
                 }
                 if self.sessions.values().any(|s| s.id != sid && s.name == name) {
                     return err(format!("duplicate session: {name}"));
@@ -1873,6 +2008,17 @@ impl Server {
                     },
                     None => (self.current(ctx).sid.ok_or("no current session")?, None),
                 };
+                // -n is a format of the target session, checked (check_name) and cleaned
+                let name = match o.get('n') {
+                    Some(n) => {
+                        let n = self.expand(self.target_for_session(sid), ctx.client, n);
+                        if !check_name(&n) {
+                            return err(format!("invalid window name: {n}"));
+                        }
+                        Some(clean_name(&n))
+                    }
+                    None => None,
+                };
                 let s = &self.sessions[&sid];
                 let cur_idx = s.active;
                 let mut replaced = None;
@@ -1897,7 +2043,7 @@ impl Server {
                     return err("session gone");
                 }
                 if o.has('S') {
-                    if let Some(n) = o.get('n') {
+                    if let Some(n) = name.as_deref() {
                         let existing = self.sessions[&sid].links.iter().find(|(_, w)| self.windows[w].name == n).map(|(i, _)| *i);
                         if let Some(i) = existing {
                             self.select_window(sid, i);
@@ -1910,7 +2056,6 @@ impl Server {
                 let (sx, sy) = (s.cols.max(1), s.rows.saturating_sub(status).max(1));
                 let cwd = o.get('c').map(|c| self.expand(self.current(ctx), ctx.client, c)).or_else(|| Some(s.cwd.clone()));
                 let pane = self.spawn_pane(Some(sid), sx, sy, &command, cwd.as_deref(), &env)?;
-                let name = o.get('n').map(|n| self.expand(self.current(ctx), ctx.client, n));
                 let named = if is_empty_pane(&command) { &[][..] } else { &command[..] };
                 let wname = name.clone().unwrap_or_else(|| self.window_name_for(named, Some(sid)));
                 let wid = self.new_window_obj(wname, pane, sx, sy);
@@ -2066,6 +2211,9 @@ impl Server {
                 let wt = self.resolve_window(ctx, t)?;
                 let name = o.rest.first().ok_or("rename-window needs a name")?;
                 let name = self.expand(wt, ctx.client, name);
+                if !check_name(&name) {
+                    return err(format!("invalid window name: {name}"));
+                }
                 let w = self.windows.get_mut(&wt.wid.unwrap()).unwrap();
                 w.name = name;
                 w.options.set("automatic-rename", "off".into());
@@ -2302,8 +2450,16 @@ impl Server {
             "resize-window" => {
                 let wt = self.resolve_window(ctx, t)?;
                 let wid = wt.wid.unwrap();
+                // cmd_resize_window_exec: the adjustment (strtonum 1..INT_MAX), then
+                // args_strtonum(args, 'x', WINDOW_MINIMUM, WINDOW_MAXIMUM) and 'y' are
+                // checked before anything changes
+                let adjust = match o.rest.first() {
+                    Some(v) => super::float::strtonum(v, 1, i32::MAX as i64).map_err(|e| format!("adjustment {e}"))?,
+                    None => 1,
+                };
+                let num = |c: char, what: &str| o.get(c).map(|v| super::float::strtonum(v, 1, 10000).map_err(|e| format!("{what} {e}"))).transpose();
+                let (x, y) = (num('x', "width")?, num('y', "height")?);
                 let w = self.windows.get_mut(&wid).unwrap();
-                let n: u16 = o.rest.first().and_then(|v| v.parse().ok()).unwrap_or(1);
                 if o.has('A') || o.has('a') {
                     w.options.unset("window-size");
                     let sid = wt.sid.unwrap();
@@ -2311,24 +2467,19 @@ impl Server {
                     return Ok(Flow::Next);
                 }
                 w.options.set("window-size", "manual".into());
-                if let Some(x) = o.get('x').and_then(|v| v.parse::<u16>().ok()) {
-                    w.sx = x.clamp(1, MAX_SIZE);
-                }
-                if let Some(y) = o.get('y').and_then(|v| v.parse::<u16>().ok()) {
-                    w.sy = y.clamp(1, MAX_SIZE);
-                }
+                let (mut sx, mut sy) = (x.unwrap_or(w.sx as i64), y.unwrap_or(w.sy as i64));
+                // one direction only, and no change when it would go below zero
                 if o.has('L') {
-                    w.sx = w.sx.saturating_sub(n).max(1);
+                    if sx >= adjust { sx -= adjust; }
+                } else if o.has('R') {
+                    sx += adjust;
+                } else if o.has('U') {
+                    if sy >= adjust { sy -= adjust; }
+                } else if o.has('D') {
+                    sy += adjust;
                 }
-                if o.has('R') {
-                    w.sx = w.sx.saturating_add(n).min(MAX_SIZE);
-                }
-                if o.has('U') {
-                    w.sy = w.sy.saturating_sub(n).max(1);
-                }
-                if o.has('D') {
-                    w.sy = w.sy.saturating_add(n).min(MAX_SIZE);
-                }
+                w.sx = sx.clamp(1, MAX_SIZE as i64) as u16;
+                w.sy = sy.clamp(1, MAX_SIZE as i64) as u16;
                 self.clamp_floats(wid);
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
@@ -2519,19 +2670,29 @@ impl Server {
                 }
                 self.unzoom(wid);
                 let area = self.window_area(wid);
-                let parse_size = |v: &str, total: u16| -> Option<u16> {
-                    if let Some(p) = v.strip_suffix('%') {
-                        p.parse::<u32>().ok().map(|p| (total as u32 * p / 100) as u16)
-                    } else {
-                        v.parse().ok()
-                    }
-                };
-                let x = o.get('x').and_then(|v| parse_size(v, area.w));
-                let y = o.get('y').and_then(|v| parse_size(v, area.h));
+                // args_percentage(args, 'x', 0, PANE_MAXIMUM, w->sx): "width invalid" and so on
+                let size = |c: char, total: u16, what: &str| o.get(c).map(|v| {
+                    super::float::percentage(v, 0, 10000, total as i64).map(|n| n.min(u16::MAX as i64) as u16).map_err(|e| format!("{what} {e}"))
+                }).transpose();
+                let x = size('x', area.w, "width");
+                let y = size('y', area.h, "height");
                 // server_unzoom_window first
                 self.unzoom_window(wid);
+                let x = x?;
                 let before = self.windows[&wid].layout.to_layout_string(area);
                 let w = self.windows.get_mut(&wid).unwrap();
+                // -x is applied before -y is checked
+                let y = match y {
+                    Ok(y) => y,
+                    Err(e) => {
+                        if x.is_some() {
+                            w.layout.set_size(pane, x, None, area);
+                            self.apply_layout(wid);
+                            self.mark_window_dirty(wid);
+                        }
+                        return err(e);
+                    }
+                };
                 if x.is_some() || y.is_some() {
                     w.layout.set_size(pane, x, y, area);
                 }
@@ -2671,6 +2832,9 @@ impl Server {
                     None => (ssid, None),
                 };
                 let name = o.get('n').map(String::from);
+                if let Some(n) = name.as_deref().filter(|n| !check_name(n)) {
+                    return err(format!("invalid window name: {n}"));
+                }
                 if self.windows[&swid].panes().len() == 1 {
                     // already alone: just move the window
                     if let Some(n) = name {
@@ -2761,20 +2925,27 @@ impl Server {
                 let (rects, _) = self.rects(dwid);
                 let r = if o.has('f') { self.window_area(dwid) } else { rects.iter().find(|(p, _)| *p == dpane).map(|(_, r)| *r).ok_or("target pane not visible")? };
                 let total = if horizontal { r.w } else { r.h };
-                if total < 3 {
-                    return err("target pane too small");
-                }
+                // layout_get_tiled_cell: args_percentage_and_expand(args, 'l', 0, INT_MAX, ...)
+                let geometry = |e: String| format!("size or position invalid tiled geometry {e}");
                 let size = match (o.get('l'), o.get('p')) {
-                    (Some(l), _) if l.ends_with('%') => l.trim_end_matches('%').parse::<u32>().ok().map(|p| (total as u32 * p / 100) as u16),
-                    (Some(l), _) => l.parse().ok(),
+                    (Some(l), _) => Some(self.pct_expand(l, 0, i32::MAX as i64, total as i64, dst).map_err(geometry)?.min(u16::MAX as i64) as u16),
                     // -p: a percentage of the target (tmux's older form of -l N%)
                     (None, Some(p)) => {
                         let v = self.expand(dst, ctx.client, p);
-                        let pct = v.parse::<u32>().ok().filter(|v| *v <= 100).ok_or_else(|| format!("size or position invalid tiled geometry {v}"))?;
-                        Some((total as u32 * pct / 100) as u16)
+                        let pct = match v.parse::<i64>() {
+                            Err(_) => Err("invalid"),
+                            Ok(n) if n < 0 => Err("too small"),
+                            Ok(n) if n > 100 => Err("too large"),
+                            Ok(n) => Ok(n),
+                        }.map_err(|e| geometry(e.into()))?;
+                        Some((total as i64 * pct / 100) as u16)
                     }
                     (None, None) => None,
                 };
+                if total < 3 {
+                    // layout_get_tiled_cell's cause
+                    return err("size or position no space for a new pane");
+                }
                 // detach from source window: layout_close_pane, then window_lost_pane
                 if self.detach_pane(swid, spane) {
                     self.apply_layout(swid);
@@ -3295,18 +3466,20 @@ impl Server {
                     return Ok(Flow::Next);
                 }
                 let (cw, ch) = self.clients[&cid].size;
-                let dim = |v: Option<&str>, total: u16| -> u16 {
-                    match v {
-                        Some(s) if s.ends_with('%') => (total as u32 * s.trim_end_matches('%').parse::<u32>().unwrap_or(50) / 100) as u16,
-                        Some(s) => s.parse().unwrap_or(total / 2),
-                        None => total / 2,
+                // args_percentage(args, 'h', 1, tty->sy, tty->sy), then 'w'
+                let dim = |c: char, total: u16, what: &str| -> Result<u16, String> {
+                    match o.get(c) {
+                        Some(v) => super::float::percentage(v, 1, total as i64, total as i64).map(|n| n as u16).map_err(|e| format!("{what} {e}")),
+                        None => Ok(total / 2),
                     }
                 };
+                let h = dim('h', ch, "height")?;
+                let w = dim('w', cw, "width")?;
                 if cw < 3 || ch < 3 {
                     return err("client too small for a popup");
                 }
-                let w = dim(o.get('w'), cw).clamp(3, cw);
-                let h = dim(o.get('h'), ch).clamp(3, ch);
+                let w = w.clamp(3, cw);
+                let h = h.clamp(3, ch);
                 let tt = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
                 // cmd_display_menu_get_popup_pos: -x/-y are formats (or letters standing
                 // for them), y is the bottom row
@@ -3511,11 +3684,12 @@ impl Server {
                 Ok(Flow::Next)
             }
             "show-messages" => {
-                // -T: the clients' terminals (there is no terminfo description to list,
-                // only which terminal each client has), -J: the running jobs
+                // -T: the clients' terminals with every capability (tty_term_describe),
+                // -J: the running jobs
                 let mut blank = false;
                 if o.has('T') {
                     let only = o.get('t').and_then(|t| self.resolve_client_canfail(ctx, Some(t)));
+                    let overrides = self.opts_server.array_items("terminal-overrides").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
                     let mut n = 0;
                     for c in self.clients.values().filter(|c| c.attached && c.control == 0 && only.is_none_or(|o| o == c.id)) {
                         let term = c.ident.as_ref().map(|i| i.term.as_str()).unwrap_or("");
@@ -3524,7 +3698,12 @@ impl Server {
                         // always VT100-like
                         let f = |name: &str, bit: u32| if c.features.has(name) { bit } else { 0 };
                         let flags = f("256", 0x1) | f("margins", 0x4) | f("rectfill", 0x8) | f("RGB", 0x11) | 0x20;
-                        ctx.out.push_str(&format!("Terminal {n}: {term} for {}, flags=0x{flags:x}:\n", c.name()));
+                        // tmux names a client by its tty
+                        let tty = c.ident.as_ref().filter(|i| i.tty).and_then(|i| super::terminfo::tty_path(i.pid)).unwrap_or_else(|| c.name());
+                        ctx.out.push_str(&format!("Terminal {n}: {term} for {tty}, flags=0x{flags:x}:\n"));
+                        for (i, v) in super::terminfo::describe(term, &overrides, &c.features).into_iter().enumerate() {
+                            ctx.out.push_str(&describe_capability(i, &v));
+                        }
                         n += 1;
                     }
                     blank = n != 0;
@@ -3576,11 +3755,20 @@ impl Server {
                     return err(format!("unknown key: {key}"));
                 }
                 let kname = parsed.map(|k| keys::key_name(&k)).unwrap_or(key.clone());
-                let table = if o.has('n') { "root".to_string() } else { o.get('T').unwrap_or("prefix").to_string() };
-                let command = binding_command(&args);
-                if command.is_empty() {
-                    return err("bind-key needs a command");
+                let table = o.get('T').map(String::from).unwrap_or_else(|| (if o.has('n') { "root" } else { "prefix" }).to_string());
+                if args.is_empty() {
+                    // key_bindings_add with no commands: the table is made and an existing
+                    // binding only gets the note (-N) or the repeat flag (-r)
+                    let b = self.bindings.entry(table).or_default().get_mut(&kname);
+                    if let Some(b) = b {
+                        if let Some(n) = o.get('N') {
+                            b.note = n.to_string();
+                        }
+                        b.repeat |= o.has('r');
+                    }
+                    return Ok(Flow::Next);
                 }
+                let command = binding_command(&args);
                 // tmux parses the command when binding: aliases expand now and unknown commands
                 // or flags are rejected; list-keys prints the parsed list
                 let command = command_list_string(&command, &self.command_aliases())?;
@@ -3967,7 +4155,7 @@ impl Server {
             }
             "show-buffer" => {
                 let b = match o.get('b') {
-                    Some(n) => self.buffers.iter().find(|b| b.name == n).ok_or_else(|| format!("unknown buffer: {n}"))?,
+                    Some(n) => self.buffers.iter().find(|b| b.name == n).ok_or_else(|| format!("no buffer {n}"))?,
                     None => self.buffers.first().ok_or("no buffers")?,
                 };
                 ctx.out.push_str(&String::from_utf8_lossy(&b.data));
@@ -3975,7 +4163,7 @@ impl Server {
             }
             "save-buffer" => {
                 let b = match o.get('b') {
-                    Some(n) => self.buffers.iter().find(|b| b.name == n).ok_or_else(|| format!("unknown buffer: {n}"))?,
+                    Some(n) => self.buffers.iter().find(|b| b.name == n).ok_or_else(|| format!("no buffer {n}"))?,
                     None => self.buffers.first().ok_or("no buffers")?,
                 };
                 let path = o.rest.first().ok_or("save-buffer needs a path")?;
@@ -4007,7 +4195,7 @@ impl Server {
             "paste-buffer" => {
                 let tt = self.resolve_pane(ctx, t)?;
                 let idx = match o.get('b') {
-                    Some(n) => self.buffers.iter().position(|b| b.name == n).ok_or_else(|| format!("unknown buffer: {n}"))?,
+                    Some(n) => self.buffers.iter().position(|b| b.name == n).ok_or_else(|| format!("no buffer {n}"))?,
                     None => {
                         if self.buffers.is_empty() {
                             return Ok(Flow::Next);
@@ -4086,50 +4274,56 @@ impl Server {
             // ---------------------------------------------------------------- scripting
             "source-file" => {
                 let mut injected = Vec::new();
+                // cmd_source_file_exec: an error with one path is reported and the others
+                // are still read; the command fails only if no file was found
+                let (mut errors, mut causes) = (Vec::new(), Vec::new());
+                let mut found = 0;
                 for pat in &o.rest {
                     let pat = if o.has('F') { self.expand(self.current(ctx), ctx.client, pat) } else { pat.clone() };
                     let path = self.resolve_path(ctx, &pat);
                     let files = glob_files(&path);
+                    // cmdq_error(item, "%s: %s", strerror(ENOENT), path): the path as given
                     if files.is_empty() && !o.has('q') {
-                        return err(format!("{path}: No such file or directory"));
+                        errors.push(format!("No such file or directory: {pat}"));
                     }
+                    found += files.len();
                     for f in files {
-                        let text = match std::fs::read_to_string(&f) {
-                            Ok(t) => t,
-                            Err(e) if o.has('q') => {
-                                let _ = e;
-                                continue;
+                        match self.load_file(&f, &f, o.has('n'), o.has('v'), ctx) {
+                            Ok((cmds, verbose)) => {
+                                for v in verbose {
+                                    ctx.out.push_str(&v);
+                                    ctx.out.push('\n');
+                                }
+                                injected.extend(cmds);
                             }
-                            Err(e) => return err(format!("{f}: {e}")),
-                        };
-                        // #{current_file} is this file while its %if lines are evaluated
-                        let saved_file = self.cur_file.replace(f.clone());
-                        let parsed = {
-                            let cond = |c: &str| truthy(&self.expand(self.current(ctx), ctx.client, c));
-                            let env = |n: &str| self.env.get(n).cloned().flatten();
-                            cmdparse::parse_with_env_lines(&text, &cond, &env)
-                        };
-                        self.cur_file = saved_file;
-                        let (cmds, lines) = parsed.map_err(|e| format!("{f}:{e}"))?;
-                        // cmd_parse_from_file: the whole file is checked before any of
-                        // it runs; an error names the file and line
-                        for (c, line) in cmds.iter().zip(&lines) {
-                            self.check_parsed(c).map_err(|e| format!("{f}:{line}: {e}"))?;
+                            // a read error is cmdq_error, a parse error a cause (cfg_add_cause)
+                            Err(e) if e.starts_with(&format!("{f}:")) => causes.push(e),
+                            Err(e) => errors.push(e),
                         }
-                        if o.has('n') {
-                            continue;
-                        }
-                        if o.has('v') {
-                            for c in &cmds {
-                                ctx.out.push_str(&format!("{f}: {}\n", c.join(" ")));
+                    }
+                }
+                if found == 0 && !errors.is_empty() {
+                    return err(errors.join("\n"));
+                }
+                for e in errors {
+                    self.soft_error(ctx, &e);
+                }
+                self.cfg_causes.extend(causes);
+                // cmd_source_file_complete_cb: once the configuration is loaded, the causes
+                // so far are printed (cfg_print_causes) and the exit status is 1
+                if self.cfg_finished && !self.cfg_causes.is_empty() {
+                    if ctx.reply.and_then(|r| self.clients.get(&r)).is_some_and(|c| c.session.is_none()) {
+                        ctx.retval = 1;
+                    }
+                    let control = ctx.client.or(ctx.reply).filter(|c| self.is_control(*c));
+                    for c in std::mem::take(&mut self.cfg_causes) {
+                        match control {
+                            Some(cid) => self.control_write(cid, &format!("%config-error {c}\n")),
+                            None => {
+                                ctx.out.push_str(&c);
+                                ctx.out.push('\n');
                             }
                         }
-                        // Run the file's commands next in this queue (so async ones like
-                        // run-shell work); errors are reported without stopping, like tmux.
-                        // The markers around them set #{current_file} while they run.
-                        injected.push(vec![FILE_PUSH.to_string(), f.clone()]);
-                        injected.extend(cmds);
-                        injected.push(vec![FILE_POP.to_string()]);
                     }
                 }
                 Ok(Flow::Inject(injected, true))
@@ -4143,7 +4337,7 @@ impl Server {
                 if o.has('F') {
                     let branch = if truthy(&cond) { Some(then) } else { otherwise };
                     return match branch {
-                        Some(b) => Ok(Flow::Inject(cmdparse::parse(&b)?, false)),
+                        Some(b) => Ok(Flow::Inject(self.parse_string(&b)?, false)),
                         None => Ok(Flow::Next),
                     };
                 }
@@ -4154,7 +4348,7 @@ impl Server {
                 let tt = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
                 if o.has('C') {
                     let c = o.rest.first().ok_or("run-shell -C needs a command")?;
-                    let cmds = cmdparse::parse(&self.expand(tt, ctx.client, c))?;
+                    let cmds = self.parse_string(&self.expand(tt, ctx.client, c))?;
                     return Ok(Flow::Inject(cmds, false));
                 }
                 if let Some(d) = o.get('d') {
@@ -4168,7 +4362,8 @@ impl Server {
                 if command.is_empty() {
                     return Ok(Flow::Next);
                 }
-                let cwd = o.get('c').map(|c| self.expand(tt, ctx.client, c)).or_else(|| tt.pane.and_then(|p| self.panes.get(&p)).map(|p| p.current_path.clone()));
+                // server_client_get_cwd(c, s) unless -c
+                let cwd = o.get('c').map(|c| self.expand(tt, ctx.client, c)).or_else(|| Some(self.client_cwd(ctx, tt.sid)));
                 let flags = format!("{}{}", if o.has('b') { "b" } else { "" }, if o.has('E') { "E" } else { "" });
                 // output goes to a pane only with -t (cdata->wp_id), else to the client
                 let out_pane = tt.pane.filter(|_| o.has('t'));
@@ -4324,7 +4519,6 @@ impl Server {
     fn new_grouped_session(&mut self, ctx: &mut Ctx, name: Option<String>, target: &str, detached: bool, print: bool, fmt: Option<&str>) -> Result<Flow, String> {
         let tsid = self.find_session(ctx, target)?;
         let name = match name {
-            Some(n) if n.is_empty() || n.contains([':', '.']) => return err(format!("invalid session: {n}")),
             Some(n) if self.sessions.values().any(|s| s.name == n) => return err(format!("duplicate session: {n}")),
             Some(n) => n,
             // grouped sessions are named by the group (or target) and their id
@@ -4432,6 +4626,12 @@ impl Server {
             if !ident.is_some_and(|i| i.tty) && c.control == 0 {
                 return err("open terminal failed: not a terminal");
             }
+            if c.control == 0 && let Some(i) = ident {
+                let overrides = self.opts_server.array_items("terminal-overrides").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
+                if let Some(cap) = super::terminfo::missing_required(&i.term, &overrides, &c.features) {
+                    return err(format!("open terminal failed: terminal does not support {cap}"));
+                }
+            }
         }
         if detach_others {
             let name = self.sessions[&sid].name.clone();
@@ -4449,6 +4649,10 @@ impl Server {
             c.ctl.ignore_size |= readonly;
         }
         self.switch_client_env(cid, sid, !no_env);
+        // cmd_attach_session / cmd_new_session: the configuration's errors are shown
+        if self.cfg_finished {
+            self.show_cfg_causes(Some(sid));
+        }
         Ok(Flow::Next)
     }
 
@@ -4463,15 +4667,26 @@ impl Server {
         if std::path::Path::new(&p).is_absolute() {
             return p;
         }
-        let base = ctx
-            .reply
-            .and_then(|c| self.clients.get(&c))
-            .and_then(|c| c.ident.as_ref())
-            .map(|i| i.cwd.clone())
-            .or_else(|| self.current(ctx).sid.map(|s| self.sessions[&s].cwd.clone()))
-            .or_else(procinfo::home_dir)
-            .unwrap_or_default();
+        let base = self.client_cwd(ctx, None);
         std::path::Path::new(&base).join(p).to_string_lossy().into_owned()
+    }
+
+    /// server_client_get_cwd: while the configuration loads, the starting client's
+    /// directory; then that of a client without a session, the session's, the client's
+    /// session's, else home.
+    pub(crate) fn client_cwd(&self, ctx: &Ctx, sid: Option<SessId>) -> String {
+        if !self.cfg_finished && let Some(d) = &self.cfg_cwd {
+            return d.clone();
+        }
+        let c = ctx.reply.or(ctx.client).and_then(|c| self.clients.get(&c));
+        if let Some(i) = c.filter(|c| c.session.is_none()).and_then(|c| c.ident.as_ref()).filter(|i| !i.cwd.is_empty()) {
+            return i.cwd.clone();
+        }
+        let session = sid.or_else(|| c.and_then(|c| c.session)).or_else(|| self.current(ctx).sid);
+        if let Some(s) = session.and_then(|s| self.sessions.get(&s)).filter(|s| !s.cwd.is_empty()) {
+            return s.cwd.clone();
+        }
+        procinfo::home_dir().unwrap_or_else(|| "/".into())
     }
 
     /// Scope for an option name like options_scope_from_name: table options use
@@ -4516,10 +4731,117 @@ impl Server {
         self.opts_server.array_items("command-alias").into_iter().map(|(_, v)| v).collect()
     }
 
+    /// load_cfg: read a file and parse and build all of it; the commands to run come
+    /// back between the marks that set #{current_file}. `name` is the file's name in
+    /// errors. A parse-only load (-n) gives no commands.
+    pub(crate) fn load_file(&mut self, path: &str, name: &str, parse_only: bool, verbose: bool, ctx: &Ctx) -> Result<(Vec<Vec<String>>, Vec<String>), String> {
+        let text = match std::fs::read(path) {
+            Ok(t) => String::from_utf8(t).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+            // file_read: a directory cannot be read
+            Err(e) if e.kind() == std::io::ErrorKind::IsADirectory || std::path::Path::new(path).is_dir() => return err(format!("I/O error: {name}")),
+            Err(e) => return err(format!("{}: {name}", strerror(&e))),
+        };
+        // #{current_file} is this file while its %if lines are evaluated
+        let saved_file = self.cur_file.replace(name.to_string());
+        let parsed = self.parse_tree_lines(&text, ctx);
+        self.cur_file = saved_file;
+        let p = parsed.map_err(|(line, e)| format!("{name}:{line}: {e}"))?;
+        let built = self.build_commands(p, Some(name), false)?;
+        let verbose = if verbose { built.verbose } else { Vec::new() };
+        if parse_only {
+            return Ok((Vec::new(), verbose));
+        }
+        let mut cmds = vec![vec![FILE_PUSH.to_string(), name.to_string()]];
+        for (c, line) in built.cmds.into_iter().zip(built.lines) {
+            if line > 0 {
+                cmds.push(vec![super::LINE_MARK.to_string(), line.to_string()]);
+            }
+            cmds.push(c);
+        }
+        cmds.push(vec![FILE_POP.to_string()]);
+        Ok((cmds, verbose))
+    }
+
+    /// cmdq_error for an error that does not end the command: in the message log, and
+    /// for a client that is not attached on its stderr (its exit status is then 1).
+    fn soft_error(&mut self, ctx: &mut Ctx, e: &str) {
+        self.log_error(ctx.client.or(ctx.reply), e);
+        let cli = ctx.control_seq.is_none() && ctx.reply.and_then(|r| self.clients.get(&r)).is_some_and(|c| !c.attached);
+        if cli {
+            ctx.soft_err.push_str(e);
+            ctx.soft_err.push('\n');
+        } else {
+            ctx.out.push_str(e);
+            ctx.out.push('\n');
+        }
+    }
+
+    /// cmd_parse_from_string: parse a command string and build all its commands before
+    /// any of them runs; an error has no line number.
+    pub(crate) fn parse_string(&self, text: &str) -> Result<Vec<Vec<String>>, String> {
+        let p = self.parse_tree(text, &Ctx::default())?;
+        self.build_commands(p, None, true).map(|b| b.cmds)
+    }
+
+    /// The parse of a string or file: %if conditions are formats, $NAME is looked up
+    /// in the global environment.
+    pub(crate) fn parse_tree(&self, text: &str, ctx: &Ctx) -> Result<cmdparse::Parsed, String> {
+        self.parse_tree_lines(text, ctx).map_err(|e| e.1)
+    }
+
+    fn parse_tree_lines(&self, text: &str, ctx: &Ctx) -> Result<cmdparse::Parsed, (usize, String)> {
+        let cond = |c: &str| truthy(&self.expand(self.current(ctx), ctx.client, c));
+        let env = |n: &str| self.env.get(n).cloned().flatten();
+        cmdparse::parse_tree(text, &cond, &env)
+    }
+
+    /// cmd_parse_build_commands: every command is found and its arguments checked (with
+    /// command-alias expanded and { } blocks built first) before any runs. The errors of
+    /// a file are "file:line: ..." with the line the parser had reached. The commands are
+    /// given as they were typed, with their blocks as their printed command lists
+    /// (bind-key's marked as blocks); assignments come first as set-environment.
+    /// `one_group` is true for a string: its lines are one group.
+    pub(crate) fn build_commands(&self, p: cmdparse::Parsed, file: Option<&str>, one_group: bool) -> Result<Built, String> {
+        let aliases = self.command_aliases();
+        let mut st = BuildState { aliases: &aliases, file, one_group, line: 0, verbose: Vec::new() };
+        let mut out = Built::default();
+        for (n, v, hidden) in p.env {
+            out.cmds.push(vec!["set-environment".into(), (if hidden { "-gh" } else { "-g" }).into(), n, v]);
+            out.lines.push(0);
+        }
+        let (cmds, _) = build_list(&p.cmds, &mut st, &mut |c, st| {
+            let words = build_words(c, st)?;
+            let printed = print_built_command(words.clone(), st.aliases, true).map_err(|e| st.error(e))?;
+            let is_alias = st.aliases.iter().any(|a| a.split_once('=').is_some_and(|(n, _)| n == words[0].0));
+            let argv = if is_alias {
+                // the alias's commands, already expanded (exec does not expand them again)
+                let mut cmds = cmdparse::parse(&printed.join(" ; ")).map_err(|e| st.error(e))?;
+                for cmd in &mut cmds {
+                    cmd[0] = format!("\0alias:{}", cmd[0]);
+                }
+                cmds
+            } else {
+                let bind = cmdparse::is_bind_key(&words[0].0);
+                vec![words.into_iter().map(|(w, b)| if b && bind { format!("{}{w}", cmdparse::BLOCK_MARK) } else { w }).collect()]
+            };
+            Ok(((argv, c.line), printed.join(" ; ")))
+        })?;
+        for (argv, line) in cmds {
+            out.lines.extend(std::iter::repeat_n(line, argv.len()));
+            out.cmds.extend(argv);
+        }
+        out.verbose = st.verbose;
+        Ok(out)
+    }
+
     /// check_command after cmd_parse_expand_alias: an alias expands first (its last
     /// command takes the arguments) and the commands it gives are checked, not expanded again.
     pub(crate) fn check_parsed(&self, argv: &[String]) -> Result<(), String> {
         let Some(name) = argv.first() else { return Ok(()) };
+        // a command an alias already expanded to ([`Server::parse_string`])
+        if let Some(n) = name.strip_prefix("\0alias:") {
+            return check_command(&[&[n.to_string()][..], &argv[1..]].concat());
+        }
         let aliases = self.command_aliases();
         let Some(alias) = aliases.iter().find_map(|a| a.split_once('=').filter(|(n, _)| n == name).map(|(_, v)| v)) else {
             return check_command(argv);
@@ -5198,6 +5520,49 @@ pub fn buffer_vars(b: &Buffer) -> HashMap<String, String> {
         ("buffer_sample".to_string(), sample),
         ("buffer_created".to_string(), b.created.to_string()),
     ])
+}
+
+/// One line of show-messages -T (tty_term_describe): strings strnvis'd into 128 bytes.
+fn describe_capability(i: usize, v: &super::terminfo::Value) -> String {
+    use super::terminfo::{Value, CODES};
+    let name = CODES[i].0;
+    match v {
+        Value::Missing => format!("{i:4}: {name}: [missing]\n"),
+        Value::Str(s) => {
+            let b = s.as_bytes();
+            let mut out = Vec::new();
+            for (j, &c) in b.iter().enumerate() {
+                let mut one = Vec::new();
+                vis::vis(&mut one, c, vis::OCTAL | vis::CSTYLE | vis::TAB | vis::NL, b.get(j + 1).copied().unwrap_or(0));
+                if out.len() + one.len() > 127 {
+                    break;
+                }
+                out.extend(one);
+            }
+            format!("{i:4}: {name}: (string) {}\n", String::from_utf8_lossy(&out))
+        }
+        Value::Num(n) => format!("{i:4}: {name}: (number) {n}\n"),
+        Value::Flag(f) => format!("{i:4}: {name}: (flag) {f}\n"),
+    }
+}
+
+/// tmux's check_name (utf8_isvalid): printable ASCII and complete UTF-8 characters.
+fn check_name(name: &str) -> bool {
+    // utf8_isvalid: printable ASCII or UTF-8 characters (bytes that were not UTF-8 come
+    // from the client as rawarg characters)
+    name.chars().all(|c| (!c.is_ascii() && !crate::rawarg::is_raw(c)) || (' '..='~').contains(&c))
+}
+
+/// tmux's clean_name for a session (or window) name: vis-escaped with
+/// VIS_OCTAL|VIS_CSTYLE|VIS_TAB|VIS_NL, complete UTF-8 characters kept.
+fn clean_name(name: &str) -> String {
+    String::from_utf8_lossy(&vis::strvis(name.as_bytes(), vis::OCTAL | vis::CSTYLE | vis::TAB | vis::NL)).into_owned()
+}
+
+/// strerror(3) text for an I/O error (without Rust's " (os error N)").
+fn strerror(e: &std::io::Error) -> String {
+    let s = e.to_string();
+    s.split(" (os error").next().unwrap_or(&s).to_string()
 }
 
 fn glob_files(path: &str) -> Vec<String> {

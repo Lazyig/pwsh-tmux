@@ -760,7 +760,7 @@ impl Server {
     /// Runs a key binding's commands for a client: the message log names the key (or,
     /// for send-keys -K, the client that sent it).
     pub fn run_key_string(&mut self, cid: ClientId, cmd: &str, pane: Option<PaneId>, key: &str) {
-        match crate::cmdparse::parse(cmd).and_then(|c| c.iter().try_for_each(|c| self.check_parsed(c)).map(|_| c)) {
+        match self.parse_string(cmd) {
             Ok(cmds) => {
                 let ctx = Ctx { client: Some(cid), pane, from_key: true, key: Some(key.to_string()), log_client: self.key_origin, ..Ctx::default() };
                 self.run_queue(Queue { cmds: cmds.into(), ctx , soft: 0 });
@@ -772,7 +772,7 @@ impl Server {
     /// Runs a command string for a client (key bindings, prompts, menus).
     pub fn run_string(&mut self, cid: ClientId, cmd: &str, pane: Option<PaneId>) {
         // cmd_parse_from_string: the whole list is checked before any of it runs
-        match crate::cmdparse::parse(cmd).and_then(|c| c.iter().try_for_each(|c| self.check_parsed(c)).map(|_| c)) {
+        match self.parse_string(cmd) {
             Ok(cmds) => {
                 let ctx = Ctx { client: Some(cid), pane, from_key: true, ..Ctx::default() };
                 self.run_queue(Queue { cmds: cmds.into(), ctx , soft: 0 });
@@ -884,7 +884,7 @@ impl Server {
         let pane = self.panes.contains_key(&pane).then_some(pane);
         match client {
             Some(c) => self.run_string(c, cmd, pane),
-            None => match crate::cmdparse::parse(cmd).and_then(|c| c.iter().try_for_each(|c| self.check_parsed(c)).map(|_| c)) {
+            None => match self.parse_string(cmd) {
                 Ok(cmds) => self.run_queue(Queue { cmds: cmds.into(), ctx: Ctx { pane, ..Ctx::default() }, soft: 0 }),
                 Err(e) => log(&format!("mode command: {e}")),
             },

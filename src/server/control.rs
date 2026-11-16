@@ -95,14 +95,9 @@ impl Server {
         let seq = c.control_seq;
         let pane = self.client_active_pane(cid);
         let ctx = Ctx { client: Some(cid), pane, control_seq: Some(seq), control_line: true, ..Ctx::default() };
-        // tmux finds the commands while parsing: an unknown one fails the whole line
-        let unknown = super::cmds::command_list_string(line, &self.command_aliases()).err()
-            .filter(|e| e.starts_with("unknown command: ") || e.starts_with("ambiguous command: "));
-        if let Some(e) = unknown {
-            self.control_block(cid, seq, true, "", Some(&format!("parse error: {e}")));
-            return;
-        }
-        match crate::cmdparse::parse(line) {
+        // the whole line is parsed and its commands (and those in its blocks) found and
+        // their arguments checked before any of it runs (cmd_parse_build_command)
+        match self.parse_string(line) {
             Ok(cmds) => self.run_queue(Queue { cmds: cmds.into(), ctx, soft: 0 }),
             // control_error
             Err(e) => self.control_block(cid, seq, true, "", Some(&format!("parse error: {e}"))),

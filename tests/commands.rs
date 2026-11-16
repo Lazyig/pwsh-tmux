@@ -668,8 +668,10 @@ fn review_regressions() {
     }
     assert!(child.wait().unwrap().success());
     assert_eq!(ctx.ok(&["show-buffer", "-b", "stdin"]), "from stdin");
-    // absurd sizes are clamped instead of exhausting memory
-    ctx.ok(&["resize-window", "-t", "r", "-x", "60000", "-y", "60000"]);
+    // sizes over WINDOW_MAXIMUM fail (tmux 3.8); large ones are clamped instead of
+    // exhausting memory
+    assert_eq!(ctx.fails(&["resize-window", "-t", "r", "-x", "60000", "-y", "60000"]).trim(), "width too large");
+    ctx.ok(&["resize-window", "-t", "r", "-x", "10000", "-y", "10000"]);
     assert_eq!(ctx.fmt("r", "#{window_width}x#{window_height}"), "1000x1000");
     ctx.ok(&["resize-window", "-A", "-t", "r"]);
 }
@@ -1544,9 +1546,10 @@ fn bind_key_splits_separate_arguments_like_cmd_parse_from_arguments() {
         assert_eq!(ctx.ok(&["list-keys", k]).trim(), format!("bind-key  -T prefix {k} {want}"), "{k}");
     }
     assert_eq!(ctx.ok(&["list-keys", "-T", "root", "M-z"]).trim(), r"bind-key  -T root M-z resize-pane -Z \; set-option -g @z 1");
-    // both commands run
+    // from the command line "1;" already ends bind-key (tmux 3.8): the second command runs now
     ctx.ok(&["bind-key", "F3", "set", "-g", "@a", "1;", "set", "-g", "@b", "2"]);
-    assert_eq!(ctx.ok(&["list-keys", "F3"]).trim(), r"bind-key  -T prefix F3 set-option -g @a 1 \; set-option -g @b 2");
+    assert_eq!(ctx.ok(&["list-keys", "F3"]).trim(), r"bind-key  -T prefix F3 set-option -g @a 1");
+    assert_eq!(ctx.ok(&["show-options", "-gv", "@b"]).trim(), "2");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2984,5 +2987,386 @@ fn floating_panes_from_the_cli() {
         assert_eq!(out.status.code(), Some(3));
         // it waits silently: no (empty) error line on stderr
         assert!(out.stderr.is_empty(), "{:?}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
+#[test]
+fn command_line_semicolons_split_like_cmd_parse_from_arguments() {
+    let ctx = Ctx::new("wq-cli-semi");
+    ctx.ok(&["new-session", "-d", "-s", "s", "sleep 100"]);
+    // the shell's '\;' reaches tmux as \; : a literal ";" argument of bind-key, which its own
+    // split then takes as a separator (tmux 3.8 stores both commands)
+    ctx.ok(&["bind", "-T", "copy-mode-vi", "K", "send", "-X", "cursor-up", "\\;", "send", "-X", "cursor-up"]);
+    assert_eq!(ctx.ok(&["list-keys", "-T", "copy-mode-vi", "K"]).trim_end(), "bind-key  -T copy-mode-vi K send-keys -X cursor-up \\; send-keys -X cursor-up");
+    ctx.ok(&["bind", "y", "display", "\\;"]);
+    assert_eq!(ctx.ok(&["list-keys", "-T", "prefix", "y"]).trim_end(), "bind-key  -T prefix y display-message");
+    // outside bind-key it stays a ";" argument; "x;" ends a command
+    assert_eq!(ctx.ok(&["display", "-p", "\\;"]), ";\n");
+    assert_eq!(ctx.ok(&["display", "-p", "a;", "display", "-p", "b"]), "a\nb\n");
+}
+
+#[test]
+fn parse_errors_are_yacc_syntax_errors() {
+    let ctx = Ctx::new("wq-parse-err");
+    ctx.ok(&["new-session", "-d", "-s", "s", "sleep 100"]);
+    let dir = std::env::temp_dir().join(format!("{}-conf", ctx.socket));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = |name: &str, text: &str| {
+        let p = dir.join(name);
+        std::fs::write(&p, text).unwrap();
+        p.to_string_lossy().into_owned()
+    };
+    // file:N: as cmd_parse_get_error makes it, N the line the parser reached
+    for (text, line) in [("if -F 1 { display a\n", 2), ("display a }\n", 1), ("%if\n", 1), ("%if 1\ndisplay a\n", 3), ("x\n%else\n", 2)] {
+        let f = file("e.conf", text);
+        assert_eq!(ctx.fails(&["source-file", &f]).trim_end(), format!("{f}:{line}: syntax error"), "{text:?}");
+    }
+    let f = file("e.conf", "set -g @x 1 2 3\n");
+    assert_eq!(ctx.fails(&["source-file", &f]).trim_end(), format!("{f}:1: command set-option: too many arguments (need at most 2)"));
+    // a quote left open at the end of the file ends there
+    let f = file("q.conf", "bind q display \"a\n");
+    ctx.ok(&["source-file", &f]);
+    assert_eq!(ctx.ok(&["list-keys", "-T", "prefix", "q"]).trim_end(), "bind-key  -T prefix q display-message a\\n");
+    // a string has no line
+    assert_eq!(ctx.fails(&["bind", "-n", "F11", "if -F 1 { display a"]).trim_end(), "syntax error");
+    ctx.ok(&["bind", "-n", "F11", "display \"abc"]);
+    assert_eq!(ctx.ok(&["list-keys", "-T", "root", "F11"]).trim_end(), "bind-key  -T root F11 display-message abc");
+    // source-file: strerror first, then the path as given
+    assert_eq!(ctx.fails(&["source-file", "/nonexistent-wq.conf"]).trim_end(), "No such file or directory: /nonexistent-wq.conf");
+    assert_eq!(ctx.fails(&["source-file", "nonexistent-wq.conf"]).trim_end(), "No such file or directory: nonexistent-wq.conf");
+    ctx.ok(&["source-file", "-q", "nonexistent-wq.conf"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn control_mode_argument_errors_are_parse_errors() {
+    use std::io::{BufRead, BufReader};
+    let ctx = Ctx::new("wq-ctl-parse");
+    ctx.ok(&["new-session", "-d", "-s", "c", "sleep 100"]);
+    let mut child = ctx.command().args(["-C", "attach", "-t", "c"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let out = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    {
+        let out = out.clone();
+        let stdout = child.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                out.lock().unwrap().push_str(&(line + "\n"));
+            }
+        });
+    }
+    let mut stdin = child.stdin.take().unwrap();
+    let text = || out.lock().unwrap().clone();
+    wait_for("attach reply", || text().contains("%end "));
+    // the argument checks are part of parsing (cmd_parse_build_command), so none of the
+    // line runs
+    stdin.write_all(b"set -g @ran 1 ; kill-session -t c extra\n").unwrap();
+    stdin.flush().unwrap();
+    wait_for("parse error", || text().contains("parse error: command kill-session: too many arguments (need at most 0)\n%error "));
+    assert!(ctx.ok(&["show-options", "-gqv", "@ran"]).is_empty());
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn startup_config_source_file_resolves_against_the_client_directory() {
+    let ctx = Ctx::new("wq-cfg-rel");
+    let dir = std::env::temp_dir().join(format!("{}-dir", ctx.socket));
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("a.conf"), "source-file sub/b.conf\n").unwrap();
+    std::fs::write(dir.join("sub/b.conf"), "set -g @rel 1\n").unwrap();
+    let result = ctx.command().current_dir(&dir).args(["-f", "a.conf", "new-session", "-d", "sleep 100"]).output().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    assert_eq!(ctx.ok(&["show-options", "-gv", "@rel"]).trim(), "1");
+}
+
+#[test]
+fn size_arguments_are_checked_like_args_percentage() {
+    let ctx = Ctx::new("wq-sizes");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "80", "-y", "24", "sleep 100"]);
+    ctx.ok(&["split-window", "-d", "-t", "s", "sleep 100"]);
+    assert_eq!(ctx.fails(&["resize-pane", "-t", "s", "-x", "abc"]).trim(), "width invalid");
+    assert_eq!(ctx.fails(&["resize-pane", "-t", "s", "-y", "abc"]).trim(), "height invalid");
+    assert_eq!(ctx.fails(&["resize-pane", "-t", "s", "-x", ""]).trim(), "width empty");
+    assert_eq!(ctx.fails(&["resize-pane", "-t", "s", "-x", "-3"]).trim(), "width too small");
+    assert_eq!(ctx.fails(&["resize-pane", "-t", "s", "-y", "5000%"]).trim(), "height too large");
+    ctx.ok(&["resize-pane", "-t", "s", "-x", "2000"]);
+    ctx.ok(&["resize-pane", "-t", "s", "-y", "50%"]);
+    assert_eq!(ctx.fails(&["resize-window", "-t", "s", "-x", "abc"]).trim(), "width invalid");
+    assert_eq!(ctx.fails(&["resize-window", "-t", "s", "-x", "0"]).trim(), "width too small");
+    assert_eq!(ctx.fails(&["resize-window", "-t", "s", "-y", "20000"]).trim(), "height too large");
+    assert_eq!(ctx.fails(&["join-pane", "-l", "abc", "-s", "s:0.1", "-t", "s:0.0"]).trim(), "size or position invalid tiled geometry invalid");
+}
+
+#[test]
+fn session_names_follow_check_name_and_clean_name() {
+    let ctx = Ctx::new("wq-names");
+    ctx.ok(&["new-session", "-d", "-s", "s", "sleep 100"]);
+    // tmux 3.8: ':', '.' and empty names are allowed; control characters are not, and
+    // backslashes are escaped (clean_name)
+    ctx.ok(&["new-session", "-d", "-s", "a:b", "sleep 100"]);
+    ctx.ok(&["new-session", "-d", "-s", "a\\b", "sleep 100"]);
+    assert_eq!(ctx.fails(&["new-session", "-d", "-s", "a\tb"]).trim_end(), "invalid session name: a\tb");
+    assert_eq!(ctx.fails(&["rename-session", "-t", "s", "q\x1b"]).trim_end(), "invalid session name: q\x1b");
+    ctx.ok(&["rename-session", "-t", "s", "x.y"]);
+    // -s is a format; from the command line there is no session in it
+    ctx.ok(&["new-session", "-d", "-s", "#{session_id}n", "sleep 100"]);
+    // renaming a session to its own name does nothing
+    ctx.ok(&["rename-session", "-t", "n", "n"]);
+    let mut names: Vec<String> = ctx.ok(&["list-sessions", "-F", "[#{session_name}]"]).lines().map(String::from).collect();
+    names.sort();
+    assert_eq!(names, ["[a:b]", "[a\\\\b]", "[n]", "[x.y]"]);
+    // and the target syntax still splits at ':' and '.', as cmd-find does
+    assert_eq!(ctx.fails(&["rename-session", "-t", "x.y", ""]).trim_end(), "can't find pane: y");
+    ctx.ok(&["rename-session", "-t", "n", ""]);
+    assert!(ctx.ok(&["list-sessions", "-F", "[#{session_name}]"]).contains("[]\n"));
+}
+
+#[test]
+fn show_messages_terminals_lists_every_capability() {
+    let ctx = Ctx::new("wq-term-caps");
+    ctx.ok(&["new-session", "-d", "-s", "t", "-x", "80", "-y", "24", "sleep 100"]);
+    let _t = Term::attach(&ctx, &["attach", "-t", "t"], 80, 24);
+    wait_for("client", || ctx.ok(&["list-clients", "-F", "x"]).contains('x'));
+    let out = ctx.ok(&["show-messages", "-T"]);
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[0].starts_with("Terminal 0: xterm-256color for ") && lines[0].ends_with(':'), "{out}");
+    // tty_term_describe: every tty_term_codes entry, numbered in tmux's order
+    assert_eq!(lines.len(), 237, "{out}");
+    assert!(lines[6].starts_with("   5: Bidi: "), "{out}");
+    assert!(lines[236].starts_with(" 235: XT: "), "{out}");
+    // xterm* features (clipboard, ccolour, cstyle, focus, title) add their capabilities
+    assert!(out.contains("\n  14: Cr: (string) \\033]112\\a\n"), "{out}");
+    assert!(out.contains("\n 196: Ms: (string) \\033]52;%p1%s;%p2%s\\a\n"), "{out}");
+    ctx.ok(&["set", "-as", "terminal-overrides", ",xterm-256color:Smol=\\E[53m:Ms@"]);
+    let _t2 = Term::attach(&ctx, &["attach", "-t", "t"], 80, 24);
+    wait_for("second client", || ctx.ok(&["show-messages", "-T"]).contains("Terminal 1:"));
+    let out = ctx.ok(&["show-messages", "-T"]);
+    assert!(out.contains(" 221: Smol: (string) \\033[53m\n") && out.contains(" 196: Ms: [missing]\n"), "{out}");
+}
+
+/// A file in a per-test directory, for source-file.
+fn conf_file(ctx: &Ctx, name: &str, text: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("{}-conf", ctx.socket));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join(name);
+    std::fs::write(&p, text).unwrap();
+    p.to_string_lossy().into_owned()
+}
+
+#[test]
+fn commands_in_blocks_are_built_while_parsing() {
+    let ctx = Ctx::new("wq-nested");
+    ctx.ok(&["new-session", "-d", "-s", "s", "sleep 100"]);
+    // cmd_parse_build_commands: a bad command inside { } fails the whole file at its
+    // own line, before any of it runs
+    let f = conf_file(&ctx, "f04", "set -g @a 1\nbind x {\n display a\n display b c d\n}\nset -g @b 2\n");
+    assert_eq!(ctx.fails(&["source-file", &f]).trim_end(), format!("{f}:4: command display-message: too many arguments (need at most 1)"));
+    assert!(ctx.ok(&["show-options", "-gqv", "@a"]).is_empty() && ctx.ok(&["show-options", "-gqv", "@b"]).is_empty());
+    let f = conf_file(&ctx, "f06", "if -F 1 { set -g @a yes } { nosuch }\n");
+    assert_eq!(ctx.fails(&["source-file", &f]).trim_end(), format!("{f}:1: unknown command: nosuch"));
+    assert!(ctx.ok(&["show-options", "-gqv", "@a"]).is_empty());
+    // the same from a string, which has no line
+    assert_eq!(ctx.fails(&["if", "-F", "1", "set -g @z { display a b c }"]).trim_end(), "command display-message: too many arguments (need at most 1)");
+    assert_eq!(ctx.fails(&["if", "-F", "1", "set -g @z {x}"]).trim_end(), "unknown command: x");
+    // a string is parsed whole before any of it runs
+    assert_eq!(ctx.fails(&["if", "-F", "1", "display -p a\ndisplay -p b c d"]).trim_end(), "command display-message: too many arguments (need at most 1)");
+    // a block given as a string is its printed command list; lines of a file are groups
+    ctx.ok(&["if", "-F", "1", "set -g @z { display a }"]);
+    assert_eq!(ctx.ok(&["show-options", "-gv", "@z"]).trim_end(), "display-message a");
+    let f = conf_file(&ctx, "g", "set -g @g {\n display a ; display b\n display c\n}\n");
+    ctx.ok(&["source-file", &f]);
+    assert_eq!(ctx.ok(&["show-options", "-gv", "@g"]).trim_end(), "display-message a ; display-message b ;; display-message c");
+    // source-file -v prints each group as cmd_parse_print_commands does
+    let out = ctx.ok(&["source-file", "-v", &f]);
+    assert_eq!(out, format!("{f}:2: display-message a ; display-message b\n{f}:3: display-message c\n{f}:3: set-option -g @g {{ display-message a ; display-message b ;; display-message c }}\n"));
+}
+
+#[test]
+fn parse_rules_of_cmd_parse_y() {
+    let ctx = Ctx::new("wq-grammar");
+    ctx.ok(&["new-session", "-d", "-s", "s", "sleep 100"]);
+    // an assignment in front of a command, and assignments that drop the commands before
+    let f = conf_file(&ctx, "a", "WQ1=1 set -g @a ok\nset -g @b 1 ; WQ2=2\n");
+    ctx.ok(&["source-file", &f]);
+    assert_eq!(ctx.ok(&["show-options", "-gv", "@a"]).trim_end(), "ok");
+    assert!(ctx.ok(&["show-options", "-gqv", "@b"]).is_empty());
+    assert_eq!(ctx.ok(&["show-environment", "-g", "WQ1"]).trim_end(), "WQ1=1");
+    assert_eq!(ctx.ok(&["show-environment", "-g", "WQ2"]).trim_end(), "WQ2=2");
+    for (text, err) in [("X=1 Y=2\n", "1: syntax error"), (";\n", "1: syntax error"), ("set -g @a %H:%M\n", "1: syntax error"),
+        ("%if 1\n%endif\n", "2: syntax error"), ("display a b c # c\n", "2: command display-message: too many arguments (need at most 1)"),
+        ("set -g @a \"x\ny\" extra\n", "2: command set-option: too many arguments (need at most 2)"), ("\n\n{\n", "3: syntax error")] {
+        let f = conf_file(&ctx, "e", text);
+        assert_eq!(ctx.fails(&["source-file", &f]).trim_end(), format!("{f}:{err}"), "{text:?}");
+    }
+    // @x=1 is a command name; NAME=value on the command line is not an assignment
+    let f = conf_file(&ctx, "e", "@x=1\n");
+    assert_eq!(ctx.fails(&["source-file", &f]).trim_end(), format!("{f}:1: unknown command: @x=1"));
+    assert_eq!(ctx.fails(&["X=1"]).trim_end(), "unknown command: X=1");
+    // # starts a comment at the start of any token
+    ctx.ok(&["if", "-F", "1", "set -g @c x #{pane_id}"]);
+    assert_eq!(ctx.ok(&["show-options", "-gv", "@c"]).trim_end(), "x");
+}
+
+#[test]
+fn flag_errors_follow_args_parse() {
+    let ctx = Ctx::new("wq-flags");
+    ctx.ok(&["new-session", "-d", "-s", "s", "sleep 100"]);
+    assert_eq!(ctx.fails(&["display", "-%", "x"]).trim_end(), "command display-message: invalid flag -%");
+    assert_eq!(ctx.fails(&["display", "-Q", "x"]).trim_end(), "command display-message: unknown flag -Q");
+    assert_eq!(ctx.fails(&["display", "-?", "x"]).trim_end(), "usage: display-message [-aCIjlNpv] [-c target-client] [-d delay] [-F format] [-t target-pane] [message]");
+    assert_eq!(ctx.fails(&["kill-server", "-?"]).trim_end(), "usage: kill-server");
+    assert_eq!(ctx.fails(&["if", "-F", "1", "display -% x"]).trim_end(), "command display-message: invalid flag -%");
+}
+
+#[test]
+fn bind_key_without_a_command_changes_only_note_and_repeat() {
+    let ctx = Ctx::new("wq-bind-none");
+    ctx.ok(&["new-session", "-d", "-s", "s", "sleep 100"]);
+    ctx.ok(&["bind", "x"]);
+    ctx.ok(&["bind", "-n", "M-x"]);
+    ctx.ok(&["bind", "-N", "mynote", "x"]);
+    assert_eq!(ctx.ok(&["list-keys", "-N", "x"]).trim_end(), "C-b x mynote");
+    ctx.ok(&["bind", "-r", "x"]);
+    assert!(ctx.ok(&["list-keys", "-T", "prefix", "x"]).starts_with("bind-key -r -T prefix x "));
+    // the table is made; -T wins over -n
+    ctx.ok(&["bind", "-T", "newtab", "y"]);
+    ctx.ok(&["list-keys", "-T", "newtab"]);
+    ctx.ok(&["bind", "-n", "-T", "copy-mode", "M-q", "display", "hi"]);
+    assert_eq!(ctx.ok(&["list-keys", "-T", "copy-mode", "M-q"]).trim_end(), "bind-key  -T copy-mode M-q display-message hi");
+}
+
+#[test]
+fn source_file_goes_on_after_errors() {
+    let ctx = Ctx::new("wq-source");
+    ctx.ok(&["new-session", "-d", "-s", "s", "sleep 100"]);
+    assert_eq!(ctx.fails(&["source-file", "/nonexist-wq/a", "/nonexist-wq/b"]).trim_end(), "No such file or directory: /nonexist-wq/a\nNo such file or directory: /nonexist-wq/b");
+    let ok = conf_file(&ctx, "ok.conf", "set -g @ok 1\n");
+    assert_eq!(ctx.fails(&["source-file", "/nonexist-wq/a", &ok]).trim_end(), "No such file or directory: /nonexist-wq/a");
+    assert_eq!(ctx.ok(&["show-options", "-gv", "@ok"]).trim_end(), "1");
+    // file_read: a directory is an I/O error
+    assert_eq!(ctx.fails(&["source-file", "/"]).trim_end(), "I/O error: /");
+    // a parse error is a cause, printed on stdout once the command is done; the other
+    // files still run
+    let bad = conf_file(&ctx, "bad.conf", "set -g @x 1 2 3\n");
+    let ok2 = conf_file(&ctx, "ok2.conf", "set -g @ok2 1\n");
+    let out = ctx.command().args(["source-file", &bad, &ok2]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{bad}:1: command set-option: too many arguments (need at most 2)\n"));
+    assert_eq!(ctx.ok(&["show-options", "-gv", "@ok2"]).trim_end(), "1");
+}
+
+#[test]
+fn startup_config_runs_in_the_client_directory_and_keeps_its_errors() {
+    let ctx = Ctx::new("wq-cfg-run");
+    let dir = std::env::temp_dir().join(format!("{}-dir", ctx.socket));
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    // relative paths after an asynchronous command still resolve against the client's
+    // directory (cfg_finished is set when the whole queue is done), and so do run-shell's
+    // and new-session's directories; a failed command drops only the rest of its line
+    std::fs::write(dir.join("a.conf"), "set -g nosuchopt 1\nrun-shell 'pwd > runpwd.txt'\nsource-file sub/c.conf\nnew -d -s cfg 'sleep 100'\nset -g @x 1 ; set -g nosuch 2 ; set -g @y 1\nset -g @z 1\n").unwrap();
+    std::fs::write(dir.join("sub/c.conf"), "set -g @c 1\n").unwrap();
+    let result = ctx.command().current_dir(&dir).args(["-f", "a.conf", "new-session", "-d", "-s", "s", "sleep 100"]).output().unwrap();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    let real = std::fs::canonicalize(&dir).unwrap().to_string_lossy().into_owned();
+    assert_eq!(std::fs::read_to_string(dir.join("runpwd.txt")).unwrap().trim_end(), real);
+    assert_eq!(ctx.ok(&["show-options", "-gv", "@c"]).trim_end(), "1");
+    assert_eq!(ctx.fmt("cfg", "#{pane_current_path}"), dir.to_string_lossy());
+    assert_eq!(ctx.ok(&["show-options", "-gv", "@x"]).trim_end(), "1");
+    assert!(ctx.ok(&["show-options", "-gqv", "@y"]).is_empty());
+    assert_eq!(ctx.ok(&["show-options", "-gv", "@z"]).trim_end(), "1");
+    // the server's own variable does not reach jobs
+    assert_eq!(ctx.ok(&["run-shell", "env | grep -c PWSH_TMUX_CFG_CWD || true"]).trim_end(), "0");
+    // the configuration's errors wait, named as given, until source-file prints them
+    let ok = conf_file(&ctx, "ok.conf", "set -g @ok 1\n");
+    let out = ctx.command().args(["source-file", &ok]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a.conf:1: invalid option: nosuchopt\na.conf:5: invalid option: nosuch\n");
+    assert_eq!(out.status.code(), Some(1));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn window_and_session_names_and_targets() {
+    let ctx = Ctx::new("wq-names2");
+    ctx.ok(&["new-session", "-d", "-s", "base", "sleep 100"]);
+    ctx.ok(&["new-session", "-d", "-s", "other", "sleep 100"]);
+    // format_single_from_target: the -t session's formats
+    ctx.ok(&["rename-session", "-t", "base", "r-#{session_name}"]);
+    let mut names: Vec<String> = ctx.ok(&["list-sessions", "-F", "#{session_name}"]).lines().map(String::from).collect();
+    names.sort();
+    assert_eq!(names, ["other", "r-base"]);
+    ctx.ok(&["new-window", "-d", "-n", "w-#{session_name}", "-t", "r-base:", "sleep 100"]);
+    assert!(ctx.ok(&["list-windows", "-t", "r-base", "-F", "#{window_name}"]).contains("w-r-base\n"));
+    // check_name for windows too
+    assert_eq!(ctx.fails(&["new-window", "-d", "-n", "w\x01", "-t", "r-base:"]).trim_end(), "invalid window name: w\x01");
+    assert_eq!(ctx.fails(&["rename-window", "-t", "r-base:0", "w\x01"]).trim_end(), "invalid window name: w\x01");
+    assert_eq!(ctx.fails(&["new-session", "-d", "-s", "z", "-n", "w\x01"]).trim_end(), "invalid window name: w\x01");
+    assert_eq!(ctx.fails(&["new-session", "-d", "-t", "grp\x01"]).trim_end(), "invalid session group name: grp\x01");
+    assert_eq!(ctx.fails(&["new-session", "-d", "-s", "g", "-t", "other", "sleep 100"]).trim_end(), "command or window name given with target");
+    // new-session -A attaches through the name as a target
+    ctx.ok(&["new-session", "-d", "-s", "a:b", "sleep 100"]);
+    assert_eq!(ctx.fails(&["new-session", "-A", "-d", "-s", "a:b"]).trim_end(), "can't find window: b");
+    // a name that is not UTF-8 is an error, not a crash
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let out = ctx.command().args(["new-session", "-d", "-s"]).arg(std::ffi::OsStr::from_bytes(b"bad\xff")).output().unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(out.stderr, b"invalid session name: bad\xff\n");
+    }
+}
+
+#[test]
+fn buffer_and_size_messages() {
+    let ctx = Ctx::new("wq-msgs");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "80", "-y", "24", "sleep 100"]);
+    for args in [&["show-buffer", "-b", "nosuch"][..], &["save-buffer", "-b", "nosuch", "/tmp/wq-x"], &["paste-buffer", "-b", "nosuch"]] {
+        assert_eq!(ctx.fails(args).trim_end(), "no buffer nosuch", "{args:?}");
+    }
+    assert_eq!(ctx.fails(&["delete-buffer", "-b", "nosuch"]).trim_end(), "unknown buffer: nosuch");
+    // cmd_resize_window_exec checks the adjustment, -x and -y first, also with -A
+    assert_eq!(ctx.fails(&["resize-window", "-t", "s", "-L", "abc"]).trim_end(), "adjustment invalid");
+    assert_eq!(ctx.fails(&["resize-window", "-t", "s", "-L", "0"]).trim_end(), "adjustment too small");
+    assert_eq!(ctx.fails(&["resize-window", "-t", "s", "-A", "-x", "abc"]).trim_end(), "width invalid");
+    assert_eq!(ctx.fails(&["resize-window", "-t", "s", "-a", "-y", "0"]).trim_end(), "height too small");
+    // strtonum skips blanks in front, not after
+    ctx.ok(&["resize-window", "-t", "s", "-x", " 50"]);
+    assert_eq!(ctx.fmt("s", "#{window_width}"), "50");
+    ctx.ok(&["split-window", "-d", "-t", "s", "sleep 100"]);
+    assert_eq!(ctx.fails(&["resize-pane", "-t", "s:0.0", "-x", "5 "]).trim_end(), "width invalid");
+    assert_eq!(ctx.fails(&["resize-pane", "-t", "s:0.0", "-y", "5 "]).trim_end(), "height invalid");
+    ctx.ok(&["resize-window", "-t", "s", "-x", "80", "-y", "24"]);
+    ctx.ok(&["split-window", "-d", "-t", "s:0.1", "-l", "1", "sleep 100"]);
+    assert_eq!(ctx.fails(&["join-pane", "-d", "-v", "-s", "s:0.0", "-t", "s:0.2"]).trim_end(), "size or position no space for a new pane");
+}
+
+#[test]
+fn terminals_without_clear_cannot_attach() {
+    if !std::process::Command::new("infocmp").arg("xterm-256color").output().is_ok_and(|o| o.status.success()) {
+        return;
+    }
+    let ctx = Ctx::new("wq-noclear");
+    ctx.ok(&["new-session", "-d", "-s", "t", "sleep 100"]);
+    ctx.ok(&["set", "-g", "terminal-overrides", "xterm*:clear@"]);
+    let mut t = Term::attach(&ctx, &["attach", "-t", "t"], 80, 24);
+    t.wait_exit();
+    assert!(t.raw_text().contains("open terminal failed: terminal does not support clear"), "{}", t.raw_text());
+    assert!(ctx.ok(&["list-clients"]).is_empty());
+}
+
+#[test]
+fn popup_sizes_are_checked_like_args_percentage() {
+    let ctx = Ctx::new("wq-popup-size");
+    ctx.ok(&["new-session", "-d", "-s", "p", "-x", "80", "-y", "24", "sleep 100"]);
+    let _t = Term::attach(&ctx, &["attach", "-t", "p"], 80, 24);
+    wait_for("client", || !ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().is_empty());
+    let c = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    for (args, err) in [(&["-w", "abc"][..], "width invalid"), (&["-w", "0"], "width too small"), (&["-w", "200%"], "width too large"),
+        (&["-w", ""], "width empty"), (&["-h", "abc"], "height invalid"), (&["-h", "-1"], "height too small"), (&["-h", "abc", "-w", "abc"], "height invalid")] {
+        let mut a = vec!["display-popup", "-c", &c];
+        a.extend(args);
+        a.extend(["-E", "true"]);
+        assert_eq!(ctx.fails(&a).trim_end(), err, "{args:?}");
     }
 }

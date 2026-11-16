@@ -46,8 +46,11 @@ fn wait_status(s: i32) -> u8 {
     }
 }
 
-fn strtonum(v: &str, lo: i64, hi: i64) -> Result<i64, String> {
-    let n: i64 = v.trim().parse().map_err(|_| "invalid".to_string())?;
+/// strtonum: strtoll skips white space in front; anything after the number is invalid.
+pub(crate) fn strtonum(v: &str, lo: i64, hi: i64) -> Result<i64, String> {
+    let n: i64 = v.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']).parse::<i128>()
+        .map(|n| n.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+        .map_err(|_| "invalid".to_string())?;
     if n < lo {
         Err("too small".into())
     } else if n > hi {

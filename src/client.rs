@@ -27,13 +27,13 @@ pub struct Global {
 
 fn spawn_server(config: Option<&str>) -> std::io::Result<()> {
     use std::process::{Command, Stdio};
-    // Resolve before changing the server's cwd. Preserve source-file's ~/ form.
+    // Preserve source-file's ~/ form. A relative path stays as given (errors and
+    // #{config_files} show it so); the server reads it relative to our cwd.
     let config = config.map(|path| {
-        let path = if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
-            crate::server::procinfo::home_dir().map(|home| std::path::PathBuf::from(home).join(rest)).unwrap_or_else(|| path.into())
-        } else { std::path::PathBuf::from(path) };
-        std::path::absolute(path).map(|path| path.to_string_lossy().into_owned())
-    }).transpose()?;
+        if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+            crate::server::procinfo::home_dir().map(|home| std::path::PathBuf::from(home).join(rest).to_string_lossy().into_owned()).unwrap_or_else(|| path.into())
+        } else { path.to_string() }
+    });
     let config = config.as_deref();
     let exe = std::env::current_exe()?;
     let make = || {
@@ -43,6 +43,10 @@ fn spawn_server(config: Option<&str>) -> std::io::Result<()> {
             c.arg(f);
         }
         c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).env_remove("PWSH_TMUX").env_remove("PWSH_TMUX_PANE").env_remove(OUTPUT_COPY);
+        // the startup configuration's relative paths resolve against our cwd
+        if let Ok(d) = std::env::current_dir() {
+            c.env(crate::server::CFG_CWD_ENV, d);
+        }
         // Don't pin the client's cwd for the server's lifetime.
         let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
         if let Some(h) = std::env::var_os(home) {
@@ -88,7 +92,8 @@ fn win_spawn_detached(exe: &std::path::Path, config: Option<&str>) -> std::io::R
     let mut cmdline: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
     // environment block without our nesting markers
     let mut env: Vec<u16> = Vec::new();
-    for (k, v) in std::env::vars_os() {
+    let cwd = std::env::current_dir().ok().map(|d| (std::ffi::OsString::from(crate::server::CFG_CWD_ENV), d.into_os_string()));
+    for (k, v) in std::env::vars_os().filter(|(k, _)| k.to_str() != Some(crate::server::CFG_CWD_ENV)).chain(cwd) {
         if k == "PWSH_TMUX" || k == "PWSH_TMUX_PANE" || k == OUTPUT_COPY {
             continue;
         }
@@ -170,18 +175,19 @@ fn terminal_name(term: String, windows_console: bool) -> String {
 fn prepare_stdin_buffers(args: &mut [String], input: &mut impl Read) -> std::io::Result<()> {
     let mut start = 0;
     for index in 0..args.len() {
+        // command boundaries as split_commands finds them: ";" alone, or "x;" (not "x\;")
         let separate = args[index] == ";";
-        let suffixed = args[index].ends_with("\\;");
+        let suffixed = !separate && args[index].ends_with(';') && !args[index].ends_with("\\;");
         if !separate && !suffixed && index + 1 != args.len() { continue; }
         let end = if separate { index } else { index + 1 };
         if end > start + 1 && matches!(args[start].as_str(), "load-buffer" | "loadb") {
             let last = end - 1;
-            let path = args[last].strip_suffix("\\;").unwrap_or(&args[last]);
+            let path = if suffixed { &args[last][..args[last].len() - 1] } else { &args[last] };
             if path == "-" {
                 let mut data = Vec::new();
                 input.take(MAX_STDIN_BUFFER as u64 + 1).read_to_end(&mut data)?;
                 if data.len() > MAX_STDIN_BUFFER { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "stdin buffer exceeds command frame limit")); }
-                let separator = if args[last].ends_with("\\;") { "\\;" } else { "" };
+                let separator = if suffixed { ";" } else { "" };
                 args[last] = encode_stdin_buffer(&data) + separator;
             }
         }
@@ -219,7 +225,7 @@ mod tests {
         let mut input = std::io::Cursor::new(b"not consumed");
         prepare_stdin_buffers(&mut argv, &mut input).unwrap();
         assert_eq!(input.position(), 0);
-        let mut argv = ["load-buffer", "-\\;", "load-buffer", "-"].map(String::from);
+        let mut argv = ["load-buffer", "-;", "load-buffer", "-"].map(String::from);
         prepare_stdin_buffers(&mut argv, &mut &b"data"[..]).unwrap();
         let commands = crate::cmdparse::split_commands(&argv);
         assert_eq!(decode_stdin_buffer(&commands[0][1]).unwrap(), b"data");
@@ -320,11 +326,13 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                     }
                     continue;
                 }
+                // bytes of arguments that were not UTF-8 are printed as they were
                 if code == 0 {
-                    print!("{text}");
+                    let _ = std::io::stdout().write_all(&crate::rawarg::to_bytes(&text));
                 } else if !text.is_empty() {
                     // a bare exit status (new-pane -W) prints nothing
-                    eprint!("{text}{}", if text.ends_with('\n') { "" } else { "\n" });
+                    let nl = if text.ends_with('\n') { "" } else { "\n" };
+                    let _ = std::io::stderr().write_all(&crate::rawarg::to_bytes(&format!("{text}{nl}")));
                 }
                 let _ = std::io::stdout().flush();
                 return code as i32;

@@ -481,7 +481,7 @@ impl Server {
                 }
                 c.dirty = true;
                 // the whole list is checked (aliases expanded) before any of it runs
-                match crate::cmdparse::parse(&cmd).and_then(|c| c.iter().try_for_each(|c| self.check_parsed(c)).map(|_| c)) {
+                match self.parse_string(&cmd) {
                     Ok(cmds) => {
                         let qctx = Ctx { client: Some(cid), pane: fs_pane, mouse: Some(ctx), from_key: true, ..Ctx::default() };
                         self.run_queue(Queue { cmds: cmds.into(), ctx: qctx, soft: 0 });

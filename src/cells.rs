@@ -89,7 +89,9 @@ impl Line {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn text(&self) -> String {
         let s: String = self.cells.iter().map(|c| c.text.as_str()).collect();
-        s.trim_end().to_string()
+        // only blank cells: a C1 character such as U+0085 is white space to Rust but
+        // is kept in its cell
+        s.trim_end_matches(' ').to_string()
     }
 }
 
@@ -146,7 +148,7 @@ pub fn text_at(screen: &vt100::Screen, index: usize) -> (String, bool) {
         return (s.trim_end_matches(' ').to_string(), line.wrapped);
     }
     row.write_plain(&mut s, cols);
-    let len = s.trim_end().len();
+    let len = s.trim_end_matches(' ').len();
     s.truncate(len);
     (s, row.wrapped())
 }
@@ -189,6 +191,17 @@ mod tests {
         // the plain capture path gives the tabs back and keeps a trailing one
         assert_eq!(text_at(p.screen(), 0), ("a\tb中x\t".to_string(), false));
         assert_eq!(line.tabs_end(), 16);
+    }
+
+    #[test]
+    fn trailing_c1_characters_are_kept() {
+        // U+0085 joins the cell before it and is white space only to Rust: a row ending
+        // in it keeps it (capture-pane shows "s\302\205")
+        let nz = |n| NonZeroU16::new(n).unwrap();
+        let mut p = vt100::Parser::new(nz(3), nz(20), 0);
+        p.process(b"abcdefghijklmnopqrs\xc2\x85\r\nx\xc2\x85  ");
+        assert_eq!(text_at(p.screen(), 0).0, "abcdefghijklmnopqrs\u{85}");
+        assert_eq!(line_at(p.screen(), 1).text(), "x\u{85}");
     }
 
     #[test]

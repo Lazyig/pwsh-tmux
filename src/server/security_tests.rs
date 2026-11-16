@@ -170,8 +170,9 @@ fn format_target_and_client_target_cannot_change_request_authority() {
 #[test]
 fn readonly_rejects_mutating_variants_and_environment_assignment() {
     let (mut srv, _) = fixture();
+    // tmux 3.8: NAME=value on the command line is not an assignment
+    assert_eq!(command(&mut srv, &["SECURITY_TEST=value"]).err().as_deref(), Some("unknown command: SECURITY_TEST=value"));
     for args in [
-        vec!["SECURITY_TEST=value"],
         vec!["capture-pane"],
         vec!["display-message", "-I"],
         vec!["detach-client", "-a"],
