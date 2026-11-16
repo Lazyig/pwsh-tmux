@@ -617,6 +617,8 @@ pub fn nz(v: u16) -> NonZeroU16 {
 pub const ALERT_ACTIVITY: u8 = 1;
 pub const ALERT_BELL: u8 = 2;
 pub const ALERT_SILENCE: u8 = 4;
+/// Window::alerts: the silence timer fired since the last output.
+pub const ALERT_SILENCE_DONE: u8 = 0x80;
 
 pub struct Window {
     pub id: WinId,
@@ -640,7 +642,8 @@ pub struct Window {
     /// The cell a pane had when it last floated (tmux `layout_cell.fg`), for break-pane -W.
     pub float_saved: HashMap<PaneId, crate::layout::FGeom>,
     pub options: Options,
-    #[allow(dead_code)]
+    /// tmux w->flags: bell and activity seen but not yet checked (alerts_check_session
+    /// finds them later if monitoring is turned on), and ALERT_SILENCE_DONE.
     pub alerts: u8,
     pub layout_cycle: Option<usize>,
     pub old_layout: Option<String>,
@@ -2185,62 +2188,77 @@ impl Server {
         if let Some(w) = self.windows.get_mut(&wid) {
             w.activity = now_secs();
             w.activity_us = now_us();
+            // alerts_queue sets the window flags even when nothing monitors them
+            w.alerts |= ALERT_ACTIVITY | if bell { ALERT_BELL } else { 0 };
+            w.alerts &= !ALERT_SILENCE_DONE;
         }
         self.pane_output_events(id, osc_events, clip_set);
-        if bell && self.opt_window_on(Some(wid), "monitor-bell") {
+        let monitor_bell = bell && self.opt_window_on(Some(wid), "monitor-bell");
+        let monitor_activity = self.opt_window_on(Some(wid), "monitor-activity");
+        if monitor_bell {
             self.alert(wid, ALERT_BELL);
         }
-        if self.opt_window_on(Some(wid), "monitor-activity") {
+        if monitor_activity {
             self.alert(wid, ALERT_ACTIVITY);
+        }
+        if monitor_bell || monitor_activity {
+            // alerts_callback clears the flags of a window it checked
+            if let Some(w) = self.windows.get_mut(&wid) { w.alerts &= !(ALERT_BELL | ALERT_ACTIVITY); }
         }
         self.mark_window_dirty(wid);
     }
 
-    /// Flags a window in every session where it is not the current window.
+    /// tmux alerts_check_{bell,activity,silence}: flags the window in every session where it is
+    /// not the current window of an attached session, then, when {bell,activity,silence}-action
+    /// applies (any, current or other), fires the hook and tells the session's clients once.
     pub fn alert(&mut self, wid: WinId, flag: u8) {
-        let links = self.links_of(wid);
-        let mut hooks = Vec::new();
-        for (sid, idx) in links {
-            let s = self.sessions.get_mut(&sid).unwrap();
-            let attached_here = self.clients.values().any(|c| c.attached && c.session == Some(sid));
-            if s.active == idx && attached_here {
+        let (opt, visual, hook, what) = match flag {
+            ALERT_BELL => ("bell-action", "visual-bell", "alert-bell", "Bell"),
+            ALERT_ACTIVITY => ("activity-action", "visual-activity", "alert-activity", "Activity"),
+            _ => ("silence-action", "visual-silence", "alert-silence", "Silence"),
+        };
+        let mut alerted: Vec<SessId> = Vec::new();
+        for (sid, idx) in self.winlinks_of(wid) {
+            let attached = self.clients.values().any(|c| c.attached && c.session == Some(sid));
+            let Some(s) = self.sessions.get_mut(&sid) else { continue };
+            // bells are allowed even with an existing bell; activity and silence are not
+            if flag != ALERT_BELL && s.alerts.get(&idx).is_some_and(|a| a & flag != 0) {
                 continue;
             }
-            let e = s.alerts.entry(idx).or_insert(0);
-            if *e & flag == 0 {
-                *e |= flag;
-                let (opt, visual, hook) = match flag {
-                    ALERT_BELL => ("bell-action", "visual-bell", "alert-bell"),
-                    ALERT_ACTIVITY => ("activity-action", "visual-activity", "alert-activity"),
-                    _ => ("silence-action", "visual-silence", "alert-silence"),
-                };
-                hooks.push((sid, idx, opt, visual, hook));
+            let current = s.active == idx;
+            if !current || !attached {
+                *s.alerts.entry(idx).or_insert(0) |= flag;
+                self.mark_session_dirty(sid);
             }
-        }
-        for (sid, idx, opt, visual, hook) in hooks {
-            let action = self.opt_session(Some(sid), opt);
-            if action == "none" {
-                continue;
-            }
-            let vis = self.opt_session(Some(sid), visual);
-            let what = match flag {
-                ALERT_BELL => "Bell",
-                ALERT_ACTIVITY => "Activity",
-                _ => "Silence",
+            let applies = match self.opt_session(Some(sid), opt).as_str() {
+                "any" => true,
+                "current" => current,
+                "other" => !current,
+                _ => false,
             };
-            let cids: Vec<ClientId> = self.clients.values().filter(|c| c.attached && c.session == Some(sid)).map(|c| c.id).collect();
-            for cid in cids {
-                if vis == "on" || vis == "both" {
-                    self.set_message(cid, &format!("{what} in window {idx}"));
-                }
-                if flag == ALERT_BELL && vis != "on" {
-                    if let Some(c) = self.clients.get(&cid).filter(|c| c.control == 0) {
-                        c.send(S_OUTPUT, b"\x07");
-                    }
-                }
+            if !applies {
+                continue;
             }
             if let Some(w) = self.sessions.get(&sid).and_then(|s| s.links.get(&idx)).copied() {
                 self.fire_winlink(hook, sid, idx, w);
+            }
+            if alerted.contains(&sid) {
+                continue;
+            }
+            alerted.push(sid);
+            // alerts_set_message: off rings, on shows a message instead, both does both
+            let vis = self.opt_session(Some(sid), visual);
+            let msg = if current { format!("{what} in current window") } else { format!("{what} in window {idx}") };
+            let cids: Vec<ClientId> = self.clients.values().filter(|c| c.attached && c.session == Some(sid) && c.control == 0).map(|c| c.id).collect();
+            for cid in cids {
+                if vis == "off" || vis == "both" {
+                    if let Some(c) = self.clients.get(&cid) {
+                        c.send(S_OUTPUT, b"\x07");
+                    }
+                }
+                if vis != "off" {
+                    self.set_message(cid, &msg);
+                }
             }
             self.mark_session_dirty(sid);
         }
@@ -2605,7 +2623,9 @@ impl Server {
                     .iter()
                     .filter_map(|p| self.panes.get(p))
                     .all(|p| p.last_output.elapsed() >= Duration::from_secs(secs as u64));
-                if quiet {
+                // alerts_timer fires once until the next output resets it
+                if quiet && self.windows.get(&wid).is_some_and(|w| w.alerts & ALERT_SILENCE_DONE == 0) {
+                    if let Some(w) = self.windows.get_mut(&wid) { w.alerts |= ALERT_SILENCE_DONE; }
                     self.alert(wid, ALERT_SILENCE);
                 }
             }
@@ -3174,6 +3194,17 @@ impl Server {
             }
             let active = s.active;
             if writable { s.alerts.remove(&active); }
+        }
+        // alerts_check_session: flags left on the session's windows
+        let wids: Vec<WinId> = self.sessions.get(&sid).map(|s| s.links.values().copied().collect()).unwrap_or_default();
+        for wid in wids {
+            let pending = self.windows.get(&wid).map_or(0, |w| w.alerts);
+            if pending & ALERT_BELL != 0 && self.opt_window_on(Some(wid), "monitor-bell") {
+                self.alert(wid, ALERT_BELL);
+            }
+            if pending & ALERT_ACTIVITY != 0 && self.opt_window_on(Some(wid), "monitor-activity") {
+                self.alert(wid, ALERT_ACTIVITY);
+            }
         }
         // server_client_set_session: the client is focused (set above) and its window's
         // latest, then the sizes are recalculated
