@@ -36,8 +36,9 @@ fn readonly_terminal_blocks_keys_paste_mouse_and_shared_resize() {
     ctx.ok(&["set-buffer", "-b", "barrier", "echo WRITABLE_BARRIER\n"]);
     ctx.ok(&["paste-buffer", "-d", "-b", "barrier", "-t", "ro"]);
     // (zsh redraws a line it wrapped with CR EL at the start of the next row, which in
-    // tmux 3.8 ends the wrap, so the echoed command may stay cut: match its start)
-    wait_for("writable input barrier", || ctx.ok(&["capture-pane", "-p", "-J", "-t", "ro"]).matches("WRITABLE_BARRI").count() >= 2);
+    // tmux 3.8 ends the wrap, so -J may leave the echoed command cut wherever the prompt
+    // (its length depends on the shell and directory) puts the end of the row: join rows)
+    wait_for("writable input barrier", || ctx.ok(&["capture-pane", "-p", "-t", "ro"]).replace('\n', "").matches("WRITABLE_BARRIER").count() >= 2);
     let capture = ctx.ok(&["capture-pane", "-p", "-t", "ro", "-S", "-"]);
     assert!(!capture.contains("READONLY_TYPED") && !capture.contains("READONLY_PASTED"), "{capture}");
     assert_eq!(ctx.fmt("ro", "#{pane_id}:#{window_width}x#{window_height}:#{session_windows}"), before);
