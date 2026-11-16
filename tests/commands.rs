@@ -1628,3 +1628,26 @@ fn run_shell_status_and_new_session_sizes() {
     assert_eq!(ctx.fails(&["new-session", "-d", "-y", "0"]).trim(), "height too small");
     assert_eq!(ctx.fails(&["new-session", "-d", "-x", "abc"]).trim(), "width invalid");
 }
+
+#[test]
+fn copy_mode_format_variables() {
+    let ctx = Ctx::new("p1fix-copyvars");
+    ctx.ok(&["new-session", "-d", "-s", "s1", "-x", "60", "-y", "16", "printf 'hello world\\nworld two\\n'; sleep 100"]);
+    wait_for("output", || ctx.capture("s1").contains("two"));
+    // not in copy mode: no values, and display -a has none of them
+    assert_eq!(ctx.fmt("s1", "[#{copy_cursor_word}#{selection_mode}]"), "[]");
+    ctx.ok(&["copy-mode", "-t", "s1"]);
+    ctx.ok(&["send-keys", "-t", "s1", "-X", "history-top"]);
+    assert_eq!(ctx.fmt("s1", "#{copy_cursor_word}|#{copy_cursor_line}|#{selection_mode}|#{search_present}|#{search_count}"), "hello|hello world|char|0|0");
+    let all = ctx.ok(&["display-message", "-a", "-t", "s1"]);
+    for v in ["copy_cursor_hyperlink=", "copy_position=0", "copy_position_limit=0", "rectangle_toggle=0", "search_match=", "selection_active=0", "top_line_time=0"] {
+        assert!(all.lines().any(|l| l == v), "{v} in display -a");
+    }
+    ctx.ok(&["send-keys", "-t", "s1", "-X", "search-forward", "wor"]);
+    assert_eq!(ctx.fmt("s1", "#{search_present}|#{search_count}|#{search_match}"), "1|2|wor");
+    ctx.ok(&["send-keys", "-t", "s1", "-X", "select-word"]);
+    assert_eq!(ctx.fmt("s1", "#{selection_mode}|#{selection_active}|#{selection_present}"), "word|1|1");
+    ctx.ok(&["send-keys", "-t", "s1", "-X", "rectangle-toggle"]);
+    ctx.ok(&["send-keys", "-t", "s1", "-X", "select-line"]);
+    assert_eq!(ctx.fmt("s1", "#{selection_mode}|#{rectangle_toggle}"), "line|0");
+}

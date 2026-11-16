@@ -3007,7 +3007,12 @@ impl Server {
                             ctx.out.push_str(&format!("{n}={v}\n"));
                         }
                     }
-                    for (n, v) in &extra {
+                    // the added entries are a sorted tree: the command's, and the copy
+                    // mode's (window_copy_formats) while the pane is in copy mode
+                    let mut tree: Vec<(String, String)> = extra.iter().map(|(n, v)| (n.clone(), v.clone())).collect();
+                    tree.extend(COPY_VAR_NAMES.iter().filter_map(|n| crate::format::Vars::get(&vc, n).map(|v| (n.to_string(), v))));
+                    tree.sort();
+                    for (n, v) in tree {
                         ctx.out.push_str(&format!("{n}={v}\n"));
                     }
                     return Ok(Flow::Next);
@@ -4903,6 +4908,14 @@ fn capture_grid(screen: &vt100::Screen, limit: usize) -> String {
     }
     out
 }
+
+/// The variables window_copy_formats adds while a pane is in copy mode.
+pub const COPY_VAR_NAMES: &[&str] = &[
+    "copy_cursor_hyperlink", "copy_cursor_line", "copy_cursor_word", "copy_cursor_x", "copy_cursor_y", "copy_line_numbers",
+    "copy_position", "copy_position_limit", "rectangle_toggle", "scroll_position", "search_count", "search_count_partial",
+    "search_match", "search_present", "search_timed_out", "selection_active", "selection_end_x", "selection_end_y",
+    "selection_mode", "selection_present", "selection_start_x", "selection_start_y", "top_line_time",
+];
 
 pub const VAR_NAMES: &[&str] = &[
     // tmux 3.8's format_table, which display-message -a lists

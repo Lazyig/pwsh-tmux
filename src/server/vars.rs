@@ -566,7 +566,31 @@ impl Vars for VarCtx<'_> {
                 _ => None,
             }),
             "selection_present" => pane.and_then(|p| match &p.mode {
-                Some(PaneMode::Copy(c)) => Some(b(c.selection_active())),
+                Some(PaneMode::Copy(c)) => Some(b(c.selection_nonempty())),
+                _ => None,
+            }),
+            // window_copy_formats: only while the pane is in copy mode
+            "selection_active" | "selection_mode" | "rectangle_toggle" | "copy_line_numbers" | "copy_position"
+            | "copy_position_limit" | "top_line_time" | "search_present" | "search_timed_out" | "search_count"
+            | "search_count_partial" | "search_match" | "copy_cursor_word" | "copy_cursor_line" | "copy_cursor_hyperlink" => pane.and_then(|p| match &p.mode {
+                Some(PaneMode::Copy(c)) => Some(match name {
+                    "selection_active" => b(c.selection_active()),
+                    "selection_mode" => c.selection_mode().to_string(),
+                    "rectangle_toggle" => b(c.rectangle()),
+                    // no line numbers: the position is the scroll offset
+                    "copy_line_numbers" | "search_timed_out" | "search_count_partial" | "top_line_time" => "0".to_string(),
+                    "copy_position" => c.scroll_offset().to_string(),
+                    "copy_position_limit" => c.history_size().to_string(),
+                    "search_present" => b(c.search_present()),
+                    "search_count" => c.search_count().to_string(),
+                    "search_match" => c.search_match().unwrap_or_default(),
+                    "copy_cursor_word" => {
+                        let (y, x) = c.cursor_abs();
+                        super::mouse::grid_word(|i| c.line(i).cloned(), c.line_count(), x, y, c.word_separators()).unwrap_or_default()
+                    }
+                    "copy_cursor_line" => c.line(c.cursor_abs().0).and_then(super::mouse::grid_line).unwrap_or_default(),
+                    _ => String::new(),
+                }),
                 _ => None,
             }),
             "mouse_x" | "mouse_y" | "mouse_word" | "mouse_line" | "mouse_hyperlink" | "mouse_status_line" | "mouse_status_range" | "mouse_pane" => {

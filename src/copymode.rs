@@ -75,6 +75,8 @@ pub struct CopyMode {
     /// Selection anchor; the other end is the cursor.
     anchor: Option<Pos>,
     line_mode: bool,
+    /// select-word made the selection (selection_mode "word").
+    word_mode: bool,
     rect: bool,
     /// Last search: (text, forward).
     search: Option<(String, bool)>,
@@ -111,6 +113,7 @@ impl CopyMode {
             vi,
             anchor: None,
             line_mode: false,
+            word_mode: false,
             rect: false,
             search: None,
             incremental_origin: None,
@@ -243,6 +246,59 @@ impl CopyMode {
 
     pub fn selection_active(&self) -> bool {
         self.anchor.is_some()
+    }
+
+    /// The cursor as (line, column), the line counted from the oldest history line.
+    pub fn cursor_abs(&self) -> (usize, usize) {
+        (self.cy, self.cx)
+    }
+
+    /// rectangle_toggle
+    pub fn rectangle(&self) -> bool {
+        self.rect
+    }
+
+    /// selection_mode (window_copy's selflag)
+    pub fn selection_mode(&self) -> &'static str {
+        if self.line_mode { "line" } else if self.word_mode { "word" } else { "char" }
+    }
+
+    /// selection_present: the selection's ends differ.
+    pub fn selection_nonempty(&self) -> bool {
+        self.anchor.is_some_and(|a| a != (self.cy, self.cx))
+    }
+
+    /// The word separators the mode uses.
+    pub fn word_separators(&self) -> &str {
+        &self.separators
+    }
+
+    /// History lines above the screen (screen_hsize of the backing screen).
+    pub fn history_size(&self) -> usize {
+        self.hsize()
+    }
+
+    fn marked_search(&self) -> Option<&str> {
+        self.search.as_ref().map(|s| s.0.as_str()).filter(|t| !t.is_empty() && self.search_marks)
+    }
+
+    /// search_present: the search results are marked.
+    pub fn search_present(&self) -> bool {
+        self.marked_search().is_some()
+    }
+
+    /// search_count: how many matches are marked.
+    pub fn search_count(&self) -> usize {
+        self.marked_search().map_or(0, |n| (0..self.lines.len()).map(|y| self.row_matches(y, n).len()).sum())
+    }
+
+    /// search_match (window_copy_match_at_cursor): the marked match under the cursor
+    /// (or ending just before it).
+    pub fn search_match(&self) -> Option<String> {
+        let needle = self.marked_search()?;
+        let (x0, x1) = self.row_matches(self.cy, needle).into_iter().find(|&(a, b)| a <= self.cx && self.cx <= b && b > a)?;
+        let line = self.lines.get(self.cy)?;
+        Some(line.cells.iter().take(x1).skip(x0).filter(|c| !c.is_continuation()).map(|c| c.text.as_str()).collect())
     }
 
     /// The last search text (pane_search_string).
@@ -481,6 +537,19 @@ impl CopyMode {
     /// Run a named copy-mode command (`send-keys -X name args`). A pending repeat count
     /// (from digit keys) is applied and consumed.
     pub fn run(&mut self, command: &str, args: &[String]) -> Action {
+        match command {
+            // select-line and select-word are never rectangles
+            "select-word" => {
+                self.word_mode = true;
+                self.rect = false;
+            }
+            "select-line" => {
+                self.word_mode = false;
+                self.rect = false;
+            }
+            "begin-selection" | "clear-selection" => self.word_mode = false,
+            _ => {}
+        }
         if command.starts_with("search-") {
             self.search_marks = true;
         } else if matches!(command,
