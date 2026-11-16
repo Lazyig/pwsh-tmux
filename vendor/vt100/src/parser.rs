@@ -289,14 +289,15 @@ fn utf8_isvalid(s: &[u8]) -> bool {
 }
 
 /// tmux's clean_name for untrusted names: None unless valid, "#(" becomes "_(" and a
-/// backslash is escaped as vis(3) does.
+/// backslash is escaped as vis(3) does. Not on Windows, where a backslash separates the
+/// parts of a path and every console title (ConPTY sends the program's path) has some.
 fn clean_name(s: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     if !utf8_isvalid(s) { return None; }
     let mut out = alloc::vec::Vec::with_capacity(s.len());
     for (i, &c) in s.iter().enumerate() {
         match c {
             b'#' if s.get(i + 1) == Some(&b'(') => out.push(b'_'),
-            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\\' if cfg!(not(windows)) => out.extend_from_slice(b"\\\\"),
             _ => out.push(c),
         }
     }
