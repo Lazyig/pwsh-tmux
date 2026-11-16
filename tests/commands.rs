@@ -1651,3 +1651,64 @@ fn copy_mode_format_variables() {
     ctx.ok(&["send-keys", "-t", "s1", "-X", "select-line"]);
     assert_eq!(ctx.fmt("s1", "#{selection_mode}|#{rectangle_toggle}"), "line|0");
 }
+
+#[test]
+fn display_message_verbose_loops_aliases_and_modifiers() {
+    let ctx = Ctx::new("p1fix-dv2");
+    ctx.ok(&["new-session", "-d", "-s", "m", "sleep 100"]);
+    ctx.ok(&["set", "-g", "@a", "#{session_name}"]);
+    // the whole format_log trace of tmux 3.8 for these
+    let out = ctx.ok(&["display-message", "-v", "-p", "-t", "m", "#{E:@a}|#{W:#I}|#{=3:session_name}|#{s/m/M/:session_name}|#{nosuch}"]);
+    assert_eq!(out, "# expanding format: #{E:@a}|#{W:#I}|#{=3:session_name}|#{s/m/M/:session_name}|#{nosuch}\n\
+# found #{}: E:@a\n\
+# modifier 0 is E\n\
+# format '@a' found: #{session_name}\n\
+#  expanding format: #{session_name}\n\
+#  found #{}: session_name\n\
+#  format 'session_name' found: m\n\
+#  replaced 'session_name' with 'm'\n\
+#  result is: m\n\
+# replaced 'E:@a' with 'm'\n\
+# found #{}: W:#I\n\
+# modifier 0 is W\n\
+# window loop: 0 @0\n\
+#  expanding format: #I\n\
+#  found #I: window_index\n\
+#  format 'window_index' found: 0\n\
+#  replaced 'window_index' with '0'\n\
+#  result is: 0\n\
+# replaced 'W:#I' with '0'\n\
+# found #{}: =3:session_name\n\
+#  expanding format: 3\n\
+#  result is: 3\n\
+# modifier 0 is =\n\
+# modifier 0 argument 0: 3\n\
+# format 'session_name' found: m\n\
+# applied length limit 3: m\n\
+# replaced '=3:session_name' with 'm'\n\
+# found #{}: s/m/M/:session_name\n\
+#  expanding format: m\n\
+#  result is: m\n\
+#  expanding format: M\n\
+#  result is: M\n\
+# modifier 0 is s\n\
+# modifier 0 argument 0: m\n\
+# modifier 0 argument 1: M\n\
+# format 'session_name' found: m\n\
+#  expanding format: m\n\
+#  result is: m\n\
+#  expanding format: M\n\
+#  result is: M\n\
+# substitute 'm' to 'M': M\n\
+# replaced 's/m/M/:session_name' with 'M'\n\
+# found #{}: nosuch\n\
+# format 'nosuch' not found\n\
+# replaced 'nosuch' with ''\n\
+# result is: m|0|m|M|\n\
+m|0|m|M|\n");
+    let out = ctx.ok(&["display-message", "-v", "-p", "-t", "m", "#{l:#{x}}|#{?#{==:1,2},a,#{?1,b,c}}|#{p7:session_name}|#{n:session_name}"]);
+    for want in ["# literal string is '#{x}'", "# no condition matched in '#{==:1,2},a,#{?1,b,c}'; using last arg",
+        "#  condition '1' not found; assuming false", "# applied padding width 7: m      ", "# replacing with length: 1"] {
+        assert!(out.lines().any(|l| l == want), "{want}: {out}");
+    }
+}
