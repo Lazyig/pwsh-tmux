@@ -1963,6 +1963,7 @@ impl CopyMode {
         let needle = self.search.as_ref().map(|(t, _)| t.as_str()).filter(|t| !t.is_empty() && self.search_marks);
         let cur_row = self.cy - self.top;
         let screen_sel = self.screen_selection();
+        let text_x = lnw.min(self.width - 1);
         for row in 0..self.height {
             let y = self.top + row;
             let mut line = Line { cells: Vec::with_capacity(self.width), wrapped: false };
@@ -2024,7 +2025,7 @@ impl CopyMode {
                     if !c.is_continuation() {
                         lead = x;
                     }
-                    if sel.contains(lnw + lead, row) {
+                    if sel.contains(if lnw > 0 { self.cursor_offset(lead) } else { lead }, row) {
                         c.style = select_cell(st, c.style);
                     }
                 }
@@ -2041,7 +2042,9 @@ impl CopyMode {
                 };
                 let text = format!("{number:>w$} ", w = lnw - 1);
                 let style = if current { st.current_line_number } else { st.line_number };
-                let mut cells: Vec<Cell> = text.chars().take(lnw.min(self.width)).map(|ch| Cell { text: ch.to_string(), style }).collect();
+                // the text starts at column lnw, which screen_write_cursormove keeps on the
+                // screen: a gutter as wide as the pane loses its last column to the text
+                let mut cells: Vec<Cell> = text.chars().take(text_x).map(|ch| Cell { text: ch.to_string(), style }).collect();
                 cells.append(&mut line.cells);
                 cells.truncate(self.width);
                 line.cells = cells;
@@ -2049,7 +2052,7 @@ impl CopyMode {
             out.push(line);
         }
         if self.show_position {
-            self.draw_position(&mut out[0], st, lnw, content);
+            self.draw_position(&mut out[0], st, text_x, content);
         }
         // a cursor past the last column shows as a '$'
         if self.cx >= content {
@@ -2084,21 +2087,37 @@ impl CopyMode {
         // cells the format leaves alone keep the fill: lay out twice with different fills
         let a = crate::format::layout_line(&spans, content, Style { fg: Color::Idx(1), ..Style::default() });
         let b = crate::format::layout_line(&spans, content, Style { fg: Color::Idx(2), ..Style::default() });
-        let mut first = None;
+        let orig = row.cells.clone();
+        let mut drawn = vec![false; orig.len()];
         for (x, (ca, cb)) in a.into_iter().zip(b).enumerate() {
             if ca != cb {
                 continue;
             }
             let at = lnw + x;
-            if first.is_none() {
-                first = Some(at);
-                // a wide character cut by the indicator is blanked
-                if at > 0 && row.cells.get(at).is_some_and(Cell::is_continuation) {
-                    row.cells[at - 1].text = " ".into();
-                }
-            }
             if let Some(c) = row.cells.get_mut(at) {
                 *c = ca;
+                drawn[at] = true;
+            }
+        }
+        // screen_write_overwrite: what is left of a wide character the format drew over
+        // becomes spaces
+        let blank = |c: &mut Cell| c.text = " ".into();
+        for at in (0..orig.len()).filter(|&at| drawn[at]) {
+            if orig[at].is_continuation() {
+                let mut l = at;
+                while l > 0 && orig[l].is_continuation() {
+                    l -= 1;
+                    if !drawn[l] {
+                        blank(&mut row.cells[l]);
+                    }
+                }
+            }
+            let mut r = at + 1;
+            while r < orig.len() && orig[r].is_continuation() {
+                if !drawn[r] {
+                    blank(&mut row.cells[r]);
+                }
+                r += 1;
             }
         }
     }
@@ -4303,6 +4322,28 @@ mod tests {
         assert_eq!(view[0].cells[17].style.fg, Color::Idx(4));
         assert_eq!(view[0].cells[18].style.fg, Color::Idx(1));
         assert_eq!(view[0].cells[16].style, Style::default());
+    }
+
+    #[test]
+    fn position_format_blanks_cut_wide_characters_and_narrow_gutters_keep_a_column() {
+        let row0 = |cm: &CopyMode, fmt: &str| {
+            let st = RenderStyle { position_text: Some(fmt.into()), ..RenderStyle::default() };
+            cm.render_with(&st).0[0].cells.iter().map(|c| c.text.as_str()).collect::<String>()
+        };
+        let cm = CopyMode::new(lines(&["漢字漢字漢字漢字", "foo"]), 12, 4, (0, 0), true);
+        // what is left of a wide character the format overwrites becomes a space
+        assert_eq!(row0(&cm, "XYZ"), "XYZ 漢字漢字");
+        assert_eq!(row0(&cm, "#[align=left]X"), "X 字漢字漢字");
+        assert_eq!(row0(&cm, "#[align=left]AB#[align=centre]C#[align=right]Z"), "AB字漢C 漢 Z");
+        // line numbers wider than the pane: the gutter loses its last column to the text
+        let v: Vec<String> = (1..=1206).map(|i| format!("{}", (b'a' + (i % 26) as u8) as char)).collect();
+        let v: Vec<&str> = v.iter().map(String::as_str).collect();
+        let mut cm = CopyMode::new(lines(&v), 5, 5, (4, 0), true);
+        cm.set_line_number_option(LineNumbers::Absolute);
+        let (view, cursor) = cm.render_with(&RenderStyle { position_text: Some(String::new()), ..RenderStyle::default() });
+        let rows: Vec<String> = view.iter().map(|l| l.cells.iter().map(|c| c.text.as_str()).collect()).collect();
+        assert_eq!(rows[1], format!("1203{}", v[1202]));
+        assert_eq!(cursor, (4, 4));
     }
 
     #[test]
