@@ -6,6 +6,8 @@ pub struct Parser<CB: crate::Callbacks = ()> {
     string_kind: Option<u8>,
     string_overflow: bool,
     escape: bool,
+    /// The last byte given to vte was the `[` of ESC [.
+    csi_start: bool,
     dcs_handler: bool,
     dcs_ignore: bool,
     input_limit: usize,
@@ -63,7 +65,7 @@ impl<CB: crate::Callbacks> Parser<CB> {
         Self {
             parser: vte::Parser::new(),
             string: alloc::vec::Vec::new(), string_kind: None, string_overflow: false,
-            escape: false, dcs_handler: false, dcs_ignore: false, input_limit: 1048575,
+            escape: false, csi_start: false, dcs_handler: false, dcs_ignore: false, input_limit: 1048575,
             screen: crate::screen::WrappedScreen { screen, callbacks },
         }
     }
@@ -119,18 +121,27 @@ impl<CB: crate::Callbacks> Parser<CB> {
                 }
                 continue;
             }
+            let mut after_escape = false;
             if self.escape {
                 self.escape = false;
                 if matches!(b, b']' | b'P' | b'_' | b'k' | b'X' | b'^') {
                     // ESC cancels whatever vte was in the middle of
                     self.parser.advance(&mut self.screen, b"\x1b\\");
                     self.string_kind = Some(if b == b'^' { b'X' } else { b });
+                    self.csi_start = false;
                     continue;
                 }
                 self.parser.advance(&mut self.screen, &[0x1b]);
+                after_escape = true;
             }
-            if b == 0x1b { self.escape = true; }
-            else { self.parser.advance(&mut self.screen, &[b]); }
+            if b == 0x1b { self.escape = true; self.csi_start = false; }
+            else {
+                // vte gives `CSI m` the parameter 0 it gives `CSI 0 m`; tell them apart here
+                self.screen.screen.empty_sgr = self.csi_start && b == b'm';
+                self.csi_start = after_escape && b == b'[';
+                self.parser.advance(&mut self.screen, &[b]);
+                self.screen.screen.empty_sgr = false;
+            }
         }
     }
 

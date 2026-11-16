@@ -68,7 +68,7 @@ impl Row {
         self.time = time;
     }
 
-    fn cols(&self) -> u16 {
+    pub(crate) fn cols(&self) -> u16 {
         self.cells
             .len()
             .try_into()
@@ -120,6 +120,12 @@ impl Row {
     /// The metadata of the cell at `col`.
     pub fn cell_metadata(&self, col: u16) -> Option<&crate::CellMetadata> {
         self.metadata.as_ref()?.get(&col)
+    }
+
+    /// The link of the cell at `col` or of the tab covering it.
+    pub fn hyperlink_at(&self, col: u16) -> Option<&alloc::sync::Arc<crate::Hyperlink>> {
+        let (&x, m) = self.metadata.as_ref()?.range(..=col).next_back()?;
+        (x == col || col < x.saturating_add(m.tab_width)).then_some(m.hyperlink.as_ref()).flatten()
     }
 
     /// Drops the hyperlinks of every cell (screen_reset_hyperlinks leaves the
@@ -279,6 +285,14 @@ impl Row {
                 self.grow_unchecked(len, cell);
             }
         }
+    }
+
+    /// Cells up to the last written one or the end of the last tab (tmux's cellused:
+    /// a row wrapped early, before a wide character or tab that did not fit, ends there).
+    pub fn used_len(&self) -> u16 {
+        let cells = self.cells.iter().rposition(|c| *c != crate::cell::Cell::DEFAULT).map_or(0, |i| i + 1);
+        let tabs = self.metadata().map(|(x, m)| x.saturating_add(m.tab_width)).max().unwrap_or(0);
+        (cells as u16).max(tabs.min(self.cols()))
     }
 
     /// Trims trailing blank cells from the row.

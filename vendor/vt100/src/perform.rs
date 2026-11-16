@@ -202,8 +202,7 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
     fn osc_dispatch(&mut self, params: &[&[u8]], bel_terminated: bool) {
         match params {
             [b"8", options, uri @ ..] if !uri.is_empty() => {
-                let uri = uri.iter().map(|p| alloc::string::String::from_utf8_lossy(p)).collect::<alloc::vec::Vec<_>>().join(";");
-                self.screen.set_hyperlink(&alloc::string::String::from_utf8_lossy(options), &uri);
+                self.screen.set_hyperlink(options, &uri.join(&b';'));
             }
             [b"133", arg, rest @ ..] => {
                 match arg.first() {
