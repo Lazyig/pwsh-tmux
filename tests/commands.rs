@@ -2983,3 +2983,35 @@ fn floating_panes_from_the_cli() {
         assert!(out.stderr.is_empty(), "{:?}", String::from_utf8_lossy(&out.stderr));
     }
 }
+
+#[test]
+fn spawn_without_c_uses_the_command_clients_directory() {
+    // server_client_get_cwd: a command client without a session gives its cwd to
+    // new-window, split-window, new-pane and run-shell; -c may be relative to it;
+    // respawn-pane keeps the pane's directory
+    let ctx = Ctx::new("spawncwd");
+    let base = std::env::temp_dir().join(format!("pt-spawncwd-{}", std::process::id()));
+    let (a, b) = (base.join("a"), base.join("b"));
+    std::fs::create_dir_all(a.join("sub")).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let canon = |p: &std::path::Path| p.canonicalize().unwrap().to_string_lossy().into_owned();
+    let run = |dir: &std::path::Path, args: &[&str]| {
+        let out = ctx.command().current_dir(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    run(&std::env::temp_dir(), &["new-session", "-d", "-s", "s", "-x", "80", "-y", "24"]);
+    run(&a, &["new-window", "-d", "-t", "s:6"]);
+    run(&b, &["split-window", "-d", "-t", "s:6"]);
+    run(&a, &["new-pane", "-d", "-t", "s:6"]);
+    run(&a, &["split-window", "-d", "-t", "s:6", "-c", "sub"]);
+    run(&b, &["respawn-pane", "-k", "-t", "s:6.0"]);
+    let want = format!("0 {}\n1 {}\n2 {}\n3 {}", canon(&a), canon(&a.join("sub")), canon(&b), canon(&a));
+    wait_for("pane paths", || {
+        let got = ctx.ok(&["list-panes", "-t", "s:6", "-F", "#{pane_index} #{pane_current_path}"]);
+        got.trim_end() == want
+    });
+    #[cfg(unix)]
+    assert_eq!(run(&b, &["run-shell", "pwd"]).trim_end(), canon(&b));
+    let _ = std::fs::remove_dir_all(&base);
+}

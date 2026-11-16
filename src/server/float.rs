@@ -698,6 +698,7 @@ impl Server {
             Some(v) => options::validate("pane-border-lines", Some(v), None).map_err(|e| format!("pane-border-lines {e}"))?,
         };
         let cwd = o.get('c').map(|c| self.expand(tt, ctx.client, c));
+        let cwd = Some(self.spawn_cwd(ctx, tt.sid, cwd));
         let new = if floating {
             let lines_none = lines == "none";
             let g = if split {

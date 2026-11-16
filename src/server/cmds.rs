@@ -1210,6 +1210,28 @@ impl Server {
         Ok(())
     }
 
+    /// server_client_get_cwd: a command client without a session (the CLI) gives its own
+    /// directory, else the target session's, else the client's session's, else home.
+    pub fn client_cwd(&self, ctx: &Ctx, sid: Option<SessId>) -> String {
+        let client = ctx.client.and_then(|c| self.clients.get(&c));
+        if let Some(i) = client.filter(|c| c.session.is_none()).and_then(|c| c.ident.as_ref()).filter(|i| !i.cwd.is_empty()) {
+            return i.cwd.clone();
+        }
+        let session = |s: Option<SessId>| s.and_then(|s| self.sessions.get(&s)).map(|s| s.cwd.clone()).filter(|d| !d.is_empty());
+        session(sid).or_else(|| session(client.and_then(|c| c.session))).or_else(procinfo::home_dir).unwrap_or_else(|| "/".into())
+    }
+
+    /// spawn_pane's working directory: -c (a format, relative to server_client_get_cwd)
+    /// or server_client_get_cwd.
+    pub fn spawn_cwd(&self, ctx: &Ctx, sid: Option<SessId>, given: Option<String>) -> String {
+        match given {
+            Some(d) if std::path::Path::new(&d).is_absolute() => d,
+            Some(d) if d.is_empty() => self.client_cwd(ctx, sid),
+            Some(d) => format!("{}/{d}", self.client_cwd(ctx, sid)),
+            None => self.client_cwd(ctx, sid),
+        }
+    }
+
     pub fn split_pane(&mut self, t: Target, horizontal: bool, before: bool, size: Option<u16>, full: bool, cwd: Option<String>, cmd: &[String], env: &[(String, String)]) -> Result<PaneId, String> {
         let wid = t.wid.ok_or("no window")?;
         let target = t.pane.ok_or("no pane")?;
@@ -1909,8 +1931,9 @@ impl Server {
                 let s = &self.sessions[&sid];
                 let status = self.status_lines(Some(sid));
                 let (sx, sy) = (s.cols.max(1), s.rows.saturating_sub(status).max(1));
-                let cwd = o.get('c').map(|c| self.expand(self.current(ctx), ctx.client, c)).or_else(|| Some(s.cwd.clone()));
-                let pane = self.spawn_pane(Some(sid), sx, sy, &command, cwd.as_deref(), &env)?;
+                let cwd = o.get('c').map(|c| self.expand(self.current(ctx), ctx.client, c));
+                let cwd = self.spawn_cwd(ctx, Some(sid), cwd);
+                let pane = self.spawn_pane(Some(sid), sx, sy, &command, Some(&cwd), &env)?;
                 let name = o.get('n').map(|n| self.expand(self.current(ctx), ctx.client, n));
                 let named = if is_empty_pane(&command) { &[][..] } else { &command[..] };
                 let wname = name.clone().unwrap_or_else(|| self.window_name_for(named, Some(sid)));
@@ -3287,8 +3310,12 @@ impl Server {
                 // -B, or border lines (-b or popup-border-lines) none: no border
                 let border = !o.has('B') && o.get('b').map(String::from).unwrap_or_else(|| self.opt_window(self.current(ctx).wid, "popup-border-lines")) != "none";
                 let (iw, ih) = if border { (w - 2, h - 2) } else { (w, h) };
-                let cwd = o.get('d').map(|d| self.expand(tt, Some(cid), d)).or_else(|| tt.pane.and_then(|p| self.panes.get(&p)).map(|p| p.current_path.clone()));
-                let pane = self.spawn_pane(tt.sid, iw.max(1), ih.max(1), &o.rest, cwd.as_deref(), &env)?;
+                // cmd_display_popup_exec: -d, else server_client_get_cwd for the target client
+                let cwd = match o.get('d') {
+                    Some(d) => self.expand(tt, Some(cid), d),
+                    None => self.client_cwd(&Ctx { client: Some(cid), ..Default::default() }, tt.sid),
+                };
+                let pane = self.spawn_pane(tt.sid, iw.max(1), ih.max(1), &o.rest, Some(&cwd), &env)?;
                 let title = o.get('T').map(|s| self.expand(tt, Some(cid), s)).unwrap_or_default();
                 let epoch = self.replace_overlay(cid, Some(Overlay::Popup(Popup {
                     pane, x, y, w, h, border, close_on_exit: o.has('E'), close_any_key: o.has('k'), title,
@@ -4141,7 +4168,7 @@ impl Server {
                 if command.is_empty() {
                     return Ok(Flow::Next);
                 }
-                let cwd = o.get('c').map(|c| self.expand(tt, ctx.client, c)).or_else(|| tt.pane.and_then(|p| self.panes.get(&p)).map(|p| p.current_path.clone()));
+                let cwd = Some(o.get('c').map(|c| self.expand(tt, ctx.client, c)).unwrap_or_else(|| self.client_cwd(ctx, tt.sid)));
                 let flags = format!("{}{}", if o.has('b') { "b" } else { "" }, if o.has('E') { "E" } else { "" });
                 // output goes to a pane only with -t (cdata->wp_id), else to the client
                 let out_pane = tt.pane.filter(|_| o.has('t'));
