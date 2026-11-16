@@ -1210,6 +1210,44 @@ impl Server {
         Ok(())
     }
 
+    /// popup_modify: display-popup on a client with a popup open changes that popup: its
+    /// title (none without -T), styles, border lines and, with -N, -E or -k, its flags.
+    fn popup_modify(&mut self, cid: ClientId, o: &Opts, ctx: &Ctx) {
+        let tt = self.current(ctx);
+        let title = o.get('T').map(|s| self.expand(tt, Some(cid), s)).unwrap_or_default();
+        let lines = if o.has('B') { Some("none".to_string()) } else { o.get('b').map(String::from) };
+        let flags = (o.has('N') || o.has('E') || o.has('k')).then(|| (o.has('E'), o.has('k')));
+        let Some(Some(Overlay::Popup(p))) = self.clients.get_mut(&cid).map(|c| c.overlay.as_mut()) else { return };
+        p.title = title;
+        if let Some(s) = o.get('S') {
+            p.look.border_style = Some(s.to_string());
+        }
+        if let Some(s) = o.get('s') {
+            p.look.style = Some(s.to_string());
+        }
+        let mut resize = None;
+        if let Some(l) = lines {
+            let border = l != "none";
+            if border != p.border {
+                p.border = border;
+                resize = Some((p.pane, p.inner()));
+            }
+            p.look.lines = Some(l);
+        }
+        if let Some((e, k)) = flags {
+            p.close_on_exit = e;
+            p.close_any_key = k;
+        }
+        if let Some((pane, (_, _, w, h))) = resize {
+            if let Some(p) = self.panes.get_mut(&pane) {
+                p.resize(w.max(1), h.max(1));
+            }
+        }
+        if let Some(c) = self.clients.get_mut(&cid) {
+            c.dirty = true;
+        }
+    }
+
     /// server_client_get_cwd: a command client without a session (the CLI) gives its own
     /// directory, else the target session's, else the client's session's, else home.
     pub fn client_cwd(&self, ctx: &Ctx, sid: Option<SessId>) -> String {
@@ -3285,6 +3323,10 @@ impl Server {
                     if matches!(self.clients.get(&cid).and_then(|c| c.overlay.as_ref()), Some(Overlay::Popup(_))) {
                         self.replace_overlay(cid, None)?;
                     }
+                    return Ok(Flow::Next);
+                }
+                if matches!(self.clients.get(&cid).and_then(|c| c.overlay.as_ref()), Some(Overlay::Popup(_))) {
+                    self.popup_modify(cid, &o, ctx);
                     return Ok(Flow::Next);
                 }
                 if self.clients.get(&cid).is_some_and(|c| c.overlay.is_some()) {

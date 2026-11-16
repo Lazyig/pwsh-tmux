@@ -1503,3 +1503,22 @@ fn kept_dead_panes_close_on_a_key() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(ctx.fmt("dk", "#{session_windows}"), "1");
 }
+
+#[test]
+fn display_popup_modifies_an_open_popup() {
+    // popup_modify: the title (cleared without -T), border lines and flags change in place
+    let ctx = Ctx::new("popupmod");
+    let t = start(&ctx, "pm");
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    let mut popup = ctx.command().args(["display-popup", "-c", &client, "-T", "first", "-w", "30", "-h", "6", "echo inside; sleep 30"]).spawn().unwrap();
+    t.wait_screen("popup", |s| s.contains("first") && s.contains("inside"));
+    ctx.ok(&["display-popup", "-c", &client, "-T", "second"]);
+    t.wait_screen("retitled", |s| s.contains("─second─") && !s.contains("first"));
+    ctx.ok(&["display-popup", "-c", &client, "-b", "double"]);
+    t.wait_screen("double lines, no title", |s| s.contains("╔════") && !s.contains("second"));
+    ctx.ok(&["display-popup", "-c", &client, "-B", "-T", "x"]);
+    t.wait_screen("no border", |s| !s.contains("╔") && !s.contains("║inside"));
+    ctx.ok(&["display-popup", "-c", &client, "-C"]);
+    t.wait_screen("closed", |s| !s.contains("inside"));
+    let _ = popup.wait();
+}
