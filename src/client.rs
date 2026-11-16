@@ -11,6 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+/// Names a file the client appends its terminal output to (used by the tests).
+pub const OUTPUT_COPY: &str = "PWSH_TMUX_OUTPUT_COPY";
+
 pub struct Global {
     pub config: Option<String>,
     pub no_start: bool,
@@ -39,7 +42,7 @@ fn spawn_server(config: Option<&str>) -> std::io::Result<()> {
         if let Some(f) = config {
             c.arg(f);
         }
-        c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).env_remove("PWSH_TMUX").env_remove("PWSH_TMUX_PANE");
+        c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).env_remove("PWSH_TMUX").env_remove("PWSH_TMUX_PANE").env_remove(OUTPUT_COPY);
         // Don't pin the client's cwd for the server's lifetime.
         let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
         if let Some(h) = std::env::var_os(home) {
@@ -86,7 +89,7 @@ fn win_spawn_detached(exe: &std::path::Path, config: Option<&str>) -> std::io::R
     // environment block without our nesting markers
     let mut env: Vec<u16> = Vec::new();
     for (k, v) in std::env::vars_os() {
-        if k == "PWSH_TMUX" || k == "PWSH_TMUX_PANE" {
+        if k == "PWSH_TMUX" || k == "PWSH_TMUX_PANE" || k == OUTPUT_COPY {
             continue;
         }
         env.extend(k.encode_wide());
@@ -282,6 +285,9 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
     // Set while a lock command or a suspended shell owns the terminal.
     let paused = Arc::new(AtomicBool::new(false));
     let mut out = std::io::stdout();
+    // a copy of the terminal output for the tests: on Windows ConPTY re-renders what the
+    // client writes and keeps some sequences (OSC 52 queries) from the terminal
+    let mut output_copy = std::env::var_os(OUTPUT_COPY).and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
     let restore = |out: &mut std::io::Stdout, alternate: bool| {
         let _ = out.write_all(b"\x1b[?2031l\x1b[0m\x1b[?25h\x1b[?1l\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1004l\x1b[>4m");
         let _ = out.write_all(if alternate { b"\x1b[?1049l" } else { b"\x1b[H\x1b[2J" });
@@ -291,8 +297,12 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
         let frame = read_frame(&mut &*stream);
         match frame {
             Ok((S_OUTPUT, p)) => {
+                term::note_focus_mode(&p);
                 let _ = out.write_all(&p);
                 let _ = out.flush();
+                if let Some(f) = output_copy.as_mut() {
+                    let _ = f.write_all(&p);
+                }
             }
             Ok((S_STDOUT, p)) => {
                 let _ = out.write_all(&p);

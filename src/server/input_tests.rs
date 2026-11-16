@@ -567,7 +567,7 @@ fn control_strings_end_and_dispatch_as_tmux_does() {
     // C0 controls inside are dropped, DEL makes the title invalid, '#(' and '\' are made safe
     feed(&mut f, b"\x1b]2;ab\ncd\x07"); assert_eq!(title(&f), "abcd");
     feed(&mut f, b"\x1b]2;ab\x7fcd\x07"); assert_eq!(title(&f), "abcd");
-    feed(&mut f, b"\x1b]2;a\\b#(x)\x07"); assert_eq!(title(&f), "a\\\\b_(x)");
+    feed(&mut f, b"\x1b]2;a\\b#(x)\x07"); assert_eq!(title(&f), if cfg!(windows) { "a\\b_(x)" } else { "a\\\\b_(x)" });
     feed(&mut f, b"\x1b]0;q;r\x1b\\"); assert_eq!(title(&f), "q;r");
     // APC sets the title too
     feed(&mut f, b"\x1b_apctitle\x1b\\"); assert_eq!(title(&f), "apctitle");

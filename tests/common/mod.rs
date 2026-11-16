@@ -80,6 +80,29 @@ pub fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
+/// Pane commands for the shell that runs them (default-shell -c): sh on Unix, PowerShell
+/// (powershell.exe or pwsh -Command) on Windows, where `cat` is Get-Content and there is no
+/// printf. Windows commands use single quotes only: the command line quotes the argument.
+pub fn sh<'a>(unix: &'a str, windows: &'a str) -> &'a str {
+    if cfg!(windows) { windows } else { unix }
+}
+
+/// Like `cat` on a terminal: shows what is typed, control keys as ^X (a tty's echoctl).
+pub const CAT: &str = if cfg!(windows) { ECHO_KEYS } else { "cat" };
+/// Like `cat -v`: the same for the keys these tests type.
+pub const CAT_V: &str = if cfg!(windows) { ECHO_KEYS } else { "cat -v" };
+const ECHO_KEYS: &str = "while ($true) { $c = [int][Console]::ReadKey($true).KeyChar; if ($c -eq 13) { [Console]::WriteLine() } elseif ($c -lt 32) { [Console]::Write('^' + [char]($c + 64)) } else { [Console]::Write([char]$c) } }";
+
+/// Prints `text` (plain ASCII, no quotes) without a newline, then keeps the pane open.
+pub fn print_then_sleep(text: &str, secs: u32) -> String {
+    if cfg!(windows) { format!("[Console]::Write('{text}'); Start-Sleep {secs}") } else { format!("printf {text}; sleep {secs}") }
+}
+
+/// What to type at the interactive shell's prompt for `n` lines of "line" (history).
+pub fn typed_lines(n: u32) -> String {
+    if cfg!(windows) { format!("1..{n} | ForEach-Object {{ 'line' }}\r") } else { format!("printf 'line\\n%.0s' {{1..{n}}}\r") }
+}
+
 fn nz(v: u16) -> NonZeroU16 {
     NonZeroU16::new(v).unwrap()
 }
@@ -91,6 +114,8 @@ pub struct Term {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pub master: Option<Box<dyn MasterPty + Send>>,
     pub child: Box<dyn Child + Send + Sync>,
+    /// The client's copy of what it writes to the terminal (PWSH_TMUX_OUTPUT_COPY).
+    output_copy: Option<std::path::PathBuf>,
 }
 
 impl Term {
@@ -105,7 +130,12 @@ impl Term {
         cb.env_remove("COLORTERM");
         // TERM_PROGRAM names the outer terminal's tmux default features
         cb.env_remove("TERM_PROGRAM");
-        Term::spawn(cb, cols, rows)
+        let copy = std::env::temp_dir().join(format!("pwsh-tmux-out-{}-{}", ctx.socket, SEQ.fetch_add(1, Ordering::SeqCst)));
+        let _ = std::fs::remove_file(&copy);
+        cb.env("PWSH_TMUX_OUTPUT_COPY", &copy);
+        let mut t = Term::spawn(cb, cols, rows);
+        t.output_copy = Some(copy);
+        t
     }
 
     /// Runs any program (e.g. `ssh -tt host pwsh-tmux ...`) in a pty.
@@ -135,11 +165,19 @@ impl Term {
                 }
             });
         }
-        Term { screen, raw, writer, master: Some(pair.master), child }
+        Term { screen, raw, writer, master: Some(pair.master), child, output_copy: None }
     }
 
+    /// The screen's rows, one line each. (vt100's contents() joins a row marked as soft
+    /// wrapped with the next one: ConPTY marks every row whose last column was written as
+    /// wrapped and repaints it so the terminal wraps it, so full-width rows such as a
+    /// highlighted list item or a box edge would run into the next row on Windows.)
     pub fn contents(&self) -> String {
-        self.screen.lock().unwrap().screen().contents()
+        let p = self.screen.lock().unwrap();
+        let (_, cols) = p.screen().size();
+        let mut s = p.screen().rows(0, cols.get()).collect::<Vec<_>>().join("\n");
+        s.truncate(s.trim_end_matches('\n').len());
+        s
     }
 
     pub fn row(&self, r: u16) -> String {
@@ -208,10 +246,39 @@ impl Term {
     pub fn raw_text(&self) -> String {
         String::from_utf8_lossy(&self.raw.lock().unwrap()).into_owned()
     }
+
+    /// What the client wrote to its terminal. On Unix that is what the terminal got; on
+    /// Windows ConPTY repaints it for the terminal and drops sequences it handles itself
+    /// (such as OSC 52 queries), so the client's own copy is read.
+    pub fn sent_text(&self) -> String {
+        match self.output_copy.as_ref().filter(|_| cfg!(windows)) {
+            Some(p) => String::from_utf8_lossy(&std::fs::read(p).unwrap_or_default()).into_owned(),
+            None => self.raw_text(),
+        }
+    }
+
+    /// wait_for that shows the screen, the cursor and the end of the terminal output when
+    /// it times out.
+    pub fn wait(&self, what: &str, mut f: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(20) {
+            if f() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let raw = self.raw_text();
+        let tail: String = raw.chars().rev().take(1500).collect::<Vec<_>>().into_iter().rev().collect();
+        let cursor = self.screen.lock().unwrap().screen().cursor_position();
+        panic!("timed out waiting for {what}; cursor {cursor:?}; screen:\n{}\noutput tail: {tail:?}", self.contents());
+    }
 }
 
 impl Drop for Term {
     fn drop(&mut self) {
         let _ = self.child.kill();
+        if let Some(p) = &self.output_copy {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
