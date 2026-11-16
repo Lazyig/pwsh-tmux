@@ -287,6 +287,20 @@ mod tests {
     }
 
     #[test]
+    fn colors_override_sets_terminfo_colours_not_the_256_feature() {
+        let mut f = compute("screen", "", &[], "");
+        overrides("screen", &["screen:colors=256".into()], &mut f);
+        assert!(f.render_256() && !f.has("256") && f.colours() == 16);
+        overrides("screen", &["screen:colors=8".into()], &mut f);
+        assert!(!f.render_256() && f.colours() == 8);
+        overrides("screen", &["screen:colors@".into()], &mut f);
+        assert_eq!(f.colours(), 2);
+        let mut f = compute("xterm-256color", "", &[], "256");
+        overrides("xterm-256color", &["xterm*:colors=8".into()], &mut f);
+        assert!(f.has("256") && f.colours() == 256);
+    }
+
+    #[test]
     fn colour_downgrade() {
         assert_eq!(rgb_to_256(255, 0, 0), 196);
         assert_eq!(rgb_to_256(128, 128, 128), 244);
@@ -310,13 +324,24 @@ pub fn overrides(term: &str, table: &[String], features: &mut Features) -> std::
         for cap in parts.filter(|c| !c.is_empty()) {
             let (name, value) = cap.split_once('=').map(|(n, v)| (n, v.to_string()))
                 .unwrap_or_else(|| (cap.trim_end_matches('@'), if cap.ends_with('@') { String::new() } else { "1".into() }));
+            if name == "colors" {
+                // terminfo colors, not the 256 feature: what tty_check_fg/bg and client_colours
+                // read when neither 256 nor RGB is set
+                for c in ["t256", "16", "mono"] { features.0.remove(c); }
+                match value.parse::<u32>().unwrap_or(0) {
+                    n if n >= 256 => features.set_colours("t256"),
+                    n if n >= 16 => features.set_colours("16"),
+                    n if n >= 8 => {}
+                    _ => features.set_colours("mono"),
+                }
+            }
             let feature = match name {
-                "Tc" | "RGB" => "RGB", "colors" => "256", "Ss" | "Se" => "cstyle", "Cs" | "Cr" => "ccolour",
+                "Tc" | "RGB" => "RGB", "Ss" | "Se" => "cstyle", "Cs" | "Cr" => "ccolour",
                 "Ms" => "clipboard", "Enbp" | "Dsbp" => "bpaste", "XT" => "title", "Dsfcs" | "Enfcs" => "focus",
                 _ => "",
             };
             if !feature.is_empty() {
-                if value.is_empty() || (name == "colors" && value.parse::<u32>().unwrap_or(0) < 256) { features.0.remove(feature); }
+                if value.is_empty() { features.0.remove(feature); }
                 else { features.add(feature); }
             }
             caps.insert(name.to_string(), decode_capability(&value));

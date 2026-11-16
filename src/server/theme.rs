@@ -472,16 +472,20 @@ mod tests {
             key_table: "root".into(),
             repeat_until: None,
             keyp: keys::Parser::new(),
+            input_state: Default::default(),
+            term_caps: Default::default(),
             esc_deadline: None,
             prompt: None,
             overlay: None,
             overlay_epoch: 0,
+            prompt_epoch: 0,
             message: None,
             prev: None,
             dirty: false,
             last_session: None,
             created: now_secs(),
             activity: now_secs(),
+            activity_seq: 0,
             drag: None,
             title: String::new(),
             suspended: false,
@@ -494,6 +498,8 @@ mod tests {
             control_seq: 0,
             seen: Default::default(),
             features: Default::default(),
+            clipboard_query: None,
+            focused: false,
             terminal: Default::default(),
             pending: Default::default(),
             queued_bytes: Default::default(),
@@ -568,11 +574,17 @@ mod tests {
 
     #[test]
     fn palette_values_use_only_client_context() {
+        // server_client_update_theme_colours: format_defaults with only the client, so the
+        // client's session (not the pane being drawn) fills in session_name (red on tmux 3.8)
         let (mut srv, pane) = with_pane();
         srv.opts_server.set("dark-theme-green", "#{?session_name,red,#{?window_name,green,#{?pane_index,white,#123456}}}".into());
         let vars = VarCtx { srv: &srv, t: srv.target_for_pane(pane), client: Some(1), extra: HashMap::new() };
+        assert_eq!(vars.theme_color("themegreen"), Some(Color::Idx(1)));
+        assert_eq!(format::expand("#{c/f:themegreen}", &vars), "\x1b[31m");
+        // without a session the nested conditions all fall through
+        srv.clients.get_mut(&1).unwrap().session = None;
+        let vars = VarCtx { srv: &srv, t: srv.target_for_pane(pane), client: Some(1), extra: HashMap::new() };
         assert_eq!(vars.theme_color("themegreen"), Some(Color::Rgb(18, 52, 86)));
-        assert_eq!(format::expand("#{c/f:themegreen}", &vars), "\x1b[38;2;18;52;86m");
         srv.shutdown();
     }
 

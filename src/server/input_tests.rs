@@ -357,8 +357,9 @@ fn input_terminal_features_parse_like_tty_parse_features() {
     assert!(f.has("mouse") && !f.has("bogus") && !f.has("sync"));
     let f = features::compute("xterm-256color", "", &["xterm*:title@".into(), "xterm*:title".into()], "");
     assert!(!f.has("title"));
+    // RGB alone is not the 256 feature, and terminfo colors#256 is not either (tty_get_features)
     let f = features::compute("xterm-256color", "", &["xterm*:RGB:appesc:clipboard".into()], "");
-    assert_eq!(f.list(), "256,appesc,bpaste,clipboard,mouse,RGB,strikethrough");
+    assert_eq!(f.list(), "appesc,bpaste,clipboard,mouse,RGB,strikethrough");
     assert!(!features::compute("xterm-256color", "", &[], "").has("utf8"));
     assert!(features::compute_named("xterm-256color", "tmux", "", &[], "").has("extkeys"));
     assert!(features::compute_named("xterm-256color", "iTerm.app", "", &[], "").has("osc7"));

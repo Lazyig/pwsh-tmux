@@ -1505,7 +1505,6 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
 
     // ESC c
     pub fn ris(&mut self) {
-        self.callbacks.reset(&mut self.screen);
         let scroll_on_clear = self.screen.scroll_on_clear;
         let allow_alternate = self.screen.allow_alternate;
         let widths = core::mem::take(&mut self.screen.widths);
