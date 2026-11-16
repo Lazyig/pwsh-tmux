@@ -79,24 +79,18 @@ comparison; this CLI fixture does not capture an attached terminal's rendered UI
 
 ## Remaining differences
 
-- **Scrollbar mouse integration is incomplete.** scroll-to-mouse and -S use the
-  tmux slider arithmetic, and the root bindings exist, but this repository has no
-  scrollbar drawing or mouse location classification. The server currently uses
-  slider grab offset zero. Real slider dragging therefore needs shared rendering,
-  mouse hit testing and per-client slider grab state before it works end to end.
-  The emacs search-mark bookkeeping on this special server path also remains.
-- next-prompt/previous-prompt have bindings and metadata but no movement: snapshots
-  do not carry shell prompt markers. They need terminal-parser/snapshot metadata.
-- Snapshots lack hyperlink, tab-cell (GRID_FLAG_TAB) and history timestamp
-  metadata, so copy_cursor_hyperlink, tab-aware motion and copying, and
-  top_line_time lack full parity. The terminal parser would have to record them.
-- The repeat-count prompt is kept by the engine and not drawn: tmux 3.8 shows it as
-  a pane prompt (`command-prompt -P -N`), which needs pane-prompt support and the
-  numeric prompt's "close and dispatch the key again" behaviour in the prompt code.
-  Keys after a count already go through the copy-mode table with the count.
-- The incremental prompt sends `=text` on open and on each edit as tmux does, but
-  C-r/C-s inside the open prompt (refill from the last search, or `-`/`+` again)
-  need the prompt editor to fire them.
+The differences recorded here earlier are resolved since the integration:
+
+- The scrollbar is drawn and wired: mouse locations are classified, slider drags keep
+  the grabbed row per client, and scroll-to-mouse and -S use the tmux arithmetic.
+- next-prompt/previous-prompt, copy_cursor_hyperlink, tab-aware motion and copying and
+  top_line_time use the terminal's line metadata (OSC 133 marks, OSC 8 links, tab cells,
+  history line times).
+- The repeat count is the real numeric pane prompt (`command-prompt -NP -p (repeat)`):
+  `(repeat) N` is drawn on the pane's last line, and the key that closes it is looked up
+  again with the count (send-keys -N).
+- C-r/C-s inside the incremental search prompt fire it again with `-`/`+`, as the
+  prompt editor does in tmux.
 
 ## Round 3 (verified against live tmux 3.8)
 

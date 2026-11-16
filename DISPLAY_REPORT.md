@@ -46,12 +46,12 @@ Validation (all cargo commands use `CARGO_BUILD_JOBS=2`):
 - Linux: `cargo test --release --no-fail-fast`: 249 unit tests passed; commands 36 passed with only known `format_loops_and_utf8_length` failing; interactive 19 passed with only known `readonly_terminal_blocks_keys_paste_mouse_and_shared_resize` failing; attach 3, SSH 1 passed; UI recording 1 ignored.
 - Compared live against tmux 3.8 in the reference pod (nested outer/inner client scenarios in the scratchpad `vd/` directory): layouts, borders/indicators, fill-character, scrollbars, messages, prompt editing, menus/popups, clock, dead panes, wrap-search and list-keys. Remaining differences belong to other packages (see below) or are terminal capture noise.
 
-Known differences left to other packages:
-
-- Copy mode: `page-up` scrolls by height-2 in tmux (scrollbar clicks too), search leaves the cursor at the match end, `copy-mode-position-format` shows the line time, `send -X` outside a mode is not an error here.
-- Input/terminal: `clear` does not push the screen into history (`scroll-on-clear`).
-- Modes: choose-tree drawing; help list lacks the delegated Tab/BTab/*/@/g bindings.
-- 3.8 "menus belong to the window" (shown on all clients) is not implemented; menus stay per client.
+Differences that were left to other packages are fixed since the integration: `page-up`
+scrolls by height-2 (scrollbar clicks too), searches leave the cursor where tmux does
+(emacs at the match end), `send -X` outside a mode is an error, `clear` pushes the
+screen into history with `scroll-on-clear`, choose-tree draws as in 3.8, and menus belong
+to the window (every client showing it sees them). `copy-mode-position-format` gets the
+line time from the terminal's history line times (`top_line_time`).
 
 ## Second verification round
 
@@ -72,5 +72,5 @@ Fixed after the second live comparison (scenarios in the scratchpad `vb2/`, `v2d
 Not changed:
 
 - `message-style` with `width=N%` and `align=`: tmux 3.8 built with musl leaves the text at the area's left only because strftime fails on the `%` of `#{E:message-style}`; with `width=40` it centres like here.
-- Default menus in list-keys and the delegated default bindings wait for the floating and modes packages (`new-pane`, `move-pane -P`, `break-pane -W`).
+- (Fixed since: the default menus in list-keys and the floating default bindings, `new-pane`, `move-pane -P` and `break-pane -W`, are in place.)
 - `Can't find session` instead of `Can't find pane` for a bad `-t` is target resolution, not display.

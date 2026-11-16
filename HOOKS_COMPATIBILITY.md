@@ -42,26 +42,20 @@ Review fixes (second round), each with a regression test:
 - Change detection is skipped on loop turns with only pane output (at least every
   50ms), keeping server CPU at the baseline's level with many panes.
 
-## Cross-package integration still required
+## Cross-package integration (done)
 
-The modes and theme worktrees are being implemented independently. This worktree
-has no pane-owned prompt storage or terminal theme report handling; duplicating
-those implementations here would conflict with their owners.
+The points this package left for others are integrated:
 
-- After modes is merged, call `fire_pane_prompt(name, pane, prompt_type)` from its
-  `set_pane_prompt` owner: close the previous prompt before replacing it and fire
-  the open event after creating the new one. Fire close on accept/cancel, but not
-  while destroying the pane. Names are `pane-prompt-opened` and
-  `pane-prompt-closed`; the payload includes pane, window and prompt_type. Do not
-  fire these for client status prompts. The helper is implemented in events.rs.
-- The theme package calls the retained `run_hook` shim for `client-light-theme`
-  and `client-dark-theme`; the shim turns these into client payload events.
-- Floating panes are not represented on this branch. General pane/window change
-  detection uses `Window::panes()`; the float package must expose floating panes
-  there and supply explicit movement events for changes within the same window.
-- Pane mode stacks are owned by modes. Snapshot detection covers transitions
-  observable after a command/key; intermediate stack transitions inside one
-  operation need event calls at the mode owner after integration.
+- Pane prompts fire `pane-prompt-opened` and `pane-prompt-closed` (pane, window and
+  prompt_type) through `fire_pane_prompt` from `set_pane_prompt`: the previous prompt
+  closes before a new one opens, accept and cancel close it, destroying the pane does
+  not; client status prompts fire neither.
+- `client-light-theme` and `client-dark-theme` are fired directly as client events;
+  the old `run_hook` shim is gone.
+- Floating panes are part of `Window::panes()`, the layout events and the movement
+  events within a window.
+- Pane mode changes are found by snapshot detection after each command or key
+  (`pane-mode-changed`), with the modes' stacks integrated.
 
 ## Live reference verification
 
