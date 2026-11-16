@@ -5,7 +5,7 @@ use super::vars::Target;
 use super::*;
 use crate::cmdparse;
 use crate::layout::{self, Dir};
-use crate::opts::{getopt, getopt_optional, Opts};
+use crate::opts::{getopt_optional, Opts};
 use std::cmp::Ordering;
 
 pub(crate) mod json;
@@ -161,12 +161,22 @@ pub fn check_command(argv: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let full = canonical(name).ok_or_else(|| format!("unknown command: {name}"))?;
-    let spec = COMMANDS.iter().find(|c| c.0 == full).unwrap();
     let mut args = rest.to_vec();
-    if matches!(full, "new-session" | "new-window" | "split-window" | "respawn-pane" | "respawn-window" | "display-popup") {
+    if ENV_COMMANDS.contains(&full) {
         take_env(&mut args);
     }
-    let o = getopt(&args, spec.2, spec.3).map_err(|e| format!("command {full}: {e}"))?;
+    parse_args(full, &args).map(|_| ())
+}
+
+/// Commands whose `-e VAR=value` flags are taken out before args_parse.
+const ENV_COMMANDS: &[&str] = &["new-session", "new-window", "split-window", "new-pane", "respawn-pane", "respawn-window", "display-popup"];
+
+/// args_parse for a command: its flags, those with an optional value (tmux `D::`), and
+/// the argument count, with the errors cmd_parse reports.
+fn parse_args(full: &str, args: &[String]) -> Result<Opts, String> {
+    let spec = COMMANDS.iter().find(|c| c.0 == full).unwrap();
+    let optional = if matches!(full, "move-pane" | "resize-pane") { "DLRU" } else { "" };
+    let o = getopt_optional(args, spec.2, spec.3, optional).map_err(|e| format!("command {full}: {e}"))?;
     if let Some(&(_, min, max)) = ARG_COUNTS.iter().find(|a| a.0 == full) {
         if (o.rest.len() as i32) < min {
             return err(format!("command {full}: too few arguments (need at least {min})"));
@@ -175,7 +185,7 @@ pub fn check_command(argv: &[String]) -> Result<(), String> {
             return err(format!("command {full}: too many arguments (need at most {max})"));
         }
     }
-    Ok(())
+    Ok(o)
 }
 
 /// Store a command option (default-client-command, hooks) the way tmux parses
@@ -1414,28 +1424,13 @@ impl Server {
         if full == "display-popup" && self.overlay_waits.len() >= 64 {
             return err("too many waiting overlays");
         }
-        let spec = COMMANDS.iter().find(|c| c.0 == full).unwrap();
         let mut args = rest.to_vec();
-        let env = if matches!(full, "new-session" | "new-window" | "split-window" | "new-pane" | "respawn-pane" | "respawn-window" | "display-popup") {
-            take_env(&mut args)
-        } else {
-            Vec::new()
-        };
+        let env = if ENV_COMMANDS.contains(&full) { take_env(&mut args) } else { Vec::new() };
         // read-only users (server-access -r) may only look
         if ctx.readonly && !READ_ONLY_OK.contains(&full) {
             return err("client is read-only");
         }
-        // args_parse errors, as cmd_parse reports them; flags with an optional value (tmux `D::`)
-        let optional = if matches!(full, "move-pane" | "resize-pane") { "DLRU" } else { "" };
-        let o = if optional.is_empty() { getopt(&args, spec.2, spec.3) } else { getopt_optional(&args, spec.2, spec.3, optional) }.map_err(|e| format!("command {full}: {e}"))?;
-        if let Some(&(_, min, max)) = ARG_COUNTS.iter().find(|a| a.0 == full) {
-            if (o.rest.len() as i32) < min {
-                return err(format!("command {full}: too few arguments (need at least {min})"));
-            }
-            if max != -1 && o.rest.len() as i32 > max {
-                return err(format!("command {full}: too many arguments (need at most {max})"));
-            }
-        }
+        let o = parse_args(full, &args)?;
         if ctx.readonly {
             self.check_readonly_command(full, &o, ctx)?;
         }

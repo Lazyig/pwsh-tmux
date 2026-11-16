@@ -217,3 +217,23 @@ C-b S-Up    Move the visible part of the window up
 C-b S-Down  Move the visible part of the window down
 C-b S-Left  Move the visible part of the window left
 C-b S-Right Move the visible part of the window right
+# list-keys -T move
+bind-key  -T move ,       if-shell -F "#{pane_floating_flag}" { display-menu -T "#[align=centre]Move" -x P -y P Centre c { move-pane -P centre } '' "Top Left" 1 { move-pane -P top-left } "Top Right" 2 { move-pane -P top-right } "Bottom Left" 3 { move-pane -P bottom-left } "Bottom Right" 4 { move-pane -P bottom-right } '' Top t { move-pane -P top-centre } Bottom b { move-pane -P bottom-centre } Left l { move-pane -P centre-left } Right r { move-pane -P centre-right } }
+bind-key  -T move .       if-shell -F "#{pane_floating_flag}" { display-menu -T "#[align=centre]Move & Resize" -x P -y P Fill 0 { resize-pane -x "100%" -y "100%" ; move-pane -P top-left } '' "Top Left" 1 { resize-pane -x "50%" -y "50%" ; move-pane -P top-left } "Top Right" 2 { resize-pane -x "50%" -y "50%" ; move-pane -P top-right } "Bottom Left" 3 { resize-pane -x "50%" -y "50%" ; move-pane -P bottom-left } "Bottom Right" 4 { resize-pane -x "50%" -y "50%" ; move-pane -P bottom-right } '' Top t { resize-pane -x "100%" -y "50%" ; move-pane -P top-centre } Bottom b { resize-pane -x "100%" -y "50%" ; move-pane -P bottom-centre } Left l { resize-pane -x "50%" -y "100%" ; move-pane -P centre-left } Right r { resize-pane -x "50%" -y "100%" ; move-pane -P centre-right } }
+bind-key  -T move 0       resize-pane -x "100%" -y "100%" \; move-pane -P top-left
+bind-key  -T move 1       move-pane -P top-left
+bind-key  -T move 2       move-pane -P top-right
+bind-key  -T move 3       move-pane -P bottom-left
+bind-key  -T move 4       move-pane -P bottom-right
+bind-key  -T move Up      move-pane -P top-centre
+bind-key  -T move Down    move-pane -P bottom-centre
+bind-key  -T move Left    move-pane -P centre-left
+bind-key  -T move Right   move-pane -P centre-right
+bind-key  -T move M-1     resize-pane -x "50%" -y "50%" \; move-pane -P top-left
+bind-key  -T move M-2     resize-pane -x "50%" -y "50%" \; move-pane -P top-right
+bind-key  -T move M-3     resize-pane -x "50%" -y "50%" \; move-pane -P bottom-left
+bind-key  -T move M-4     resize-pane -x "50%" -y "50%" \; move-pane -P bottom-right
+bind-key  -T move M-Up    resize-pane -x "100%" -y "50%" \; move-pane -P top-centre
+bind-key  -T move M-Down  resize-pane -x "100%" -y "50%" \; move-pane -P bottom-centre
+bind-key  -T move M-Left  resize-pane -x "50%" -y "100%" \; move-pane -P centre-left
+bind-key  -T move M-Right resize-pane -x "50%" -y "100%" \; move-pane -P centre-right

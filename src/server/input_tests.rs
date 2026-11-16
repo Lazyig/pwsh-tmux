@@ -260,8 +260,10 @@ fn input_option_remain_on_exit_key_and_failed_key() {
         f.pane_exited(pane, Some(status));
         assert_eq!(f.panes.contains_key(&pane), keep);
         if keep {
-            f.dispatch_input(1, keys::Input::Paste(b"paste".to_vec())); assert!(f.panes.contains_key(&pane));
-            f.handle_input(1, b"x"); assert!(!f.panes.contains_key(&pane)); assert!(f.sessions.is_empty());
+            // tmux 3.8 (checked on the pod): any key closes it, a pasted one too
+            // (server_client_handle_dead_key skips only the paste start and end markers)
+            if setting == "key" { f.handle_input(1, b"x"); } else { f.dispatch_input(1, keys::Input::Paste(b"paste".to_vec())); }
+            assert!(!f.panes.contains_key(&pane)); assert!(f.sessions.is_empty());
         }
     }
 }
@@ -337,15 +339,21 @@ fn input_backspace_and_extended_keys_follow_input_key() {
 }
 
 #[test]
-fn input_remain_on_exit_key_runs_bindings_first() {
+fn input_remain_on_exit_key_closes_before_bindings() {
     let mut f = fixture(); let pane = f.pane;
     f.opts_session.set("remain-on-exit", "key".into());
     run(&mut f, &["new-window", "-d"]);
     f.panes.get_mut(&pane).unwrap().options.set("remain-on-exit", "key".into());
     f.pane_exited(pane, Some(0));
     let windows = f.sessions[&f.sid].links.len();
-    f.handle_input(1, b"\x02c"); // the prefix and a bound key reach the key tables
-    assert!(f.panes.contains_key(&pane)); assert_eq!(f.sessions[&f.sid].links.len(), windows + 1);
+    // server_client_handle_key: the prefix itself closes it (tmux 3.8, checked on the pod),
+    // and the next key goes on to the window now current, not to the prefix table
+    f.handle_input(1, b"\x02c");
+    assert!(!f.panes.contains_key(&pane)); assert_eq!(f.sessions[&f.sid].links.len(), windows - 1);
+    let mut f = fixture(); let pane = f.pane;
+    run(&mut f, &["new-window", "-d"]);
+    f.panes.get_mut(&pane).unwrap().options.set("remain-on-exit", "key".into());
+    f.pane_exited(pane, Some(0));
     run(&mut f, &["select-window", "-t", ":0"]);
     f.clients.get_mut(&1).unwrap().readonly = true;
     f.handle_input(1, b"x"); assert!(!f.panes.contains_key(&pane)); // read-only clients may dismiss it
@@ -769,13 +777,13 @@ fn pasted_input_never_reaches_a_pane_in_a_mode() {
     f.handle_input(1, b"\x1b[200~hi\x1b[201~");
     assert!(f.panes[&pane].mode.is_none());
     assert_eq!(f.pane_input.try_iter().flatten().collect::<Vec<u8>>(), b"hi");
-    // a guessed paste goes as the bytes typed, and does not close a dead pane kept by
-    // remain-on-exit key
+    // a dead pane kept by remain-on-exit key closes on typed (or guessed pasted) input
+    // too: server_client_handle_key checks it before the paste guess (tmux 3.8, pod)
     f.panes.get_mut(&pane).unwrap().options.set("remain-on-exit", "key".into());
     run(&mut f, &["new-window", "-d"]);
     f.pane_exited(pane, Some(0));
     f.handle_input(1, b"xyz");
-    assert!(f.panes.contains_key(&pane));
+    assert!(!f.panes.contains_key(&pane));
 }
 
 #[test]

@@ -213,14 +213,12 @@ impl Server {
         Some(FGeom { x: c.x as i32, y: c.y as i32, w: c.w, h: c.h })
     }
 
-    /// tmux `window_set_active_pane` (with `window_redraw_active_switch` raising a floating
-    /// pane to the front): nothing but the modal pane can become active while there is one,
-    /// and a zoomed window is unzoomed unless the pane is shown above the zoom.
     /// tmux server_client_handle_dead_key: a key pressed in a dead pane kept by
-    /// remain-on-exit key or failed-key (split-window/new-pane -k and -m) closes it, before
-    /// any binding is looked up. False when the key goes on as usual.
-    pub fn dead_key(&mut self, cid: ClientId, pane: PaneId) -> bool {
-        if self.clients.get(&cid).is_none_or(|c| c.is_readonly()) || self.panes.get(&pane).is_none_or(|p| p.dead.is_none()) {
+    /// remain-on-exit key or failed-key (split-window/new-pane -k and -m) closes it. Callers
+    /// decide about read-only clients (server_client_handle_key skips them, forward_key
+    /// does not). False when the key goes on as usual.
+    pub fn dead_key(&mut self, pane: PaneId) -> bool {
+        if self.panes.get(&pane).is_none_or(|p| p.dead.is_none()) {
             return false;
         }
         if !matches!(self.opt_pane(pane, "remain-on-exit").as_str(), "key" | "failed-key") {
@@ -233,6 +231,9 @@ impl Server {
         true
     }
 
+    /// tmux `window_set_active_pane` (with `window_redraw_active_switch` raising a floating
+    /// pane to the front): nothing but the modal pane can become active while there is one,
+    /// and a zoomed window is unzoomed unless the pane is shown above the zoom.
     pub fn set_active_pane(&mut self, wid: WinId, pane: PaneId) -> bool {
         let Some(w) = self.windows.get(&wid) else { return false };
         if w.modal.is_some_and(|m| m != pane) || pane == w.active {
@@ -374,11 +375,14 @@ impl Server {
 
     /// Continue parked new-pane -W queues: split-window's after hook (tmux inserts it
     /// before blocking, so it runs once the item continues), then the rest of the queue.
-    pub fn resume_pane_waits(&mut self, queues: Vec<Queue>, status: Option<i32>) {
+    pub fn resume_pane_waits(&mut self, queues: Vec<(Vec<String>, Queue)>, status: Option<i32>) {
         let code = status.map_or(129, wait_status);
-        for mut q in queues {
-            q.ctx.retval = Some(code);
-            self.after_command("new-pane", &q.ctx);
+        for (argv, mut q) in queues {
+            q.ctx.retval = code.into();
+            self.after_command(&argv, &q.ctx);
+            for c in std::mem::take(&mut self.ev.inject).into_iter().rev() {
+                q.cmds.push_front(c);
+            }
             self.run_queue(q);
         }
     }
@@ -489,15 +493,14 @@ impl Server {
         (x0.max(0)..end).rev().find(|x| !above.iter().any(|p| self.float_contains(wid, *p, *x, by))).map_or(0, |x| (x - x0 + 1) as usize)
     }
 
-    /// What a %layout-change is about, the same in either layout format: the tiled layout,
-    /// the floating panes and the zoom. Not the active pane or the z-order it raises (tmux
-    /// tells control clients on window-layout-changed only).
-    pub fn layout_key(&self, wid: WinId) -> String {
+    /// The floating panes' geometries, for telling a layout change (the old layout format
+    /// leaves them out). Not the z-order a raised pane changes: tmux fires
+    /// window-layout-changed for move-pane -z but not for selecting a pane.
+    pub fn float_key(&self, wid: WinId) -> String {
         let Some(w) = self.windows.get(&wid) else { return String::new() };
-        let area = self.window_area(wid);
         let mut floats = w.layout.floats();
         floats.sort_by_key(|f| f.0);
-        format!("{} {floats:?} {}", w.layout.to_layout_string(area), w.zoomed)
+        format!("{floats:?}")
     }
 
     /// Expand a size or position argument for a target (tmux
@@ -668,7 +671,7 @@ impl Server {
                 restore_zoom = false;
             }
             if !restore_zoom {
-                self.unzoom(wid);
+                self.unzoom_window(wid);
             }
             self.windows[&wid].is_floating(target)
         };
@@ -707,13 +710,13 @@ impl Server {
             } else {
                 self.float_geometry(wid, o, lines_none, None, tt)?
             };
-            self.unzoom(wid);
+            self.unzoom_window(wid);
             let cwd = cwd.or_else(|| self.panes.get(&target).map(|p| p.current_path.clone()));
             let new = match self.spawn_pane(tt.sid, g.w, g.h, &command, cwd.as_deref(), env) {
                 Ok(n) => n,
                 Err(e) => {
                     if restore_zoom {
-                        self.rezoom(wid, was_zoomed);
+                        self.rezoom_window(wid, was_zoomed);
                     }
                     return Err(e);
                 }
@@ -748,7 +751,7 @@ impl Server {
                 None
             };
             if !restore_zoom {
-                self.unzoom(wid);
+                self.unzoom_window(wid);
             }
             let new = self.split_pane(tt, horizontal, o.has('b'), size.map(|s| s.min(u16::MAX as i64) as u16), o.has('f'), cwd, &command, env)?;
             self.windows.get_mut(&wid).unwrap().zorder.retain(|p| *p != new);
@@ -793,9 +796,14 @@ impl Server {
             for (k, v) in set {
                 p.options.set(k, v);
             }
-            if let Some(t) = title {
-                p.title = t;
+            if let Some(t) = &title {
+                p.title = t.clone();
             }
+        }
+        if let Some(t) = title {
+            let mut p = self.payload_pane(new);
+            p.str("new_title", t);
+            self.fire("pane-title-changed", p);
         }
         // the new pane becomes active (a modal pane always), unless -d or a modal pane
         let w = self.windows.get_mut(&wid).unwrap();
@@ -807,7 +815,7 @@ impl Server {
             w.set_active(new);
         }
         if restore_zoom {
-            self.rezoom(wid, was_zoomed);
+            self.rezoom_window(wid, was_zoomed);
         } else if !floating && o.has('Z') {
             let w = self.windows.get_mut(&wid).unwrap();
             w.zoomed = true;
@@ -818,7 +826,7 @@ impl Server {
             self.mark_session_dirty(sid);
         }
         self.mark_window_dirty(wid);
-        self.run_hook(tt.sid, "window-layout-changed", Ctx::default());
+        // spawn_pane's window-layout-changed: reported with the command's other changes
         if o.has('P') {
             let fmt = o.get('F').unwrap_or("#{session_name}:#{window_index}.#{pane_index}");
             let line = self.expand_for_pane(new, fmt);
@@ -862,12 +870,13 @@ impl Server {
         }
         self.apply_layout(wid);
         self.mark_window_dirty(wid);
-        self.run_hook(t.sid, "window-layout-changed", Ctx::default());
+        // join-pane.c / cmd-resize-pane.c fire it whether or not anything changed
+        self.ev.layout_fired.push((wid, 1));
         Ok(Flow::Next)
     }
 
     /// join-pane of a floating pane onto itself (tmux `cmd_join_pane_tile`): tile it again.
-    pub fn cmd_tile_pane(&mut self, o: &Opts, wid: WinId, pane: PaneId, t: Target) -> Result<Flow, String> {
+    pub fn cmd_tile_pane(&mut self, o: &Opts, wid: WinId, pane: PaneId, _t: Target) -> Result<Flow, String> {
         let w = &self.windows[&wid];
         let Some(g) = w.layout.geom(pane) else { return err("pane is not floating") };
         if w.zoomed {
@@ -886,7 +895,8 @@ impl Server {
         }
         self.apply_layout(wid);
         self.mark_window_dirty(wid);
-        self.run_hook(t.sid, "window-layout-changed", Ctx::default());
+        // join-pane.c / cmd-resize-pane.c fire it whether or not anything changed
+        self.ev.layout_fired.push((wid, 1));
         Ok(Flow::Next)
     }
 
@@ -994,13 +1004,14 @@ impl Server {
             (g.x, g.y) = (x, y);
         }
         self.mark_window_dirty(wid);
-        self.run_hook(t.sid, "window-layout-changed", Ctx::default());
+        // join-pane.c / cmd-resize-pane.c fire it whether or not anything changed
+        self.ev.layout_fired.push((wid, 1));
         Ok(Flow::Next)
     }
 
     /// resize-pane on a floating pane: -x/-y set the size with the border lines (tmux
     /// `layout_resize_floating_pane_to`), -U/-D/-L/-R move a border (`_floating_pane`).
-    pub fn cmd_resize_float(&mut self, o: &Opts, wid: WinId, pane: PaneId, t: Target) -> Result<Flow, String> {
+    pub fn cmd_resize_float(&mut self, o: &Opts, wid: WinId, pane: PaneId, _t: Target) -> Result<Flow, String> {
         let w = &self.windows[&wid];
         let (wsx, wsy) = (w.sx as i64, w.sy as i64);
         let lines_none = self.pane_lines(wid, pane) == "none";
@@ -1066,7 +1077,8 @@ impl Server {
         }
         self.apply_layout(wid);
         self.mark_window_dirty(wid);
-        self.run_hook(t.sid, "window-layout-changed", Ctx::default());
+        // join-pane.c / cmd-resize-pane.c fire it whether or not anything changed
+        self.ev.layout_fired.push((wid, 1));
         Ok(Flow::Next)
     }
 
@@ -1317,7 +1329,8 @@ mod tests {
     fn default_floating_bindings() {
         let b = super::super::input::default_bindings();
         // C-b g enters the move table of tmux 3.8 (19 keys)
-        assert_eq!(b["prefix"]["g"].cmd, "switch-client -T move");
+        // stored as key-bindings.c writes it; list-keys prints "switch-client -T move"
+        assert_eq!(b["prefix"]["g"].cmd, "switch-client -Tmove");
         assert_eq!(b["move"].len(), 19);
         assert_eq!(b["move"]["M-Right"].note, "Move pane to right and resize");
         assert_eq!(b["prefix"]["*"].cmd, "new-pane");
@@ -1510,7 +1523,7 @@ mod tests {
         let e = r.err().unwrap();
         assert!(e.starts_with("\0pane-wait\0"));
         let id: PaneId = e.rsplit('\0').next().unwrap().parse().unwrap();
-        srv.pane_waits.entry(id).or_default().push(Queue { cmds: VecDeque::new(), ctx: Ctx::default(), soft: 0 });
+        srv.pane_waits.entry(id).or_default().push((vec!["new-pane".into()], Queue { cmds: VecDeque::new(), ctx: Ctx::default(), soft: 0 }));
         srv.finish_pane_waits(id, Some(3));
         assert!(srv.pane_waits.is_empty());
         // after-split-window runs when the -W item continues, not before
@@ -1518,7 +1531,7 @@ mod tests {
         let r = srv.exec(["new-pane", "-W", "-E", "-P", "-F", "#{pane_id}"].iter().map(|s| s.to_string()).collect(), &mut Ctx::default());
         let id: PaneId = r.err().unwrap().rsplit('\0').next().unwrap().parse().unwrap();
         assert_eq!(ok(&mut srv, &["show", "-gqv", "@c"]), "");
-        srv.pane_waits.entry(id).or_default().push(Queue { cmds: VecDeque::new(), ctx: Ctx::default(), soft: 0 });
+        srv.pane_waits.entry(id).or_default().push((vec!["new-pane".into()], Queue { cmds: VecDeque::new(), ctx: Ctx::default(), soft: 0 }));
         srv.finish_pane_waits(id, Some(0));
         assert_eq!(ok(&mut srv, &["show", "-gqv", "@c"]), "S\n");
         // WEXITSTATUS; a failing Windows status never looks like success
@@ -1698,4 +1711,26 @@ mod tests {
         assert!(!srv.panes.contains_key(&id2));
         srv.shutdown();
     }
+
+    #[test]
+    fn display_panes_mode_draws_floating_panes() {
+        let (mut srv, _ev) = server();
+        ok(&mut srv, &["new-session", "-d", "-s", "p", "-x", "50", "-y", "14"]);
+        ok(&mut srv, &["split-window", "-h"]);
+        ok(&mut srv, &["new-pane", "-x", "20", "-y", "6", "-X", "5", "-Y", "3"]);
+        ok(&mut srv, &["display-panes", "-d", "0"]);
+        let wid = win(&srv);
+        let a = srv.windows[&wid].active;
+        let Some(PaneMode::Panes(m)) = &srv.panes[&a].mode else { panic!("no panes mode") };
+        let lines = m.render(&srv, 50, 14);
+        let row = |y: usize| -> String { lines[y].cells.iter().map(|c| c.text.as_str()).collect() };
+        // window_panes_draw_screen: the tiled panes with their display-panes-format...
+        assert_eq!(row(0), "                    25x14│                   24x14");
+        // ...then the floating pane on a cleared area inside its own border, with its number
+        // (as tmux 3.8 draws the same window: border from column 5, row 3)
+        assert_eq!(&row(3)[..row(3).char_indices().nth(26).unwrap().0], "     ┌──────────────────┐│");
+        assert!(row(4).starts_with("     │") && row(4).contains("18x4││"), "{}", row(4));
+        assert_eq!(&row(8)[..row(8).char_indices().nth(26).unwrap().0], "     └──────────────────┘│");
+    }
+
 }

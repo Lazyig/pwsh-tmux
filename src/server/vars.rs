@@ -541,6 +541,10 @@ impl Vars for VarCtx<'_> {
             | "pane_unzoomed_width" | "pane_unzoomed_height" => {
                 let (w, p) = (win?, t.pane?);
                 let area = srv.window_area(w.id);
+                // a zoomed floating pane keeps its floating cell's size unzoomed
+                if let (Some(g), "pane_unzoomed_width" | "pane_unzoomed_height") = (w.layout.geom(p), name) {
+                    return Some(if name == "pane_unzoomed_width" { g.w } else { g.h }.to_string());
+                }
                 // a floating pane's cell (also while hidden by a zoom)
                 if let Some(g) = w.layout.geom(p).filter(|_| srv.zoomed_pane(w.id) != Some(p)) {
                     let (right, bottom) = (g.x + g.w as i32, g.y + g.h as i32);

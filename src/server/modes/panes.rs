@@ -158,6 +158,57 @@ impl Panes {
             }
             out.push((p, x, y, x2 - x, sy));
         }
+        for (p, area, _) in self.floats(srv, dsx, dsy) {
+            if let Some(area) = area {
+                out.push((p, area.0, area.1, area.2, area.3));
+            }
+        }
+        out
+    }
+
+    /// The floating panes of the source window back to front, as their saved (unzoomed)
+    /// cells: the area drawn (window_panes_get_geometry clipped by
+    /// window_panes_clip_floating_pane) and the border lines (x, y, x2, y2) around it
+    /// (window_panes_get_floating_borders, -1 for a pane at the top or left edge).
+    #[allow(clippy::type_complexity)]
+    fn floats(&self, srv: &Server, dsx: u16, dsy: u16) -> Vec<(PaneId, Option<(u16, u16, u16, u16)>, (i32, i32, i32, i32))> {
+        let Some(w) = srv.windows.get(&self.source) else { return vec![] };
+        let (osx, osy) = (w.sx.max(1), w.sy.max(1));
+        if dsx == 0 || dsy == 0 {
+            return vec![];
+        }
+        let scaled = !(osx <= dsx && osy <= dsy);
+        let m = |v: i64, o: u16, d: u16| if scaled { v * d as i64 / o as i64 } else { v };
+        let mut out = Vec::new();
+        for p in w.zlist().into_iter().rev() {
+            let Some(g) = w.layout.geom(p) else { continue };
+            let (gx, gy) = (g.x as i64, g.y as i64);
+            let border = (
+                if gx == 0 { -1 } else { m(gx - 1, osx, dsx) as i32 },
+                if gy == 0 { -1 } else { m(gy - 1, osy, dsy) as i32 },
+                m(gx + g.w as i64, osx, dsx) as i32,
+                m(gy + g.h as i64, osy, dsy) as i32,
+            );
+            // tmux's unsigned offsets: a pane off the left or top is not drawn
+            let area = (gx >= 0 && gy >= 0).then(|| {
+                let (x, y) = (m(gx, osx, dsx), m(gy, osy, dsy));
+                let (mut x2, mut y2) = (m(gx + g.w as i64, osx, dsx), m(gy + g.h as i64, osy, dsy));
+                if x >= dsx as i64 || y >= dsy as i64 {
+                    return None;
+                }
+                x2 = x2.max(x + 1).min(dsx as i64);
+                y2 = y2.max(y + 1).min(dsy as i64);
+                // window_panes_clip_floating_pane: inside the border lines
+                let (mut bx, mut by, mut bx2, mut by2) = (x, y, x2 - 1, y2 - 1);
+                let (cx, cy, cx2, cy2) = (border.0 as i64, border.1 as i64, border.2 as i64, border.3 as i64);
+                if cx >= 0 && bx <= cx { bx = cx + 1; }
+                if cy >= 0 && by <= cy { by = cy + 1; }
+                if cx2 < dsx as i64 && bx2 >= cx2 { bx2 = cx2 - 1; }
+                if cy2 < dsy as i64 && by2 >= cy2 { by2 = cy2 - 1; }
+                (bx2 >= bx && by2 >= by).then_some((bx as u16, by as u16, (bx2 - bx + 1) as u16, (by2 - by + 1) as u16))
+            }).flatten();
+            out.push((p, area, border));
+        }
         out
     }
 
@@ -172,8 +223,8 @@ impl Panes {
         let scaled = !(osx <= w && osy <= h);
         let active = srv.windows.get(&wid).map(|w| w.active);
         let format = srv.opt_window(owner_t.wid, "display-panes-format");
-        for (p, x, y, sx, sy) in self.areas(srv, w, h) {
-            let Some(pane) = srv.panes.get(&p) else { continue };
+        let draw_pane = |grid: &mut Vec<Vec<Cell>>, (p, x, y, sx, sy): Area| {
+            let Some(pane) = srv.panes.get(&p) else { return };
             // the pane's content: the top left, or the area around the cursor when scaled
             let scr = pane.screen();
             let (cy, cx) = scr.cursor_position();
@@ -207,7 +258,7 @@ impl Panes {
                 }
             }
             // window_panes_draw_number
-            let Some(number) = Panes::pane_index(srv, wid, p) else { continue };
+            let Some(number) = Panes::pane_index(srv, wid, p) else { return };
             let t = Target { sid, idx, wid: Some(wid), pane: Some(p) };
             let name = if active == Some(p) { "display-panes-active-colour" } else { "display-panes-colour" };
             let colour = crate::format::parse_color_with(&srv.opt_window(owner_t.wid, name), Some(&crate::server::vars::VarCtx { srv, t, client: None, extra: HashMap::new() })).unwrap_or(Color::Default);
@@ -217,7 +268,7 @@ impl Panes {
             let lbuf = if number > 9 && number < 35 { ((b'a' + (number - 10) as u8) as char).to_string() } else { String::new() };
             let (len, llen) = (buf.len() as u16, lbuf.len() as u16);
             if sx < len {
-                continue;
+                return;
             }
             let has_format = !format.is_empty();
             let put = |grid: &mut Vec<Vec<Cell>>, x: u16, y: u16, text: &str, style: Style| {
@@ -250,14 +301,14 @@ impl Panes {
                 }
                 let cx = x + (sx - width) / 2;
                 let cy = y + sy / 2;
-                put(&mut grid, cx, cy, &buf, fgc);
+                put(grid, cx, cy, &buf, fgc);
                 if width > len {
-                    put(&mut grid, cx + len, cy, &format!(" {lbuf}"), fgc);
+                    put(grid, cx + len, cy, &format!(" {lbuf}"), fgc);
                 }
                 if has_format && sy > 1 {
-                    draw_format(&mut grid);
+                    draw_format(grid);
                 }
-                continue;
+                return;
             }
             let mut px = (sx - width) / 2;
             let py = (sy - 5) / 2;
@@ -266,19 +317,24 @@ impl Panes {
                 for (j, row) in rows.iter().enumerate() {
                     for (i, b) in row.chars().enumerate() {
                         if b == '#' {
-                            put(&mut grid, x + px + i as u16, y + py + j as u16, " ", bgc);
+                            put(grid, x + px + i as u16, y + py + j as u16, " ", bgc);
                         }
                     }
                 }
                 px += 6;
             }
             if sy <= 6 {
-                continue;
+                return;
             }
-            draw_format(&mut grid);
+            draw_format(grid);
             if llen != 0 {
-                put(&mut grid, (x + px).saturating_sub(llen + 1), y + py + 5, &lbuf, fgc);
+                put(grid, (x + px).saturating_sub(llen + 1), y + py + 5, &lbuf, fgc);
             }
+        };
+        let floats = self.floats(srv, w, h);
+        let tiled: Vec<Area> = self.areas(srv, w, h).into_iter().filter(|a| !floats.iter().any(|f| f.0 == a.0)).collect();
+        for area in tiled {
+            draw_pane(&mut grid, area);
         }
 
         // window_panes_draw_borders
@@ -334,6 +390,31 @@ impl Panes {
                 let m = bm.m[y * wu + x];
                 if m != 0 {
                     grid[y][x] = Cell { text: border_char(m).into(), style: bstyle };
+                }
+            }
+        }
+        // window_panes_draw_screen: the floating panes go over the tiled ones, back to front,
+        // each on a cleared area inside its own border
+        for (p, area, (bx, by, bx2, by2)) in floats {
+            for yy in by.max(0)..=by2.min(h as i32 - 1) {
+                for xx in bx.max(0)..=bx2.min(w as i32 - 1) {
+                    grid[yy as usize][xx as usize] = Cell { text: " ".into(), style: Style::default() };
+                }
+            }
+            if let Some((x, y, sx, sy)) = area {
+                draw_pane(&mut grid, (p, x, y, sx, sy));
+            }
+            let mut fm = BorderMap { w: wu, h: hu, m: vec![0; wu * hu] };
+            fm.hline(bx, bx2 + 1, by);
+            fm.hline(bx, bx2 + 1, by2);
+            fm.vline(bx, by, by2 + 1);
+            fm.vline(bx2, by, by2 + 1);
+            for y in 0..hu {
+                for x in 0..wu {
+                    let m = fm.m[y * wu + x];
+                    if m != 0 {
+                        grid[y][x] = Cell { text: border_char(m).into(), style: bstyle };
+                    }
                 }
             }
         }

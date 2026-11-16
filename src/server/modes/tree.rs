@@ -560,7 +560,7 @@ impl Tree {
         // active_point (focus order: never active, then the last active, then the active)
         let order = self.sort().unwrap_or(Sort::Index);
         let title = |p: PaneId| srv.panes.get(&p).map(|p| p.title.clone()).unwrap_or_default();
-        let point = |p: PaneId| if p == w.active { 2 } else if w.last_active == Some(p) { 1 } else { 0 };
+        let point = |p: PaneId| if p == w.active { 2 } else if w.last() == Some(p) { 1 } else { 0 };
         let size = |p: PaneId| srv.panes.get(&p).map_or(0, |p| p.size.0 as u32 * p.size.1 as u32);
         sort_by(&mut panes, order, self.reversed, |a, c| {
             match order {
@@ -1613,7 +1613,7 @@ impl Tree {
                     let t = Tree::client_target(srv, cl);
                     let mut pane = t.pane;
                     if self.hide_this_pane && pane == Some(self.owner) {
-                        pane = t.wid.and_then(|w| srv.windows.get(&w)).and_then(|w| w.last_active);
+                        pane = t.wid.and_then(|w| srv.windows.get(&w)).and_then(|w| w.last());
                     }
                     let lines = srv.status_lines(t.sid) as usize;
                     let lines = if lines >= sy { 0 } else { lines };

@@ -200,6 +200,8 @@ pub struct WinSeen {
     pub zoomed: bool,
     pub size: (u16, u16),
     pub layout: String,
+    /// The floating panes (Server::float_key), which `layout` leaves out.
+    pub floats: String,
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -1485,7 +1487,7 @@ impl Server {
             return;
         }
         let Some(w) = self.windows.get(&wid) else { return };
-        let seen = WinSeen { name: w.name.clone(), active: w.active, zoomed: w.zoomed, size: (w.sx, w.sy), layout: w.layout.to_layout_string(self.window_area(wid)) };
+        let seen = WinSeen { name: w.name.clone(), active: w.active, zoomed: w.zoomed, size: (w.sx, w.sy), layout: w.layout.to_layout_string(self.window_area(wid)), floats: self.float_key(wid) };
         self.ev.seen.windows.insert(wid, seen);
         self.fire_window("window-created", wid);
     }
@@ -1731,7 +1733,7 @@ impl Server {
         let mut changed: Vec<(WinId, WinSeen, WinSeen)> = Vec::new();
         for &wid in &wids {
             let Some(w) = self.windows.get(&wid) else { continue };
-            let now = WinSeen { name: w.name.clone(), active: w.active, zoomed: w.zoomed, size: (w.sx, w.sy), layout: w.layout.to_layout_string(self.window_area(wid)) };
+            let now = WinSeen { name: w.name.clone(), active: w.active, zoomed: w.zoomed, size: (w.sx, w.sy), layout: w.layout.to_layout_string(self.window_area(wid)), floats: self.float_key(wid) };
             let Some(old) = self.ev.seen.windows.get(&wid).cloned() else { continue };
             if old != now {
                 self.ev.seen.windows.insert(wid, now.clone());
@@ -1790,7 +1792,7 @@ impl Server {
                 self.fire_window(if now.zoomed { "window-zoomed" } else { "window-unzoomed" }, wid);
             }
             // rotate-window does not fire it
-            if (old.layout != now.layout || old.zoomed != now.zoomed || old.size != now.size) && command != Some("rotate-window") {
+            if (old.layout != now.layout || old.floats != now.floats || old.zoomed != now.zoomed || old.size != now.size) && command != Some("rotate-window") {
                 self.fire_window("window-layout-changed", wid);
                 layout_seen.push(wid);
             }
@@ -1840,6 +1842,7 @@ impl Server {
     pub fn flush_window_layout(&mut self, wid: WinId) {
         let Some(w) = self.windows.get(&wid) else { return };
         let (zoomed, layout) = (w.zoomed, w.layout.to_layout_string(self.window_area(wid)));
+        let floats = self.float_key(wid);
         for pane in w.panes() {
             let Some(size) = self.panes.get(&pane).map(|p| p.size) else { continue };
             let Some(seen) = self.ev.seen.panes.get_mut(&pane).filter(|s| s.wid == wid) else { continue };
@@ -1852,9 +1855,10 @@ impl Server {
         }
         let Some(seen) = self.ev.seen.windows.get_mut(&wid) else { return };
         let zoom_changed = seen.zoomed != zoomed;
-        let changed = zoom_changed || seen.layout != layout;
+        let changed = zoom_changed || seen.layout != layout || seen.floats != floats;
         seen.zoomed = zoomed;
         seen.layout = layout;
+        seen.floats = floats;
         if zoom_changed {
             self.fire_window(if zoomed { "window-zoomed" } else { "window-unzoomed" }, wid);
         }
@@ -1866,9 +1870,9 @@ impl Server {
     /// window_unzoom with notify (server_unzoom_window, window_push_zoom): its events
     /// come before those of the command that unzooms. Whether it was zoomed.
     pub fn unzoom_window(&mut self, wid: WinId) -> bool {
-        let Some(w) = self.windows.get_mut(&wid).filter(|w| w.zoomed) else { return false };
-        w.zoomed = false;
-        self.apply_layout(wid);
+        if !self.unzoom(wid) {
+            return false;
+        }
         self.flush_window_layout(wid);
         true
     }
@@ -1920,9 +1924,11 @@ impl Server {
     pub fn seen_layout_now(&mut self, wid: WinId) {
         let Some(w) = self.windows.get(&wid) else { return };
         let (zoomed, layout) = (w.zoomed, w.layout.to_layout_string(self.window_area(wid)));
+        let floats = self.float_key(wid);
         if let Some(seen) = self.ev.seen.windows.get_mut(&wid) {
             seen.zoomed = zoomed;
             seen.layout = layout;
+            seen.floats = floats;
         }
     }
 
@@ -1934,11 +1940,13 @@ impl Server {
         }
     }
 
-    /// window_pop_zoom: zooms the (new) active pane again.
-    pub fn rezoom_window(&mut self, wid: WinId) {
-        let Some(w) = self.windows.get_mut(&wid).filter(|w| !w.zoomed && w.panes().len() > 1) else { return };
-        w.zoomed = true;
-        self.apply_layout(wid);
+    /// window_pop_zoom: zooms the (new) active pane again, or `was` (the pane zoomed
+    /// before) while the active pane floats above the zoom.
+    pub fn rezoom_window(&mut self, wid: WinId, was: Option<PaneId>) {
+        if self.windows.get(&wid).is_none_or(|w| w.zoomed || w.panes().len() < 2) {
+            return;
+        }
+        self.rezoom(wid, was);
         self.flush_window_layout(wid);
     }
 

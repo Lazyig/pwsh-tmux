@@ -1314,12 +1314,12 @@ impl Node {
 /// links their cells in pane order into the node holding the other panes (even-*, and main-*
 /// with several other panes), or at the end of the root. None when there are not two tiled
 /// panes (tmux leaves the layout alone).
-pub fn preset_with_floats(name: &str, panes: &[(PaneId, Option<FGeom>)], area: Rect, main_size: Option<u16>) -> Option<Node> {
+pub fn preset_with_floats(name: &str, panes: &[(PaneId, Option<FGeom>)], area: Rect, main_size: Option<u16>, other_size: Option<u16>, max_columns: usize) -> Option<Node> {
     let tiled: Vec<PaneId> = panes.iter().filter(|p| p.1.is_none()).map(|p| p.0).collect();
     if tiled.len() <= 1 {
         return None;
     }
-    let mut cell = preset(name, &tiled, area, main_size)?.to_cell(area);
+    let mut cell = preset_with_options(name, &tiled, area, main_size, other_size, max_columns)?.to_cell(area);
     let float = |id: PaneId, g: FGeom| Cell { w: g.w, h: g.h, x: g.x, y: g.y, kind: CellKind::Float(id) };
     // interleave the floating cells with the tiled cells of a node, in pane order
     let interleave = |c: &mut Cell, skip: Option<PaneId>| {
@@ -2117,18 +2117,18 @@ mod tests {
         let a = area(80, 24);
         let g = FGeom { x: 4, y: 2, w: 40, h: 6 };
         let panes = [(1, None), (2, Some(g)), (3, None), (4, None)];
-        let n = preset_with_floats("even-horizontal", &panes, a, None).unwrap();
+        let n = preset_with_floats("even-horizontal", &panes, a, None, None, 0).unwrap();
         let ids: Vec<PaneId> = n.panes();
         assert_eq!(ids, vec![1, 2, 3, 4]);
         assert!(json(&n, a).starts_with(r#"{"V":2,"L":{"t":"h","w":80,"h":24,"x":0,"y":0,"c":[{"t":"p","w":26"#));
         // main-*: the floating cell joins the other panes
-        let n = preset_with_floats("main-vertical", &panes, a, None).unwrap();
+        let n = preset_with_floats("main-vertical", &panes, a, None, None, 0).unwrap();
         assert!(json(&n, a).ends_with(r#"{"t":"p","w":40,"h":6,"x":4,"y":2,"i":2,"z":0,"I":"%2"},{"t":"p","w":1,"h":12,"x":79,"y":0,"i":3,"I":"%3"},{"t":"p","w":1,"h":11,"x":79,"y":13,"i":4,"I":"%4"}]}]}}"#), "{}", json(&n, a));
         // tiled: at the end of the root
-        let n = preset_with_floats("tiled", &panes, a, None).unwrap();
+        let n = preset_with_floats("tiled", &panes, a, None, None, 0).unwrap();
         assert_eq!(n.panes(), vec![1, 3, 4, 2]);
         // one tiled pane: unchanged
-        assert!(preset_with_floats("tiled", &[(1, None), (2, Some(g))], a, None).is_none());
+        assert!(preset_with_floats("tiled", &[(1, None), (2, Some(g))], a, None, None, 0).is_none());
     }
 
     #[test]

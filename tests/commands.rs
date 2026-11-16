@@ -1802,7 +1802,8 @@ fn display_defaults_match_tmux_38_source() {
     }
     let ctx = Ctx::new("display-defaults");
     ctx.ok(&["new-session", "-d", "-s", "s"]);
-    let actual = [ctx.ok(&["list-keys", "-T", "prefix"]), ctx.ok(&["list-keys", "-T", "root"]), ctx.ok(&["list-keys", "-N"])];
+    let actual = [ctx.ok(&["list-keys", "-T", "prefix"]), ctx.ok(&["list-keys", "-T", "root"]), ctx.ok(&["list-keys", "-N"]), ctx.ok(&["list-keys", "-T", "move"])];
+    assert_eq!(sections.len(), actual.len());
     let key = |l: &str| -> String {
         let w: Vec<&str> = l.split_whitespace().collect();
         if w[0] == "bind-key" { w[if w[1] == "-r" { 4 } else { 3 }].to_string() } else { w[1].to_string() }
