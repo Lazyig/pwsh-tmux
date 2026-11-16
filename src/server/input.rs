@@ -795,16 +795,20 @@ impl Server {
 
     /// A menu belongs to a window (tmux 3.8 w->menu): every client showing the window sees
     /// and uses it, and opening another menu there replaces it (menu_close).
+    /// menu_display / menu_close: a window with a menu has no focused pane, so focus is
+    /// updated whenever one opens or closes (a new menu first closes the old one).
     pub fn set_window_menu(&mut self, wid: WinId, menu: Option<super::modes::Menu>) {
-        match menu {
-            Some(m) => {
-                self.menus.insert(wid, m);
-            }
-            None => {
-                self.menus.remove(&wid);
+        let live = self.windows.contains_key(&wid);
+        if self.menus.remove(&wid).is_some() && live {
+            self.update_window_focus(wid);
+        }
+        if let Some(m) = menu {
+            self.menus.insert(wid, m);
+            if live {
+                self.update_window_focus(wid);
             }
         }
-        if self.windows.contains_key(&wid) {
+        if live {
             self.mark_window_dirty(wid);
         }
     }

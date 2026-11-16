@@ -747,12 +747,8 @@ pub fn prompt_done(tree: &mut Tree, p: PromptFor, s: String, srv: &Server, b: &m
         PromptFor::Set { .. } | PromptFor::Append(_) if s.is_empty() => None,
         PromptFor::Set { item, value_scope } => set_command(srv, &item, value_scope, &s),
         PromptFor::Append(Item::Option { scope, name, hook, .. }) => {
-            // the first index that is not set
-            let used: Vec<u32> = if hook {
-                (0..array_values(srv, scope, &name, true).len() as u32).collect()
-            } else {
-                store_of(srv, scope).map(|o| o.array_items(&name).into_iter().filter_map(|(k, _)| k[name.len() + 1..k.len() - 1].parse().ok()).collect()).unwrap_or_default()
-            };
+            // the first index that is not set (hooks are sparse array options too)
+            let used: Vec<u32> = hook_items(srv, scope, &name).into_iter().filter_map(|(k, _)| k.parse().ok()).collect();
             let idx = (0..).find(|i| !used.contains(i)).unwrap_or(0);
             set_command(srv, &Item::Option { scope, name, key: Some(idx.to_string()), hook }, scope, &s)
         }

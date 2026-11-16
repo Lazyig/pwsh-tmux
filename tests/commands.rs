@@ -2455,6 +2455,36 @@ fn tmux_38_focus_then_pane_changed() {
     let _ = child.wait();
 }
 
+/// Checked against tmux 3.8: a window with an open menu has no focused pane
+/// (window_pane_update_focus); opening a menu over another closes that one first.
+#[test]
+fn tmux_38_menu_takes_pane_focus() {
+    let ctx = Ctx::new("menufocus");
+    ctx.ok(&["new-session", "-d", "-s", "f", "-x", "80", "-y", "24"]);
+    ctx.ok(&["set", "-g", "focus-events", "on"]);
+    for e in ["pane-focus-in", "pane-focus-out"] {
+        ctx.ok(&["set-hook", "-g", e, "set -gaF @log '#{hook} '"]);
+    }
+    let mut child = ctx.command().args(["-C", "attach", "-t", "f"]).stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+    wait_for("focused", || ctx.cmd(&["show", "-gv", "@log"]).1.contains("pane-focus-in"));
+    let log = || {
+        let l = ctx.cmd(&["show", "-gv", "@log"]).1.trim().to_string();
+        ctx.ok(&["set", "-gu", "@log"]);
+        l
+    };
+    log();
+    ctx.ok(&["display-menu", "-t", "f", "-x", "0", "-y", "0", "A", "a", "display a", "B", "b", "display b"]);
+    assert_eq!(log(), "pane-focus-out");
+    ctx.ok(&["display-menu", "-t", "f", "-x", "0", "-y", "0", "C", "c", "display c"]);
+    assert_eq!(log(), "pane-focus-in pane-focus-out");
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).lines().next().unwrap().to_string();
+    ctx.ok(&["send-keys", "-K", "-c", &client, "Escape"]);
+    wait_for("menu closed", || ctx.cmd(&["show", "-gv", "@log"]).1.contains("pane-focus-in"));
+    assert_eq!(log(), "pane-focus-in");
+    child.kill().unwrap();
+    let _ = child.wait();
+}
+
 /// A channel's waiters and lockers are independent; -w does not release a lock.
 #[test]
 fn tmux_38_wait_channel_lockers() {

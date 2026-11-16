@@ -1216,7 +1216,13 @@ impl Server {
     pub(crate) fn prompt_layout(&self, cid: ClientId, pr: &Prompt, ax: u16, aw: u16) -> PromptLayout {
         let sid = self.client_session(cid);
         let t = sid.map(|s| self.sessions[&s].active_window()).map(|w| self.target_for_pane(self.windows[&w].active)).unwrap_or_default();
-        let flags = [(pr.single_key, "SINGLE"), (pr.numeric, "NUMERIC"), (pr.incremental || pr.copy_incremental.is_some(), "INCREMENTAL"), (pr.bspace_exit, "BSPACE_EXIT"), (pr.vi_command, "COMMANDMODE"), (pr.host.is_some(), "ISPANE")];
+        // prompt_create keeps the command's find state: a pane prompt expands for its pane
+        let t = match pr.host.filter(|h| self.panes.contains_key(h)) {
+            Some(h) if self.window_of(h) == t.wid => Target { pane: Some(h), ..t },
+            Some(h) => self.target_for_pane(h),
+            None => t,
+        };
+        let flags =[(pr.single_key, "SINGLE"), (pr.numeric, "NUMERIC"), (pr.incremental || pr.copy_incremental.is_some(), "INCREMENTAL"), (pr.bspace_exit, "BSPACE_EXIT"), (pr.vi_command, "COMMANDMODE"), (pr.host.is_some(), "ISPANE")];
         let extra = HashMap::from([
             ("prompt_input".to_string(), pr.input.iter().collect::<String>()),
             ("prompt_flags".to_string(), flags.into_iter().filter_map(|(on, flag)| on.then_some(flag)).collect::<Vec<_>>().join(",")),

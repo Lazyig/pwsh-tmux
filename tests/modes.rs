@@ -477,6 +477,23 @@ fn pane_prompt_belongs_to_the_pane_not_the_client() {
 }
 
 #[test]
+fn pane_prompt_expands_for_its_own_pane() {
+    let ctx = Ctx::new("pane-prompt-fmt");
+    let t = start(&ctx, "pf");
+    let c1 = client(&ctx);
+    ctx.ok(&["split-window", "-h", "-t", "pf"]);
+    ctx.ok(&["set", "-g", "message-format", "<#{pane_index}>#{message}"]);
+    ctx.ok(&["command-prompt", "-b", "-P", "-t", &c1, "-p", "IDX#{pane_index}", "set -g @p '%%'"]);
+    t.wait_screen("prompt on pane 1", |s| s.contains("<1>IDX1"));
+    // prompt_create keeps the command's state: the label is still for pane 1 once
+    // another pane is active
+    ctx.ok(&["select-pane", "-t", "pf:0.0"]);
+    ctx.ok(&["refresh-client", "-t", &c1]);
+    std::thread::sleep(Duration::from_millis(300));
+    t.wait_screen("still pane 1", |s| s.contains("<1>IDX1") && !s.contains("IDX0"));
+}
+
+#[test]
 fn pane_in_mode_counts_the_mode_stack_and_only_copy_mode_takes_commands() {
     let ctx = Ctx::new("mode-count");
     ctx.ok(&["new-session", "-d", "-s", "n"]);
@@ -663,6 +680,34 @@ fn customize_mode_toggles_cycles_appends_and_describes() {
     t.wait_screen("changed only", |s| s.contains("+ command-alias"));
     t.send(b"\x1b[H\x1b[B\x1b[C");
     t.wait_screen("changed elements", |s| s.contains("zz=display hi") && !s.contains("command-alias[0]"));
+}
+
+#[test]
+fn customize_mode_appends_to_a_sparse_hook_at_the_first_free_index() {
+    let ctx = Ctx::new("customize-hookadd");
+    let t = start(&ctx, "ch");
+    ctx.ok(&["set-hook", "-g", "after-new-window[1]", "set -g @one 1"]);
+    ctx.ok(&["set-hook", "-g", "after-new-window[2]", "set -g @two 1"]);
+    ctx.ok(&["customize-mode", "-t", "ch", "-f", "#{==:#{option_name},after-new-window}"]);
+    t.wait_screen("groups", |s| s.contains("Session Hooks"));
+    t.send(b"\x1b+");
+    t.wait_screen("expanded", |s| s.contains("+ after-new-window"));
+    let c = t.contents();
+    let first = c.lines().position(|l| l.starts_with("(0)")).unwrap();
+    let at = c.lines().position(|l| l.contains("after-new-window") && !l.contains('[')).unwrap() - first;
+    t.send(b"\x1b[H");
+    for _ in 0..at {
+        t.send(b"\x1b[B");
+    }
+    t.send(b"s");
+    t.wait_screen("append prompt", |s| s.contains("(after-new-window[+]"));
+    t.send(b"\x15set -g @zero 1\r");
+    // window_customize_set_option_callback: the first index without a value, here 0
+    wait_for("appended", || ctx.ok(&["show-hooks", "-g", "after-new-window"]).contains("@zero"));
+    assert_eq!(
+        ctx.ok(&["show-hooks", "-g", "after-new-window"]),
+        "after-new-window[0] set-option -g @zero 1\nafter-new-window[1] set-option -g @one 1\nafter-new-window[2] set-option -g @two 1\n"
+    );
 }
 
 #[test]

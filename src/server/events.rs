@@ -2012,8 +2012,8 @@ impl Server {
     }
 
     /// window_pane_update_focus for every window: the active pane of a window shown
-    /// to a focused client (without an overlay) has focus; changes are sent to panes
-    /// that asked for focus events and fire pane-focus-in/out.
+    /// to a focused client (without an overlay) and without an open menu has focus;
+    /// changes are sent to panes that asked for focus events and fire pane-focus-in/out.
     pub fn update_focus(&mut self) {
         let mut focused = HashSet::new();
         for c in self.clients.values() {
@@ -2021,6 +2021,9 @@ impl Server {
                 continue;
             }
             let Some((_, wid)) = c.session.and_then(|s| self.session_window(s)) else { continue };
+            if self.menus.contains_key(&wid) {
+                continue;
+            }
             if let Some(w) = self.windows.get(&wid) {
                 focused.insert(w.active);
             }
@@ -2039,11 +2042,11 @@ impl Server {
         }
     }
 
-    /// Whether a pane should have focus: the active pane of a window that is current
-    /// for a focused client without an overlay.
+    /// Whether a pane should have focus: the active pane of a window without an open
+    /// menu that is current for a focused client without an overlay.
     fn pane_should_focus(&self, pane: PaneId) -> bool {
         let Some(wid) = self.window_of(pane) else { return false };
-        if self.windows.get(&wid).is_none_or(|w| w.active != pane) {
+        if self.windows.get(&wid).is_none_or(|w| w.active != pane) || self.menus.contains_key(&wid) {
             return false;
         }
         self.clients.values().any(|c| {
