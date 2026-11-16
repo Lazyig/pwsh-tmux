@@ -3032,3 +3032,33 @@ fn parse_errors_are_yacc_syntax_errors() {
     ctx.ok(&["source-file", "-q", "nonexistent-wq.conf"]);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn control_mode_argument_errors_are_parse_errors() {
+    use std::io::{BufRead, BufReader};
+    let ctx = Ctx::new("wq-ctl-parse");
+    ctx.ok(&["new-session", "-d", "-s", "c", "sleep 100"]);
+    let mut child = ctx.command().args(["-C", "attach", "-t", "c"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let out = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    {
+        let out = out.clone();
+        let stdout = child.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                out.lock().unwrap().push_str(&(line + "\n"));
+            }
+        });
+    }
+    let mut stdin = child.stdin.take().unwrap();
+    let text = || out.lock().unwrap().clone();
+    wait_for("attach reply", || text().contains("%end "));
+    // the argument checks are part of parsing (cmd_parse_build_command), so none of the
+    // line runs
+    stdin.write_all(b"set -g @ran 1 ; kill-session -t c extra\n").unwrap();
+    stdin.flush().unwrap();
+    wait_for("parse error", || text().contains("parse error: command kill-session: too many arguments (need at most 0)\n%error "));
+    assert!(ctx.ok(&["show-options", "-gqv", "@ran"]).is_empty());
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+}

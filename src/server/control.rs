@@ -102,7 +102,8 @@ impl Server {
             self.control_block(cid, seq, true, "", Some(&format!("parse error: {e}")));
             return;
         }
-        match crate::cmdparse::parse(line) {
+        // the commands' arguments are checked while parsing too (cmd_parse_build_command)
+        match crate::cmdparse::parse(line).and_then(|c| c.iter().try_for_each(|c| self.check_parsed(c)).map(|_| c)) {
             Ok(cmds) => self.run_queue(Queue { cmds: cmds.into(), ctx, soft: 0 }),
             // control_error
             Err(e) => self.control_block(cid, seq, true, "", Some(&format!("parse error: {e}"))),
