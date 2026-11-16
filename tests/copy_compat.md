@@ -87,8 +87,32 @@ comparison; this CLI fixture does not capture an attached terminal's rendered UI
   The emacs search-mark bookkeeping on this special server path also remains.
 - next-prompt/previous-prompt have bindings and metadata but no movement: snapshots
   do not carry shell prompt markers. They need terminal-parser/snapshot metadata.
-- Snapshots lack hyperlink, original tab and history timestamp metadata, so
-  copy_cursor_hyperlink, original-tab copying and top_line_time lack full parity.
+- Snapshots lack hyperlink, tab-cell (GRID_FLAG_TAB) and history timestamp
+  metadata, so copy_cursor_hyperlink, tab-aware motion and copying, and
+  top_line_time lack full parity. The terminal parser would have to record them.
+- The repeat-count prompt is kept by the engine and not drawn: tmux 3.8 shows it as
+  a pane prompt (`command-prompt -P -N`), which needs pane-prompt support and the
+  numeric prompt's "close and dispatch the key again" behaviour in the prompt code.
+  Keys after a count already go through the copy-mode table with the count.
+- The incremental prompt sends `=text` on open and on each edit as tmux does, but
+  C-r/C-s inside the open prompt (refill from the last search, or `-`/`+` again)
+  need the prompt editor to fire them.
+
+## Round 3 (verified against live tmux 3.8)
+
+- Edge rows: a drag scroll that cannot scroll leaves the selection end in place;
+  window_copy_move_mouse moves only the cursor before a mouse binding's command.
+- copy-line / copy-end-of-line: tmux's start_selection keeps selflag, lineflag and
+  rectflag, no vi trailing newline, the selection is cleared afterwards.
+- Selection drawing follows screen_check_selection and screen_select_cell; the
+  position format blanks wide characters it cuts; a gutter as wide as the pane keeps
+  one text column.
+- Searches look at each wrapped line once; refresh re-marks the search; incremental
+  restart positions (searchx/searchy) follow window_copy_command; send -X parses
+  flags (`--`), expands buffer prefixes and pipe commands, fails outside a mode.
+- copy-mode -s clones like window_copy_clone_screen (trim, height, reflow) and
+  resizes reflow with grid_reflow's split/join rules, including its counting of a
+  wide character's padding cell as a column.
 
 These metadata and scrollbar limitations remain outside the round 2 search scope.
 The package should not be described as full window-copy.c parity. A no-current-client scroll-to-mouse probe crashed the live reference;
