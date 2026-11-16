@@ -1352,25 +1352,36 @@ impl Server {
                 return;
             }
         }
+        match name {
+            None => self.paste_add("buffer", data),
+            Some(name) if !data.is_empty() => {
+                self.buffers.insert(0, Buffer { name: name.clone(), data, automatic: false, created: now_secs() });
+                self.buffer_event(&name, false);
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// paste_add: a new automatic buffer named `{prefix}N`, freeing the oldest automatic
+    /// buffers over buffer-limit first; paste-buffer-changed fires with the final name.
+    pub fn paste_add(&mut self, prefix: &str, data: Vec<u8>) {
         if data.is_empty() {
             return;
         }
-        let automatic = name.is_none();
-        let name = name.unwrap_or_else(|| loop {
-            let n = format!("buffer{}", self.buffer_seq);
-            self.buffer_seq += 1;
-            if !self.buffers.iter().any(|b| b.name == n) {
-                break n;
-            }
-        });
         let limit = self.opt_server_num("buffer-limit").max(1) as usize;
-        // paste_add frees the oldest automatic buffers first
-        while self.buffers.iter().filter(|b| b.automatic).count() >= limit && automatic {
+        while self.buffers.iter().filter(|b| b.automatic).count() >= limit {
             let Some(pos) = self.buffers.iter().rposition(|b| b.automatic) else { break };
             let old = self.buffers.remove(pos);
             self.buffer_event(&old.name, true);
         }
-        self.buffers.insert(0, Buffer { name: name.clone(), data, automatic, created: now_secs() });
+        let name = loop {
+            let n = format!("{prefix}{}", self.buffer_seq);
+            self.buffer_seq += 1;
+            if !self.buffers.iter().any(|b| b.name == n) {
+                break n;
+            }
+        };
+        self.buffers.insert(0, Buffer { name: name.clone(), data, automatic: true, created: now_secs() });
         self.buffer_event(&name, false);
     }
 

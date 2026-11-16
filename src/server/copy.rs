@@ -247,29 +247,19 @@ impl Server {
                 let (no_clip, no_paste) = flags;
                 if append {
                     self.copy_to_clipboard(pane, &text);
-                    self.add_buffer(None, text.into_bytes(), true);
-                } else if !no_clip && !no_paste {
-                    self.copy_to_clipboard(pane, &text);
-                    if !text.is_empty() {
-                        self.add_buffer(None, text.into_bytes(), false);
-                    }
-                    if let (Some(p), Some(b)) = (prefix, self.buffers.first_mut()) {
-                        if let Some(n) = b.name.strip_prefix("buffer") {
-                            b.name = format!("{p}{n}");
-                        }
+                    // window_copy_append_selection: the top automatic buffer (paste_get_top)
+                    // is replaced under its name by its data followed by the selection
+                    match self.buffers.iter().find(|b| b.automatic).map(|b| b.name.clone()) {
+                        Some(top) => self.add_buffer(Some(top), text.into_bytes(), true),
+                        None => self.paste_add("buffer", text.into_bytes()),
                     }
                 } else {
                     if !no_clip {
                         self.copy_to_clipboard(pane, &text);
                     }
-                    if !no_paste && !text.is_empty() {
-                        self.add_buffer(None, text.into_bytes(), false);
+                    if !no_paste {
                         // paste_add(prefix, ...): the automatic name uses the prefix
-                        if let (Some(p), Some(b)) = (prefix, self.buffers.first_mut()) {
-                            if let Some(n) = b.name.strip_prefix("buffer") {
-                                b.name = format!("{p}{n}");
-                            }
-                        }
+                        self.paste_add(prefix.as_deref().unwrap_or("buffer"), text.into_bytes());
                     }
                 }
                 if cancel {

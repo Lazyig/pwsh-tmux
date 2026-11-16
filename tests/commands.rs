@@ -1252,6 +1252,9 @@ fn display_all_samples_and_printed_commands() {
     assert_eq!(ctx.fails(&["bind", "v", "splitw -Q"]).trim(), "command split-window: unknown flag -Q");
     assert_eq!(ctx.fails(&["bind", "v", "kill-session", "-t", "x", "y"]).trim(), "command kill-session: too many arguments (need at most 0)");
     assert!(ctx.fails(&["list-keys", "-T", "prefix", "v"]).contains("unknown key: v"));
+    // an abbreviated bind-key keeps its blocks too
+    ctx.ok(&["if", "-F", "1", "bind-k u if -F 1 { display a } b"]);
+    assert_eq!(ctx.ok(&["list-keys", "-T", "prefix", "u"]).trim_end(), "bind-key  -T prefix u if-shell -F 1 { display-message a } b");
     ctx.ok(&["if", "-F", "1", "bind -n F3 { display x ; display y }"]);
     assert_eq!(ctx.ok(&["list-keys", "-T", "root", "F3"]).trim_end(), "bind-key  -T root F3 display-message x \\; display-message y");
     ctx.ok(&["bind", "w", "send-keys", "-X", "copy-pipe", "cat >/dev/null"]);
@@ -1961,6 +1964,46 @@ fn copy_mode_command_arguments_like_tmux() {
     ctx.ok(&["send", "-t", "c", "-X", "copy-pipe-line", "cat", "Q#{window_index}y"]);
     let names = ctx.ok(&["list-buffers", "-F", "#{buffer_name}"]);
     assert_eq!(names.lines().collect::<Vec<_>>(), ["Q0y1", "P0x0"], "{names}");
+}
+
+/// Checked against tmux 3.8: a copy with a buffer prefix is announced under its final
+/// name, and append-selection replaces the top automatic buffer (paste_get_top) by its
+/// data followed by the selection, under the same name and no longer automatic.
+#[test]
+fn copy_mode_buffer_prefix_and_append_selection() {
+    use std::io::{BufRead, BufReader};
+    use std::sync::{Arc, Mutex};
+    let ctx = Ctx::new("copyappend");
+    ctx.ok(&["new", "-d", "-s", "c", "-x", "30", "-y", "6", "printf 'foo bar\nbaz\n'; sleep 100"]);
+    wait_for("copy text", || ctx.capture("c").contains("baz"));
+    let mut child = ctx.command().args(["-C", "attach", "-t", "c"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let out = Arc::new(Mutex::new(String::new()));
+    let stdout = child.stdout.take().unwrap();
+    let o = out.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if line.starts_with("%paste-buffer") {
+                o.lock().unwrap().push_str(&(line + "\n"));
+            }
+        }
+    });
+    wait_for("attached", || !ctx.ok(&["list-clients"]).is_empty());
+    ctx.ok(&["copy-mode", "-t", "c"]);
+    ctx.ok(&["send", "-t", "c", "-X", "history-top"]);
+    ctx.ok(&["send", "-t", "c", "-X", "copy-line", "P#{pane_index}x"]);
+    ctx.ok(&["set-buffer", "-b", "named", "zzz"]);
+    ctx.ok(&["send", "-t", "c", "-X", "select-line"]);
+    ctx.ok(&["send", "-t", "c", "-X", "append-selection"]);
+    ctx.ok(&["send", "-t", "c", "-X", "cursor-down"]);
+    ctx.ok(&["send", "-t", "c", "-X", "select-line"]);
+    // the appended buffer is no longer automatic, so this one makes a new buffer
+    ctx.ok(&["send", "-t", "c", "-X", "append-selection-and-cancel"]);
+    assert_eq!(ctx.ok(&["list-buffers", "-F", "#{buffer_name}=#{buffer_sample}"]), "buffer1=baz\nP0x0=foo barfoo bar\nnamed=zzz\n");
+    let want = "%paste-buffer-changed P0x0\n%paste-buffer-changed named\n%paste-buffer-deleted P0x0\n%paste-buffer-changed P0x0\n%paste-buffer-changed buffer1\n";
+    wait_for("buffer notifications", || out.lock().unwrap().len() >= want.len());
+    assert_eq!(out.lock().unwrap().as_str(), want);
+    child.kill().unwrap();
+    let _ = child.wait();
 }
 
 #[test]
