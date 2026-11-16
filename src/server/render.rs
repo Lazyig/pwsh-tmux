@@ -171,6 +171,16 @@ pub(crate) fn prompt_complete_display(list: &[String]) -> String {
     list.iter().map(|m| format!(" {m}")).collect()
 }
 
+/// The panes around a border cell (redraw span top_wp, bottom_wp, left_wp, right_wp).
+#[derive(Default)]
+struct BorderOwners {
+    above: Option<PaneId>,
+    below: Option<PaneId>,
+    left: Option<PaneId>,
+    right: Option<PaneId>,
+    active: bool,
+}
+
 /// Where prompt_layout puts the parts of a prompt.
 #[derive(Default)]
 pub(crate) struct PromptLayout {
@@ -630,6 +640,48 @@ impl Server {
             }
         }
         let at = |x: i32, y: i32| -> bool { x >= 0 && y >= 0 && (x as u16) < cw && (y as u16) < area_h && is_border[y as usize * cw as usize + x as usize] };
+        // Each pane's border runs round its layout cell, from the pane status line
+        // (top or bottom) when there is one; scrollbars sit inside it.
+        let border_rects: Vec<(PaneId, Rect, i32, i32, i32, i32)> = rects.iter().map(|(p, r)| {
+            let cr = self.content_rect(wid, *r);
+            (*p, cr, r.x as i32 - 1, r.right() as i32, cr.y as i32 - 1, cr.bottom() as i32)
+        }).collect();
+        // The panes a border cell belongs to, by side: the pane above, below, to the
+        // left or right of it (top_wp, bottom_wp, left_wp, right_wp), and whether one
+        // of them is the active pane.
+        let border_owners = |x: i32, y: i32| -> BorderOwners {
+            let mut o = BorderOwners::default();
+            for (p, _, l, r, t, b) in &border_rects {
+                if x < *l || x > *r || y < *t || y > *b || (x > *l && x < *r && y > *t && y < *b) { continue; }
+                if y == *t { o.below = Some(*p); }
+                if y == *b { o.above = Some(*p); }
+                if x == *l { o.right = Some(*p); }
+                if x == *r { o.left = Some(*p); }
+                o.active |= *p == win.active;
+            }
+            o
+        };
+        // redraw_mark_border_arrows: each pane marks the border cells one in from its corners
+        let border_marked = |x: u16, y: u16| -> bool {
+            let (x, y) = (x as i32, y as i32);
+            border_rects.iter().any(|(_, cr, l, r, t, b)| (x == cr.x as i32 + 1 && (y == *t || y == *b)) || (y == cr.y as i32 + 1 && (x == *l || x == *r)))
+        };
+        // pane-border-lines number: window_pane_index of the pane the cell is drawn
+        // for (redraw_get_pane_for_border_style): with two panes and colour
+        // indicators the pane of that half, else the active pane if the cell borders
+        // it, else the pane above, below, left or right of it
+        let two_pane = matches!(indicators.as_str(), "colour" | "both") && rects.len() == 2 && !win.zoomed;
+        let base = self.opt_window_num(Some(wid), "pane-base-index").max(0) as usize;
+        let border_number = |x: i32, y: i32| -> String {
+            let o = border_owners(x, y);
+            let split = if !two_pane { None } else if rects[0].1.y == rects[1].1.y {
+                o.left.zip(o.right).map(|(l, r)| if y <= win.sy as i32 / 2 { l } else { r })
+            } else {
+                o.above.zip(o.below).map(|(a, b)| if x <= win.sx as i32 / 2 { a } else { b })
+            };
+            let owner = split.or(if o.active { Some(win.active) } else { o.above.or(o.below).or(o.left).or(o.right) });
+            owner.and_then(|o| win.panes().iter().position(|p| *p == o)).map(|i| char::from(b'0' + ((i + base) % 10) as u8).to_string()).unwrap_or_else(|| "*".into())
+        };
         for y in 0..area_h {
             for x in 0..cw {
                 if !is_border[y as usize * cw as usize + x as usize] {
@@ -661,36 +713,17 @@ impl Server {
                         }
                     }
                 }
-                // redraw_mark_border_arrows: every pane marks the border cells one
-                // in from its corners; a marked cell next to the active pane points at it
-                let marked = || rects.iter().any(|(_, p)| (x == p.x + 1 && (y + 1 == p.y || y == p.bottom())) || (y == p.y + 1 && (x + 1 == p.x || x == p.right())));
-                let arrow = if matches!(indicators.as_str(), "arrows" | "both") && marked() {
-                    active_rect.and_then(|a| {
-                        let inside = |px: i32, py: i32| px >= a.x as i32 && px < a.right() as i32 && py >= a.y as i32 && py < a.bottom() as i32;
-                        if inside(xi - 1, yi) { Some("←") }
-                        else if inside(xi + 1, yi) { Some("→") }
-                        else if inside(xi, yi - 1) { Some("↑") }
-                        else if inside(xi, yi + 1) { Some("↓") }
-                        else { None }
-                    })
+                let arrow = if matches!(indicators.as_str(), "arrows" | "both") && border_marked(x, y) {
+                    let o = border_owners(xi, yi);
+                    let active = Some(win.active);
+                    if o.left == active { Some("←") }
+                    else if o.right == active { Some("→") }
+                    else if o.above == active { Some("↑") }
+                    else if o.below == active { Some("↓") }
+                    else { None }
                 } else { None };
                 let text = if let Some(arrow) = arrow { arrow.into() } else if lines_kind == "number" {
-                    // window_pane_index of the pane the cell is drawn for
-                    // (redraw_get_pane_for_border_style): the active pane if the cell
-                    // borders it, else the pane above, below, left or right of it
-                    let (mut above, mut below, mut left, mut right, mut active) = (None, None, None, None, false);
-                    for (p, a) in &rects {
-                        let (l, r, t, b) = (a.x as i32 - 1, a.right() as i32, a.y as i32 - 1, a.bottom() as i32);
-                        if xi < l || xi > r || yi < t || yi > b || (xi > l && xi < r && yi > t && yi < b) { continue; }
-                        if yi == t { below = Some(*p); }
-                        if yi == b { above = Some(*p); }
-                        if xi == l { right = Some(*p); }
-                        if xi == r { left = Some(*p); }
-                        active |= *p == win.active;
-                    }
-                    let owner = if active { Some(win.active) } else { above.or(below).or(left).or(right) };
-                    let base = self.opt_window_num(Some(wid), "pane-base-index").max(0) as usize;
-                    owner.and_then(|o| win.panes().iter().position(|p| *p == o)).map(|i| char::from(b'0' + ((i + base) % 10) as u8).to_string()).unwrap_or_else(|| "*".into())
+                    border_number(xi, yi)
                 } else { ch.into() };
                 f.set(x, oy + y, Cell { text, style: if near { active_border } else { inactive_border } });
             }
@@ -702,12 +735,27 @@ impl Server {
                 let cr = self.content_rect(wid, *r);
                 let by = if border_status == "top" { cr.y.saturating_sub(1) } else { cr.bottom() };
                 let st = if *id == win.active { active_border } else { inactive_border };
+                // window_make_pane_status: the line starts two in from the pane
+                // (after a left scrollbar), filled with the pane's border cells, and
+                // the format is drawn over it with its alignment
+                let sx = cr.x + 2;
+                let fill = |x: u16| if lines_kind == "number" { border_number(x as i32, by as i32) } else { bset[0].to_string() };
                 for x in r.x..r.right() {
-                    if x >= r.x + 2 || !at(x as i32, by as i32) { f.set(x, oy + by, Cell { text: bset[0].into(), style: st }); }
+                    if x >= sx || !at(x as i32, by as i32) { f.set(x, oy + by, Cell { text: fill(x), style: st }); }
                 }
-                let text = self.expand_for_pane(*id, &self.opt_window(Some(wid), "pane-border-format"));
-                let cells = spans_cells(&format::spans(&text, st), r.w.saturating_sub(2) as usize, st);
-                f.put_cells(r.x + 2, oy + by, &cells);
+                // the cell before the line is an arrow when the pane is the active one
+                if matches!(indicators.as_str(), "arrows" | "both") && *id == win.active && cr.x + 1 < r.right() {
+                    f.set(cr.x + 1, oy + by, Cell { text: (if border_status == "top" { "↓" } else { "↑" }).into(), style: st });
+                }
+                if sx < r.right() {
+                    let text = self.expand_for_pane(*id, &self.opt_window(Some(wid), "pane-border-format"));
+                    // no public style attribute uses bit 7: it marks cells the format left empty
+                    let marker = Style { attrs: 0x80, ..Style::default() };
+                    let cells = format::layout_line(&format::spans(&text, st), (r.right() - sx) as usize, marker);
+                    for (i, cell) in cells.into_iter().enumerate() {
+                        if cell.style != marker { f.set(sx + i as u16, oy + by, cell); }
+                    }
+                }
             }
         }
         if border_status != "off" {
@@ -715,7 +763,8 @@ impl Server {
             for sep in &seps {
                 if sep.vertical && (if by == 0 { sep.y == 0 } else { sep.y + sep.len == area_h }) {
                     if let Some(cell) = f.get(sep.x, oy + by).cloned() {
-                        f.set(sep.x, oy + by, Cell { text: (if by == 0 { bset[7] } else { bset[8] }).into(), ..cell });
+                        let text = if lines_kind == "number" { border_number(sep.x as i32, by as i32) } else { (if by == 0 { bset[7] } else { bset[8] }).into() };
+                        f.set(sep.x, oy + by, Cell { text, ..cell });
                     }
                 }
             }

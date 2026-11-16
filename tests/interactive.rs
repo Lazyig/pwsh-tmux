@@ -858,3 +858,31 @@ fn display_scrollbar_clicks_slider_drag_and_modes_like_tmux_3_8() {
     wait_for("clock bar", || bg(0, 99) == vt100::Color::Idx(1) && bg(29, 99) == vt100::Color::Idx(1));
     assert_eq!(ctx.fmt("s", "#{pane_width}"), "99");
 }
+
+#[test]
+fn display_pane_status_alignment_scrollbar_offset_and_arrows() {
+    let ctx = Ctx::new("display-bstatus38");
+    let t = start(&ctx, "s");
+    ctx.ok(&["set", "-g", "status", "off"]);
+    ctx.ok(&["set", "-g", "mouse", "on"]);
+    ctx.ok(&["split-window", "-h", "-t", "s"]);
+    ctx.ok(&["select-pane", "-t", "s:0.0", "-T", "t0"]);
+    ctx.ok(&["select-pane", "-t", "s:0.1", "-T", "t1"]);
+    let sep = ctx.fmt("s", "#{pane_left}").trim().parse::<usize>().unwrap() - 1;
+    ctx.ok(&["set", "-g", "pane-border-status", "top"]);
+    // #[align=right] in pane-border-format puts the buttons at the right end
+    wait_for("pane status", || t.row(0).starts_with("──0 \"t0\"─"));
+    let row: Vec<char> = t.row(0).chars().collect();
+    assert_eq!(row[sep - 3..sep].iter().collect::<String>(), "[x]", "{}", t.row(0));
+    assert_eq!(row[sep], '┬');
+    // with the scrollbar on the left the line moves with the pane content
+    ctx.ok(&["set", "-g", "pane-scrollbars", "on"]);
+    ctx.ok(&["set", "-g", "pane-scrollbars-position", "left"]);
+    wait_for("shifted", || t.row(0).starts_with("───0 \"t0\"─"));
+    // arrows: on the status line before the active pane's text, and one row
+    // below the pane's first row on the side border
+    ctx.ok(&["set", "-g", "pane-border-indicators", "arrows"]);
+    wait_for("status arrow", || t.row(0).chars().nth(sep + 3) == Some('↓'));
+    assert_eq!(t.row(2).chars().nth(sep), Some('→'));
+    assert_eq!(t.row(1).chars().nth(sep), Some('│'));
+}
