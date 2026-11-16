@@ -8,14 +8,27 @@ pub struct Row {
     /// When the row entered the history (seconds since the epoch), 0 if it
     /// has not or the time was not set (tmux's grid_line time).
     time: u64,
-    /// ROW_START_PROMPT / ROW_START_OUTPUT (tmux's GRID_LINE_START_* flags).
+    /// ROW_* (tmux's GRID_LINE_* flags).
     flags: u8,
+    /// Hyperlinks and tabs by column, only for rows that have any.
+    metadata: Option<alloc::boxed::Box<alloc::collections::BTreeMap<u16, crate::CellMetadata>>>,
 }
 
 /// The line has the start of a shell prompt (OSC 133;A, N or P).
 pub const ROW_START_PROMPT: u8 = 1;
 /// The line has the start of command output (OSC 133;C).
 pub const ROW_START_OUTPUT: u8 = 2;
+/// The line has had a hyperlink cell (GRID_LINE_HYPERLINK, kept until the
+/// line is cleared).
+pub const ROW_HYPERLINK: u8 = 4;
+/// The line has had a hyperlink or tab cell (part of GRID_LINE_EXTENDED).
+pub const ROW_EXTENDED: u8 = 8;
+/// OSC 133 B/I command start.
+pub const ROW_START_COMMAND: u8 = 16;
+/// OSC 133 D output end.
+pub const ROW_END_OUTPUT: u8 = 32;
+/// OSC 133 P;k=s continuation prompt.
+pub const ROW_SECOND_PROMPT: u8 = 64;
 
 impl Row {
     pub fn new(cols: u16) -> Self {
@@ -24,6 +37,7 @@ impl Row {
             wrapped: false,
             time: 0,
             flags: 0,
+            metadata: None,
         }
     }
 
@@ -36,9 +50,9 @@ impl Row {
     }
 
     /// Whether a cell needs more than tmux's compact cell entry (multi-byte or
-    /// wide characters, RGB colours: GRID_LINE_EXTENDED).
+    /// wide characters, RGB colours, hyperlinks and tabs: GRID_LINE_EXTENDED).
     pub fn extended(&self) -> bool {
-        self.cells().any(|c| {
+        self.flags & ROW_EXTENDED != 0 || self.cells().any(|c| {
             c.contents().len() > 1
                 || c.is_wide()
                 || matches!(c.fgcolor(), crate::Color::Rgb(..))
@@ -54,7 +68,7 @@ impl Row {
         self.time = time;
     }
 
-    fn cols(&self) -> u16 {
+    pub(crate) fn cols(&self) -> u16 {
         self.cells
             .len()
             .try_into()
@@ -72,6 +86,7 @@ impl Row {
         }
         self.wrapped = false;
         self.flags = 0;
+        self.metadata = None;
     }
 
     pub fn reset(&mut self) {
@@ -79,6 +94,7 @@ impl Row {
         self.wrapped = false;
         self.time = 0;
         self.flags = 0;
+        self.metadata = None;
     }
 
     fn cells(&self) -> impl Iterator<Item = &crate::Cell> {
@@ -89,7 +105,56 @@ impl Row {
         self.cells.get(usize::from(col))
     }
 
+    pub fn metadata(&self) -> impl Iterator<Item = (u16, &crate::CellMetadata)> {
+        self.metadata.iter().flat_map(|m| m.iter().map(|(&x, m)| (x, m)))
+    }
+
+    pub fn set_metadata(&mut self, col: u16, value: crate::CellMetadata) {
+        if value != crate::CellMetadata::default() {
+            self.flags |= ROW_EXTENDED;
+            if value.hyperlink.is_some() { self.flags |= ROW_HYPERLINK; }
+            self.metadata.get_or_insert_with(Default::default).insert(col, value);
+        }
+    }
+
+    /// The metadata of the cell at `col`.
+    pub fn cell_metadata(&self, col: u16) -> Option<&crate::CellMetadata> {
+        self.metadata.as_ref()?.get(&col)
+    }
+
+    /// The link of the cell at `col` or of the tab covering it.
+    pub fn hyperlink_at(&self, col: u16) -> Option<&alloc::sync::Arc<crate::Hyperlink>> {
+        let (&x, m) = self.metadata.as_ref()?.range(..=col).next_back()?;
+        (x == col || col < x.saturating_add(m.tab_width)).then_some(m.hyperlink.as_ref()).flatten()
+    }
+
+    /// Drops the hyperlinks of every cell (screen_reset_hyperlinks leaves the
+    /// cells' links unresolvable); tabs and the line's flags stay.
+    pub fn clear_hyperlinks(&mut self) {
+        if let Some(m) = &mut self.metadata {
+            m.retain(|_, v| { v.hyperlink = None; v.tab_width != 0 });
+            if m.is_empty() { self.metadata = None; }
+        }
+    }
+
+    /// Cell `col` is rewritten: its own metadata goes and a tab covering it
+    /// becomes plain spaces.
+    fn invalidate(&mut self, col: u16) {
+        let Some(m) = &mut self.metadata else { return };
+        m.remove(&col);
+        if let Some((&x, v)) = m.range_mut(..col).next_back() {
+            if col < x.saturating_add(v.tab_width) {
+                v.tab_width = 0;
+                if v.hyperlink.is_none() { m.remove(&x); }
+            }
+        }
+        if m.is_empty() { self.metadata = None; }
+    }
+
+    pub fn get_mut_untracked(&mut self, col: u16) -> Option<&mut crate::Cell> { self.cells.get_mut(usize::from(col)) }
+
     pub fn get_mut(&mut self, col: u16) -> Option<&mut crate::Cell> {
+        self.invalidate(col);
         self.cells.get_mut(usize::from(col))
     }
 
@@ -112,6 +177,15 @@ impl Row {
             self.get_mut(i).unwrap().set_wide_continuation(false);
         }
 
+        if let Some(m) = self.metadata.take() {
+            for (x, mut v) in *m {
+                // a tab cut by the insert keeps the cells before it (the rest of its
+                // padding moves on as blanks, as tmux's moved padding cells print nothing)
+                if x < i && x.saturating_add(v.tab_width) > i { v.tab_width = i - x; }
+                let x = if x >= i { x.saturating_add(count as u16) } else { x };
+                if x < self.cols() { self.set_metadata(x, v); }
+            }
+        }
         // only the stored cells (and the empty ones they move over) shift
         let stored = self.cells.stored_len();
         if usize::from(i) < stored {
@@ -141,6 +215,14 @@ impl Row {
             self.clear_wide(last);
         }
 
+        if let Some(m) = self.metadata.take() {
+            for (x, mut v) in *m {
+                if x < range.start && x.saturating_add(v.tab_width) > range.start { v.tab_width = range.start - x; }
+                if range.contains(&x) { continue; }
+                let x = if x >= range.end { x - (range.end - range.start) } else { x };
+                self.set_metadata(x, v);
+            }
+        }
         let count = usize::from(range.end - range.start);
         let stored = self.cells.stored_len();
         if usize::from(range.start) < stored {
@@ -152,6 +234,7 @@ impl Row {
     }
 
     pub fn erase(&mut self, i: u16, attrs: crate::attrs::Attrs) {
+        self.invalidate(i);
         let wide = self.cells[usize::from(i)].is_wide();
         self.clear_wide(i);
         self.cells[usize::from(i)].clear(attrs);
@@ -165,6 +248,7 @@ impl Row {
     }
 
     pub fn truncate(&mut self, len: u16) {
+        if let Some(m) = &mut self.metadata { m.retain(|&x, v| { if x.saturating_add(v.tab_width) > len { v.tab_width = 0; } x < len }); }
         self.cells.truncate(usize::from(len));
         self.set_truncated();
     }
@@ -203,6 +287,14 @@ impl Row {
         }
     }
 
+    /// Cells up to the last written one or the end of the last tab (tmux's cellused:
+    /// a row wrapped early, before a wide character or tab that did not fit, ends there).
+    pub fn used_len(&self) -> u16 {
+        let cells = self.cells.iter().rposition(|c| *c != crate::cell::Cell::DEFAULT).map_or(0, |i| i + 1);
+        let tabs = self.metadata().map(|(x, m)| x.saturating_add(m.tab_width)).max().unwrap_or(0);
+        (cells as u16).max(tabs.min(self.cols()))
+    }
+
     /// Trims trailing blank cells from the row.
     pub fn trim(&mut self) {
         let excess = self
@@ -232,6 +324,9 @@ impl Row {
 
     pub fn clear_wide(&mut self, col: u16) {
         let col_idx = usize::from(col);
+        let cell = &self.cells[col_idx];
+        let other_col = if cell.is_wide() { col.saturating_add(1) } else if cell.is_wide_continuation() { col.saturating_sub(1) } else { return };
+        self.invalidate(other_col);
         let cell = &self.cells[col_idx];
         let other = if cell.is_wide() {
             let next = col_idx + 1;

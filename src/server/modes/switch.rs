@@ -220,7 +220,7 @@ impl Switch {
     /// window_switch_draw_screen: the lines and the prompt cursor.
     pub fn render(&self, srv: &Server, w: u16, h: u16) -> (Vec<Line>, Option<(u16, u16)>) {
         let (wu, hu) = (w as usize, h as usize);
-        let blank = Line { cells: vec![crate::cells::Cell { text: " ".into(), style: Style::default() }; wu], wrapped: false };
+        let blank = Line { cells: vec![crate::cells::Cell { text: " ".into(), style: Style::default() }; wu], wrapped: false, ..Default::default() };
         let mut lines = vec![blank; hu];
         if hu <= 1 {
             return (lines, None);

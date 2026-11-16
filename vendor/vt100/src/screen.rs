@@ -117,6 +117,17 @@ pub struct Screen {
     alternate_saved_attrs: crate::attrs::Attrs,
     /// Tab stops when changed by HTS/TBC; None means one every 8 columns.
     tabs: Option<Vec<bool>>,
+    /// The OSC 8 link of new text, the one DECSC saved, and named links by
+    /// (id, URI) so the same pair gets the same link.
+    hyperlink: Option<alloc::sync::Arc<crate::Hyperlink>>,
+    saved_hyperlink: Option<alloc::sync::Arc<crate::Hyperlink>>,
+    hyperlinks: alloc::collections::BTreeMap<(String, String), alloc::sync::Weak<crate::Hyperlink>>,
+    /// Table size at which dead entries are swept next.
+    pub(crate) hyperlinks_sweep: usize,
+    /// The SGR being dispatched had no parameters at all (`CSI m`), which vte reports as
+    /// a 0: tmux resets the link too only for that one.
+    pub(crate) empty_sgr: bool,
+
 }
 
 impl Screen {
@@ -153,7 +164,7 @@ impl Screen {
 
             alternate_saved: None,
             alternate_saved_attrs: crate::attrs::Attrs::default(),
-            tabs: None,
+            tabs: None, hyperlink: None, saved_hyperlink: None, hyperlinks: Default::default(), hyperlinks_sweep: 5000, empty_sgr: false,
         }
     }
 
@@ -194,6 +205,46 @@ impl Screen {
     #[must_use]
     pub fn history_row_time(&self, index: usize) -> u64 {
         self.grid().absolute_row(index).map_or(0, crate::row::Row::time)
+    }
+
+    /// Apply OSC 8 (input_osc_8, hyperlinks_put), retaining only links referenced by
+    /// live/history cells. The URI and id are stored vis-encoded (utf8_stravis with
+    /// VIS_OCTAL|VIS_CSTYLE) and a URI over 1024 bytes once encoded is no link.
+    pub fn set_hyperlink(&mut self, params: &[u8], uri: &[u8]) {
+        let ids: Vec<_> = params.split(|&b| b == b':').filter_map(|p| p.strip_prefix(b"id=")).filter(|s| !s.is_empty()).collect();
+        if ids.len() > 1 { return; }
+        if uri.is_empty() { self.hyperlink = None; return; }
+        let uri = stravis(uri);
+        if uri.len() > 1024 { self.hyperlink = None; return; }
+        let id = ids.first().map_or_else(String::new, |id| stravis(id));
+        let key = (id, uri);
+        if !key.0.is_empty() {
+            if let Some(link) = self.hyperlinks.get(&key).and_then(alloc::sync::Weak::upgrade) {
+                self.hyperlink = Some(link); return;
+            }
+        }
+        // dead entries go once the table has doubled since the last sweep, so a long run
+        // of live named links costs amortised O(log n) each, not a full scan per link
+        if self.hyperlinks.len() >= self.hyperlinks_sweep {
+            self.hyperlinks.retain(|_, p| p.strong_count() != 0);
+            self.hyperlinks_sweep = (self.hyperlinks.len() * 2).max(5000);
+        }
+        static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+        let inner = NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let (id, uri) = key;
+        let link = alloc::sync::Arc::new(crate::Hyperlink { inner, id, external_id: alloc::format!("tmux{:X}", inner), uri });
+        if !link.id.is_empty() { self.hyperlinks.insert((link.id.clone(), link.uri.clone()), alloc::sync::Arc::downgrade(&link)); }
+        self.hyperlink = Some(link);
+    }
+
+    /// screen_reset_hyperlinks (clear-history -H): every cell loses its link and
+    /// the current one is forgotten.
+    pub fn reset_hyperlinks(&mut self) {
+        self.hyperlink = None;
+        self.saved_hyperlink = None;
+        self.hyperlinks.clear();
+        self.grid.for_each_row_mut(crate::row::Row::clear_hyperlinks);
+        self.alternate_grid.for_each_row_mut(crate::row::Row::clear_hyperlinks);
     }
 
     /// Resizes the screen **without calling** the [`on_scroll`] callback.
@@ -1019,11 +1070,14 @@ impl Screen {
     fn save_cursor(&mut self) {
         self.grid_mut().save_cursor();
         self.saved_attrs = self.attrs;
+        self.saved_hyperlink = self.hyperlink.clone();
     }
 
     fn restore_cursor(&mut self) {
         self.grid_mut().restore_cursor();
         self.attrs = self.saved_attrs;
+        // input_restore_state: the saved cell has its link
+        self.hyperlink = self.saved_hyperlink.clone();
     }
 
     fn set_mode(&mut self, mode: u8) {
@@ -1193,7 +1247,7 @@ impl Screen {
         let size = self.grid().size();
         let attrs = self.attrs;
 
-        if base_pos.col > 0 {
+        if base_pos.col > 0 && self.grid().drawing_cell(crate::grid::Pos { row: base_pos.row, col: base_pos.col - 1 }).is_some_and(crate::Cell::is_wide) {
             let prev_cell = self
                 .grid_mut()
                 .drawing_cell_mut(crate::grid::Pos {
@@ -1322,6 +1376,13 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
             screen.grid_mut().col_wrap(width, wrap, on_row);
             // col_wrap always sets self.grid().pos() to a valid cell
             base_pos = screen.grid().pos();
+            // IRM (screen_write_cell): the character makes room for itself
+            if screen.insert_mode() {
+                let row = screen.grid_mut().drawing_row_mut(base_pos.row).unwrap();
+                let wrapped = row.wrapped();
+                row.insert(base_pos.col, width);
+                row.wrap(wrapped);
+            }
             cell_was_wide =
                 screen.grid().drawing_cell(base_pos).unwrap().is_wide();
 
@@ -1343,8 +1404,8 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                 col: pos.col - 1,
             };
             if screen
-                .grid_mut()
-                .drawing_cell_mut(base_pos)
+                .grid()
+                .drawing_cell(base_pos)
                 .unwrap()
                 .is_wide_continuation()
             {
@@ -1391,6 +1452,18 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
             screen.grid().drawing_cell(base_pos).unwrap().is_wide();
 
         screen.text_cleanup(base_pos, cell_was_wide, cell_is_wide);
+        let hyperlink = screen.hyperlink.clone();
+        // grid_extended_cell: the line keeps GRID_LINE_EXTENDED once an extended cell is
+        // written to it, even after the cell is overwritten
+        let cell = screen.grid().drawing_cell(base_pos).unwrap();
+        let extended = cell.contents().len() > 1 || cell.is_wide() || matches!(cell.fgcolor(), crate::Color::Rgb(..)) || matches!(cell.bgcolor(), crate::Color::Rgb(..));
+        let row = screen.grid_mut().drawing_row_mut(base_pos.row).unwrap();
+        if extended {
+            row.set_flags(row.flags() | crate::ROW_EXTENDED);
+        }
+        if hyperlink.is_some() {
+            row.set_metadata(base_pos.col, crate::CellMetadata { hyperlink, tab_width: 0 });
+        }
     }
 
     // control codes
@@ -1399,15 +1472,35 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
         self.screen.grid_mut().col_dec(1);
     }
 
+    /// HT (input_c0_dispatch): over blank cells that look alike (up to 32) a
+    /// tab is kept (GRID_FLAG_TAB) with the first cell's style and link, so
+    /// capture-pane and copy mode give back the tab; otherwise the cursor just moves.
     pub fn tab(&mut self) {
-        let Some(tabs) = &self.screen.tabs else {
-            self.screen.grid_mut().col_tab();
-            return;
-        };
         let col = self.screen.grid().pos().col;
         let last = self.screen.grid().size().cols() - 1;
-        let next = (col + 1..last).find(|&i| tabs.get(usize::from(i)).copied().unwrap_or(false)).unwrap_or(last);
-        self.screen.grid_mut().col_set(next.max(col));
+        if col >= last { return; }
+        let next = (col + 1..=last).find(|&i| self.screen.tabs.as_ref().map_or(i % 8 == 0, |t| t.get(usize::from(i)).copied().unwrap_or(false))).unwrap_or(last);
+        let insert = self.screen.insert_mode();
+        let row = self.screen.grid_mut().current_row_mut();
+        let first = row.get(col).unwrap().clone();
+        let link = |x: u16| row.cell_metadata(x).and_then(|m| m.hyperlink.as_ref()).map(|l| l.inner);
+        // a tab's own cell (its width is its size) and padding are content, except that a
+        // one-column tab looks like the one-column tab it is compared with
+        let tab = |x: u16| row.metadata().take_while(|&(at, _)| at <= x).filter(|(at, m)| x < at.saturating_add(m.tab_width)).map(|(at, m)| (at, m.tab_width)).last();
+        let blank = |x: u16| row.get(x).is_some_and(|c| (!c.has_contents() || c.contents() == " ") && !c.is_wide_continuation() && c.attrs() == first.attrs() && link(x) == link(col))
+            && match (tab(col), tab(x)) { (None, None) => true, (Some((at, 1)), Some(t)) => at == col && t == (col, 1) && next == col + 1, _ => false };
+        if next - col <= 32 && (col..next).all(blank) {
+            let hyperlink = row.cell_metadata(col).and_then(|m| m.hyperlink.clone());
+            // in IRM the tab is inserted like any cell
+            if insert {
+                let wrapped = row.wrapped();
+                row.insert(col, next - col);
+                row.wrap(wrapped);
+            }
+            for x in col..next { row.get_mut(x).unwrap().set(' ', *first.attrs()); }
+            row.set_metadata(col, crate::CellMetadata { tab_width: next - col, hyperlink });
+        }
+        self.screen.grid_mut().col_set(next);
     }
 
     // ESC H
@@ -1511,8 +1604,16 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
         let variation_wide = self.screen.variation_wide;
         // screen_write_reset keeps the cursor shape (only the mode bits are reset)
         let cursor_style = self.screen.cursor_style;
-        let counters = self.screen.grid.history_counters();
         let now = self.screen.grid.now();
+        // screen_write_reset clears the screen like ED 2: the history stays and, with
+        // scroll-on-clear, the main screen's lines go into it
+        if scroll_on_clear && !self.screen.mode(MODE_ALTERNATE_SCREEN) {
+            let attrs = crate::attrs::Attrs::default();
+            let on_row = Self::on_row(&self.screen, &mut self.callbacks);
+            self.screen.grid.erase_all_into_history(attrs, on_row);
+        }
+        let history = self.screen.grid.take_history();
+        let counters = self.screen.grid.history_counters();
         self.screen = Screen::new(
             self.screen.grid.size(),
             self.screen.grid.scrollback_capacity(),
@@ -1523,6 +1624,7 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
         self.screen.variation_wide = variation_wide;
         self.screen.cursor_style = cursor_style;
         self.screen.grid.set_history_counters(counters);
+        self.screen.grid.set_history(history);
         self.screen.set_time(now);
     }
 
@@ -1630,7 +1732,10 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                 let on_row = Self::on_row(&self.screen, &mut self.callbacks);
                 self.screen.grid_mut().erase_all_into_history(attrs,on_row);
             }
-            2 => self.screen.grid_mut().erase_all(attrs),
+            2 => {
+                self.screen.grid_mut().erase_all(attrs);
+                self.screen.grid_mut().unwrap_above(0);
+            }
             3 => {
                 let on_row = Self::on_row(&self.screen, &mut self.callbacks);
                 self.screen.grid_mut().erase_all_scrollback(on_row);
@@ -1649,6 +1754,8 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
         let attrs = self.screen.attrs;
         match mode {
             0 => self.screen.grid_mut().erase_row_forward(attrs),
+            // screen_write_clearstartofline: to the last column it is the whole line
+            1 if self.screen.grid().pos().col >= self.screen.grid().size().cols() - 1 => self.screen.grid_mut().erase_row(attrs),
             1 => self.screen.grid_mut().erase_row_backward(attrs),
             2 => self.screen.grid_mut().erase_row(attrs),
             _ => unhandled(self),
@@ -1796,8 +1903,11 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
         // XXX really i want to just be able to pass in a default Params
         // instance with a 0 in it, but vte doesn't allow creating new Params
         // instances
-        if params.is_empty() {
+        // input_csi_dispatch_sgr: no parameters is the default cell, link included; SGR 0
+        // keeps the link
+        if params.is_empty() || self.screen.empty_sgr {
             self.screen.attrs = crate::attrs::Attrs::default();
+            self.screen.hyperlink = None;
             return;
         }
 
@@ -1929,4 +2039,36 @@ fn u16_to_u8(i: u16) -> Option<u8> {
         // safe because we just ensured that the value fits in a u8
         Some(i.try_into().unwrap())
     }
+}
+
+/// utf8_stravis(VIS_OCTAL|VIS_CSTYLE): complete UTF-8 characters and printable ASCII
+/// pass (a backslash doubled), other bytes become C-style or octal escapes.
+fn stravis(src: &[u8]) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < src.len() {
+        let c = src[i];
+        let n = match c { 0xc2..=0xdf => 2, 0xe0..=0xef => 3, 0xf0..=0xf4 => 4, _ => 1 };
+        if n > 1 {
+            if let Some(ch) = src.get(i..i + n).and_then(|b| core::str::from_utf8(b).ok()) {
+                out.push_str(ch);
+                i += n;
+                continue;
+            }
+        }
+        match c {
+            b'\\' => out.push_str("\\\\"),
+            b' ' | b'\t' | b'\n' => out.push(char::from(c)),
+            _ if c.is_ascii_graphic() => out.push(char::from(c)),
+            b'\r' => out.push_str("\\r"),
+            0x08 => out.push_str("\\b"),
+            0x07 => out.push_str("\\a"),
+            0x0b => out.push_str("\\v"),
+            0x0c => out.push_str("\\f"),
+            0 => out.push_str(if src.get(i + 1).is_some_and(|b| (b'0'..=b'7').contains(b)) { "\\000" } else { "\\0" }),
+            _ => { let _ = core::fmt::Write::write_fmt(&mut out, format_args!("\\{:03o}", c)); }
+        }
+        i += 1;
+    }
+    out
 }

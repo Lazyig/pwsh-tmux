@@ -673,6 +673,20 @@ impl CopyMode {
         self.lastcx = self.cx;
     }
 
+    /// top_line_time: when the top line of the view entered the history (0 if it did not).
+    pub fn top_line_time(&self) -> u64 {
+        self.lines.get(self.top).map_or(0, |l| l.time)
+    }
+
+    /// copy_cursor_hyperlink: window_copy_cursor_hyperlink_cb reads the drawn copy-mode
+    /// screen (line numbers and the position indicator included) at the cursor's column
+    /// in the backing line, so an indicator over the link hides it and line numbers
+    /// shift what is read.
+    pub fn cursor_hyperlink(&self, style: &RenderStyle) -> Option<String> {
+        let (lines, _) = self.render_with(style);
+        lines.get(self.cy.checked_sub(self.top)?)?.hyperlink_at(self.cx).map(|l| l.uri.clone())
+    }
+
     /// window_copy_view_init: command output, no line numbers and no refresh.
     pub fn set_view_mode(&mut self) {
         self.view = true;
@@ -1164,8 +1178,7 @@ impl CopyMode {
             .find(|&(a, b)| at >= a && at < b)
             .or_else(|| at.checked_sub(1).and_then(|prev| self.visible_matches(prev / self.width, needle).into_iter()
                 .find(|&(a, b)| prev >= a && prev < b)))?;
-        Some((start..end).filter_map(|i| self.cell(i / self.width, i % self.width))
-            .map(|c| c.text.as_str()).collect())
+        Some((start..end).filter_map(|i| self.lines.get(i / self.width).map(|l| l.cell_text(i % self.width))).collect())
     }
 
     /// copy_cursor_word: the word under the cursor.
@@ -1176,7 +1189,8 @@ impl CopyMode {
     /// copy_cursor_line: the cursor's row (format_grid_line: one grid line, without its
     /// trailing blanks, even when it wraps).
     pub fn cursor_line(&self) -> String {
-        (0..self.len(self.cy)).filter_map(|x| self.cell(self.cy, x)).map(|c| c.text.as_str()).collect()
+        let Some(l) = self.lines.get(self.cy) else { return String::new() };
+        (0..self.len(self.cy)).map(|x| l.cell_text(x)).collect()
     }
 
     /// selection_start_* / selection_end_*: the anchor and the other end as (x, y), y
@@ -1444,7 +1458,19 @@ impl CopyMode {
                 }
             }
             // window_copy_cursor_left: wraps to the end of the line above
-            "cursor-left" => self.repeat_move(n, |s, p| Some(s.clamp_pos(s.reader_left(p, true)))),
+            // grid_reader_cursor_left steps onto the padding of a wide character or tab (the
+            // next step goes past its start), it does not snap to the start
+            "cursor-left" => {
+                let mut p = (self.cy, self.cx);
+                for _ in 0..n {
+                    p = self.reader_left(p, true);
+                }
+                let y = p.0.min(self.lines.len() - 1);
+                self.cy = y;
+                self.cx = self.clamp_x(y, p.1);
+                self.lastcx = self.cx;
+                self.ensure_visible();
+            }
             "cursor-right" => {
                 let all = self.anchor.is_some() && self.rect;
                 self.repeat_move(n, |s, p| s.cursor_right(p, all))
@@ -1800,6 +1826,20 @@ impl CopyMode {
                     self.cy = (self.top + row).min(self.lines.len() - 1);
                 }
             }
+            "next-prompt" | "previous-prompt" => {
+                // window_copy_cursor_prompt: the next line marked by OSC 133 A (or C with
+                // -o) goes to the top of the view; the repeat count is not used
+                let flag = if args.iter().any(|s| s == "-o") { vt100::ROW_START_OUTPUT } else { vt100::ROW_START_PROMPT };
+                let found = if command == "next-prompt" {
+                    (self.cy + 1..self.lines.len()).find(|&y| self.lines[y].flags & flag != 0)
+                } else {
+                    (0..self.cy).rev().find(|&y| self.lines[y].flags & flag != 0)
+                };
+                if let Some(y) = found {
+                    self.pinned = None;
+                    self.place_cursor(0, y);
+                }
+            }
             "previous-paragraph" => (0..n).for_each(|_| self.previous_paragraph()),
             "next-paragraph" => (0..n).for_each(|_| self.next_paragraph()),
             "set-mark" => {
@@ -2031,9 +2071,12 @@ impl CopyMode {
         let text_x = lnw.min(self.width - 1);
         for row in 0..self.height {
             let y = self.top + row;
-            let mut line = Line { cells: Vec::with_capacity(self.width), wrapped: false };
+            let mut line = Line { cells: Vec::with_capacity(self.width), wrapped: false, ..Default::default() };
             if let Some(src) = self.lines.get(y) {
                 line.wrapped = src.wrapped;
+                line.flags = src.flags;
+                line.time = src.time;
+                line.metadata = src.metadata.iter().filter(|(x, _)| (**x as usize) < content).map(|(&x,m)| ((x as usize + text_x) as u16,m.clone())).collect();
                 line.cells.extend(src.cells.iter().take(content).cloned());
                 // A wide char cut at the right edge: blank its lead.
                 if line.cells.len() == content
@@ -2041,6 +2084,13 @@ impl CopyMode {
                     && let Some(last) = line.cells.last_mut()
                 {
                     last.text = " ".into();
+                }
+                // padding a reflow moved off its tab's or wide character's row shows
+                // nothing in tmux; drawn as a blank, what follows keeps its column
+                for x in 0..line.cells.len() {
+                    if line.cells[x].text.is_empty() && (x == 0 || unicode_width::UnicodeWidthStr::width(line.cells[x - 1].text.as_str()) != 2) {
+                        line.cells[x].text = " ".into();
+                    }
                 }
             }
             line.cells.resize(content, Cell::default());
@@ -2161,6 +2211,7 @@ impl CopyMode {
             let at = lnw + x;
             if let Some(c) = row.cells.get_mut(at) {
                 *c = ca;
+                row.metadata.remove(&(at as u16));
                 drawn[at] = true;
             }
         }
@@ -2208,7 +2259,7 @@ impl CopyMode {
     }
 
     fn is_cont(&self, y: usize, x: usize) -> bool {
-        self.cell(y, x).is_some_and(Cell::is_continuation)
+        self.lines.get(y).is_some_and(|l| l.is_padding(x))
     }
 
     fn wrapped(&self, y: usize) -> bool {
@@ -2218,7 +2269,7 @@ impl CopyMode {
     /// Length of the line's text (trailing blanks excluded).
     fn len(&self, y: usize) -> usize {
         let Some(l) = self.lines.get(y) else { return 0 };
-        l.cells.iter().rposition(|c| c.text != " ").map_or(0, |i| i + 1)
+        l.cells.iter().rposition(|c| c.text != " ").map_or(0, |i| i + 1).max(l.tabs_end())
     }
 
     /// Number of cells copied from the line: the whole row when it soft-wraps.
@@ -2988,7 +3039,8 @@ impl CopyMode {
         let limit = if regex { 2000 } else { self.width + needle.len() };
         loop {
             for x in 0..self.width {
-                let text = self.cell(row, x).map_or(" ", |c| c.text.as_str());
+                // a tab matches a tab (window_copy_search_compare)
+                let text = match self.lines.get(row) { Some(l) if x < l.cells.len() => l.cell_text(x), _ => " " };
                 if !text.is_empty() {
                     starts.push((s.len(), (row - y) * self.width + x));
                     s.push_str(text);
@@ -3246,10 +3298,9 @@ impl CopyMode {
         let wrapped = self.wrapped(y);
         let xx = self.copy_len(y);
         let (sx, ex) = (sx.min(xx), ex.min(xx));
+        // padding is skipped and a tab copied as a tab
         for x in sx..ex {
-            if let Some(c) = self.cell(y, x).filter(|c| !c.is_continuation()) {
-                out.push_str(&c.text);
-            }
+            out.push_str(self.lines[y].cell_text(x));
         }
         if !wrapped || ex != xx {
             out.push('\n');
@@ -3364,16 +3415,20 @@ fn reflow_width(c: &Cell) -> usize {
 /// grid_reflow, with grid_reflow_move, _split and _join as tmux 3.8 has them: rows too
 /// wide are split, rows that wrap take what fits from the rows after them.
 fn reflow(lines: &[Line], sx: usize) -> Vec<Line> {
-    let mut src: Vec<(Vec<Cell>, bool)> = lines.iter().map(|l| (l.cells[..cells_used(l).min(l.cells.len())].to_vec(), l.wrapped)).collect();
+    // each cell with its width: a tab is a cell of its width and its padding cells one
+    // column each, as grid_reflow counts them
+    let mut src: Vec<(Vec<(Cell, usize)>, bool)> = lines.iter().map(|l| {
+        let cells = l.cells[..cells_used(l).min(l.cells.len())].iter().enumerate();
+        (cells.map(|(x, c)| (c.clone(), l.metadata.get(&(x as u16)).filter(|m| m.tab_width > 0).map_or_else(|| reflow_width(c), |m| usize::from(m.tab_width)))).collect(), l.wrapped)
+    }).collect();
     let mut dead = vec![false; src.len()];
-    let mut target: Vec<(Vec<Cell>, bool)> = Vec::with_capacity(src.len());
+    let mut target: Vec<(Vec<(Cell, usize)>, bool)> = Vec::with_capacity(src.len());
     for yy in 0..src.len() {
         if dead[yy] {
             continue;
         }
         let (mut width, mut at) = (0, 0);
-        for (i, c) in src[yy].0.iter().enumerate() {
-            let w = reflow_width(c);
+        for (i, (_, w)) in src[yy].0.iter().enumerate() {
             if at == 0 && width + w > sx {
                 at = i;
             }
@@ -3386,13 +3441,12 @@ fn reflow(lines: &[Line], sx: usize) -> Vec<Line> {
             target.push((cells[..at].to_vec(), true));
             let (mut line, mut width) = ((Vec::new(), false), 0);
             for c in &cells[at..] {
-                let w = reflow_width(c);
-                if width + w > sx {
+                if width + c.1 > sx {
                     line.1 = true;
                     target.push(std::mem::take(&mut line));
                     width = 0;
                 }
-                width += w;
+                width += c.1;
                 line.0.push(c.clone());
             }
             line.1 |= wrapped;
@@ -3408,17 +3462,68 @@ fn reflow(lines: &[Line], sx: usize) -> Vec<Line> {
             }
         }
     }
-    target.into_iter().map(|(mut cells, wrapped)| {
+    let mut output: Vec<Line> = target.into_iter().map(|(cells, wrapped)| {
+        let mut cells: Vec<Cell> = cells.into_iter().map(|(c, _)| c).collect();
         if !wrapped {
             cells.resize(sx.max(cells.len()), Cell::default());
         }
-        Line { cells, wrapped }
-    }).collect()
+        Line { cells, wrapped, ..Default::default() }
+    }).collect();
+    // Line flags and times stay on the row a line starts (grid_reflow_move/_split
+    // copy the line, rows joined onto another lose theirs); cell metadata follows its
+    // cell, and a tab's padding moved past the tab's row is padding there (shows
+    // nothing, as tmux's). One pass: rows only move on.
+    let (mut cy, mut base, mut offset) = (0, 0, 0);
+    let place = |output: &[Line], cy: &mut usize, base: &mut usize, wx: usize| -> (usize, usize) {
+        while *cy + 1 < output.len() && output[*cy].wrapped && wx >= *base + cells_used(&output[*cy]) {
+            *base += cells_used(&output[*cy]);
+            *cy += 1;
+        }
+        (wx - *base, *cy)
+    };
+    for line in lines {
+        if cy >= output.len() {
+            break;
+        }
+        let (x, y) = place(&output, &mut cy, &mut base, offset);
+        if x == 0 {
+            output[y].flags = line.flags;
+            output[y].time = line.time;
+        }
+        for (&col, m) in &line.metadata {
+            let (x, y) = place(&output, &mut cy, &mut base, offset + usize::from(col));
+            let m = m.clone();
+            for pad in 1..usize::from(m.tab_width) {
+                let (px, py) = place(&output, &mut cy, &mut base, offset + usize::from(col) + pad);
+                if py != y {
+                    if let Some(c) = output[py].cells.get_mut(px) {
+                        c.text.clear();
+                    }
+                }
+            }
+            if x < output[y].cells.len() {
+                // grid_set_cell marks the line the cell lands on
+                output[y].flags |= vt100::ROW_EXTENDED | if m.hyperlink.is_some() { vt100::ROW_HYPERLINK } else { 0 };
+                if m != vt100::CellMetadata::default() {
+                    output[y].metadata.insert(x as u16, m);
+                }
+            }
+        }
+        if line.wrapped {
+            offset += cells_used(line);
+        } else {
+            while cy + 1 < output.len() && output[cy].wrapped {
+                cy += 1;
+            }
+            (cy, base, offset) = (cy + 1, 0, 0);
+        }
+    }
+    output
 }
 
 /// grid_reflow_join: the rows after `yy` are joined onto the last target row while they
 /// fit; a row taken only in part keeps the rest for later.
-fn reflow_join(target: &mut [(Vec<Cell>, bool)], src: &mut [(Vec<Cell>, bool)], dead: &mut [bool], sx: usize, yy: usize, mut width: usize) {
+fn reflow_join(target: &mut [(Vec<(Cell, usize)>, bool)], src: &mut [(Vec<(Cell, usize)>, bool)], dead: &mut [bool], sx: usize, yy: usize, mut width: usize) {
     let to = target.len() - 1;
     let (mut lines, mut wrapped, mut from, mut want) = (0, true, None, 0);
     loop {
@@ -3436,7 +3541,7 @@ fn reflow_join(target: &mut [(Vec<Cell>, bool)], src: &mut [(Vec<Cell>, bool)], 
             lines += 1;
             continue;
         }
-        let w = reflow_width(&src[line].0[0]);
+        let w = src[line].0[0].1;
         if width + w > sx {
             break;
         }
@@ -3445,7 +3550,7 @@ fn reflow_join(target: &mut [(Vec<Cell>, bool)], src: &mut [(Vec<Cell>, bool)], 
         from = Some(line);
         want = 1;
         while want < src[line].0.len() {
-            let w = reflow_width(&src[line].0[want]);
+            let w = src[line].0[want].1;
             if width + w > sx {
                 break;
             }
@@ -3583,7 +3688,7 @@ mod tests {
             }
         }
         cells.resize(W as usize, Cell::default());
-        Line { cells, wrapped }
+        Line { cells, wrapped, ..Default::default() }
     }
 
     fn lines(v: &[&str]) -> Vec<Line> {
@@ -3800,6 +3905,10 @@ mod tests {
         let mut cm = CopyMode::new(lines(&["가나 다라 x"]), W, 1, (0, 0), true);
         cm.press("l");
         assert_eq!(cm.cx, 2, "skips continuation cell");
+        // grid_reader_cursor_left stops on the padding (tmux 3.8 shows x=1), the next
+        // step goes past the lead
+        cm.press("h");
+        assert_eq!(cm.cx, 1);
         cm.press("h");
         assert_eq!(cm.cx, 0);
         cm.press("w");
@@ -4455,9 +4564,77 @@ mod tests {
     }
 
     #[test]
+    fn reflow_keeps_line_marks_times_and_cell_metadata_on_their_rows() {
+        let nz = |n| std::num::NonZeroU16::new(n).unwrap();
+        let mut p = vt100::Parser::new(nz(4), nz(20), 50);
+        p.screen_mut().set_time(1000);
+        p.process(b"\x1b]133;A\x07$ abcdefghijklmnop\r\n\x1b]133;C\x07a\tb\x1b]8;;http://z\x07zz\x1b]8;;\x07\r\n\r\n\r\n\r\nend");
+        let lines = crate::cells::snapshot(p.screen());
+        assert_eq!((lines[0].flags, lines[0].time, lines[1].time), (vt100::ROW_START_PROMPT, 1000, 1000));
+        let mut cm = CopyMode::new(lines, 20, 4, (3, 3), true);
+        cm.resize(8, 4);
+        // the prompt line is split: its mark and time stay on its first row
+        let rows: Vec<(u8, u64, bool)> = cm.lines.iter().take(4).map(|l| (l.flags, l.time, l.wrapped)).collect();
+        assert_eq!(rows, [(vt100::ROW_START_PROMPT, 1000, true), (0, 0, true), (0, 0, false), (vt100::ROW_START_OUTPUT | vt100::ROW_HYPERLINK | vt100::ROW_EXTENDED, 1000, true)]);
+        // the tab is a cell of its width and each padding cell counts a column
+        // (grid_reflow): the padding goes on to the next row, where it shows nothing, and
+        // takes the link's cells with it (capture-pane -M -F: "OHWX a^I", "HWX bz", "HX z")
+        assert_eq!(cm.lines[3].tab_at(4), Some((1, 7)));
+        assert_eq!((cm.lines[3].cells.len(), cm.lines[4].flags), (2, vt100::ROW_HYPERLINK | vt100::ROW_EXTENDED));
+        let text = |l: &Line| (0..l.cells.len()).map(|x| l.cell_text(x)).collect::<String>();
+        assert_eq!((text(&cm.lines[4]), (0..6).all(|x| cm.lines[4].is_padding(x))), ("bz".into(), true));
+        assert_eq!((cm.lines[4].hyperlink_at(7).map(|l| l.uri.as_str()), cm.lines[5].hyperlink_at(0).map(|l| l.uri.as_str())), (Some("http://z"), Some("http://z")));
+        // drawn, the moved padding is blank so the text after it keeps its column
+        let (top, shown) = (cm.top, cm.show_position);
+        (cm.top, cm.show_position) = (4, false);
+        let drawn: String = cm.render().0[0].cells.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(drawn, "      bz");
+        (cm.top, cm.show_position) = (top, shown);
+        cm.run("history-top", &[]);
+        cm.run("next-prompt", &["-o".into()]);
+        assert_eq!(cm.cursor_line(), "a\t");
+        // wider again the line is whole, the tab still a tab
+        cm.resize(20, 4);
+        assert_eq!(text(&cm.lines[1]).trim_end(), "a\tbzz");
+    }
+
+    #[test]
+    fn cursor_left_steps_onto_padding_and_cursor_hyperlink_reads_the_drawn_screen() {
+        let nz = |n| std::num::NonZeroU16::new(n).unwrap();
+        let mut p = vt100::Parser::new(nz(6), nz(30), 50);
+        p.process("ab\tcd\tef\r\n\tX\r\na\u{4e2d}\u{6587}b\r\nab\x1b]8;;http://z\x07ZZZZ\x1b]8;;\x07cd".as_bytes());
+        let mut cm = CopyMode::new(crate::cells::snapshot(p.screen()), 30, 6, (0, 0), false);
+        // grid_reader_cursor_left lands on a tab's or wide character's padding; the next
+        // step goes past its start (tmux 3.8: 8 7 18 17 16 15 and 6 5 4 2 0)
+        let lefts = |cm: &mut CopyMode, y: usize, n: usize| -> Vec<(usize, usize)> {
+            cm.set_cursor(y, 0);
+            cm.run("end-of-line", &[]);
+            (0..n).map(|_| { cm.run("cursor-left", &[]); (cm.cx, cm.cy) }).collect()
+        };
+        assert_eq!(lefts(&mut cm, 1, 6), [(8, 1), (7, 1), (18, 0), (17, 0), (16, 0), (15, 0)]);
+        assert_eq!(lefts(&mut cm, 2, 4), [(5, 2), (4, 2), (2, 2), (0, 2)]);
+        // copy_cursor_hyperlink: the copy-mode screen as drawn, at the backing column, so
+        // the position indicator ("[0/0]" at the right) hides a link and line numbers
+        // shift what is read
+        let mut p = vt100::Parser::new(nz(6), nz(10), 50);
+        p.process(b"\r\n\r\n\r\nab\x1b]8;;http://z\x07ZZZZ\x1b]8;;\x07cd");
+        let mut cm = CopyMode::new(crate::cells::snapshot(p.screen()), 10, 3, (0, 0), false);
+        let links = |cm: &mut CopyMode| -> Vec<bool> {
+            (0..8).map(|x| { cm.set_cursor(3, x); cm.cursor_hyperlink(&RenderStyle::default()).is_some() }).collect()
+        };
+        assert_eq!((cm.top, links(&mut cm)), (3, vec![false, false, true, true, true, false, false, false]));
+        cm.top = 2;
+        assert_eq!(links(&mut cm), [false, false, true, true, true, true, false, false]);
+        cm.set_line_number_option(LineNumbers::Absolute);
+        cm.set_line_numbers(true);
+        let lnw = (0..10).position(|x| { cm.set_cursor(3, x); cm.cursor_hyperlink(&RenderStyle::default()).is_some() }).unwrap() - 2;
+        assert!(lnw > 0);
+    }
+
+    #[test]
     fn clone_trims_resizes_and_rewraps_like_tmux() {
         let row = |s: &str, w: usize, wrapped: bool| {
-            let mut l = Line { cells: s.chars().map(|c| Cell { text: c.to_string(), style: Style::default() }).collect(), wrapped };
+            let mut l = Line { cells: s.chars().map(|c| Cell { text: c.to_string(), style: Style::default() }).collect(), wrapped, ..Default::default() };
             l.cells.resize(w, Cell::default());
             l
         };
@@ -4492,13 +4669,13 @@ mod tests {
         assert_eq!(cm.cursor(), (1, 0));
         // grid_reflow counts a wide character's padding cell as a column: four CJK
         // characters to a 13-column row, as live tmux 3.8 shows
-        let mut wide = Line { cells: Vec::new(), wrapped: false };
+        let mut wide = Line { cells: Vec::new(), wrapped: false, ..Default::default() };
         for _ in 0..22 {
             wide.cells.push(Cell { text: "漢".into(), style: Style::default() });
             wide.cells.push(Cell { text: String::new(), style: Style::default() });
         }
-        let first = Line { cells: wide.cells[..40].to_vec(), wrapped: true };
-        let rest = Line { cells: wide.cells[40..].to_vec(), wrapped: false };
+        let first = Line { cells: wide.cells[..40].to_vec(), wrapped: true, ..Default::default() };
+        let rest = Line { cells: wide.cells[40..].to_vec(), wrapped: false, ..Default::default() };
         let mut cm = CopyMode::new(vec![first, rest, line("DONE", false)], 40, 6, (2, 0), true);
         cm.resize(13, 6);
         let t: Vec<String> = cm.lines.iter().map(|l| l.cells.iter().map(|c| c.text.as_str()).collect::<String>().trim_end().to_string()).collect();
@@ -4802,7 +4979,7 @@ mod tests {
         let text = "ab\u{3000}\u{3000}cd\u{a0}ef\u{2003}gh-ij  \u{3000}kl";
         for (vi, want) in [(true, [1, 7, 10, 13, 14, 16, 22]), (false, [2, 8, 11, 14, 15, 17, 23])] {
             // line() keeps W cells; this line is longer
-            let mut l = Line { cells: Vec::new(), wrapped: false };
+            let mut l = Line { cells: Vec::new(), wrapped: false, ..Default::default() };
             for ch in text.chars() {
                 l.cells.push(Cell { text: ch.to_string(), style: Style::default() });
                 if ch.width() == Some(2) {
@@ -5269,7 +5446,7 @@ mod display_search_tests {
     use super::*;
     #[test]
     fn wrap_search_can_be_disabled() {
-        let lines = ["target", "middle", "target"].into_iter().map(|s| Line { cells: s.chars().map(|c| crate::cells::Cell { text: c.to_string(), style: Default::default() }).collect(), wrapped: false }).collect();
+        let lines = ["target", "middle", "target"].into_iter().map(|s| Line { cells: s.chars().map(|c| crate::cells::Cell { text: c.to_string(), style: Default::default() }).collect(), wrapped: false, ..Default::default() }).collect();
         let mut cm = CopyMode::new(lines, 10, 3, (2, 0), false);
         cm.wrap_search = false;
         cm.run("search-forward", &["target".into()]);

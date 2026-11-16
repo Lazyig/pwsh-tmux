@@ -43,24 +43,38 @@ pub struct Frame {
     pub w: u16,
     pub h: u16,
     pub cells: Vec<Cell>,
+    links: std::collections::BTreeMap<usize, std::sync::Arc<vt100::Hyperlink>>,
 }
 
 impl Frame {
     pub fn new(w: u16, h: u16) -> Frame {
-        Frame { w, h, cells: vec![Cell::default(); w as usize * h as usize] }
+        Frame { w, h, cells: vec![Cell::default(); w as usize * h as usize], links: Default::default() }
     }
     pub fn set(&mut self, x: u16, y: u16, cell: Cell) {
         if x < self.w && y < self.h {
             let i = y as usize * self.w as usize + x as usize;
+            self.links.remove(&i);
             // Overwriting half of a wide char: blank the other half.
             if self.cells[i].text.is_empty() && x > 0 {
+                self.links.remove(&(i - 1));
                 self.cells[i - 1] = Cell { text: " ".into(), style: self.cells[i - 1].style };
             }
             if !cell.text.is_empty() && x + 1 < self.w && self.cells[i + 1].text.is_empty() && self.cells[i].text.chars().next().and_then(|c| char_width(c)) == Some(2) {
+                self.links.remove(&(i + 1));
                 self.cells[i + 1] = Cell { text: " ".into(), style: self.cells[i + 1].style };
             }
             self.cells[i] = cell;
         }
+    }
+    /// The OSC 8 link of a cell set with [`Frame::set`] (cleared by the next set).
+    fn set_link(&mut self, x: u16, y: u16, link: Option<&std::sync::Arc<vt100::Hyperlink>>) {
+        if let Some(link) = link.filter(|_| x < self.w && y < self.h) {
+            self.links.insert(y as usize * self.w as usize + x as usize, link.clone());
+        }
+    }
+    fn row_links(&self, y: u16) -> impl Iterator<Item = (&usize, &std::sync::Arc<vt100::Hyperlink>)> {
+        let start = y as usize * self.w as usize;
+        self.links.range(start..start + self.w as usize)
     }
     pub fn get(&self, x: u16, y: u16) -> Option<&Cell> {
         (x < self.w && y < self.h).then(|| &self.cells[y as usize * self.w as usize + x as usize])
@@ -326,17 +340,53 @@ pub fn push_sgr(out: &mut String, st: &Style) {
 
 /// capture-pane -e: text with SGR escapes.
 pub fn line_with_escapes(line: &Line) -> String {
+    line_with_escapes_from(line, &mut None, false)
+}
+
+/// [`line_with_escapes`] after lines that ended in link `last` (grid_string_cells keeps
+/// lastgc from line to line: a line that goes on with the link the line before ended in
+/// does not open it again, though each line closes what it opened); `last` becomes the
+/// link of the last cell read: the last used one, or with `allocated`
+/// (GRID_STRING_EMPTY_CELLS) the last the line has room for, which grid_expand_line
+/// grows to a quarter, half or all of the width (more than the text written at once).
+pub fn line_with_escapes_from(line: &Line, last: &mut Option<u64>, allocated: bool) -> String {
     let mut out = String::new();
     let mut cur = Style::default();
-    for c in &line.cells {
-        if c.text.is_empty() {
+    let mut link = *last;
+    let mut open = false;
+    let used = (0..line.cells.len()).rposition(|x| line.cells[x].text != " " || line.cells[x].style != Style::default() || line.metadata.contains_key(&(x as u16))).map_or(0, |x| x + 1);
+    for (x, c) in line.cells.iter().enumerate() {
+        if line.is_padding(x) {
             continue;
         }
         if c.style != cur {
             push_sgr(&mut out, &c.style);
             cur = c.style;
         }
-        out.push_str(&c.text);
+        // grid_string_cells_code: an OSC 8 link (with its own id) follows the attributes;
+        // a cell without one closes the link only if this line opened it
+        let next = line.metadata.get(&(x as u16)).and_then(|m| m.hyperlink.as_ref());
+        if next.map(|l| l.inner) != link {
+            if let Some(l) = next {
+                let _ = write!(out, "\x1b]8;{}{};{}\x1b\\", if l.id.is_empty() { "" } else { "id=" }, l.id, l.uri);
+                open = true;
+            } else if open {
+                out.push_str("\x1b]8;;\x1b\\");
+                open = false;
+            }
+            link = next.map(|l| l.inner);
+        }
+        if x < used {
+            *last = link;
+        }
+        out.push_str(line.cell_text(x));
+    }
+    let w = line.cells.len();
+    if allocated && used > 0 && used < [w / 4, w / 2, w].into_iter().find(|&n| used < n).unwrap_or(w) {
+        *last = None;
+    }
+    if open {
+        out.push_str("\x1b]8;;\x1b\\");
     }
     let trimmed = out.trim_end_matches(' ').to_string();
     if cur != Style::default() { trimmed + "\x1b[0m" } else { trimmed }
@@ -352,6 +402,9 @@ fn overlay_style(cell: &mut Style, over: Style) {
 }
 
 /// A blank that EL (erase to end of line, default background) reproduces exactly.
+/// tty-features.c's Hls (the hyperlinks feature).
+const HLS: &str = "\x1b]8;%?%p1%l%tid=%p1%s%;;%p2%s\x1b\\";
+
 fn erasable(c: &Cell) -> bool {
     c.text == " " && c.style.bg == Color::Default && c.style.attrs & (UNDERLINE | INVERSE | STRIKE) == 0
 }
@@ -629,12 +682,14 @@ impl Server {
                         let mut cell = lines.get(y as usize).and_then(|l| l.cells.get(x as usize)).cloned().unwrap_or_default();
                         overlay_style(&mut cell.style, wstyle);
                         f.set(ax, oy + ay, cell);
+                        f.set_link(ax, oy + ay, lines.get(y as usize).and_then(|l| l.tab_at(x as usize).map_or(l.metadata.get(&x), |(at, _)| l.metadata.get(&(at as u16)))?.hyperlink.as_ref()));
                     }
                 }
             }
             None => {
                 let scr = p.screen();
                 for y in span(y0, h, clip.1) {
+                    let row = scr.history_row(scr.scrollback_len() + y as usize);
                     for x in span(x0, w, clip.0) {
                         let Some((ax, ay)) = vis(x, y) else { continue };
                         let Some(vc) = scr.cell(y, x) else {
@@ -647,6 +702,7 @@ impl Server {
                         }
                         overlay_style(&mut cell.style, wstyle);
                         f.set(ax, oy + ay, cell);
+                        f.set_link(ax, oy + ay, row.as_ref().and_then(|r| r.hyperlink_at(x)));
                     }
                 }
             }
@@ -1159,6 +1215,7 @@ impl Server {
                     if let Some(p) = self.panes.get(&pp.pane) {
                         let scr = p.screen();
                         for y in 0..ih {
+                            let row = scr.history_row(scr.scrollback_len() + y as usize);
                             for x in 0..iw {
                                 if let Some(vc) = scr.cell(y, x) {
                                     let mut cell = crate::cells::cell_from_vt(vc);
@@ -1167,6 +1224,7 @@ impl Server {
                                     }
                                     overlay_style(&mut cell.style, st);
                                     f.set(ix + x, iy + y, cell);
+                                    f.set_link(ix + x, iy + y, row.as_ref().and_then(|r| r.hyperlink_at(x)));
                                 }
                             }
                         }
@@ -1355,9 +1413,10 @@ impl Server {
             out.push_str("\x1b[0m\x1b[H\x1b[2J");
         }
         let mut changed = false;
+        let hyperlinks = feats.has("hyperlinks") || c.term_caps.contains_key("Hls");
         for y in 0..next.frame.h {
             let row = next.frame.row(y);
-            if prev.is_some_and(|p| p.frame.row(y) == row) {
+            if prev.is_some_and(|p| p.frame.row(y) == row && p.frame.row_links(y).eq(next.frame.row_links(y))) {
                 continue;
             }
             changed = true;
@@ -1367,7 +1426,8 @@ impl Server {
             // with EL instead of being written as spaces. Terminals that keep text per line
             // (the IntelliJ terminal's editor) then don't get full-width lines, which an
             // IME's composed-text inlay at the cursor would push into a soft wrap.
-            let end = row.iter().rposition(|c| !erasable(c)).map_or(0, |i| i + 1);
+            let end = row.iter().rposition(|c| !erasable(c)).map_or(0, |i| i + 1).max(next.frame.row_links(y).last().map_or(0, |(i,_)| i % next.frame.w as usize + 1));
+            let mut link = None;
             for (x, cell) in row.iter().enumerate().take(end) {
                 if cell.text.is_empty() {
                     continue;
@@ -1376,12 +1436,24 @@ impl Server {
                     push_sgr(&mut out, &fit_style(cell.style, &feats));
                     cur = Some(cell.style);
                 }
+                // tty_hyperlink (after the attributes): Hls with the link's external id, when the terminal has it
+                if hyperlinks {
+                    let next_link = next.frame.links.get(&(y as usize * next.frame.w as usize + x));
+                    if next_link.map(|l| l.inner) != link {
+                        let (id, uri) = next_link.map_or(("", ""), |l| (l.external_id.as_str(), l.uri.as_str()));
+                        out.push_str(&features::string_capability(&c.term_caps, "Hls", HLS, &[id, uri]));
+                        link = next_link.map(|l| l.inner);
+                    }
+                }
                 if c.utf8() || cell.text.is_ascii() { out.push_str(&terminal_text(&cell.text)); }
                 else { out.push_str(&non_utf8_text(&cell.text, row.get(x + 1).is_some_and(|n| n.text.is_empty()))); }
                 if cfg!(windows) && cell.text.chars().any(|c| char_width(c) == Some(0)) {
                     let width = cell.text.chars().filter_map(|c| char_width(c)).sum::<usize>();
                     if x + width < next.frame.w as usize { let _ = write!(out, "\x1b[{};{}H", y + 1, x + width + 1); }
                 }
+            }
+            if link.is_some() {
+                out.push_str(&features::string_capability(&c.term_caps, "Hls", HLS, &["", ""]));
             }
             if end < row.len() {
                 // EL erases with the current background: make sure it is the default

@@ -45,3 +45,30 @@ set with HTS (ESC H) and cleared with TBC (CSI g), which HT now follows (reset t
 every 8 columns when the width changes), and exposes `origin_mode` and
 `scroll_region`. `Grid` counts rows added to and dropped from history and history
 clears/rewraps (`history_counters`); RIS keeps those counts.
+
+Local addition: tmux 3.8 grid metadata. OSC 133 A/N/P, B/I, C and D set the
+cursor row's ROW_* flags (GRID_LINE_START_PROMPT and friends; callbacks still get
+OSC 133 for the pane events); erasing a row keeps them, reflow keeps them on the
+row a line starts on. OSC 8 links (hyperlinks.c: named links shared by id and
+URI, anonymous links always new, URIs over 1024 bytes dropped) and HT tab cells
+(GRID_FLAG_TAB: HT over up to 32 blank cells that look alike keeps the tab with
+the first cell's style and link; a tab's own cells are content to a later HT) live
+in an optional boxed map per row, so normal cells stay 32 bytes and ordinary rows
+allocate nothing. URIs and ids are vis-encoded (utf8_stravis) before the 1024 byte
+limit; dead named links are swept once the lookup table doubles. `CSI m` with no
+parameter resets the link (vte reports it as 0, so the parser notes it), `CSI 0 m`
+keeps it. Rewriting a cell drops its entry and turns a tab covering it into
+spaces; an insert or delete inside a tab keeps the part before it. Reflow counts
+widths as grid_reflow does (a tab is a cell of its width and each padding cell
+another column, a row that wrapped early ends at its last used cell, a split whose
+first cell is wider than the row leaves an empty row, the rest of a row a join
+stopped in is a line of its own), so the tab stays a tab at any width; the padding
+has no cells here, which only moves where text after a tab is drawn on a row the
+padding went on to. ROW_HYPERLINK / ROW_EXTENDED (also set by wide, multi-byte and
+RGB cells) stay set until the row is cleared, as tmux's line flags; EL/ED/ECH over
+a whole line clear its flags (EL keeps the OSC 133 marks) and the line above's
+wrap. Rows that a shrink moves into the history get no time; the top line of a
+scroll region not at the top goes into the history (grid_scroll_history_region);
+RIS keeps the history and, with scroll-on-clear, moves the screen into it; IRM
+makes text and tabs insert. `Screen::reset_hyperlinks` is screen_reset_hyperlinks
+(clear-history -H). Tests: lib.rs::metadata_tests.

@@ -1457,7 +1457,7 @@ impl Tree {
                 cursor = Some((cx as u16, py as u16));
             }
         }
-        (grid.into_iter().map(|cells| Line { cells, wrapped: false }).collect(), cursor)
+        (grid.into_iter().map(|cells| Line { cells, wrapped: false, ..Default::default() }).collect(), cursor)
     }
 
     fn view_name(&self) -> Option<&'static str> {

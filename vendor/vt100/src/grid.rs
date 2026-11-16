@@ -111,7 +111,7 @@ impl Grid {
         } else if size.rows() < self.size.rows() {
             let num_excess_bottom = self.size.rows() - self.pos.row - 1;
             let num_pushed = diff.saturating_sub(num_excess_bottom);
-            self.scroll_up(num_pushed, on_row);
+            self.scroll_up_stamped(num_pushed, on_row, false);
             self.rows.truncate(size.rows().into());
             num_pushed
         } else if let Some(scrollback) = &mut self.scrollback {
@@ -196,7 +196,13 @@ impl Grid {
         let mut out = VecDeque::new();
         let mut produced = 0usize;
         let mut row = crate::row::Row::new(size.cols());
+        // `col` is the next cell of the new row, `used` tmux's width count for it: a tab
+        // is one cell of its width followed by padding cells of one column each, so
+        // grid_reflow puts the padding (which has no cells here) after the tab and moves
+        // what follows on when it does not fit, as tmux 3.8 shows; the tab stays a tab
         let mut col = 0u16;
+        let mut used = 0u16;
+        let cols = size.cols();
         let mut cursor = (0usize, 0u16);
         let mut saved = (0usize, 0u16);
         let emit = |row: crate::row::Row, out: &mut VecDeque<crate::row::Row>, produced: &mut usize| {
@@ -204,42 +210,82 @@ impl Grid {
             out.push_back(row);
             *produced += 1;
         };
+        // grid_reflow splits the row a line starts on and joins the rows after it until
+        // one does not fit, whose rest is then a line of its own (`line_row`); a split
+        // whose first cell is wider than the row leaves an empty row before it
+        let (mut line_row, mut split) = (0usize, false);
+        macro_rules! wrap {
+            () => {{
+                row.wrap(true);
+                emit(row, &mut out, &mut produced);
+                row = crate::row::Row::new(cols);
+                (col, used) = (0, 0);
+            }};
+        }
         for (index, mut old) in source.enumerate() {
             let wrapped = old.wrapped();
             if !wrapped { old.trim(); }
+            let end = if wrapped { old.used_len() } else { old.cols() };
             // rewrapped rows keep the time their line entered the history
-            if col == 0 { row.set_time(old.time()); row.set_flags(old.flags()); }
+            if col == 0 && used == 0 { row.set_time(old.time()); row.set_flags(old.flags()); }
             let mut x = 0u16;
-            while let Some(cell) = old.get(x) {
+            while x < end {
+                let Some(cell) = old.get(x) else { break };
                 if cell.is_wide_continuation() { x += 1; continue; }
-                let width = if cell.is_wide() { 2 } else { 1 };
-                if col + width > size.cols() {
-                    row.wrap(true);
-                    emit(row, &mut out, &mut produced);
-                    row = crate::row::Row::new(size.cols());
-                    col = 0;
-                }
-                if index == cursor_row && self.pos.col >= x && self.pos.col < x + width { cursor = (produced,col); }
-                if index == saved_row && self.saved_pos.col >= x && self.saved_pos.col < x + width { saved = (produced,col); }
-                // A two-column glyph cannot fit in a one-column terminal.
-                if width <= size.cols() {
-                    *row.get_mut(col).unwrap() = cell.clone();
-                    if width == 2 {
-                        if let Some(next) = old.get(x+1) { *row.get_mut(col+1).unwrap() = next.clone(); }
+                let metadata = old.cell_metadata(x).cloned();
+                let tab = metadata.as_ref().map_or(0, |m| m.tab_width);
+                // columns taken (a tab wider than the row is kept, clipped to it), the
+                // cells it has here and the padding counted after it
+                let (width, span, padding) = if tab > 0 { (tab, tab.min(end - x), tab - 1) } else if cell.is_wide() { (2, 2, 0) } else { (1, 1, 0) };
+                if used > 0 && used + width > cols {
+                    if index != line_row {
+                        // the rest of a row a join stopped in keeps its line (flags, time)
+                        (line_row, split) = (index, false);
+                        wrap!();
+                        row.set_time(old.time());
+                        row.set_flags(old.flags());
+                    } else {
+                        let first = !split;
+                        split = true;
+                        wrap!();
+                        if first && width > cols { wrap!(); }
                     }
-                    col += width;
                 }
-                x += width;
+                // a cursor inside a tab keeps its offset, on a wide character its first half
+                let within = |c: u16| if tab > 0 { (col + c - x).min(cols - 1) } else { col };
+                let cover = if tab > 0 { span } else { width };
+                if index == cursor_row && self.pos.col >= x && self.pos.col < x + cover { cursor = (produced, within(self.pos.col)); }
+                if index == saved_row && self.saved_pos.col >= x && self.saved_pos.col < x + cover { saved = (produced, within(self.saved_pos.col)); }
+                // A two-column glyph cannot fit in a one-column terminal.
+                if tab > 0 || width <= cols {
+                    for i in 0..width.min(cols - col) {
+                        // a tab's cells cut off by an earlier, narrower row are its blanks again
+                        let c = if i < span { old.get(x + i).cloned() } else { None }.unwrap_or_else(|| cell.clone());
+                        *row.get_mut_untracked(col + i).unwrap() = c;
+                    }
+                    if let Some(m) = metadata { row.set_metadata(col, m); }
+                    col += width.min(cols - col);
+                    used = used.saturating_add(width);
+                }
+                for _ in 0..padding {
+                    if used + 1 > cols {
+                        if index != line_row { (line_row, split) = (index, false); } else { split = true; }
+                        wrap!();
+                    }
+                    used += 1;
+                }
+                x += span;
             }
-            if index == cursor_row && self.pos.col >= x { cursor = (produced,col.saturating_add(self.pos.col-x).min(size.cols()-1)); }
-            if index == saved_row && self.saved_pos.col >= x { saved = (produced,col.saturating_add(self.saved_pos.col-x).min(size.cols()-1)); }
+            if index == cursor_row && self.pos.col >= x { cursor = (produced,col.saturating_add(self.pos.col-x).min(cols-1)); }
+            if index == saved_row && self.saved_pos.col >= x { saved = (produced,col.saturating_add(self.saved_pos.col-x).min(cols-1)); }
             if !wrapped {
                 emit(row, &mut out, &mut produced);
-                row = crate::row::Row::new(size.cols());
-                col = 0;
+                row = crate::row::Row::new(cols);
+                (col, used) = (0, 0);
+                (line_row, split) = (index + 1, false);
             }
         }
-        if col > 0 { emit(row, &mut out, &mut produced); }
+        if col > 0 || used > 0 { emit(row, &mut out, &mut produced); }
         while out.len() < usize::from(size.rows()) {
             emit(crate::row::Row::new(size.cols()), &mut out, &mut produced);
         }
@@ -379,6 +425,26 @@ impl Grid {
             self.scrollback.as_ref().and_then(|s| s.rows.get(index))
         } else {
             self.rows.get(index - history)
+        }
+    }
+
+    /// Every history and screen row.
+    pub fn for_each_row_mut(&mut self, f: impl FnMut(&mut crate::row::Row)) {
+        let history = self.scrollback.iter_mut().flat_map(|s| s.rows.iter_mut());
+        history.chain(self.rows.iter_mut()).for_each(f);
+    }
+
+    /// The history rows, taken (another grid's history goes in with
+    /// [`Grid::set_history`]).
+    pub fn take_history(&mut self) -> alloc::collections::VecDeque<crate::row::Row> {
+        self.scrollback.as_mut().map(|s| { s.offset = 0; s.unbounded_len = 0; core::mem::take(&mut s.rows) }).unwrap_or_default()
+    }
+
+    pub fn set_history(&mut self, rows: alloc::collections::VecDeque<crate::row::Row>) {
+        // as after a clear into the history (hscrolled 0): growing does not pull it back
+        if let Some(s) = self.scrollback.as_mut() {
+            s.unbounded_len = 0;
+            s.rows = rows;
         }
     }
 
@@ -724,7 +790,12 @@ impl Grid {
             row.clear(attrs);
         }
 
-        self.erase_row_forward(attrs);
+        if pos.col == 0 {
+            // grid_clear_lines: from the line's start the whole line goes, marks too
+            self.clear_line(pos.row, attrs);
+        } else {
+            self.erase_row_forward(attrs);
+        }
     }
 
     pub fn erase_all_backward(&mut self, attrs: crate::attrs::Attrs) {
@@ -732,8 +803,36 @@ impl Grid {
         for row in self.drawing_rows_mut().take(usize::from(pos.row)) {
             row.clear(attrs);
         }
+        if pos.row > 0 {
+            self.unwrap_above(0);
+        }
 
-        self.erase_row_backward(attrs);
+        if pos.col >= self.size.cols() - 1 {
+            self.clear_line(pos.row, attrs);
+        } else {
+            self.erase_row_backward(attrs);
+        }
+    }
+
+    /// grid_clear_lines on one screen line: its cells and every line flag go and the
+    /// line above no longer wraps onto it.
+    pub fn clear_line(&mut self, row: u16, attrs: crate::attrs::Attrs) {
+        if let Some(r) = self.drawing_row_mut(row) {
+            r.clear(attrs);
+        }
+        self.unwrap_above(row);
+    }
+
+    /// The line above screen line `row` (the last history line above the first) ends
+    /// there (grid_clear_lines clears its GRID_LINE_WRAPPED).
+    pub fn unwrap_above(&mut self, row: u16) {
+        if row > 0 {
+            if let Some(r) = self.drawing_row_mut(row - 1) {
+                r.wrap(false);
+            }
+        } else if let Some(r) = self.scrollback.as_mut().and_then(|s| s.rows.back_mut()) {
+            r.wrap(false);
+        }
     }
 
     pub fn erase_all_scrollback<F>(&mut self, mut on_row: F)
@@ -751,16 +850,27 @@ impl Grid {
     }
 
     pub fn erase_row(&mut self, attrs: crate::attrs::Attrs) {
-        // screen_write_clearline: the line's OSC 133 marks survive
+        // screen_write_clearline: the line's OSC 133 marks survive; a line never written
+        // (no cells, tmux's cellsize 0) with the default background is left alone, the
+        // wrap of the line above included
         let row = self.current_row_mut();
-        let flags = row.flags();
+        if row.used_len() == 0 && row.metadata().next().is_none() && attrs.bgcolor == crate::Color::Default {
+            return;
+        }
+        let flags = row.flags() & !(crate::ROW_HYPERLINK | crate::ROW_EXTENDED);
         row.clear(attrs);
         row.set_flags(flags);
+        self.unwrap_above(self.pos.row);
     }
 
     pub fn erase_row_forward(&mut self, attrs: crate::attrs::Attrs) {
         let size = self.size;
         let pos = self.pos;
+        // screen_write_clearendofline: from the start it is the whole line
+        if pos.col == 0 {
+            self.erase_row(attrs);
+            return;
+        }
         let row = self.current_row_mut();
         for col in pos.col..size.cols() {
             row.erase(col, attrs);
@@ -792,6 +902,11 @@ impl Grid {
     pub fn erase_cells(&mut self, count: u16, attrs: crate::attrs::Attrs) {
         let size = self.size;
         let pos = self.pos;
+        // ECH over the whole line is grid_clear_lines
+        if pos.col == 0 && count.max(1) >= size.cols() {
+            self.clear_line(pos.row, attrs);
+            return;
+        }
         let row = self.current_row_mut();
         for col in pos.col..((pos.col.saturating_add(count)).min(size.cols()))
         {
@@ -832,13 +947,24 @@ impl Grid {
         between.rotate_left(num_removed);
     }
 
-    pub fn scroll_up<F>(&mut self, count: u16, mut on_row: F)
+    pub fn scroll_up<F>(&mut self, count: u16, on_row: F)
+    where
+        F: FnMut(&crate::row::Row),
+    {
+        self.scroll_up_stamped(count, on_row, true);
+    }
+
+    /// Scrolls up; `stamp` gives the rows entering the history the current time
+    /// (grid_scroll_history). Shrinking the screen moves rows into the history
+    /// without one (screen_resize_y only grows hsize).
+    fn scroll_up_stamped<F>(&mut self, count: u16, mut on_row: F, stamp: bool)
     where
         F: FnMut(&crate::row::Row),
     {
         // This can be true even when `self.scrollback` is `None`; it controls
-        // whether we call the `on_row` callback.
-        let scrollback_enabled = self.scroll_top == 0;
+        // whether we call the `on_row` callback. With a history the top line of any
+        // scroll region goes into it (grid_scroll_history_region).
+        let scrollback_enabled = self.scroll_top == 0 || self.scrollback.is_some();
         let between = &mut self.rows
             [usize::from(self.scroll_top)..=usize::from(self.scroll_bottom)];
         let num_between = between.len();
@@ -881,7 +1007,7 @@ impl Grid {
                 between[num_reset..num_removed].iter_mut().map(|row| {
                     row.trim();
                     row.compact();
-                    row.set_time(now);
+                    if stamp { row.set_time(now); }
                     core::mem::replace(row, new_row())
                 }),
             );
@@ -1015,12 +1141,6 @@ impl Grid {
 
     pub fn col_dec(&mut self, count: u16) {
         self.pos.col = self.pos.col.saturating_sub(count);
-    }
-
-    pub fn col_tab(&mut self) {
-        self.pos.col -= self.pos.col % 8;
-        self.pos.col = self.pos.col.saturating_add(8);
-        self.col_clamp();
     }
 
     pub fn col_set(&mut self, i: u16) {

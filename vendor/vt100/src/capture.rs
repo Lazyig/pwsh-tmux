@@ -54,6 +54,19 @@ impl BasicFormattedCaptureState {
 pub struct RowContents<'a>(pub(crate) &'a crate::row::Row);
 
 impl RowContents<'_> {
+    /// Sparse cell metadata in column order.
+    pub fn metadata(&self) -> impl Iterator<Item = (u16, &crate::CellMetadata)> { self.0.metadata() }
+    /// The metadata of the cell at `col`.
+    pub fn cell_metadata(&self, col: u16) -> Option<&crate::CellMetadata> { self.0.cell_metadata(col) }
+    /// The link of the cell at `col` or of the tab covering it.
+    pub fn hyperlink_at(&self, col: u16) -> Option<&alloc::sync::Arc<crate::Hyperlink>> { self.0.hyperlink_at(col) }
+    /// Cells up to the last written one or the end of the last tab (tmux's cellused).
+    pub fn used_len(&self) -> u16 { self.0.used_len() }
+    /// The row's ROW_* flags (OSC 133 marks, hyperlinks).
+    pub fn flags(&self) -> u8 { self.0.flags() }
+    /// Time this row entered history.
+    pub fn time(&self) -> u64 { self.0.time() }
+
     /// The cell at `col`, or `None` past the stored row width (history rows
     /// may be narrower than the screen).
     #[must_use]

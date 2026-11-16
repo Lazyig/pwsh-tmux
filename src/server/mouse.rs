@@ -1012,6 +1012,17 @@ impl Server {
                     r => r.name().to_string(),
                 })
             }
+            "mouse_hyperlink" => {
+                // format_cb_mouse_hyperlink: the copy mode's screen or the pane's
+                let (p, (x, y)) = at?;
+                let pane = self.panes.get(&p)?;
+                let line = match &pane.mode {
+                    Some(PaneMode::Copy(cm)) => cm.render_with(&self.copy_render_style(p, None)).0.into_iter().nth(y as usize)?,
+                    Some(_) => return None,
+                    None => crate::cells::line_at(pane.screen(), pane.screen().scrollback_len() + y as usize),
+                };
+                line.hyperlink_at(x as usize).map(|l| l.uri.clone())
+            }
             "mouse_word" | "mouse_line" => {
                 let (p, (x, y)) = at?;
                 let pane = self.panes.get(&p)?;
@@ -1039,7 +1050,7 @@ impl Server {
 
 /// Cells used on a line, trailing blanks excluded (grid_line_length).
 fn line_length(l: &Line) -> usize {
-    l.cells.iter().rposition(|c| c.text != " ").map_or(0, |i| i + 1)
+    l.cells.iter().rposition(|c| c.text != " ").map_or(0, |i| i + 1).max(l.tabs_end())
 }
 
 fn is_word_separator(ws: &str, c: Option<&crate::cells::Cell>) -> bool {
@@ -1055,7 +1066,7 @@ pub(crate) fn grid_word(get: impl Fn(usize) -> Option<Line>, rows: usize, mut x:
     let mut found = false;
     loop {
         let c = line.cells.get(x);
-        if !c.is_some_and(|c| c.is_continuation()) && is_word_separator(ws, c) {
+        if !line.is_padding(x) && is_word_separator(ws, c) {
             found = true;
             break;
         }
@@ -1093,7 +1104,7 @@ pub(crate) fn grid_word(get: impl Fn(usize) -> Option<Line>, rows: usize, mut x:
         }
         found = true;
         let c = line.cells.get(x);
-        if c.is_some_and(|c| c.is_continuation()) {
+        if line.is_padding(x) {
             continue;
         }
         if is_word_separator(ws, c) {
@@ -1106,7 +1117,7 @@ pub(crate) fn grid_word(get: impl Fn(usize) -> Option<Line>, rows: usize, mut x:
 
 /// The text of a line (format_grid_line).
 pub(crate) fn grid_line(l: &Line) -> Option<String> {
-    let s: String = l.cells[..line_length(l)].iter().filter(|c| !c.is_continuation()).map(|c| c.text.as_str()).collect();
+    let s: String = (0..line_length(l)).map(|x| l.cell_text(x)).collect();
     (!s.is_empty()).then_some(s)
 }
 
@@ -1151,7 +1162,7 @@ mod tests {
     use super::*;
 
     fn line(s: &str, wrapped: bool) -> Line {
-        let mut l = Line { cells: s.chars().map(|c| crate::cells::Cell { text: c.to_string(), style: Default::default() }).collect(), wrapped };
+        let mut l = Line { cells: s.chars().map(|c| crate::cells::Cell { text: c.to_string(), style: Default::default() }).collect(), wrapped, ..Default::default() };
         l.cells.resize(12, crate::cells::Cell::default());
         l
     }
