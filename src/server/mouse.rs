@@ -42,6 +42,10 @@ pub struct MouseCtx {
     pub statuslines: u16,
     /// The row of the scrollbar slider under the mouse (sl_mpos).
     pub slider_mpos: u16,
+    /// Where the client's view of a bigger window starts (m->ox, m->oy): window
+    /// positions are the client's plus these.
+    pub ox: u16,
+    pub oy: u16,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -128,15 +132,19 @@ impl Server {
         if let Some(sid) = self.client_session(cid) {
             let wid = self.sessions[&sid].active_window();
             let oy = if self.opt_session(Some(sid), "status-position") == "top" { self.status_lines(Some(sid)) } else { 0 };
+            // the position in the window (a bigger window is shown from an offset)
+            let view = self.view_offset(cid);
+            let (mx, my) = (m.x as u32 + view.ox as u32, m.y as u32 + view.oy as u32);
             // server_client_update_scrollbar_hover: moving over the scrollbar
             // area (width + pad) shows it, any other movement restarts the timer
             // of a visible one; it hides on the timer even while hovered
-            for (pane, r) in self.rects(wid).0 {
+            for (pane, sb) in self.scrollbars(wid) {
                 if m.kind != MouseKind::Move { break; }
-                let Some(sb) = self.pane_scrollbar(wid, pane, r) else { continue };
-                let total = (sb.width + sb.pad).min(r.w);
-                let x0 = if sb.left { r.x } else { r.right() - total };
-                let hover = m.x >= x0 && m.x < x0 + total && m.y >= oy + sb.y && m.y < oy + sb.y + sb.height;
+                let total = (sb.width + sb.pad) as i64;
+                let x0 = if sb.left { sb.x as i64 } else { sb.x as i64 + sb.width as i64 - total };
+                let (top, height) = (oy as i64 + sb.y as i64, sb.height as i64);
+                let (mx, my) = (mx as i64, my as i64);
+                let hover = mx >= x0 && mx < x0 + total && my >= top && my < top + height;
                 if hover || self.panes[&pane].scrollbar_until.is_some() {
                     self.show_scrollbar(pane);
                 }
@@ -167,7 +175,8 @@ impl Server {
                 let top = self.client_window_top(cid);
                 let lines = self.status_lines(c.session).min(c.size.1.saturating_sub(1));
                 let area = c.size.1.saturating_sub(lines);
-                let wm = if m.y < top || m.y >= top + area { Mouse { x: u16::MAX, y: u16::MAX, ..*m } } else { Mouse { y: m.y - top, ..*m } };
+                let view = self.view_offset(cid);
+                let wm = if m.y < top || m.y >= top + area { Mouse { x: u16::MAX, y: u16::MAX, ..*m } } else { Mouse { x: m.x.saturating_add(view.ox), y: (m.y - top).saturating_add(view.oy), ..*m } };
                 let action = self.menus.get_mut(&wid).map_or(MenuAction::None, |menu| menu.mouse(&wm));
                 self.menu_action(cid, wid, action);
                 return true;
@@ -369,11 +378,15 @@ impl Server {
         };
         let wid = s.active_window();
         let w = &self.windows[&wid];
-        if x > w.sx || py > w.sy {
+        // past the window area shown, then in window coordinates
+        let view = self.view_offset(cid);
+        if x > view.sx || py > view.sy {
             return None;
         }
+        (ctx.ox, ctx.oy) = (view.ox, view.oy);
+        let (x, py) = (x.saturating_add(view.ox), py.saturating_add(view.oy));
         // the window columns and rows shown on the client
-        let clip = (c.size.0.min(w.sx), (ch - nstatus).min(w.sy));
+        let clip = ((view.ox as u32 + c.size.0 as u32).min(w.sx as u32) as u16, (view.oy as u32 + (ch - nstatus) as u32).min(w.sy as u32) as u16);
         // floating panes are above the tiled ones and their status lines; nothing outside a
         // modal pane can be reached (tmux window_get_active_at)
         match self.float_at(wid, x as i32, py as i32) {
@@ -387,6 +400,12 @@ impl Server {
                 ctx.pane = Some(p);
                 let g = w.layout.geom(p)?;
                 let (xi, yi) = (x as i32, py as i32);
+                // its scrollbar first (server_client_check_mouse_in_pane checks floating panes)
+                if let Some(sb) = self.float_scrollbar(wid, p, g).filter(|sb| sb.visible) {
+                    if let Some(wh) = scrollbar_where(&sb, xi, yi, &mut ctx) {
+                        return Some((wh, ctx));
+                    }
+                }
                 let inside = xi >= g.x && xi < g.x + g.w as i32 && yi >= g.y && yi < g.y + g.h as i32;
                 if inside {
                     return Some((Where::Pane, ctx));
@@ -402,14 +421,9 @@ impl Server {
             }
             // a hidden auto-hide bar takes no clicks (window_pane_scrollbar_visible)
             if let Some(sb) = self.pane_scrollbar(wid, pane, r).filter(|sb| sb.visible) {
-                if x >= sb.x && x < sb.x + sb.width && py >= sb.y && py < sb.y + sb.height {
+                if let Some(wh) = scrollbar_where(&sb, x as i32, py as i32, &mut ctx) {
                     ctx.pane = Some(pane);
-                    let y = py - sb.y;
-                    let where_ = if y < sb.slider_y { Where::ScrollbarUp } else if y >= sb.slider_y + sb.slider_h { Where::ScrollbarDown } else { Where::ScrollbarSlider };
-                    if where_ == Where::ScrollbarSlider {
-                        ctx.slider_mpos = y - sb.slider_y;
-                    }
-                    return Some((where_, ctx));
+                    return Some((wh, ctx));
                 }
             }
         }
@@ -574,16 +588,18 @@ impl Server {
             (n, false) if y >= ch - n => return None,
             _ => y,
         };
-        if x > w.sx || py > w.sy {
+        let view = self.view_offset(cid);
+        if x > view.sx || py > view.sy {
             return None;
         }
-        (!self.float_contains(wid, modal, x as i32, py as i32)).then_some(modal)
+        (!self.float_contains(wid, modal, x as i32 + view.ox as i32, py as i32 + view.oy as i32)).then_some(modal)
     }
 
     /// Visible content rectangle of a pane in its window.
     pub fn pane_rect(&self, pane: PaneId) -> Option<Rect> {
         let wid = self.window_of(pane)?;
         if let Some(g) = self.pane_geom(wid, pane).filter(|_| self.shown_floating(wid, pane)) {
+            let g = self.float_content(wid, pane, g);
             return Some(Rect { x: g.x.max(0) as u16, y: g.y.max(0) as u16, w: g.w, h: g.h });
         }
         let (rects, _) = self.rects(wid);
@@ -592,7 +608,8 @@ impl Server {
 
     /// Pane-relative position of the event, or of the event before it (cmd_mouse_at).
     pub fn mouse_at(&self, pane: PaneId, m: &MouseCtx, last: bool) -> Option<(u16, u16)> {
-        let (x, mut y) = if last { (m.lx, m.ly) } else { (m.x, m.y) };
+        let (x, y) = if last { (m.lx, m.ly) } else { (m.x, m.y) };
+        let (x, mut y) = (x.saturating_add(m.ox), y.saturating_add(m.oy));
         if m.statusat == Some(0) && y >= m.statuslines {
             y -= m.statuslines;
         }
@@ -693,7 +710,7 @@ impl Server {
             Some(at) if at > 0 && v >= at => at - 1,
             _ => v,
         };
-        let (x, y, lx, ly) = (m.x, adjust(m.y), m.lx, adjust(m.ly));
+        let (x, y, lx, ly) = (m.x.saturating_add(m.ox), adjust(m.y.saturating_add(m.oy)), m.lx.saturating_add(m.ox), adjust(m.ly.saturating_add(m.oy)));
         let (rects, _) = self.rects(wid);
         if self.windows[&wid].zoomed {
             return;
@@ -840,13 +857,16 @@ impl Server {
         let mut set = |k: &str, n: i64| {
             v.insert(k.to_string(), n.to_string());
         };
+        // the mouse in the window: the client's view of a bigger one is offset
+        let view = self.view_offset(cid);
+        let (ox, oy) = (view.ox as i64, view.oy as i64);
         let mouse = m.map(|m| {
             let y = match m.statusat {
-                Some(0) => (m.y as i64 - m.statuslines as i64).max(0),
-                Some(at) if m.y >= at => wsy.min(c.size.1 as i64 - lines) - 1,
-                _ => m.y as i64,
+                Some(0) => (m.y as i64 - m.statuslines as i64).max(0) + oy,
+                Some(at) if m.y >= at => oy + wsy.min(c.size.1 as i64 - lines) - 1,
+                _ => m.y as i64 + oy,
             };
-            (m.x as i64, y)
+            (m.x as i64 + ox, y)
         });
         if let Some((mx, my)) = mouse {
             set("popup_mouse_x", mx);
@@ -932,11 +952,14 @@ impl Server {
             set("popup_mouse_bottom", (my - h).max(0));
         }
         if let Some(r) = t.pane.and_then(|p| self.pane_rect(p)) {
-            let n = top + r.y as i64 + h;
+            // where the pane is on the client (tty_window_offset)
+            let view = self.view_offset(cid);
+            let (ox, oy) = (view.ox as i64, view.oy as i64);
+            let n = top + r.y as i64 - oy + h;
             set("popup_pane_top", if n >= sy { sy - h } else { n });
-            set("popup_pane_bottom", top + r.bottom() as i64);
-            set("popup_pane_left", r.x as i64);
-            set("popup_pane_right", (r.right() as i64 - w).max(0));
+            set("popup_pane_bottom", top + r.bottom() as i64 - oy);
+            set("popup_pane_left", r.x as i64 - ox);
+            set("popup_pane_right", (r.right() as i64 - ox - w).max(0));
         }
         let mut x = strtol(&self.expand_extra(t, Some(cid), position_format(xarg, true), v.clone()));
         if x + w >= sx {
@@ -1205,4 +1228,21 @@ fn strtol(s: &str) -> i64 {
     let s = s.trim_start();
     let end = s.char_indices().find(|(i, ch)| !(ch.is_ascii_digit() || (*i == 0 && (*ch == '-' || *ch == '+')))).map_or(s.len(), |(i, _)| i);
     s[..end].parse().unwrap_or(0)
+}
+
+/// Where on a scrollbar window position (x, y) is: above, on or below the slider, with
+/// the slider row it is on (sl_mpos); None off the bar.
+fn scrollbar_where(sb: &super::display::Scrollbar, x: i32, y: i32, ctx: &mut MouseCtx) -> Option<Where> {
+    if x < sb.x || x >= sb.x + sb.width as i32 || y < sb.y || y >= sb.y + sb.height as i32 {
+        return None;
+    }
+    let y = (y - sb.y) as u16;
+    Some(if y < sb.slider_y {
+        Where::ScrollbarUp
+    } else if y >= sb.slider_y + sb.slider_h {
+        Where::ScrollbarDown
+    } else {
+        ctx.slider_mpos = y - sb.slider_y;
+        Where::ScrollbarSlider
+    })
 }

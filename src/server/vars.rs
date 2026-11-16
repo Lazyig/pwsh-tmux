@@ -427,8 +427,8 @@ impl Vars for VarCtx<'_> {
             "window_end_flag" => Some(b(sess.zip(t.idx).is_some_and(|(s, i)| s.links.keys().next_back() == Some(&i)))),
             "window_linked" => win.map(|w| b(srv.links_of(w.id).len() > 1)),
             "window_linked_sessions" => win.map(|w| srv.links_of(w.id).len().to_string()),
-            // windows always fit their clients here (no offset)
-            "window_bigger" => client.map(|_| "0".into()),
+            // the format client's view of its current window (tty_window_offset)
+            "window_bigger" => client.map(|c| b(srv.view_offset(c.id).bigger)),
             "window_active_clients" | "window_active_clients_list" => win.map(|w| {
                 let names: Vec<String> = srv.clients.values()
                     .filter(|c| c.attached && c.session.and_then(|s| srv.sessions.get(&s)).is_some_and(|s| s.links.get(&s.active) == Some(&w.id)))
@@ -450,8 +450,9 @@ impl Vars for VarCtx<'_> {
                 else if name == "window_manual_width" { w.sx.to_string() } else { w.sy.to_string() }
             }),
             "window_modal_pane" => win.and_then(|w| w.modal).map(|m| format!("%{m}")),
-            // only set while the client shows part of a larger window, which never happens here
-            "window_offset_x" | "window_offset_y" => None,
+            // only set while the client shows part of a larger window
+            "window_offset_x" | "window_offset_y" => client.map(|c| srv.view_offset(c.id)).filter(|v| v.bigger)
+                .map(|v| if name == "window_offset_x" { v.ox } else { v.oy }.to_string()),
             "window_format" => Some(b(ftype == "W")),
             // pane
             "pane_index" => win.zip(t.pane).and_then(|(w, p)| {
@@ -547,6 +548,8 @@ impl Vars for VarCtx<'_> {
                 }
                 // a floating pane's cell (also while hidden by a zoom)
                 if let Some(g) = w.layout.geom(p).filter(|_| srv.zoomed_pane(w.id) != Some(p)) {
+                    // less a reserved scrollbar (wp->xoff and wp->sx)
+                    let g = srv.float_content(w.id, p, g);
                     let (right, bottom) = (g.x + g.w as i32, g.y + g.h as i32);
                     return Some(match name {
                         "pane_left" | "pane_x" => g.x.to_string(),

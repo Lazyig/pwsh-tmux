@@ -25,6 +25,8 @@ fn err<T>(s: impl Into<String>) -> Result<T, String> {
 
 /// The window row of a mouse row (below a top status line, or clamped above a bottom one).
 fn drag_row(m: &super::input::MouseCtx, v: u16) -> i32 {
+    // in the window (m->y + m->oy), less the status lines
+    let v = v.saturating_add(m.oy);
     (match m.statusat {
         Some(0) if v >= m.statuslines => v - m.statuslines,
         Some(at) if at > 0 && v >= at => at - 1,
@@ -1089,7 +1091,7 @@ impl Server {
         if !self.windows[&wid].is_floating(pane) || self.client_session(cid) != m.sid {
             return;
         }
-        let (lx, ly) = (m.lx as i32, drag_row(m, m.ly));
+        let (lx, ly) = (m.lx as i32 + m.ox as i32, drag_row(m, m.ly));
         let kind = if new { DragKind::NewFloat { pane, x: lx, y: ly } } else { DragKind::Float { pane, moving } };
         if !new {
             self.set_active_pane(wid, pane);
@@ -1115,7 +1117,7 @@ impl Server {
             }
             return;
         };
-        let (x, y, lx, ly) = (m.x as i32, drag_row(m, m.y), m.lx as i32, drag_row(m, m.ly));
+        let (x, y, lx, ly) = (m.x as i32 + m.ox as i32, drag_row(m, m.y), m.lx as i32 + m.ox as i32, drag_row(m, m.ly));
         let border = self.pane_lines(wid, pane) != "none";
         let w = self.windows.get_mut(&wid).unwrap();
         let Some(g) = w.layout.geom_mut(pane) else { return };

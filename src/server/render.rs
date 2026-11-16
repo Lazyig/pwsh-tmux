@@ -745,15 +745,18 @@ impl Server {
     /// Draw the floating panes above the tiled ones, back to front: border lines (the pane's
     /// own pane-border-lines, -style and -status), the title on the border and the content.
     #[allow(clippy::too_many_arguments)]
-    fn draw_floats(&self, f: &mut Frame, cid: ClientId, wid: WinId, clip: (u16, u16), oy: u16, modes: &mut Modes, cursor: &mut Option<(u16, u16)>) {
+    fn draw_floats(&self, f: &mut Frame, cid: ClientId, wid: WinId, clip: (u16, u16), (px, py): (u16, u16), oy: u16, modes: &mut Modes, cursor: &mut Option<(u16, u16)>) {
         let win = &self.windows[&wid];
         let floats = self.float_rects(wid);
         if floats.is_empty() {
             return;
         }
+        // `clip` is on the client; the window cells it shows start at (px, py)
+        let (pxi, pyi) = (px as i32, py as i32);
+        let wclip = (clip.0 + px, clip.1 + py);
         // a floating pane above the active pane's cursor hides it
         if let Some((cx, cy)) = *cursor {
-            let (wx, wy) = (cx as i32, cy as i32 - oy as i32);
+            let (wx, wy) = (cx as i32 + pxi, cy as i32 - oy as i32 + pyi);
             if floats.iter().any(|(p, _)| *p != win.active && self.float_contains(wid, *p, wx, wy)) && !win.is_floating(win.active) {
                 *cursor = None;
             }
@@ -772,6 +775,7 @@ impl Server {
             let st = if active { self.style_option(&self.opt_pane(id, "pane-active-border-style"), base, t, Some(cid)).unwrap_or(base) } else { base };
             let st = if self.marked == Some(id) { Style { attrs: st.attrs | INVERSE, ..st } } else { st };
             let put = |f: &mut Frame, x: i32, y: i32, text: &str| {
+                let (x, y) = (x - pxi, y - pyi);
                 if x >= 0 && y >= 0 && x < clip.0 as i32 && y < clip.1 as i32 {
                     f.set(x as u16, oy + y as u16, Cell { text: text.into(), style: st });
                 }
@@ -813,22 +817,26 @@ impl Server {
                 let status = self.pane_status(wid, id);
                 if status != "off" {
                     let by = if status == "top" { top } else { bot };
-                    let width = self.pane_status_width(wid, id, (g.x + 2, by), g.w.saturating_sub(2) as usize, clip);
+                    let width = self.pane_status_width(wid, id, (g.x + 2, by), g.w.saturating_sub(2) as usize, wclip);
                     let (cells, _) = if width > 0 { self.pane_status_line(id, width, st, Some(cid)) } else { Default::default() };
                     for (i, c) in cells.into_iter().enumerate() {
                         let x = g.x + 2 + i as i32;
-                        if let Some(c) = c.filter(|_| x >= 0 && by >= 0 && x < clip.0 as i32 && by < clip.1 as i32 && x < r) {
-                            f.set(x as u16, oy + by as u16, c);
+                        let (cx, cy) = (x - pxi, by - pyi);
+                        if let Some(c) = c.filter(|_| cx >= 0 && cy >= 0 && cx < clip.0 as i32 && cy < clip.1 as i32 && x < r) {
+                            f.set(cx as u16, oy + cy as u16, c);
                         }
                     }
                 }
             }
-            self.draw_pane_body(f, cid, wid, id, (g.x, g.y, g.w, g.h), clip, oy, modes, cursor);
-            self.draw_pane_prompt(f, cid, wid, id, (g.x, g.y, g.w, g.h), clip, oy, modes, cursor);
+            // the content less a reserved scrollbar, then the bar inside the border
+            let cg = self.float_content(wid, id, g);
+            self.draw_pane_body(f, cid, wid, id, (cg.x - pxi, cg.y - pyi, cg.w, cg.h), clip, oy, modes, cursor);
+            if let Some(sb) = self.float_scrollbar(wid, id, g) { super::display::draw_scrollbar(f, sb, (-pxi, -pyi), clip, oy); }
+            self.draw_pane_prompt(f, cid, wid, id, (cg.x - pxi, cg.y - pyi, cg.w, cg.h), clip, oy, modes, cursor);
         }
         // ... and so does one above an active floating pane
         if let (Some((cx, cy)), true) = (*cursor, win.is_floating(win.active)) {
-            let (wx, wy) = (cx as i32, cy as i32 - oy as i32);
+            let (wx, wy) = (cx as i32 + pxi, cy as i32 - oy as i32 + pyi);
             let above = floats.iter().skip_while(|(p, _)| *p != win.active).skip(1);
             if above.into_iter().any(|(p, _)| self.float_contains(wid, *p, wx, wy)) {
                 *cursor = None;
@@ -851,9 +859,20 @@ impl Server {
         let (rects, seps) = self.rects(wid);
         let mut cursor = None;
         let mut status_ranges = Vec::new();
+        // a window bigger than the client is shown from (px, py): client column x is
+        // window column x + px (tty_window_offset)
+        let view = self.view_offset(cid);
+        let (px, py) = (view.ox, view.oy);
+        let (pxi, pyi) = (px as i32, py as i32);
         let mut modes = Modes { mouse: self.outer_mouse_mode(cid), focus: options::is_on(&self.opt_server("focus-events")), ..Modes::default() };
-        let active_rect = rects.iter().find(|(p, _)| *p == win.active).map(|(_, r)| *r);
         let area_h = ch.saturating_sub(nstatus);
+        // window position to client position, when it is on the client
+        let to_client = |x: i32, y: i32| -> Option<(u16, u16)> {
+            let (x, y) = (x - pxi, y - pyi);
+            (x >= 0 && y >= 0 && x < cw as i32 && y < area_h as i32).then_some((x as u16, y as u16))
+        };
+        // the window columns and rows shown, in window coordinates
+        let wclip = ((px as u32 + cw as u32).min(win.sx as u32) as u16, (py as u32 + area_h as u32).min(win.sy as u32) as u16);
         // top-floating and bottom-floating show status lines on floating panes only
         let border_status = match self.opt_window(Some(wid), "pane-border-status").as_str() {
             s @ ("top" | "bottom") => s.to_string(),
@@ -890,30 +909,31 @@ impl Server {
                 if char_width(ch) == Some(1) { Cell { text: ch.to_string(), style: over(s.style) } } else { Cell { text: " ".into(), style: inactive_border } }
             })).unwrap_or(Cell { text: " ".into(), style: inactive_border });
             for y in 0..area_h { for x in 0..cw {
-                if (x < win.sx && y < win.sy) == inside { f.set(x, oy + y, cell.clone()); }
+                if ((x as u32 + px as u32) < win.sx as u32 && (y as u32 + py as u32) < win.sy as u32) == inside { f.set(x, oy + y, cell.clone()); }
             } }
         }
 
         // panes
         for (id, r) in &rects {
             let cr = self.content_rect(wid, *r);
-            self.draw_pane_body(&mut f, cid, wid, *id, (cr.x as i32, cr.y as i32, cr.w, cr.h), (cw, area_h), oy, &mut modes, &mut cursor);
+            self.draw_pane_body(&mut f, cid, wid, *id, (cr.x as i32 - pxi, cr.y as i32 - pyi, cr.w, cr.h), (cw, area_h), oy, &mut modes, &mut cursor);
         }
 
         for (id, r) in &rects {
-            if let Some(sb) = self.pane_scrollbar(wid, *id, *r) { super::display::draw_scrollbar(&mut f, sb, oy); }
+            if let Some(sb) = self.pane_scrollbar(wid, *id, *r) { super::display::draw_scrollbar(&mut f, sb, (-pxi, -pyi), (cw, area_h), oy); }
         }
 
         // borders with junctions
         let mut is_border = vec![false; cw as usize * area_h as usize];
         // the window's right and bottom edges are borders when the client is larger
         let mut edges = Vec::new();
-        if cw > win.sx { edges.push(crate::layout::Sep { vertical: true, x: win.sx, y: 0, len: win.sy + u16::from(area_h > win.sy) }); }
-        if area_h > win.sy { edges.push(crate::layout::Sep { vertical: false, x: 0, y: win.sy, len: win.sx + u16::from(cw > win.sx) }); }
+        let (wider, taller) = ((px as u32 + cw as u32) > win.sx as u32, (py as u32 + area_h as u32) > win.sy as u32);
+        if wider { edges.push(crate::layout::Sep { vertical: true, x: win.sx, y: 0, len: win.sy + u16::from(taller) }); }
+        if taller { edges.push(crate::layout::Sep { vertical: false, x: 0, y: win.sy, len: win.sx + u16::from(wider) }); }
         for sep in seps.iter().chain(&edges) {
             for k in 0..sep.len {
                 let (x, y) = if sep.vertical { (sep.x, sep.y + k) } else { (sep.x + k, sep.y) };
-                if x < cw && y < area_h {
+                if let Some((x, y)) = to_client(x as i32, y as i32) {
                     is_border[y as usize * cw as usize + x as usize] = true;
                 }
             }
@@ -928,21 +948,25 @@ impl Server {
         // The panes a border cell belongs to, by side: the pane above, below, to the
         // left or right of it (top_wp, bottom_wp, left_wp, right_wp), and whether one
         // of them is the active pane.
+        // A pane status line belongs to its pane: with the line at the top a pane does not
+        // own its bottom border (unless at the window's bottom), at the bottom not its top
+        // (redraw_mark_pane_borders).
+        // Panes are marked last to first, so where two mark the same side the first wins;
+        // the active pane counts only for a side it owns (redraw_data_has_pane).
         let border_owners = |x: i32, y: i32| -> BorderOwners {
             let mut o = BorderOwners::default();
             for (p, _, l, r, t, b) in &border_rects {
                 if x < *l || x > *r || y < *t || y > *b || (x > *l && x < *r && y > *t && y < *b) { continue; }
-                if y == *t { o.below = Some(*p); }
-                if y == *b { o.above = Some(*p); }
-                if x == *l { o.right = Some(*p); }
-                if x == *r { o.left = Some(*p); }
-                o.active |= *p == win.active;
+                if y == *t && border_status != "bottom" { o.below.get_or_insert(*p); }
+                if y == *b && !(border_status == "top" && *b < win.sy as i32) { o.above.get_or_insert(*p); }
+                if x == *l { o.right.get_or_insert(*p); }
+                if x == *r { o.left.get_or_insert(*p); }
             }
+            o.active = [o.above, o.below, o.left, o.right].contains(&Some(win.active));
             o
         };
         // redraw_mark_border_arrows: each pane marks the border cells one in from its corners
-        let border_marked = |x: u16, y: u16| -> bool {
-            let (x, y) = (x as i32, y as i32);
+        let border_marked = |x: i32, y: i32| -> bool {
             border_rects.iter().any(|(_, cr, l, r, t, b)| (x == cr.x as i32 + 1 && (y == *t || y == *b)) || (y == cr.y as i32 + 1 && (x == *l || x == *r)))
         };
         // pane-border-lines number: window_pane_index of the pane the cell is drawn
@@ -951,15 +975,18 @@ impl Server {
         // it, else the pane above, below, left or right of it
         let two_pane = matches!(indicators.as_str(), "colour" | "both") && rects.len() == 2 && !win.zoomed;
         let base = self.opt_window_num(Some(wid), "pane-base-index").max(0) as usize;
-        let border_number = |x: i32, y: i32| -> String {
+        // the pane whose border style a cell is drawn with (redraw_get_pane_for_border_style)
+        let border_owner = |x: i32, y: i32| -> Option<PaneId> {
             let o = border_owners(x, y);
             let split = if !two_pane { None } else if rects[0].1.y == rects[1].1.y {
                 o.left.zip(o.right).map(|(l, r)| if y <= win.sy as i32 / 2 { l } else { r })
             } else {
                 o.above.zip(o.below).map(|(a, b)| if x <= win.sx as i32 / 2 { a } else { b })
             };
-            let owner = split.or(if o.active { Some(win.active) } else { o.above.or(o.below).or(o.left).or(o.right) });
-            owner.and_then(|o| win.panes().iter().position(|p| *p == o)).map(|i| char::from(b'0' + ((i + base) % 10) as u8).to_string()).unwrap_or_else(|| "*".into())
+            split.or(if o.active { Some(win.active) } else { o.above.or(o.below).or(o.left).or(o.right) })
+        };
+        let border_number = |x: i32, y: i32| -> String {
+            border_owner(x, y).and_then(|o| win.panes().iter().position(|p| *p == o)).map(|i| char::from(b'0' + ((i + base) % 10) as u8).to_string()).unwrap_or_else(|| "*".into())
         };
         for y in 0..area_h {
             for x in 0..cw {
@@ -968,6 +995,8 @@ impl Server {
                 }
                 let (xi, yi) = (x as i32, y as i32);
                 let (u, d, l, r) = (at(xi, yi - 1), at(xi, yi + 1), at(xi - 1, yi), at(xi + 1, yi));
+                // the cell in window coordinates
+                let (wx, wy) = (xi + pxi, yi + pyi);
                 let ch = match (u, d, l, r) {
                     (true, true, true, true) => bset[6],
                     (false, true, true, true) => bset[7],
@@ -981,19 +1010,10 @@ impl Server {
                     (true, _, false, false) | (_, true, false, false) => bset[1],
                     _ => bset[0],
                 };
-                let edge = x == win.sx || y == win.sy;
-                let mut near = active_rect.is_some_and(|a| x + 1 >= a.x && x <= a.right() && y + 1 >= a.y && y <= a.bottom()) && (rects.len() > 1 || edge);
-                if near && !edge && rects.len() == 2 && matches!(indicators.as_str(), "colour" | "both") {
-                    if let Some(a) = active_rect {
-                        if rects[0].1.y == rects[1].1.y {
-                            near = if a.x == 0 { y <= a.h / 2 } else { y > a.h / 2 };
-                        } else if border_status == "off" {
-                            near = if a.y == 0 { x <= a.w / 2 } else { x > a.w / 2 };
-                        }
-                    }
-                }
-                let arrow = if matches!(indicators.as_str(), "arrows" | "both") && border_marked(x, y) {
-                    let o = border_owners(xi, yi);
+                // pane-active-border-style when the cell is drawn for the active pane
+                let near = border_owner(wx, wy) == Some(win.active);
+                let arrow = if matches!(indicators.as_str(), "arrows" | "both") && border_marked(wx, wy) {
+                    let o = border_owners(wx, wy);
                     let active = Some(win.active);
                     if o.left == active { Some("←") }
                     else if o.right == active { Some("→") }
@@ -1002,7 +1022,7 @@ impl Server {
                     else { None }
                 } else { None };
                 let text = if let Some(arrow) = arrow { arrow.into() } else if lines_kind == "number" {
-                    border_number(xi, yi)
+                    border_number(wx, wy)
                 } else { ch.into() };
                 f.set(x, oy + y, Cell { text, style: if near { active_border } else { inactive_border } });
             }
@@ -1018,32 +1038,39 @@ impl Server {
                 // (after a left scrollbar), filled with the pane's border cells, and
                 // the format is drawn over it with its alignment
                 let sx = cr.x + 2;
-                let fill = |x: u16| if lines_kind == "number" { border_number(x as i32, by as i32) } else { bset[0].to_string() };
+                // window_make_pane_status: the line is filled with the pane's own border
+                // cells (pane-border-lines number: its own index)
+                let own = pane_number(&win.panes(), base, Some(*id));
+                let fill = || if lines_kind == "number" { own.clone() } else { bset[0].to_string() };
                 for x in r.x..r.right() {
-                    if x >= sx || !at(x as i32, by as i32) { f.set(x, oy + by, Cell { text: fill(x), style: st }); }
+                    let Some((cx, cy)) = to_client(x as i32, by as i32) else { continue };
+                    if x >= sx || !at(cx as i32, cy as i32) { f.set(cx, oy + cy, Cell { text: fill(), style: st }); }
                 }
                 // the cell before the line is an arrow when the pane is the active one
                 if matches!(indicators.as_str(), "arrows" | "both") && *id == win.active && cr.x + 1 < r.right() {
-                    f.set(cr.x + 1, oy + by, Cell { text: (if border_status == "top" { "↓" } else { "↑" }).into(), style: st });
+                    if let Some((cx, cy)) = to_client(cr.x as i32 + 1, by as i32) {
+                        f.set(cx, oy + cy, Cell { text: (if border_status == "top" { "↓" } else { "↑" }).into(), style: st });
+                    }
                 }
                 if sx < r.right() {
                     // as wide as what floating panes leave visible (redraw_pane_status_width)
-                    let clip = (cw.min(win.sx), area_h.min(win.sy));
-                    let width = self.pane_status_width(wid, *id, (sx as i32, by as i32), (r.right() - sx) as usize, clip);
+                    let width = self.pane_status_width(wid, *id, (sx as i32, by as i32), (r.right() - sx) as usize, wclip);
                     let (cells, _) = if width > 0 { self.pane_status_line(*id, width, st, Some(cid)) } else { Default::default() };
                     for (i, cell) in cells.into_iter().enumerate() {
-                        if let Some(cell) = cell { f.set(sx + i as u16, oy + by, cell); }
+                        if let (Some(cell), Some((cx, cy))) = (cell, to_client(sx as i32 + i as i32, by as i32)) { f.set(cx, oy + cy, cell); }
                     }
                 }
             }
         }
         if border_status != "off" {
-            let by = if border_status == "top" { 0 } else { area_h.saturating_sub(1) };
+            let top = border_status == "top";
+            let by = if top { 0 } else { area_h.saturating_sub(1) as i32 + pyi };
             for sep in &seps {
-                if sep.vertical && (if by == 0 { sep.y == 0 } else { sep.y + sep.len == area_h }) {
-                    if let Some(cell) = f.get(sep.x, oy + by).cloned() {
-                        let text = if lines_kind == "number" { border_number(sep.x as i32, by as i32) } else { (if by == 0 { bset[7] } else { bset[8] }).into() };
-                        f.set(sep.x, oy + by, Cell { text, ..cell });
+                if sep.vertical && (if top { sep.y == 0 } else { (sep.y + sep.len) as i32 == by + 1 }) {
+                    let Some((cx, cy)) = to_client(sep.x as i32, by) else { continue };
+                    if let Some(cell) = f.get(cx, oy + cy).cloned() {
+                        let text = if lines_kind == "number" { border_number(sep.x as i32, by) } else { (if top { bset[7] } else { bset[8] }).into() };
+                        f.set(cx, oy + cy, Cell { text, ..cell });
                     }
                 }
             }
@@ -1051,8 +1078,9 @@ impl Server {
         // marked pane: reverse its borders
         if let Some(m) = self.marked.filter(|m| win.panes().contains(m)) {
             if let Some((_, r)) = rects.iter().find(|(p, _)| *p == m) {
-                for y in r.y.saturating_sub(1)..=r.bottom().min(area_h.saturating_sub(1)) {
-                    for x in r.x.saturating_sub(1)..=r.right().min(cw - 1) {
+                for y in r.y.saturating_sub(1)..=r.bottom() {
+                    for x in r.x.saturating_sub(1)..=r.right() {
+                        let Some((x, y)) = to_client(x as i32, y as i32) else { continue };
                         if at(x as i32, y as i32) {
                             if let Some(cell) = f.get(x, oy + y).cloned() {
                                 f.set(x, oy + y, Cell { style: Style { attrs: cell.style.attrs | INVERSE, ..cell.style }, ..cell });
@@ -1068,10 +1096,10 @@ impl Server {
             // a zoomed window shows only the active pane's
             if win.zoomed && *id != win.active { continue; }
             let cr = self.content_rect(wid, *r);
-            self.draw_pane_prompt(&mut f, cid, wid, *id, (cr.x as i32, cr.y as i32, cr.w, cr.h), (cw, area_h), oy, &mut modes, &mut cursor);
+            self.draw_pane_prompt(&mut f, cid, wid, *id, (cr.x as i32 - pxi, cr.y as i32 - pyi, cr.w, cr.h), (cw, area_h), oy, &mut modes, &mut cursor);
         }
         // floating panes above the tiled ones
-        self.draw_floats(&mut f, cid, wid, (cw.min(win.sx), area_h.min(win.sy)), oy, &mut modes, &mut cursor);
+        self.draw_floats(&mut f, cid, wid, (wclip.0 - px, wclip.1 - py), (px, py), oy, &mut modes, &mut cursor);
 
         // the window menu, above the panes (redraw_mark_menu)
         if let Some(m) = self.menus.get(&wid).filter(|_| c.overlay.is_none()) {
@@ -1085,7 +1113,17 @@ impl Server {
             let given = |v: &Option<String>, base: Style| self.flag_style(v.as_deref(), base, active_target, cid);
             let (st, bst, selected) = (given(&m.look.style, st), given(&m.look.border_style, bst), given(&m.look.selected_style, selected));
             let lines = m.look.lines.clone().unwrap_or_else(|| self.opt_window(Some(wid), "menu-border-lines"));
-            m.draw(&mut f, oy, st, bst, selected, &lines);
+            if (px, py) == (0, 0) {
+                m.draw(&mut f, oy, st, bst, selected, &lines);
+            } else {
+                // drawn in the window, so it pans with it
+                let mut mf = Frame::new(m.w, m.h);
+                m.draw_at(&mut mf, (0, 0), st, bst, selected, &lines);
+                for (i, cell) in mf.cells.into_iter().enumerate() {
+                    let (x, y) = ((i % m.w as usize) as i32 + m.x as i32, (i / m.w as usize) as i32 + m.y as i32);
+                    if let Some((x, y)) = to_client(x, y) { f.set(x, oy + y, cell); }
+                }
+            }
             cursor = None;
         }
 
@@ -1320,6 +1358,7 @@ impl Server {
 
     pub fn render(&mut self, cid: ClientId) {
         let _widths = self.width_context();
+        self.update_view(cid);
         let Some(next) = self.compose(cid) else { return };
         // window title
         let mut title_update = None;
@@ -1555,5 +1594,56 @@ mod display_tests {
             assert_eq!(f.cells[0].text, corner);
             assert_eq!(f.cells[1].text, line);
         }
+    }
+}
+
+#[cfg(test)]
+mod border_tests {
+    use super::*;
+    use super::super::pan::tests::{clients, kill, run};
+
+    fn rows(srv: &Server) -> Vec<String> {
+        let f = srv.compose(1).unwrap().frame;
+        (0..f.h).map(|y| f.row(y).iter().map(|c| c.text.as_str()).collect()).collect()
+    }
+
+    /// A 60x14 window without a status line: pane 0 on the left, 1 above 2 on the right.
+    fn three_panes() -> Server {
+        let (mut srv, _) = clients((60, 14), None);
+        for args in [&["new-session", "-d", "-s", "s", "-x", "60", "-y", "14"][..], &["split-window", "-h", "-d"], &["split-window", "-v", "-d", "-t", "s:0.1"],
+            &["set", "-g", "status", "off"], &["set", "-g", "pane-border-format", " #{pane_index} "], &["set", "-g", "pane-active-border-style", "fg=red"]] {
+            run(&mut srv, 1, args).unwrap();
+        }
+        let sid = *srv.sessions.keys().next().unwrap();
+        srv.attach_client(1, sid);
+        srv
+    }
+
+    #[test]
+    fn pane_status_lines_own_their_border_cells() {
+        let mut srv = three_panes();
+        run(&mut srv, 1, &["set", "-g", "pane-border-lines", "number"]).unwrap();
+        run(&mut srv, 1, &["set", "-g", "pane-border-status", "top"]).unwrap();
+        // the separator above pane 2 is its status line: drawn with its number, the
+        // junction with the active pane's (redraw_mark_pane_borders)
+        let r = rows(&srv);
+        assert_eq!(&r[0][..36], "00 0 0000000000000000000000000011 1 ");
+        assert_eq!(&r[7][29..36], " 022 2 ");
+        run(&mut srv, 1, &["select-pane", "-t", "s:0.2"]).unwrap();
+        // the first pane wins a cell two panes mark (they are marked last to first)
+        assert_eq!(&rows(&srv)[0][..36], "00 0 0000000000000000000000000011 1 ");
+        run(&mut srv, 1, &["set", "-g", "pane-border-status", "bottom"]).unwrap();
+        let r = rows(&srv);
+        assert_eq!(&r[7][29..36], " 111 1 ");
+        assert_eq!(&r[13][..36], "00 0 0000000000000000000000000222 2 ");
+        // the active style goes with the pane a cell is drawn for, not with any pane next to it
+        run(&mut srv, 1, &["set", "-g", "pane-border-status", "top"]).unwrap();
+        run(&mut srv, 1, &["set", "-g", "pane-border-lines", "single"]).unwrap();
+        run(&mut srv, 1, &["select-pane", "-t", "s:0.1"]).unwrap();
+        let f = srv.compose(1).unwrap().frame;
+        let red = |x: u16, y: u16| f.get(x, y).unwrap().style.fg == Color::Idx(1);
+        assert!(red(30, 7) && !red(31, 7) && !red(32, 7) && !red(34, 7));
+        assert!(red(30, 0) && red(31, 0) && red(34, 0));
+        kill(&mut srv);
     }
 }

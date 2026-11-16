@@ -1787,19 +1787,18 @@ impl Server {
             }
             "refresh-client" => {
                 let cid = self.resolve_client(ctx, t)?;
-                // -c/-L/-R/-U/-D pan a window larger than the client; windows are drawn from
-                // their top left here, so only the adjustment is checked
-                if ['c', 'L', 'R', 'U', 'D'].into_iter().any(|f| o.has(f)) {
-                    if let Some(a) = o.rest.first() {
-                        match a.parse::<i64>() {
-                            Ok(n) if (1..=i32::MAX as i64).contains(&n) => {}
-                            Ok(n) if n < 1 => return err("adjustment too small"),
-                            Ok(_) => return err("adjustment too large"),
-                            Err(_) => return err("adjustment invalid"),
-                        }
-                    }
-                    if let Some(c) = self.clients.get_mut(&cid) {
-                        c.dirty = true;
+                // -c/-L/-R/-U/-D pan a window larger than the client (-c: follow the cursor
+                // again); the adjustment is 1 by default
+                if let Some(dir) = ['c', 'L', 'R', 'U', 'D'].into_iter().find(|f| o.has(*f)) {
+                    let adjust = match o.rest.first().map(|a| a.parse::<i64>()) {
+                        None => 1,
+                        Some(Ok(n)) if (1..=i32::MAX as i64).contains(&n) => n,
+                        Some(Ok(n)) if n < 1 => return err("adjustment too small"),
+                        Some(Ok(_)) => return err("adjustment too large"),
+                        Some(Err(_)) => return err("adjustment invalid"),
+                    };
+                    if self.client_session(cid).is_some() {
+                        self.pan_client(cid, dir, adjust.min(u16::MAX as i64) as u16);
                     }
                     return Ok(Flow::Next);
                 }

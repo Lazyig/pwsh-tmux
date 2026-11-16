@@ -18,6 +18,7 @@ mod modes;
 mod mouse;
 pub mod procinfo;
 mod display;
+mod pan;
 mod render;
 mod vars;
 mod transport;
@@ -936,6 +937,9 @@ pub struct Client {
     pub acl_readonly: bool,
     /// Bytes written to the client and dropped for it (client_written, client_discarded).
     pub io: Arc<ClientIo>,
+    /// refresh-client -L/-R/-U/-D: the window panned and the view's top left in it
+    /// (pan_window, pan_ox, pan_oy).
+    pub pan: Option<(WinId, u16, u16)>,
 }
 
 #[derive(Default)]
@@ -1733,6 +1737,7 @@ impl Server {
                 denied: false,
                 acl_readonly: false,
                 io,
+                pan: None,
             },
         );
     }
@@ -3084,6 +3089,7 @@ impl Server {
         let zoomed = self.zoomed_pane(wid);
         for (id, g) in self.windows[&wid].layout.floats() {
             if Some(id) != zoomed {
+                let g = self.float_content(wid, id, g);
                 if let Some(p) = self.panes.get_mut(&id) {
                     p.resize(g.w, g.h);
                 }
