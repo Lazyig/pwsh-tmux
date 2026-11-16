@@ -668,10 +668,22 @@ fn review_regressions() {
     }
     assert!(child.wait().unwrap().success());
     assert_eq!(ctx.ok(&["show-buffer", "-b", "stdin"]), "from stdin");
-    // absurd sizes are clamped instead of exhausting memory
-    ctx.ok(&["resize-window", "-t", "r", "-x", "60000", "-y", "60000"]);
-    assert_eq!(ctx.fmt("r", "#{window_width}x#{window_height}"), "1000x1000");
+    // sizes up to WINDOW_MAXIMUM (10000) are taken, larger ones refused; rows are
+    // allocated as they are used
+    assert_eq!(ctx.fails(&["resize-window", "-t", "r", "-x", "60000", "-y", "60000"]).trim_end(), "width too large");
+    assert_eq!(ctx.fails(&["resize-window", "-t", "r", "-y", "0"]).trim_end(), "height too small");
+    assert_eq!(ctx.fails(&["resize-window", "-t", "r", "-U", "x"]).trim_end(), "adjustment invalid");
+    ctx.ok(&["resize-window", "-t", "r", "-x", "10000", "-y", "10000"]);
+    assert_eq!(ctx.fmt("r", "#{window_width}x#{window_height} #{window-size}"), "10000x10000 manual");
+    ctx.ok(&["resize-window", "-t", "r", "-L", "20"]);
+    ctx.ok(&["resize-window", "-t", "r", "-x", "9999", "-y", "9999", "-R", "50"]);
+    assert_eq!(ctx.fmt("r", "#{window_width}x#{window_height}"), "10000x9999");
+    // -A without clients: the session's default-size
+    ctx.ok(&["set", "-t", "r", "default-size", "123x45"]);
     ctx.ok(&["resize-window", "-A", "-t", "r"]);
+    assert_eq!(ctx.fmt("r", "#{window_width}x#{window_height} #{window-size}"), "123x45 manual");
+    ctx.ok(&["new-session", "-d", "-s", "big", "-x", "5000", "-y", "3000"]);
+    assert_eq!(ctx.fmt("big", "#{window_width}x#{window_height}"), "5000x3000");
 }
 
 #[test]

@@ -41,9 +41,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-/// Largest window/client dimension accepted. tmux allows 10000, but vt100 allocates
-/// every cell up front, so a smaller bound keeps a hostile size from exhausting memory.
-pub const MAX_SIZE: u16 = 1000;
+/// Largest window/client dimension accepted (tmux WINDOW_MAXIMUM). Screen rows are
+/// allocated as they are written, so a large but empty window costs little.
+pub const MAX_SIZE: u16 = 10000;
 /// A message without a timer (delay 0) stays until a key press.
 pub const MESSAGE_FOREVER: Duration = Duration::from_secs(86_400 * 365);
 
@@ -3160,14 +3160,7 @@ impl Server {
     fn recalculate_session_size(&mut self, sid: SessId, now: bool) {
         let Some(s) = self.sessions.get(&sid) else { return };
         let status = self.status_lines(Some(sid));
-        // control clients only count once they set a size (refresh-client -C), and
-        // have no status line (status_line_size): their size is all window
-        let clients: Vec<(u64, (u16, u16))> = self
-            .clients
-            .values()
-            .filter(|c| c.attached && c.session == Some(sid) && !c.is_readonly() && !c.ctl.ignore_size)
-            .filter_map(|c| if c.control > 0 { c.control_size.map(|s| (c.activity, (s.0, s.1.saturating_add(status)))) } else { Some((c.activity, c.size)) })
-            .collect();
+        let clients = self.session_client_sizes(sid);
         let latest = clients.iter().max_by_key(|c| c.0).map(|c| c.1);
         let smallest = clients.iter().map(|c| c.1).reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)));
         let largest = clients.iter().map(|c| c.1).reduce(|a, b| (a.0.max(b.0), a.1.max(b.1)));
@@ -3199,6 +3192,18 @@ impl Server {
             s.rows = r;
         }
         self.mark_session_dirty(sid);
+    }
+
+    /// The sizes (with the status line) and activity of the clients a session's windows
+    /// are sized for: control clients only count once they set a size (refresh-client
+    /// -C), and have no status line (status_line_size), their size is all window.
+    pub fn session_client_sizes(&self, sid: SessId) -> Vec<(u64, (u16, u16))> {
+        let status = self.status_lines(Some(sid));
+        self.clients
+            .values()
+            .filter(|c| c.attached && c.session == Some(sid) && !c.is_readonly() && !c.ctl.ignore_size)
+            .filter_map(|c| if c.control > 0 { c.control_size.map(|s| (c.activity, (s.0, s.1.saturating_add(status)))) } else { Some((c.activity, c.size)) })
+            .collect()
     }
 
     /// The window is the current window of a session with an attached client.

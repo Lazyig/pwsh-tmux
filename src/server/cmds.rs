@@ -2369,36 +2369,57 @@ impl Server {
                 Ok(Flow::Next)
             }
             "resize-window" => {
+                // cmd_resize_window_exec: -x/-y (1 to WINDOW_MAXIMUM) or an adjustment from
+                // the current size, -A/-a the largest/smallest client size (default-size
+                // without clients); the window becomes manual and is resized at once
                 let wt = self.resolve_window(ctx, t)?;
-                let wid = wt.wid.unwrap();
-                let w = self.windows.get_mut(&wid).unwrap();
-                let n: u16 = o.rest.first().and_then(|v| v.parse().ok()).unwrap_or(1);
-                if o.has('A') || o.has('a') {
-                    w.options.unset("window-size");
-                    let sid = wt.sid.unwrap();
-                    self.update_session_size_now(sid);
-                    return Ok(Flow::Next);
+                let (wid, sid) = (wt.wid.unwrap(), wt.sid.unwrap());
+                let adjust = match o.rest.first() {
+                    Some(v) => options::strtonum(v, 1, i32::MAX as i64).map_err(|e| format!("adjustment {e}"))?,
+                    None => 1,
+                };
+                let w = &self.windows[&wid];
+                let (mut sx, mut sy) = (w.sx as i64, w.sy as i64);
+                if let Some(x) = o.get('x') {
+                    sx = options::strtonum(x, 1, MAX_SIZE as i64).map_err(|e| format!("width {e}"))?;
                 }
-                w.options.set("window-size", "manual".into());
-                w.new_size = None;
-                if let Some(x) = o.get('x').and_then(|v| v.parse::<u16>().ok()) {
-                    w.sx = x.clamp(1, MAX_SIZE);
-                }
-                if let Some(y) = o.get('y').and_then(|v| v.parse::<u16>().ok()) {
-                    w.sy = y.clamp(1, MAX_SIZE);
+                if let Some(y) = o.get('y') {
+                    sy = options::strtonum(y, 1, MAX_SIZE as i64).map_err(|e| format!("height {e}"))?;
                 }
                 if o.has('L') {
-                    w.sx = w.sx.saturating_sub(n).max(1);
+                    if sx >= adjust {
+                        sx -= adjust;
+                    }
+                } else if o.has('R') {
+                    sx += adjust;
+                } else if o.has('U') {
+                    if sy >= adjust {
+                        sy -= adjust;
+                    }
+                } else if o.has('D') {
+                    sy += adjust;
                 }
-                if o.has('R') {
-                    w.sx = w.sx.saturating_add(n).min(MAX_SIZE);
+                if o.has('A') || o.has('a') {
+                    // default_window_size with WINDOW_SIZE_LARGEST or _SMALLEST
+                    let status = self.status_lines(Some(sid)) as i64;
+                    let sizes = self.session_client_sizes(sid);
+                    let pick = if o.has('A') {
+                        sizes.iter().map(|c| c.1).reduce(|a, b| (a.0.max(b.0), a.1.max(b.1)))
+                    } else {
+                        sizes.iter().map(|c| c.1).reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)))
+                    };
+                    (sx, sy) = match pick {
+                        Some((c, r)) => (c as i64, r as i64 - status),
+                        None => self.opt_session(Some(sid), "default-size").split_once('x').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))).unwrap_or((80, 24)),
+                    };
                 }
-                if o.has('U') {
-                    w.sy = w.sy.saturating_sub(n).max(1);
-                }
-                if o.has('D') {
-                    w.sy = w.sy.saturating_add(n).min(MAX_SIZE);
-                }
+                // resize_window: the size limits
+                let (sx, sy) = (sx.clamp(1, MAX_SIZE as i64) as u16, sy.clamp(1, MAX_SIZE as i64) as u16);
+                let w = self.windows.get_mut(&wid).unwrap();
+                w.options.set("window-size", "manual".into());
+                w.new_size = None;
+                w.sx = sx;
+                w.sy = sy;
                 self.clamp_floats(wid);
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
