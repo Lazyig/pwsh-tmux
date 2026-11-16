@@ -1554,6 +1554,22 @@ fn display_popup_modifies_an_open_popup() {
     ctx.ok(&["display-popup", "-c", &client, "-C"]);
     t.wait_screen("closed", |s| !s.contains("inside"));
     let _ = popup.wait();
+    // -EE (POPUP_CLOSEEXITZERO) replaces -E: a failing command leaves the popup open,
+    // and a new -EE popup closes when its command succeeds
+    let mut popup = ctx.command().args(["display-popup", "-c", &client, "-E", "-w", "30", "-h", "6", "echo failing; read x; exit 3"]).spawn().unwrap();
+    t.wait_screen("-E popup", |s| s.contains("failing"));
+    ctx.ok(&["display-popup", "-c", &client, "-EE"]);
+    t.send(b"\r");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(t.contents().contains("failing"), "{}", t.contents());
+    t.send(b"\x1b");
+    t.wait_screen("closed by Escape", |s| !s.contains("failing"));
+    let _ = popup.wait();
+    let mut popup = ctx.command().args(["display-popup", "-c", &client, "-EE", "-w", "30", "-h", "6", "echo zero; read x"]).spawn().unwrap();
+    t.wait_screen("-EE popup", |s| s.contains("zero"));
+    t.send(b"\r");
+    t.wait_screen("closed on status 0", |s| !s.contains("zero"));
+    let _ = popup.wait();
 }
 
 #[cfg(unix)]

@@ -608,7 +608,7 @@ impl Server {
                 // popup_key_cb: Escape and C-c close the popup unless -E leaves them
                 // to its running command; after the command exits only they (or with
                 // -k any key) do
-                let (pane, close_on_exit, any_key) = (p.pane, p.close_on_exit, p.close_any_key);
+                let (pane, close_on_exit, any_key) = (p.pane, p.close_on_exit || p.close_exit_zero, p.close_any_key);
                 let exited = self.panes.get(&pane).is_none_or(|x| x.dead.is_some());
                 let cancel = name == "Escape" || name == "C-c";
                 if ((!close_on_exit || exited) && cancel) || (exited && any_key) {

@@ -1212,7 +1212,8 @@ impl Server {
         let tt = self.current(ctx);
         let title = o.get('T').map(|s| self.expand(tt, Some(cid), s)).unwrap_or_default();
         let lines = if o.has('B') { Some("none".to_string()) } else { o.get('b').map(String::from) };
-        let flags = (o.has('N') || o.has('E') || o.has('k')).then(|| (o.has('E'), o.has('k')));
+        // -N clears the flags; -E, -EE and -k replace them
+        let flags = (o.has('N') || o.has('E') || o.has('k')).then(|| (o.count('E') == 1, o.count('E') > 1, o.has('k')));
         let Some(Some(Overlay::Popup(p))) = self.clients.get_mut(&cid).map(|c| c.overlay.as_mut()) else { return };
         p.title = title;
         if let Some(s) = o.get('S') {
@@ -1230,8 +1231,9 @@ impl Server {
             }
             p.look.lines = Some(l);
         }
-        if let Some((e, k)) = flags {
+        if let Some((e, ee, k)) = flags {
             p.close_on_exit = e;
+            p.close_exit_zero = ee;
             p.close_any_key = k;
         }
         if let Some((pane, (_, _, w, h))) = resize {
@@ -3412,7 +3414,7 @@ impl Server {
                 let pane = self.spawn_pane(tt.sid, iw.max(1), ih.max(1), &o.rest, Some(&cwd), &env)?;
                 let title = o.get('T').map(|s| self.expand(tt, Some(cid), s)).unwrap_or_default();
                 let epoch = self.replace_overlay(cid, Some(Overlay::Popup(Popup {
-                    pane, x, y, w, h, border, close_on_exit: o.has('E'), close_any_key: o.has('k'), title,
+                    pane, x, y, w, h, border, close_on_exit: o.count('E') == 1, close_exit_zero: o.count('E') > 1, close_any_key: o.has('k'), title,
                     look: super::modes::OverlayLook { style: o.get('s').map(String::from), border_style: o.get('S').map(String::from), lines: o.get('b').map(String::from), ..Default::default() },
                 })))?;
                 Ok(Flow::WaitOverlay(cid, epoch))

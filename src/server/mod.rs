@@ -2221,7 +2221,8 @@ impl Server {
         // popup?
         let popup_owner = self.clients.values().find(|c| matches!(&c.overlay, Some(Overlay::Popup(p)) if p.pane == id)).map(|c| c.id);
         if let Some(cid) = popup_owner {
-            let close = matches!(&self.clients[&cid].overlay, Some(Overlay::Popup(p)) if p.close_on_exit);
+            // popup_job_complete_cb: -E closes it, -EE only for status 0
+            let close = matches!(&self.clients[&cid].overlay, Some(Overlay::Popup(p)) if p.close_on_exit || (p.close_exit_zero && status == Some(0)));
             if let Some(p) = self.panes.get_mut(&id) {
                 p.dead = Some((status, now_secs()));
             }
