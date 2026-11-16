@@ -82,6 +82,14 @@ impl Server {
         self.copy_sync_options(pane);
         let vi = self.opt_window(self.window_of(pane), "mode-keys") == "vi";
         let table = if vi { "copy-mode-vi" } else { "copy-mode" };
+        // the numeric prompt takes digits; any other key closes it and is looked up in the
+        // table with the count as the prefix (PROMPT_NUMERIC returns PROMPT_KEY_NOT_HANDLED)
+        let digit = name.len() == 1 && name.as_bytes()[0].is_ascii_digit();
+        if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
+            if cm.counting() && !digit {
+                cm.end_count();
+            }
+        }
         let pending = matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(cm)) if cm.waiting_for_key());
         let binding = self.bindings.get(table).and_then(|t| t.get(name)).map(|b| b.cmd.clone());
         let default = copymode::CopyMode::default_bindings(vi).iter().find(|(k, _)| keys::parse_key_name(k).map(|k| keys::key_name(&k)).as_deref().unwrap_or(k) == name).map(|(_, c)| *c);

@@ -729,6 +729,17 @@ impl CopyMode {
         self.pending_jump.is_some() || self.count_open
     }
 
+    /// The repeat count is being typed (tmux's numeric command-prompt is open).
+    pub fn counting(&self) -> bool {
+        self.count_open && self.pending_jump.is_none()
+    }
+
+    /// A key that is not a digit closes the numeric prompt: the count is kept for the
+    /// command that key runs from the copy-mode table (send -N, then the key again).
+    pub fn end_count(&mut self) {
+        self.count_open = false;
+    }
+
     /// The position indicator is shown (copy-mode -H, toggle-position).
     pub fn position_shown(&self) -> bool {
         self.show_position
