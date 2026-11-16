@@ -1388,7 +1388,17 @@ impl Server {
     /// Checks every set-hook -B monitor (once a second, monitor_timer).
     pub fn check_monitors(&mut self) {
         self.prune_monitors();
-        let keys: Vec<(Level, String)> = self.ev.monitors.keys().cloned().collect();
+        // monitor_timer: session monitors, single panes and windows, every pane, every
+        // window; by name within each
+        let group = |w: &MonitorWhat| match w {
+            MonitorWhat::Session => 0,
+            MonitorWhat::Pane(_) | MonitorWhat::Window(_) => 1,
+            MonitorWhat::AllPanes => 2,
+            MonitorWhat::AllWindows => 3,
+        };
+        let mut keys: Vec<(u8, (Level, String))> = self.ev.monitors.iter().map(|(k, m)| (group(&m.what), k.clone())).collect();
+        keys.sort_by(|a, b| (a.0, &a.1 .1).cmp(&(b.0, &b.1 .1)));
+        let keys: Vec<(Level, String)> = keys.into_iter().map(|k| k.1).collect();
         for key in keys {
             let Some(m) = self.ev.monitors.get(&key) else { continue };
             // monitor_get_session: its own session, else the first session by name

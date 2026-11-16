@@ -1917,3 +1917,31 @@ fn tmux_38_waiters_monitors_and_exit_signals() {
         assert!(dead.lines().any(|l| l == "|15"), "{dead}");
     }
 }
+
+/// Subscriptions are checked as tmux's monitor_timer does: the session ones, single
+/// panes and windows, then every pane and every window.
+#[test]
+fn tmux_38_subscription_order() {
+    use std::io::{BufRead, BufReader};
+    use std::sync::{Arc, Mutex};
+    let ctx = Ctx::new("suborder");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-n", "w0"]);
+    let mut child = ctx.command().args(["-C", "attach", "-t", "s"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let stdout = child.stdout.take().unwrap();
+    let o = out.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(rest) = line.strip_prefix("%subscription-changed ") {
+                o.lock().unwrap().push(rest.split(' ').next().unwrap_or("").to_string());
+            }
+        }
+    });
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"refresh-client -B \"wn:@*:#{window_name}\"\nrefresh-client -B \"pn:%*:#{pane_index}\"\nrefresh-client -B \"sn::#{session_name}\"\n").unwrap();
+    stdin.flush().unwrap();
+    wait_for("subscriptions", || out.lock().unwrap().len() >= 3);
+    assert_eq!(*out.lock().unwrap(), ["sn", "pn", "wn"]);
+    child.kill().unwrap();
+    let _ = child.wait();
+}

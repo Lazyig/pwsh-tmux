@@ -259,30 +259,49 @@ impl Server {
             let mut updates = Vec::new();
             let mut cached_bytes: usize = self.clients[&cid].ctl.subs.values()
                 .flat_map(|(_, _, values)| values.iter()).map(|(key, value)| key.len() + value.len()).sum();
-            for (name, what, fmt) in subs {
-                // (key, target, line prefix)
-                let mut targets: Vec<(String, Target, String)> = Vec::new();
-                let win_target = |idx: u32, wid: WinId| Target { sid: Some(sid), idx: Some(idx), wid: Some(wid), pane: Some(self.windows[&wid].active) };
-                if what.is_empty() {
-                    let t = win_target(s.active, s.active_window());
-                    targets.push((String::new(), t, format!("${sid} - - -")));
-                } else if what == "@*" || what.starts_with('@') {
+            // monitor_timer's order: session subscriptions, then single panes and
+            // windows (by name), then every pane, then every window (by winlink,
+            // each with the subscriptions in name order)
+            let win_target = |idx: u32, wid: WinId| Target { sid: Some(sid), idx: Some(idx), wid: Some(wid), pane: Some(self.windows[&wid].active) };
+            // (name, format, key, target, line prefix)
+            let mut targets: Vec<(String, String, String, Target, String)> = Vec::new();
+            for (name, _, fmt) in subs.iter().filter(|s| s.1.is_empty()) {
+                let t = win_target(s.active, s.active_window());
+                targets.push((name.clone(), fmt.clone(), String::new(), t, format!("${sid} - - -")));
+            }
+            for (name, what, fmt) in &subs {
+                if what.starts_with('@') && what != "@*" {
                     for (idx, wid) in &s.links {
-                        if what == "@*" || what == format!("@{wid}") {
-                            targets.push((format!("@{wid}"), win_target(*idx, *wid), format!("${sid} @{wid} {idx} -")));
+                        if *what == format!("@{wid}") {
+                            targets.push((name.clone(), fmt.clone(), format!("@{wid}"), win_target(*idx, *wid), format!("${sid} @{wid} {idx} -")));
                         }
                     }
-                } else if what == "%*" || what.starts_with('%') {
+                } else if what.starts_with('%') && what != "%*" {
                     for (idx, wid) in &s.links {
                         for p in self.windows[wid].panes() {
-                            if what == "%*" || what == format!("%{p}") {
+                            if *what == format!("%{p}") {
                                 let t = Target { pane: Some(p), ..win_target(*idx, *wid) };
-                                targets.push((format!("%{p}"), t, format!("${sid} @{wid} {idx} %{p}")));
+                                targets.push((name.clone(), fmt.clone(), format!("%{p}"), t, format!("${sid} @{wid} {idx} %{p}")));
                             }
                         }
                     }
                 }
-                for (key, t, prefix) in targets {
+            }
+            for (idx, wid) in &s.links {
+                for p in self.windows[wid].panes() {
+                    for (name, _, fmt) in subs.iter().filter(|s| s.1 == "%*") {
+                        let t = Target { pane: Some(p), ..win_target(*idx, *wid) };
+                        targets.push((name.clone(), fmt.clone(), format!("%{p}"), t, format!("${sid} @{wid} {idx} %{p}")));
+                    }
+                }
+            }
+            for (idx, wid) in &s.links {
+                for (name, _, fmt) in subs.iter().filter(|s| s.1 == "@*") {
+                    targets.push((name.clone(), fmt.clone(), format!("@{wid}"), win_target(*idx, *wid), format!("${sid} @{wid} {idx} -")));
+                }
+            }
+            {
+                for (name, fmt, key, t, prefix) in targets {
                     let value = self.expand(t, Some(cid), &fmt);
                     let last = self.clients[&cid].ctl.subs.get(&name).and_then(|x| x.2.get(&key));
                     if last != Some(&value) {
