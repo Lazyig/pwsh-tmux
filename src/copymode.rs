@@ -2955,13 +2955,8 @@ impl CopyMode {
         out
     }
 
-    /// Visible marks retain the first match's generation where row searches overlap.
-    fn mark_matches(&self, y: usize, needle: &str) -> Vec<(usize, usize)> {
-        let mut first = y;
-        while first > 0 && self.wrapped(first - 1) { first -= 1; }
-        self.match_spans(first, y, needle)
-    }
-
+    /// Matches starting on rows `first..=y`; where row searches overlap, the marks keep the
+    /// first match's cells.
     fn match_spans(&self, first: usize, y: usize, needle: &str) -> Vec<(usize, usize)> {
         let mut marks: Vec<(usize, usize)> = Vec::new();
         for row in first..=y {
@@ -3030,10 +3025,18 @@ impl CopyMode {
             self.search_present().then(|| self.visible_matches(self.cy, needle).into_iter()
                 .find(|&(a, b)| at >= a && at < b).map(|(_, b)| b)).flatten().unwrap_or(at + 1)
         } else { at };
+        // the matches of a whole wrapped line are found once (window_copy_search_jump looks
+        // at each row once; per-row searches of long wrapped lines would be quadratic)
+        let mut line: Option<(usize, usize, Vec<(usize, usize)>)> = None;
         for i in 0..=total {
             if !self.wrap_search && ((forward && self.cy + i >= total) || (!forward && i > self.cy)) { break; }
             let y = if forward { (self.cy + i) % total } else { (self.cy + total * 2 - i) % total };
-            let matches = self.mark_matches(y, needle);
+            if !line.as_ref().is_some_and(|(a, b, _)| (*a..=*b).contains(&y)) {
+                let (first, last) = (self.logical_start(y), self.logical_end(y));
+                line = Some((first, last, self.match_spans(first, last, needle)));
+            }
+            let spans = &line.as_ref().unwrap().2;
+            let matches: Vec<(usize, usize)> = spans.iter().copied().filter(|&(a, b)| a < (y + 1) * self.width && b > y * self.width).collect();
             let eligible = |&(a, _): &(usize, usize)| {
                 if forward {
                     if i == 0 { a >= from } else if i == total { a < from } else { a >= y * self.width }
@@ -4727,6 +4730,22 @@ mod tests {
         assert!(cm.row_matches(0, "^").is_empty());
         cm.search_regex = false;
         assert_eq!(cm.row_matches(0, &"x".repeat(2001)), vec![(0, 2001)], "literal searches have no regex join limit");
+    }
+
+    #[test]
+    fn search_over_a_long_wrapped_line_is_linear() {
+        // one 160000-cell line soft-wrapped over 2000 rows: each row is searched once
+        let mut v: Vec<Line> = (0..2000).map(|_| line(&"x".repeat(80), true)).collect();
+        v.push(line("DONE", false));
+        let mut cm = CopyMode::new(v, 80, 24, (0, 0), true);
+        cm.run("history-top", &[]);
+        let started = std::time::Instant::now();
+        cm.run("search-forward", &["Q.Q".into()]);
+        cm.run("search-forward", &["QQQ".into()]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(!cm.search_present());
+        cm.run("search-forward", &["DONE".into()]);
+        assert_eq!(cm.cursor(), (0, 23));
     }
 
     #[test]
