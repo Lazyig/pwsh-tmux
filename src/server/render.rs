@@ -1,6 +1,6 @@
 //! Composes a client's screen (panes, borders, status line, overlays) and sends the diff.
 
-use super::modes::{big_text, clock_text};
+use super::modes::{clock_text, draw_clock};
 use super::vars::Target;
 use super::*;
 use crate::cells::{Cell, Color, Line, Style, BLINK, BOLD, DIM, INVERSE, ITALIC, STRIKE, UNDERLINE};
@@ -154,7 +154,8 @@ pub fn draw_box_lines(f: &mut Frame, x: u16, y: u16, w: u16, h: u16, style: Styl
         let spans = format::spans(title, style);
         let cells = spans_cells(&spans, w.saturating_sub(4) as usize, style);
         let start = match spans.first().map(|s| s.align) {
-            Some(format::Align::Centre | format::Align::AbsoluteCentre) => x + (w.saturating_sub(cells.len() as u16)) / 2,
+            // format_draw from x + 2 in w - 4 cells: the centre is available / 2 - width / 2
+            Some(format::Align::Centre | format::Align::AbsoluteCentre) => x + 2 + (w - 4) / 2 - (cells.len() as u16 / 2).min((w - 4) / 2),
             Some(format::Align::Right) => x + w - 2 - cells.len() as u16,
             _ => x + 2,
         };
@@ -647,7 +648,13 @@ impl Server {
                     let (lines, cur) = cm.render_with(&self.copy_render_style(*id, Some(cid)));
                     Some((lines, Some((cur.1, cur.0))))
                 }
-                Some(PaneMode::Tree(t)) => Some((t.render(self, cid, cr.w, cr.h), None)),
+                Some(PaneMode::Tree(t)) => {
+                    Some(t.render(self, cr.w, cr.h))
+                }
+                Some(PaneMode::Switch(s)) => {
+                    Some(s.render(self, cr.w, cr.h))
+                }
+                Some(PaneMode::Panes(m)) => Some((m.render(self, cr.w, cr.h), None)),
                 // the clock's screen is cleared before the time is drawn
                 Some(PaneMode::Clock) => Some((vec![Line { cells: vec![Cell::default(); cr.w as usize], wrapped: false }; cr.h as usize], None)),
                 None => None,
@@ -678,16 +685,11 @@ impl Server {
                 }
             }
             if matches!(p.mode, Some(PaneMode::Clock)) {
-                let ctx = vars::VarCtx { srv: self, t: pane_target, client: Some(cid), extra: HashMap::new() };
-                let value = format::expand(&self.opt_window(Some(wid), "clock-mode-colour"), &ctx);
-                let colour = format::parse_color_with(&value, Some(&ctx)).unwrap_or(Color::Idx(4));
-                let text = clock_text(&self.opt_window(Some(wid), "clock-mode-style"));
-                let rr = Rect { y: oy + cr.y, h: cr.h.saturating_sub(1), ..cr };
-                // too small for the big digits: the plain text, centred, if it fits
-                let len = text.chars().count() as u16;
-                if (cr.h < 6 || !super::modes::big_clock(&mut f, rr, &text, colour)) && cr.w >= len && cr.h > 0 {
-                    f.text(cr.x + cr.w / 2 - len / 2, oy + cr.y + cr.h / 2, &text, Style { fg: colour, bg: wstyle.bg, ..Style::default() }, cr.x + cr.w);
-                }
+                // style_apply of clock-mode-colour: a format, theme colours from the client
+                let t = Target { sid: Some(sid), idx: None, wid: Some(wid), pane: Some(p.id) };
+                let colour = self.style_option(&format!("fg={}", self.opt_window(Some(wid), "clock-mode-colour")), Style::default(), t, Some(cid)).map_or(Color::Idx(4), |s| s.fg);
+                let text = clock_text(&self.opt_window(Some(wid), "clock-mode-style"), chrono::Local::now().time());
+                draw_clock(&mut f, Rect { y: oy + cr.y, ..cr }, &text, colour, wstyle.bg);
             }
             if dim != 0 {
                 for y in 0..cr.h { for x in 0..cr.w {
@@ -892,7 +894,8 @@ impl Server {
         for (id, r) in &rects {
             let Some(pr) = self.panes.get(id).and_then(|p| p.prompt.as_ref()) else { continue };
             let cr = self.content_rect(wid, *r);
-            if cr.w == 0 || cr.h == 0 { continue; }
+            // a zoomed window shows only the active pane's
+            if cr.w == 0 || cr.h == 0 || (win.zoomed && *id != win.active) { continue; }
             let row = if top && nstatus > 0 { cr.y } else { cr.bottom() - 1 };
             let mut line = Frame::new(cr.w, 1);
             let x = self.draw_prompt(&mut line, cid, pr, 0, cr.w, 0);
@@ -901,6 +904,22 @@ impl Server {
                 cursor = Some((cr.x + x.min(cr.w - 1), oy + row));
                 self.prompt_cursor(&mut modes, sid, pr);
             }
+        }
+
+        // the window menu, above the panes (redraw_mark_menu)
+        if let Some(m) = self.menus.get(&wid).filter(|_| c.overlay.is_none()) {
+            let ost = |name: &str, base: Style| self.style_option(&self.opt_window(Some(wid), name), base, active_target, Some(cid)).unwrap_or(base);
+            let st = ost("popup-style", Style::default());
+            let bst = ost("popup-border-style", Style::default());
+            let st = ost("menu-style", st);
+            let bst = ost("menu-border-style", bst);
+            let selected = ost("menu-selected-style", Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() });
+            // display-menu -s -S -H -b
+            let given = |v: &Option<String>, base: Style| self.flag_style(v.as_deref(), base, active_target, cid);
+            let (st, bst, selected) = (given(&m.look.style, st), given(&m.look.border_style, bst), given(&m.look.selected_style, selected));
+            let lines = m.look.lines.clone().unwrap_or_else(|| self.opt_window(Some(wid), "menu-border-lines"));
+            m.draw(&mut f, oy, st, bst, selected, &lines);
+            cursor = None;
         }
 
         // status lines
@@ -951,40 +970,8 @@ impl Server {
         }
 
         // overlays, over the status line like tmux's overlay_draw
-        if let Some(ov) = &c.overlay {
+        if let Some(ov) = c.overlay.as_ref() {
             match ov {
-                Overlay::DisplayPanes { .. } => {
-                    cursor = None;
-                    let ctx = vars::VarCtx { srv: self, t: active_target, client: Some(cid), extra: HashMap::new() };
-                    let colour = |name| format::parse_color_with(&format::expand(&self.opt_window(Some(wid), name), &ctx), Some(&ctx)).unwrap_or(Color::Default);
-                    let acolour = colour("display-panes-active-colour");
-                    let colour = colour("display-panes-colour");
-                    let base = self.opt_window_num(Some(wid), "pane-base-index").max(0) as usize;
-                    for (i, (id, r)) in rects.iter().enumerate() {
-                        let col = if *id == win.active { acolour } else { colour };
-                        let label = (i + base).to_string();
-                        let rr = Rect { y: oy + r.y, ..*r };
-                        if !big_text(&mut f, rr, &label, col) {
-                            f.text(r.x + r.w / 2, oy + r.y + r.h / 2, &label, Style { fg: col, ..Style::default() }, r.right());
-                        }
-                        let size = format!("{}x{}", r.w, r.h);
-                        f.text(r.right().saturating_sub(size.len() as u16), oy + r.y, &size, Style { fg: col, ..Style::default() }, r.right());
-                    }
-                }
-                Overlay::Menu(m) => {
-                    let ost = |name: &str, base: Style| self.style_option(&self.opt_window(Some(wid), name), base, active_target, Some(cid)).unwrap_or(base);
-                    let st = ost("popup-style", Style::default());
-                    let bst = ost("popup-border-style", Style::default());
-                    let st = ost("menu-style", st);
-                    let bst = ost("menu-border-style", bst);
-                    let selected = ost("menu-selected-style", Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() });
-                    // display-menu -s -S -H -b
-                    let given = |v: &Option<String>, base: Style| self.flag_style(v.as_deref(), base, active_target, cid);
-                    let (st, bst, selected) = (given(&m.look.style, st), given(&m.look.border_style, bst), given(&m.look.selected_style, selected));
-                    let lines = m.look.lines.clone().unwrap_or_else(|| self.opt_window(Some(wid), "menu-border-lines"));
-                    m.draw(&mut f, st, bst, selected, &lines);
-                    cursor = None;
-                }
                 Overlay::Popup(pp) => {
                     let st = self.style_option(&self.opt_window(Some(wid), "popup-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();
                     let bst = self.style_option(&self.opt_window(Some(wid), "popup-border-style"), Style::default(), active_target, Some(cid)).unwrap_or_default();

@@ -1,6 +1,6 @@
 //! Client input: key tables, prompts, overlays, pane modes and the mouse.
 
-use super::modes::{MenuAction, TreeAction};
+use super::modes::{MenuAction, ModeAction};
 use super::*;
 use crate::{cmdparse, format, opts};
 use crate::keys::{Input, Key, KeyCode};
@@ -592,13 +592,23 @@ impl Server {
     pub(super) fn handle_key(&mut self, cid: ClientId, k: Key, raw: Vec<u8>) {
         let name = keys::key_name(&k);
         let Some(c) = self.clients.get(&cid) else { return };
-        if c.is_readonly() && (c.prompt.is_some() || c.overlay.is_some()) { return; }
+        let menu = if c.overlay.is_none() { self.client_window(cid).filter(|w| self.menus.contains_key(w)) } else { None };
+        if c.is_readonly() && (c.prompt.is_some() || c.overlay.is_some() || menu.is_some()) { return; }
         // a key clears a message (and is then handled), unless display -N
         if c.message.is_some() && !c.is_readonly() {
             if c.message_ignore_keys { return; }
             let c = self.clients.get_mut(&cid).unwrap();
             c.message = None;
             c.dirty = true;
+        }
+        // the menu of the client's window comes before the prompt (server_client_handle_menu_key)
+        if let Some(wid) = menu {
+            let action = match self.menus.get_mut(&wid) {
+                Some(m) => m.key(&name),
+                None => MenuAction::None,
+            };
+            self.menu_action(cid, wid, action);
+            return;
         }
         if self.clients[&cid].prompt.is_some() {
             let prompt_key = match k.code { KeyCode::KP('\r') => Key::plain(KeyCode::Enter), KeyCode::KP(ch) => Key::plain(KeyCode::Char(ch)), _ => k.clone() };
@@ -607,36 +617,7 @@ impl Server {
             }
         }
         let Some(c) = self.clients.get(&cid) else { return };
-        // overlays
         match &c.overlay {
-            Some(Overlay::Menu(_)) => {
-                let action = match &mut self.clients.get_mut(&cid).unwrap().overlay {
-                    Some(Overlay::Menu(m)) => m.key(&name),
-                    _ => MenuAction::None,
-                };
-                self.menu_action(cid, action);
-                return;
-            }
-            Some(Overlay::DisplayPanes { template, .. }) => {
-                let template = template.clone();
-                let c = self.clients.get_mut(&cid).unwrap();
-                c.overlay = None;
-                c.dirty = true;
-                if let KeyCode::Char(ch) = k.code {
-                    if let Some(d) = ch.to_digit(10) {
-                        if let Some(sid) = self.client_session(cid) {
-                            let wid = self.sessions[&sid].active_window();
-                            let base = self.opt_window_num(Some(wid), "pane-base-index").max(0) as u32;
-                            let panes = self.windows[&wid].panes();
-                            if let Some(p) = d.checked_sub(base).and_then(|i| panes.get(i as usize)) {
-                                let cmd = fill_template(&template, &[format!("%{p}")]);
-                                self.run_string(cid, &cmd, Some(*p));
-                            }
-                        }
-                    }
-                }
-                return;
-            }
             Some(Overlay::Popup(p)) => {
                 // popup_key_cb: Escape and C-c close the popup unless -E leaves them
                 // to its running command; after the command exits only they (or with
@@ -658,7 +639,8 @@ impl Server {
             }
             None => {}
         }
-        if let Some(pane) = self.pane_prompt_target(cid) {
+        // a pane prompt in the window; read-only clients skip it (server_client_handle_key)
+        if let Some(pane) = self.pane_prompt_target(cid).filter(|_| !self.client_is_readonly(Some(cid))) {
             if self.pane_prompt_key(cid, pane, &k, &name) {
                 return;
             }
@@ -790,25 +772,47 @@ impl Server {
         }
     }
 
-    pub(crate) fn menu_action(&mut self, cid: ClientId, action: MenuAction) {
+    /// The window a client shows.
+    pub fn client_window(&self, cid: ClientId) -> Option<WinId> {
+        self.client_session(cid).and_then(|s| self.sessions.get(&s)).map(|s| s.active_window())
+    }
+
+    /// The rows above the window on a client (status lines at the top).
+    pub fn client_window_top(&self, cid: ClientId) -> u16 {
+        let Some(c) = self.clients.get(&cid) else { return 0 };
+        if c.session.is_none() || self.opt_session(c.session, "status-position") != "top" {
+            return 0;
+        }
+        self.status_lines(c.session).min(c.size.1.saturating_sub(1))
+    }
+
+    /// A menu belongs to a window (tmux 3.8 w->menu): every client showing the window sees
+    /// and uses it, and opening another menu there replaces it (menu_close).
+    pub fn set_window_menu(&mut self, wid: WinId, menu: Option<super::modes::Menu>) {
+        match menu {
+            Some(m) => {
+                self.menus.insert(wid, m);
+            }
+            None => {
+                self.menus.remove(&wid);
+            }
+        }
+        if self.windows.contains_key(&wid) {
+            self.mark_window_dirty(wid);
+        }
+    }
+
+    pub(crate) fn menu_action(&mut self, cid: ClientId, wid: WinId, action: MenuAction) {
         match action {
             MenuAction::None => {
-                if let Some(c) = self.clients.get_mut(&cid) {
-                    c.dirty = true;
+                if self.windows.contains_key(&wid) {
+                    self.mark_window_dirty(wid);
                 }
             }
-            MenuAction::Cancel => {
-                let c = self.clients.get_mut(&cid).unwrap();
-                c.overlay = None;
-                c.dirty = true;
-            }
+            MenuAction::Cancel => self.set_window_menu(wid, None),
             MenuAction::Run(cmd) => {
-                let c = self.clients.get_mut(&cid).unwrap();
-                let pane = match c.overlay.take() {
-                    Some(Overlay::Menu(m)) => m.pane,
-                    _ => None,
-                };
-                c.dirty = true;
+                let pane = self.menus.get(&wid).and_then(|m| m.pane).filter(|p| self.panes.contains_key(p));
+                self.set_window_menu(wid, None);
                 self.run_string(cid, &cmd, pane.or_else(|| self.client_active_pane(cid)));
             }
         }
@@ -822,40 +826,67 @@ impl Server {
         let Some(p) = self.panes.get_mut(&pane) else { return };
         match &mut p.mode {
             Some(PaneMode::Clock) => self.exit_mode(pane),
-            Some(PaneMode::Tree(_)) => {
-                let h = p.size.1 as usize;
-                let Some(PaneMode::Tree(mut tree)) = p.mode.take() else { return };
-                let action = tree.key(name, tree.list_height(h), self);
-                // the client that opened the tree, if it is still attached
-                let client = tree.client.filter(|c| self.clients.get(c).is_some_and(|c| c.attached)).or(cid);
-                match action {
-                    TreeAction::None => {
-                        self.panes.get_mut(&pane).unwrap().mode = Some(PaneMode::Tree(tree));
+            Some(PaneMode::Tree(_) | PaneMode::Switch(_) | PaneMode::Panes(_)) => {
+                let (w, h) = (p.size.0 as usize, p.size.1 as usize);
+                let Some(mut mode) = p.mode.take() else { return };
+                let action = match &mut mode {
+                    PaneMode::Tree(t) => {
+                        let a = t.key(name, self, w, h);
+                        for (ty, line) in t.take_history() {
+                            self.add_prompt_history(&line, ty);
+                        }
+                        a
                     }
-                    TreeAction::Cancel => {}
-                    TreeAction::Run(cmd) => {
-                        let kill = name == "x" || name == "X";
-                        if kill {
-                            self.panes.get_mut(&pane).unwrap().mode = Some(PaneMode::Tree(tree));
-                        }
-                        if let Some(c) = client {
-                            self.run_string(c, &cmd, Some(pane));
-                        } else {
-                            let cmds = crate::cmdparse::parse(&cmd).unwrap_or_default();
-                            self.run_queue(Queue { cmds: cmds.into(), ctx: Ctx { pane: Some(pane), ..Ctx::default() } , soft: 0 });
-                        }
-                        if kill {
-                            if let Some(PaneMode::Tree(mut t)) = self.panes.get_mut(&pane).and_then(|p| p.mode.take()) {
-                                t.rebuild(self);
-                                if let Some(p) = self.panes.get_mut(&pane) {
-                                    p.mode = Some(PaneMode::Tree(t));
-                                }
-                            }
-                        }
-                    }
+                    PaneMode::Switch(s) => s.key(name, self, w, h),
+                    PaneMode::Panes(m) => m.key(name, self),
+                    _ => ModeAction::None,
+                };
+                if let Some(p) = self.panes.get_mut(&pane) {
+                    p.mode = Some(mode);
                 }
-                // unzoom if the tree zoomed the window
-                if self.panes.get(&pane).is_some_and(|p| p.mode.is_none()) {
+                self.mode_action(pane, cid, action);
+            }
+            Some(PaneMode::Copy(_)) => self.copy_key(pane, cid, name),
+            None => {}
+        }
+    }
+
+    /// The client a mode's commands run for: the one whose key or click it was (tmux passes
+    /// that client to mode_tree_run_command and friends), else the one that opened the mode.
+    fn mode_client(&self, pane: PaneId, cid: Option<ClientId>) -> Option<ClientId> {
+        let attached = |c: &ClientId| self.clients.get(c).is_some_and(|c| c.attached);
+        if let Some(c) = cid.filter(attached) {
+            return Some(c);
+        }
+        let opened = match self.panes.get(&pane).and_then(|p| p.mode.as_ref()) {
+            Some(PaneMode::Tree(t)) => t.client,
+            Some(PaneMode::Switch(s)) => s.client,
+            Some(PaneMode::Panes(m)) => m.client,
+            _ => None,
+        };
+        opened.filter(attached).or(cid)
+    }
+
+    fn run_mode_command(&mut self, client: Option<ClientId>, cmd: &str, pane: PaneId) {
+        let pane = self.panes.contains_key(&pane).then_some(pane);
+        match client {
+            Some(c) => self.run_string(c, cmd, pane),
+            None => match crate::cmdparse::parse(cmd) {
+                Ok(cmds) => self.run_queue(Queue { cmds: cmds.into(), ctx: Ctx { pane, ..Ctx::default() }, soft: 0 }),
+                Err(e) => log(&format!("mode command: {e}")),
+            },
+        }
+    }
+
+    /// Carry out what a mode asked for after a key or a click.
+    pub fn mode_action(&mut self, pane: PaneId, cid: Option<ClientId>, action: ModeAction) {
+        let client = self.mode_client(pane, cid);
+        match action {
+            ModeAction::None => {}
+            ModeAction::Exit => self.exit_mode(pane),
+            ModeAction::Run(cmd) => {
+                // choosing a pane in panes mode unzooms its window (window_panes_key)
+                if matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Panes(_))) {
                     if let Some(wid) = self.window_of(pane) {
                         if self.windows[&wid].zoomed {
                             self.windows.get_mut(&wid).unwrap().zoomed = false;
@@ -863,13 +894,109 @@ impl Server {
                         }
                     }
                 }
-                if let Some(wid) = self.window_of(pane) {
-                    self.mark_window_dirty(wid);
+                // like tmux, the mode is gone before the queued command runs
+                self.exit_mode(pane);
+                self.run_mode_command(client, &cmd, pane);
+            }
+            ModeAction::RunKeep(cmd) => self.run_mode_command(client, &cmd, pane),
+            ModeAction::Menu { title, items, x, y } => {
+                // the items send their key to the mode (mode_tree_menu_callback)
+                let mode = self.panes.get(&pane).and_then(|p| p.mode.as_ref()).map(|m| m.name().to_string()).unwrap_or_default();
+                let items: Vec<super::modes::MenuItem> = items
+                    .into_iter()
+                    .map(|(name, key, send)| super::modes::MenuItem {
+                        name: name.to_string(),
+                        key: key.to_string(),
+                        cmd: if name.is_empty() { String::new() } else { format!("if-shell -F -t '%{pane}' '#{{==:#{{pane_mode}},{mode}}}' \"send-keys -t '%{pane}' {send}\"") },
+                    })
+                    .collect();
+                if let (Some(wid), Some(r)) = (self.window_of(pane), self.pane_rect(pane)) {
+                    let (w, h) = super::modes::Menu::box_size(&title, &items);
+                    let x = if x >= w / 2 { x - w / 2 } else { 0 } + r.x;
+                    let y = y + r.y;
+                    // menu_prepare: inside the window
+                    let (wsx, wsy) = self.windows.get(&wid).map_or((0, 0), |w| (w.sx, w.sy));
+                    let fit = |p: u16, size: u16, total: u16| if size >= total { 0 } else if p + size > total { total - size } else { p };
+                    let menu = super::modes::Menu::at(title, items, fit(x, w, wsx), fit(y, h, wsy), Some(pane), false, false, None);
+                    self.set_window_menu(wid, Some(menu));
                 }
             }
-            Some(PaneMode::Copy(_)) => self.copy_key(pane, cid, name),
-            None => {}
+            ModeAction::Edit { value, command, buffer } => {
+                if let Some(c) = client {
+                    if let Err(e) = self.open_editor(c, &value, command, buffer) {
+                        self.set_message(c, &e);
+                    }
+                }
+            }
         }
+        if let Some(wid) = self.window_of(pane) {
+            self.mark_window_dirty(wid);
+        }
+    }
+
+    /// spawn_editor: edit `value` in the editor option's program, in a popup over the client;
+    /// `command` runs with %% replaced by the text when the editor exits successfully.
+    pub fn open_editor(&mut self, cid: ClientId, value: &[u8], command: String, buffer: Option<String>) -> Result<(), String> {
+        if self.clients.get(&cid).is_some_and(|c| c.overlay.is_some()) {
+            return Err("an overlay is already open".into());
+        }
+        let text: &[u8] = if value.is_empty() { b"\n" } else { value };
+        let path = editor_file(text).map_err(|e| format!("editor: {e}"))?;
+        let editor = self.opt_server("editor");
+        // the editor option names the program (notepad.exe on Windows); the file is one argument
+        let quoted = if cfg!(windows) { format!("\"{}\"", path.display()) } else { crate::cmdparse::quote(&path.display().to_string()) };
+        let sid = self.client_session(cid);
+        let shell = self.opt_session(sid, "default-shell");
+        let shell = if shell.is_empty() { procinfo::default_shell() } else { shell };
+        let cmd = editor_command(&editor, &quoted, cfg!(windows) && procinfo::is_powershell(&shell));
+        // spawn_editor: a pane 9/10 of the window in its middle (xoff = sx / 2 - w / 2),
+        // here with a border around it
+        let (wsx, wsy) = self.client_window(cid).and_then(|w| self.windows.get(&w)).map_or(self.clients[&cid].size, |w| (w.sx, w.sy));
+        let (pw, ph) = (((wsx as u32 * 9 / 10) as u16).max(1), ((wsy as u32 * 9 / 10) as u16).max(1));
+        let top = self.client_window_top(cid);
+        let (x, y) = ((wsx / 2 - pw / 2).saturating_sub(1), (top + wsy / 2 - ph / 2).saturating_sub(1));
+        let (w, h) = (pw + 2, ph + 2);
+        let pane = match self.spawn_pane(sid, pw, ph, &[cmd], Some(&std::env::temp_dir().display().to_string()), &[]) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                return Err(e);
+            }
+        };
+        let editor = Some(Box::new(super::modes::PopupEditor { path, command, buffer }));
+        self.replace_overlay(cid, Some(Overlay::Popup(super::modes::Popup { pane, x, y, w, h, border: true, close_on_exit: true, title: String::new(), editor })))?;
+        Ok(())
+    }
+
+    /// The editor popup closed (spawn_editor_finish): nothing for a failed editor or an
+    /// empty file, else the paste buffer gets the text (window_buffer_edit_close_cb) or the
+    /// command runs with it, less a final newline.
+    pub fn editor_done(&mut self, cid: ClientId, ed: super::modes::PopupEditor, status: Option<i32>) {
+        let data = std::fs::read(&ed.path).ok();
+        let _ = std::fs::remove_file(&ed.path);
+        let Some(mut data) = data.filter(|d| status.unwrap_or(0) == 0 && !d.is_empty()) else { return };
+        let strip = |d: &mut Vec<u8>| {
+            if d.last() == Some(&b'\n') {
+                d.pop();
+                if cfg!(windows) && d.last() == Some(&b'\r') {
+                    d.pop();
+                }
+            }
+        };
+        if let Some(name) = &ed.buffer {
+            // only a buffer that is still there; its old final newline decides
+            let Some(b) = self.buffers.iter_mut().find(|b| &b.name == name) else { return };
+            if !b.data.is_empty() && b.data.last() != Some(&b'\n') {
+                strip(&mut data);
+            }
+            if !data.is_empty() {
+                b.data = data;
+            }
+            return;
+        }
+        strip(&mut data);
+        let cmd = fill_template(&ed.command, &[String::from_utf8_lossy(&data).into_owned()]);
+        self.run_string(cid, &cmd, None);
     }
 
     // ---- prompt ----------------------------------------------------------------------
@@ -1706,6 +1833,28 @@ mod tests {
     }
 
     #[test]
+    fn editor_files_are_new_and_private() {
+        let a = editor_file(b"one").unwrap();
+        let b = editor_file(b"two").unwrap();
+        assert_ne!(a, b);
+        assert!(a.file_name().unwrap().to_string_lossy().starts_with("tmux."));
+        assert_eq!(std::fs::read(&a).unwrap(), b"one");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&a).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_file(a);
+        let _ = std::fs::remove_file(b);
+    }
+
+    #[test]
+    fn editor_waits_under_powershell() {
+        assert_eq!(editor_command("vi", "'/tmp/tmux.x'", false), "vi '/tmp/tmux.x'");
+        assert_eq!(editor_command("notepad.exe", "\"C:\\t\\tmux.x\"", true), "notepad.exe \"C:\\t\\tmux.x\" | Out-Null");
+    }
+
+    #[test]
     fn templates() {
         assert_eq!(fill_template("rename-window -- '%%'", &["it's".into()]), "rename-window -- 'it'\\''s'");
         assert_eq!(fill_template("a %1 b %2", &["x".into(), "y z".into()]), "a x b y z");
@@ -1787,3 +1936,53 @@ pub fn prompt_type(name: &str) -> Option<usize> {
     PROMPT_TYPES.iter().position(|t| *t == name)
 }
 
+/// "editor file" (spawn_editor). PowerShell does not wait for a GUI program such as the
+/// default notepad.exe to exit, so the file would be read (and removed) while it is still
+/// being edited; piping the program to Out-Null makes PowerShell wait for it.
+fn editor_command(editor: &str, quoted: &str, powershell: bool) -> String {
+    if powershell {
+        format!("{editor} {quoted} | Out-Null")
+    } else {
+        format!("{editor} {quoted}")
+    }
+}
+
+/// mkstemp(_PATH_TMP "tmux.XXXXXXXX"): a new file only this user can read, created
+/// exclusively under a random name (never through an existing file or link).
+fn editor_file(data: &[u8]) -> std::io::Result<std::path::PathBuf> {
+    use std::hash::{BuildHasher, Hasher};
+    use std::io::Write;
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let dir = std::env::temp_dir();
+    let mut last = None;
+    for attempt in 0..100u64 {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(now_ms() ^ attempt);
+        h.write_u32(std::process::id());
+        let mut n = h.finish();
+        let name: String = (0..8)
+            .map(|_| {
+                let c = CHARS[(n % CHARS.len() as u64) as usize] as char;
+                n /= CHARS.len() as u64;
+                c
+            })
+            .collect();
+        let path = dir.join(format!("tmux.{name}"));
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+        match o.open(&path) {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(data) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(e);
+                }
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no temporary file")))
+}

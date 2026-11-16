@@ -116,8 +116,9 @@ impl Server {
         if self.clients.get(&cid).is_some_and(|c| c.prompt.is_some()) && self.prompt_mouse(cid, &m) {
             return;
         }
-        // an open pane prompt takes all mouse events
-        if let Some(pane) = self.pane_prompt_target(cid) {
+        // an open pane prompt takes all mouse events (PROMPT_KEY_NOT_HANDLED for a mouse key
+        // in server_client_handle_key); read-only clients skip it
+        if let Some(pane) = self.pane_prompt_target(cid).filter(|_| !self.client_is_readonly(Some(cid))) {
             self.pane_prompt_mouse(cid, pane, &m);
             return;
         }
@@ -155,13 +156,22 @@ impl Server {
 
     /// Menus get the raw events (tmux menu_key_cb); true when the event was used.
     fn mouse_overlay(&mut self, cid: ClientId, m: &Mouse) -> bool {
+        let Some(c) = self.clients.get(&cid) else { return true };
+        // a menu belongs to its window: every client on the window uses it (3.8), with the
+        // event in window coordinates (server_client_handle_menu_key)
+        if c.overlay.is_none() {
+            if let Some(wid) = self.client_window(cid).filter(|w| self.menus.contains_key(w)) {
+                let top = self.client_window_top(cid);
+                let lines = self.status_lines(c.session).min(c.size.1.saturating_sub(1));
+                let area = c.size.1.saturating_sub(lines);
+                let wm = if m.y < top || m.y >= top + area { Mouse { x: u16::MAX, y: u16::MAX, ..*m } } else { Mouse { y: m.y - top, ..*m } };
+                let action = self.menus.get_mut(&wid).map_or(MenuAction::None, |menu| menu.mouse(&wm));
+                self.menu_action(cid, wid, action);
+                return true;
+            }
+        }
         let Some(c) = self.clients.get_mut(&cid) else { return true };
         match &mut c.overlay {
-            Some(Overlay::Menu(menu)) => {
-                let action = menu.mouse(m);
-                self.menu_action(cid, action);
-                true
-            }
             Some(Overlay::Popup(p)) => {
                 let (ix, iy, iw, ih) = p.inner();
                 let pane = p.pane;
@@ -176,11 +186,6 @@ impl Server {
                     }
                 }
                 true
-            }
-            Some(Overlay::DisplayPanes { .. }) => {
-                c.overlay = None;
-                c.dirty = true;
-                false
             }
             None => false,
         }
@@ -492,7 +497,7 @@ impl Server {
     pub fn window_pane_mouse(&mut self, pane: PaneId, cid: Option<ClientId>, m: &MouseCtx) {
         let Some(p) = self.panes.get(&pane) else { return };
         match &p.mode {
-            Some(PaneMode::Tree(_)) => self.tree_mouse(pane, cid, m),
+            Some(PaneMode::Tree(_) | PaneMode::Switch(_) | PaneMode::Panes(_)) => self.tree_mouse(pane, cid, m),
             Some(PaneMode::Clock) => self.exit_mode(pane),
             Some(_) => {}
             None => {
@@ -511,29 +516,25 @@ impl Server {
         }
     }
 
-    /// mode_tree_key for mouse keys: clicks pick a line, a double click chooses it.
+    /// Mouse keys for the tree, switch and panes modes (their window_mode key callbacks).
     fn tree_mouse(&mut self, pane: PaneId, cid: Option<ClientId>, m: &MouseCtx) {
-        let Some((_, y)) = self.mouse_at(pane, m, false) else { return };
-        let height = self.pane_rect(pane).map(|r| r.h as usize).unwrap_or(1);
-        let mut choose = false;
-        if let Some(PaneMode::Tree(tr)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
-            let list_h = tr.list_height(height);
-            if (y as usize) > list_h {
-                return;
-            }
-            let top = tr.top.min(tr.sel).max((tr.sel + 1).saturating_sub(list_h));
-            let row = top + y as usize;
-            if row < tr.items.len() && matches!(m.key.as_str(), "MouseDown1Pane" | "MouseDown3Pane" | "DoubleClick1Pane") {
-                tr.sel = row;
-                tr.top = top;
-                choose = m.key == "DoubleClick1Pane";
-            }
+        if self.client_is_readonly(cid) {
+            return;
         }
-        if choose {
-            self.mode_key(pane, cid, "Enter");
-        } else if let Some(w) = self.window_of(pane) {
-            self.mark_window_dirty(w);
+        let Some((x, y)) = self.mouse_at(pane, m, false) else { return };
+        let Some(p) = self.panes.get_mut(&pane) else { return };
+        let (w, h) = (p.size.0, p.size.1);
+        let Some(mut mode) = p.mode.take() else { return };
+        let action = match &mut mode {
+            PaneMode::Tree(t) => t.mouse(&m.key, x, y, self, w as usize, h as usize),
+            PaneMode::Switch(s) => s.mouse(&m.key, x, y, self, w as usize, h as usize),
+            PaneMode::Panes(pm) => pm.mouse(&m.key, x, y, self, w, h),
+            _ => super::modes::ModeAction::None,
+        };
+        if let Some(p) = self.panes.get_mut(&pane) {
+            p.mode = Some(mode);
         }
+        self.mode_action(pane, cid, action);
     }
 
     fn mouse_drag_update(&mut self, cid: ClientId, m: &MouseCtx) {
@@ -853,14 +854,14 @@ impl Server {
             P::AnyMotion => 1003,
         };
         let pane_mode = |p: PaneId| self.panes.get(&p).filter(|p| p.mode.is_none()).map_or(0, |p| level(p.screen().mouse_protocol_mode()));
-        let mut mode = match &c.overlay {
-            Some(Overlay::Menu(menu)) if !menu.nomouse => 1003,
-            Some(Overlay::Popup(p)) => pane_mode(p.pane),
-            Some(_) => 0,
-            None => pane_mode(self.windows[&wid].active),
+        let menu = if c.overlay.is_none() { self.menus.get(&wid) } else { None };
+        let mut mode = match (&c.overlay, menu) {
+            (Some(Overlay::Popup(p)), _) => pane_mode(p.pane),
+            (None, Some(menu)) => if menu.nomouse { 0 } else { 1003 },
+            (None, None) => pane_mode(self.windows[&wid].active),
         };
         if self.opt_session_on(Some(sid), "mouse") {
-            if c.overlay.is_none() {
+            if c.overlay.is_none() && menu.is_none() {
                 mode = if self.windows[&wid].panes().iter().any(|p| pane_mode(*p) == 1003) { 1003 } else { 0 };
             }
             // focus-follows-mouse and modal/auto-hide scrollbars need movement, overlay or not

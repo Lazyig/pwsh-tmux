@@ -6,13 +6,7 @@ use crate::format::{self, Vars};
 
 /// #{pane_mode}: the name of the pane's current mode, empty without one.
 pub fn pane_mode_name(p: &Pane) -> &'static str {
-    match &p.mode {
-        Some(PaneMode::Copy(c)) if c.is_view_mode() => "view-mode",
-        Some(PaneMode::Copy(_)) => "copy-mode",
-        Some(PaneMode::Clock) => "clock-mode",
-        Some(PaneMode::Tree(_)) => "tree-mode",
-        None => "",
-    }
+    p.mode.as_ref().map_or("", |m| m.name())
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -490,7 +484,8 @@ impl Vars for VarCtx<'_> {
             "pane_dead_time" => pane.and_then(|p| p.dead).map(|d| d.1.to_string()),
             // only a pane ended by a signal has one (sig2name: the number here)
             "pane_dead_signal" => pane.and_then(|p| p.dead).and_then(|d| d.0).and_then(super::exit_signal).map(|s| s.to_string()),
-            "pane_in_mode" => pane.map(|p| b(p.mode.is_some())),
+            // format_cb_pane_in_mode: the number of modes on the pane's stack
+            "pane_in_mode" => pane.map(|p| (p.mode.iter().count() + p.mode_stack.len()).to_string()),
             "pane_mode" => pane.map(pane_mode_name).filter(|m| !m.is_empty()).map(String::from),
             "pane_synchronized" => t.pane.map(|p| b(options::is_on(&srv.opt_pane(p, "synchronize-panes")))),
             "pane_format" => Some(b(ftype == "P")),

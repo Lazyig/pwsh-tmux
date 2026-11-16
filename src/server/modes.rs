@@ -1,427 +1,173 @@
-//! Interactive modes: choose-tree / choose-buffer / choose-client / customize (tree mode),
-//! menus, popups, the clock and big digits for display-panes.
+//! Interactive modes: tree modes (choose-tree, choose-buffer, choose-client, customize-mode),
+//! switch-mode, panes mode (display-panes), menus, popups, the clock and big digits.
 
 use super::*;
-use crate::cells::{Cell, Color, Line, Style, INVERSE};
-use std::collections::HashSet;
+use crate::cells::{Cell, Color, Style};
+use unicode_width::UnicodeWidthChar;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TreeKind {
-    Sessions,
-    Windows,
-    Buffers,
-    Clients,
-    Options,
+mod customize;
+mod customize_text;
+mod fuzzy;
+mod panes;
+pub mod prompt;
+mod switch;
+mod tree;
+
+pub use panes::{Panes, DEFAULT_TEMPLATE as PANES_DEFAULT_TEMPLATE};
+pub use switch::Switch;
+pub use tree::{Collapse, Preview, Sort, Tree, TreeKind};
+
+/// The key a byte is when sent to a mode (send-keys -H and -l): control bytes as their
+/// C- names, Enter, Tab, Escape and BSpace.
+pub fn byte_key_name(b: u8) -> String {
+    match b {
+        b'\r' => "Enter".into(),
+        b'\t' => "Tab".into(),
+        0x1b => "Escape".into(),
+        0x7f => "BSpace".into(),
+        b' ' => "Space".into(),
+        0 => "C-Space".into(),
+        1..=26 => format!("C-{}", (b'a' + b - 1) as char),
+        28..=31 => format!("C-{}", (b + 0x40) as char),
+        _ => (b as char).to_string(),
+    }
 }
 
-#[derive(Clone, Debug)]
-pub struct TreeItem {
-    pub id: String,
-    pub depth: u8,
-    pub label: String,
-    pub target: String,
-    pub kill: String,
-    pub expandable: bool,
-    pub preview: Option<PaneId>,
-}
-
-pub struct Tree {
-    pub kind: TreeKind,
-    pub owner: PaneId,
-    pub template: String,
-    pub items: Vec<TreeItem>,
-    pub expanded: HashSet<String>,
-    pub sel: usize,
-    pub top: usize,
-    pub filter: Option<Vec<WinId>>,
-    pub client: Option<ClientId>,
-    pub tagged: HashSet<String>,
-    info: bool,
-}
-
-pub enum TreeAction {
+/// What a mode wants done after a key.
+#[derive(Debug, PartialEq)]
+pub enum ModeAction {
     None,
-    Cancel,
+    /// Leave the mode.
+    Exit,
+    /// Run a command, then leave the mode.
     Run(String),
+    /// Run a command and stay in the mode.
+    RunKeep(String),
+    /// Open `value` in the editor and run `command` (%% is the new text) when it closes,
+    /// or replace the contents of paste buffer `buffer` with it.
+    Edit { value: Vec<u8>, command: String, buffer: Option<String> },
+    /// mode_tree_display_menu: a menu at (x, y) in the pane whose items are keys for the
+    /// mode, as (name, key shown, key sent).
+    Menu { title: String, items: Vec<(&'static str, &'static str, &'static str)>, x: u16, y: u16 },
 }
 
-fn line_from(text: &str, width: usize, style: Style, ctx: &dyn crate::format::Vars, selected: bool) -> Line {
-    let mut cells = crate::format::layout_line(&crate::format::spans_with(text, style, Some(ctx)), width, style);
-    // mode-tree's selected line ignores embedded colours, including the padding.
-    if selected { for cell in &mut cells { cell.style = style; } }
-    Line { cells, wrapped: false }
+/// Which of session_format, window_format and pane_format a format sees as set (the type
+/// tmux's format_defaults gives a format tree).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FmtType {
+    None,
+    Session,
+    Window,
+    Pane,
 }
 
-impl Tree {
-    pub fn new(kind: TreeKind, template: Option<String>, filter: Option<Vec<WinId>>, srv: &Server, pane: PaneId) -> Tree {
-        let template = template.unwrap_or_else(|| {
-            match kind {
-                TreeKind::Sessions | TreeKind::Windows => "switch-client -t '%%'",
-                TreeKind::Buffers => "paste-buffer -p -b '%%'",
-                TreeKind::Clients => "detach-client -t '%%'",
-                TreeKind::Options => "",
-            }
-            .to_string()
-        });
-        let mut expanded = HashSet::new();
-        if kind == TreeKind::Windows {
-            for s in srv.sessions.values() {
-                expanded.insert(format!("s{}", s.id));
-            }
-        }
-        let mut t = Tree { kind, owner: pane, template, items: Vec::new(), expanded, sel: 0, top: 0, filter, client: None, tagged: HashSet::new(), info: false };
-        t.rebuild(srv);
-        // select the current session / window
-        let cur = srv.target_for_pane(pane);
-        let want = match (kind, cur.sid, cur.wid) {
-            (TreeKind::Windows, Some(s), Some(w)) => format!("s{s}w{w}"),
-            (TreeKind::Sessions, Some(s), _) => format!("s{s}"),
-            _ => String::new(),
-        };
-        if let Some(i) = t.items.iter().position(|it| it.id == want) {
-            t.sel = i;
-        }
-        t
+/// Expand a format for an item of a mode.
+pub fn expand_as(srv: &Server, t: vars::Target, ty: FmtType, fmt: &str, mut extra: HashMap<String, String>) -> String {
+    if ty != FmtType::None {
+        let b = |v: bool| if v { "1" } else { "0" }.to_string();
+        extra.entry("session_format".into()).or_insert_with(|| b(ty == FmtType::Session));
+        extra.entry("window_format".into()).or_insert_with(|| b(ty == FmtType::Window));
+        extra.entry("pane_format".into()).or_insert_with(|| b(ty == FmtType::Pane));
     }
+    srv.expand_extra(t, None, fmt, extra)
+}
 
-    pub fn rebuild(&mut self, srv: &Server) {
-        let mut items = Vec::new();
-        match self.kind {
-            TreeKind::Sessions | TreeKind::Windows => {
-                let mut sessions: Vec<&Session> = srv.sessions.values().collect();
-                sessions.sort_by(|a, b| a.name.cmp(&b.name));
-                for s in sessions {
-                    let wins: Vec<(u32, WinId)> = s.links.iter().filter(|(_, w)| self.filter.as_ref().is_none_or(|f| f.contains(w))).map(|(i, w)| (*i, *w)).collect();
-                    if wins.is_empty() {
-                        continue;
-                    }
-                    let attached = srv.clients.values().any(|c| c.attached && c.session == Some(s.id));
-                    let sid = format!("s{}", s.id);
-                    items.push(TreeItem {
-                        id: sid.clone(),
-                        depth: 0,
-                        label: format!("{}: #[fg=themelightgrey]{} windows{}", s.name, s.links.len(), if attached { " (attached)" } else { "" }),
-                        target: format!("${}", s.id),
-                        kill: format!("kill-session -t '${}'", s.id),
-                        expandable: true,
-                        preview: Some(srv.windows[&s.active_window()].active),
-                    });
-                    if !self.expanded.contains(&sid) {
-                        continue;
-                    }
-                    for (idx, wid) in wins {
-                        let w = &srv.windows[&wid];
-                        let wkey = format!("s{}w{}", s.id, wid);
-                        let flags = srv.window_flags(s.id, idx);
-                        let np = w.panes().len();
-                        items.push(TreeItem {
-                            id: wkey.clone(),
-                            depth: 1,
-                            label: format!("{idx}: {}#[fg=themelightgrey]{flags}{}", w.name, if np == 1 { format!(": \"{}\"", srv.panes.get(&w.active).map(|p| p.title.as_str()).unwrap_or("")) } else { String::new() }),
-                            target: format!("${}:{idx}", s.id),
-                            kill: format!("kill-window -t '@{wid}'"),
-                            expandable: np > 0,
-                            preview: Some(w.active),
-                        });
-                        if np > 0 && self.expanded.contains(&wkey) {
-                            for (pi, p) in w.panes().iter().enumerate() {
-                                let pp = srv.panes.get(p);
-                                items.push(TreeItem {
-                                    id: format!("p{p}"),
-                                    depth: 2,
-                                    label: format!("{pi}: {}#[fg=themelightgrey]{} \"{}\"", pp.map(|x| x.current_cmd.as_str()).unwrap_or(""), if *p == w.active { "*" } else { "" }, pp.map(|x| x.title.as_str()).unwrap_or("")),
-                                    target: format!("%{p}"),
-                                    kill: format!("kill-pane -t '%{p}'"),
-                                    expandable: false,
-                                    preview: Some(*p),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-            TreeKind::Buffers => {
-                for b in &srv.buffers {
-                    let sample: String = String::from_utf8_lossy(&b.data).chars().take(200).flat_map(|c| c.escape_default()).collect();
-                    let time = chrono::DateTime::from_timestamp(b.created as i64, 0).map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string()).unwrap_or_default();
-                    items.push(TreeItem {
-                        id: format!("b{}", b.name),
-                        depth: 0,
-                        label: format!("{}: {time}: {sample}", b.name),
-                        target: b.name.clone(),
-                        kill: format!("delete-buffer -b '{}'", b.name),
-                        expandable: false,
-                        preview: None,
-                    });
-                }
-            }
-            TreeKind::Clients => {
-                for c in srv.clients.values().filter(|c| c.attached) {
-                    let sname = c.session.and_then(|s| srv.sessions.get(&s)).map(|s| s.name.clone()).unwrap_or_default();
-                    items.push(TreeItem {
-                        id: format!("c{}", c.id),
-                        depth: 0,
-                        label: format!("{}: session {} [{}x{}]", c.name(), sname, c.size.0, c.size.1),
-                        target: c.name(),
-                        kill: format!("detach-client -t '{}'", c.name()),
-                        expandable: false,
-                        preview: c.session.and_then(|s| srv.sessions.get(&s)).map(|s| srv.windows[&s.active_window()].active),
-                    });
-                }
-            }
-            TreeKind::Options => {
-                for (scope, store) in [("-s", &srv.opts_server), ("-g", &srv.opts_session), ("-gw", &srv.opts_window)] {
-                    for (k, v) in &store.0 {
-                        items.push(TreeItem {
-                            id: format!("o{scope}{k}"),
-                            depth: 0,
-                            label: format!("{k} {v}"),
-                            target: format!("command-prompt -I {} -p '{k}' \"set-option {scope} {k} '%%'\"", crate::cmdparse::quote(v)),
-                            kill: format!("set-option -u {scope} {k}"),
-                            expandable: false,
-                            preview: None,
-                        });
-                    }
-                }
-            }
-        }
-        self.items = items;
-        if self.sel >= self.items.len() {
-            self.sel = self.items.len().saturating_sub(1);
-        }
-    }
+/// A style option value applied over `base`, expanded as a format for the target.
+pub fn mode_style(srv: &Server, value: &str, base: Style, t: vars::Target) -> Style {
+    let ctx = vars::VarCtx { srv, t, client: None, extra: HashMap::new() };
+    crate::format::parse_style_with(value, base, Some(&ctx)).map(|p| p.style).unwrap_or(base)
+}
 
-    fn command_for(&self, item: &TreeItem) -> String {
-        if self.kind == TreeKind::Options {
-            return item.target.clone();
-        }
-        let t = self.template.replace("%%", &item.target).replace("%1", &item.target);
-        if t.contains('%') || self.template.contains("%%") || self.template.contains("%1") {
-            t
-        } else {
-            format!("{} -t '{}'", self.template, item.target)
-        }
-    }
+/// Draw already expanded format text into `width` cells over `base` (format_draw).
+pub fn format_cells(text: &str, width: usize, base: Style) -> Vec<Cell> {
+    crate::format::layout_line(&crate::format::spans(text, base), width, base)
+}
 
-    /// Handles one key; `height` is the list height (for paging).
-    pub fn key(&mut self, key: &str, height: usize, srv: &Server) -> TreeAction {
-        let n = self.items.len();
-        if n == 0 {
-            return if matches!(key, "q" | "Escape" | "C-c" | "C-g") { TreeAction::Cancel } else { TreeAction::None };
+pub fn put_cells(row: &mut [Cell], x: usize, cells: &[Cell]) {
+    for (i, c) in cells.iter().enumerate() {
+        if let Some(d) = row.get_mut(x + i) {
+            *d = c.clone();
         }
-        let page = height.max(1);
-        match key {
-            "q" | "Escape" | "C-c" | "C-g" => return TreeAction::Cancel,
-            "Up" | "k" | "C-p" => self.sel = (self.sel + n - 1) % n,
-            "Down" | "j" | "C-n" => self.sel = (self.sel + 1) % n,
-            "PPage" | "C-b" => self.sel = self.sel.saturating_sub(page),
-            "NPage" | "C-f" => self.sel = (self.sel + page).min(n - 1),
-            "Home" | "g" => self.sel = 0,
-            "End" | "G" => self.sel = n - 1,
-            "Left" | "h" | "-" => {
-                let it = &self.items[self.sel];
-                if self.expanded.remove(&it.id) {
-                    self.rebuild(srv);
-                } else if it.depth > 0 {
-                    // go to parent
-                    let d = it.depth;
-                    if let Some(p) = (0..self.sel).rev().find(|i| self.items[*i].depth < d) {
-                        self.sel = p;
-                    }
-                }
-            }
-            "Right" | "l" | "+" => {
-                let it = &self.items[self.sel];
-                if it.expandable && self.expanded.insert(it.id.clone()) {
-                    self.rebuild(srv);
-                }
-            }
-            "M-+" => {
-                for it in self.items.clone() {
-                    if it.expandable {
-                        self.expanded.insert(it.id.clone());
-                    }
-                }
-                self.rebuild(srv);
-            }
-            "M--" => {
-                self.expanded.clear();
-                self.rebuild(srv);
-            }
-            "t" => {
-                let id = self.items[self.sel].id.clone();
-                if !self.tagged.remove(&id) {
-                    self.tagged.insert(id);
-                }
-                self.sel = (self.sel + 1).min(n - 1);
-            }
-            "i" if matches!(self.kind, TreeKind::Sessions | TreeKind::Windows) => self.info = !self.info,
-            "T" => self.tagged.clear(),
-            "C-t" => {
-                self.tagged = self.items.iter().map(|i| i.id.clone()).collect();
-            }
-            "x" => {
-                let cmd = self.items[self.sel].kill.clone();
-                return TreeAction::Run(cmd);
-            }
-            "X" => {
-                let cmds: Vec<String> = self.items.iter().filter(|i| self.tagged.contains(&i.id)).map(|i| i.kill.clone()).collect();
-                self.tagged.clear();
-                if cmds.is_empty() {
-                    return TreeAction::None;
-                }
-                return TreeAction::Run(cmds.join(" ; "));
-            }
-            "Enter" => {
-                if !self.tagged.is_empty() && self.kind != TreeKind::Options {
-                    let cmds: Vec<String> = self.items.iter().filter(|i| self.tagged.contains(&i.id)).map(|i| self.command_for(i)).collect();
-                    return TreeAction::Run(cmds.join(" ; "));
-                }
-                let it = self.items[self.sel].clone();
-                return TreeAction::Run(self.command_for(&it));
-            }
-            k => {
-                // quick keys 0-9 then M-a..M-z
-                let idx = match k.chars().collect::<Vec<_>>().as_slice() {
-                    [c] if c.is_ascii_digit() => Some(*c as usize - '0' as usize),
-                    ['M', '-', c] if c.is_ascii_lowercase() => Some(10 + (*c as usize - 'a' as usize)),
-                    _ => None,
-                };
-                if let Some(i) = idx.filter(|i| *i < n) {
-                    let it = self.items[i].clone();
-                    return TreeAction::Run(self.command_for(&it));
-                }
-            }
-        }
-        if self.sel < self.top {
-            self.top = self.sel;
-        }
-        if self.sel >= self.top + page {
-            self.top = self.sel + 1 - page;
-        }
-        TreeAction::None
-    }
-
-    pub fn list_height(&self, h: usize) -> usize {
-        let mut height = (h / 3) * 2;
-        if height > self.items.len() { height = h / 2; }
-        if height < 10 || h.saturating_sub(height) < 2 { h } else { height }
-    }
-
-    pub fn render(&self, srv: &Server, cid: ClientId, w: u16, h: u16) -> Vec<Line> {
-        use super::render::{Frame, draw_box};
-        let list_h = self.list_height(h as usize);
-        let mut f = Frame::new(w, h);
-        let top = self.top.min(self.sel).max((self.sel + 1).saturating_sub(list_h));
-        let pane = self.items.get(self.sel).and_then(|i| i.preview);
-        let wid = srv.target_for_pane(self.owner).wid;
-        let ctx = super::vars::VarCtx { srv, t: srv.target_for_pane(self.owner), client: Some(cid), extra: HashMap::new() };
-        let border = crate::format::parse_style_with(&srv.opt_window(wid, "tree-mode-border-style"), Style::default(), Some(&ctx)).map(|p| p.style).unwrap_or_default();
-        let selected = crate::format::parse_style_with(&srv.opt_window(wid, "tree-mode-selection-style"), Style::default(), Some(&ctx)).map(|p| p.style).unwrap_or_default();
-        for row in 0..list_h {
-            let i = top + row;
-            let Some(it) = self.items.get(i) else { continue };
-            let quick = if i < 10 { format!("({i}) ") } else if i < 36 { format!("(M-{}) ", (b'a' + (i - 10) as u8) as char) } else { "     ".into() };
-            let flat = !matches!(self.kind, TreeKind::Windows | TreeKind::Sessions);
-            let arrow = if flat { "" } else if it.expandable { if self.expanded.contains(&it.id) { "#[fg=themered]-#[fg=themelightgrey] " } else { "#[fg=themegreen]+#[fg=themelightgrey] " } } else { "  " };
-            let last = self.items.get(i + 1).is_none_or(|n| n.depth < it.depth) || !self.items[i+1..].iter().take_while(|n| n.depth >= it.depth).any(|n| n.depth == it.depth);
-            let indent = if it.depth == 0 { String::new() } else { format!("{}{}", "    ".repeat(it.depth.saturating_sub(1) as usize), if last { "└─> " } else { "├─> " }) };
-            let text = format!("#[fg=themelightgrey]{quick}{indent}{arrow}#[default]{}{}", it.label, if self.tagged.contains(&it.id) { "*" } else { "" });
-            let mut style = if i == self.sel { selected } else { Style::default() };
-            // mode_tree_draw: tagged items are themecyan, selected or not
-            if self.tagged.contains(&it.id) { style.fg = crate::format::parse_color_with("themecyan", Some(&ctx)).unwrap_or(Color::Default); }
-            f.put_cells(0, row as u16, &line_from(&text, w as usize, style, &ctx, i == self.sel || self.tagged.contains(&it.id)).cells);
-        }
-        let y = list_h as u16;
-        if h.saturating_sub(y) > 4 && w > 4 {
-            if let Some(it) = self.items.get(self.sel) {
-                draw_box(&mut f, 0, y, w, h-y, border, "");
-                let name = if self.kind == TreeKind::Buffers { it.target.clone() } else { it.target.rsplit(':').next().unwrap_or(&it.target).to_string() };
-                f.text(1, y, &format!(" {name} (sort: {}) ", if self.kind == TreeKind::Buffers { "time" } else { "index" }), border, w-1);
-                let (pw,ph) = (w-4,h-y-2);
-                if self.info {
-                    let target = it.preview.map(|p| srv.target_for_pane(p)).unwrap_or_default();
-                    let info_ctx = super::vars::VarCtx { srv, t: target, client: Some(cid), extra: HashMap::new() };
-                    let lines = if it.id.starts_with('p') { PANE_INFO } else if it.depth == 1 { WINDOW_INFO } else { SESSION_INFO };
-                    for (row, line) in lines.iter().take(ph as usize).enumerate() {
-                        f.put_cells(2, y + 1 + row as u16, &line_from(line, pw as usize, Style::default(), &info_ctx, false).cells);
-                    }
-                } else if self.kind == TreeKind::Buffers {
-                    if let Some(b) = srv.buffers.iter().find(|b| b.name == it.target) {
-                        for (row,line) in String::from_utf8_lossy(&b.data).lines().take(ph as usize).enumerate() { f.text(2, y+1+row as u16, line, Style::default(), w-2); }
-                    }
-                } else if let Some(p) = pane.and_then(|p| srv.panes.get(&p)) {
-                    let window = &srv.windows[&srv.target_for_pane(p.id).wid.unwrap()];
-                    let panes = window.panes();
-                    let visible = panes.len().min((pw / 24).max(1) as usize);
-                    let current = panes.iter().position(|id| *id == p.id).unwrap_or(0);
-                    let start = current.saturating_sub(visible-1).min(panes.len()-visible);
-                    let each = pw / visible as u16;
-                    for (i,id) in panes.iter().enumerate().skip(start).take(visible) {
-                        let pp = &srv.panes[id];
-                        let x = 2 + (i-start) as u16 * each;
-                        let width = if i == start+visible-1 { pw - (i-start) as u16 * each } else { each-1 };
-                        let scr = pp.screen();
-                        let (cy,cx) = scr.cursor_position();
-                        let px = if scr.hide_cursor() { 0 } else { cx.saturating_sub(width/3).min(pp.size.0.saturating_sub(width)) };
-                        let py = if scr.hide_cursor() { 0 } else { cy.saturating_sub(ph/3).min(pp.size.1.saturating_sub(ph)) };
-                        for yy in 0..ph { for xx in 0..width {
-                            if let Some(cell) = scr.cell(py+yy,px+xx) {
-                                let mut cell = crate::cells::cell_from_vt(cell);
-                                if !scr.hide_cursor() && (px+xx,py+yy)==(cx,cy) { cell.style.attrs |= INVERSE; }
-                                f.set(x+xx,y+1+yy,cell);
-                            }
-                        } }
-                        if i != start+visible-1 { for yy in 0..ph { f.text(x+width,y+1+yy,"│",border,w); } }
-                        let label = format!(" {i} ");
-                        let len = label.len() as u16;
-                        if len <= each && ph > 1 {
-                            let ox = (each-len+1)/2;
-                            let oy = (ph+1)/2;
-                            if ox>1 && ox+len<each-1 && ph>=3 { draw_box(&mut f,x+ox-1,y+oy,len+2,3,border,""); }
-                            let color = if *id==window.active { "display-panes-active-colour" } else { "display-panes-colour" };
-                            let style = Style { fg: crate::format::parse_color_with(&crate::format::expand(&srv.opt_window(Some(window.id),color), &ctx), Some(&ctx)).unwrap_or(Color::Default), ..Style::default() };
-                            f.text(x+ox,y+1+oy,&label,style,w-2);
-                        }
-                    }
-                }
-            }
-        }
-        f.cells.chunks(w as usize).map(|c| Line { cells:c.to_vec(),wrapped:false }).collect()
     }
 }
 
-const PANE_INFO: &[&str] = &[
-    "#[fg=themelightgrey]Pane          #[#{E:tree-mode-border-style}]│#[default] #{pane_index} #[fg=themelightgrey](#{pane_id})#[default]",
-    "#[fg=themelightgrey]Title         #[#{E:tree-mode-border-style}]│#[default] #{pane_title}",
-    "#[fg=themelightgrey]Command       #[#{E:tree-mode-border-style}]│#[default] #{pane_current_command} #[fg=themelightgrey](PID #{pane_pid})#[default]",
-    "#[fg=themelightgrey]Path          #[#{E:tree-mode-border-style}]│#[default] #{pane_current_path}",
-    "#[fg=themelightgrey]TTY           #[#{E:tree-mode-border-style}]│#[default] #{pane_tty}",
-    "#[fg=themelightgrey]Position      #[#{E:tree-mode-border-style}]│#[default] #{pane_x},#{pane_y} #{pane_width}x#{pane_height}",
-    "#[fg=themelightgrey]Mode          #[#{E:tree-mode-border-style}]│#[default] #{?pane_in_mode,#{pane_mode},none}",
-    "#[fg=themelightgrey]Flags         #[#{E:tree-mode-border-style}]│#[default] #{?pane_active,#[fg=themegreen],#[fg=themelightgrey]}active#[default] #{?window_zoomed_flag,#[fg=themegreen],#[fg=themelightgrey]}zoomed#[default] #{?pane_marked,#[fg=themegreen],#[fg=themelightgrey]}marked#[default] #{?pane_synchronized,#[fg=themegreen],#[fg=themelightgrey]}sync#[default] #{?pane_dead,#[fg=themegreen],#[fg=themelightgrey]}dead#[default] #{?pane_pipe,#[fg=themegreen],#[fg=themelightgrey]}piped#[default]",
-];
+/// Plain text at (x, y) up to column `limit`.
+pub fn put_text(grid: &mut [Vec<Cell>], x: usize, y: usize, text: &str, style: Style, limit: usize) {
+    let Some(row) = grid.get_mut(y) else { return };
+    let mut x = x;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if w == 0 {
+            continue;
+        }
+        if x + w > limit.min(row.len()) {
+            break;
+        }
+        row[x] = Cell { text: ch.to_string(), style };
+        if w == 2 {
+            row[x + 1] = Cell { text: String::new(), style };
+        }
+        x += w;
+    }
+}
 
-const WINDOW_INFO: &[&str] = &[
-    "#[fg=themelightgrey]Window        #[#{E:tree-mode-border-style}]│#[default] #{window_index}: #{window_name} #[fg=themelightgrey](#{window_id})#[default]",
-    "#[fg=themelightgrey]Size          #[#{E:tree-mode-border-style}]│#[default] #{window_width}x#{window_height}",
-    "#[fg=themelightgrey]Panes         #[#{E:tree-mode-border-style}]│#[default] #{window_panes}",
-    "#[fg=themelightgrey]Activity Time #[#{E:tree-mode-border-style}]│#[default] #{t:window_activity} #[fg=themelightgrey](#{t/r:window_activity})#[default]",
-    "#[fg=themelightgrey]Sessions      #[#{E:tree-mode-border-style}]│#[default] #{s/,/ /:window_linked_sessions_list}",
-    "#[fg=themelightgrey]Flags         #[#{E:tree-mode-border-style}]│#[default] #{?window_active,#[fg=themegreen],#[fg=themelightgrey]}active#[default] #{?window_last_flag,#[fg=themegreen],#[fg=themelightgrey]}last#[default] #{?window_bell_flag,#[fg=themegreen],#[fg=themelightgrey]}bell#[default] #{?window_activity_flag,#[fg=themegreen],#[fg=themelightgrey]}activity#[default] #{?window_silence_flag,#[fg=themegreen],#[fg=themelightgrey]}silence#[default] #{?window_zoomed_flag,#[fg=themegreen],#[fg=themelightgrey]}zoomed#[default] #{?window_marked_flag,#[fg=themegreen],#[fg=themelightgrey]}marked#[default]",
-];
+/// A single-line box (screen_write_box).
+pub fn draw_box(grid: &mut [Vec<Cell>], x: usize, y: usize, w: usize, h: usize, style: Style) {
+    if w < 2 || h < 2 {
+        return;
+    }
+    let mut set = |xx: usize, yy: usize, s: &str| {
+        if let Some(c) = grid.get_mut(yy).and_then(|r| r.get_mut(xx)) {
+            *c = Cell { text: s.into(), style };
+        }
+    };
+    for i in x + 1..x + w - 1 {
+        set(i, y, "─");
+        set(i, y + h - 1, "─");
+    }
+    for j in y + 1..y + h - 1 {
+        set(x, j, "│");
+        set(x + w - 1, j, "│");
+    }
+    set(x, y, "┌");
+    set(x + w - 1, y, "┐");
+    set(x, y + h - 1, "└");
+    set(x + w - 1, y + h - 1, "┘");
+}
 
-const SESSION_INFO: &[&str] = &[
-    "#[fg=themelightgrey]Session       #[#{E:tree-mode-border-style}]│#[default] #{session_name} #[fg=themelightgrey](#{session_id})#[default]",
-    "#[fg=themelightgrey]Created Time  #[#{E:tree-mode-border-style}]│#[default] #{t:session_created} #[fg=themelightgrey](#{t/r:session_created})#[default]",
-    "#[fg=themelightgrey]Activity Time #[#{E:tree-mode-border-style}]│#[default] #{t:session_activity} #[fg=themelightgrey](#{t/r:session_activity})#[default]",
-    "#[fg=themelightgrey]Attached Time #[#{E:tree-mode-border-style}]│#[default] #{?#{t:session_last_attached},#{t:session_last_attached} #[fg=themelightgrey](#{t/r:session_last_attached})#[default],never}",
-    "#[fg=themelightgrey]Clients       #[#{E:tree-mode-border-style}]│#[default] #{s/,/ /:session_attached_list}",
-    "#[fg=themelightgrey]Windows       #[#{E:tree-mode-border-style}]│#[default] #{session_windows}",
-    "#[fg=themelightgrey]Path          #[#{E:tree-mode-border-style}]│#[default] #{session_path}",
-    "#[fg=themelightgrey]Group         #[#{E:tree-mode-border-style}]│#[default] #{?session_grouped,#{session_group} (#{session_group_size}),none}",
-    "#[fg=themelightgrey]Flags         #[#{E:tree-mode-border-style}]│#[default] #{?session_attached,#[fg=themegreen],#[fg=themelightgrey]}attached#[default] #{?session_grouped,#[fg=themegreen],#[fg=themelightgrey]}grouped#[default] #{?session_marked,#[fg=themegreen],#[fg=themelightgrey]}marked#[default] #{?session_bell_flag,#[fg=themegreen],#[fg=themelightgrey]}bell#[default] #{?session_activity_flag,#[fg=themegreen],#[fg=themelightgrey]}activity#[default] #{?session_silence_flag,#[fg=themegreen],#[fg=themelightgrey]}silence#[default]",
-];
+/// screen_write_preview: a pane's screen in nx x ny at (x, y), around the cursor when it is on.
+pub fn preview_into(srv: &Server, pane: PaneId, grid: &mut [Vec<Cell>], x: usize, y: usize, nx: usize, ny: usize) {
+    let Some(p) = srv.panes.get(&pane) else { return };
+    let scr = p.screen();
+    let (sy, sx) = (p.size.1 as usize, p.size.0 as usize);
+    let (cy, cx) = scr.cursor_position();
+    let (cx, cy) = (cx as usize, cy as usize);
+    let cursor = !scr.hide_cursor();
+    let (px, py) = if cursor {
+        let px = if cx < nx / 3 { 0 } else { cx - nx / 3 };
+        let px = if px + nx > sx { if nx > sx { 0 } else { sx - nx } } else { px };
+        let py = if cy < ny / 3 { 0 } else { cy - ny / 3 };
+        let py = if py + ny > sy { if ny > sy { 0 } else { sy - ny } } else { py };
+        (px, py)
+    } else {
+        (0, 0)
+    };
+    for yy in 0..ny {
+        for xx in 0..nx {
+            let Some(vc) = scr.cell((py + yy) as u16, (px + xx) as u16) else { continue };
+            let mut cell = crate::cells::cell_from_vt(vc);
+            if cell.text.is_empty() && xx == 0 {
+                cell.text = " ".into();
+            }
+            if cursor && (px + xx, py + yy) == (cx, cy) {
+                cell.style.attrs |= crate::cells::INVERSE;
+            }
+            if let Some(c) = grid.get_mut(y + yy).and_then(|r| r.get_mut(x + xx)) {
+                *c = cell;
+            }
+        }
+    }
+}
 
 // ---- menu ------------------------------------------------------------------------
 
@@ -580,8 +326,9 @@ impl Menu {
         }
     }
 
-    pub fn draw(&self, f: &mut super::render::Frame, style: Style, border: Style, selected_style: Style, lines_kind: &str) {
-        let (x0, y0, w, h) = (self.x, self.y, self.w, self.h);
+    /// Draw the menu with the window `oy` rows down the client.
+    pub fn draw(&self, f: &mut super::render::Frame, oy: u16, style: Style, border: Style, selected_style: Style, lines_kind: &str) {
+        let (x0, y0, w, h) = (self.x, self.y + oy, self.w, self.h);
         let lines = super::render::box_lines(lines_kind);
         super::render::draw_box_lines(f, x0, y0, w, h, border, &self.title, lines_kind);
         for (i, it) in self.items.iter().enumerate() {
@@ -631,6 +378,16 @@ pub struct Popup {
     pub close_any_key: bool,
     pub title: String,
     pub look: OverlayLook,
+    /// The popup runs the editor for a mode (spawn_editor).
+    pub editor: Option<Box<PopupEditor>>,
+}
+
+pub struct PopupEditor {
+    pub path: std::path::PathBuf,
+    /// Run with %% replaced by the edited text.
+    pub command: String,
+    /// The paste buffer being edited (window_buffer_edit_close_cb) instead of a command.
+    pub buffer: Option<String>,
 }
 
 impl Popup {
@@ -645,7 +402,7 @@ impl Popup {
 
 // ---- big digits (clock-mode, display-panes) ----------------------------------------
 
-const FONT: [(char, [&str; 5]); 14] = [
+pub(super) const FONT: [(char, [&str; 5]); 14] = [
     ('0', ["#####", "#   #", "#   #", "#   #", "#####"]),
     ('1', ["    #", "    #", "    #", "    #", "    #"]),
     ('2', ["#####", "    #", "#####", "#    ", "#####"]),
@@ -662,51 +419,50 @@ const FONT: [(char, [&str; 5]); 14] = [
     ('M', ["#   #", "## ##", "# # #", "#   #", "#   #"]),
 ];
 
-/// Draws `text` in 5x5 block digits centred in the rect; returns false if it doesn't fit.
-pub fn big_text(f: &mut super::render::Frame, r: Rect, text: &str, colour: Color) -> bool {
-    big_text_cells(f, r, text, Cell { text: " ".into(), style: Style { bg: colour, ..Style::default() } })
-}
-
-/// window_clock_draw: the clock's blocks are '#' in its colour on its colour, so they still
-/// show on terminals without colours.
-pub fn big_clock(f: &mut super::render::Frame, r: Rect, text: &str, colour: Color) -> bool {
-    big_text_cells(f, r, text, Cell { text: "#".into(), style: Style { fg: colour, bg: colour, ..Style::default() } })
-}
-
-fn big_text_cells(f: &mut super::render::Frame, r: Rect, text: &str, block: Cell) -> bool {
-    let n = text.chars().count() as u16;
-    let width = n * 6;
-    if r.w < width || r.h < 5 {
-        return false;
+/// The clock-mode text for a clock-mode-style (window_clock_draw_screen): "12" and
+/// "12-with-seconds" are strftime "%l:%M " or "%l:%M:%S " plus AM or PM, the others "%H:%M"
+/// or "%H:%M:%S".
+pub fn clock_text(style: &str, now: chrono::NaiveTime) -> String {
+    use chrono::Timelike;
+    let seconds = style.ends_with("-with-seconds");
+    if style.starts_with("12") {
+        let (pm, h) = now.hour12();
+        let mut t = format!("{:2}:{:02}", h, now.minute());
+        if seconds {
+            t += &format!(":{:02}", now.second());
+        }
+        t + if pm { " PM" } else { " AM" }
+    } else if seconds {
+        format!("{:02}:{:02}:{:02}", now.hour(), now.minute(), now.second())
+    } else {
+        format!("{:02}:{:02}", now.hour(), now.minute())
     }
-    let x0 = r.x + (r.w - width) / 2;
-    let y0 = r.y + (r.h - 5) / 2;
-    for (i, ch) in text.chars().enumerate() {
-        let Some((_, rows)) = FONT.iter().find(|(c, _)| *c == ch) else { continue };
-        for (dy, row) in rows.iter().enumerate() {
-            for (dx, b) in row.chars().enumerate() {
-                if b == '#' {
-                    f.set(x0 + i as u16 * 6 + dx as u16, y0 + dy as u16, block.clone());
+}
+
+/// window_clock_draw_screen: big 5x5 digits from (sx / 2 - 3 * len, sy / 2 - 3) drawn as
+/// '#' in the colour on the colour (spaces only advance), or the plain text in the middle
+/// when the pane is too small, or nothing when it is narrower than the text.
+pub fn draw_clock(f: &mut super::render::Frame, r: Rect, text: &str, colour: Color, bg: Color) {
+    let len = text.chars().count() as u16;
+    if r.w < 6 * len || r.h < 6 {
+        if r.w >= len && r.h != 0 {
+            f.text(r.x + r.w / 2 - len / 2, r.y + r.h / 2, text, Style { fg: colour, bg, ..Style::default() }, r.x + r.w);
+        }
+        return;
+    }
+    let (mut x, y) = (r.x + r.w / 2 - 3 * len, r.y + r.h / 2 - 3);
+    let block = Style { fg: colour, bg: colour, ..Style::default() };
+    for ch in text.chars() {
+        if let Some((_, rows)) = FONT.iter().find(|(c, _)| *c == ch) {
+            for (dy, row) in rows.iter().enumerate() {
+                for (dx, b) in row.chars().enumerate() {
+                    if b == '#' {
+                        f.set(x + dx as u16, y + dy as u16, Cell { text: "#".into(), style: block });
+                    }
                 }
             }
         }
-    }
-    true
-}
-
-pub fn clock_text(style: &str) -> String {
-    clock_text_at(style, chrono::Local::now())
-}
-
-fn clock_text_at(style: &str, now: chrono::DateTime<chrono::Local>) -> String {
-    use chrono::Timelike;
-    let seconds = if style.ends_with("-with-seconds") { format!(":{:02}", now.second()) } else { String::new() };
-    if style.starts_with("24") {
-        format!("{:02}:{:02}{seconds}", now.hour(), now.minute())
-    } else {
-        // strftime "%l:%M " (or "%l:%M:%S ") then AM or PM
-        let (pm, h) = now.hour12();
-        format!("{h:>2}:{:02}{seconds} {}", now.minute(), if pm { "PM" } else { "AM" })
+        x += 6;
     }
 }
 
@@ -720,7 +476,7 @@ mod menu_format_tests {
         assert_eq!((w, h), (9 + 4 + 4, 3));
         let m = Menu::at(String::new(), items, 0, 0, None, true, false, None);
         let mut f = super::super::render::Frame::new(30, 4);
-        m.draw(&mut f, Style::default(), Style::default(), Style::default(), "single");
+        m.draw(&mut f, 0, Style::default(), Style::default(), Style::default(), "single");
         let row: String = (0..w).map(|x| f.cells[(30 + x) as usize].text.clone()).collect();
         assert_eq!(row, "│ Paste abc (p) │");
         assert_ne!(f.cells[30 + 8].style.attrs & crate::cells::UNDERLINE, 0);
@@ -728,17 +484,28 @@ mod menu_format_tests {
 }
 
 #[cfg(test)]
-mod clock_display_tests {
-    use super::*;
-    use chrono::TimeZone;
+mod clock_tests {
+    use super::clock_text;
+    use chrono::NaiveTime;
+
     #[test]
-    fn clock_seconds_and_monochrome() {
-        let now = chrono::Local.with_ymd_and_hms(2026, 11, 13, 13, 2, 3).unwrap();
-        for (style, text) in [("12", " 1:02 PM"), ("24", "13:02"), ("12-with-seconds", " 1:02:03 PM"), ("24-with-seconds", "13:02:03")] {
-            assert_eq!(clock_text_at(style, now), text);
-        }
+    fn clock_mode_styles() {
+        let t = NaiveTime::from_hms_opt(9, 5, 7).unwrap();
+        assert_eq!(clock_text("24", t), "09:05");
+        assert_eq!(clock_text("24-with-seconds", t), "09:05:07");
+        assert_eq!(clock_text("12", t), " 9:05 AM");
+        assert_eq!(clock_text("12-with-seconds", t), " 9:05:07 AM");
+        let t = NaiveTime::from_hms_opt(0, 30, 0).unwrap();
+        assert_eq!(clock_text("12", t), "12:30 AM");
+        let t = NaiveTime::from_hms_opt(23, 59, 59).unwrap();
+        assert_eq!(clock_text("12-with-seconds", t), "11:59:59 PM");
+    }
+
+    #[test]
+    fn clock_blocks_show_without_colours() {
+        // window_clock_draw: '#' in the colour on the colour
         let mut f = super::super::render::Frame::new(80, 10);
-        assert!(big_clock(&mut f, Rect { x: 0, y: 0, w: 80, h: 10 }, "12:34", Color::Default));
+        super::draw_clock(&mut f, super::Rect { x: 0, y: 0, w: 80, h: 10 }, "12:34", super::Color::Default, super::Color::Default);
         assert!(f.cells.iter().any(|c| c.text == "#"));
     }
 }

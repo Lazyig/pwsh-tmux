@@ -11,6 +11,10 @@ impl Opts {
     pub fn has(&self, c: char) -> bool {
         self.flags.contains_key(&c)
     }
+    /// How many times a flag without a value was given.
+    pub fn count(&self, c: char) -> usize {
+        self.flags.get(&c).map_or(0, |v| v.len() + 1)
+    }
     pub fn get(&self, c: char) -> Option<&str> {
         self.flags.get(&c).map(String::as_str)
     }
@@ -35,7 +39,8 @@ pub fn getopt(args: &[String], bools: &str, vals: &str) -> Result<Opts, String> 
         while j < chars.len() {
             let c = chars[j];
             if bools.contains(c) {
-                flags.insert(c, String::new());
+                // a repeated flag (-NN) is counted by its value's length
+                flags.entry(c).and_modify(|v: &mut String| v.push(c)).or_insert_with(String::new);
                 j += 1;
             } else if vals.contains(c) {
                 let inline: String = chars[j + 1..].iter().collect();

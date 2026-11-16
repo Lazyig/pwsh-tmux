@@ -309,7 +309,12 @@ fn copy_mode_commands() {
     // view mode for command output from clock / clear-history
     ctx.ok(&["clock-mode", "-t", "c"]);
     assert_eq!(ctx.fmt("c", "#{pane_mode}"), "clock-mode");
+    // without a client the key does not reach the mode (window_pane_key), and clock mode
+    // takes no -X commands
     ctx.ok(&["send-keys", "-t", "c", "q"]);
+    assert_eq!(ctx.fmt("c", "#{pane_in_mode}"), "1");
+    assert!(ctx.fails(&["send-keys", "-t", "c", "-X", "cancel"]).contains("not in a mode"));
+    ctx.ok(&["copy-mode", "-q", "-t", "c"]);
     assert_eq!(ctx.fmt("c", "#{pane_in_mode}"), "0");
     ctx.ok(&["clear-history", "-t", "c"]);
     assert_eq!(ctx.fmt("c", "#{history_size}"), "0");
@@ -434,8 +439,10 @@ fn windows_and_sessions() {
     assert_eq!(ctx.fmt("a", "#{window_index}"), "1");
     ctx.ok(&["rename-window", "-t", "a:1", "uno"]);
     assert_eq!(ctx.fmt("a:1", "#W #{automatic-rename}"), "uno 0");
+    // find-window opens tree mode filtered to the matches (tmux 3.8)
     ctx.ok(&["find-window", "-t", "a", "-N", "zero"]);
-    assert_eq!(ctx.fmt("a", "#{window_name}"), "zero");
+    assert_eq!(ctx.fmt("a", "#{pane_mode}"), "tree-mode");
+    ctx.ok(&["copy-mode", "-q", "-t", "a"]);
     // link into another session
     ctx.ok(&["new-session", "-d", "-s", "b"]);
     ctx.ok(&["link-window", "-s", "a:uno", "-t", "b:5"]);

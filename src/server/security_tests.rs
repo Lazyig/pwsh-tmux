@@ -217,10 +217,8 @@ fn overlay_queue_waits_for_close_and_rechecks_access() {
     client.readonly = false;
     client.acl_readonly = false;
     client.overlay_epoch = 7;
-    client.overlay = Some(Overlay::DisplayPanes {
-        until: Instant::now() + Duration::from_secs(30),
-        template: String::new(),
-    });
+    let pane = srv.spawn_pane(None, 20, 6, &[], None, &[]).unwrap();
+    srv.clients.get_mut(&1).unwrap().overlay = Some(parked_popup(pane));
     let queue = Queue {
         cmds: VecDeque::from([vec!["set-option".into(), "-g".into(), "@overlay-result".into(), "written".into()]]),
         ctx: Ctx { client: Some(1), ..Ctx::default() }, soft: 0,
@@ -235,6 +233,11 @@ fn overlay_queue_waits_for_close_and_rechecks_access() {
     srv.timers();
     assert!(srv.overlay_waits.is_empty());
     assert!(!srv.opts_session.0.contains_key("@overlay-result"));
+    srv.shutdown();
+}
+
+fn parked_popup(pane: PaneId) -> Overlay {
+    Overlay::Popup(Popup { pane, x: 0, y: 0, w: 22, h: 8, border: true, close_on_exit: false, close_any_key: false, title: String::new(), look: Default::default(), editor: None })
 }
 
 #[test]
@@ -244,9 +247,8 @@ fn replacing_overlay_resumes_the_previous_queue() {
     client.readonly = false;
     client.acl_readonly = false;
     client.overlay_epoch = 8;
-    client.overlay = Some(Overlay::DisplayPanes {
-        until: Instant::now() + Duration::from_secs(30), template: String::new(),
-    });
+    let pane = srv.spawn_pane(None, 20, 6, &[], None, &[]).unwrap();
+    srv.clients.get_mut(&1).unwrap().overlay = Some(parked_popup(pane));
     srv.overlay_waits.push((1, 7, vec!["display-menu".into()], Queue {
         cmds: VecDeque::from([vec!["set-option".into(), "-g".into(), "@overlay-result".into(), "written".into()]]),
         ctx: Ctx { client: Some(1), ..Ctx::default() }, soft: 0,
@@ -255,6 +257,7 @@ fn replacing_overlay_resumes_the_previous_queue() {
     assert!(srv.overlay_waits.is_empty());
     assert_eq!(srv.opts_session.0.get("@overlay-result").map(String::as_str), Some("written"));
     assert!(srv.clients[&1].overlay.is_some(), "replacement stays open");
+    srv.shutdown();
 }
 
 #[test]
@@ -361,11 +364,11 @@ fn replacing_popup_with_other_overlays_releases_its_pane() {
         c.acl_readonly = false;
         c.attached = true;
         let pane = srv.spawn_pane(None, 20, 6, &[], None, &[]).unwrap();
-        srv.replace_overlay(1, Some(Overlay::Popup(Popup { pane, x: 0, y: 0, w: 22, h: 8, border: true, close_on_exit: false, close_any_key: false, title: String::new(), look: Default::default() }))).unwrap();
+        srv.replace_overlay(1, Some(Overlay::Popup(Popup { pane, x: 0, y: 0, w: 22, h: 8, border: true, close_on_exit: false, close_any_key: false, title: String::new(), look: Default::default(), editor: None }))).unwrap();
         pane
     };
     // like tmux, other overlays are not shown over a popup: it and its pane stay
-    for args in [&["display-panes", "-b"][..], &["display-menu", "Item", "i", "display-message done"][..]] {
+    for args in [&["display-menu", "Item", "i", "display-message done"][..]] {
         let (mut srv, _events) = fixture();
         let pane = popup(&mut srv);
         let epoch = srv.clients[&1].overlay_epoch;
@@ -378,7 +381,7 @@ fn replacing_popup_with_other_overlays_releases_its_pane() {
     // replacing the overlay directly releases the popup's pane
     let (mut srv, _events) = fixture();
     let pane = popup(&mut srv);
-    srv.replace_overlay(1, Some(Overlay::DisplayPanes { until: Instant::now(), template: String::new() })).unwrap();
+    srv.replace_overlay(1, None).unwrap();
     let released = !srv.panes.contains_key(&pane);
     srv.shutdown();
     assert!(released, "replaced popup left an orphan pane");
@@ -391,9 +394,14 @@ fn close_popup_does_not_remove_an_unrelated_menu() {
     c.readonly = false;
     c.acl_readonly = false;
     c.attached = true;
+    command(&mut srv, &["new-session", "-d", "-s", "m"]).unwrap();
+    let sid = *srv.sessions.keys().next().unwrap();
+    srv.clients.get_mut(&1).unwrap().session = Some(sid);
     command(&mut srv, &["display-menu", "Item", "i", "display-message done"]).unwrap();
     command(&mut srv, &["display-popup", "-C"]).unwrap();
-    assert!(matches!(srv.clients[&1].overlay, Some(Overlay::Menu(_))));
+    let kept = srv.menus.len() == 1;
+    srv.shutdown();
+    assert!(kept);
 }
 
 #[test]

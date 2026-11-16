@@ -70,6 +70,11 @@ pub fn activity_seq() -> u64 {
     SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
+/// Microseconds since the epoch, for activity times tmux keeps as a timeval.
+pub fn now_us() -> u64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(0)
+}
+
 pub enum Event {
     Conn(Stream),
     ClientMsg(ClientId, u8, Vec<u8>),
@@ -425,6 +430,59 @@ pub enum PaneMode {
     Copy(Box<CopyMode>),
     Clock,
     Tree(Box<modes::Tree>),
+    Switch(Box<modes::Switch>),
+    Panes(Box<modes::Panes>),
+}
+
+impl PaneMode {
+    /// The mode's name, as pane_mode shows it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            PaneMode::Copy(c) if c.is_view_mode() => "view-mode",
+            PaneMode::Copy(_) => "copy-mode",
+            PaneMode::Clock => "clock-mode",
+            PaneMode::Tree(t) => match t.kind {
+                modes::TreeKind::Tree => "tree-mode",
+                modes::TreeKind::Buffers => "buffer-mode",
+                modes::TreeKind::Clients => "client-mode",
+                modes::TreeKind::Options => "options-mode",
+            },
+            PaneMode::Switch(_) => "switch-mode",
+            PaneMode::Panes(_) => "panes-mode",
+        }
+    }
+
+    /// Set -k again when the mode is raised from the stack (window_pane_set_mode).
+    pub fn set_kill(&mut self, kill: bool) {
+        match self {
+            PaneMode::Tree(t) => t.kill = kill,
+            PaneMode::Switch(s) => s.kill = kill,
+            PaneMode::Panes(p) => p.kill = kill,
+            PaneMode::Copy(c) => c.kill = kill,
+            _ => {}
+        }
+    }
+
+    /// -k: the pane is killed when the mode exits.
+    pub fn kill_on_exit(&self) -> bool {
+        match self {
+            PaneMode::Tree(t) => t.kill,
+            PaneMode::Switch(s) => s.kill,
+            PaneMode::Panes(p) => p.kill,
+            PaneMode::Copy(c) => c.kill,
+            _ => false,
+        }
+    }
+
+    /// Whether the mode zoomed the window itself (so leaving it unzooms).
+    pub fn zoomed_window(&self) -> bool {
+        match self {
+            PaneMode::Tree(t) => t.zoomed == Some(false),
+            PaneMode::Switch(s) => s.zoomed == Some(false),
+            PaneMode::Panes(p) => p.zoomed == Some(false),
+            _ => false,
+        }
+    }
 }
 
 pub struct Pane {
@@ -440,8 +498,13 @@ pub struct Pane {
     pub title: String,
     pub dead: Option<(Option<i32>, u64)>,
     pub scrollbar_until: Option<Instant>,
+    /// The mode on top of the pane's mode stack (what is shown and gets keys).
     pub mode: Option<PaneMode>,
-    /// command-prompt -P: a prompt drawn on the pane's last line.
+    /// The modes under it (wp->modes after the first), the next one last: leaving the
+    /// top mode goes back to the one below.
+    pub mode_stack: Vec<PaneMode>,
+    /// command-prompt -P: a prompt owned by the pane (wp->prompt), drawn over its last line
+    /// on every client showing it; keys from any of them go to it.
     pub prompt: Option<Prompt>,
     pub options: Options,
     pub pipe: Option<Sender<Vec<u8>>>,
@@ -485,8 +548,10 @@ impl Pane {
         self.size = (cols, rows);
         let _ = self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
         self.parser.set_size(nz(rows), nz(cols));
-        if let Some(PaneMode::Copy(cm)) = &mut self.mode {
-            cm.resize(cols, rows);
+        for m in self.mode.iter_mut().chain(self.mode_stack.iter_mut()) {
+            if let PaneMode::Copy(cm) = m {
+                cm.resize(cols, rows);
+            }
         }
     }
 
@@ -562,6 +627,8 @@ pub struct Window {
     pub old_layout: Option<String>,
     pub created: u64,
     pub activity: u64,
+    /// activity_time to the microsecond (sort orders).
+    pub activity_us: u64,
     /// Width/height the window is laid out at (follows the attached session size).
     pub sx: u16,
     pub sy: u16,
@@ -607,6 +674,8 @@ pub struct Session {
     pub activity: u64,
     /// activity_seq() at the last activity update.
     pub activity_seq: u64,
+    /// activity_time to the microsecond (sort orders).
+    pub activity_us: u64,
     pub last_attached: u64,
     pub alerts: BTreeMap<u32, u8>,
     /// Session group (new-session -t): members share one window list.
@@ -676,6 +745,8 @@ pub struct Prompt {
     pub bspace_exit: bool,
     /// confirm-before: the key that confirms (-c) and whether Enter does too (-y).
     pub confirm: (char, bool),
+    /// command-prompt -P: drawn on the last line of `pane` rather than the status line.
+    pub in_pane: bool,
 }
 
 impl Prompt {
@@ -692,9 +763,7 @@ impl Prompt {
 }
 
 pub enum Overlay {
-    Menu(modes::Menu),
     Popup(modes::Popup),
-    DisplayPanes { until: Instant, template: String },
 }
 
 pub struct RenderState {
@@ -1056,6 +1125,8 @@ pub struct Server {
     pub prompt_waits: Vec<(ClientId, u64, Vec<String>, Queue)>,
     /// The last prompt id given out (Server::next_prompt_id).
     pub prompt_ids: u64,
+    /// Open menus by window (w->menu).
+    pub menus: HashMap<WinId, modes::Menu>,
     /// Copy-mode panes scrolling while a selection drag rests at an edge.
     pub copy_drag_timers: HashMap<PaneId, Instant>,
     /// A lookup of what the panes run is in progress (at most one at a time).
@@ -1215,6 +1286,7 @@ impl Server {
             overlay_waits: Vec::new(),
             prompt_waits: Vec::new(),
             prompt_ids: 0,
+            menus: HashMap::new(),
             copy_drag_timers: HashMap::new(),
             pane_info_busy: false,
             delayed: Vec::new(),
@@ -1729,6 +1801,7 @@ impl Server {
                 if let Some(s) = self.clients.get(&cid).filter(|c| c.attached).and_then(|c| c.session).and_then(|s| self.sessions.get_mut(&s)) {
                     s.activity = now_secs();
                     s.activity_seq = activity_seq();
+                    s.activity_us = now_us();
                 }
                 self.handle_input(cid, &payload);
                 // a focus-out report does not make the client the latest
@@ -1875,6 +1948,7 @@ impl Server {
         }
         if let Some(w) = self.windows.get_mut(&wid) {
             w.activity = now_secs();
+            w.activity_us = now_us();
         }
         self.pane_output_events(id, osc_events, clip_set);
         if bell && self.opt_window_on(Some(wid), "monitor-bell") {
@@ -1946,11 +2020,17 @@ impl Server {
                 p.dead = Some((status, now_secs()));
             }
             if close {
+                let mut editor = None;
                 if let Some(c) = self.clients.get_mut(&cid) {
-                    c.overlay = None;
+                    if let Some(Overlay::Popup(p)) = c.overlay.take() {
+                        editor = p.editor;
+                    }
                     c.dirty = true;
                 }
                 self.destroy_pane(id);
+                if let Some(ed) = editor {
+                    self.editor_done(cid, *ed, status);
+                }
             }
             return;
         }
@@ -2084,11 +2164,14 @@ impl Server {
         cm.set_view_mode();
         // Start at the top of the output.
         cm.run("history-top", &[]);
-        if let Some(p) = self.panes.get_mut(&pane) {
+        // output replaces the view on top; any other mode stays under it
+        if let Some(p) = self.panes.get_mut(&pane).filter(|p| matches!(p.mode, Some(PaneMode::Copy(_)))) {
             p.mode = Some(PaneMode::Copy(Box::new(cm)));
-        }
-        if let Some(wid) = self.window_of(pane) {
-            self.mark_window_dirty(wid);
+            if let Some(wid) = self.window_of(pane) {
+                self.mark_window_dirty(wid);
+            }
+        } else {
+            self.set_pane_mode(pane, PaneMode::Copy(Box::new(cm)));
         }
     }
 
@@ -2103,8 +2186,13 @@ impl Server {
             for d in [c.esc_deadline, c.repeat_until, c.message.as_ref().map(|m| m.1), c.click.deadline].into_iter().flatten() {
                 t = t.min(d.saturating_duration_since(now));
             }
-            if let Some(Overlay::DisplayPanes { until, .. }) = &c.overlay {
-                t = t.min(until.saturating_duration_since(now));
+        }
+        // display-panes closes by itself
+        for p in self.panes.values() {
+            if let Some(PaneMode::Panes(m)) = &p.mode {
+                if let Some(until) = m.until {
+                    t = t.min(until.saturating_duration_since(now));
+                }
             }
         }
         for d in self.animation_deadlines.borrow().values() {
@@ -2149,10 +2237,10 @@ impl Server {
                 c.message = None;
                 c.dirty = true;
             }
-            if matches!(&c.overlay, Some(Overlay::DisplayPanes { until, .. }) if *until <= now) {
-                c.overlay = None;
-                c.dirty = true;
-            }
+        }
+        let expired: Vec<PaneId> = self.panes.values().filter(|p| matches!(&p.mode, Some(PaneMode::Panes(m)) if m.until.is_some_and(|u| u <= now))).map(|p| p.id).collect();
+        for p in expired {
+            self.exit_mode(p);
         }
         if !self.copy_drag_timers.is_empty() {
             self.copy_drag_timers_due(now);
@@ -2164,6 +2252,10 @@ impl Server {
             for (_, q) in due {
                 self.run_queue(q);
             }
+        }
+        if !self.menus.is_empty() {
+            let windows = &self.windows;
+            self.menus.retain(|w, _| windows.contains_key(w));
         }
         let waiting = std::mem::take(&mut self.prompt_waits);
         for (cid, epoch, argv, queue) in waiting {
@@ -2478,6 +2570,7 @@ impl Server {
                 dead: None,
                 scrollbar_until: None,
                 mode: None,
+                mode_stack: Vec::new(),
                 prompt: None,
                 options: existing_opts,
                 pipe: None,
@@ -2758,6 +2851,7 @@ impl Server {
             s.last_attached = now;
             s.activity = now;
             s.activity_seq = activity_seq();
+            s.activity_us = now_us();
             if writable && update_env {
                 s.env.extend(cmds::environ_update(&names, &env));
             }
