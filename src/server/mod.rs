@@ -1080,6 +1080,8 @@ pub struct Ctx {
     pub readonly: bool,
     /// Files being sourced (innermost last), for #{current_file}.
     pub files: Vec<String>,
+    /// The line of the sourced file the command is on (cmd_get_source).
+    pub line: Option<u32>,
     /// The exit status for the command-line client (c->retval: run-shell and new-pane -W
     /// set it).
     pub retval: i32,
@@ -1120,6 +1122,7 @@ pub fn internal_mark(name: &str) -> String {
 }
 pub static FILE_PUSH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("file-push"));
 pub static FILE_POP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("file-pop"));
+pub static FILE_LINE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("file-line"));
 
 /// The tmux release whose behaviour this server matches (`#{version}`).
 pub const TMUX_VERSION: &str = "3.8";
@@ -1233,6 +1236,9 @@ pub struct Server {
     pub pipe_acl: Option<Vec<String>>,
     /// Configuration files tried at startup (config_files).
     pub cfg_files: Vec<String>,
+    /// Errors (and display-message output) of commands run without a client while the
+    /// configuration loads (cfg_causes), shown on the first attach.
+    pub cfg_causes: Vec<String>,
     /// Queues waiting for a pane's command to exit (new-pane -W).
     pub pane_waits: HashMap<PaneId, Vec<(Vec<String>, Queue)>>,
 }
@@ -1383,6 +1389,7 @@ impl Server {
             acl: Vec::new(),
             pipe_acl: None,
             cfg_files: Vec::new(),
+            cfg_causes: Vec::new(),
             pane_waits: HashMap::new(),
         };
         srv.opts_session.set("default-shell", procinfo::default_shell());
@@ -1433,6 +1440,7 @@ impl Server {
             self.run_queue(Queue { cmds: VecDeque::from([args]), ctx , soft: 0 });
         }
         self.cfg_finished = true;
+        self.cfg_show_causes(None);
     }
 
     pub fn add_message(&mut self, msg: &str) {
@@ -3289,6 +3297,11 @@ impl Server {
             }
             if name == *FILE_POP {
                 q.ctx.files.pop();
+                q.ctx.line = None;
+                continue;
+            }
+            if name == *FILE_LINE {
+                q.ctx.line = cmd.get(1).and_then(|l| l.parse().ok());
                 continue;
             }
             let delay_cmd = (cmds::canonical(&name) == Some("run-shell")).then(|| cmd.clone());
@@ -3371,6 +3384,11 @@ impl Server {
                     for c in std::mem::take(&mut self.ev.inject).into_iter().rev() {
                         q.cmds.push_front(c);
                     }
+                    self.control_item_done(&mut q, None);
+                }
+                Err(e) if soft && !e.starts_with('\0') && q.ctx.client.is_none() && q.ctx.reply.is_none() => {
+                    log(&format!("{e}"));
+                    self.cmdq_error_noclient(&q.ctx, &e);
                     self.control_item_done(&mut q, None);
                 }
                 Err(e) if soft && !e.starts_with('\0') => {
@@ -3602,7 +3620,9 @@ impl Server {
         }
         if let Some(e) = &err {
             log(&format!("command error: {e}"));
-            if !attached {
+            if ctx.client.is_none() {
+                self.cmdq_error_noclient(&ctx, e);
+            } else if !attached {
                 self.log_error(None, e);
             }
         }
@@ -3618,6 +3638,43 @@ impl Server {
                 }
             }
         }
+    }
+
+    /// cmdq_error for a command without a client: a cause while the configuration loads,
+    /// else a message log entry, with the file and line it came from.
+    pub fn cmdq_error_noclient(&mut self, ctx: &Ctx, e: &str) {
+        let msg = match (ctx.files.last(), ctx.line) {
+            (Some(f), Some(l)) => format!("{f}:{l}: {e}"),
+            _ => e.to_string(),
+        };
+        if self.cfg_finished {
+            self.add_message(&format!("message: {msg}"));
+        } else {
+            self.cfg_causes.push(msg);
+        }
+    }
+
+    /// cfg_show_causes: the configuration's causes go to the first client if it is a
+    /// control client (%config-error), else into view mode in the active pane of the
+    /// session (or the first client's, or the first one) once it is attached.
+    pub fn cfg_show_causes(&mut self, sid: Option<SessId>) {
+        if self.cfg_causes.is_empty() {
+            return;
+        }
+        let first = self.clients.keys().next().copied();
+        if let Some(c) = first.filter(|c| self.is_control(*c)) {
+            for cause in std::mem::take(&mut self.cfg_causes) {
+                self.control_notify_write(c, &format!("%config-error {cause}"));
+            }
+            return;
+        }
+        let sid = sid
+            .or_else(|| first.and_then(|c| self.clients.get(&c)).and_then(|c| c.session))
+            .or_else(|| self.sessions.keys().next().copied());
+        let Some(sid) = sid.filter(|s| self.clients.values().any(|c| c.attached && c.session == Some(*s))) else { return };
+        let Some(pane) = self.sessions.get(&sid).map(|s| self.windows[&s.active_window()].active) else { return };
+        let text = std::mem::take(&mut self.cfg_causes).join("\n");
+        self.view_output(pane, &text);
     }
 
     /// cmdq_error's message log entry for a client that shows no status line (or none).

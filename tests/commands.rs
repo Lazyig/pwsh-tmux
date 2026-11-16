@@ -3033,3 +3033,50 @@ fn run_shell_t_shows_waited_output_in_view_mode() {
     wait_for("failure shown", || mode().contains("hello\ntwo\n'echo two; exit 3' returned 3"));
     assert_eq!(ctx.ok(&["run-shell", "echo cli"]).trim_end(), "cli");
 }
+
+#[test]
+fn startup_config_causes_go_to_the_first_attach() {
+    // cmdq_error without a client while the configuration loads is a config cause
+    // (display-message too, even with -p); a control client gets %config-error after
+    // %session-changed, once
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::{Arc, Mutex};
+    let ctx = Ctx::new("cfgcause");
+    let conf = std::env::temp_dir().join(format!("{}.conf", ctx.socket));
+    std::fs::write(&conf, "display \"from config\"\nset -g @cfg 1\nset -g nosuchopt 1\ndisplay -p printed\n").unwrap();
+    let conf_s = conf.to_string_lossy().into_owned();
+    ctx.ok(&["-f", &conf_s, "new-session", "-d", "-s", "s"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@cfg"]).trim_end(), "1");
+    // nobody is attached yet: the causes wait
+    assert_eq!(ctx.fmt("s", "#{pane_mode}"), "");
+    let attach = || {
+        let mut child = ctx.command().args(["-C", "attach", "-t", "s"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+        let out = Arc::new(Mutex::new(String::new()));
+        let o = out.clone();
+        let stdout = child.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                o.lock().unwrap().push_str(&(line + "\n"));
+            }
+        });
+        wait_for("attached", || out.lock().unwrap().contains("%session-changed $"));
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"display -p done\n").unwrap();
+        stdin.flush().unwrap();
+        wait_for("reply", || out.lock().unwrap().contains("\ndone\n"));
+        drop(stdin);
+        let _ = child.wait();
+        let text = out.lock().unwrap().clone();
+        text.lines().filter(|l| l.starts_with("%config-error") || l.starts_with("%session-changed")).map(String::from).collect::<Vec<_>>()
+    };
+    let f = conf_s.as_str();
+    assert_eq!(attach(), vec![
+        "%session-changed $0 s".to_string(),
+        format!("%config-error {f}:1: from config"),
+        format!("%config-error {f}:3: invalid option: nosuchopt"),
+        format!("%config-error {f}:4: printed"),
+    ]);
+    assert_eq!(attach(), vec!["%session-changed $0 s".to_string()]);
+    let _ = std::fs::remove_file(&conf);
+}

@@ -356,7 +356,7 @@ impl Server {
 
     /// control_notify_write: notifications never go inside a %begin/%end block, so
     /// they wait until the reply of the command that caused them is written.
-    fn control_notify_write(&mut self, cid: ClientId, line: &str) {
+    pub(super) fn control_notify_write(&mut self, cid: ClientId, line: &str) {
         let q = self.ev.ctl_queue.entry(cid).or_default();
         q.push_str(line);
         q.push('\n');

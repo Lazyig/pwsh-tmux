@@ -1626,6 +1626,9 @@ impl Server {
                         self.attach_client(c, sid);
                     }
                 }
+                if self.cfg_finished {
+                    self.cfg_show_causes(Some(sid));
+                }
                 ctx.pane = self.sessions.get(&sid).map(|s| self.windows[&s.active_window()].active);
                 Ok(Flow::Next)
             }
@@ -1642,7 +1645,11 @@ impl Server {
                     let c = self.expand(self.current(ctx), None, c);
                     self.sessions.get_mut(&sid).unwrap().cwd = c;
                 }
-                self.attach_or_switch(ctx, sid, o.has('d') || o.has('x'), o.has('r'), o.has('E'), o.get('f'))
+                let r = self.attach_or_switch(ctx, sid, o.has('d') || o.has('x'), o.has('r'), o.has('E'), o.get('f'));
+                if r.is_ok() && self.cfg_finished {
+                    self.cfg_show_causes(Some(sid));
+                }
+                r
             }
             "switch-client" => {
                 let cid = self.resolve_client(ctx, o.get('c'))?;
@@ -3529,14 +3536,18 @@ impl Server {
                 };
                 let msg = if o.has('j') { json::normalize(&msg)? } else { msg };
                 let attached_client = cid.filter(|c| self.clients.get(c).is_some_and(|c| c.attached));
-                if ctx.client.is_none() && ctx.reply.is_none() && self.cfg_finished {
-                    // no client at all after startup (a hook with nobody attached):
-                    // cmdq_error logs it
-                    self.add_message(&format!("message: {msg}"));
-                } else if o.has('p') || (attached_client.is_none() && ctx.client.is_none() && ctx.reply.is_none()) {
-                    // -p, or a command without any client (the configuration, where
-                    // cmdq_error reports it as an error); without -p the message needs a
-                    // client to show it on, with none tmux shows nothing
+                if ctx.client.is_none() && ctx.reply.is_none() {
+                    // no client (the configuration, or a hook with nobody attached):
+                    // cmdq_error makes it a config cause or logs it, even with -p (the
+                    // queue's output, which nobody reads, keeps it too)
+                    self.cmdq_error_noclient(ctx, &msg);
+                    if o.has('p') && !self.cfg_finished {
+                        ctx.out.push_str(&msg);
+                        ctx.out.push('\n');
+                    }
+                } else if o.has('p') {
+                    // without -p the message needs a client to show it on, with none
+                    // tmux shows nothing
                     ctx.out.push_str(&msg);
                     ctx.out.push('\n');
                 } else if let Some(c) = attached_client.filter(|c| self.is_control(*c)) {
@@ -4170,7 +4181,10 @@ impl Server {
                         // run-shell work); errors are reported without stopping, like tmux.
                         // The markers around them set #{current_file} while they run.
                         injected.push(vec![FILE_PUSH.to_string(), f.clone()]);
-                        injected.extend(cmds);
+                        for (c, line) in cmds.into_iter().zip(lines) {
+                            injected.push(vec![FILE_LINE.to_string(), line.to_string()]);
+                            injected.push(c);
+                        }
                         injected.push(vec![FILE_POP.to_string()]);
                     }
                 }
