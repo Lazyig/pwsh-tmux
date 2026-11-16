@@ -4,9 +4,17 @@ use core::ops::{Index, IndexMut};
 /// Visible rows remain directly editable. History rows share default ASCII
 /// cells and keep a small, lossless palette for all other cells. Reads return
 /// references without allocating or expanding the history; only edits expand.
+///
+/// New and cleared rows are sparse: only the cells up to the last one written
+/// are stored, the rest are default cells (like tmux's lazily extended grid
+/// lines), so a huge but mostly empty screen costs little memory.
 #[derive(Clone, Debug)]
 pub(crate) enum RowCells {
     Dense(Vec<crate::Cell>),
+    Sparse {
+        cells: Vec<crate::Cell>,
+        len: usize,
+    },
     Compact {
         indices: Box<[u8]>,
         extra: Box<[crate::Cell]>,
@@ -15,19 +23,63 @@ pub(crate) enum RowCells {
 
 impl RowCells {
     pub(crate) fn new(cols: u16) -> Self {
-        Self::Dense(alloc::vec![crate::Cell::new(); usize::from(cols)])
+        Self::Sparse {
+            cells: Vec::new(),
+            len: usize::from(cols),
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::Dense(cells) => cells.len(),
+            Self::Sparse { len, .. } => *len,
             Self::Compact { indices, .. } => indices.len(),
+        }
+    }
+
+    /// Makes every cell a default cell without storing any.
+    pub(crate) fn clear_default(&mut self) {
+        *self = Self::Sparse {
+            cells: Vec::new(),
+            len: self.len(),
+        };
+    }
+
+    pub(crate) fn truncate(&mut self, new_len: usize) {
+        match self {
+            Self::Sparse { cells, len } => {
+                cells.truncate(new_len);
+                *len = (*len).min(new_len);
+            }
+            _ => self.dense_mut().truncate(new_len),
+        }
+    }
+
+    pub(crate) fn resize(&mut self, new_len: usize, cell: crate::Cell) {
+        match self {
+            Self::Sparse { cells, len } if cell == crate::Cell::DEFAULT => {
+                cells.truncate(new_len);
+                *len = new_len;
+            }
+            _ => self.dense_mut().resize(new_len, cell),
+        }
+    }
+
+    pub(crate) fn shrink_to_fit(&mut self) {
+        match self {
+            Self::Dense(cells) | Self::Sparse { cells, .. } => {
+                cells.shrink_to_fit();
+            }
+            Self::Compact { .. } => {}
         }
     }
 
     pub(crate) fn get(&self, index: usize) -> Option<&crate::Cell> {
         match self {
             Self::Dense(cells) => cells.get(index),
+            Self::Sparse { cells, len } => (index < *len).then(|| {
+                cells.get(index).unwrap_or(&crate::cell::ASCII_CELLS[0])
+            }),
             Self::Compact { indices, extra } => indices.get(index).map(|&i| {
                 if i < 128 {
                     &crate::cell::ASCII_CELLS[usize::from(i)]
@@ -43,20 +95,65 @@ impl RowCells {
     }
 
     pub(crate) fn dense_mut(&mut self) -> &mut Vec<crate::Cell> {
-        if matches!(self, Self::Compact { .. }) {
-            *self = Self::Dense(self.iter().cloned().collect());
+        match self {
+            Self::Dense(_) => {}
+            Self::Sparse { cells, len } => {
+                let mut cells = core::mem::take(cells);
+                cells.resize(*len, crate::Cell::new());
+                *self = Self::Dense(cells);
+            }
+            Self::Compact { .. } => {
+                *self = Self::Dense(self.iter().cloned().collect());
+            }
         }
         match self {
             Self::Dense(cells) => cells,
-            Self::Compact { .. } => unreachable!(),
+            _ => unreachable!(),
         }
     }
 
+    /// How many cells are stored: those past them are default cells.
+    pub(crate) fn stored_len(&self) -> usize {
+        match self {
+            Self::Sparse { cells, .. } => cells.len(),
+            _ => self.len(),
+        }
+    }
+
+    /// The stored cells, at least the first `upto` of the row.
+    pub(crate) fn stored_mut(&mut self, upto: usize) -> &mut [crate::Cell] {
+        match self {
+            Self::Sparse { cells, len } => {
+                let n = upto.min(*len);
+                if cells.len() < n {
+                    cells.resize(n, crate::Cell::new());
+                }
+                cells
+            }
+            _ => self.dense_mut(),
+        }
+    }
+
+    /// Editing a cell of a sparse row stores the cells up to it only.
     pub(crate) fn get_mut(&mut self, index: usize) -> Option<&mut crate::Cell> {
-        self.dense_mut().get_mut(index)
+        match self {
+            Self::Sparse { cells, len } => {
+                if index >= *len {
+                    return None;
+                }
+                if index >= cells.len() {
+                    cells.resize(index + 1, crate::Cell::new());
+                }
+                cells.get_mut(index)
+            }
+            _ => self.dense_mut().get_mut(index),
+        }
     }
 
     pub(crate) fn compact(&mut self) {
+        if matches!(self, Self::Sparse { .. }) {
+            self.dense_mut();
+        }
         let Self::Dense(cells) = self else { return };
         if cells.is_empty() {
             return;
@@ -100,13 +197,37 @@ impl Index<usize> for RowCells {
 
 impl IndexMut<usize> for RowCells {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        &mut self.dense_mut()[index]
+        self.get_mut(index).expect("cell index out of bounds")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_rows_store_only_written_cells() {
+        let mut cells = RowCells::new(10000);
+        assert_eq!(cells.len(), 10000);
+        assert!(!cells[9999].has_contents());
+        assert!(cells.get(10000).is_none());
+        cells[2].set('x', crate::attrs::Attrs::new());
+        let RowCells::Sparse { cells: stored, .. } = &cells else {
+            panic!("an edit keeps the row sparse")
+        };
+        assert_eq!(stored.len(), 3);
+        assert_eq!(cells[2].contents(), "x");
+        cells.resize(20000, crate::Cell::new());
+        assert_eq!(cells.len(), 20000);
+        cells.truncate(2);
+        assert_eq!((cells.len(), cells.iter().filter(|c| c.has_contents()).count()), (2, 0));
+        cells.resize(5, crate::Cell::new());
+        cells[4].set('y', crate::attrs::Attrs::new());
+        let full: Vec<_> = cells.iter().cloned().collect();
+        assert_eq!(cells.dense_mut(), &full);
+        cells.clear_default();
+        assert!(matches!(cells, RowCells::Sparse { ref cells, len: 5 } if cells.is_empty()));
+    }
 
     #[test]
     fn ascii_history_reads_and_clones_stay_compact() {

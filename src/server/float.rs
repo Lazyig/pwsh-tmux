@@ -1602,6 +1602,33 @@ mod tests {
         srv.shutdown();
     }
 
+    /// tmux keeps a 9998x9998 floating pane at a few hundred KB (its grid lines grow
+    /// lazily): so must the pane's screen, or a couple of panes take gigabytes.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn huge_floating_panes_stay_small() {
+        let rss = || {
+            let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+            statm.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() * 4096
+        };
+        let (mut srv, _ev) = server();
+        ok(&mut srv, &["new-session", "-d", "-s", "h", "-x", "80", "-y", "24"]);
+        let before = rss();
+        for _ in 0..2 {
+            let p = ok(&mut srv, &["new-pane", "-E", "-d", "-P", "-F", "#{pane_id}", "-x", "10000", "-y", "10000"]).trim().to_string();
+            assert_eq!(fmt(&srv, &p, "#{pane_width}x#{pane_height}"), "9998x9998");
+            let id: PaneId = p.trim_start_matches('%').parse().unwrap();
+            let pane = srv.panes.get_mut(&id).unwrap();
+            for i in 0..12000 {
+                pane.parser.process(format!("{i}\r\n").as_bytes());
+            }
+            pane.parser.process(b"\x1b[2J\x1b[H\x1b[3@x");
+        }
+        let grown = rss().saturating_sub(before);
+        assert!(grown < 256 << 20, "{} MB", grown >> 20);
+        srv.shutdown();
+    }
+
     #[test]
     fn clamp_floats_off_the_top_left() {
         let (mut srv, _ev) = server();

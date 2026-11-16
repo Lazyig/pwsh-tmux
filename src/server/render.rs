@@ -450,8 +450,10 @@ impl Server {
             }
             None => {
                 let scr = p.screen();
-                for y in 0..h {
-                    for x in 0..w {
+                // only the part on the client: a floating pane may be far bigger
+                let span = |o: i32, n: u16, c: u16| (o.max(0) - o).min(n as i32) as u16..((c as i32 - o).clamp(0, n as i32)) as u16;
+                for y in span(y0, h, clip.1) {
+                    for x in span(x0, w, clip.0) {
                         let Some((ax, ay)) = vis(x, y) else { continue };
                         let Some(vc) = scr.cell(y, x) else {
                             f.set(ax, oy + ay, Cell { text: " ".into(), style: wstyle });

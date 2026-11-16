@@ -24,14 +24,18 @@ impl Row {
     }
 
     pub fn clear(&mut self, attrs: crate::attrs::Attrs) {
-        for cell in self.cells.dense_mut() {
-            cell.clear(attrs);
+        if attrs == crate::attrs::Attrs::new() {
+            self.cells.clear_default();
+        } else {
+            for cell in self.cells.dense_mut() {
+                cell.clear(attrs);
+            }
         }
         self.wrapped = false;
     }
 
     pub fn reset(&mut self) {
-        self.cells.dense_mut().fill(crate::Cell::new());
+        self.cells.clear_default();
         self.wrapped = false;
     }
 
@@ -61,17 +65,19 @@ impl Row {
             return;
         }
 
-        let is_wide_continuation = self.get_mut(i).is_some_and(|cell| {
-            let is_wc = cell.is_wide_continuation();
-            if is_wc {
-                cell.set_wide_continuation(false);
-            }
-            is_wc
-        });
+        let is_wide_continuation = self.get(i).is_some_and(crate::Cell::is_wide_continuation);
+        if is_wide_continuation {
+            self.get_mut(i).unwrap().set_wide_continuation(false);
+        }
 
-        let slice = &mut self.cells.dense_mut()[usize::from(i)..];
-        slice.rotate_right(count);
-        slice[..count].fill(crate::Cell::new());
+        // only the stored cells (and the empty ones they move over) shift
+        let stored = self.cells.stored_len();
+        if usize::from(i) < stored {
+            let n = (stored + count).min(self.cells.len());
+            let slice = &mut self.cells.stored_mut(n)[usize::from(i)..n];
+            slice.rotate_right(count);
+            slice[..count].fill(crate::Cell::new());
+        }
         if is_wide_continuation {
             self.get_mut(i).unwrap().set_wide_continuation(true);
         }
@@ -94,9 +100,13 @@ impl Row {
         }
 
         let count = usize::from(range.end - range.start);
-        let slice = &mut self.cells.dense_mut()[usize::from(range.start)..];
-        slice[..count].fill(crate::Cell::new());
-        slice.rotate_left(count);
+        let stored = self.cells.stored_len();
+        if usize::from(range.start) < stored {
+            let n = stored.max(usize::from(range.end));
+            let slice = &mut self.cells.stored_mut(n)[usize::from(range.start)..n];
+            slice[..count].fill(crate::Cell::new());
+            slice.rotate_left(count);
+        }
     }
 
     pub fn erase(&mut self, i: u16, attrs: crate::attrs::Attrs) {
@@ -113,22 +123,22 @@ impl Row {
     }
 
     pub fn truncate(&mut self, len: u16) {
-        self.cells.dense_mut().truncate(usize::from(len));
+        self.cells.truncate(usize::from(len));
         self.set_truncated();
     }
 
     fn set_truncated(&mut self) {
         self.wrapped = false;
-        if let Some(last_cell) = self.cells.dense_mut().last_mut() {
-            if last_cell.is_wide() {
-                last_cell.clear(*last_cell.attrs());
-            }
+        let Some(last) = self.cells.len().checked_sub(1) else { return };
+        if self.cells[last].is_wide() {
+            let attrs = *self.cells[last].attrs();
+            self.cells[last].clear(attrs);
         }
     }
 
     fn grow_unchecked(&mut self, len: u16, cell: crate::Cell) {
         debug_assert!(self.cells.len() < usize::from(len));
-        self.cells.dense_mut().resize(len.into(), cell);
+        self.cells.resize(len.into(), cell);
         self.wrapped = false;
     }
 
@@ -161,11 +171,9 @@ impl Row {
             .count();
         if excess > 0 {
             let len = self.cells.len() - excess;
-            self.cells.dense_mut().truncate(len);
+            self.cells.truncate(len);
         }
-        if let crate::row_cells::RowCells::Dense(cells) = &mut self.cells {
-            cells.shrink_to_fit();
-        }
+        self.cells.shrink_to_fit();
     }
 
     pub(crate) fn compact(&mut self) {

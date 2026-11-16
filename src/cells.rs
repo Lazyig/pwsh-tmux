@@ -203,4 +203,34 @@ mod tests {
         p.process(b"\x1b[?1049halternate\x1b[2J\x1b[?1049l");
         assert_eq!(snapshot(p.screen()).len(), 6, "alternate screen has no history");
     }
+
+    #[test]
+    fn sparse_rows_edit_like_dense_ones() {
+        // vt100 rows store cells up to the last one written only (vendor PATCHES.md):
+        // inserts, deletes, erases and resizes must see the empty cells past them
+        let nz = |n| NonZeroU16::new(n).unwrap();
+        let mut p = vt100::Parser::new(nz(6), nz(20), 0);
+        p.process(b"abc\x1b[1;2H\x1b[2@");
+        p.process(b"\x1b[2;10Hx\x1b[2;3H\x1b[4@\x1b[2;2H\x1b[2P");
+        p.process(b"\x1b[3;1H0123456789abcdefghij\x1b[3;5H\x1b[3@");
+        p.process(b"\x1b[4;5Hy\x1b[4;9H\x1b[3P\x1b[4;1H\x1b[2@");
+        p.process(b"\x1b[5;1H\x1b[41m\x1b[K\x1b[0m");
+        let rows: Vec<String> = p.screen().rows(0, 20).collect();
+        assert_eq!(&rows[..4], ["a  bc", "           x", "0123   456789abcdefg", "      y"]);
+        assert_eq!(p.screen().cell(4, 19).map(vt100::Cell::bgcolor), Some(vt100::Color::Idx(1)));
+        assert!(p.screen().cell(5, 19).is_some_and(|c| !c.has_contents()));
+        // a resized row has the new columns, empty
+        p.screen_mut().set_size(nz(6), nz(30));
+        assert!(p.screen().cell(0, 29).is_some_and(|c| !c.has_contents()));
+        p.process(b"\x1b[1;30Hz\x1b[2J\x1b[1;1H\x1b[1@");
+        assert_eq!(p.screen().contents(), "");
+        // a huge screen with a little output (a floating pane of 10000x10000)
+        let mut p = vt100::Parser::new(nz(10000), nz(10000), 100);
+        for i in 0..20000 {
+            p.process(format!("{i}\r\n").as_bytes());
+        }
+        p.process(b"\x1b[5;5H\x1b[3@q\x1b[2P");
+        assert_eq!(p.screen().cell(4, 4).map(|c| c.contents().to_string()).as_deref(), Some("q"));
+        assert_eq!(p.screen().cell(9999, 9999).map(vt100::Cell::has_contents), Some(false));
+    }
 }
