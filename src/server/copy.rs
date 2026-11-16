@@ -298,7 +298,7 @@ impl Server {
     }
 
     /// window_copy_copy_buffer's clipboard half (set-clipboard): screen_write_setselection
-    /// on the pane, so the terminals of the attached clients showing its window get the
+    /// on the pane with no selection parameter (OSC 52 ;;), so the terminals of the attached clients showing its window get the
     /// OSC 52 (Ms), whichever client (or command) did the copy.
     fn copy_to_clipboard(&mut self, pane: PaneId, text: &str) {
         if text.is_empty() || self.opt_server("set-clipboard") == "off" {
@@ -309,7 +309,7 @@ impl Server {
         for c in self.clients.values().filter(|c| c.attached && c.control == 0 && c.features.has("clipboard")) {
             let shown = c.session.and_then(|s| self.sessions.get(&s)).and_then(|s| s.links.get(&s.active)).is_some_and(|w| *w == wid);
             if shown {
-                c.send(S_OUTPUT, features::string_capability(&c.term_caps, "Ms", "\x1b]52;%p1%s;%p2%s\x07", &["c", &enc]).as_bytes());
+                c.send(S_OUTPUT, features::string_capability(&c.term_caps, "Ms", "\x1b]52;%p1%s;%p2%s\x07", &["", &enc]).as_bytes());
             }
         }
         // window_copy_copy_buffer

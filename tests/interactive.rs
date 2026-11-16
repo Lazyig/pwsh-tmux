@@ -129,7 +129,8 @@ fn copy_mode_keys_and_paste() {
     wait_for("left copy mode", || ctx.fmt("c", "#{pane_in_mode}") == "0");
     assert_eq!(ctx.ok(&["show-buffer"]), "alpha");
     // OSC 52 was sent to the outer terminal
-    assert!(t.raw_text().contains("\x1b]52;c;YWxwaGE="));
+    // with an empty selection parameter, as window_copy_copy_buffer sends it
+    assert!(t.raw_text().contains("\x1b]52;;YWxwaGE="));
     // C-b ] pastes it
     t.send(b"\x15echo ");
     t.prefix(b"]");
