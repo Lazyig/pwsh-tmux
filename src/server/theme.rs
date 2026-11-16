@@ -340,9 +340,8 @@ impl Server {
         }
         c.prev = None;
         c.dirty = true;
-        let sid = c.session;
         if let Some(t) = reported {
-            self.run_hook(sid, if t == Theme::Light { "client-light-theme" } else { "client-dark-theme" }, Ctx { client: Some(cid), ..Ctx::default() });
+            self.fire_client(if t == Theme::Light { "client-light-theme" } else { "client-dark-theme" }, cid);
         }
         if colour.is_some() || reported.is_some() { self.notify_pane_themes(); }
         true
@@ -498,7 +497,6 @@ mod tests {
             control: 0,
             control_size: None,
             control_seq: 0,
-            seen: Default::default(),
             features: Default::default(),
             clipboard_query: None,
             focused: false,

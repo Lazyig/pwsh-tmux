@@ -305,7 +305,7 @@ impl Server {
     /// window_copy_copy_buffer's clipboard half (set-clipboard): screen_write_setselection
     /// on the pane, so the terminals of the attached clients showing its window get the
     /// OSC 52 (Ms), whichever client (or command) did the copy.
-    fn copy_to_clipboard(&self, pane: PaneId, text: &str) {
+    fn copy_to_clipboard(&mut self, pane: PaneId, text: &str) {
         if text.is_empty() || self.opt_server("set-clipboard") == "off" {
             return;
         }
@@ -317,6 +317,8 @@ impl Server {
                 c.send(S_OUTPUT, features::string_capability(&c.term_caps, "Ms", "\x1b]52;%p1%s;%p2%s\x07", &["c", &enc]).as_bytes());
             }
         }
+        // window_copy_copy_buffer
+        self.fire_pane("pane-set-clipboard", pane);
     }
 
     /// refresh-now and the automatic refresh: the pane's content again.

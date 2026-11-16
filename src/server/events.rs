@@ -15,7 +15,8 @@ use std::collections::HashSet;
 pub enum OutputEvent {
     Osc(&'static str, OscState),
     Title(String),
-    Clipboard((String, String)),
+    /// An OSC 52 set (its data is in PaneCb::clipboard_sets).
+    Clipboard,
 }
 
 /// A payload value, printed as tmux's event_payload_item_print does.
@@ -214,7 +215,8 @@ pub struct PaneSeen {
 #[derive(Clone, Default, PartialEq)]
 pub struct SessSeen {
     pub name: String,
-    pub active: (u32, WinId),
+    /// The current winlink (index, window); None until one is seen (ids start at 0).
+    pub active: Option<(u32, WinId)>,
     pub links: BTreeMap<u32, WinId>,
     /// (group id, name)
     pub group: Option<(u32, String)>,
@@ -270,9 +272,8 @@ pub struct State {
     pub lost_attached: HashSet<ClientId>,
     /// Panes with output since the last turn of the loop (PANE_ACTIVITY).
     pub activity: HashSet<PaneId>,
-    /// Panes that have focus (PANE_FOCUSED) and clients that lost it (~CLIENT_FOCUSED).
+    /// Panes that have focus (PANE_FOCUSED); a client's own focus is Client::focused.
     pub focused: HashSet<PaneId>,
-    pub unfocused: HashSet<ClientId>,
     /// Focus needs checking; whether each client had an overlay.
     pub focus_dirty: bool,
     pub overlays: HashMap<ClientId, bool>,
@@ -1343,33 +1344,6 @@ impl Server {
         self.fire(if deleted { "paste-buffer-deleted" } else { "paste-buffer-changed" }, p);
     }
 
-    /// OSC 52 from a pane (input_osc_52): with set-clipboard on, the text goes to the
-    /// terminals showing the pane and into a new buffer.
-    pub fn pane_clipboard(&mut self, pane: PaneId, (sel, data): (String, String)) -> bool {
-        if self.opt_server("set-clipboard") != "on" || data.is_empty() || data == "?" {
-            return false;
-        }
-        let Ok(bytes) = decode_stdin_buffer(&format!("{STDIN_BUFFER_PREFIX}{data}")) else { return false };
-        if bytes.is_empty() {
-            return false;
-        }
-        let mut clip = String::new();
-        for c in sel.chars().filter(|c| "cpqs01234567".contains(*c)) {
-            if !clip.contains(c) {
-                clip.push(c);
-            }
-        }
-        let wid = self.window_of(pane);
-        let seq = format!("\x1b]52;{clip};{}\x07", cmds::base64(&bytes));
-        for c in self.clients.values().filter(|c| c.attached && c.control == 0 && c.features.has("clipboard")) {
-            if c.session.and_then(|s| self.session_window(s)).is_some_and(|(_, w)| Some(w) == wid) {
-                c.send(S_OUTPUT, seq.as_bytes());
-            }
-        }
-        self.add_buffer(None, bytes, false);
-        true
-    }
-
     // ---- monitors ----------------------------------------------------------------------
 
     /// Monitors live with their option (hooks_monitor_free): those whose option was
@@ -1491,13 +1465,11 @@ impl Server {
         let Some(s) = self.sessions.get(&sid) else { return };
         let Some(&wid) = s.links.get(&s.active) else { return };
         let now = (s.active, wid);
-        let Some(old) = self.ev.seen.sessions.get(&sid).map(|x| x.active).filter(|o| *o != now) else { return };
+        let Some(old) = self.ev.seen.sessions.get(&sid).map(|x| x.active).filter(|o| *o != Some(now)) else { return };
         if let Some(x) = self.ev.seen.sessions.get_mut(&sid) {
-            x.active = now;
+            x.active = Some(now);
         }
-        if old == (0, 0) || (swapped && old.0 == now.0) {
-            return;
-        }
+        let Some(old) = old.filter(|o| !(swapped && o.0 == now.0)) else { return };
         let mut p = self.payload_winlink(sid, now.0, now.1);
         p.set("new_window", self.val_window(now.1)).int("new_window_index", now.0 as i64);
         p.set("old_window", self.val_window(old.1)).int("old_window_index", old.0 as i64);
@@ -1617,7 +1589,7 @@ impl Server {
     }
 
     pub(super) fn seen_active_now(&mut self, sid: SessId) {
-        let active = self.sessions.get(&sid).and_then(|s| s.links.get(&s.active).map(|w| (s.active, *w))).unwrap_or_default();
+        let active = self.sessions.get(&sid).and_then(|s| s.links.get(&s.active).map(|w| (s.active, *w)));
         if let Some(e) = self.ev.seen.sessions.get_mut(&sid) {
             e.active = active;
         }
@@ -1634,7 +1606,7 @@ impl Server {
         let old = std::mem::replace(&mut e.links, links.clone());
         e.name = name;
         let old_active = e.active;
-        if !new_session && !links.contains_key(&old_active.0) {
+        if !new_session && !old_active.is_some_and(|a| links.contains_key(&a.0)) {
             self.detect_current_window(sid, false);
         }
         for (idx, wid) in &links {
@@ -2075,7 +2047,7 @@ impl Server {
     pub fn update_focus(&mut self) {
         let mut focused = HashSet::new();
         for c in self.clients.values() {
-            if !c.attached || c.overlay.is_some() || self.ev.unfocused.contains(&c.id) {
+            if !c.attached || c.overlay.is_some() || !c.focused {
                 continue;
             }
             let Some((_, wid)) = c.session.and_then(|s| self.session_window(s)) else { continue };
@@ -2105,7 +2077,7 @@ impl Server {
             return false;
         }
         self.clients.values().any(|c| {
-            c.attached && c.overlay.is_none() && !self.ev.unfocused.contains(&c.id)
+            c.attached && c.overlay.is_none() && c.focused
                 && c.session.and_then(|s| self.session_window(s)).is_some_and(|(_, w)| w == wid)
         })
     }
@@ -2155,14 +2127,15 @@ impl Server {
     pub fn client_focus(&mut self, cid: ClientId, focus: bool) {
         // tty_keys: the client's current window
         let wid = self.client_session(cid).and_then(|s| self.session_window(s)).map(|w| w.1);
+        if let Some(c) = self.clients.get_mut(&cid) {
+            c.focused = focus;
+        }
         if focus {
-            self.ev.unfocused.remove(&cid);
             self.fire_client("client-focus-in", cid);
             if let Some(w) = wid {
                 self.update_window_focus(w);
             }
         } else {
-            self.ev.unfocused.insert(cid);
             if let Some(w) = wid {
                 self.update_window_focus(w);
             }
@@ -2172,7 +2145,9 @@ impl Server {
 
     /// The pane events of one read of output: activity, bell, title, OSC 133 and
     /// clipboard.
-    pub fn pane_output_events(&mut self, pane: PaneId, events: Vec<OutputEvent>) {
+    /// `clip_set`: whether each OSC 52 set reached the clipboard (pane_input_requests).
+    pub fn pane_output_events(&mut self, pane: PaneId, events: Vec<OutputEvent>, clip_set: Vec<bool>) {
+        let mut clip_set = clip_set.into_iter();
         if self.window_of(pane).is_none() {
             return;
         }
@@ -2187,8 +2162,8 @@ impl Server {
                     self.fire("pane-title-changed", p);
                     continue;
                 }
-                OutputEvent::Clipboard(data) => {
-                    if self.pane_clipboard(pane, data) {
+                OutputEvent::Clipboard => {
+                    if clip_set.next().unwrap_or(false) {
                         self.fire_pane("pane-set-clipboard", pane);
                     }
                     continue;
@@ -2352,14 +2327,14 @@ mod tests {
         let mut p = vt100::Parser::new_with_callbacks(nz(24), nz(80), 0, PaneCb::default());
         p.process(b"\x1b]133;A\x07\x1b]133;C\x07out\x1b]133;D;7\x07\x07\x1b]52;c;aGk=\x07");
         let cb = p.callbacks_mut();
-        let names: Vec<&str> = cb.events.iter().map(|e| match e { OutputEvent::Osc(name, _) => *name, OutputEvent::Title(_) => "title", OutputEvent::Clipboard(_) => "clipboard" }).collect();
+        let names: Vec<&str> = cb.events.iter().map(|e| match e { OutputEvent::Osc(name, _) => *name, OutputEvent::Title(_) => "title", OutputEvent::Clipboard => "clipboard" }).collect();
         assert_eq!(names, ["pane-shell-prompt", "pane-command-started", "pane-command-finished", "pane-bell", "clipboard"]);
         let OutputEvent::Osc(_, started) = &cb.events[1] else { panic!("command start") };
         let OutputEvent::Osc(_, finished) = &cb.events[2] else { panic!("command end") };
         assert!(started.cmd_running && started.cmd_status.is_none());
         assert_eq!(finished.cmd_status, Some(7));
         assert!(!finished.cmd_running);
-        assert_eq!(cb.clipboard, Some(("c".into(), "aGk=".into())));
+        assert_eq!(cb.clipboard_sets, [(b"c".to_vec(), b"aGk=".to_vec())]);
     }
 
     #[test]
