@@ -50,7 +50,7 @@ pub fn default_shell() -> String {
     }
 }
 
-fn is_powershell(shell: &str) -> bool {
+pub fn is_powershell(shell: &str) -> bool {
     let stem = std::path::Path::new(shell).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
     stem == "pwsh" || stem == "powershell"
 }

@@ -612,13 +612,18 @@ impl Server {
         let editor = self.opt_server("editor");
         // the editor option names the program (notepad.exe on Windows); the file is one argument
         let quoted = if cfg!(windows) { format!("\"{}\"", path.display()) } else { crate::cmdparse::quote(&path.display().to_string()) };
-        let cmd = format!("{editor} {quoted}");
-        let (cw, ch) = self.clients[&cid].size;
-        let (w, h) = ((cw as u32 * 9 / 10) as u16, (ch.saturating_sub(self.status_lines(self.client_session(cid))) as u32 * 9 / 10) as u16);
-        let (w, h) = (w.max(3), h.max(3));
-        let (x, y) = (cw / 2 - w / 2, ch / 2 - h / 2);
         let sid = self.client_session(cid);
-        let pane = match self.spawn_pane(sid, w - 2, h - 2, &[cmd], Some(&std::env::temp_dir().display().to_string()), &[]) {
+        let shell = self.opt_session(sid, "default-shell");
+        let shell = if shell.is_empty() { procinfo::default_shell() } else { shell };
+        let cmd = editor_command(&editor, &quoted, cfg!(windows) && procinfo::is_powershell(&shell));
+        // spawn_editor: a pane 9/10 of the window in its middle (xoff = sx / 2 - w / 2),
+        // here with a border around it
+        let (wsx, wsy) = self.client_window(cid).and_then(|w| self.windows.get(&w)).map_or(self.clients[&cid].size, |w| (w.sx, w.sy));
+        let (pw, ph) = (((wsx as u32 * 9 / 10) as u16).max(1), ((wsy as u32 * 9 / 10) as u16).max(1));
+        let top = self.client_window_top(cid);
+        let (x, y) = ((wsx / 2 - pw / 2).saturating_sub(1), (top + wsy / 2 - ph / 2).saturating_sub(1));
+        let (w, h) = (pw + 2, ph + 2);
+        let pane = match self.spawn_pane(sid, pw, ph, &[cmd], Some(&std::env::temp_dir().display().to_string()), &[]) {
             Ok(p) => p,
             Err(e) => {
                 let _ = std::fs::remove_file(&path);
@@ -989,6 +994,12 @@ mod tests {
     }
 
     #[test]
+    fn editor_waits_under_powershell() {
+        assert_eq!(editor_command("vi", "'/tmp/tmux.x'", false), "vi '/tmp/tmux.x'");
+        assert_eq!(editor_command("notepad.exe", "\"C:\\t\\tmux.x\"", true), "notepad.exe \"C:\\t\\tmux.x\" | Out-Null");
+    }
+
+    #[test]
     fn templates() {
         assert_eq!(fill_template("rename-window -- '%%'", &["it's".into()]), "rename-window -- 'it'\\''s'");
         assert_eq!(fill_template("a %1 b %2", &["x".into(), "y z".into()]), "a x b y z");
@@ -997,6 +1008,17 @@ mod tests {
         assert!(b["prefix"].contains_key("%"));
         assert!(b["prefix"].contains_key("\""));
         assert!(b["copy-mode-vi"].len() > 20);
+    }
+}
+
+/// "editor file" (spawn_editor). PowerShell does not wait for a GUI program such as the
+/// default notepad.exe to exit, so the file would be read (and removed) while it is still
+/// being edited; piping the program to Out-Null makes PowerShell wait for it.
+fn editor_command(editor: &str, quoted: &str, powershell: bool) -> String {
+    if powershell {
+        format!("{editor} {quoted} | Out-Null")
+    } else {
+        format!("{editor} {quoted}")
     }
 }
 
