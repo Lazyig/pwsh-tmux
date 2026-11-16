@@ -60,11 +60,20 @@ fn history_usage(screen: &vt100::Screen) -> (usize, usize, usize) {
                 ext += 1;
             }
         }
-        if used > 0 {
-            cells += if used < width / 4 { width / 4 } else if used < width / 2 { width / 2 } else { width };
-        }
+        cells += line_cellsize(width, used);
     }
     (lines, cells, ext)
+}
+
+/// A grid line's allocated cells (gl->cellsize): none until written, then grid_expand_line
+/// rounds up to a quarter, half or all of the width.
+pub fn line_cellsize(width: usize, used: usize) -> usize {
+    match used {
+        0 => 0,
+        u if u < width / 4 => width / 4,
+        u if u < width / 2 => width / 2,
+        _ => width,
+    }
 }
 
 /// tmux's pane_private_modes: the DEC private modes the application has turned on.

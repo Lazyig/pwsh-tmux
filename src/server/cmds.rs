@@ -5717,12 +5717,13 @@ fn capture_grid(screen: &vt100::Screen, limit: usize) -> String {
         let p = if yy < hsize { "-".to_string() } else { (yy - hsize).to_string() };
         let cells: Vec<Option<&vt100::Cell>> = (0..sx).map(|x| row.cell(x)).collect();
         let used = cells.iter().rposition(|c| c.is_some_and(|c| c.has_contents())).map_or(0, |i| i + 1);
+        let written = cells.iter().rposition(|c| c.is_some_and(|c| c.has_contents() || c.bgcolor() != vt100::Color::Default)).map_or(0, |i| i + 1);
         // GRID_LINE_* from the row's flags (the OSC 133 columns are not kept)
         let (marks, extended) = screen.history_row_flags(yy);
         let lflags = row.wrapped() as u32 | (extended as u32) << 1
             | [(vt100::ROW_START_PROMPT, 0x8), (vt100::ROW_SECOND_PROMPT, 0x10), (vt100::ROW_START_COMMAND, 0x20), (vt100::ROW_START_OUTPUT, 0x40), (vt100::ROW_END_OUTPUT, 0x80), (vt100::ROW_HYPERLINK, 0x100)]
                 .iter().filter(|(m, _)| marks & m != 0).map(|(_, f)| f).sum::<u32>();
-        let _ = writeln!(out, "\tL {yy} ({p}) flags={}[{lflags:x}] {used}/{}", names(lflags, &[(1, "WRAPPED"), (2, "EXTENDED"), (0x8, "START_PROMPT"), (0x10, "SECOND_PROMPT"), (0x20, "START_COMMAND"), (0x40, "START_OUTPUT"), (0x80, "END_OUTPUT"), (0x100, "HYPERLINK")]), cells.len());
+        let _ = writeln!(out, "\tL {yy} ({p}) flags={}[{lflags:x}] {used}/{}", names(lflags, &[(1, "WRAPPED"), (2, "EXTENDED"), (0x8, "START_PROMPT"), (0x10, "SECOND_PROMPT"), (0x20, "START_COMMAND"), (0x40, "START_OUTPUT"), (0x80, "END_OUTPUT"), (0x100, "HYPERLINK")]), super::vars::line_cellsize(cells.len(), written));
         let mut tab_end = 0;
         for (xx, c) in cells.iter().enumerate() {
             let meta = row.cell_metadata(xx as u16);
