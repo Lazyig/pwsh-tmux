@@ -1,6 +1,8 @@
 //! tmux 3.8 grid metadata: OSC 133 line marks, OSC 8 hyperlinks, tab cells and line
 //! times, and what reads them (capture-pane -F/-H/-I/-e, copy mode, attached clients).
-//! The expected outputs come from tmux 3.8 (tests/grid_metadata.sh on the reference pod).
+//! The expected outputs come from tmux 3.8 (tests/grid_metadata.sh on the reference pod);
+//! the panes run printf, so the tests are Unix-only.
+#![cfg(unix)]
 mod common;
 use common::*;
 
@@ -17,7 +19,6 @@ fn x(ctx: &Ctx, cmd: &[&str]) {
     ctx.ok(&args);
 }
 
-#[cfg(unix)]
 #[test]
 fn prompt_marks_and_prompt_motions() {
     let ctx = Ctx::new("grid-prompt");
@@ -58,7 +59,6 @@ fn prompt_marks_and_prompt_motions() {
     wait_for("unwrap", || cap(&ctx, &["-F", "-S", "-", "-E", "-"]) == marks);
 }
 
-#[cfg(unix)]
 #[test]
 fn hyperlinks_in_capture_and_copy_mode() {
     let ctx = Ctx::new("grid-link");
@@ -100,7 +100,6 @@ fn hyperlinks_in_capture_and_copy_mode() {
     assert_eq!(ctx.ok(&["capture-pane", "-p", "-M", "-F", "-E", "0", "-t", "m"]), "HX XA BB bb\n");
 }
 
-#[cfg(unix)]
 #[test]
 fn clear_history_h_forgets_links() {
     let ctx = Ctx::new("grid-link-reset");
@@ -120,7 +119,6 @@ fn clear_history_h_forgets_links() {
     assert_eq!(cap(&ctx, &["-e"])[2], "three\x1b]8;id=k;http://k\x1b\\four\x1b]8;;\x1b\\");
 }
 
-#[cfg(unix)]
 #[test]
 fn tab_cells_are_captured_and_copied_as_tabs() {
     let ctx = Ctx::new("grid-tab");
@@ -179,7 +177,6 @@ fn tab_cells_are_captured_and_copied_as_tabs() {
     assert_eq!(ctx.fmt("m", "#{copy_cursor_x},#{copy_cursor_y}"), "0,0");
 }
 
-#[cfg(unix)]
 #[test]
 fn line_times_for_capture_and_copy_mode() {
     let ctx = Ctx::new("grid-time");
@@ -207,7 +204,6 @@ fn line_times_for_capture_and_copy_mode() {
     assert_eq!(ctx.fmt("m", "#{top_line_time}"), first);
 }
 
-#[cfg(unix)]
 #[test]
 fn client_hyperlinks_are_feature_gated_and_survive_copy_mode() {
     for enabled in [false, true] {
