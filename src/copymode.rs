@@ -891,6 +891,10 @@ impl CopyMode {
     /// the cursor first moves a row so it stays on the same text.
     pub fn scroll_line(&mut self, up: bool) {
         let norect = self.anchor.is_none() || !self.rect;
+        // window_copy_scroll_up/down update the selection only when the view moves: at the
+        // top or bottom the cursor moves alone and the selection keeps its ends
+        let can_scroll = if up { self.top > 0 } else { self.top < self.hsize() };
+        let mut held = if can_scroll { None } else { self.slots().filter(|_| self.frozen.is_none()) };
         self.sticky_begin(norect);
         let row = self.cy - self.top;
         if self.vi {
@@ -916,11 +920,27 @@ impl CopyMode {
             let px = self.len(self.cy);
             if (self.cx >= self.tlastsx && self.cx != px) || self.cx > px {
                 self.cx = self.clamp_x(self.cy, px);
+                held = None;
             }
         } else {
             self.cx = self.clamp_x(self.cy, self.cx);
         }
         self.cx = self.snap(self.cy, self.cx);
+        if let Some((s, e)) = held {
+            self.pinned = Some(((self.cy, self.cx), s, e));
+        }
+    }
+
+    /// window_copy_move_mouse: the cursor goes to a cell of the view (before a command from
+    /// a mouse binding) without updating the selection.
+    pub fn move_mouse(&mut self, row: u16, col: u16) {
+        let held = self.slots().filter(|_| self.frozen.is_none());
+        let row = (row as usize).min(self.height - 1);
+        let y = (self.top + row).min(self.lines.len().saturating_sub(1));
+        self.update_cursor(y, self.cursor_unoffset(col as usize));
+        if let Some((s, e)) = held {
+            self.pinned = Some(((self.cy, self.cx), s, e));
+        }
     }
 
     /// Before a vertical move: remember the column unless the cursor is at the end of
@@ -3130,25 +3150,34 @@ impl CopyMode {
         Action::Copy { text, cancel, append }
     }
 
-    /// copy-line / copy-end-of-line: select from line start (or the cursor) to the end of
-    /// the `n`th line and copy it, leaving the original state untouched.
+    /// window_copy_do_copy_line / _do_copy_end_of_line: a selection from the start of the
+    /// line (copy-line, which also goes back to a character selection) or the cursor to the
+    /// end of the `n`th line is copied, then cleared, and the cursor goes back. The selection
+    /// mode, line and rectangle flags of an earlier selection stay in effect while it is made.
     fn copy_lines(&mut self, n: usize, from_cursor: bool, cancel: bool) -> Action {
-        let saved = (self.anchor, self.frozen, self.line_mode, self.rect, self.cy, self.cx, self.lastcx, self.top);
-        let saved_flags = (self.lineflag, self.word_origin, self.pinned);
-        (self.lineflag, self.word_origin, self.pinned) = (None, None, None);
-        self.anchor = Some((self.cy, if from_cursor { self.cx } else { 0 }));
+        let (ocy, ocx, otop) = (self.cy, self.cx, self.top);
+        if !from_cursor {
+            self.sel_mode = SelMode::Char;
+            let y = self.logical_start(self.cy);
+            self.set_cursor(y, 0);
+        }
+        // window_copy_start_selection
+        self.anchor = Some((self.cy, self.cx));
         self.frozen = None;
-        self.line_mode = false;
-        self.rect = false;
+        self.ends_swapped = false;
+        self.pinned = None;
         for _ in 1..n {
             self.vertical(1);
         }
-        self.cx = self.max_x(self.cy);
+        self.end_of_line();
         let text = self.selection_text();
-        (self.anchor, self.frozen, self.line_mode, self.rect, self.cy, self.cx, self.lastcx, self.top) = saved;
-        (self.lineflag, self.word_origin, self.pinned) = saved_flags;
+        if cancel {
+            return if text.is_empty() { Action::Cancel } else { Action::Copy { text, cancel, append: false } };
+        }
+        self.clear_selection();
+        (self.cy, self.cx, self.top) = (ocy, ocx, otop);
         if text.is_empty() {
-            return if cancel { Action::Cancel } else { Action::None };
+            return Action::None;
         }
         Action::Copy { text, cancel, append: false }
     }
@@ -3696,14 +3725,80 @@ mod tests {
     #[test]
     fn copy_line_and_end_of_line() {
         let mut cm = CopyMode::new(lines(&["first line", "second"]), W, 2, (0, 6), true);
-        assert_eq!(cm.run("copy-end-of-line", &[]), Action::Copy { text: "line\n".into(), cancel: false, append: false });
+        // vi copies to the last character, without the newline (tmux 3.8)
+        assert_eq!(cm.run("copy-end-of-line", &[]), Action::Copy { text: "line".into(), cancel: false, append: false });
         assert_eq!(pos(&cm), (0, 6), "state restored");
-        assert_eq!(copied(cm.run("copy-line", &[])), "first line\n");
+        assert_eq!(copied(cm.run("copy-line", &[])), "first line");
         cm.count = Some(2);
-        assert_eq!(copied(cm.run("copy-line", &[])), "first line\nsecond\n");
-        assert_eq!(cm.press("D"), Action::Copy { text: "line\n".into(), cancel: true, append: false });
+        assert_eq!(copied(cm.run("copy-line", &[])), "first line\nsecond");
+        assert_eq!(cm.press("D"), Action::Copy { text: "line".into(), cancel: true, append: false });
         let mut cm = CopyMode::new(lines(&["first line"]), W, 1, (0, 6), false);
         assert_eq!(cm.press("C-k"), Action::Copy { text: "line".into(), cancel: true, append: false });
+    }
+
+    #[test]
+    fn edge_scroll_without_history_and_mouse_moves_keep_the_selection_end() {
+        // window_copy_cursor_up/down(scroll_only) at the top or bottom move only the cursor
+        // (vi), and window_copy_move_mouse never updates the selection
+        let text = ["top line", "second", "third", "fourth"];
+        let mut cm = CopyMode::new(lines(&text), 30, 8, (4, 0), true);
+        cm.start_drag(3, 3);
+        cm.drag_to(0, 2);
+        cm.scroll_line(true);
+        assert_eq!(cm.view_cursor(), (1, 2));
+        assert_eq!(cm.selection_ends(), Some(((3, 3), (2, 0))));
+        cm.end_drag();
+        cm.move_mouse(0, 2);
+        assert_eq!(copied(cm.run("copy-pipe-and-cancel", &[])), "p line\nsecond\nthird\nfour");
+        // at the bottom of the history: the last row stays selected
+        let mut cm = CopyMode::new(lines(&["row1", "row2", "lastr"]), 30, 3, (2, 0), true);
+        cm.start_drag(0, 1);
+        cm.drag_to(2, 4);
+        cm.scroll_line(false);
+        assert_eq!(cm.view_cursor(), (1, 4));
+        cm.end_drag();
+        cm.move_mouse(2, 4);
+        assert_eq!(cm.view_cursor(), (2, 4));
+        assert_eq!(copied(cm.run("copy-selection", &[])), "ow1\nrow2\nlastr");
+        // a command from MouseDragEnd: the cursor goes to the release point first
+        let mut cm = CopyMode::new(lines(&text), 30, 8, (4, 0), false);
+        cm.start_drag(0, 0);
+        cm.drag_to(1, 3);
+        cm.end_drag();
+        cm.move_mouse(2, 4);
+        cm.run("stop-selection", &[]);
+        assert_eq!(cm.view_cursor(), (2, 4));
+        assert_eq!(cm.selection_ends(), Some(((0, 0), (3, 1))));
+    }
+
+    #[test]
+    fn copy_end_of_line_keeps_selection_flags_and_clears_the_selection() {
+        // window_copy_do_copy_end_of_line: start_selection keeps selflag, lineflag and
+        // rectflag; the selection is cleared afterwards (checked against tmux 3.8)
+        let text = ["one two three", "four five", "six seven", "eight"];
+        let run = |vi: bool, pre: &str, n: usize, cmd: &str| {
+            let mut cm = CopyMode::new(lines(&text), 30, 6, (0, 0), vi);
+            cm.run("history-top", &[]);
+            for _ in 0..5 { cm.run("cursor-right", &[]); }
+            if !pre.is_empty() { cm.run(pre, &[]); }
+            cm.count = Some(n);
+            let t = copied(cm.run(cmd, &[]));
+            assert!(!cm.selection_present() && !cm.selection_following() && cm.selection_mode() == SelMode::Char, "{pre} {cmd}");
+            t
+        };
+        assert_eq!(run(false, "", 1, "copy-end-of-line"), "wo three");
+        assert_eq!(run(false, "begin-selection", 2, "copy-end-of-line"), "wo three\nfour five");
+        assert_eq!(run(false, "select-line", 1, "copy-end-of-line"), "one two three");
+        assert_eq!(run(false, "select-word", 1, "copy-end-of-line"), "two three\nfour");
+        assert_eq!(run(false, "select-word", 2, "copy-end-of-line"), "two three\nfour five\nsix");
+        assert_eq!(run(false, "rectangle-on", 2, "copy-end-of-line"), "wo three\nfive");
+        assert_eq!(run(true, "", 2, "copy-end-of-line"), "wo three\nfour five");
+        assert_eq!(run(true, "select-line", 2, "copy-end-of-line"), "one two three\nfour five\n");
+        assert_eq!(run(true, "select-word", 1, "copy-end-of-line"), "two three");
+        assert_eq!(run(true, "rectangle-on", 1, "copy-end-of-line"), "wo three\n");
+        assert_eq!(run(true, "rectangle-on", 2, "copy-end-of-line"), "wo three\nfive\n");
+        assert_eq!(run(true, "begin-selection", 1, "copy-line"), "one two three");
+        assert_eq!(run(false, "select-line", 1, "copy-line"), "one two three");
     }
 
     #[test]

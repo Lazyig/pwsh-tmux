@@ -211,6 +211,10 @@ impl Server {
             let button = c.mouse_drag_flag - 1;
             c.mouse_drag_flag = 0;
             if let Some(Drag { kind: DragKind::Copy { pane } }) = c.drag.take() {
+                // window_copy_drag_release: with line numbers the release position counts
+                if matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(cm)) if cm.line_numbers_active()) {
+                    self.copy_drag_update(&ctx);
+                }
                 self.copy_drag_timers.remove(&pane);
                 if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
                     cm.end_drag();
@@ -628,11 +632,7 @@ impl Server {
         let Some(pane) = self.mouse_pane(m) else { return };
         let Some((x, y)) = self.mouse_at(pane, m, false) else { return };
         if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
-            // tmux moves only the cursor; here the cursor is one end of the selection, so
-            // an existing selection (to be copied next) is left alone
-            if !cm.selection_active() {
-                cm.move_to_view(y, x);
-            }
+            cm.move_mouse(y, x);
         }
     }
 
