@@ -1718,3 +1718,20 @@ m|0|m|M|\n");
         assert!(out.lines().any(|l| l == want), "{want}: {out}");
     }
 }
+
+#[test]
+fn global_colour_flags_accumulate_in_both_orders() {
+    let ctx = Ctx::new("theme-global-flags");
+    ctx.ok(&["new-session", "-d", "-s", "c"]);
+    for flags in [["-2", "-T", "RGB", "-T", "sync"], ["-T", "sync", "-T", "RGB", "-2"]] {
+        let mut child = ctx.command().args(flags).args(["-C", "attach", "-t", "c"])
+            .env("TERM", "dumb").env_remove("COLORTERM")
+            .stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+        wait_for("accumulated global features", || {
+            let features = ctx.ok(&["list-clients", "-F", "#{client_termfeatures}"]);
+            features.lines().any(|line| ["256", "RGB", "sync"].iter().all(|f| line.split(',').any(|v| v == *f)))
+        });
+        child.stdin.take().unwrap().write_all(b"\n").unwrap();
+        wait_for("control client exit", || child.try_wait().unwrap().is_some());
+    }
+}

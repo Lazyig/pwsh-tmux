@@ -444,10 +444,14 @@ impl Server {
         let inputs = c.keyp.feed(data);
         if c.keyp.in_paste() && c.input_state.paste_at.is_none() { c.input_state.paste_at = Some(Instant::now()); }
         if !c.keyp.in_paste() { c.input_state.paste_at = None; }
+        // a partial paste end or theme/colour reply restarts the deadline at 500ms or more
+        let reply = c.keyp.partial_paste_end() || c.keyp.theme_reply_pending();
         c.esc_deadline = if c.keyp.has_pending() || c.keyp.partial_paste_end() {
             let mut ms = self.opts_server.get("escape-time").and_then(|v| v.parse().ok()).unwrap_or(10u64).max(1);
-            if c.keyp.partial_paste_end() || !c.input_state.clipboard.is_empty() { ms = ms.max(500); }
-            if c.keyp.partial_paste_end() { Some(Instant::now() + Duration::from_millis(ms)) }
+            // tty_keys_next: also while a clipboard request (TTY_OSC52QUERY) is outstanding
+            let clipboard = !c.input_state.clipboard.is_empty() || c.clipboard_query.is_some_and(|d| Instant::now() < d);
+            if reply || clipboard { ms = ms.max(500); }
+            if reply { Some(Instant::now() + Duration::from_millis(ms)) }
             else { c.esc_deadline.or_else(|| Some(Instant::now() + Duration::from_millis(ms))) }
         } else {
             None
@@ -463,6 +467,7 @@ impl Server {
                 self.clipboard_reply(cid, raw);
                 return;
             }
+            if self.terminal_report(cid, raw) { return; }
             // focus reports set the client's focus (also for read-only clients)
             if raw == b"\x1b[I" || raw == b"\x1b[O" {
                 if let Some(c) = self.clients.get_mut(&cid) {

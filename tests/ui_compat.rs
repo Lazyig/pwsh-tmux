@@ -25,7 +25,7 @@ fn quote(s: &str) -> String {
 fn color(c: vt100::Color) -> String {
     match c {
         vt100::Color::Default => "default".into(),
-        vt100::Color::Idx(i) => format!("idx:{i}"),
+        vt100::Color::Idx(i) | vt100::Color::Palette(i) => format!("idx:{i}"),
         vt100::Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
     }
 }

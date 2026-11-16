@@ -280,7 +280,9 @@ fn terminal_features_and_extended_keys() {
     let t = Term::attach(&ctx, &["attach", "-t", "f"], 80, 24);
     t.wait_screen("status", |s| s.contains("[f]"));
     let feats = ctx.ok(&["list-clients", "-F", "#{client_termfeatures}"]);
-    assert!(feats.contains("256") && feats.contains("clipboard") && !feats.contains("RGB"), "{feats}");
+    // terminfo colors#256 is not the 256 feature (tmux adds that from DA replies or -2)
+    assert!(!feats.contains("256") && feats.contains("clipboard") && !feats.contains("RGB"), "{feats}");
+    assert_eq!(ctx.ok(&["list-clients", "-F", "#{client_colours}"]).trim(), "16");
     wait_for("256-colour status", || t.raw_text().contains("48;5;196"));
     assert!(!t.raw_text().contains("48;2;255;0;0"));
     drop(t);
@@ -620,4 +622,31 @@ fn message_log_names_keys_messages_and_errors() {
     let flags = term.split("flags=0x").nth(1).and_then(|r| r.split(':').next()).and_then(|h| u32::from_str_radix(h, 16).ok()).unwrap();
     assert!(term.starts_with("Terminal 0: ") && flags & 0x20 != 0, "{term}");
     drop(t);
+}
+
+#[cfg(unix)]
+#[test]
+fn client_theme_detection_and_pane_colours() {
+    // tmux 3.8: the client asks its terminal for the theme (mode 2031, DSR 996) and colours
+    // (OSC 10/11); builtin UI colours follow the detected theme on 256+ colour terminals.
+    let ctx = Ctx::new("theme");
+    ctx.ok(&["new-session", "-d", "-s", "th", "-x", "80", "-y", "24", "printf '\\033]11;#00ff00\\007'; sleep 30"]);
+    let t = Term::attach(&ctx, &["-T", "RGB", "attach", "-t", "th"], 80, 24);
+    t.wait_screen("status", |s| s.contains("[th]"));
+    assert!(t.raw_text().contains("\x1b[?2031h\x1b[?996n"), "theme subscription and query");
+    assert!(t.raw_text().contains("\x1b]10;?\x1b\\\x1b]11;?\x1b\\"), "colour queries");
+    // nothing reported yet: the dark theme (status bg yellowgreen)
+    wait_for("dark status", || t.raw_text().contains("48;2;154;205;50"));
+    // the pane's own OSC 11 colour is its default background
+    assert!(t.raw_text().contains("48;2;0;255;0"), "pane background");
+    // a light background reply infers the light theme without setting client_theme
+    t.send(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\");
+    wait_for("light status", || t.raw_text().contains("48;2;46;139;87"));
+    assert_eq!(ctx.ok(&["list-clients", "-F", "[#{client_theme}]"]).trim(), "[]");
+    // a theme report wins over the background
+    t.send(b"\x1b[?997;1n");
+    wait_for("reported theme", || ctx.ok(&["list-clients", "-F", "#{client_theme}"]).trim() == "dark");
+    ctx.ok(&["set", "-s", "theme", "terminal"]);
+    // theme terminal: the old ANSI colours (black on green)
+    wait_for("terminal colours", || t.raw_text().contains("\x1b[0;30;42m"));
 }

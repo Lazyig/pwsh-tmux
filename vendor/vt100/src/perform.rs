@@ -232,12 +232,12 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
                     }
                     _ => {
                         self.callbacks
-                            .unhandled_osc(&mut self.screen, params);
+                            .unhandled_osc_terminated(&mut self.screen, params, bel_terminated);
                     }
                 }
             }
             _ => {
-                self.callbacks.unhandled_osc(&mut self.screen, params);
+                self.callbacks.unhandled_osc_terminated(&mut self.screen, params, bel_terminated);
             }
         }
     }

@@ -170,7 +170,7 @@ fn push_color(out: &mut String, c: Color, base: u8) {
         Color::Idx(i) if i < 16 => {
             let _ = write!(out, ";{}", base + 60 + i - 8);
         }
-        Color::Idx(i) => {
+        Color::Idx(i) | Color::Palette(i) => {
             let _ = write!(out, ";{};5;{}", base + 8, i);
         }
         Color::Rgb(r, g, b) => {
@@ -181,12 +181,43 @@ fn push_color(out: &mut String, c: Color, base: u8) {
 
 /// Colours and attributes the client's terminal can show.
 fn fit_style(mut st: Style, f: &super::features::Features) -> Style {
+    let palette_fg = matches!(st.fg, Color::Rgb(..) | Color::Palette(_) | Color::Idx(16..=255));
+    // tty_check_fg runs before tty_check_bg: black-on-black compares with the unconverted bg
+    let bg = st.bg;
     st.fg = super::features::fit_color(st.fg, f);
     st.bg = super::features::fit_color(st.bg, f);
+    if f.colours() == 2 {
+        if st.attrs & INVERSE != 0 {
+            if st.fg != Color::Idx(7) && st.fg != Color::Default { st.attrs &= !INVERSE; }
+        } else if st.bg != Color::Idx(0) && st.bg != Color::Default { st.attrs |= INVERSE; }
+        st.fg = Color::Default;
+        st.bg = Color::Default;
+    } else if f.colours() < 16 {
+        if let Color::Idx(i @ 8..=15) = st.bg { st.bg = Color::Idx(i & 7); }
+        if let Color::Idx(i @ 8..=15) = st.fg {
+            st.fg = Color::Idx(i & 7);
+            if !palette_fg { st.attrs |= BOLD; }
+            else if st.fg == bg && matches!(st.fg, Color::Idx(0 | 7)) {
+                st.fg = if st.fg == Color::Idx(0) { Color::Idx(7) } else { Color::Idx(0) };
+            }
+        }
+    }
     if !f.has("strikethrough") {
         st.attrs &= !STRIKE;
     }
     st
+}
+
+/// tty_dim_default_colour: use terminal colours, then the explicit terminal theme.
+fn dim_default(colour: Color, foreground: bool, terminal: &super::theme::Terminal, dim: u8) -> Color {
+    let colour = if colour != Color::Default { colour } else {
+        (if foreground { terminal.fg } else { terminal.bg }).unwrap_or_else(|| match terminal.reported {
+            Some(format::Theme::Dark) => Color::Idx(if foreground { 7 } else { 0 }),
+            Some(format::Theme::Light) => Color::Idx(if foreground { 0 } else { 7 }),
+            _ => Color::Default,
+        })
+    };
+    format::dim_color(colour, dim)
 }
 
 pub fn push_sgr(out: &mut String, st: &Style) {
@@ -257,14 +288,21 @@ impl Server {
     }
 
     pub fn render_all(&mut self) {
+        self.notify_pane_themes();
         let ids: Vec<ClientId> = self.clients.iter().filter(|(_, c)| c.dirty && c.attached && !c.suspended && c.control == 0 && c.session.is_some()).map(|(id, _)| *id).collect();
         for id in ids {
-            self.render(id);
+            // theme colours parsed without a client are drawn in this client's palette
+            let palette = vars::VarCtx { srv: self, t: Target::default(), client: Some(id), extra: HashMap::new() }.theme_palette();
+            format::with_draw_palette(palette, || self.render(id));
         }
     }
 
-    /// A style option for a target and client. As options_string_to_style, a style containing
-    /// `#{` is expanded as a format first, so colours in styles can be formats (3.8).
+    fn styled_spans(&self, text: &str, base: Style, t: Target, cid: ClientId) -> Vec<format::Span> {
+        let ctx = vars::VarCtx { srv: self, t, client: Some(cid), extra: HashMap::new() };
+        format::spans_with(text, base, Some(&ctx))
+    }
+
+    /// Expand a style option with the rendering client and target (options_string_to_style).
     fn style_option(&self, value: &str, base: Style, t: Target, cid: Option<ClientId>) -> Option<Style> {
         let ctx = vars::VarCtx { srv: self, t, client: cid, extra: HashMap::new() };
         format::parse_style_with(value, base, Some(&ctx)).ok().map(|p| p.style)
@@ -314,8 +352,8 @@ impl Server {
         let right = self.expand_status_time(cur, cid, &self.opt_session(Some(sid), "status-right"), "");
         let left_len = self.opt_session_num(Some(sid), "status-left-length").max(0) as usize;
         let right_len = self.opt_session_num(Some(sid), "status-right-length").max(0) as usize;
-        let lcells = spans_cells(&format::spans(&left, left_style), left_len.min(width), base);
-        let mut rcells = spans_cells(&format::spans(&right, right_style), right_len, base);
+        let lcells = spans_cells(&self.styled_spans(&left, left_style, cur, cid), left_len.min(width), base);
+        let mut rcells = spans_cells(&self.styled_spans(&right, right_style, cur, cid), right_len, base);
         let available = width.saturating_sub(lcells.len());
         if rcells.len() > available { rcells.drain(..rcells.len() - available); }
 
@@ -345,14 +383,14 @@ impl Server {
             }
             let text = self.expand_status_time(t, cid, &fmt, "W");
             let start = wcells.len();
-            wcells.extend(spans_cells(&format::spans(&text, st), usize::MAX, st));
+            wcells.extend(spans_cells(&self.styled_spans(&text, st, t, cid), usize::MAX, st));
             wtags.resize(wcells.len(), Some(format::Range::Window(*idx)));
             if is_cur {
                 cur_range = (start, wcells.len());
             }
             if k + 1 < n {
                 let sep_start = wcells.len();
-                wcells.extend(spans_cells(&format::spans(&sep, base), usize::MAX, base));
+                wcells.extend(spans_cells(&self.styled_spans(&sep, base, t, cid), usize::MAX, base));
                 wtags.resize(wcells.len(), None);
                 // tmux's window range (closed by #[norange]) covers one cell more
                 if let Some(t) = wtags.get_mut(sep_start) {
@@ -450,16 +488,41 @@ impl Server {
             let is_active = *id == win.active;
             let pane_target = self.target_for_pane(*id);
             let pst = |name: &str| self.style_option(&self.opt_pane(*id, name), Style::default(), pane_target, Some(cid)).unwrap_or_default();
-            let wstyle = pst(if is_active { "window-active-style" } else { "window-style" });
-            let wstyle = if is_active && wstyle == Style::default() { pst("window-style") } else { wstyle };
+            // Active: active style > pane palette > window style. Inactive: window style > palette.
+            let mut wstyle = pst("window-style");
+            let own = &p.parser.callbacks().colours;
+            if is_active {
+                if let Some(c) = own.fg { wstyle.fg = c; }
+                if let Some(c) = own.bg { wstyle.bg = c; }
+                let active = pst("window-active-style");
+                if active.fg != Color::Default { wstyle.fg = active.fg; }
+                if active.bg != Color::Default { wstyle.bg = active.bg; }
+            }
+            if wstyle.fg == Color::Default { wstyle.fg = own.fg.unwrap_or(Color::Default); }
+            if wstyle.bg == Color::Default { wstyle.bg = own.bg.unwrap_or(Color::Default); }
+            let (default_fg, default_bg) = self.pane_style_colours(*id);
+            if default_fg == super::theme::StyleColour::Terminal { wstyle.fg = Color::Default; }
+            if default_bg == super::theme::StyleColour::Terminal { wstyle.bg = Color::Default; }
+            let dim_ctx = vars::VarCtx { srv: self, t: pane_target, client: Some(cid), extra: HashMap::new() };
+            let mut dim = format::parse_style_with(&self.opt_pane(*id, "window-style"), Style::default(), Some(&dim_ctx)).map(|p| p.dim).unwrap_or(0);
+            if is_active {
+                let active_dim = format::parse_style_with(&self.opt_pane(*id, "window-active-style"), Style::default(), Some(&dim_ctx)).map(|p| p.dim).unwrap_or(0);
+                dim = active_dim;
+            }
+            let dim_style = |style: &mut Style| {
+                if dim != 0 {
+                    style.fg = dim_default(style.fg, true, &c.terminal, dim);
+                    style.bg = dim_default(style.bg, false, &c.terminal, dim);
+                }
+            };
             let mode_lines: Option<(Vec<Line>, Option<(u16, u16)>)> = match &p.mode {
                 Some(PaneMode::Copy(cm)) => {
                     let style = self.style_option(&self.opt_window(Some(wid), "mode-style"), Style::default(), pane_target, Some(cid)).unwrap_or_default();
                     let (lines, cur) = cm.render_with_style(style);
                     Some((lines, Some((cur.1, cur.0))))
                 }
-                Some(PaneMode::Tree(t)) => Some((t.render(self, cr.w, cr.h), None)),
-                Some(PaneMode::Clock) => Some((Vec::new(), None)),
+                Some(PaneMode::Tree(t)) => Some((t.render(self, cid, cr.w, cr.h), None)),
+                Some(PaneMode::Clock) => Some((vec![Line { cells: vec![Cell::default(); cr.w as usize], wrapped: false }; cr.h as usize], None)),
                 None => None,
             };
             match &mode_lines {
@@ -488,12 +551,23 @@ impl Server {
                 }
             }
             if matches!(p.mode, Some(PaneMode::Clock)) {
-                let colour = format::parse_color(&self.opt_window(Some(wid), "clock-mode-colour")).unwrap_or(Color::Idx(4));
+                let ctx = vars::VarCtx { srv: self, t: pane_target, client: Some(cid), extra: HashMap::new() };
+                let value = format::expand(&self.opt_window(Some(wid), "clock-mode-colour"), &ctx);
+                let colour = format::parse_color_with(&value, Some(&ctx)).unwrap_or(Color::Idx(4));
                 let text = clock_text(self.opt_window(Some(wid), "clock-mode-style") != "12");
                 let rr = Rect { y: oy + cr.y, h: cr.h.saturating_sub(1), ..cr };
-                if cr.h < 6 || !big_text(&mut f, rr, &text, colour) {
-                    f.text(cr.x, oy + cr.y + cr.h / 2, &text, Style { fg: colour, ..Style::default() }, cr.x + cr.w);
+                if cr.h < 6 || !super::modes::big_clock(&mut f, rr, &text, colour) {
+                    f.text(cr.x, oy + cr.y + cr.h / 2, &text, Style { fg: colour, bg: wstyle.bg, ..Style::default() }, cr.x + cr.w);
                 }
+            }
+            if dim != 0 {
+                for y in 0..cr.h { for x in 0..cr.w {
+                    if let Some(cell) = f.get(cr.x + x, oy + cr.y + y).cloned() {
+                        let mut cell = cell;
+                        dim_style(&mut cell.style);
+                        f.set(cr.x + x, oy + cr.y + y, cell);
+                    }
+                } }
             }
             if is_active {
                 match &mode_lines {
@@ -585,7 +659,7 @@ impl Server {
                     if x >= r.x + 2 || !at(x as i32, by as i32) { f.set(x, oy + by, Cell { text: bset[0].into(), style: st }); }
                 }
                 let text = self.expand_for_pane(*id, &self.opt_window(Some(wid), "pane-border-format"));
-                let cells = spans_cells(&format::spans(&text, st), r.w.saturating_sub(2) as usize, st);
+                let cells = spans_cells(&self.styled_spans(&text, st, self.target_for_pane(*id), cid), r.w.saturating_sub(2) as usize, st);
                 f.put_cells(r.x + 2, oy + by, &cells);
             }
         }
@@ -627,8 +701,10 @@ impl Server {
             match ov {
                 Overlay::DisplayPanes { .. } => {
                     cursor = None;
-                    let colour = format::parse_color(&self.opt_window(Some(wid), "display-panes-colour")).unwrap_or(Color::Idx(4));
-                    let acolour = format::parse_color(&self.opt_window(Some(wid), "display-panes-active-colour")).unwrap_or(Color::Idx(1));
+                    let ctx = vars::VarCtx { srv: self, t: active_target, client: Some(cid), extra: HashMap::new() };
+                    let colour = |name| format::parse_color_with(&format::expand(&self.opt_window(Some(wid), name), &ctx), Some(&ctx)).unwrap_or(Color::Default);
+                    let acolour = colour("display-panes-active-colour");
+                    let colour = colour("display-panes-colour");
                     let base = self.opt_window_num(Some(wid), "pane-base-index").max(0) as usize;
                     for (i, (id, r)) in rects.iter().enumerate() {
                         let col = if *id == win.active { acolour } else { colour };
@@ -711,7 +787,7 @@ impl Server {
                     let base = self.status_style(sid, cid);
                     let cur = Target { sid: Some(sid), idx: Some(s.active), wid: Some(wid), pane: Some(win.active) };
                     let text = self.expand_status_time(cur, cid, custom, "");
-                    format::layout_line_ranged(&format::spans(&text, base), cw as usize, base)
+                    format::layout_line_ranged(&self.styled_spans(&text, base, cur, cid), cw as usize, base)
                 } else if i == 0 {
                     self.status_line(cid, sid, cw)
                 } else {
@@ -922,5 +998,67 @@ pub(super) fn merged_cursor_style(app: u8, (blinking, blinking_set): (bool, bool
         0 if !blinking_set => option,
         0 => with_blink(option),
         n => with_blink(n),
+    }
+}
+
+
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+
+
+    #[test]
+    fn mono_and_modern_terminals_preserve_their_colour_capabilities() {
+        for term in ["vt100", "dumb"] {
+            let f = super::super::features::compute(term, "", &[], "");
+            let style = fit_style(Style { fg: Color::Idx(1), bg: Color::Idx(4), ..Style::default() }, &f);
+            assert_eq!((style.fg, style.bg, style.attrs & INVERSE), (Color::Default, Color::Default, INVERSE));
+            let mut out = String::new();
+            push_sgr(&mut out, &style);
+            assert_eq!(out, "\x1b[0;7m");
+        }
+        for term in ["xterm", "foot", "xterm-ghostty", "wezterm"] {
+            let f = super::super::features::compute(term, "", &[], "");
+            let style = fit_style(Style { fg: Color::Idx(9), ..Style::default() }, &f);
+            assert_eq!((style.fg, style.attrs & BOLD), (Color::Idx(9), 0), "{term}");
+        }
+        let f = super::super::features::compute("screen", "", &[], "");
+        let mut parser = vt100::Parser::default();
+        parser.process(b"\x1b[38;5;9mX");
+        let cell = crate::cells::cell_from_vt(parser.screen().cell(0, 0).unwrap());
+        assert_eq!(cell.style.fg, Color::Palette(9));
+        let style = fit_style(cell.style, &f);
+        assert_eq!((style.fg, style.attrs & BOLD), (Color::Idx(1), 0));
+    }
+
+    #[test]
+    fn dim_defaults_follow_explicit_terminal_colours_and_theme() {
+        let mut t = super::super::theme::Terminal::default();
+        t.reported = Some(format::Theme::Dark);
+        assert_eq!(dim_default(Color::Default, true, &t, 50), format::dim_color(Color::Idx(7), 50));
+        t.reported = Some(format::Theme::Light);
+        assert_eq!(dim_default(Color::Default, false, &t, 50), format::dim_color(Color::Idx(7), 50));
+        t.bg = Some(Color::Rgb(20, 40, 60));
+        assert_eq!(dim_default(Color::Default, false, &t, 50), Color::Rgb(10, 20, 30));
+    }
+    #[test]
+    fn eight_colour_style_downgrade_matches_tty_checks() {
+        let f = super::super::features::compute("screen", "", &[], "");
+        let style = fit_style(Style { fg: Color::Idx(9), bg: Color::Idx(15), ..Style::default() }, &f);
+        assert_eq!((style.fg, style.bg, style.attrs & BOLD), (Color::Idx(1), Color::Idx(7), BOLD));
+        let style = fit_style(Style { fg: Color::Idx(196), bg: Color::Idx(231), ..Style::default() }, &f);
+        assert_eq!((style.fg, style.bg, style.attrs & BOLD), (Color::Idx(1), Color::Idx(7), 0));
+        // colour240 is bright black, so black: not on black, which would hide it
+        let style = fit_style(Style { fg: Color::Idx(240), bg: Color::Idx(0), ..Style::default() }, &f);
+        assert_eq!((style.fg, style.bg), (Color::Idx(7), Color::Idx(0)));
+        // the swap looks at the bg before it is converted: colour233 is not black yet
+        let style = fit_style(Style { fg: Color::Idx(240), bg: Color::Idx(233), ..Style::default() }, &f);
+        assert_eq!((style.fg, style.bg), (Color::Idx(0), Color::Idx(0)));
+        // colour244 is white in colour_256to16, so nothing is swapped
+        let style = fit_style(Style { fg: Color::Idx(244), bg: Color::Idx(7), ..Style::default() }, &f);
+        assert_eq!((style.fg, style.bg), (Color::Idx(7), Color::Idx(7)));
+        let f = super::super::features::compute("xterm-16color", "", &[], "");
+        let style = fit_style(Style { fg: Color::Idx(196), bg: Color::Idx(231), ..Style::default() }, &f);
+        assert_eq!((style.fg, style.bg), (Color::Idx(9), Color::Idx(15)));
     }
 }

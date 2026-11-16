@@ -16,6 +16,7 @@ mod render;
 mod vars;
 mod transport;
 mod output;
+mod theme;
 
 use crate::cells::Line;
 use crate::copymode::CopyMode;
@@ -93,6 +94,7 @@ pub struct PaneInfo {
 /// Answers terminal queries and collects title / bell / cwd reports from a pane.
 #[derive(Default)]
 pub struct PaneCb {
+    pub colours: theme::PaneColours,
     pub replies: Vec<u8>,
     pub bell: bool,
     pub title: Option<String>,
@@ -251,7 +253,7 @@ pub fn colour_name(c: vt100::Color) -> String {
         vt100::Color::Default => "default".into(),
         vt100::Color::Idx(i) if i < 8 => NAMES[i as usize].into(),
         vt100::Color::Idx(i) if i < 16 => format!("bright{}", NAMES[i as usize - 8]),
-        vt100::Color::Idx(i) => format!("colour{i}"),
+        vt100::Color::Idx(i) | vt100::Color::Palette(i) => format!("colour{i}"),
         vt100::Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
     }
 }
@@ -314,11 +316,15 @@ impl vt100::Callbacks for PaneCb {
     fn reset(&mut self, _: &mut vt100::Screen) {
         // screen_write_reset: extended-keys always puts the pane back in mode 1
         self.ext_keys = (self.ext_option == 2) as u8;
+        // colour_palette_clear: the pane's OSC 10/11 colours go back to the default
+        self.colours.reset();
     }
+    fn theme_subscription(&mut self, _: &mut vt100::Screen) { self.colours.subscribe(); }
     fn rename_window(&mut self, _: &mut vt100::Screen, name: &[u8]) {
         self.rename = Some(String::from_utf8_lossy(name).into_owned());
     }
-    fn unhandled_osc(&mut self, screen: &mut vt100::Screen, params: &[&[u8]]) {
+    fn unhandled_osc_terminated(&mut self, screen: &mut vt100::Screen, params: &[&[u8]], bel: bool) {
+        self.colours.osc(params, bel, &mut self.replies);
         self.osc.osc(params);
         match params {
             // input_osc_133: the cursor's line starts a prompt (a continuation prompt,
@@ -337,6 +343,10 @@ impl vt100::Callbacks for PaneCb {
     fn unhandled_csi(&mut self, screen: &mut vt100::Screen, i1: Option<u8>, _i2: Option<u8>, params: &[&[u16]], c: char) {
         let first = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
         match (i1, c, first) {
+            (Some(b'?'), 'p', 2031) if _i2 == Some(b'$') => {
+                self.replies.extend(format!("\x1b[?2031;{}$y", if screen.theme_updates() { 1 } else { 2 }).bytes());
+            }
+            (Some(b'?'), 'n', 996) => self.colours.report(&mut self.replies),
             (None, 'n', 6) => {
                 let (r, c) = screen.cursor_position();
                 self.replies.extend(format!("\x1b[{};{}R", r + 1, c + 1).bytes());
@@ -689,6 +699,7 @@ pub struct Client {
     /// CLIENT_FOCUSED: set when the client gets a session, then follows the terminal's
     /// focus reports.
     pub focused: bool,
+    pub terminal: theme::Terminal,
     /// Frames queued for the writer thread, and since when the queue has been non-empty
     /// (ms since the epoch): how far behind the client is (control mode pause-after).
     pub pending: Arc<std::sync::atomic::AtomicUsize>,
@@ -1402,6 +1413,7 @@ impl Server {
                 features: Default::default(),
                 clipboard_query: None,
                 focused: false,
+                terminal: Default::default(),
                 pending,
                 queued_bytes,
                 closed,
@@ -1487,12 +1499,14 @@ impl Server {
                 let table: Vec<String> = self.opts_server.0.iter().filter(|(k, _)| k.starts_with("terminal-features[")).map(|(_, v)| v.clone()).collect();
                 let program = ident.env.iter().find(|(k, _)| k == "TERM_PROGRAM").map(|(_, v)| v.as_str()).unwrap_or("");
                 let mut features = features::compute_named(&ident.term, program, colorterm, &table, &get(8));
-                let table = self.opts_server.array_items("terminal-overrides").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
-                let caps = features::overrides(&ident.term, &table, &mut features);
+                let overrides = self.opts_server.array_items("terminal-overrides").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
+                let caps = features::overrides(&ident.term, &overrides, &mut features);
+                let vt100 = theme::vt100_like(&ident.term, &overrides);
                 if let Some(c) = self.clients.get_mut(&cid) {
                     c.term_caps = caps;
                     c.control = control;
                     c.features = features;
+                    c.terminal.vt100 = vt100;
                     c.size = (ident.cols.max(1), ident.rows.max(1));
                     c.ident = Some(ident);
                 }
@@ -1548,6 +1562,7 @@ impl Server {
                 if let Some(sid) = c.session {
                     self.update_session_size(sid);
                 }
+                self.repeat_terminal_queries(cid);
             }
             C_CONTROL_LINE => {
                 let line = String::from_utf8_lossy(&payload).into_owned();
@@ -1560,6 +1575,11 @@ impl Server {
                     c.activity = now_secs();
                     c.prev = None;
                     c.dirty = true;
+                    // tty_start_tty: subscribe to theme changes and ask for the theme again;
+                    // colours are asked for (and waited on) only once a theme report arrives
+                    if c.control == 0 && c.terminal.vt100 {
+                        c.send(S_OUTPUT, b"\x1b[?2031h\x1b[?996n");
+                    }
                 }
             }
             _ => {}
@@ -1577,11 +1597,13 @@ impl Server {
         let variation_wide = options::is_on(&self.opt_server("variation-selector-always-wide"));
         let input_limit = self.opt_server_num("input-buffer-size") as usize;
         let ext_option = ext_keys_option(&self.opt_server("extended-keys"));
+        let colours = self.pane_colours(id);
         let p = self.panes.get_mut(&id).unwrap();
         p.parser.callbacks_mut().ext_option = ext_option;
         p.parser.set_input_buffer_size(input_limit);
         p.parser.screen_mut().set_alternate_screen_allowed(alternate);
         p.parser.screen_mut().set_codepoint_widths(widths, variation_wide);
+        p.parser.callbacks_mut().colours.update(colours);
         p.parser.screen_mut().set_scroll_on_clear(scroll_on_clear);
         // capture-pane -I: rows entering the history record when
         p.parser.screen_mut().set_time(now_secs());
@@ -1602,7 +1624,9 @@ impl Server {
                 p.track.pipe_pid = None;
             }
         }
+        let enabled = p.screen().theme_updates();
         let cb = p.parser.callbacks_mut();
+        cb.colours.notify(enabled, &mut cb.replies);
         let replies = std::mem::take(&mut cb.replies);
         let bell = std::mem::take(&mut cb.bell);
         let title = cb.title.take();
@@ -2444,12 +2468,7 @@ impl Server {
         c.key_table = "root".into();
         if !was_attached {
             c.send(S_ATTACHED, if clear { b"" } else { b"no-clear" });
-            // tty_send_requests: ask a VT100-like terminal whether it has synchronized output
-            // (DECRQM 2026); the reply adds the sync feature
-            let term = c.ident.as_ref().map(|i| i.term.as_str()).unwrap_or("");
-            if c.control == 0 && !term.is_empty() && term != "dumb" {
-                c.send(S_OUTPUT, b"\x1b[?2026$p");
-            }
+            self.start_terminal_queries(cid);
         }
         let writable = !self.client_is_readonly(Some(cid));
         let now = now_secs();

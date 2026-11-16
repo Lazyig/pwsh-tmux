@@ -48,6 +48,8 @@ pub trait Vars {
     fn theme_color(&self, _name: &str) -> Option<Color> {
         None
     }
+    /// A colour escape using the current client's terminal capabilities.
+    fn colour_escape(&self, _name: &str, _background: bool) -> Option<String> { None }
     /// The session environment, then the global one: format_find's last resort for a name
     /// that is not a variable or option. A name removed (-r) in the session has no value and
     /// is not looked up globally.
@@ -917,6 +919,9 @@ impl Vars for Overlay<'_> {
     fn theme_color(&self, name: &str) -> Option<Color> {
         self.base.theme_color(name)
     }
+    fn colour_escape(&self, name: &str, background: bool) -> Option<String> {
+        self.base.colour_escape(name, background)
+    }
     fn environ(&self, name: &str) -> Option<String> {
         self.base.environ(name)
     }
@@ -1005,12 +1010,11 @@ fn palette_rgb(n: u8) -> (u8, u8, u8) {
 
 /// Dim a colour by a percentage (colour_dim), for styles with dim=. Default colours are
 /// left alone.
-#[allow(dead_code)] // for the renderer of window-style dim=
 pub fn dim_color(color: Color, dim: u8) -> Color {
     let (r, g, b) = match color {
         _ if dim == 0 => return color,
         Color::Default => return color,
-        Color::Idx(n) => palette_rgb(n),
+        Color::Idx(n) | Color::Palette(n) => palette_rgb(n),
         Color::Rgb(r, g, b) => (r, g, b),
     };
     let scale = |v: u8| (v as u32 * (100 - dim.min(100) as u32) / 100) as u8;
@@ -1027,7 +1031,7 @@ fn colour_format(s: &str, flags: &str, vars: &dyn Vars) -> String {
     if !fg && !bg {
         let rgb = match theme.map_or_else(|| parse_color(s), |_| None) {
             Some(Color::Rgb(r, g, b)) => (r, g, b),
-            Some(Color::Idx(n)) => palette_rgb(n),
+            Some(Color::Idx(n) | Color::Palette(n)) => palette_rgb(n),
             _ => return String::new(),
         };
         return format!("{:02x}{:02x}{:02x}", rgb.0, rgb.1, rgb.2);
@@ -1035,10 +1039,11 @@ fn colour_format(s: &str, flags: &str, vars: &dyn Vars) -> String {
     if lower == "none" {
         return "\x1b[0m".into();
     }
+    if let Some(escape) = vars.colour_escape(s, bg) { return escape; }
     let base = if bg { 40 } else { 30 };
     let (color, is256) = match theme {
         Some(i) => match vars.theme_color(&lower) {
-            Some(c) => (c, true),
+            Some(c) => (c, matches!(c, Color::Idx(16..=255))),
             None => (Color::Idx(THEMES[i].3), false),
         },
         None => match parse_color(s) {
@@ -1049,6 +1054,7 @@ fn colour_format(s: &str, flags: &str, vars: &dyn Vars) -> String {
     match color {
         Color::Default => format!("\x1b[{}m", base + 9),
         Color::Rgb(r, g, b) => format!("\x1b[{};2;{r};{g};{b}m", base + 8),
+        Color::Palette(n) => format!("\x1b[{};5;{n}m", base + 8),
         Color::Idx(n) if is256 => format!("\x1b[{};5;{n}m", base + 8),
         Color::Idx(n) if n < 8 => format!("\x1b[{}m", base + n as u32),
         Color::Idx(n) => format!("\x1b[{}m", base + 60 + n as u32 - 8),
@@ -1730,20 +1736,39 @@ pub enum Theme {
     Terminal,
 }
 
-static DEFAULT_THEME: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-/// Set the theme used for theme colour names in styles parsed without a client (default dark).
-#[allow(dead_code)] // for the theme option
-pub fn set_default_theme(theme: Theme) {
-    DEFAULT_THEME.store(theme as u8, std::sync::atomic::Ordering::Relaxed);
+thread_local! {
+    /// The theme palette of the client being drawn. tmux keeps theme colours unresolved in
+    /// styles parsed without a client and maps them per client as it draws
+    /// (tty_map_theme_colour); here names parsed without a client while a client is drawn
+    /// use that client's palette, and the dark defaults otherwise.
+    static DRAW_PALETTE: std::cell::Cell<Option<[Color; 10]>> = const { std::cell::Cell::new(None) };
 }
 
-fn default_theme() -> Theme {
-    match DEFAULT_THEME.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => Theme::Light,
-        2 => Theme::Terminal,
-        _ => Theme::Dark,
+/// Run `f` with theme names parsed without a client resolving to `palette` (one colour per
+/// theme_index).
+pub fn with_draw_palette<R>(palette: [Color; 10], f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<[Color; 10]>);
+    impl Drop for Restore {
+        fn drop(&mut self) { DRAW_PALETTE.with(|p| p.set(self.0)); }
     }
+    let _restore = Restore(DRAW_PALETTE.with(|p| p.replace(Some(palette))));
+    f()
+}
+
+/// A theme name parsed without a client: the drawn client's colour, else the dark default.
+fn default_theme_color(name: &str) -> Option<Color> {
+    let i = theme_index(name)?;
+    DRAW_PALETTE.with(|p| p.get()).map(|p| p[i]).or_else(|| theme_color(name, Theme::Dark))
+}
+
+/// The position of a theme colour name in theme_name order.
+pub fn theme_index(name: &str) -> Option<usize> {
+    THEMES.iter().position(|t| name.eq_ignore_ascii_case(t.0))
+}
+
+/// The theme colour name at a theme_index (themeblack ... thememagenta).
+pub fn theme_name(i: usize) -> &'static str {
+    THEMES[i].0
 }
 
 /// The colour of a theme name (themeblack, themewhite, themelightgrey, themedarkgrey,
@@ -1760,7 +1785,7 @@ pub fn theme_color(name: &str, theme: Theme) -> Option<Color> {
 /// parse_color, resolving theme names through the client of a format context if any.
 pub fn parse_color_with(s: &str, vars: Option<&dyn Vars>) -> Option<Color> {
     if THEMES.iter().any(|t| s.eq_ignore_ascii_case(t.0)) {
-        return vars.and_then(|v| v.theme_color(&s.to_ascii_lowercase())).or_else(|| theme_color(s, default_theme()));
+        return vars.and_then(|v| v.theme_color(&s.to_ascii_lowercase())).or_else(|| default_theme_color(s));
     }
     parse_color(s)
 }
@@ -1775,7 +1800,7 @@ pub fn parse_color(s: &str) -> Option<Color> {
         return Some(Color::Default);
     }
     if THEMES.iter().any(|t| t.0 == s) {
-        return theme_color(&s, default_theme());
+        return default_theme_color(&s);
     }
     if let Some(i) = NAMES.iter().position(|n| *n == s) {
         return Some(Color::Idx(i as u8));
@@ -1791,7 +1816,7 @@ pub fn parse_color(s: &str) -> Option<Color> {
         return Some(Color::Rgb((v >> 16) as u8, (v >> 8) as u8, v as u8));
     }
     if let Some(num) = s.strip_prefix("colour").or_else(|| s.strip_prefix("color")) {
-        return strtonum(num).filter(|n| (0..=255).contains(n)).map(|n| Color::Idx(n as u8));
+        return strtonum(num).filter(|n| (0..=255).contains(n)).map(|n| Color::palette(n as u8));
     }
     match s.as_str() {
         "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" => return s.parse().ok().map(Color::Idx),
@@ -1923,6 +1948,7 @@ fn style_words(s: &str) -> impl Iterator<Item = &str> {
 
 /// Parse a style string like "fg=red,bg=colour235,bold,noitalics" applying it on top of `base`.
 /// `default` resets to `base`. `align=`, `fill=`, `list=` etc are validated but have no effect.
+#[allow(dead_code)] // the tests' shorthand for parse_style_with
 pub fn parse_style(s: &str, base: Style) -> Result<Style, String> {
     parse_style_with(s, base, None).map(|p| p.style)
 }
@@ -2044,6 +2070,11 @@ pub struct Span {
 /// current style the default, `#[pop-default]` restores the previous one. A directive with an
 /// invalid word is ignored.
 pub fn spans(text: &str, base: Style) -> Vec<Span> {
+    spans_with(text, base, None)
+}
+
+/// Styled text with per-client theme colours.
+pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span> {
     let mut out: Vec<Span> = Vec::new();
     let mut cur = base;
     let mut link = None;
@@ -2083,7 +2114,7 @@ pub fn spans(text: &str, base: Style) -> Vec<Span> {
         {
             // As format_draw, a directive with any invalid word is ignored as a whole.
             let (mut st, mut al) = (cur, align);
-            if !style_words(&rest[2..e]).all(|w| apply_word(w, &mut st, &mut al, default, None).is_ok()) {
+            if !style_words(&rest[2..e]).all(|w| apply_word(w, &mut st, &mut al, default, vars).is_ok()) {
                 i += e + 1;
                 continue;
             }
@@ -2115,10 +2146,10 @@ pub fn spans(text: &str, base: Style) -> Vec<Span> {
                     "default" => {
                         link = None;
                         range = None;
-                        let _ = apply_word(w, &mut cur, &mut align, default, None);
+                        let _ = apply_word(w, &mut cur, &mut align, default, vars);
                     }
                     _ => {
-                        let _ = apply_word(w, &mut cur, &mut align, default, None);
+                        let _ = apply_word(w, &mut cur, &mut align, default, vars);
                     }
                 }
             }
@@ -2694,7 +2725,7 @@ mod tests {
         assert_eq!(parse_color("brightred"), Some(Color::Idx(9)));
         assert_eq!(parse_color("brightwhite"), Some(Color::Idx(15)));
         assert_eq!(parse_color("colour235"), Some(Color::Idx(235)));
-        assert_eq!(parse_color("color0"), Some(Color::Idx(0)));
+        assert_eq!(parse_color("color0"), Some(Color::Palette(0)));
         assert_eq!(parse_color("colour256"), None);
         assert_eq!(parse_color("#ff8000"), Some(Color::Rgb(255, 128, 0)));
         assert_eq!(parse_color("#ff80"), None);

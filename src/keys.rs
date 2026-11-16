@@ -201,6 +201,12 @@ impl Parser {
         self.in_paste && !self.buf.is_empty() && PASTE_END.starts_with(&self.buf)
     }
 
+    /// A partial terminal theme/colour response needs a longer deadline than a bare Escape.
+    pub fn theme_reply_pending(&self) -> bool {
+        [b"\x1b]10;".as_slice(), b"\x1b]11;", b"\x1b[?997;", b"\x1bP>|", b"\x1b[>"].iter()
+            .any(|prefix| self.buf.starts_with(prefix) || (self.buf.len() >= 3 && prefix.starts_with(&self.buf)))
+    }
+
     pub fn feed(&mut self, data: &[u8]) -> Vec<Input> {
         self.buf.extend_from_slice(data);
         self.run(false)
@@ -417,6 +423,22 @@ fn parse_esc(buf: &[u8], force: bool) -> Res {
                 Some(n) => Res::Done(unknown_tok(&buf[..n]), n),
                 None if !force && buf.len() < MAX_PASTE => Res::Incomplete,
                 _ => Res::Done(unknown_tok(buf), buf.len()),
+            }
+        }
+        b']' if buf.starts_with(b"\x1b]10;") || buf.starts_with(b"\x1b]11;") || b"\x1b]10;".starts_with(buf) || b"\x1b]11;".starts_with(buf) => {
+            // tty_keys_colours: the reply ends at its first BEL or ST, within 127 bytes
+            let end = (5..buf.len().min(5 + 127)).find(|&j| buf[j] == 7 || (buf[j - 1] == ESC && buf[j] == b'\\')).map(|j| j + 1);
+            match end {
+                Some(n) => Res::Done(unknown_tok(&buf[..n]), n),
+                None if !force && buf.len() < 5 + 127 => Res::Incomplete,
+                None => meta_fallback(buf),
+            }
+        }
+        b'P' if buf.starts_with(b"\x1bP>|") || b"\x1bP>|".starts_with(buf) => {
+            match buf.windows(2).position(|w| w == b"\x1b\\") {
+                Some(i) => Res::Done(unknown_tok(&buf[..i + 2]), i + 2),
+                None if !force && buf.len() < 256 => Res::Incomplete,
+                None => meta_fallback(buf),
             }
         }
         b'O' => parse_ss3(buf, force),
@@ -2426,5 +2448,36 @@ mod compatibility_input_tests {
             assert!(parser.feed(&reply[..at]).is_empty());
             assert_eq!(parser.feed(&reply[at..]), vec![Input::Unknown(reply.to_vec())]);
         }
+    }
+}
+
+
+#[cfg(test)]
+mod terminal_reply_tests {
+    use super::*;
+
+    #[test]
+    fn query_delay_does_not_capture_a_prompt_cancel_escape() {
+        let mut parser = Parser::new();
+        parser.feed(b"\x1b");
+        assert!(!parser.theme_reply_pending());
+        parser.feed(b"]11;rgb:ff");
+        assert!(parser.theme_reply_pending());
+        let replies = parser.feed(b"/ff/ff\x1b\\");
+        assert_eq!(replies, vec![Input::Unknown(b"\x1b]11;rgb:ff/ff/ff\x1b\\".to_vec())]);
+        assert!(!parser.theme_reply_pending());
+    }
+
+    #[test]
+    fn colour_replies_end_at_their_first_terminator() {
+        let mut parser = Parser::new();
+        let got = parser.feed(b"A\x1b]11;rgb:ffff/ffff/ffff\x1b\\B\x1b]11;rgba:0/0/0/f\x1b\\C\x1b]10;rgb:fff/fff/fff\x07D");
+        let unknown: Vec<_> = got.iter().filter_map(|i| match i { Input::Unknown(r) => Some(r.clone()), _ => None }).collect();
+        assert_eq!(unknown, vec![b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\".to_vec(), b"\x1b]11;rgba:0/0/0/f\x1b\\".to_vec(), b"\x1b]10;rgb:fff/fff/fff\x07".to_vec()]);
+        assert_eq!(got.iter().filter(|i| matches!(i, Input::Key(..))).count(), 4); // A B C D
+        // no terminator within 127 bytes: not a colour reply
+        let mut long = b"\x1b]11;".to_vec();
+        long.extend(std::iter::repeat_n(b'x', 130));
+        assert!(!matches!(parser.feed(&long).first(), Some(Input::Unknown(_))));
     }
 }

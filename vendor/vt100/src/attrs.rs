@@ -11,8 +11,18 @@ pub enum Color {
     /// An indexed terminal color.
     Idx(u8),
 
+    /// Explicit palette colour (COLOUR_FLAG_256), including indices below 16.
+    Palette(u8),
+
     /// An RGB terminal color. The parameters are (red, green, blue).
     Rgb(u8, u8, u8),
+}
+
+impl Color {
+    /// Keep explicit palette identity where it differs from the ANSI colour index.
+    pub fn palette(index: u8) -> Self {
+        if index < 16 { Self::Palette(index) } else { Self::Idx(index) }
+    }
 }
 
 const TEXT_MODE_INTENSITY: u8 = 0b0000_0011;

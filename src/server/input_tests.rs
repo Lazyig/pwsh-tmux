@@ -719,8 +719,10 @@ fn attach_asks_for_synchronized_output() {
     let mut f = fixture(); let sid = f.sid;
     f.clients.get_mut(&1).unwrap().ident = Some(Identity { cols: 80, rows: 24, tty: true, cwd: String::new(), term: "xterm-256color".into(), pid: 0, ctx_pane: None, utf8: true, env: Vec::new() });
     f.clients.get_mut(&1).unwrap().attached = false;
+    f.clients.get_mut(&1).unwrap().terminal.vt100 = true;
     f.output.try_iter().for_each(drop); f.attach_client(1, sid);
-    assert!(frames(&f, S_OUTPUT).ends_with(b"\x1b[?2026$p"));
+    let out = frames(&f, S_OUTPUT);
+    assert!(out.windows(9).any(|w| w == b"\x1b[?2026$p"), "{:?}", String::from_utf8_lossy(&out));
     assert!(!f.clients[&1].features.has("sync"));
     f.pane_input.try_iter().for_each(drop);
     f.handle_input(1, b"\x1b[?2026;2$y");

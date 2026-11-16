@@ -19,8 +19,13 @@ impl Features {
         self.0.contains(f) || (f == "256" && self.0.contains("RGB"))
     }
 
-    fn add(&mut self, list: &str) {
+    pub(super) fn add(&mut self, list: &str) {
         self.parse(list, &[',', ':']);
+    }
+
+    /// The terminfo colors stand-ins ("t256", "16", "mono"): not features, so never listed.
+    fn set_colours(&mut self, cap: &str) {
+        self.0.insert(cap.to_string());
     }
 
     /// tty_parse_features: a trailing `@` removes a feature and keeps later lists from adding it
@@ -40,13 +45,44 @@ impl Features {
         }
     }
 
+    /// tty_keys_device_attributes2 / tty_keys_extended_device_attributes.
+    pub fn device_report(&mut self, raw: &[u8]) -> bool {
+        let name = if let Some(body) = raw.strip_prefix(b"\x1bP>|").and_then(|s| s.strip_suffix(b"\x1b\\")) {
+            let body = String::from_utf8_lossy(body);
+            [("iTerm2 ", "iTerm2"), ("tmux ", "tmux"), ("XTerm(", "XTerm"), ("mintty ", "mintty"),
+                ("foot(", "foot"), ("WezTerm ", "WezTerm"), ("ghostty ", "ghostty"), ("Rio ", "Rio")]
+                .into_iter().find(|(prefix, _)| body.starts_with(prefix)).map(|(_, name)| name)
+        } else if let Some(body) = raw.strip_prefix(b"\x1b[>").and_then(|s| s.strip_suffix(b"c")) {
+            match body.split(|b| *b == b';').next() {
+                Some(b"77") => Some("mintty"), Some(b"84") => Some("tmux"), Some(b"85") => Some("rxvt-unicode"), _ => None,
+            }
+        } else { return false };
+        for list in name.map(default_features).unwrap_or(&[]) {
+            self.add(list);
+        }
+        true
+    }
+
+    /// client_colours (format_cb_client_colours): only the RGB and 256 features count as
+    /// more than 16 colours; otherwise terminfo colors, which is capped at 16.
+    pub fn colours(&self) -> u32 {
+        if self.has("RGB") { 16777216 } else if self.has("256") { 256 }
+        else if self.has("16") || self.has("t256") { 16 } else if self.has("mono") { 2 } else { 8 }
+    }
+
+    /// Whether 256-colour cells can be drawn: the 256 feature or terminfo colors#256
+    /// (tty_check_fg/tty_check_bg).
+    pub fn render_256(&self) -> bool {
+        self.has("256") || self.has("t256")
+    }
+
     pub fn list(&self) -> String {
         KNOWN.iter().filter(|f| self.0.contains(**f)).copied().collect::<Vec<_>>().join(",")
     }
 }
 
-/// tty_default_features: what tmux enables for a terminal it identifies (by XDA there, by
-/// TERM_PROGRAM or TERM here since no device attributes are requested).
+/// tty_default_features: what tmux enables for a terminal it identifies, by its secondary or
+/// extended device attributes (device_report) or, before any reply, by TERM_PROGRAM or TERM.
 fn default_features(name: &str) -> &'static [&'static str] {
     const BASE: &str = "256,RGB,bpaste,clipboard,mouse,strikethrough,title";
     match name {
@@ -58,6 +94,7 @@ fn default_features(name: &str) -> &'static [&'static str] {
         "WezTerm" => &[BASE, "ccolour,cstyle,extkeys,focus,hyperlinks,margins,usstyle"],
         "ghostty" => &[BASE, "ccolour,cstyle,extkeys,focus,margins,overline,hyperlinks,osc7,sync,usstyle,progressbar"],
         "Rio" | "rio" => &[BASE, "ccolour,cstyle,focus,overline,hyperlinks,osc7,sync,usstyle,progressbar"],
+        "XTerm" => &[BASE, "ccolour,cstyle,extkeys,focus"],
         _ => &[],
     }
 }
@@ -77,6 +114,8 @@ pub fn fnmatch(pat: &str, s: &str) -> bool {
 
 /// `term`: the client's TERM (empty for a Windows console client), `colorterm`: its COLORTERM,
 /// `table`: terminal-features entries ("pattern:feature:feature"), `extra`: the `-T` list.
+/// Without terminfo, the TERM name stands in for its colors capability: "t256" (colors#256,
+/// which is not the 256 feature), "16" (16 or 88 colours) or "mono" (none, as dumb and vt100).
 #[cfg(test)]
 pub fn compute(term: &str, colorterm: &str, table: &[String], extra: &str) -> Features {
     compute_named(term, "", colorterm, table, extra)
@@ -95,11 +134,15 @@ pub fn compute_named(term: &str, program: &str, colorterm: &str, table: &[String
             f.parse(rest, &[':']);
         }
     }
+    // tty_term_create: COLORTERM truecolor/24bit is RGB, any other value with 256 in it is 256
     if colorterm.eq_ignore_ascii_case("truecolor") || colorterm.eq_ignore_ascii_case("24bit") {
         f.add("RGB");
     } else if colorterm.contains("256") {
         f.add("256");
     }
+    let vt = term.strip_prefix("vt").is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()));
+    if term == "dumb" || (vt && !term.contains("color")) { f.set_colours("mono"); }
+    if term.contains("16color") || term.contains("88color") || term == "rxvt-unicode" || term == "xterm" { f.set_colours("16"); }
     if term.is_empty() {
         // Windows console / Windows Terminal: a modern VT implementation
         f.add("RGB,mouse,bpaste,title,ccolour,cstyle,focus,clipboard,strikethrough,sync,usstyle,overline,hyperlinks");
@@ -107,8 +150,8 @@ pub fn compute_named(term: &str, program: &str, colorterm: &str, table: &[String
         if term != "linux" && !term.starts_with("vt1") {
             f.add("mouse,bpaste,strikethrough");
         }
-        if term.contains("256col") || term.contains("direct") || term.starts_with("tmux") || term.starts_with("alacritty") || term.starts_with("xterm-kitty") {
-            f.add("256");
+        if term.contains("256col") || term.contains("direct") || term.starts_with("tmux") || term.starts_with("alacritty") || term.starts_with("xterm-kitty") || term.starts_with("foot") || term.starts_with("wezterm") || term.starts_with("xterm-ghostty") {
+            f.set_colours("t256");
         }
         if term.contains("direct") {
             f.add("RGB");
@@ -124,7 +167,7 @@ pub fn compute_named(term: &str, program: &str, colorterm: &str, table: &[String
 
 /// Nearest xterm-256 colour for an RGB value.
 pub fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
-    let cube = |v: u8| -> u8 { if v < 48 { 0 } else if v < 115 { 1 } else { (v - 35) / 40 } };
+    let cube = |v: u8| -> u8 { if v < 48 { 0 } else if v < 114 { 1 } else { (v - 35) / 40 } };
     let (cr, cg, cb) = (cube(r), cube(g), cube(b));
     let level = |c: u8| -> u8 { if c == 0 { 0 } else { 55 + c * 40 } };
     let cube_idx = 16 + 36 * cr + 6 * cg + cb;
@@ -141,11 +184,11 @@ fn dist(a: (u8, u8, u8), b: (u8, u8, u8)) -> u32 {
 }
 
 const ANSI16: [(u8, u8, u8); 16] = [
-    (0, 0, 0), (205, 0, 0), (0, 205, 0), (205, 205, 0), (0, 0, 238), (205, 0, 205), (0, 205, 205), (229, 229, 229),
-    (127, 127, 127), (255, 0, 0), (0, 255, 0), (255, 255, 0), (92, 92, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255),
+    (0, 0, 0), (128, 0, 0), (0, 128, 0), (128, 128, 0), (0, 0, 128), (128, 0, 128), (0, 128, 128), (192, 192, 192),
+    (128, 128, 128), (255, 0, 0), (0, 255, 0), (255, 255, 0), (0, 0, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255),
 ];
 
-fn idx_to_rgb(i: u8) -> (u8, u8, u8) {
+pub(super) fn idx_to_rgb(i: u8) -> (u8, u8, u8) {
     match i {
         0..=15 => ANSI16[i as usize],
         16..=231 => {
@@ -162,19 +205,39 @@ fn idx_to_rgb(i: u8) -> (u8, u8, u8) {
 
 /// colour_force_rgb with tmux's colour_256toRGB table; None for the default colour.
 pub fn colour_force_rgb(c: vt100::Color) -> Option<(u8, u8, u8)> {
-    const ANSI: [u32; 16] = [0x000000, 0x800000, 0x008000, 0x808000, 0x000080, 0x800080, 0x008080, 0xc0c0c0, 0x808080, 0xff0000, 0x00ff00, 0xffff00, 0x0000ff, 0xff00ff, 0x00ffff, 0xffffff];
-    const CUBE: [u8; 6] = [0x00, 0x5f, 0x87, 0xaf, 0xd7, 0xff];
     match c {
         vt100::Color::Rgb(r, g, b) => Some((r, g, b)),
-        vt100::Color::Idx(i @ 0..=15) => { let v = ANSI[i as usize]; Some(((v >> 16) as u8, (v >> 8) as u8, v as u8)) }
-        vt100::Color::Idx(i @ 16..=231) => { let i = i - 16; Some((CUBE[(i / 36) as usize], CUBE[(i / 6 % 6) as usize], CUBE[(i % 6) as usize])) }
-        vt100::Color::Idx(i) => { let v = 8 + 10 * (i - 232); Some((v, v, v)) }
+        vt100::Color::Idx(i) | vt100::Color::Palette(i) => Some(idx_to_rgb(i)),
         vt100::Color::Default => None,
     }
 }
 
+#[cfg(test)]
 pub fn rgb_to_16(r: u8, g: u8, b: u8) -> u8 {
     (0..16u8).min_by_key(|i| dist((r, g, b), ANSI16[*i as usize])).unwrap()
+}
+
+/// tmux colour_256to16 table.
+pub fn idx_to_16(i: u8) -> u8 {
+    const TABLE: [u8; 256] = [
+        0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+        0,  4,  4,  4, 12, 12,  2,  6,  4,  4, 12, 12,  2,  2,  6,  4,
+		12, 12,  2,  2,  2,  6, 12, 12, 10, 10, 10, 10, 14, 12, 10, 10,
+		10, 10, 10, 14,  1,  5,  4,  4, 12, 12,  3,  8,  4,  4, 12, 12,
+        2,  2,  6,  4, 12, 12,  2,  2,  2,  6, 12, 12, 10, 10, 10, 10,
+		14, 12, 10, 10, 10, 10, 10, 14,  1,  1,  5,  4, 12, 12,  1,  1,
+        5,  4, 12, 12,  3,  3,  8,  4, 12, 12,  2,  2,  2,  6, 12, 12,
+		10, 10, 10, 10, 14, 12, 10, 10, 10, 10, 10, 14,  1,  1,  1,  5,
+		12, 12,  1,  1,  1,  5, 12, 12,  1,  1,  1,  5, 12, 12,  3,  3,
+        3,  7, 12, 12, 10, 10, 10, 10, 14, 12, 10, 10, 10, 10, 10, 14,
+        9,  9,  9,  9, 13, 12,  9,  9,  9,  9, 13, 12,  9,  9,  9,  9,
+		13, 12,  9,  9,  9,  9, 13, 12, 11, 11, 11, 11,  7, 12, 10, 10,
+		10, 10, 10, 14,  9,  9,  9,  9,  9, 13,  9,  9,  9,  9,  9, 13,
+        9,  9,  9,  9,  9, 13,  9,  9,  9,  9,  9, 13,  9,  9,  9,  9,
+        9, 13, 11, 11, 11, 11, 11, 15,  0,  0,  0,  0,  0,  0,  8,  8,
+        8,  8,  8,  8,  7,  7,  7,  7,  7,  7, 15, 15, 15, 15, 15, 15
+    ];
+    TABLE[i as usize]
 }
 
 /// Downgrades a colour to what the terminal can show.
@@ -182,15 +245,15 @@ pub fn fit_color(c: vt100::Color, f: &Features) -> vt100::Color {
     use vt100::Color::*;
     match c {
         Rgb(r, g, b) if !f.has("RGB") => {
-            if f.has("256") {
+            if f.render_256() {
                 Idx(rgb_to_256(r, g, b))
             } else {
-                Idx(rgb_to_16(r, g, b))
+                Idx(idx_to_16(rgb_to_256(r, g, b)))
             }
         }
-        Idx(i) if i >= 16 && !f.has("256") => {
-            let (r, g, b) = idx_to_rgb(i);
-            Idx(rgb_to_16(r, g, b))
+        Palette(i) if !f.render_256() => Idx(idx_to_16(i)),
+        Idx(i) if i >= 16 && !f.render_256() => {
+            Idx(idx_to_16(i))
         }
         other => other,
     }
@@ -204,7 +267,16 @@ mod tests {
     fn computes_features() {
         let table = vec!["xterm*:clipboard:ccolour:cstyle:focus:title".to_string(), "screen*:title".to_string()];
         let x = compute("xterm-256color", "", &table, "");
-        assert!(x.has("256") && x.has("clipboard") && x.has("mouse") && !x.has("RGB"));
+        // terminfo colors#256 draws 256 colours but is not the 256 feature
+        assert!(x.render_256() && !x.has("256") && x.has("clipboard") && x.has("mouse") && !x.has("RGB"));
+        assert_eq!((x.colours(), x.list().contains("256")), (16, false));
+        assert_eq!(compute("xterm-256color", "rxvt-256color", &table, "").colours(), 256);
+        assert_eq!(compute("xterm", "TrueColor", &table, "").colours(), 16777216);
+        assert_eq!(compute("screen-256color", "", &table, "256").colours(), 256);
+        // terminfo colors: none (vt100) is 2, 8 stays 8, 16 and 88 are 16
+        for (term, n) in [("vt100", 2), ("vt220", 2), ("dumb", 2), ("vte-256color", 16), ("linux", 8), ("screen", 8), ("xterm-16color", 16), ("rxvt-unicode", 16), ("xterm-88color", 16)] {
+            assert_eq!(compute(term, "", &table, "").colours(), n, "{term}");
+        }
         assert!(compute("xterm-256color", "truecolor", &table, "").has("RGB"));
         let l = compute("linux", "", &table, "");
         assert!(!l.has("256") && !l.has("mouse"));

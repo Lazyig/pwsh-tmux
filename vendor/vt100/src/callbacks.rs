@@ -78,6 +78,14 @@ pub trait Callbacks {
     /// This callback is called when the terminal receives a OSC sequence
     /// (`\e]`) which is otherwise not implemented.
     fn unhandled_osc(&mut self, _: &mut crate::Screen, _params: &[&[u8]]) {}
+
+    /// The application subscribed to terminal theme changes.
+    fn theme_subscription(&mut self, _: &mut crate::Screen) {}
+
+    /// Unhandled OSC with its original terminator, for query replies.
+    fn unhandled_osc_terminated(&mut self, screen: &mut crate::Screen, params: &[&[u8]], _bel: bool) {
+        self.unhandled_osc(screen, params);
+    }
     /// Called when the top row of scrollback is discarded because a new row
     /// was added at the bottom of the screen.
     ///

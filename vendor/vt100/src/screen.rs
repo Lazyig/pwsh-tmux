@@ -1505,6 +1505,7 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
 
     // ESC c
     pub fn ris(&mut self) {
+        self.callbacks.reset(&mut self.screen);
         let scroll_on_clear = self.screen.scroll_on_clear;
         let allow_alternate = self.screen.allow_alternate;
         let widths = core::mem::take(&mut self.screen.widths);
@@ -1732,7 +1733,10 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                 [1049] => screen.alternate_on(true),
                 [2004] => screen.set_mode(MODE_BRACKETED_PASTE),
                 [2026] => screen.set_xmode(XMODE_SYNC, true),
-                [2031] => screen.set_xmode(XMODE_THEME_UPDATES, true),
+                [2031] => {
+                    screen.set_xmode(XMODE_THEME_UPDATES, true);
+                    self.callbacks.theme_subscription(&mut self.screen);
+                },
                 _ => unhandled(self),
             }
         }
@@ -1850,7 +1854,7 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                         crate::Color::Rgb(to_u8!(*r), to_u8!(*g), to_u8!(*b));
                 }
                 [38, 5, i] => {
-                    screen.attrs.fgcolor = crate::Color::Idx(to_u8!(*i));
+                    screen.attrs.fgcolor = crate::Color::palette(to_u8!(*i));
                 }
                 [38] => match next_param!() {
                     [2] => {
@@ -1861,7 +1865,7 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                     }
                     [5] => {
                         screen.attrs.fgcolor =
-                            crate::Color::Idx(next_param_u8!());
+                            crate::Color::palette(next_param_u8!());
                     }
                     _ => {
                         unhandled(self);
@@ -1879,7 +1883,7 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                         crate::Color::Rgb(to_u8!(*r), to_u8!(*g), to_u8!(*b));
                 }
                 [48, 5, i] => {
-                    screen.attrs.bgcolor = crate::Color::Idx(to_u8!(*i));
+                    screen.attrs.bgcolor = crate::Color::palette(to_u8!(*i));
                 }
                 [48] => match next_param!() {
                     [2] => {
@@ -1890,7 +1894,7 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                     }
                     [5] => {
                         screen.attrs.bgcolor =
-                            crate::Color::Idx(next_param_u8!());
+                            crate::Color::palette(next_param_u8!());
                     }
                     _ => {
                         unhandled(self);

@@ -283,7 +283,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
     let paused = Arc::new(AtomicBool::new(false));
     let mut out = std::io::stdout();
     let restore = |out: &mut std::io::Stdout, alternate: bool| {
-        let _ = out.write_all(b"\x1b[0m\x1b[?25h\x1b[?1l\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1004l\x1b[>4m");
+        let _ = out.write_all(b"\x1b[?2031l\x1b[0m\x1b[?25h\x1b[?1l\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1004l\x1b[>4m");
         let _ = out.write_all(if alternate { b"\x1b[?1049l" } else { b"\x1b[H\x1b[2J" });
         let _ = out.flush();
     };
@@ -350,6 +350,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                             return 1;
                         }
                     }
+                    // the server sends the theme and colour queries (VT100-like terminals only)
                     if alternate { let _ = out.write_all(b"\x1b[?1049h\x1b[H\x1b[2J"); }
                     else {
                         // Scroll the previous terminal contents into scrollback.

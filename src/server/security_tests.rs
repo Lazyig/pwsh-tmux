@@ -51,6 +51,7 @@ pub(super) fn fixture() -> (Server, mpsc::Receiver<Event>) {
             features: Default::default(),
             clipboard_query: None,
             focused: false,
+            terminal: Default::default(),
             pending,
             queued_bytes: Default::default(),
             closed: Default::default(),

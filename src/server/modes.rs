@@ -2,9 +2,8 @@
 //! menus, popups, the clock and big digits for display-panes.
 
 use super::*;
-use crate::cells::{Cell, Color, Line, Style, BOLD, INVERSE};
+use crate::cells::{Cell, Color, Line, Style, INVERSE};
 use std::collections::HashSet;
-use unicode_width::UnicodeWidthChar;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TreeKind {
@@ -37,6 +36,7 @@ pub struct Tree {
     pub filter: Option<Vec<WinId>>,
     pub client: Option<ClientId>,
     pub tagged: HashSet<String>,
+    info: bool,
 }
 
 pub enum TreeAction {
@@ -45,25 +45,10 @@ pub enum TreeAction {
     Run(String),
 }
 
-fn line_from(text: &str, width: usize, style: Style) -> Line {
-    let mut cells = Vec::with_capacity(width);
-    for ch in text.chars() {
-        let w = ch.width().unwrap_or(0);
-        if w == 0 {
-            if let Some(cell) = cells.iter_mut().rev().find(|c: &&mut Cell| !c.text.is_empty()) { cell.text.push(ch); }
-            continue;
-        }
-        if cells.len() + w > width {
-            break;
-        }
-        cells.push(Cell { text: ch.to_string(), style });
-        if w == 2 {
-            cells.push(Cell { text: String::new(), style });
-        }
-    }
-    while cells.len() < width {
-        cells.push(Cell { text: " ".into(), style });
-    }
+fn line_from(text: &str, width: usize, style: Style, ctx: &dyn crate::format::Vars, selected: bool) -> Line {
+    let mut cells = crate::format::layout_line(&crate::format::spans_with(text, style, Some(ctx)), width, style);
+    // mode-tree's selected line ignores embedded colours, including the padding.
+    if selected { for cell in &mut cells { cell.style = style; } }
     Line { cells, wrapped: false }
 }
 
@@ -84,7 +69,7 @@ impl Tree {
                 expanded.insert(format!("s{}", s.id));
             }
         }
-        let mut t = Tree { kind, owner: pane, template, items: Vec::new(), expanded, sel: 0, top: 0, filter, client: None, tagged: HashSet::new() };
+        let mut t = Tree { kind, owner: pane, template, items: Vec::new(), expanded, sel: 0, top: 0, filter, client: None, tagged: HashSet::new(), info: false };
         t.rebuild(srv);
         // select the current session / window
         let cur = srv.target_for_pane(pane);
@@ -115,7 +100,7 @@ impl Tree {
                     items.push(TreeItem {
                         id: sid.clone(),
                         depth: 0,
-                        label: format!("{}: {} windows{}", s.name, s.links.len(), if attached { " (attached)" } else { "" }),
+                        label: format!("{}: #[fg=themelightgrey]{} windows{}", s.name, s.links.len(), if attached { " (attached)" } else { "" }),
                         target: format!("${}", s.id),
                         kill: format!("kill-session -t '${}'", s.id),
                         expandable: true,
@@ -132,7 +117,7 @@ impl Tree {
                         items.push(TreeItem {
                             id: wkey.clone(),
                             depth: 1,
-                            label: format!("{idx}: {}{flags}{}", w.name, if np == 1 { format!(": \"{}\"", srv.panes.get(&w.active).map(|p| p.title.as_str()).unwrap_or("")) } else { String::new() }),
+                            label: format!("{idx}: {}#[fg=themelightgrey]{flags}{}", w.name, if np == 1 { format!(": \"{}\"", srv.panes.get(&w.active).map(|p| p.title.as_str()).unwrap_or("")) } else { String::new() }),
                             target: format!("${}:{idx}", s.id),
                             kill: format!("kill-window -t '@{wid}'"),
                             expandable: np > 0,
@@ -144,7 +129,7 @@ impl Tree {
                                 items.push(TreeItem {
                                     id: format!("p{p}"),
                                     depth: 2,
-                                    label: format!("{pi}: {}{} \"{}\"", pp.map(|x| x.current_cmd.as_str()).unwrap_or(""), if *p == w.active { "*" } else { "" }, pp.map(|x| x.title.as_str()).unwrap_or("")),
+                                    label: format!("{pi}: {}#[fg=themelightgrey]{} \"{}\"", pp.map(|x| x.current_cmd.as_str()).unwrap_or(""), if *p == w.active { "*" } else { "" }, pp.map(|x| x.title.as_str()).unwrap_or("")),
                                     target: format!("%{p}"),
                                     kill: format!("kill-pane -t '%{p}'"),
                                     expandable: false,
@@ -270,6 +255,7 @@ impl Tree {
                 }
                 self.sel = (self.sel + 1).min(n - 1);
             }
+            "i" if matches!(self.kind, TreeKind::Sessions | TreeKind::Windows) => self.info = !self.info,
             "T" => self.tagged.clear(),
             "C-t" => {
                 self.tagged = self.items.iter().map(|i| i.id.clone()).collect();
@@ -322,34 +308,45 @@ impl Tree {
         if height < 10 || h.saturating_sub(height) < 2 { h } else { height }
     }
 
-    pub fn render(&self, srv: &Server, w: u16, h: u16) -> Vec<Line> {
+    pub fn render(&self, srv: &Server, cid: ClientId, w: u16, h: u16) -> Vec<Line> {
         use super::render::{Frame, draw_box};
         let list_h = self.list_height(h as usize);
         let mut f = Frame::new(w, h);
         let top = self.top.min(self.sel).max((self.sel + 1).saturating_sub(list_h));
         let pane = self.items.get(self.sel).and_then(|i| i.preview);
         let wid = srv.target_for_pane(self.owner).wid;
-        let selected = crate::format::parse_style(&srv.opt_window(wid, "mode-style"), Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() }).unwrap_or_default();
+        let ctx = super::vars::VarCtx { srv, t: srv.target_for_pane(self.owner), client: Some(cid), extra: HashMap::new() };
+        let border = crate::format::parse_style_with(&srv.opt_window(wid, "tree-mode-border-style"), Style::default(), Some(&ctx)).map(|p| p.style).unwrap_or_default();
+        let selected = crate::format::parse_style_with(&srv.opt_window(wid, "tree-mode-selection-style"), Style::default(), Some(&ctx)).map(|p| p.style).unwrap_or_default();
         for row in 0..list_h {
             let i = top + row;
             let Some(it) = self.items.get(i) else { continue };
             let quick = if i < 10 { format!("({i}) ") } else if i < 36 { format!("(M-{}) ", (b'a' + (i - 10) as u8) as char) } else { "     ".into() };
             let flat = !matches!(self.kind, TreeKind::Windows | TreeKind::Sessions);
-            let arrow = if flat { "" } else if it.expandable { if self.expanded.contains(&it.id) { "- " } else { "+ " } } else { "  " };
+            let arrow = if flat { "" } else if it.expandable { if self.expanded.contains(&it.id) { "#[fg=themered]-#[fg=themelightgrey] " } else { "#[fg=themegreen]+#[fg=themelightgrey] " } } else { "  " };
             let last = self.items.get(i + 1).is_none_or(|n| n.depth < it.depth) || !self.items[i+1..].iter().take_while(|n| n.depth >= it.depth).any(|n| n.depth == it.depth);
             let indent = if it.depth == 0 { String::new() } else { format!("{}{}", "    ".repeat(it.depth.saturating_sub(1) as usize), if last { "└─> " } else { "├─> " }) };
-            let text = format!("{quick}{indent}{arrow}{}{}", it.label, if self.tagged.contains(&it.id) { "*" } else { "" });
-            let style = if i == self.sel { selected } else if self.tagged.contains(&it.id) { Style { attrs: BOLD, ..Style::default() } } else { Style::default() };
-            f.put_cells(0, row as u16, &line_from(&text, w as usize, style).cells);
+            let text = format!("#[fg=themelightgrey]{quick}{indent}{arrow}#[default]{}{}", it.label, if self.tagged.contains(&it.id) { "*" } else { "" });
+            let mut style = if i == self.sel { selected } else { Style::default() };
+            // mode_tree_draw: tagged items are themecyan, selected or not
+            if self.tagged.contains(&it.id) { style.fg = crate::format::parse_color_with("themecyan", Some(&ctx)).unwrap_or(Color::Default); }
+            f.put_cells(0, row as u16, &line_from(&text, w as usize, style, &ctx, i == self.sel || self.tagged.contains(&it.id)).cells);
         }
         let y = list_h as u16;
         if h.saturating_sub(y) > 4 && w > 4 {
             if let Some(it) = self.items.get(self.sel) {
-                draw_box(&mut f, 0, y, w, h-y, Style::default(), "");
+                draw_box(&mut f, 0, y, w, h-y, border, "");
                 let name = if self.kind == TreeKind::Buffers { it.target.clone() } else { it.target.rsplit(':').next().unwrap_or(&it.target).to_string() };
-                f.text(1, y, &format!(" {name} (sort: {}) ", if self.kind == TreeKind::Buffers { "time" } else { "index" }), Style::default(), w-1);
+                f.text(1, y, &format!(" {name} (sort: {}) ", if self.kind == TreeKind::Buffers { "time" } else { "index" }), border, w-1);
                 let (pw,ph) = (w-4,h-y-2);
-                if self.kind == TreeKind::Buffers {
+                if self.info {
+                    let target = it.preview.map(|p| srv.target_for_pane(p)).unwrap_or_default();
+                    let info_ctx = super::vars::VarCtx { srv, t: target, client: Some(cid), extra: HashMap::new() };
+                    let lines = if it.id.starts_with('p') { PANE_INFO } else if it.depth == 1 { WINDOW_INFO } else { SESSION_INFO };
+                    for (row, line) in lines.iter().take(ph as usize).enumerate() {
+                        f.put_cells(2, y + 1 + row as u16, &line_from(line, pw as usize, Style::default(), &info_ctx, false).cells);
+                    }
+                } else if self.kind == TreeKind::Buffers {
                     if let Some(b) = srv.buffers.iter().find(|b| b.name == it.target) {
                         for (row,line) in String::from_utf8_lossy(&b.data).lines().take(ph as usize).enumerate() { f.text(2, y+1+row as u16, line, Style::default(), w-2); }
                     }
@@ -375,15 +372,15 @@ impl Tree {
                                 f.set(x+xx,y+1+yy,cell);
                             }
                         } }
-                        if i != start+visible-1 { for yy in 0..ph { f.text(x+width,y+1+yy,"│",Style::default(),w); } }
+                        if i != start+visible-1 { for yy in 0..ph { f.text(x+width,y+1+yy,"│",border,w); } }
                         let label = format!(" {i} ");
                         let len = label.len() as u16;
                         if len <= each && ph > 1 {
                             let ox = (each-len+1)/2;
                             let oy = (ph+1)/2;
-                            if ox>1 && ox+len<each-1 && ph>=3 { draw_box(&mut f,x+ox-1,y+oy,len+2,3,Style::default(),""); }
+                            if ox>1 && ox+len<each-1 && ph>=3 { draw_box(&mut f,x+ox-1,y+oy,len+2,3,border,""); }
                             let color = if *id==window.active { "display-panes-active-colour" } else { "display-panes-colour" };
-                            let style = Style { fg: crate::format::parse_color(&srv.opt_window(Some(window.id),color)).unwrap_or(Color::Default), ..Style::default() };
+                            let style = Style { fg: crate::format::parse_color_with(&crate::format::expand(&srv.opt_window(Some(window.id),color), &ctx), Some(&ctx)).unwrap_or(Color::Default), ..Style::default() };
                             f.text(x+ox,y+1+oy,&label,style,w-2);
                         }
                     }
@@ -393,6 +390,38 @@ impl Tree {
         f.cells.chunks(w as usize).map(|c| Line { cells:c.to_vec(),wrapped:false }).collect()
     }
 }
+
+const PANE_INFO: &[&str] = &[
+    "#[fg=themelightgrey]Pane          #[#{E:tree-mode-border-style}]│#[default] #{pane_index} #[fg=themelightgrey](#{pane_id})#[default]",
+    "#[fg=themelightgrey]Title         #[#{E:tree-mode-border-style}]│#[default] #{pane_title}",
+    "#[fg=themelightgrey]Command       #[#{E:tree-mode-border-style}]│#[default] #{pane_current_command} #[fg=themelightgrey](PID #{pane_pid})#[default]",
+    "#[fg=themelightgrey]Path          #[#{E:tree-mode-border-style}]│#[default] #{pane_current_path}",
+    "#[fg=themelightgrey]TTY           #[#{E:tree-mode-border-style}]│#[default] #{pane_tty}",
+    "#[fg=themelightgrey]Position      #[#{E:tree-mode-border-style}]│#[default] #{pane_x},#{pane_y} #{pane_width}x#{pane_height}",
+    "#[fg=themelightgrey]Mode          #[#{E:tree-mode-border-style}]│#[default] #{?pane_in_mode,#{pane_mode},none}",
+    "#[fg=themelightgrey]Flags         #[#{E:tree-mode-border-style}]│#[default] #{?pane_active,#[fg=themegreen],#[fg=themelightgrey]}active#[default] #{?window_zoomed_flag,#[fg=themegreen],#[fg=themelightgrey]}zoomed#[default] #{?pane_marked,#[fg=themegreen],#[fg=themelightgrey]}marked#[default] #{?pane_synchronized,#[fg=themegreen],#[fg=themelightgrey]}sync#[default] #{?pane_dead,#[fg=themegreen],#[fg=themelightgrey]}dead#[default] #{?pane_pipe,#[fg=themegreen],#[fg=themelightgrey]}piped#[default]",
+];
+
+const WINDOW_INFO: &[&str] = &[
+    "#[fg=themelightgrey]Window        #[#{E:tree-mode-border-style}]│#[default] #{window_index}: #{window_name} #[fg=themelightgrey](#{window_id})#[default]",
+    "#[fg=themelightgrey]Size          #[#{E:tree-mode-border-style}]│#[default] #{window_width}x#{window_height}",
+    "#[fg=themelightgrey]Panes         #[#{E:tree-mode-border-style}]│#[default] #{window_panes}",
+    "#[fg=themelightgrey]Activity Time #[#{E:tree-mode-border-style}]│#[default] #{t:window_activity} #[fg=themelightgrey](#{t/r:window_activity})#[default]",
+    "#[fg=themelightgrey]Sessions      #[#{E:tree-mode-border-style}]│#[default] #{s/,/ /:window_linked_sessions_list}",
+    "#[fg=themelightgrey]Flags         #[#{E:tree-mode-border-style}]│#[default] #{?window_active,#[fg=themegreen],#[fg=themelightgrey]}active#[default] #{?window_last_flag,#[fg=themegreen],#[fg=themelightgrey]}last#[default] #{?window_bell_flag,#[fg=themegreen],#[fg=themelightgrey]}bell#[default] #{?window_activity_flag,#[fg=themegreen],#[fg=themelightgrey]}activity#[default] #{?window_silence_flag,#[fg=themegreen],#[fg=themelightgrey]}silence#[default] #{?window_zoomed_flag,#[fg=themegreen],#[fg=themelightgrey]}zoomed#[default] #{?window_marked_flag,#[fg=themegreen],#[fg=themelightgrey]}marked#[default]",
+];
+
+const SESSION_INFO: &[&str] = &[
+    "#[fg=themelightgrey]Session       #[#{E:tree-mode-border-style}]│#[default] #{session_name} #[fg=themelightgrey](#{session_id})#[default]",
+    "#[fg=themelightgrey]Created Time  #[#{E:tree-mode-border-style}]│#[default] #{t:session_created} #[fg=themelightgrey](#{t/r:session_created})#[default]",
+    "#[fg=themelightgrey]Activity Time #[#{E:tree-mode-border-style}]│#[default] #{t:session_activity} #[fg=themelightgrey](#{t/r:session_activity})#[default]",
+    "#[fg=themelightgrey]Attached Time #[#{E:tree-mode-border-style}]│#[default] #{?#{t:session_last_attached},#{t:session_last_attached} #[fg=themelightgrey](#{t/r:session_last_attached})#[default],never}",
+    "#[fg=themelightgrey]Clients       #[#{E:tree-mode-border-style}]│#[default] #{s/,/ /:session_attached_list}",
+    "#[fg=themelightgrey]Windows       #[#{E:tree-mode-border-style}]│#[default] #{session_windows}",
+    "#[fg=themelightgrey]Path          #[#{E:tree-mode-border-style}]│#[default] #{session_path}",
+    "#[fg=themelightgrey]Group         #[#{E:tree-mode-border-style}]│#[default] #{?session_grouped,#{session_group} (#{session_group_size}),none}",
+    "#[fg=themelightgrey]Flags         #[#{E:tree-mode-border-style}]│#[default] #{?session_attached,#[fg=themegreen],#[fg=themelightgrey]}attached#[default] #{?session_grouped,#[fg=themegreen],#[fg=themelightgrey]}grouped#[default] #{?session_marked,#[fg=themegreen],#[fg=themelightgrey]}marked#[default] #{?session_bell_flag,#[fg=themegreen],#[fg=themelightgrey]}bell#[default] #{?session_activity_flag,#[fg=themegreen],#[fg=themelightgrey]}activity#[default] #{?session_silence_flag,#[fg=themegreen],#[fg=themelightgrey]}silence#[default]",
+];
 
 // ---- menu ------------------------------------------------------------------------
 
@@ -626,6 +655,16 @@ const FONT: [(char, [&str; 5]); 14] = [
 
 /// Draws `text` in 5x5 block digits centred in the rect; returns false if it doesn't fit.
 pub fn big_text(f: &mut super::render::Frame, r: Rect, text: &str, colour: Color) -> bool {
+    big_text_cells(f, r, text, Cell { text: " ".into(), style: Style { bg: colour, ..Style::default() } })
+}
+
+/// window_clock_draw: the clock's blocks are '#' in its colour on its colour, so they still
+/// show on terminals without colours.
+pub fn big_clock(f: &mut super::render::Frame, r: Rect, text: &str, colour: Color) -> bool {
+    big_text_cells(f, r, text, Cell { text: "#".into(), style: Style { fg: colour, bg: colour, ..Style::default() } })
+}
+
+fn big_text_cells(f: &mut super::render::Frame, r: Rect, text: &str, block: Cell) -> bool {
     let n = text.chars().count() as u16;
     let width = n * 6;
     if r.w < width || r.h < 5 {
@@ -633,13 +672,12 @@ pub fn big_text(f: &mut super::render::Frame, r: Rect, text: &str, colour: Color
     }
     let x0 = r.x + (r.w - width) / 2;
     let y0 = r.y + (r.h - 5) / 2;
-    let block = Style { bg: colour, ..Style::default() };
     for (i, ch) in text.chars().enumerate() {
         let Some((_, rows)) = FONT.iter().find(|(c, _)| *c == ch) else { continue };
         for (dy, row) in rows.iter().enumerate() {
             for (dx, b) in row.chars().enumerate() {
                 if b == '#' {
-                    f.set(x0 + i as u16 * 6 + dx as u16, y0 + dy as u16, Cell { text: " ".into(), style: block });
+                    f.set(x0 + i as u16 * 6 + dx as u16, y0 + dy as u16, block.clone());
                 }
             }
         }

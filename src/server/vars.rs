@@ -1,7 +1,7 @@
 //! Format variables (#{session_name}, #{pane_current_path}, ...) for a target.
 
 use super::*;
-use crate::cells::{Color, Style};
+use crate::cells::Color;
 use crate::format::{self, Vars};
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -157,6 +157,14 @@ impl Server {
 }
 
 impl Vars for VarCtx<'_> {
+    fn theme_color(&self, name: &str) -> Option<Color> {
+        self.resolve_theme_colour(name)
+    }
+
+    fn colour_escape(&self, name: &str, background: bool) -> Option<String> {
+        self.client_colour_escape(name, background)
+    }
+
     fn contexts(&self, kind: char, flags: &str) -> Vec<(Box<dyn Vars + '_>, bool)> {
         let mut targets = Vec::new();
         match kind {
@@ -500,12 +508,14 @@ impl Vars for VarCtx<'_> {
                 _ => p.track.search.clone(),
             }),
             "pane_start_command_list" => pane.map(|p| p.track.argv.iter().map(|a| format!("'{}'", a.replace('\'', "'\\''"))).collect::<Vec<_>>().join(" ")),
-            "pane_fg" | "pane_bg" => win.zip(t.pane).map(|(w, p)| {
-                // window-active-style colours win over window-style ones for the active pane
-                let style = |o: &str| crate::format::parse_style(&srv.expand_for_pane(p, &srv.opt_pane(p, o)), Style::default()).unwrap_or_default();
-                let (normal, active) = (style("window-style"), style("window-active-style"));
-                let pick = |n: Color, a: Color| if w.active == p && a != Color::Default { a } else { n };
-                colour_name(if name == "pane_fg" { pick(normal.fg, active.fg) } else { pick(normal.bg, active.bg) })
+            "pane_fg" | "pane_bg" => win.and(t.pane).map(|p| {
+                use super::theme::StyleColour;
+                // tty_default_colours: window-active-style for the active pane, then
+                // pane palette, then window-style; inactive panes prefer window-style.
+                let (sfg, sbg) = srv.pane_style_colours(p);
+                let palette = srv.panes.get(&p).map(|pp| &pp.parser.callbacks().colours);
+                let pick = |st: StyleColour, own: Option<Color>| if st == StyleColour::Default { own.map_or(st, StyleColour::Colour) } else { st };
+                if name == "pane_fg" { pick(sfg, palette.and_then(|c| c.fg)) } else { pick(sbg, palette.and_then(|c| c.bg)) }.name()
             }),
             "pane_left" | "pane_top" | "pane_right" | "pane_bottom" | "pane_at_left" | "pane_at_right" | "pane_at_top" | "pane_at_bottom" | "pane_x" | "pane_y"
             | "pane_unzoomed_width" | "pane_unzoomed_height" => {
@@ -631,7 +641,8 @@ impl Vars for VarCtx<'_> {
                 None => {
                     // the cursor-colour option, "none" when unset
                     let o = srv.opt_pane(p.id, "cursor-colour");
-                    crate::format::parse_color(&o).filter(|_| !o.is_empty() && o != "none").map_or("none".into(), colour_name)
+                    if let Some(i) = crate::format::theme_index(&o) { return crate::format::theme_name(i).into(); }
+                    if o.is_empty() || o == "none" { "none".into() } else { super::theme::style_colours(&format!("fg={o}"), self).0.name() }
                 }
             }),
             "cursor_character" => pane.and_then(|p| {
@@ -688,11 +699,10 @@ impl Vars for VarCtx<'_> {
             "client_cell_width" => client.filter(|c| c.attached && c.control == 0).map(|_| "16".into()),
             "client_cell_height" => client.filter(|c| c.attached && c.control == 0).map(|_| "32".into()),
             "client_colours" => client.filter(|c| c.attached && c.control == 0).map(|c| {
-                if c.features.has("RGB") { "16777216" } else if c.features.has("256") { "256" } else { "8" }.into()
+                c.features.colours().to_string()
             }),
-            // dark/light detection (OSC 11 / mode 2031) is not done: unknown, as tmux shows it
-            "client_theme" => None,
-            // server_client_get_flags (focus is not tracked)
+            "client_theme" => client.and_then(|c| c.terminal.reported).map(|t| if t == format::Theme::Light { "light" } else { "dark" }.into()),
+            // server_client_get_flags
             "client_flags" => client.map(|c| {
                 let pause = c.ctl.pause_after.map(|d| format!("pause-after={}", d.as_secs()));
                 [
@@ -1092,6 +1102,13 @@ mod tests {
         run(&mut srv, &["set", "-g", "window-active-style", "bg=blue"]);
         assert_eq!(srv.expand_for_pane(active, "#{pane_fg} #{pane_bg}"), "colour100 blue");
         assert_eq!(srv.expand_for_pane(other, "#{pane_fg} #{pane_bg}"), "colour100 #102030");
+        // tty_default_colours: the window styles win over a pane's own OSC 10/11 colours
+        output(&mut srv, other, b"\x1b]10;#ff0000\x07\x1b]11;#00ff00\x07");
+        assert_eq!(srv.expand_for_pane(other, "#{pane_fg} #{pane_bg}"), "colour100 #102030");
+        run(&mut srv, &["set", "-g", "window-style", "bg=themecyan"]);
+        assert_eq!(srv.expand_for_pane(other, "#{pane_fg} #{pane_bg}"), "#ff0000 themecyan");
+        run(&mut srv, &["set", "-gu", "window-style"]);
+        assert_eq!(srv.expand_for_pane(other, "#{pane_fg} #{pane_bg}"), "#ff0000 #00ff00");
         srv.shutdown();
     }
 }
