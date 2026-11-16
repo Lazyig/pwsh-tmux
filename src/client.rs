@@ -68,6 +68,29 @@ fn spawn_server(config: Option<&str>) -> std::io::Result<()> {
     }
 }
 
+/// One argument quoted for CommandLineToArgvW: backslashes are doubled before a quote
+/// and at the end (a cwd of `C:\\` must not escape the closing quote).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn win_quote(s: &str) -> String {
+    let mut out = String::from("\"");
+    let mut slashes = 0;
+    for ch in s.chars() {
+        match ch {
+            '\\' => {
+                slashes += 1;
+                continue;
+            }
+            '"' => out.push_str(&"\\".repeat(slashes * 2 + 1)),
+            _ => out.push_str(&"\\".repeat(slashes)),
+        }
+        slashes = 0;
+        out.push(ch);
+    }
+    out.push_str(&"\\".repeat(slashes * 2));
+    out.push('"');
+    out
+}
+
 /// Starts the server with CreateProcessW directly: std's Command always enables handle
 /// inheritance, which leaks whatever inheritable handles the client got from its parent
 /// (e.g. sshd's session pipes, keeping `ssh host pwsh-tmux new -d` from ever returning).
@@ -78,30 +101,7 @@ fn win_spawn_detached(exe: &std::path::Path, config: Option<&str>, cwd: &str) ->
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, PROCESS_INFORMATION, STARTUPINFOW,
     };
-    // CommandLineToArgvW quoting: backslashes are doubled before a quote and at the end
-    let quote = |s: &str| {
-        let mut out = String::from("\"");
-        let mut slashes = 0;
-        for ch in s.chars() {
-            match ch {
-                '\\' => slashes += 1,
-                '"' => {
-                    out.push_str(&"\\".repeat(slashes * 2 + 1));
-                    slashes = 0;
-                }
-                _ => {
-                    out.push_str(&"\\".repeat(slashes));
-                    slashes = 0;
-                }
-            }
-            if ch != '\\' {
-                out.push(ch);
-            }
-        }
-        out.push_str(&"\\".repeat(slashes * 2));
-        out.push('"');
-        out
-    };
+    let quote = win_quote;
     let mut cmdline = format!("{} __server -c {}", quote(&exe.to_string_lossy()), quote(cwd));
     if let Some(f) = config {
         cmdline.push(' ');
@@ -215,6 +215,14 @@ fn prepare_stdin_buffers(args: &mut [String], input: &mut impl Read) -> std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn win_quote_survives_command_line_parsing() {
+        assert_eq!(win_quote(r"C:\Users\a b"), r#""C:\Users\a b""#);
+        assert_eq!(win_quote(r"C:\"), r#""C:\\""#);
+        assert_eq!(win_quote(r#"a\"b"#), r#""a\\\"b""#);
+        assert_eq!(win_quote(""), r#""""#);
+    }
 
     #[test]
     fn native_windows_console_does_not_inherit_dumb_color_capabilities() {

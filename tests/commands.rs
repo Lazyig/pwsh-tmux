@@ -3158,6 +3158,22 @@ fn startup_config_waits_on_its_jobs_and_uses_the_starting_directory() {
         "%session-changed $0 s".to_string(),
         format!("%config-error {f}:2: unknown command: bogus-cmd"),
     ]);
+    // load_cfg names a -f file it cannot open as "path: strerror" (cmd-source-file has
+    // "strerror: path" for a nested one); kill-server lets a new server start at once
+    ctx.ok(&["kill-server"]);
+    let missing = dir.join("none.conf").to_string_lossy().into_owned();
+    std::fs::write(&conf, format!("source-file {missing}\n")).unwrap();
+    ctx.ok(&["-f", &missing, "new-session", "-d", "-s", "s"]);
+    assert_eq!(control_attach_causes(&ctx, "s"), vec![
+        "%session-changed $0 s".to_string(),
+        format!("%config-error {missing}: No such file or directory"),
+    ]);
+    ctx.ok(&["kill-server"]);
+    ctx.ok(&["-f", &f, "new-session", "-d", "-s", "s"]);
+    assert_eq!(control_attach_causes(&ctx, "s"), vec![
+        "%session-changed $0 s".to_string(),
+        format!("%config-error {f}:1: No such file or directory: {missing}"),
+    ]);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

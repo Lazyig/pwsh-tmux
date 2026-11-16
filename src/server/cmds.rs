@@ -1786,6 +1786,11 @@ impl Server {
                 Ok(Flow::Next)
             }
             "kill-server" => {
+                // nobody connects to a server on its way out: a client started next
+                // starts a new one (tmux's exits before the command returns)
+                if self.pipe_acl.is_some() {
+                    crate::ipc::cleanup();
+                }
                 self.quit = true;
                 Ok(Flow::Next)
             }

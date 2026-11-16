@@ -1474,6 +1474,15 @@ impl Server {
         // the first client's command waits for cfg_done
         let mut cmds = VecDeque::new();
         for (f, quiet) in files {
+            // load_cfg: a file that cannot be opened is a cause "path: strerror" (a missing
+            // one is fine when quiet)
+            if let Err(e) = std::fs::File::open(&f) {
+                if !(quiet && e.kind() == io::ErrorKind::NotFound) {
+                    let e = e.to_string();
+                    self.cfg_causes.push(format!("{f}: {}", e.split(" (os error").next().unwrap_or_default()));
+                }
+                continue;
+            }
             let mut args = vec!["source-file".to_string()];
             if quiet {
                 args.push("-q".into());
