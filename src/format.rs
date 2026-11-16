@@ -843,6 +843,15 @@ fn relative_time(age: i64) -> String {
     if b == 0 { format!("{a}{unit}") } else { format!("{a}{unit}{b}{next}") }
 }
 
+/// The RGB of a colour, None for the default.
+pub fn color_rgb(c: Color) -> Option<(u8, u8, u8)> {
+    match c {
+        Color::Idx(n) => Some(palette_rgb(n)),
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+        Color::Default => None,
+    }
+}
+
 /// RGB of a 256-colour palette entry (colour_256toRGB).
 fn palette_rgb(n: u8) -> (u8, u8, u8) {
     const BASIC: [u32; 16] = [

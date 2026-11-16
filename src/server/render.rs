@@ -94,6 +94,8 @@ pub struct Modes {
     pub mouse: u16,
     pub focus: bool,
     pub cursor_style: u8,
+    /// Cursor colour set with OSC 12 (the prompt's prompt-cursor-colour).
+    pub cursor_colour: Option<(u8, u8, u8)>,
     /// modifyOtherKeys level requested from the outer terminal (extended-keys).
     pub extkeys: u8,
 }
@@ -795,6 +797,7 @@ impl Server {
             f.put_cells(cr.x, oy + row, &line.cells);
             if *id == win.active {
                 cursor = Some((cr.x + x.min(cr.w - 1), oy + row));
+                self.prompt_cursor(&mut modes, sid, pr);
             }
         }
 
@@ -828,6 +831,7 @@ impl Server {
             let (ax, aw) = message_area(cw, &style_text);
             let x = self.draw_prompt(&mut f, cid, pr, ax, aw, my);
             cursor = Some((x.min(cw - 1), my));
+            self.prompt_cursor(&mut modes, sid, pr);
         } else if let Some((msg, _)) = &c.message {
             let style_text = self.expand_time(active_target, Some(cid), &self.opt_session(Some(sid), "message-style"));
             let (ax, aw) = message_area(cw, &style_text);
@@ -919,6 +923,18 @@ impl Server {
         modes.app_cursor = true;
         modes.bracketed_paste = c.features.has("bpaste");
         Some(RenderState { frame: f, cursor, modes, status_ranges })
+    }
+
+    /// prompt_draw: while a prompt has the cursor it takes prompt-cursor-style and
+    /// prompt-cursor-colour (the prompt-command-* ones in vi command mode).
+    fn prompt_cursor(&self, modes: &mut Modes, sid: SessId, pr: &Prompt) {
+        let (style, colour) = if pr.vi_command { ("prompt-command-cursor-style", "prompt-command-cursor-colour") } else { ("prompt-cursor-style", "prompt-cursor-colour") };
+        const STYLES: [&str; 7] = ["default", "blinking-block", "block", "blinking-underline", "underline", "blinking-bar", "bar"];
+        if let Some(n) = STYLES.iter().position(|s| *s == self.opt_session(Some(sid), style)).filter(|n| *n != 0) {
+            modes.cursor_style = n as u8;
+        }
+        let value = self.opt_session(Some(sid), colour);
+        modes.cursor_colour = format::parse_color(&value).and_then(format::color_rgb);
     }
 
     /// The status line row of the client's prompt and messages
@@ -1141,6 +1157,12 @@ impl Server {
             out.push_str(if m.focus { "\x1b[?1004h" } else { "\x1b[?1004l" });
             if feats.has("cstyle") {
                 let _ = write!(out, "\x1b[{} q", m.cursor_style);
+            }
+            if feats.has("ccolour") && pm.map_or(None, |p| p.cursor_colour) != m.cursor_colour {
+                match m.cursor_colour {
+                    Some((r, g, b)) => { let _ = write!(out, "\x1b]12;rgb:{r:02x}/{g:02x}/{b:02x}\x07"); }
+                    None => out.push_str("\x1b]112\x07"),
+                }
             }
             if pm.map_or(0, |p| p.extkeys) != m.extkeys {
                 // modifyOtherKeys: have the terminal report keys like C-Enter distinctly

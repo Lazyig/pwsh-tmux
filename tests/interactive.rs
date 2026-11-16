@@ -886,3 +886,23 @@ fn display_pane_status_alignment_scrollbar_offset_and_arrows() {
     assert_eq!(t.row(2).chars().nth(sep), Some('→'));
     assert_eq!(t.row(1).chars().nth(sep), Some('│'));
 }
+
+#[test]
+fn display_prompt_cursor_style_and_colour() {
+    let ctx = Ctx::new("display-pcursor");
+    let t = start(&ctx, "s");
+    ctx.ok(&["set", "-g", "prompt-cursor-style", "bar"]);
+    ctx.ok(&["set", "-g", "prompt-cursor-colour", "red"]);
+    t.prefix(b":");
+    wait_for("prompt cursor", || t.raw_text().contains("\x1b[6 q") && t.raw_text().contains("\x1b]12;rgb:80/00/00\x07"));
+    t.send(b"\x03");
+    wait_for("cursor colour reset", || t.raw_text().contains("\x1b]112\x07"));
+    // vi command mode uses the prompt-command-* options
+    ctx.ok(&["set", "-g", "status-keys", "vi"]);
+    ctx.ok(&["set", "-g", "prompt-command-cursor-style", "blinking-underline"]);
+    ctx.ok(&["set", "-g", "prompt-command-cursor-colour", "blue"]);
+    t.prefix(b":");
+    t.send(b"a\x1b");
+    wait_for("command mode cursor", || t.raw_text().contains("\x1b[3 q") && t.raw_text().contains("\x1b]12;rgb:00/00/80\x07"));
+    t.send(b"\x03");
+}
