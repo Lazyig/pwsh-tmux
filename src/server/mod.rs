@@ -1248,6 +1248,8 @@ pub struct Server {
     pub cfg_causes: Vec<String>,
     /// Queues waiting for a pane's command to exit (new-pane -W).
     pub pane_waits: HashMap<PaneId, Vec<(Vec<String>, Queue)>>,
+    /// Panes running the editor of a mode (wp->editor) and the client it was opened for.
+    pub editors: HashMap<PaneId, (ClientId, modes::PopupEditor)>,
 }
 
 pub fn run(config: Option<String>) -> io::Result<()> {
@@ -1398,6 +1400,7 @@ impl Server {
             cfg_files: Vec::new(),
             cfg_causes: Vec::new(),
             pane_waits: HashMap::new(),
+            editors: HashMap::new(),
         };
         srv.opts_session.set("default-shell", procinfo::default_shell());
         srv
@@ -2123,19 +2126,17 @@ impl Server {
                 p.dead = Some((status, now_secs()));
             }
             if close {
-                let mut editor = None;
                 if let Some(c) = self.clients.get_mut(&cid) {
-                    if let Some(Overlay::Popup(p)) = c.overlay.take() {
-                        editor = p.editor;
-                    }
+                    c.overlay = None;
                     c.dirty = true;
                 }
                 self.destroy_pane(id);
-                if let Some(ed) = editor {
-                    self.editor_done(cid, *ed, status);
-                }
             }
             return;
+        }
+        // server_child_exited: spawn_editor_finish before the pane is destroyed
+        if let Some((cid, ed)) = self.editors.remove(&id) {
+            self.editor_done(cid, ed, status);
         }
         let remain = self.opt_pane(id, "remain-on-exit");
         // "key" and "failed-key" keep it until a key is pressed (see Server::dead_key)
@@ -2740,6 +2741,10 @@ impl Server {
         if let Some(mut p) = self.panes.remove(&id) {
             p.kill();
             release(p);
+        }
+        // window_pane_destroy: an editor killed with its pane changes nothing
+        if let Some((_, ed)) = self.editors.remove(&id) {
+            let _ = std::fs::remove_file(&ed.path);
         }
         if self.marked == Some(id) {
             self.marked = None;

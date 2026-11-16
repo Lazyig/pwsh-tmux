@@ -3390,7 +3390,6 @@ impl Server {
                 let epoch = self.replace_overlay(cid, Some(Overlay::Popup(Popup {
                     pane, x, y, w, h, border, close_on_exit: o.has('E'), close_any_key: o.has('k'), title,
                     look: super::modes::OverlayLook { style: o.get('s').map(String::from), border_style: o.get('S').map(String::from), lines: o.get('b').map(String::from), ..Default::default() },
-                    editor: None,
                 })))?;
                 Ok(Flow::WaitOverlay(cid, epoch))
             }

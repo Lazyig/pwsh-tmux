@@ -944,12 +944,16 @@ impl Server {
         }
     }
 
-    /// spawn_editor: edit `value` in the editor option's program, in a popup over the client;
-    /// `command` runs with %% replaced by the text when the editor exits successfully.
+    /// spawn_editor: edit `value` in the editor option's program, in a modal floating pane
+    /// 9/10 of the client's window in its middle; `command` runs with %% replaced by the
+    /// text when the editor exits successfully.
     pub fn open_editor(&mut self, cid: ClientId, value: &[u8], command: String, buffer: Option<String>) -> Result<(), String> {
-        if self.clients.get(&cid).is_some_and(|c| c.overlay.is_some()) {
-            return Err("an overlay is already open".into());
+        let wid = self.client_window(cid).ok_or("no current window")?;
+        let w = &self.windows[&wid];
+        if w.modal.is_some() {
+            return Err("window already has a modal pane".into());
         }
+        let (wsx, wsy, active) = (w.sx, w.sy, w.active);
         let text: &[u8] = if value.is_empty() { b"\n" } else { value };
         let path = editor_file(text).map_err(|e| format!("editor: {e}"))?;
         let editor = self.opt_server("editor");
@@ -959,26 +963,32 @@ impl Server {
         let shell = self.opt_session(sid, "default-shell");
         let shell = if shell.is_empty() { procinfo::default_shell() } else { shell };
         let cmd = editor_command(&editor, &quoted, cfg!(windows) && procinfo::is_powershell(&shell));
-        // spawn_editor: a pane 9/10 of the window in its middle (xoff = sx / 2 - w / 2),
-        // here with a border around it
-        let (wsx, wsy) = self.client_window(cid).and_then(|w| self.windows.get(&w)).map_or(self.clients[&cid].size, |w| (w.sx, w.sy));
-        let (pw, ph) = (((wsx as u32 * 9 / 10) as u16).max(1), ((wsy as u32 * 9 / 10) as u16).max(1));
-        let top = self.client_window_top(cid);
-        let (x, y) = ((wsx / 2 - pw / 2).saturating_sub(1), (top + wsy / 2 - ph / 2).saturating_sub(1));
-        let (w, h) = (pw + 2, ph + 2);
-        let pane = match self.spawn_pane(sid, pw, ph, &[cmd], Some(&std::env::temp_dir().display().to_string()), &[]) {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = std::fs::remove_file(&path);
-                return Err(e);
-            }
-        };
-        let editor = Some(Box::new(super::modes::PopupEditor { path, command, buffer }));
-        self.replace_overlay(cid, Some(Overlay::Popup(super::modes::Popup { pane, x, y, w, h, border: true, close_on_exit: true, close_any_key: false, title: String::new(), look: Default::default(), editor })))?;
+        // the layout cell: sx * 9 / 10 by sy * 9 / 10 at sx / 2 - w / 2, sy / 2 - h / 2
+        // (new-pane's -x/-y count the border, -X/-Y place the border)
+        let (pw, ph) = (((wsx as u32 * 9 / 10) as i64).max(1), ((wsy as u32 * 9 / 10) as i64).max(1));
+        let (xoff, yoff) = (wsx as i64 / 2 - pw / 2, wsy as i64 / 2 - ph / 2);
+        let b = i64::from(self.opt_window(Some(wid), "pane-border-lines") != "none");
+        let args: Vec<String> = [
+            "-O".to_string(), "-x".into(), (pw + 2 * b).to_string(), "-y".into(), (ph + 2 * b).to_string(),
+            "-X".into(), (xoff - b).to_string(), "-Y".into(), (yoff - b).to_string(),
+            "-c".into(), std::env::temp_dir().display().to_string(), "-t".into(), format!("%{active}"), cmd,
+        ].into();
+        let (bools, vals) = cmds::command_flags("new-pane");
+        let o = crate::opts::getopt(&args, bools, vals)?;
+        let mut ctx = Ctx { client: Some(cid), ..Default::default() };
+        if let Err(e) = self.cmd_new_pane("new-pane", &o, &[], &mut ctx) {
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
+        }
+        let Some(pane) = ctx.pane else { return Ok(()) };
+        if let Some(p) = self.panes.get_mut(&pane) {
+            p.options.set("remain-on-exit", "off".into());
+        }
+        self.editors.insert(pane, (cid, super::modes::PopupEditor { path, command, buffer }));
         Ok(())
     }
 
-    /// The editor popup closed (spawn_editor_finish): nothing for a failed editor or an
+    /// The editor pane exited (spawn_editor_finish): nothing for a failed editor or an
     /// empty file, else the paste buffer gets the text (window_buffer_edit_close_cb) or the
     /// command runs with it, less a final newline.
     pub fn editor_done(&mut self, cid: ClientId, ed: super::modes::PopupEditor, status: Option<i32>) {

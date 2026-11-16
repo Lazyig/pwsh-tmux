@@ -378,10 +378,9 @@ pub struct Popup {
     pub close_any_key: bool,
     pub title: String,
     pub look: OverlayLook,
-    /// The popup runs the editor for a mode (spawn_editor).
-    pub editor: Option<Box<PopupEditor>>,
 }
 
+/// The editor a mode runs in a modal floating pane (spawn_editor_state).
 pub struct PopupEditor {
     pub path: std::path::PathBuf,
     /// Run with %% replaced by the edited text.
