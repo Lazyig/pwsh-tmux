@@ -715,3 +715,92 @@ fn display_prompt_flags_completion_and_mouse_like_tmux_3_8() {
     t.mouse(0, 10, 5, true);
     wait_for("click clears the message", || !t.row(29).starts_with("Can't"));
 }
+
+#[test]
+fn display_menu_popup_positions_and_pane_prompt_like_tmux_3_8() {
+    let ctx = Ctx::new("display-pos38");
+    let t = start(&ctx, "s");
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    let rows = || t.contents().lines().map(str::to_string).collect::<Vec<_>>();
+    let row_of = |pat: &str| rows().iter().position(|l| l.contains(pat));
+    // display-popup waits for the popup to close
+    let popup = |args: &[&str]| {
+        let mut a = vec!["display-popup", "-c", &client];
+        a.extend_from_slice(args);
+        ctx.command().args(&a).spawn().unwrap()
+    };
+    // menus are placed inside the window, above a bottom status line
+    ctx.ok(&["display-menu", "-c", &client, "-x", "10", "-y", "100%", "-T", "T", "First", "a", "display 1"]);
+    wait_for("menu", || row_of("First").is_some());
+    assert_eq!(row_of("└"), Some(28));
+    assert!(t.row(29).contains("[s]"));
+    t.send(b"q");
+    wait_for("menu closed", || row_of("First").is_none());
+    // and below one at the top
+    ctx.ok(&["set", "-g", "status-position", "top"]);
+    ctx.ok(&["display-menu", "-c", &client, "-x", "10", "-y", "0", "-T", "T", "First", "a", "display 1"]);
+    wait_for("top menu", || row_of("First").is_some());
+    assert_eq!(row_of("┌"), Some(1));
+    t.send(b"q");
+    wait_for("menu closed", || row_of("First").is_none());
+    ctx.ok(&["set", "-g", "status-position", "bottom"]);
+    // popup -x/-y take letters and formats; y is the bottom row
+    let _p1 = popup(&["-x", "#{e|+:2,3}", "-y", "6", "-w", "12", "-h", "4", "printf hi; sleep 10"]);
+    wait_for("popup", || row_of("hi").is_some());
+    assert_eq!(row_of("┌"), Some(2));
+    assert_eq!(rows()[2].find('┌'), Some(5));
+    // Escape closes a popup without -E even while its command runs
+    t.send(b"\x1b");
+    wait_for("popup closed", || row_of("┌").is_none());
+    // popups are drawn over the status line
+    let _p2 = popup(&["-x", "R", "-y", "100%", "-w", "12", "-h", "4", "printf hi; sleep 10"]);
+    wait_for("popup over status", || t.row(29).contains('└'));
+    assert_eq!(t.row(29).find('└'), Some(88));
+    t.send(b"\x03");
+    wait_for("popup closed", || row_of("┌").is_none());
+    // after its command exits, a key that is not Escape leaves it open
+    let _p3 = popup(&["-x", "0", "-y", "0", "-w", "12", "-h", "4", "printf noE"]);
+    wait_for("popup", || row_of("noE").is_some());
+    std::thread::sleep(Duration::from_millis(300));
+    t.send(b"q");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(row_of("noE").is_some());
+    t.send(b"\x1b");
+    wait_for("popup closed", || row_of("noE").is_none());
+    // command-prompt -P prompts on the pane's last line, the status line stays
+    ctx.ok(&["command-prompt", "-b", "-P", "-t", &client, "-p", "pane:", "set -g @pp '%%'"]);
+    wait_for("pane prompt", || t.row(28).starts_with("pane: "));
+    assert!(t.row(29).contains("[s]"));
+    t.send(b"hi\r");
+    wait_for("pane prompt done", || ctx.ok(&["show", "-gv", "@pp"]) == "hi\n");
+    assert!(!t.row(28).starts_with("pane:"));
+    // copy-mode searches prompt in the pane too
+    t.prefix(b"[");
+    t.send(b"\x12");
+    wait_for("search prompt in the pane", || t.row(28).starts_with("(search up) "));
+    t.send(b"\x1b");
+    wait_for("search prompt closed", || !t.row(28).starts_with("(search up)"));
+    t.send(b"q");
+}
+
+#[test]
+fn display_border_lines_spaces_none_and_numbers() {
+    let ctx = Ctx::new("display-lines38");
+    let t = start(&ctx, "s");
+    ctx.ok(&["set", "-g", "status", "off"]);
+    ctx.ok(&["split-window", "-h", "-t", "s"]);
+    ctx.ok(&["split-window", "-v", "-t", "s"]);
+    let x = ctx.fmt("s", "#{pane_left}").trim().parse::<usize>().unwrap() - 1;
+    let y = ctx.fmt("s", "#{pane_top}").trim().parse::<u16>().unwrap() - 1;
+    wait_for("borders", || t.row(0).chars().nth(x) == Some('│'));
+    for lines in ["spaces", "none"] {
+        ctx.ok(&["set", "-g", "pane-border-lines", lines]);
+        wait_for(lines, || !t.contents().contains('│') && !t.contents().contains('─'));
+    }
+    // number: the pane's index; a junction next to the active pane is its number
+    ctx.ok(&["set", "-g", "pane-border-lines", "number"]);
+    wait_for("numbers", || t.row(1).chars().nth(x) == Some('0'));
+    assert_eq!(t.row(y).chars().nth(x), Some('2'));
+    assert_eq!(t.row(y).chars().nth(x + 1), Some('2'));
+    assert_eq!(t.row(y + 1).chars().nth(x), Some('2'));
+}

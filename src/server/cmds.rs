@@ -29,7 +29,7 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("clear-history", "clearhist", "H", "t"),
     ("clear-prompt-history", "clearphist", "", "T"),
     ("clock-mode", "", "", "t"),
-    ("command-prompt", "", "1bCeFkilN", "IpTt"),
+    ("command-prompt", "", "1bCeFkilNP", "IpTt"),
     ("confirm-before", "confirm", "by", "cpt"),
     ("copy-mode", "", "deHMqSu", "st"),
     ("customize-mode", "", "NZy", "Fft"),
@@ -2627,7 +2627,7 @@ impl Server {
                 }
                 let title = o.get('T').map(|s| self.expand(tt, Some(cid), s)).unwrap_or_default();
                 let (w, h) = Menu::box_size(&title, &items);
-                let Some((x, y)) = self.overlay_position(cid, tt, ctx.mouse.as_ref(), o.get('x'), o.get('y'), w, h) else { return Ok(Flow::Next) };
+                let Some((x, y)) = self.menu_position(cid, tt, ctx.mouse.as_ref(), o.get('x'), o.get('y'), w, h) else { return Ok(Flow::Next) };
                 let nomouse = ctx.mouse.is_none() && !o.has('M');
                 let mut menu = Menu::at(title, items, x, y, tt.pane, nomouse, o.has('O'), start);
                 menu.lines = border_lines_flag(o.get('b'), "menu-border-lines")?;
@@ -2660,25 +2660,32 @@ impl Server {
                 }
                 let w = dim(o.get('w'), cw).clamp(3, cw);
                 let h = dim(o.get('h'), ch).clamp(3, ch);
-                let x = o.get('x').and_then(|v| v.parse().ok()).unwrap_or(((cw - 1) / 2).saturating_sub(w / 2)).min(cw - w);
-                let y = o.get('y').and_then(|v| v.parse().ok()).unwrap_or(((ch - 1) / 2).saturating_sub(h / 2)).min(ch - h);
+                let tt = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
+                // cmd_display_menu_get_popup_pos: -x/-y are formats (or letters standing
+                // for them), y is the bottom row
+                let Some((x, y)) = self.overlay_position(cid, tt, ctx.mouse.as_ref(), o.get('x'), o.get('y'), w, h) else { return Ok(Flow::Next) };
                 let lines = border_lines_flag(o.get('b'), "popup-border-lines")?;
                 let border = !o.has('B') && lines.clone().unwrap_or_else(|| self.opt_window(self.current(ctx).wid, "popup-border-lines")) != "none";
                 let (iw, ih) = if border { (w - 2, h - 2) } else { (w, h) };
-                let tt = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
                 let cwd = o.get('d').map(|d| self.expand(tt, Some(cid), d)).or_else(|| tt.pane.and_then(|p| self.panes.get(&p)).map(|p| p.current_path.clone()));
                 let pane = self.spawn_pane(tt.sid, iw.max(1), ih.max(1), &o.rest, cwd.as_deref(), &env)?;
                 let title = o.get('T').map(|s| self.expand(tt, Some(cid), s)).unwrap_or_default();
-                let epoch = self.replace_overlay(cid, Some(Overlay::Popup(Popup { pane, x, y, w, h, border, close_on_exit: o.has('E'), title, lines, styles: [o.get('s'), o.get('S')].map(|v| v.map(str::to_string)) })))?;
+                let epoch = self.replace_overlay(cid, Some(Overlay::Popup(Popup { pane, x, y, w, h, border, close_on_exit: o.has('E'), close_any_key: o.has('k'), title, lines, styles: [o.get('s'), o.get('S')].map(|v| v.map(str::to_string)) })))?;
                 Ok(Flow::WaitOverlay(cid, epoch))
             }
             // ---------------------------------------------------------------- prompts & messages
             "command-prompt" => {
                 let cid = self.resolve_client(ctx, t)?;
-                if self.clients.get(&cid).is_some_and(|c| c.prompt.is_some()) {
+                let tt = self.current(&Ctx { client: Some(cid), ..ctx.clone() });
+                // -P: the prompt belongs to the pane and is drawn over its last line
+                let host = if o.has('P') { ctx.pane.or(tt.pane) } else { None };
+                if o.has('P') {
+                    if host.is_none_or(|p| self.panes.get(&p).is_none_or(|p| p.prompt.is_some())) {
+                        return Ok(Flow::Next);
+                    }
+                } else if self.clients.get(&cid).is_some_and(|c| c.prompt.is_some()) {
                     return Ok(Flow::Next);
                 }
-                let tt = self.current(&Ctx { client: Some(cid), ..ctx.clone() });
                 let template = o.rest.first().cloned().unwrap_or_else(|| "%1".into());
                 // -F: the template is a format, expanded now
                 let template = if o.has('F') { self.expand(tt, Some(cid), &template) } else { template };
@@ -2705,18 +2712,30 @@ impl Server {
                 };
                 let kind = if o.has('k') && !o.has('1') && !o.has('N') && !o.has('i') { PromptKind::Key } else { PromptKind::Command };
                 // -1, -N, -i, -k and -e exclude each other in this order
-                self.open_prompt(cid, kind, prompts, template, ctx.pane, o.has('N') && !o.has('1'), o.has('1'));
-                if let Some(pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
-                    pr.search = search;
-                    pr.incremental = o.has('i') && !o.has('1') && !o.has('N');
-                    if pr.incremental {
-                        // the -I text is kept for C-r/C-s, the prompt starts empty
-                        pr.last = pr.input.drain(..).collect();
-                        pr.cursor = 0;
-                    }
-                    pr.bspace_exit = o.has('e') && !o.has('1') && !o.has('N') && !o.has('i') && !o.has('k');
+                let mut pr = Prompt::new(kind, prompts, template, ctx.pane);
+                pr.single_key = o.has('1');
+                pr.numeric = o.has('N') && !o.has('1');
+                pr.search = search;
+                pr.incremental = o.has('i') && !o.has('1') && !o.has('N');
+                if pr.incremental {
+                    // the -I text is kept for C-r/C-s, the prompt starts empty
+                    pr.last = pr.input.drain(..).collect();
+                    pr.cursor = 0;
                 }
-                self.prompt_incremental_start(cid);
+                pr.bspace_exit = o.has('e') && !o.has('1') && !o.has('N') && !o.has('i') && !o.has('k');
+                match host {
+                    Some(pane) => {
+                        pr.host = Some(pane);
+                        self.set_pane_prompt(pane, pr);
+                    }
+                    None => {
+                        if let Some(c) = self.clients.get_mut(&cid) {
+                            c.prompt = Some(pr);
+                            c.dirty = true;
+                        }
+                    }
+                }
+                self.prompt_incremental_start(cid, host);
                 // -C (keep updating panes) is how prompts behave here anyway
                 Ok(Flow::Next)
             }
@@ -4001,6 +4020,15 @@ impl Server {
                     self.apply_layout(wid);
                 }
             }
+            self.mark_window_dirty(wid);
+        }
+    }
+
+    pub fn set_pane_prompt(&mut self, pane: PaneId, pr: Prompt) {
+        if let Some(p) = self.panes.get_mut(&pane) {
+            p.prompt = Some(pr);
+        }
+        if let Some(wid) = self.window_of(pane) {
             self.mark_window_dirty(wid);
         }
     }

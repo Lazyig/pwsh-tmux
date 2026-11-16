@@ -114,6 +114,11 @@ impl Server {
         if self.clients.get(&cid).is_some_and(|c| c.prompt.is_some()) && self.prompt_mouse(cid, &m) {
             return;
         }
+        // an open pane prompt takes all mouse events
+        if let Some(pane) = self.pane_prompt_target(cid) {
+            self.pane_prompt_mouse(cid, pane, &m);
+            return;
+        }
         if let Some(sid) = self.client_session(cid) {
             let wid = self.sessions[&sid].active_window();
             let oy = if self.opt_session(Some(sid), "status-position") == "top" { self.status_lines(Some(sid)) } else { 0 };
@@ -682,6 +687,71 @@ impl Server {
         }
     }
 
+    /// Position of a menu of `w` x `h` (tmux 3.8 cmd_display_menu_get_menu_pos): menus
+    /// belong to the window, so -x/-y are window coordinates kept inside the window;
+    /// the result is moved below a status line at the top. None when it does not fit
+    /// on the client.
+    #[allow(clippy::too_many_arguments)]
+    pub fn menu_position(&self, cid: ClientId, t: vars::Target, m: Option<&MouseCtx>, xarg: Option<&str>, yarg: Option<&str>, w: u16, h: u16) -> Option<(u16, u16)> {
+        let c = self.clients.get(&cid)?;
+        if w > c.size.0 || h > c.size.1 {
+            return None;
+        }
+        let win = self.windows.get(&t.wid?)?;
+        let (wsx, wsy, w, h) = (win.sx as i64, win.sy as i64, w as i64, h as i64);
+        let (max_x, max_y) = ((wsx - w).max(0), (wsy - h).max(0));
+        let sid = c.session;
+        let lines = self.status_lines(sid).min(c.size.1.saturating_sub(1)) as i64;
+        let at_top = self.opt_session(sid, "status-position") == "top";
+        let mut v: HashMap<String, String> = HashMap::new();
+        let mut set = |k: &str, n: i64| {
+            v.insert(k.to_string(), n.to_string());
+        };
+        let mouse = m.map(|m| {
+            let y = match m.statusat {
+                Some(0) => (m.y as i64 - m.statuslines as i64).max(0),
+                Some(at) if m.y >= at => wsy.min(c.size.1 as i64 - lines) - 1,
+                _ => m.y as i64,
+            };
+            (m.x as i64, y)
+        });
+        if let Some((mx, my)) = mouse {
+            set("popup_mouse_x", mx);
+            set("popup_mouse_y", my);
+        }
+        if lines > 0 {
+            let found = c.status_ranges.iter().any(|tags| tags.iter().any(|r| matches!(r, Some(Range::Window(i)) if Some(*i) == t.idx)));
+            if let Some(x) = c.status_ranges.iter().find_map(|tags| tags.iter().position(|r| matches!(r, Some(Range::Window(i)) if Some(*i) == t.idx))).filter(|_| found) {
+                set("popup_window_status_line_x", x as i64);
+                set("popup_window_status_line_y", if at_top { h } else { wsy });
+            }
+            set("popup_status_line_y", if at_top { h } else { wsy });
+        }
+        set("popup_width", w);
+        set("popup_height", h);
+        set("popup_centre_x", ((wsx - 1) / 2 - w / 2).max(0));
+        let n = (wsy - 1) / 2 + h / 2;
+        set("popup_centre_y", if n >= wsy { max_y } else { n });
+        if let Some((mx, my)) = mouse {
+            set("popup_mouse_centre_x", (mx - w / 2).max(0));
+            let n = my - h / 2;
+            set("popup_mouse_centre_y", if n + h >= wsy { max_y } else { n });
+            set("popup_mouse_top", (my + h).min(wsy - 1));
+            set("popup_mouse_bottom", (my - h).max(0));
+        }
+        if let Some(r) = t.pane.and_then(|p| self.pane_rect(p)) {
+            let n = r.y as i64 + h;
+            set("popup_pane_top", if n >= wsy { max_y } else { n });
+            set("popup_pane_bottom", r.bottom() as i64);
+            set("popup_pane_left", r.x as i64);
+            set("popup_pane_right", (r.right() as i64 - w).max(0));
+        }
+        let x = strtol(&self.expand_extra(t, Some(cid), position_format(xarg, true), v.clone())).clamp(0, max_x);
+        let y = strtol(&self.expand_extra(t, Some(cid), position_format(yarg, false), v));
+        let y = if y < h { 0 } else { y - h }.clamp(0, max_y);
+        Some((x as u16, (y + if at_top { lines } else { 0 }) as u16))
+    }
+
     /// Position of a menu or popup of `w` x `h` (cmd_display_menu_get_pos); None when it
     /// does not fit on the client.
     #[allow(clippy::too_many_arguments)]
@@ -735,34 +805,13 @@ impl Server {
             set("popup_pane_left", r.x as i64);
             set("popup_pane_right", (r.right() as i64 - w).max(0));
         }
-        let strtol = |s: &str| -> i64 {
-            let s = s.trim_start();
-            let end = s.char_indices().find(|(i, ch)| !(ch.is_ascii_digit() || (*i == 0 && (*ch == '-' || *ch == '+')))).map_or(s.len(), |(i, _)| i);
-            s[..end].parse().unwrap_or(0)
-        };
-        let xf = match xarg {
-            None | Some("C") => "#{popup_centre_x}",
-            Some("R") => "#{popup_pane_right}",
-            Some("P") => "#{popup_pane_left}",
-            Some("M") => "#{popup_mouse_centre_x}",
-            Some("W") => "#{popup_window_status_line_x}",
-            Some(other) => other,
-        };
-        let mut x = strtol(&self.expand_extra(t, Some(cid), xf, v.clone()));
+        let mut x = strtol(&self.expand_extra(t, Some(cid), position_format(xarg, true), v.clone()));
         if x + w >= sx {
             x = sx - w;
         } else if x < 0 {
             x = 0;
         }
-        let yf = match yarg {
-            None | Some("C") => "#{popup_centre_y}",
-            Some("P") => "#{popup_pane_bottom}",
-            Some("M") => "#{popup_mouse_top}",
-            Some("S") => "#{popup_status_line_y}",
-            Some("W") => "#{popup_window_status_line_y}",
-            Some(other) => other,
-        };
-        let mut y = strtol(&self.expand_extra(t, Some(cid), yf, v));
+        let mut y = strtol(&self.expand_extra(t, Some(cid), position_format(yarg, false), v));
         y = if y < h { 0 } else { y - h };
         if y + h >= sy {
             y = sy - h;
@@ -996,4 +1045,30 @@ mod tests {
         assert_eq!(super::super::strip_delay(&v(&["run-shell", "-d0.5", "-c", "/d", "echo -d"])), v(&["run-shell", "-c", "/d", "echo -d"]));
         assert_eq!(super::super::strip_delay(&v(&["run-shell", "-t", "%1", "-d", "2", "x"])), v(&["run-shell", "-t", "%1", "x"]));
     }
+}
+
+/// The format a display-menu/display-popup -x or -y letter stands for.
+fn position_format(arg: Option<&str>, x: bool) -> &str {
+    match (arg, x) {
+        (None | Some("C"), true) => "#{popup_centre_x}",
+        (None | Some("C"), false) => "#{popup_centre_y}",
+        (Some("R"), true) => "#{popup_pane_right}",
+        (Some("P"), true) => "#{popup_pane_left}",
+        (Some("P"), false) => "#{popup_pane_bottom}",
+        (Some("M"), true) => "#{popup_mouse_centre_x}",
+        (Some("M"), false) => "#{popup_mouse_top}",
+        (Some("L"), true) => "#{popup_last_x}",
+        (Some("L"), false) => "#{popup_last_y}",
+        (Some("S"), false) => "#{popup_status_line_y}",
+        (Some("W"), true) => "#{popup_window_status_line_x}",
+        (Some("W"), false) => "#{popup_window_status_line_y}",
+        (Some(other), _) => other,
+    }
+}
+
+/// strtol(3) of an expanded position: leading digits, 0 if none.
+fn strtol(s: &str) -> i64 {
+    let s = s.trim_start();
+    let end = s.char_indices().find(|(i, ch)| !(ch.is_ascii_digit() || (*i == 0 && (*ch == '-' || *ch == '+')))).map_or(s.len(), |(i, _)| i);
+    s[..end].parse().unwrap_or(0)
 }

@@ -313,12 +313,15 @@ fn spans_cells(spans: &[Span], max: usize, fill: Style) -> Vec<Cell> {
     format::layout_line(&left_aligned, total.min(max), fill)
 }
 
-const BORDER_SETS: [(&str, [&str; 11]); 4] = [
+const BORDER_SETS: [(&str, [&str; 11]); 6] = [
     // h, v, tl, tr, bl, br, cross, t-down, t-up, t-right, t-left
     ("single", ["─", "│", "┌", "┐", "└", "┘", "┼", "┬", "┴", "├", "┤"]),
     ("double", ["═", "║", "╔", "╗", "╚", "╝", "╬", "╦", "╩", "╠", "╣"]),
     ("heavy", ["━", "┃", "┏", "┓", "┗", "┛", "╋", "┳", "┻", "┣", "┫"]),
     ("simple", ["-", "|", "+", "+", "+", "+", "+", "+", "+", "+", "+"]),
+    // window_get_border_cell: PANE_LINES_SPACES and PANE_LINES_NONE are blank
+    ("spaces", [" "; 11]),
+    ("none", [" "; 11]),
 ];
 
 impl Server {
@@ -675,16 +678,22 @@ impl Server {
                     })
                 } else { None };
                 let text = if let Some(arrow) = arrow { arrow.into() } else if lines_kind == "number" {
-                    // The pane below or to the right owns a shared border.
-                    let panes = win.panes();
-                    let active = panes.iter().position(|p| *p == win.active).unwrap_or(0);
-                    (0..panes.len()).map(|i| (active+i)%panes.len()).find(|i| {
-                        rects.iter().find(|(p,_)| *p==panes[*i]).is_some_and(|(_,a)|
-                            (x == a.right() && y >= a.y && y <= a.bottom()) ||
-                            (x + 1 == a.x && y >= a.y && y <= a.bottom()) ||
-                            (y == a.bottom() && x >= a.x && x <= a.right()) ||
-                            (y + 1 == a.y && x >= a.x && x <= a.right()))
-                    }).map(|i| char::from(b'0' + (i%10) as u8).to_string()).unwrap_or_else(|| "*".into())
+                    // window_pane_index of the pane the cell is drawn for
+                    // (redraw_get_pane_for_border_style): the active pane if the cell
+                    // borders it, else the pane above, below, left or right of it
+                    let (mut above, mut below, mut left, mut right, mut active) = (None, None, None, None, false);
+                    for (p, a) in &rects {
+                        let (l, r, t, b) = (a.x as i32 - 1, a.right() as i32, a.y as i32 - 1, a.bottom() as i32);
+                        if xi < l || xi > r || yi < t || yi > b || (xi > l && xi < r && yi > t && yi < b) { continue; }
+                        if yi == t { below = Some(*p); }
+                        if yi == b { above = Some(*p); }
+                        if xi == l { right = Some(*p); }
+                        if xi == r { left = Some(*p); }
+                        active |= *p == win.active;
+                    }
+                    let owner = if active { Some(win.active) } else { above.or(below).or(left).or(right) };
+                    let base = self.opt_window_num(Some(wid), "pane-base-index").max(0) as usize;
+                    owner.and_then(|o| win.panes().iter().position(|p| *p == o)).map(|i| char::from(b'0' + ((i + base) % 10) as u8).to_string()).unwrap_or_else(|| "*".into())
                 } else { ch.into() };
                 f.set(x, oy + y, Cell { text, style: if near { active_border } else { inactive_border } });
             }
@@ -728,7 +737,68 @@ impl Server {
                 }
             }
         }
-        // overlays
+        // pane prompts over the last line of their panes (the first with the
+        // status line at the top, redraw_draw_pane_prompt)
+        for (id, r) in &rects {
+            let Some(pr) = self.panes.get(id).and_then(|p| p.prompt.as_ref()) else { continue };
+            let cr = self.content_rect(wid, *r);
+            if cr.w == 0 || cr.h == 0 { continue; }
+            let row = if top && nstatus > 0 { cr.y } else { cr.bottom() - 1 };
+            let mut line = Frame::new(cr.w, 1);
+            let x = self.draw_prompt(&mut line, cid, pr, 0, cr.w, 0);
+            f.put_cells(cr.x, oy + row, &line.cells);
+            if *id == win.active {
+                cursor = Some((cr.x + x.min(cr.w - 1), oy + row));
+            }
+        }
+
+        // status lines
+        if nstatus > 0 {
+            let sy0 = if top { 0 } else { ch - nstatus };
+            let formats: Vec<String> = (0..nstatus).map(|i| self.opt_session(Some(sid), &format!("status-format[{i}]"))).collect();
+            for i in 0..nstatus {
+                let y = sy0 + i;
+                let custom = &formats[i as usize];
+                // The built-in first line has a dedicated renderer for list clipping.
+                let (line, tags) = if !custom.is_empty() && !(i == 0 && custom == options::STATUS_FORMATS[0]) {
+                    let base = self.status_style(sid, cid);
+                    let cur = Target { sid: Some(sid), idx: Some(s.active), wid: Some(wid), pane: Some(win.active) };
+                    let text = self.expand_status_time(cur, cid, custom);
+                    format::layout_line_ranged(&format::spans(&text, base), cw as usize, base)
+                } else if i == 0 {
+                    self.status_line(cid, sid, cw)
+                } else {
+                    (vec![Cell { text: " ".into(), style: self.status_style(sid, cid) }; cw as usize], vec![None; cw as usize])
+                };
+                f.put_cells(0, y, &line);
+                status_ranges.push(tags);
+            }
+        }
+        // message / prompt replace the first status line (or the last row without a status line)
+        let message_line = self.opt_session_num(Some(sid), "message-line").max(0) as u16;
+        let my = if nstatus > 0 { (if top { 0 } else { ch - nstatus }) + message_line.min(nstatus - 1) } else { ch - 1 };
+        if let Some(pr) = &c.prompt {
+            let style_text = self.expand_time(active_target, Some(cid), &self.opt_session(Some(sid), "message-style"));
+            let (ax, aw) = message_area(cw, &style_text);
+            let x = self.draw_prompt(&mut f, cid, pr, ax, aw, my);
+            cursor = Some((x.min(cw - 1), my));
+        } else if let Some((msg, _)) = &c.message {
+            let style_text = self.expand_time(active_target, Some(cid), &self.opt_session(Some(sid), "message-style"));
+            let (ax, aw) = message_area(cw, &style_text);
+            // status_message_escape: a text message's # are drawn as they are
+            let msg = if c.message_ignore_styles { msg.replace('#', "##") } else { msg.clone() };
+            let extra = HashMap::from([("message".to_string(), msg), ("command_prompt".to_string(), "0".to_string())]);
+            let vars = super::vars::VarCtx { srv: self, t: active_target, client: Some(cid), extra };
+            let st = self.style_option(&style_text, Style::default(), active_target, Some(cid)).unwrap_or_default();
+            let expanded = format::expand_time(&self.opt_session(Some(sid), "message-format"), &vars);
+            let mut area = Frame::new(aw, 1);
+            area.put_cells(0, 0, &f.cells[(my as usize * cw as usize + ax as usize)..(my as usize * cw as usize + ax as usize + aw as usize)]);
+            message_cells(&mut area, 0, &expanded, st);
+            f.put_cells(ax, my, &area.cells);
+            cursor = None;
+        }
+
+        // overlays, over the status line like tmux's overlay_draw
         if let Some(ov) = &c.overlay {
             match ov {
                 Overlay::DisplayPanes { .. } => {
@@ -800,52 +870,6 @@ impl Server {
             }
         }
 
-        // status lines
-        if nstatus > 0 {
-            let sy0 = if top { 0 } else { ch - nstatus };
-            let formats: Vec<String> = (0..nstatus).map(|i| self.opt_session(Some(sid), &format!("status-format[{i}]"))).collect();
-            for i in 0..nstatus {
-                let y = sy0 + i;
-                let custom = &formats[i as usize];
-                // The built-in first line has a dedicated renderer for list clipping.
-                let (line, tags) = if !custom.is_empty() && !(i == 0 && custom == options::STATUS_FORMATS[0]) {
-                    let base = self.status_style(sid, cid);
-                    let cur = Target { sid: Some(sid), idx: Some(s.active), wid: Some(wid), pane: Some(win.active) };
-                    let text = self.expand_status_time(cur, cid, custom);
-                    format::layout_line_ranged(&format::spans(&text, base), cw as usize, base)
-                } else if i == 0 {
-                    self.status_line(cid, sid, cw)
-                } else {
-                    (vec![Cell { text: " ".into(), style: self.status_style(sid, cid) }; cw as usize], vec![None; cw as usize])
-                };
-                f.put_cells(0, y, &line);
-                status_ranges.push(tags);
-            }
-        }
-        // message / prompt replace the first status line (or the last row without a status line)
-        let message_line = self.opt_session_num(Some(sid), "message-line").max(0) as u16;
-        let my = if nstatus > 0 { (if top { 0 } else { ch - nstatus }) + message_line.min(nstatus - 1) } else { ch - 1 };
-        if let Some(pr) = &c.prompt {
-            let style_text = self.expand_time(active_target, Some(cid), &self.opt_session(Some(sid), "message-style"));
-            let (ax, aw) = message_area(cw, &style_text);
-            let x = self.draw_prompt(&mut f, cid, pr, ax, aw, my);
-            cursor = Some((x.min(cw - 1), my));
-        } else if let Some((msg, _)) = &c.message {
-            let style_text = self.expand_time(active_target, Some(cid), &self.opt_session(Some(sid), "message-style"));
-            let (ax, aw) = message_area(cw, &style_text);
-            // status_message_escape: a text message's # are drawn as they are
-            let msg = if c.message_ignore_styles { msg.replace('#', "##") } else { msg.clone() };
-            let extra = HashMap::from([("message".to_string(), msg), ("command_prompt".to_string(), "0".to_string())]);
-            let vars = super::vars::VarCtx { srv: self, t: active_target, client: Some(cid), extra };
-            let st = self.style_option(&style_text, Style::default(), active_target, Some(cid)).unwrap_or_default();
-            let expanded = format::expand_time(&self.opt_session(Some(sid), "message-format"), &vars);
-            let mut area = Frame::new(aw, 1);
-            area.put_cells(0, 0, &f.cells[(my as usize * cw as usize + ax as usize)..(my as usize * cw as usize + ax as usize + aw as usize)]);
-            message_cells(&mut area, 0, &expanded, st);
-            f.put_cells(ax, my, &area.cells);
-            cursor = None;
-        }
-
         modes.app_cursor = true;
         modes.bracketed_paste = c.features.has("bpaste");
         Some(RenderState { frame: f, cursor, modes, status_ranges })
@@ -870,7 +894,7 @@ impl Server {
     pub(crate) fn prompt_layout(&self, cid: ClientId, pr: &Prompt, ax: u16, aw: u16) -> PromptLayout {
         let sid = self.client_session(cid);
         let t = sid.map(|s| self.sessions[&s].active_window()).map(|w| self.target_for_pane(self.windows[&w].active)).unwrap_or_default();
-        let flags = [(pr.single_key, "SINGLE"), (pr.numeric, "NUMERIC"), (pr.incremental || pr.copy_incremental.is_some(), "INCREMENTAL"), (pr.bspace_exit, "BSPACE_EXIT"), (pr.vi_command, "COMMANDMODE")];
+        let flags = [(pr.single_key, "SINGLE"), (pr.numeric, "NUMERIC"), (pr.incremental || pr.copy_incremental.is_some(), "INCREMENTAL"), (pr.bspace_exit, "BSPACE_EXIT"), (pr.vi_command, "COMMANDMODE"), (pr.host.is_some(), "ISPANE")];
         let extra = HashMap::from([
             ("prompt_input".to_string(), pr.input.iter().collect::<String>()),
             ("prompt_flags".to_string(), flags.into_iter().filter_map(|(on, flag)| on.then_some(flag)).collect::<Vec<_>>().join(",")),

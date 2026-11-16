@@ -314,6 +314,8 @@ pub struct Pane {
     pub dead: Option<(Option<i32>, u64)>,
     pub scrollbar_until: Option<Instant>,
     pub mode: Option<PaneMode>,
+    /// command-prompt -P: a prompt drawn on the pane's last line.
+    pub prompt: Option<Prompt>,
     pub options: Options,
     pub pipe: Option<Sender<Vec<u8>>>,
     pub last_output: Instant,
@@ -533,6 +535,8 @@ pub struct Prompt {
     pub complete: Vec<String>,
     /// The prompt finished (prompt_closed).
     pub closed: bool,
+    /// The pane a command-prompt -P prompt belongs to.
+    pub host: Option<PaneId>,
     pub copy_incremental: Option<(PaneId, bool)>,
     /// command-prompt -e: backspace on an empty prompt closes it.
     pub bspace_exit: bool,
@@ -548,7 +552,7 @@ impl Prompt {
         Prompt {
             vi_command: false, quote_next: false, copied: Vec::new(), kind, prompts, answers: Vec::new(), label, cursor: input.len(), input,
             template, history_pos: None, pane, numeric: false, single_key: false, incremental: false, last: String::new(), search: false,
-            complete: Vec::new(), closed: false, copy_incremental: None, bspace_exit: false, confirm: ('y', false),
+            complete: Vec::new(), closed: false, host: None, copy_incremental: None, bspace_exit: false, confirm: ('y', false),
         }
     }
 }
@@ -2010,6 +2014,7 @@ impl Server {
                 dead: None,
                 scrollbar_until: None,
                 mode: None,
+                prompt: None,
                 options: existing_opts,
                 pipe: None,
                 last_output: Instant::now(),

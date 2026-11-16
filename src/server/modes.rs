@@ -589,6 +589,8 @@ pub struct Popup {
     pub h: u16,
     pub border: bool,
     pub close_on_exit: bool,
+    /// -k: after the command exits any key closes the popup.
+    pub close_any_key: bool,
     pub title: String,
     /// display-popup -b: border lines instead of popup-border-lines.
     pub lines: Option<String>,

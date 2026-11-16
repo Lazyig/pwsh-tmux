@@ -256,19 +256,30 @@ impl Server {
                 return;
             }
             Some(Overlay::Popup(p)) => {
-                let pane = p.pane;
-                if self.panes.get(&pane).is_some_and(|x| x.dead.is_some()) {
-                    // any key closes a popup whose command has exited
+                // popup_key_cb: Escape and C-c close the popup unless -E leaves them
+                // to its running command; after the command exits only they (or with
+                // -k any key) do
+                let (pane, close_on_exit, any_key) = (p.pane, p.close_on_exit, p.close_any_key);
+                let exited = self.panes.get(&pane).is_none_or(|x| x.dead.is_some());
+                let cancel = name == "Escape" || name == "C-c";
+                if ((!close_on_exit || exited) && cancel) || (exited && any_key) {
                     let c = self.clients.get_mut(&cid).unwrap();
                     c.overlay = None;
                     c.dirty = true;
                     self.destroy_pane(pane);
                     return;
                 }
-                self.send_key_to_pane(cid, pane, &k, raw);
+                if !exited {
+                    self.send_key_to_pane(cid, pane, &k, raw);
+                }
                 return;
             }
             None => {}
+        }
+        if let Some(pane) = self.pane_prompt_target(cid) {
+            if self.pane_prompt_key(cid, pane, &k, &name) {
+                return;
+            }
         }
         let Some(sid) = self.client_session(cid) else { return };
         let mut table = self.clients[&cid].key_table.clone();
@@ -515,18 +526,20 @@ impl Server {
                 }
             }
             Action::Prompt { label, command } => {
-                if let Some(c) = cid {
+                if cid.is_some() {
                     // the pane is the prompt's context target (a %id in the template would read as %N)
+                    // tmux 3.8 copy-mode bindings prompt in the pane (command-prompt -P)
                     let template = format!("send-keys -X {command} '%%'");
-                    self.open_prompt(c, PromptKind::Command, vec![(format!("{label} "), String::new())], template, Some(pane), false, false);
+                    let mut pr = Prompt::new(PromptKind::Command, vec![(format!("{label} "), String::new())], template, Some(pane));
+                    pr.search = command.starts_with("search");
+                    pr.host = Some(pane);
                     if command.ends_with("-incremental") {
                         if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
                             cm.begin_incremental_search();
                         }
-                        if let Some(pr) = self.clients.get_mut(&c).and_then(|c| c.prompt.as_mut()) {
-                            pr.copy_incremental = Some((pane, command.starts_with("search-forward")));
-                        }
+                        pr.copy_incremental = Some((pane, command.starts_with("search-forward")));
                     }
+                    self.set_pane_prompt(pane, pr);
                 }
             }
         }
@@ -553,7 +566,14 @@ impl Server {
     fn prompt_done_key(&mut self, cid: ClientId, pr: Prompt) {
         let incremental = pr.copy_incremental;
         let text = (!pr.closed).then(|| pr.input.iter().collect::<String>());
-        if !pr.closed {
+        if let Some(host) = pr.host {
+            if !pr.closed {
+                if let Some(p) = self.panes.get_mut(&host) {
+                    if p.prompt.is_none() { p.prompt = Some(pr); }
+                }
+            }
+            if let Some(wid) = self.window_of(host) { self.mark_window_dirty(wid); }
+        } else if !pr.closed {
             if let Some(c) = self.clients.get_mut(&cid) {
                 if c.prompt.is_none() { c.prompt = Some(pr); }
                 c.dirty = true;
@@ -919,9 +939,51 @@ impl Server {
         }
     }
 
+    /// The pane prompt a client's keys go to (server_client_handle_key): the
+    /// active pane's, else that of a visible pane of the window.
+    pub(crate) fn pane_prompt_target(&self, cid: ClientId) -> Option<PaneId> {
+        let sid = self.client_session(cid)?;
+        let wid = self.sessions[&sid].active_window();
+        let win = self.windows.get(&wid)?;
+        let has = |p: &PaneId| self.panes.get(p).is_some_and(|p| p.prompt.is_some());
+        if has(&win.active) {
+            return Some(win.active);
+        }
+        self.rects(wid).0.into_iter().map(|(p, _)| p).find(has)
+    }
+
+    /// A key for a pane prompt (window_pane_prompt_key): false when not used.
+    fn pane_prompt_key(&mut self, cid: ClientId, pane: PaneId, k: &Key, name: &str) -> bool {
+        let Some(mut pr) = self.panes.get_mut(&pane).and_then(|p| p.prompt.take()) else { return false };
+        let result = self.prompt_process(cid, &mut pr, k, name);
+        self.prompt_done_key(cid, pr);
+        result != PromptResult::NotHandled
+    }
+
+    /// A mouse event while a pane prompt shows: a button 1 press on its line
+    /// moves the cursor; every mouse event is used.
+    pub(crate) fn pane_prompt_mouse(&mut self, cid: ClientId, pane: PaneId, m: &keys::Mouse) {
+        let Some(wid) = self.window_of(pane) else { return };
+        let Some((_, r)) = self.rects(wid).0.into_iter().find(|(p, _)| *p == pane) else { return };
+        let r = self.content_rect(wid, r);
+        let sid = self.client_session(cid);
+        let oy = if self.opt_session(sid, "status-position") == "top" { self.status_lines(sid) } else { 0 };
+        let row = oy + if oy > 0 { r.y } else { r.bottom().saturating_sub(1) };
+        if m.kind != keys::MouseKind::Down || m.button != 1 || m.y != row || m.x < r.x || m.x >= r.right() {
+            return;
+        }
+        let Some(mut pr) = self.panes.get_mut(&pane).and_then(|p| p.prompt.take()) else { return };
+        self.prompt_mouse_at(cid, &mut pr, (m.x - r.x) as usize, 0, r.w);
+        self.prompt_done_key(cid, pr);
+    }
+
     /// prompt_incremental_start: an incremental prompt fires once when opened.
-    pub(crate) fn prompt_incremental_start(&mut self, cid: ClientId) {
-        let Some(mut pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.take()) else { return };
+    pub(crate) fn prompt_incremental_start(&mut self, cid: ClientId, host: Option<PaneId>) {
+        let pr = match host {
+            Some(p) => self.panes.get_mut(&p).and_then(|p| p.prompt.take()),
+            None => self.clients.get_mut(&cid).and_then(|c| c.prompt.take()),
+        };
+        let Some(mut pr) = pr else { return };
         if pr.incremental {
             let s = format!("={}", pr.input.iter().collect::<String>());
             self.prompt_fire(cid, &mut pr, Some(&s), Fire::Handled);
