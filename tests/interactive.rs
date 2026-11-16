@@ -1263,6 +1263,35 @@ fn floating_and_modal_panes_on_screen() {
     wait_for("click selects the floating pane", || ctx.fmt("fu", "#{pane_id}") == f);
 }
 
+/// Checked against tmux 3.8 (server_client_handle_key0): a -K modal pane gets keys
+/// before a pane prompt elsewhere in the window, and a prompt on a floating pane that
+/// is not active gets keys like one on a tiled pane.
+#[test]
+fn pane_prompt_keys_after_capture_and_on_floating_panes() {
+    let ctx = Ctx::new("float-prompt");
+    let t = start(&ctx, "fp");
+    let c = ctx.ok(&["list-clients", "-F", "#{client_name}"]).lines().next().unwrap().to_string();
+    let tiled = ctx.fmt("fp", "#{pane_id}");
+    ctx.ok(&["command-prompt", "-b", "-P", "-t", &c, "-p", "PP", "set -g @p '%%'"]);
+    t.wait_screen("tiled prompt", |s| s.contains("PP"));
+    let k = ctx.ok(&["new-pane", "-O", "-K", "-D", "-P", "-F", "#{pane_id}", "-t", "fp", "cat -v"]).trim().to_string();
+    wait_for("modal pane", || ctx.fmt("fp", "#{window_modal_pane}") == k);
+    t.send(b"abc");
+    wait_for("keys to the -K pane", || ctx.capture(&k).contains("abc"));
+    ctx.ok(&["kill-pane", "-t", &k]);
+    wait_for("tiled pane active", || ctx.fmt("fp", "#{pane_id}") == tiled);
+    t.send(b"\x1b");
+    t.wait_screen("tiled prompt closed", |s| !s.contains("PP"));
+    assert!(!ctx.cmd(&["show", "-gv", "@p"]).0);
+    let f = ctx.ok(&["new-pane", "-P", "-F", "#{pane_id}", "-t", "fp", "-x", "30", "-y", "8", "-X", "10", "-Y", "5", "cat"]).trim().to_string();
+    wait_for("floating pane active", || ctx.fmt("fp", "#{pane_id}") == f);
+    ctx.ok(&["command-prompt", "-b", "-P", "-t", &c, "-p", "FP", "set -g @f '%%'"]);
+    t.wait_screen("floating prompt", |s| s.contains("FP"));
+    ctx.ok(&["select-pane", "-t", &tiled]);
+    t.send(b"xyz\r");
+    wait_for("floating prompt answered", || ctx.cmd(&["show", "-gv", "@f"]).1.trim() == "xyz");
+}
+
 #[test]
 fn floating_panes_follow_mouse_drags() {
     let ctx = Ctx::new("float-drag");

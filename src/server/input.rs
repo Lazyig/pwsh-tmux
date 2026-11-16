@@ -598,21 +598,8 @@ impl Server {
             c.message = None;
             c.dirty = true;
         }
-        // the menu of the client's window comes before the prompt (server_client_handle_menu_key)
-        if let Some(wid) = menu {
-            let action = match self.menus.get_mut(&wid) {
-                Some(m) => m.key(&name),
-                None => MenuAction::None,
-            };
-            self.menu_action(cid, wid, action);
-            return;
-        }
-        if self.clients[&cid].prompt.is_some() {
-            let prompt_key = match k.code { KeyCode::KP('\r') => Key::plain(KeyCode::Enter), KeyCode::KP(ch) => Key::plain(KeyCode::Char(ch)), _ => k.clone() };
-            if self.prompt_key(cid, &prompt_key, &name) {
-                return;
-            }
-        }
+        // server_client_handle_key0 order: the overlay, the active pane (dead, modal
+        // cancel, capture-keys), the window's menu, the status prompt, then a pane prompt
         let Some(c) = self.clients.get(&cid) else { return };
         match &c.overlay {
             Some(Overlay::Popup(p)) => {
@@ -636,12 +623,6 @@ impl Server {
             }
             None => {}
         }
-        // a pane prompt in the window; read-only clients skip it (server_client_handle_key)
-        if let Some(pane) = self.pane_prompt_target(cid).filter(|_| !self.client_is_readonly(Some(cid))) {
-            if self.pane_prompt_key(cid, pane, &k, &name) {
-                return;
-            }
-        }
         let Some(sid) = self.client_session(cid) else { return };
         // a modal pane closes on Escape or C-c with -D; with -K it gets every key, the
         // prefix included, unless it is in a mode (tmux server_client_handle_key, not for
@@ -658,6 +639,27 @@ impl Server {
             }
             if fl & super::float::CAPTURE_KEYS != 0 && self.panes.get(&pane).is_some_and(|p| p.mode.is_none() && p.dead.is_none()) {
                 self.send_key_to_pane(cid, pane, &k, raw);
+                return;
+            }
+        }
+        // the menu of the client's window comes before the prompt (server_client_handle_menu_key)
+        if let Some(wid) = menu {
+            let action = match self.menus.get_mut(&wid) {
+                Some(m) => m.key(&name),
+                None => MenuAction::None,
+            };
+            self.menu_action(cid, wid, action);
+            return;
+        }
+        if self.clients[&cid].prompt.is_some() {
+            let prompt_key = match k.code { KeyCode::KP('\r') => Key::plain(KeyCode::Enter), KeyCode::KP(ch) => Key::plain(KeyCode::Char(ch)), _ => k.clone() };
+            if self.prompt_key(cid, &prompt_key, &name) {
+                return;
+            }
+        }
+        // a pane prompt in the window; read-only clients skip it (server_client_handle_key)
+        if let Some(pane) = self.pane_prompt_target(cid).filter(|_| !self.client_is_readonly(Some(cid))) {
+            if self.pane_prompt_key(cid, pane, &k, &name) {
                 return;
             }
         }
@@ -1400,16 +1402,17 @@ impl Server {
     }
 
     /// The pane prompt a client's keys go to (server_client_handle_key): the
-    /// active pane's, else that of a visible pane of the window.
+    /// active pane's, else that of the first visible pane in the window's pane
+    /// list, floating panes included (window_pane_is_visible).
     pub(crate) fn pane_prompt_target(&self, cid: ClientId) -> Option<PaneId> {
         let sid = self.client_session(cid)?;
         let wid = self.sessions[&sid].active_window();
         let win = self.windows.get(&wid)?;
         let has = |p: &PaneId| self.panes.get(p).is_some_and(|p| p.prompt.is_some());
         if has(&win.active) {
-            return Some(win.active);
+            return self.pane_visible(wid, win.active).then_some(win.active);
         }
-        self.rects(wid).0.into_iter().map(|(p, _)| p).find(has)
+        win.panes().into_iter().find(|p| has(p) && self.pane_visible(wid, *p))
     }
 
     /// A key for a pane prompt (window_pane_prompt_key): false when not used.
