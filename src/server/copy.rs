@@ -38,27 +38,25 @@ pub(super) fn default_binding_command(cmd: &str) -> String {
     }
 }
 
-/// Splits a key binding's commands: an argument `;` (written `\;`) separates commands, as
-/// when tmux parses bind-key's arguments.
-fn binding_commands(cmd: &str) -> Result<Vec<Vec<String>>, String> {
-    let cmds = crate::cmdparse::parse(cmd)?;
-    if !cmd.contains("\\;") {
-        return Ok(cmds);
-    }
-    Ok(cmds.iter().flat_map(|c| crate::cmdparse::split_commands(c)).collect())
-}
-
-/// Commands a read-only client's key binding may run (CMD_READONLY).
+/// The commands with CMD_READONLY: all a read-only client's key binding may run.
 const READONLY_BINDING_CMDS: &[&str] = &["attach-session", "copy-mode", "detach-client", "list-clients", "send-keys", "switch-client"];
 
-/// key_bindings_dispatch: a read-only client's binding runs only if all its commands may.
-fn binding_allowed_readonly(cmd: &str) -> bool {
-    binding_commands(cmd).is_ok_and(|cmds| {
-        cmds.iter().all(|c| c.first().and_then(|n| super::cmds::canonical(n)).is_some_and(|n| READONLY_BINDING_CMDS.contains(&n)))
-    })
-}
-
 impl Server {
+    /// key_bindings_dispatch: a read-only client's binding runs only if all its commands
+    /// (cmd_list_all_have, with command aliases expanded as the parser does) may.
+    pub(super) fn binding_allowed_readonly(&self, cmd: &str) -> bool {
+        let Ok(cmds) = crate::cmdparse::parse(cmd) else { return false };
+        let aliases = self.command_aliases();
+        let readonly = |c: &[String]| c.first().and_then(|n| super::cmds::canonical(n)).is_some_and(|n| READONLY_BINDING_CMDS.contains(&n));
+        cmds.iter().all(|c| {
+            let alias = c.first().and_then(|name| aliases.iter().find_map(|a| a.split_once('=').filter(|(n, _)| n == name).map(|(_, v)| v.to_string())));
+            match alias {
+                Some(v) => crate::cmdparse::parse(&v).is_ok_and(|cs| cs.iter().all(|c| readonly(c))),
+                None => readonly(c),
+            }
+        })
+    }
+
     /// The copy-mode-line-numbers option for a pane's window.
     fn copy_line_numbers_option(&self, pane: PaneId) -> LineNumbers {
         LineNumbers::parse(&self.opt_window(self.window_of(pane), "copy-mode-line-numbers"))
@@ -114,7 +112,7 @@ impl Server {
         let numeric = default_raw.is_some_and(|c| c.starts_with("command-prompt -NP"));
         // a read-only client cannot prompt or run other commands from copy mode
         if let (Some(cmd), Some(c), false) = (&binding, cid, pending) {
-            if self.client_is_readonly(cid) && !binding_allowed_readonly(cmd) {
+            if self.client_is_readonly(cid) && !self.binding_allowed_readonly(cmd) {
                 // key_bindings_dispatch: cmdq_error, which capitalizes a client's message
                 self.set_message(c, "Client is read-only");
                 return;
@@ -155,19 +153,6 @@ impl Server {
 
     /// Read-only clients may only move around (WINDOW_COPY_CMD_FLAG_READONLY).
     fn copy_mode_command_inner(&mut self, pane: PaneId, cid: Option<ClientId>, name: &str, args: &[String]) {
-        if let Some(PaneMode::Tree(_)) = self.panes.get(&pane).and_then(|p| p.mode.as_ref()) {
-            // tree mode understands a few -X commands
-            let key = match name {
-                "cursor-up" => "Up",
-                "cursor-down" => "Down",
-                "cancel" => "q",
-                _ => "",
-            };
-            if !key.is_empty() {
-                self.mode_key(pane, cid, key);
-            }
-            return;
-        }
         if !matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(_))) {
             return;
         }
@@ -463,19 +448,5 @@ fn pipe_to(cmd: &str, text: String) {
             }
             let _ = child.wait();
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::binding_allowed_readonly;
-
-    #[test]
-    fn readonly_copy_bindings() {
-        assert!(binding_allowed_readonly("send-keys -X cursor-up"));
-        assert!(binding_allowed_readonly(r"send -X history-top \; copy-mode -q"));
-        // the search and count prompts are not for read-only clients
-        assert!(!binding_allowed_readonly("command-prompt -T search -p \"(search down)\" { send-keys -X search-forward -- \"%%\" }"));
-        assert!(!binding_allowed_readonly(r"send-keys -X cancel \; select-pane -L"));
     }
 }

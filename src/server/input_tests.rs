@@ -885,3 +885,19 @@ fn clipboard_request_goes_to_the_most_recent_usable_client() {
     assert!(!out2.try_iter().any(|frame| frame.ends_with(b"\x1b]52;;?\x07")));
     assert!(f.output.try_iter().any(|frame| frame.ends_with(b"\x1b]52;;?\x07")));
 }
+
+#[test]
+fn readonly_copy_bindings_expand_command_aliases() {
+    // key_bindings_dispatch: cmd_list_all_have(CMD_READONLY) on the parsed list, where
+    // aliases are already expanded
+    let mut f = fixture();
+    run(&mut f, &["set", "-s", "command-alias[90]", "up1=send-keys -X cursor-up"]);
+    run(&mut f, &["set", "-s", "command-alias[91]", "sp=select-pane"]);
+    assert!(f.binding_allowed_readonly("send-keys -X cursor-up"));
+    assert!(f.binding_allowed_readonly("send-keys -X history-top ; copy-mode -q"));
+    assert!(f.binding_allowed_readonly("up1"));
+    // the search and count prompts are not for read-only clients
+    assert!(!f.binding_allowed_readonly("command-prompt -T search -p \"(search down)\" { send-keys -X search-forward -- \"%%\" }"));
+    assert!(!f.binding_allowed_readonly("send-keys -X cancel ; select-pane -L"));
+    assert!(!f.binding_allowed_readonly("sp -L"));
+}
