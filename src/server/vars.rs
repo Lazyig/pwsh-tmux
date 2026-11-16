@@ -1,6 +1,16 @@
 //! Format variables (#{session_name}, #{pane_current_path}, ...) for a target.
 
 use super::*;
+
+/// #{pane_mode}: the name of the pane's current mode, empty without one.
+pub fn pane_mode_name(p: &Pane) -> &'static str {
+    match &p.mode {
+        Some(PaneMode::Copy(_)) => "copy-mode",
+        Some(PaneMode::Clock) => "clock-mode",
+        Some(PaneMode::Tree(_)) => "tree-mode",
+        None => "",
+    }
+}
 use crate::cells::{Color, Style};
 use crate::format::{self, Vars};
 
@@ -425,12 +435,7 @@ impl Vars for VarCtx<'_> {
             "pane_dead_time" => pane.and_then(|p| p.dead).map(|d| d.1.to_string()),
             "pane_dead_signal" => Some(pane.and_then(|p| p.dead).and_then(|d| d.0).and_then(super::exit_signal).map(|s| s.to_string()).unwrap_or_default()),
             "pane_in_mode" => pane.map(|p| b(p.mode.is_some())),
-            "pane_mode" => pane.map(|p| match &p.mode {
-                Some(PaneMode::Copy(_)) => "copy-mode".into(),
-                Some(PaneMode::Clock) => "clock-mode".into(),
-                Some(PaneMode::Tree(_)) => "tree-mode".into(),
-                None => String::new(),
-            }),
+            "pane_mode" => pane.map(|p| pane_mode_name(p).to_string()),
             "pane_synchronized" => t.pane.map(|p| b(options::is_on(&srv.opt_pane(p, "synchronize-panes")))),
             "pane_format" => Some(b(pane.is_some())),
             "pane_created" => pane.map(|p| p.created.to_string()),

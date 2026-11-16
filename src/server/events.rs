@@ -1674,7 +1674,7 @@ impl Server {
         for (pane, wid) in panes {
             let Some(pp) = self.panes.get(&pane) else { continue };
             let size = pp.size;
-            let mode = self.expand(Target { pane: Some(pane), wid: Some(wid), ..Target::default() }, None, "#{pane_mode}");
+            let mode = super::vars::pane_mode_name(pp).to_string();
             let idx = self.session_of_pane(pane).map(|x| x.1);
             let Some(old) = self.ev.seen.panes.insert(pane, PaneSeen { wid, idx, size, mode: mode.clone(), below: Vec::new() }) else {
                 // a new pane starts at the window's size (window_pane_create) and is

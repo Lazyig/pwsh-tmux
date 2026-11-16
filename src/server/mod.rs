@@ -957,26 +957,35 @@ pub fn run(config: Option<String>) -> io::Result<()> {
     });
 
     let started = Instant::now();
+    let mut last_detect = Instant::now();
     loop {
         let timeout = srv.next_timeout();
+        // a turn with only pane output changes nothing change detection looks at (its
+        // events fire where the output is read); others are checked every turn
+        let mut output_only = true;
         match rx.recv_timeout(timeout) {
             Ok(ev) => {
+                output_only &= matches!(ev, Event::PaneData(..));
                 srv.handle(ev);
                 // Coalesce bursts of output into one render.
                 let deadline = Instant::now() + Duration::from_millis(4);
                 while let Ok(ev) = rx.try_recv() {
+                    output_only &= matches!(ev, Event::PaneData(..));
                     srv.handle(ev);
                     if Instant::now() > deadline {
                         break;
                     }
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Timeout) => output_only = false,
             Err(RecvTimeoutError::Disconnected) => break,
         }
         srv.sync_groups();
         srv.timers();
-        srv.detect_changes(None);
+        if !output_only || last_detect.elapsed() >= Duration::from_millis(50) {
+            last_detect = Instant::now();
+            srv.detect_changes(None);
+        }
         srv.drain_hooks();
         srv.ev.activity.clear();
         srv.control_notify();
