@@ -26,6 +26,22 @@ Implemented and covered by command/module tests:
   Pane output is delivered eagerly and generation checked; there are no per-pane
   control buffer offsets to reset on respawn.
 
+Review fixes (second round), each with a regression test:
+
+- Hook items inserted into a sourced file keep none of its soft (per-line) error
+  allowance; after hooks need a valid target (none while no session exists);
+  config line errors from a command client go to stderr with exit status 1.
+- Commands that change layouts in steps fire tmux's sequence instead of one
+  snapshot diff: unzoom events first (window_push_zoom/server_unzoom_window),
+  closed cells before the new active pane, break-pane/join-pane/move-window and
+  the transient first window of `new-session -t`; select-pane -Z re-zooms.
+- Focus is updated only for the panes and windows tmux updates; a stale focused
+  pane elsewhere is not reported.
+- A control client's waiting command (wait-for, run-shell, if-shell) ends its
+  block at once; later output and -v payloads are plain lines after it.
+- Change detection is skipped on loop turns with only pane output (at least every
+  50ms), keeping server CPU at the baseline's level with many panes.
+
 ## Cross-package integration still required
 
 The modes and theme worktrees are being implemented independently. This worktree

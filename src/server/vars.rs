@@ -371,7 +371,12 @@ impl Vars for VarCtx<'_> {
             "window_zoomed_flag" => win.map(|w| b(w.zoomed)),
             "window_width" => win.map(|w| w.sx.to_string()),
             "window_height" => win.map(|w| w.sy.to_string()),
-            "window_layout" | "window_visible_layout" => win.map(|w| w.layout.to_layout_string(srv.window_area(w.id))),
+            "window_layout" => win.map(|w| w.layout.to_layout_string(srv.window_area(w.id))),
+            // a zoomed window shows only its zoomed pane (layout_root while zoomed)
+            "window_visible_layout" => win.map(|w| {
+                let area = srv.window_area(w.id);
+                if w.zoomed { crate::layout::Node::Leaf(w.active).to_layout_string(area) } else { w.layout.to_layout_string(area) }
+            }),
             "window_activity" => win.map(|w| w.activity.to_string()),
             "window_created" => win.map(|w| w.created.to_string()),
             "window_activity_flag" => Some(b(sess.zip(t.idx).is_some_and(|(s, i)| s.alerts.get(&i).is_some_and(|a| a & ALERT_ACTIVITY != 0)))),

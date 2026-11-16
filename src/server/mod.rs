@@ -789,6 +789,9 @@ pub struct Ctx {
     pub pane: Option<PaneId>,
     pub mouse: Option<input::MouseCtx>,
     pub out: output::Output,
+    /// Errors of config file lines for a command client: its stderr, exit status 1
+    /// (cmdq_error sets the client's retval).
+    pub soft_err: String,
     /// 1: commands of a hook (no after-* hooks); 2: run from the global queue, so the
     /// events they cause run no hooks at all (CMDQ_STATE_NOHOOKS).
     pub hook_depth: u8,
@@ -1492,9 +1495,12 @@ impl Server {
                 if control {
                     return;
                 }
-                self.update_latest(cid);
-                if let Some(sid) = session {
-                    self.update_session_size(sid);
+                // the resize a client sends once attached changes nothing (but fires)
+                if new != old {
+                    self.update_latest(cid);
+                    if let Some(sid) = session {
+                        self.update_session_size(sid);
+                    }
                 }
                 // MSG_RESIZE fires it even when the size is the same (as after attach)
                 if session.is_some() {
@@ -2726,8 +2732,14 @@ impl Server {
                 Err(e) if soft && !e.starts_with('\0') => {
                     log(&format!("{e}"));
                     self.add_message(&e);
-                    q.ctx.out.push_str(&e);
-                    q.ctx.out.push('\n');
+                    let cli = q.ctx.control_seq.is_none() && q.ctx.reply.and_then(|r| self.clients.get(&r)).is_some_and(|c| !c.attached);
+                    if cli {
+                        q.ctx.soft_err.push_str(&e);
+                        q.ctx.soft_err.push('\n');
+                    } else {
+                        q.ctx.out.push_str(&e);
+                        q.ctx.out.push('\n');
+                    }
                     self.control_item_done(&mut q, None);
                 }
                 Ok(Flow::WaitOverlay(cid, epoch)) => {
@@ -2896,6 +2908,12 @@ impl Server {
                 }
                 return;
             }
+            // config file errors go to stderr too and make the exit status 1
+            let err = match (err, ctx.soft_err.trim_end_matches('\n')) {
+                (e, "") => e,
+                (Some(e), soft) => Some(format!("{soft}\n{e}")),
+                (None, soft) => Some(soft.to_string()),
+            };
             match err {
                 Some(e) => {
                     // output goes to stdout, the error to stderr

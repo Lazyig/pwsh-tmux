@@ -1784,6 +1784,12 @@ impl Server {
                 self.spawn_into(pane, generation, tt.sid, size.0, size.1, &cmdv, Some(&cwd), &env)?;
                 self.apply_layout(wid);
                 self.mark_window_dirty(wid);
+                // spawn_window without SPAWN_DETACHED selects the respawned window
+                if let (true, Some(sid), Some(idx)) = (cmd == "respawn-window", tt.sid, tt.idx) {
+                    if self.sessions.get(&sid).is_some_and(|s| s.links.get(&idx) == Some(&wid)) {
+                        self.select_window(sid, idx);
+                    }
+                }
                 Ok(Flow::Next)
             }
             "rotate-window" => {
@@ -3650,7 +3656,7 @@ impl Server {
         }
     }
 
-    fn command_aliases(&self) -> Vec<String> {
+    pub(super) fn command_aliases(&self) -> Vec<String> {
         self.opts_server.array_items("command-alias").into_iter().map(|(_, v)| v).collect()
     }
 

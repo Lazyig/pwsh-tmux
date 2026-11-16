@@ -1945,3 +1945,45 @@ fn tmux_38_subscription_order() {
     child.kill().unwrap();
     let _ = child.wait();
 }
+
+/// Errors of a sourced file's lines go to stderr with exit status 1; respawn-window
+/// selects the window; a control client's line with an unknown command is a parse
+/// error.
+#[test]
+fn tmux_38_source_errors_respawn_and_control_parse() {
+    use std::io::{BufRead, BufReader};
+    use std::sync::{Arc, Mutex};
+    let ctx = Ctx::new("srcerr");
+    ctx.ok(&["new-session", "-d", "-s", "s"]);
+    let file = std::env::temp_dir().join(format!("{}.conf", ctx.socket));
+    std::fs::write(&file, "selectw -t :91\nset -g @x 1\n").unwrap();
+    let out = ctx.command().args(["source-file", file.to_str().unwrap()]).output().unwrap();
+    std::fs::remove_file(&file).unwrap();
+    assert!(!out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("can't find window: 91"));
+    assert_eq!(ctx.ok(&["show", "-gv", "@x"]).trim(), "1");
+
+    ctx.ok(&["new-window", "-d", "-t", "s:3"]);
+    ctx.ok(&["respawn-window", "-k", "-t", "s:3"]);
+    assert_eq!(ctx.fmt("s", "#{window_index}"), "3");
+
+    let mut child = ctx.command().args(["-C", "attach", "-t", "s"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let text = Arc::new(Mutex::new(String::new()));
+    let stdout = child.stdout.take().unwrap();
+    let t = text.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            t.lock().unwrap().push_str(&(line + "\n"));
+        }
+    });
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"set -g @ran 1 ; nosuchcmd\n").unwrap();
+    stdin.flush().unwrap();
+    wait_for("error", || text.lock().unwrap().contains("%error"));
+    assert!(text.lock().unwrap().contains("\nparse error: unknown command: nosuchcmd\n%error"), "{}", text.lock().unwrap());
+    // nothing on the line ran
+    assert!(ctx.fails(&["show", "-gv", "@ran"]).contains("invalid option"));
+    child.kill().unwrap();
+    let _ = child.wait();
+}
