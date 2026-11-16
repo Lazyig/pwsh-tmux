@@ -1254,3 +1254,19 @@ fn remain_on_exit_format_is_styled_on_bottom_line_and_empty_is_silent() {
     assert!(captured.starts_with("marker"), "{captured:?}");
     assert!(!captured.contains("Pane is dead"));
 }
+
+#[cfg(unix)]
+#[test]
+fn pane_dead_signal_and_status_like_tmux_3_8() {
+    let ctx = Ctx::new("dead-signal");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "80", "-y", "24"]);
+    ctx.wait_prompt("s");
+    ctx.ok(&["set", "-g", "remain-on-exit", "on"]);
+    ctx.ok(&["new-window", "-d", "-n", "k", "-t", "s", "kill -TERM $$"]);
+    ctx.ok(&["new-window", "-d", "-n", "e", "-t", "s", "exit 7"]);
+    let f = "#{pane_dead}:[#{pane_dead_status}]:[#{pane_dead_signal}]";
+    wait_for("dead panes", || ctx.fmt("s:k", "#{pane_dead}") == "1" && ctx.fmt("s:e", "#{pane_dead}") == "1");
+    assert_eq!(ctx.fmt("s:k", f), "1:[]:[15]");
+    assert_eq!(ctx.fmt("s:e", f), "1:[7]:[]");
+    wait_for("default format", || ctx.capture("s:k").contains("Pane is dead (signal 15, "));
+}

@@ -62,6 +62,7 @@ pub enum Event {
     ClientMsg(ClientId, u8, Vec<u8>),
     ClientGone(ClientId),
     PaneData(PaneId, u32, Vec<u8>),
+    /// The exit status: negative for a signal (pane_dead_signal), see [`exit_status`].
     PaneExit(PaneId, u32, Option<i32>),
     Job(u32, i32, String),
     /// A `#(command)` from a format finished: (command, output).
@@ -1983,7 +1984,7 @@ impl Server {
         if let Some(mut child) = child {
             let tx = self.tx.clone();
             thread::spawn(move || {
-                let status = child.wait().ok().map(|s| s.exit_code() as i32);
+                let status = child.wait().ok().map(|s| exit_status(&s));
                 let _ = tx.send(Event::PaneExit(id, generation, status));
             });
         }
@@ -2663,3 +2664,30 @@ fn strip_delay(cmd: &[String]) -> Vec<String> {
     }
     out
 }
+
+/// A child's exit status as tmux reports it: the exit code, or minus the signal
+/// number when a signal ended it (pane_dead_signal, pane_dead_status empty).
+fn exit_status(s: &portable_pty::ExitStatus) -> i32 {
+    match s.signal().and_then(signal_number) {
+        Some(n) => -n,
+        None => s.exit_code() as i32,
+    }
+}
+
+/// The number of a signal from the strsignal(3) text portable-pty reports.
+#[cfg(unix)]
+fn signal_number(name: &str) -> Option<i32> {
+    if let Some(n) = name.strip_prefix("Signal ").and_then(|n| n.parse().ok()) {
+        return Some(n);
+    }
+    (1..65).find(|n| {
+        let s = unsafe { libc::strsignal(*n) };
+        !s.is_null() && unsafe { std::ffi::CStr::from_ptr(s) }.to_string_lossy() == name
+    })
+}
+
+#[cfg(not(unix))]
+fn signal_number(_name: &str) -> Option<i32> {
+    None
+}
+
