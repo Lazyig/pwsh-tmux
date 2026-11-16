@@ -2,7 +2,6 @@
 
 use super::modes::{MenuAction, TreeAction};
 use super::*;
-use crate::copymode::Action;
 use crate::{cmdparse, format, opts};
 use crate::keys::{Input, Key, KeyCode};
 
@@ -74,17 +73,6 @@ pub struct InputState {
     pub(super) tty_appesc: bool,
 }
 
-/// Mouse bindings of the copy-mode and copy-mode-vi tables.
-const COPY_MODE_MOUSE: &[(&str, &str)] = &[
-    ("MouseDown1Pane", "select-pane"),
-    ("MouseDrag1Pane", "select-pane ; send-keys -X begin-selection"),
-    ("MouseDragEnd1Pane", "send-keys -X copy-pipe-and-cancel"),
-    ("WheelUpPane", "select-pane ; send-keys -X -N 5 scroll-up"),
-    ("WheelDownPane", "select-pane ; send-keys -X -N 5 scroll-down"),
-    ("DoubleClick1Pane", "select-pane ; send-keys -X select-word ; run-shell -d 0.3 ; send-keys -X copy-pipe-and-cancel"),
-    ("TripleClick1Pane", "select-pane ; send-keys -X select-line ; run-shell -d 0.3 ; send-keys -X copy-pipe-and-cancel"),
-];
-
 pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
     let mut t: BTreeMap<String, BTreeMap<String, Binding>> = BTreeMap::new();
     for words in cmdparse::parse(include_str!("display-defaults.conf")).expect("tmux default bindings") {
@@ -107,12 +95,11 @@ pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
     ] {
         t.entry("prefix".into()).or_default().entry(key.into()).or_insert(Binding { cmd: cmd.into(), repeat: true, note: note.into() });
     }
+    // the copy mode tables of tmux 3.8, run by the copy mode engine while unchanged
     for (table, vi) in [("copy-mode", false), ("copy-mode-vi", true)] {
         for (k, c) in CopyMode::default_bindings(vi) {
-            t.entry(table.to_string()).or_default().insert(k.to_string(), Binding { cmd: format!("send-keys -X {c}"), repeat: false, note: "default".into() });
-        }
-        for (k, c) in COPY_MODE_MOUSE {
-            t.entry(table.to_string()).or_default().insert(k.to_string(), Binding { cmd: c.to_string(), repeat: false, note: String::new() });
+            let key = keys::parse_key_name(k).map(|k| keys::key_name(&k)).unwrap_or_else(|| k.to_string());
+            t.entry(table.into()).or_default().insert(key, Binding { cmd: super::copy::default_binding_command(c), repeat: false, note: String::new() });
         }
     }
     t
@@ -823,9 +810,11 @@ impl Server {
         }
     }
 
-    /// A key for a pane that is in a mode (copy, tree, clock).
+    /// A key for a pane that is in a mode (copy, tree, clock). Read-only clients may use
+    /// copy mode (but not copy), not the other modes.
     pub fn mode_key(&mut self, pane: PaneId, cid: Option<ClientId>, name: &str) {
-        if self.client_is_readonly(cid) { return; }
+        let copy = matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(_)));
+        if self.client_is_readonly(cid) && !copy { return; }
         let Some(p) = self.panes.get_mut(&pane) else { return };
         match &mut p.mode {
             Some(PaneMode::Clock) => self.exit_mode(pane),
@@ -874,128 +863,8 @@ impl Server {
                     self.mark_window_dirty(wid);
                 }
             }
-            Some(PaneMode::Copy(_)) => {
-                let wrap = self.opt_window_on(self.window_of(pane), "wrap-search");
-                let vi = self.opt_window(self.window_of(pane), "mode-keys") == "vi";
-                let table = if vi { "copy-mode-vi" } else { "copy-mode" };
-                let binding = self.bindings.get(table).and_then(|t| t.get(name)).map(|b| (b.cmd.clone(), b.note == "default"));
-                match binding {
-                    Some((cmd, false)) => {
-                        // user binding in the copy-mode table
-                        if let Some(c) = cid {
-                            self.run_string(c, &cmd, Some(pane));
-                        }
-                    }
-                    _ => {
-                        let before = self.copy_scroll_offset(pane);
-                        let action = match self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
-                            Some(PaneMode::Copy(cm)) => { cm.wrap_search = wrap; cm.key(name) },
-                            _ => return,
-                        };
-                        self.copy_action(pane, cid, action, None);
-                        self.show_scrollbar_if_scrolled(pane, before, false);
-                    }
-                }
-            }
+            Some(PaneMode::Copy(_)) => self.copy_key(pane, cid, name),
             None => {}
-        }
-    }
-
-    pub fn copy_mode_command(&mut self, pane: PaneId, cid: Option<ClientId>, name: &str, args: &[String]) {
-        // copy-pipe without a command uses copy-command
-        let piped = name.starts_with("copy-pipe");
-        let pipe = if !piped {
-            None
-        } else if !args.is_empty() {
-            Some(args[0].clone())
-        } else {
-            Some(self.opt_server("copy-command")).filter(|c| !c.is_empty())
-        };
-        let run_args: Vec<String> = if piped && !args.is_empty() { args[1..].to_vec() } else { args.to_vec() };
-        // these always show an auto-hide scrollbar; others (history-top and
-        // history-bottom too) when the view scrolled
-        let always = matches!(name, "page-up" | "page-down" | "page-down-and-cancel" | "halfpage-up" | "halfpage-down"
-            | "halfpage-down-and-cancel" | "scroll-to-mouse");
-        let before = self.copy_scroll_offset(pane);
-        self.copy_mode_command_inner(pane, cid, name, pipe, run_args);
-        self.show_scrollbar_if_scrolled(pane, before, always);
-    }
-
-    fn copy_mode_command_inner(&mut self, pane: PaneId, cid: Option<ClientId>, name: &str, pipe: Option<String>, run_args: Vec<String>) {
-        let wrap = options::is_on(&self.opt_window(self.window_of(pane), "wrap-search"));
-        if name == "scroll-to-mouse" {
-            if let Some(cid) = cid {
-                if let Some(m) = self.cur_mouse.clone() {
-                    if let Some(c) = self.clients.get_mut(&cid) { c.drag = Some(Drag { kind: DragKind::Scrollbar { pane } }); }
-                    self.scrollbar_to_mouse(cid, pane, &m);
-                }
-            }
-            return;
-        }
-        let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) else {
-            if let Some(PaneMode::Tree(_)) = self.panes.get(&pane).and_then(|p| p.mode.as_ref()) {
-                // tree mode understands a few -X commands
-                let key = match name {
-                    "cursor-up" => "Up",
-                    "cursor-down" => "Down",
-                    "cancel" => "q",
-                    _ => "",
-                };
-                if !key.is_empty() {
-                    self.mode_key(pane, cid, key);
-                }
-            }
-            return;
-        };
-        cm.wrap_search = wrap;
-        let action = cm.run(name, &run_args);
-        self.copy_action(pane, cid, action, pipe);
-    }
-
-    fn copy_action(&mut self, pane: PaneId, cid: Option<ClientId>, action: Action, pipe: Option<String>) {
-        match action {
-            Action::None => {}
-            Action::Cancel => self.exit_mode(pane),
-            Action::Copy { text, cancel } => {
-                if let Some(cmd) = pipe {
-                    let mut c = procinfo::job_command(&cmd);
-                    c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-                    if let Ok(mut child) = c.spawn() {
-                        let data = text.clone();
-                        thread::spawn(move || {
-                            if let Some(mut si) = child.stdin.take() {
-                                let _ = si.write_all(data.as_bytes());
-                            }
-                            let _ = child.wait();
-                        });
-                    }
-                }
-                self.copy_text(text, cid);
-                if cancel {
-                    self.exit_mode(pane);
-                }
-            }
-            Action::Prompt { label, command } => {
-                if cid.is_some() {
-                    // the pane is the prompt's context target (a %id in the template would read as %N)
-                    // tmux 3.8 copy-mode bindings prompt in the pane (command-prompt -P)
-                    let template = format!("send-keys -X {command} '%%'");
-                    let mut pr = Prompt::new(PromptKind::Command, vec![(format!("{label} "), String::new())], template, Some(pane));
-                    // the default copy-mode search bindings use command-prompt -T search
-                    pr.history_type = usize::from(command.starts_with("search"));
-                    pr.host = Some(pane);
-                    if command.ends_with("-incremental") {
-                        if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
-                            cm.begin_incremental_search();
-                        }
-                        pr.copy_incremental = Some((pane, command.starts_with("search-forward")));
-                    }
-                    self.set_pane_prompt(pane, pr);
-                }
-            }
-        }
-        if let Some(wid) = self.window_of(pane) {
-            self.mark_window_dirty(wid);
         }
     }
 
@@ -1031,9 +900,9 @@ impl Server {
             }
         }
         if let Some((pane, forward)) = incremental {
-            let wrap = self.opt_window_on(self.window_of(pane), "wrap-search");
+            // options copy mode reads as it runs (wrap-search, mode-keys, word-separators)
+            self.copy_sync_options(pane);
             if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
-                cm.wrap_search = wrap;
                 match text {
                     Some(text) => cm.preview_search(&text, forward),
                     None => cm.finish_incremental_search(false),

@@ -644,8 +644,7 @@ impl Server {
             };
             let mode_lines: Option<(Vec<Line>, Option<(u16, u16)>)> = match &p.mode {
                 Some(PaneMode::Copy(cm)) => {
-                    let style = self.style_option(&self.opt_window(Some(wid), "mode-style"), Style::default(), pane_target, Some(cid)).unwrap_or_default();
-                    let (lines, cur) = cm.render_with_style(style);
+                    let (lines, cur) = cm.render_with(&self.copy_render_style(*id, Some(cid)));
                     Some((lines, Some((cur.1, cur.0))))
                 }
                 Some(PaneMode::Tree(t)) => Some((t.render(self, cid, cr.w, cr.h), None)),

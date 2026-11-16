@@ -977,6 +977,11 @@ pub fn parse_key_name(s: &str) -> Option<Key> {
         (Some(c), None) => KeyCode::Char(c),
         _ => lookup_name(rest)?,
     };
+    // C-[ is its own key (tmux 3.7+: terminals with extended keys send it apart from
+    // Escape); input from other terminals arrives as Escape, which tmux binds the same
+    if code == KeyCode::Char('[') && mods.ctrl && !mods.shift {
+        return Some(Key::new(code, mods));
+    }
     Some(normalize(Key::new(code, mods)))
 }
 
@@ -2133,7 +2138,8 @@ mod tests {
         assert_eq!(p("C-@"), km(KeyCode::Space, true, false, false));
         assert_eq!(p("C-i"), k(KeyCode::Tab));
         assert_eq!(p("C-m"), k(KeyCode::Enter));
-        assert_eq!(p("C-["), k(KeyCode::Escape));
+        assert_eq!(p("C-["), Key::new(KeyCode::Char('['), Mods::CTRL));
+        assert_eq!(key_name(&p("C-[")), "C-[");
         assert_eq!(p("^?"), k(KeyCode::BSpace));
         assert_eq!(p("KP0"), k(KeyCode::KP('0')));
         assert_eq!(p("KPEnter"), k(KeyCode::KP('\r')));

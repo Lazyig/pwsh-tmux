@@ -143,6 +143,31 @@ fn copy_mode_keys_and_paste() {
 }
 
 #[test]
+fn copy_mode_count_then_rebound_or_unbound_key() {
+    // the key after a repeat count goes through the copy-mode table (tmux closes the
+    // numeric prompt and dispatches the key with the count as its prefix)
+    let ctx = Ctx::new("copycount");
+    let t = start(&ctx, "n");
+    ctx.ok(&["set", "-g", "mode-keys", "vi"]);
+    t.send(b"clear; seq 1 60\r");
+    wait_for("output", || ctx.capture("n").contains("60"));
+    ctx.ok(&["bind", "-T", "copy-mode-vi", "J", "send", "-X", "cursor-down"]);
+    ctx.ok(&["unbind", "-T", "copy-mode-vi", "K"]);
+    t.prefix(b"[");
+    wait_for("copy mode", || ctx.fmt("n", "#{pane_in_mode}") == "1");
+    ctx.ok(&["send-keys", "-X", "-t", "n", "history-top"]);
+    t.send(b"12J");
+    wait_for("rebound J moves the cursor", || ctx.fmt("n", "#{copy_cursor_y} #{scroll_position}").starts_with("12 "));
+    let before = ctx.fmt("n", "#{copy_cursor_y} #{scroll_position}");
+    t.send(b"3K");
+    t.send(b"j");
+    wait_for("unbound K does nothing, j moves 3", || ctx.fmt("n", "#{copy_cursor_y}") == "15");
+    assert!(before.ends_with(&ctx.fmt("n", "#{scroll_position}")));
+    t.send(b"q");
+    wait_for("quit", || ctx.fmt("n", "#{pane_in_mode}") == "0");
+}
+
+#[test]
 fn tree_panes_and_clock() {
     let ctx = Ctx::new("tree");
     let t = start(&ctx, "one");

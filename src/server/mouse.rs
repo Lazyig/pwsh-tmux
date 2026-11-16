@@ -259,7 +259,14 @@ impl Server {
             let button = c.mouse_drag_flag - 1;
             c.mouse_drag_flag = 0;
             if let Some(Drag { kind: DragKind::Copy { pane } }) = c.drag.take() {
+                // window_copy_drag_release: with line numbers the release position counts
+                if matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(cm)) if cm.line_numbers_active()) {
+                    self.copy_drag_update(&ctx);
+                }
                 self.copy_drag_timers.remove(&pane);
+                if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
+                    cm.end_drag();
+                }
             }
             let key = format!("{mods}MouseDragEnd{button}{}", wh.name());
             self.mouse_key(cid, key, ctx);
@@ -401,7 +408,8 @@ impl Server {
                     c.set_key_table(&default_table);
                 }
                 c.dirty = true;
-                match crate::cmdparse::parse(&cmd) {
+                // the whole list is checked (aliases expanded) before any of it runs
+                match crate::cmdparse::parse(&cmd).and_then(|c| c.iter().try_for_each(|c| self.check_parsed(c)).map(|_| c)) {
                     Ok(cmds) => {
                         let qctx = Ctx { client: Some(cid), pane: fs_pane, mouse: Some(ctx), from_key: true, ..Ctx::default() };
                         self.run_queue(Queue { cmds: cmds.into(), ctx: qctx, soft: 0 });
@@ -529,8 +537,8 @@ impl Server {
     }
 
     fn mouse_drag_update(&mut self, cid: ClientId, m: &MouseCtx) {
-        if let Some(Drag { kind: DragKind::Scrollbar { pane } }) = self.clients.get(&cid).and_then(|c| c.drag.as_ref()) {
-            self.scrollbar_to_mouse(cid, *pane, m);
+        if let Some(&Drag { kind: DragKind::Scrollbar { pane, exit } }) = self.clients.get(&cid).and_then(|c| c.drag.as_ref()) {
+            self.copy_scroll_to_mouse(cid, pane, m, exit);
             return;
         }
         match self.clients.get(&cid).and_then(|c| c.drag.as_ref()).map(|d| match d.kind {
@@ -691,11 +699,7 @@ impl Server {
         let Some(pane) = self.mouse_pane(m) else { return };
         let Some((x, y)) = self.mouse_at(pane, m, false) else { return };
         if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
-            // tmux moves only the cursor; here the cursor is one end of the selection, so
-            // an existing selection (to be copied next) is left alone
-            if !cm.selection_active() {
-                cm.move_to_view(y, x);
-            }
+            cm.move_mouse(y, x);
         }
     }
 

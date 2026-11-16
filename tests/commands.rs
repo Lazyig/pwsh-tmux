@@ -1095,6 +1095,9 @@ fn capture_details(ctx: &Ctx) {
     assert!(ctx.ok(&["capture-pane", "-p", "-R", "-t", "c"]).starts_with("G 20x4 (0/"));
     ctx.ok(&["copy-mode", "-t", "c"]);
     assert!(ctx.ok(&["capture-pane", "-p", "-M", "-t", "c"]).contains("long line"));
+    // -M reads the mode's copy of the pane, not its scrolled view, nor the selection
+    ctx.ok(&["send-keys", "-X", "-t", "c", "begin-selection"]);
+    assert_eq!(ctx.ok(&["capture-pane", "-p", "-M", "-S", "1", "-E", "1", "-t", "c"]), "long line wrapping a\n");
 }
 
 fn empty_panes(ctx: &Ctx) {
@@ -1879,4 +1882,85 @@ fn zoom_keeps_hidden_panes_beside_their_left_scrollbars() {
     assert_eq!(before, "0=39x24+1+0 1=38x12+42+0 2=38x11+42+13 ");
     ctx.ok(&["resize-pane", "-Z", "-t", "s:0.0"]);
     assert_eq!(ctx.fmt("s", g), "0=79x24+1+0 1=38x12+42+0 2=38x11+42+13 ");
+}
+
+#[test]
+#[cfg(unix)]
+fn copy_mode_live_word_separators_and_kill_flag() {
+    let ctx = Ctx::new("copyopts");
+    ctx.ok(&["new", "-d", "-s", "c", "-x", "40", "-y", "8", "printf 'one-two three\n'; sleep 100"]);
+    wait_for("copy text", || ctx.capture("c").contains("one-two"));
+    ctx.ok(&["set", "-w", "-t", "c", "mode-keys", "vi"]);
+    ctx.ok(&["set", "-t", "c", "word-separators", " "]);
+    ctx.ok(&["copy-mode", "-t", "c"]);
+    ctx.ok(&["send", "-t", "c", "-X", "history-top"]);
+    ctx.ok(&["send", "-t", "c", "-X", "next-word"]);
+    assert_eq!(ctx.fmt("c", "#{copy_cursor_x}"), "8");
+    ctx.ok(&["send", "-t", "c", "-X", "history-top"]);
+    ctx.ok(&["set", "-t", "c", "word-separators", " -"]);
+    ctx.ok(&["send", "-t", "c", "-X", "next-word"]);
+    assert_eq!(ctx.fmt("c", "#{copy_cursor_x} #{copy_cursor_word}"), "3 two");
+    ctx.ok(&["splitw", "-d", "-t", "c", "sleep 100"]);
+    ctx.ok(&["copy-mode", "-q", "-t", "c:0.0"]);
+    ctx.ok(&["copy-mode", "-k", "-t", "c:0.0"]);
+    ctx.ok(&["copy-mode", "-q", "-t", "c:0.0"]);
+    assert_eq!(ctx.fmt("c", "#{window_panes}"), "1");
+}
+
+#[test]
+fn copy_mode_command_arguments_like_tmux() {
+    let ctx = Ctx::new("copyargs");
+    ctx.ok(&["new", "-d", "-s", "c", "-x", "30", "-y", "6", "printf 'foo bar\n-baz foo\nfob\nend\n'; sleep 100"]);
+    wait_for("copy text", || ctx.capture("c").contains("end"));
+    // send -X outside a mode fails (cmd-send-keys.c), and -N is checked first
+    let e = ctx.fails(&["send", "-t", "c", "-X", "cursor-up"]);
+    assert!(e.contains("not in a mode"), "{e}");
+    let e = ctx.fails(&["send", "-t", "c", "-N", "0", "-X", "cursor-up"]);
+    assert!(e.contains("repeat count too small"), "{e}");
+    ctx.ok(&["copy-mode", "-t", "c"]);
+    let at = || ctx.fmt("c", "#{copy_cursor_x},#{copy_cursor_y}");
+    // an argument that looks like flags is parsed as flags, so the command does not run
+    ctx.ok(&["send", "-t", "c", "-X", "search-backward", "-baz"]);
+    assert_eq!(at(), "0,4");
+    ctx.ok(&["send", "-t", "c", "-X", "search-backward", "--", "-baz"]);
+    assert_eq!(at(), "0,1");
+    ctx.ok(&["send", "-t", "c", "-X", "search-backward-incremental", "=foo"]);
+    ctx.ok(&["send", "-t", "c", "-X", "search-backward-incremental", "-foo"]);
+    assert_eq!(at(), "0,0");
+    // the buffer name prefix and the pipe command are formats
+    ctx.ok(&["send", "-t", "c", "-X", "copy-line", "P#{pane_index}x"]);
+    ctx.ok(&["send", "-t", "c", "-X", "copy-line", "-X"]);
+    ctx.ok(&["send", "-t", "c", "-X", "copy-pipe-line", "cat", "Q#{window_index}y"]);
+    let names = ctx.ok(&["list-buffers", "-F", "#{buffer_name}"]);
+    assert_eq!(names.lines().collect::<Vec<_>>(), ["Q0y1", "P0x0"], "{names}");
+}
+
+#[test]
+#[cfg(unix)]
+fn copy_mode_automatic_refresh_waits_for_selection() {
+    let ctx = Ctx::new("copyrefresh");
+    let marker = std::env::temp_dir().join(&ctx.socket);
+    let command = format!("printf 'ready\n'; for item in first second; do while [ ! -f '{}'.$item ]; do sleep 0.02; done; printf 'out:%s\n' \"$item\"; done; sleep 100", marker.display());
+    ctx.ok(&["new", "-d", "-s", "c", "-x", "40", "-y", "8", &command]);
+    wait_for("ready", || ctx.capture("c").contains("ready"));
+    ctx.ok(&["copy-mode", "-t", "c"]);
+    assert_eq!(ctx.fmt("c", "#{refresh_active}"), "0");
+    std::fs::write(marker.with_extension("first"), "").unwrap();
+    wait_for("first output", || ctx.capture("c").contains("out:first"));
+    assert!(!ctx.ok(&["capturep", "-p", "-M", "-t", "c"]).contains("out:first"));
+    ctx.ok(&["send", "-t", "c", "-X", "refresh-now"]);
+    assert!(ctx.ok(&["capturep", "-p", "-M", "-t", "c"]).contains("out:first"));
+    ctx.ok(&["send", "-t", "c", "-X", "refresh-on"]);
+    assert_eq!(ctx.fmt("c", "#{refresh_active}"), "1");
+    ctx.ok(&["send", "-t", "c", "-X", "begin-selection"]);
+    std::fs::write(marker.with_extension("second"), "").unwrap();
+    wait_for("second output", || ctx.capture("c").contains("out:second"));
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(!ctx.ok(&["capturep", "-p", "-M", "-t", "c"]).contains("out:second"));
+    ctx.ok(&["send", "-t", "c", "-X", "clear-selection"]);
+    wait_for("automatic refresh", || ctx.ok(&["capturep", "-p", "-M", "-t", "c"]).contains("out:second"));
+    ctx.ok(&["send", "-t", "c", "-X", "refresh-toggle"]);
+    assert_eq!(ctx.fmt("c", "#{refresh_active}"), "0");
+    let _ = std::fs::remove_file(marker.with_extension("first"));
+    let _ = std::fs::remove_file(marker.with_extension("second"));
 }

@@ -564,57 +564,8 @@ impl Vars for VarCtx<'_> {
             "alternate_on" => pane.map(|p| b(p.screen().alternate_screen())),
             "history_size" => pane.map(|p| p.screen().scrollback_len().to_string()),
             "history_limit" => pane.map(|p| p.screen().scrollback_capacity().to_string()),
-            "scroll_position" => pane.and_then(|p| match &p.mode {
-                Some(PaneMode::Copy(c)) => Some(c.scroll_offset().to_string()),
-                _ => None,
-            }),
-            "copy_cursor_x" | "copy_cursor_y" => pane.and_then(|p| match &p.mode {
-                Some(PaneMode::Copy(c)) => {
-                    let (y, x) = c.render().1;
-                    Some(if name == "copy_cursor_x" { x } else { y }.to_string())
-                }
-                _ => None,
-            }),
-            "selection_start_x" | "selection_start_y" | "selection_end_x" | "selection_end_y" => pane.and_then(|p| match &p.mode {
-                Some(PaneMode::Copy(c)) => c.selection_ends().map(|(s, e)| {
-                    match name {
-                        "selection_start_x" => s.0,
-                        "selection_start_y" => s.1,
-                        "selection_end_x" => e.0,
-                        _ => e.1,
-                    }
-                    .to_string()
-                }),
-                _ => None,
-            }),
-            "selection_present" => pane.and_then(|p| match &p.mode {
-                Some(PaneMode::Copy(c)) => Some(b(c.selection_nonempty())),
-                _ => None,
-            }),
-            // window_copy_formats: only while the pane is in copy mode
-            "selection_active" | "selection_mode" | "rectangle_toggle" | "copy_line_numbers" | "copy_position"
-            | "copy_position_limit" | "top_line_time" | "search_present" | "search_timed_out" | "search_count"
-            | "search_count_partial" | "search_match" | "copy_cursor_word" | "copy_cursor_line" | "copy_cursor_hyperlink" => pane.and_then(|p| match &p.mode {
-                Some(PaneMode::Copy(c)) => Some(match name {
-                    "selection_active" => b(c.selection_active()),
-                    "selection_mode" => c.selection_mode().to_string(),
-                    "rectangle_toggle" => b(c.rectangle()),
-                    // no line numbers: the position is the scroll offset
-                    "copy_line_numbers" | "search_timed_out" | "search_count_partial" | "top_line_time" => "0".to_string(),
-                    "copy_position" => c.scroll_offset().to_string(),
-                    "copy_position_limit" => c.history_size().to_string(),
-                    "search_present" => b(c.search_present()),
-                    "search_count" => c.search_count().to_string(),
-                    "search_match" => c.search_match().unwrap_or_default(),
-                    "copy_cursor_word" => {
-                        let (y, x) = c.cursor_abs();
-                        super::mouse::grid_word(|i| c.line(i).cloned(), c.line_count(), x, y, c.word_separators()).unwrap_or_default()
-                    }
-                    "copy_cursor_line" => c.line(c.cursor_abs().0).and_then(super::mouse::grid_line).unwrap_or_default(),
-                    _ => String::new(),
-                }),
-                _ => None,
-            }),
+            // copy mode (window_copy_formats)
+            _ if super::copy::is_copy_var(name) => t.pane.and_then(|p| self.srv.copy_var(p, name)),
             "mouse_x" | "mouse_y" | "mouse_word" | "mouse_line" | "mouse_hyperlink" | "mouse_status_line" | "mouse_status_range" | "mouse_pane" => {
                 self.srv.mouse_var(name, self.client)
             }

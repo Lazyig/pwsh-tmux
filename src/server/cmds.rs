@@ -31,7 +31,7 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("clock-mode", "", "", "t"),
     ("command-prompt", "", "1bCeFkilNP", "IpTt"),
     ("confirm-before", "confirm", "by", "cpt"),
-    ("copy-mode", "", "deHMqSu", "st"),
+    ("copy-mode", "", "dekHMqSu", "st"),
     ("customize-mode", "", "NZy", "Fft"),
     ("delete-buffer", "deleteb", "", "b"),
     ("detach-client", "detach", "aP", "Esct"),
@@ -1189,21 +1189,29 @@ impl Server {
         Ok(new)
     }
 
-    pub fn enter_copy_mode(&mut self, pane: PaneId) {
+    /// copy-mode -s: the content comes from `source`, shown in `pane`.
+    pub fn enter_copy_mode_from(&mut self, pane: PaneId, source: PaneId) {
         let Some(p) = self.panes.get(&pane) else { return };
         if matches!(p.mode, Some(PaneMode::Copy(_))) {
             return;
         }
-        let lines = p.snapshot();
-        let (w, h) = p.size;
-        let (cy, cx) = p.screen().cursor_position();
+        let size = p.size;
+        let Some(src) = self.panes.get(&source) else { return };
+        let lines = src.snapshot();
+        let (cy, cx) = src.screen().cursor_position();
         let wid = self.window_of(pane);
         let vi = self.opt_window(wid, "mode-keys") == "vi";
         let sid = self.session_of_pane(pane).map(|x| x.0);
-        let mut cm = CopyMode::new(lines, w, h, (cy, cx), vi);
-        cm.wrap_search = self.opt_window_on(wid, "wrap-search");
+        // window_copy_clone_screen: trimmed and rewrapped for another pane
+        let mut cm = CopyMode::clone_from(lines, src.size, (cy, cx), size, vi, source != pane);
+        cm.set_wrap_search(self.opt_window_on(wid, "wrap-search"));
         cm.set_word_separators(&self.opt_session(sid, "word-separators"));
-        self.panes.get_mut(&pane).unwrap().mode = Some(PaneMode::Copy(Box::new(cm)));
+        cm.from_other = source != pane;
+        cm.set_pane_search(&p.track.search);
+        cm.set_line_number_option(crate::copymode::LineNumbers::parse(&self.opt_window(wid, "copy-mode-line-numbers")));
+        let p = self.panes.get_mut(&pane).unwrap();
+        p.mode = Some(PaneMode::Copy(Box::new(cm)));
+        p.track.unseen_changes = false;
         if let Some(wid) = wid {
             self.mark_window_dirty(wid);
         }
@@ -1218,7 +1226,13 @@ impl Server {
                 }
             }
             p.track.unseen_changes = false;
+            // copy-mode -k: the pane goes with the mode
+            let kill = matches!(&p.mode, Some(PaneMode::Copy(cm)) if cm.kill);
             p.mode = None;
+            if kill {
+                self.kill_pane(pane);
+                return;
+            }
         }
         if let Some(wid) = self.window_of(pane) {
             self.mark_window_dirty(wid);
@@ -1375,6 +1389,8 @@ impl Server {
                 && self.resolve_client(ctx, o.get('t').or(o.get('c')))? == own,
             "refresh-client" => self.resolve_client(ctx, o.get('t'))? == own,
             "capture-pane" => o.has('p'),
+            // copy mode works for read-only clients, its commands check themselves
+            "send-keys" => o.has('X'),
             "display-message" => (o.has('p') || o.has('a')) && !o.has('I'),
             "server-access" => o.has('l') && !['a', 'd', 'r', 'w'].into_iter().any(|f| o.has(f)),
             _ => true,
@@ -2647,15 +2663,16 @@ impl Server {
                 } else {
                     let cols = p.size.0;
                     let mode_lines = match (&p.mode, o.has('M')) {
-                        (Some(PaneMode::Copy(cm)), true) => Some(cm.render().0),
+                        // the mode's screen is its copy of the pane (window_copy_get_screen)
+                        (Some(PaneMode::Copy(cm)), true) => Some(cm.backing_screen()),
                         _ => None,
                     };
                     // the rows to read: the mode's screen (-M), the normal screen saved under
                     // the alternate screen (-a, no history) or the pane with its history
                     let (total, hist) = if o.has('a') {
                         (p.size.1 as i64, 0)
-                    } else if let Some(l) = &mode_lines {
-                        (l.len() as i64, 0)
+                    } else if let Some((l, h)) = &mode_lines {
+                        (l.len() as i64, *h as i64)
                     } else {
                         (screen.history_rows_len() as i64, screen.scrollback_len() as i64)
                     };
@@ -2675,7 +2692,7 @@ impl Server {
                         std::mem::swap(&mut a, &mut b);
                     }
                     let line_at = |i: usize| -> crate::cells::Line {
-                        if let Some(l) = &mode_lines {
+                        if let Some((l, _)) = &mode_lines {
                             return l.get(i).cloned().unwrap_or_default();
                         }
                         if o.has('a') {
@@ -2818,36 +2835,41 @@ impl Server {
                     }
                     pane = p;
                 }
+                // -s: copy from another pane
+                let source = match o.get('s') {
+                    Some(s) => self.resolve_pane(ctx, Some(s))?.pane.unwrap_or(pane),
+                    None => pane,
+                };
+                // entered with the mouse, line numbers stay off
+                let line_numbers = ctx.mouse.is_none();
                 let already = matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(_)));
                 if !already {
-                    self.enter_copy_mode(pane);
+                    self.enter_copy_mode_from(pane, source);
                     if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
                         cm.set_exit_on_bottom(o.has('e'));
-                        if o.has('H') {
-                            cm.set_show_position(false);
-                        }
+                        cm.set_show_position(!o.has('H'));
+                        cm.kill = o.has('k');
+                        cm.set_line_numbers(line_numbers);
                     }
                     if o.has('M') {
                         if let (Some(cid), Some(m)) = (ctx.client, ctx.mouse.clone()) {
                             self.start_copy_drag(cid, &m);
                         }
                     }
+                } else if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
+                    cm.set_line_numbers(line_numbers);
                 }
                 if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
                     if o.has('u') {
-                        cm.run("page-up", &[]);
+                        cm.page_up_once();
                     }
-                    if o.has('d') {
-                        let exit = o.has('e');
-                        if cm.page_down_exit(exit) {
-                            self.exit_mode(pane);
-                        }
+                    if o.has('d') && cm.page_down_exit(o.has('e')) {
+                        self.exit_mode(pane);
                     }
                 }
                 if o.has('S') {
-                    if let (Some(cid), Some(m)) = (ctx.client, ctx.mouse.as_ref()) {
-                        self.clients.get_mut(&cid).unwrap().drag = Some(Drag { kind: DragKind::Scrollbar { pane } });
-                        self.scrollbar_to_mouse(cid, pane, m);
+                    if let (Some(cid), Some(m)) = (ctx.client, ctx.mouse.clone()) {
+                        self.copy_scroll_to_mouse(cid, pane, &m, o.has('e'));
                     }
                 }
                 // window_copy_pageup/pagedown and the scrollbar drag show an
@@ -3109,7 +3131,13 @@ impl Server {
                     // the added entries are a sorted tree: the command's, and the copy
                     // mode's (window_copy_formats) while the pane is in copy mode
                     let mut tree: Vec<(String, String)> = extra.iter().map(|(n, v)| (n.clone(), v.clone())).collect();
-                    tree.extend(COPY_VAR_NAMES.iter().filter_map(|n| crate::format::Vars::get(&vc, n).map(|v| (n.to_string(), v))));
+                    // (format_each gives a callback without a value an empty one)
+                    let copying = tt.pane.is_some_and(|p| matches!(self.panes.get(&p).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(_))));
+                    tree.extend(super::copy::COPY_VARS.iter().filter_map(|n| match crate::format::Vars::get(&vc, n) {
+                        Some(v) => Some((n.to_string(), v)),
+                        None if copying && super::copy::COPY_CALLBACK_VARS.contains(n) => Some((n.to_string(), String::new())),
+                        None => None,
+                    }));
                     tree.sort();
                     for (n, v) in tree {
                         ctx.out.push_str(&format!("{n}={v}\n"));
@@ -3365,7 +3393,8 @@ impl Server {
                     return Ok(Flow::Next);
                 }
                 // cmd_send_keys_exec: the target client (-c, CANFAIL, or the current one)
-                // must not be read-only unless -X; -N is a count from 1; -X (and -N with
+                // must not be read-only unless -X; -N is a count from 1, which with -X (or
+                // with no keys) is the mode's repeat count (wme->prefix); -X (and -N with
                 // no keys in a mode) needs a mode with commands (only copy mode has them)
                 let tc = match o.get('c') {
                     Some(c) => self.resolve_client_canfail(ctx, Some(c)),
@@ -3380,7 +3409,15 @@ impl Server {
                 };
                 let has_commands = self.panes.get(&pane).is_some_and(|p| matches!(p.mode, Some(PaneMode::Copy(_))));
                 let in_any_mode = self.panes.get(&pane).is_some_and(|p| p.mode.is_some());
-                if (o.has('X') && !has_commands) || (o.has('N') && in_any_mode && !has_commands && o.rest.is_empty()) {
+                if o.has('N') && in_any_mode && (o.has('X') || o.rest.is_empty()) {
+                    if !has_commands {
+                        return err("not in a mode");
+                    }
+                    if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
+                        cm.set_count(n);
+                    }
+                }
+                if o.has('X') && !has_commands {
                     return err("not in a mode");
                 }
                 if o.has('X') {
@@ -3397,9 +3434,8 @@ impl Server {
                             return Ok(Flow::Next);
                         }
                     }
-                    for _ in 0..n {
-                        self.copy_mode_command(pane, ctx.client, &name, &rest);
-                    }
+                    // run once: -N is the mode's repeat count
+                    self.copy_mode_command(pane, ctx.client, &name, &rest);
                     return Ok(Flow::Next);
                 }
                 if o.has('M') {
@@ -4400,6 +4436,7 @@ impl Server {
             _ => {}
         }
         self.run_hook(None, "option-changed", Ctx::default());
+        self.copy_sync_all();
         self.mark_all_dirty();
         for c in self.clients.values_mut() {
             c.prev = None;
@@ -4672,7 +4709,7 @@ pub enum HookLevel {
 const READ_ONLY_OK: &[&str] = &[
     "attach-session", "detach-client", "has-session", "list-sessions", "list-windows", "list-panes", "list-clients", "list-buffers", "list-keys",
     "list-commands", "display-message", "show-options", "show-window-options", "show-environment", "show-hooks", "show-messages", "show-buffer",
-    "capture-pane", "refresh-client", "switch-client", "server-access",
+    "capture-pane", "refresh-client", "switch-client", "server-access", "copy-mode", "send-keys",
 ];
 
 /// tmux 3.8's argument counts (args_parse's lower and upper; -1 is no limit).
@@ -5036,14 +5073,6 @@ fn capture_grid(screen: &vt100::Screen, limit: usize) -> String {
     }
     out
 }
-
-/// The variables window_copy_formats adds while a pane is in copy mode.
-pub const COPY_VAR_NAMES: &[&str] = &[
-    "copy_cursor_hyperlink", "copy_cursor_line", "copy_cursor_word", "copy_cursor_x", "copy_cursor_y", "copy_line_numbers",
-    "copy_position", "copy_position_limit", "rectangle_toggle", "scroll_position", "search_count", "search_count_partial",
-    "search_match", "search_present", "search_timed_out", "selection_active", "selection_end_x", "selection_end_y",
-    "selection_mode", "selection_present", "selection_start_x", "selection_start_y", "top_line_time",
-];
 
 pub const VAR_NAMES: &[&str] = &[
     // tmux 3.8's format_table, which display-message -a lists
