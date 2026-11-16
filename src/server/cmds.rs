@@ -1272,21 +1272,6 @@ impl Server {
         }
     }
 
-    /// Copy from copy mode: store in a buffer and forward to the outer terminal clipboard (OSC 52).
-    pub fn copy_text(&mut self, text: String, cid: Option<ClientId>) {
-        if text.is_empty() {
-            return;
-        }
-        let clip = self.opt_server("set-clipboard");
-        if clip != "off" {
-            if let Some(c) = cid.and_then(|c| self.clients.get(&c)).filter(|c| c.control == 0 && c.features.has("clipboard")) {
-                let enc = base64(text.as_bytes());
-                c.send(S_OUTPUT, features::string_capability(&c.term_caps, "Ms", "\x1b]52;%p1%s;%p2%s\x07", &["c", &enc]).as_bytes());
-            }
-        }
-        self.add_buffer(None, text.into_bytes(), false);
-    }
-
     pub fn paste(&mut self, pane: PaneId, data: &[u8], bracket: bool, raw_lf: bool, sep: Option<&str>) {
         let Some(p) = self.panes.get(&pane) else { return };
         let mut out = Vec::new();

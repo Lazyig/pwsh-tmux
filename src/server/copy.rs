@@ -20,13 +20,27 @@ pub(super) const COPY_VARS: &[&str] = &[
     "top_line_time", "copy_cursor_word", "copy_cursor_line", "copy_cursor_hyperlink",
 ];
 
+/// The ones window_copy_formats adds as callbacks (format_add_cb).
+pub(super) const COPY_CALLBACK_VARS: &[&str] = &["search_match", "copy_cursor_word", "copy_cursor_line", "copy_cursor_hyperlink"];
+
 pub(super) fn is_copy_var(name: &str) -> bool {
     COPY_VARS.contains(&name)
 }
 
+/// A default copy-mode binding (as tmux's list-keys prints it) in the form bind-key
+/// stores a command (cmds::binding_command), so a rebinding to the same commands compares
+/// equal and the stored commands run like any other binding.
+pub(super) fn default_binding_command(cmd: &str) -> String {
+    // parsed as bind-key's arguments, so { } blocks stay blocks
+    match crate::cmdparse::parse(&format!("bind-key K {cmd}")) {
+        Ok(cmds) if cmds.len() == 1 => super::cmds::binding_command(&cmds[0][2..]),
+        _ => cmd.to_string(),
+    }
+}
+
 /// Splits a key binding's commands: an argument `;` (written `\;`) separates commands, as
 /// when tmux parses bind-key's arguments.
-pub(super) fn binding_commands(cmd: &str) -> Result<Vec<Vec<String>>, String> {
+fn binding_commands(cmd: &str) -> Result<Vec<Vec<String>>, String> {
     let cmds = crate::cmdparse::parse(cmd)?;
     if !cmd.contains("\\;") {
         return Ok(cmds);
@@ -92,7 +106,7 @@ impl Server {
         }
         let pending = matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(cm)) if cm.waiting_for_key());
         let binding = self.bindings.get(table).and_then(|t| t.get(name)).map(|b| b.cmd.clone());
-        let default = copymode::CopyMode::default_bindings(vi).iter().find(|(k, _)| keys::parse_key_name(k).map(|k| keys::key_name(&k)).as_deref().unwrap_or(k) == name).map(|(_, c)| *c);
+        let default = copymode::CopyMode::default_bindings(vi).iter().find(|(k, _)| keys::parse_key_name(k).map(|k| keys::key_name(&k)).as_deref().unwrap_or(k) == name).map(|(_, c)| default_binding_command(c));
         // a read-only client cannot prompt or run other commands from copy mode
         if let (Some(cmd), Some(c), false) = (&binding, cid, pending) {
             if self.client_is_readonly(cid) && !binding_allowed_readonly(cmd) {
@@ -102,9 +116,9 @@ impl Server {
             }
         }
         match binding {
-            Some(cmd) if !pending && Some(cmd.as_str()) != default => {
+            Some(cmd) if !pending && Some(&cmd) != default.as_ref() => {
                 if let Some(c) = cid {
-                    self.run_binding(c, &cmd, Some(pane));
+                    self.run_key_string(c, &cmd, Some(pane), name);
                 }
             }
             // an unbound key does nothing (unless a jump waits for its character)
@@ -112,29 +126,30 @@ impl Server {
             // the default prompts (and repeat counts) need a client, as command-prompt does
             Some(cmd) if !pending && cid.is_none() && cmd.starts_with("command-prompt") => {}
             _ => {
+                let before = self.copy_scroll_offset(pane);
                 let action = match self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
                     Some(PaneMode::Copy(cm)) => cm.key(name),
                     _ => return,
                 };
                 self.copy_action(pane, cid, action, None, (false, false), None);
+                self.show_scrollbar_if_scrolled(pane, before, false);
             }
         }
     }
 
-    /// Runs a binding's commands for a client.
-    pub(super) fn run_binding(&mut self, cid: ClientId, cmd: &str, pane: Option<PaneId>) {
-        match binding_commands(cmd) {
-            Ok(cmds) => {
-                let ctx = Ctx { client: Some(cid), pane, from_key: true, ..Ctx::default() };
-                self.run_queue(Queue { cmds: cmds.into(), ctx, soft: 0 });
-            }
-            Err(e) => self.set_message(cid, &e),
-        }
-    }
-
-    /// `send-keys -X name args`: a copy-mode command. Read-only clients may only move
-    /// around (WINDOW_COPY_CMD_FLAG_READONLY).
+    /// `send-keys -X name args`: a copy-mode command. The paging commands and the
+    /// scrollbar drag always show an auto-hide scrollbar; others (history-top and
+    /// history-bottom too) when the view scrolled.
     pub fn copy_mode_command(&mut self, pane: PaneId, cid: Option<ClientId>, name: &str, args: &[String]) {
+        let always = matches!(name, "page-up" | "page-down" | "page-down-and-cancel" | "halfpage-up" | "halfpage-down"
+            | "halfpage-down-and-cancel" | "scroll-to-mouse");
+        let before = self.copy_scroll_offset(pane);
+        self.copy_mode_command_inner(pane, cid, name, args);
+        self.show_scrollbar_if_scrolled(pane, before, always);
+    }
+
+    /// Read-only clients may only move around (WINDOW_COPY_CMD_FLAG_READONLY).
+    fn copy_mode_command_inner(&mut self, pane: PaneId, cid: Option<ClientId>, name: &str, args: &[String]) {
         if let Some(PaneMode::Tree(_)) = self.panes.get(&pane).and_then(|p| p.mode.as_ref()) {
             // tree mode understands a few -X commands
             let key = match name {
@@ -158,6 +173,15 @@ impl Server {
             return;
         }
         self.copy_sync_options(pane);
+        if name == "scroll-to-mouse" {
+            // window_copy_cmd_scroll_to_mouse: the slider follows the mouse (-e: leave at
+            // the bottom); later drag events keep moving it
+            if let (Some(c), Some(m)) = (cid, self.cur_mouse.clone()) {
+                let exit = args.iter().any(|a| a == "-e");
+                self.copy_scroll_to_mouse(c, pane, &m, exit);
+            }
+            return;
+        }
         // args_parse with the command's flags: the copy commands take -C (no clipboard) and
         // -P (no paste buffer), next-prompt and previous-prompt -o; an unknown flag means the
         // command is not run (window_copy_command ignores the parse error), "--" ends flags
@@ -222,10 +246,13 @@ impl Server {
                 }
                 let (no_clip, no_paste) = flags;
                 if append {
-                    self.copy_to_clipboard(&text, cid);
+                    self.copy_to_clipboard(pane, &text);
                     self.add_buffer(None, text.into_bytes(), true);
                 } else if !no_clip && !no_paste {
-                    self.copy_text(text, cid);
+                    self.copy_to_clipboard(pane, &text);
+                    if !text.is_empty() {
+                        self.add_buffer(None, text.into_bytes(), false);
+                    }
                     if let (Some(p), Some(b)) = (prefix, self.buffers.first_mut()) {
                         if let Some(n) = b.name.strip_prefix("buffer") {
                             b.name = format!("{p}{n}");
@@ -233,7 +260,7 @@ impl Server {
                     }
                 } else {
                     if !no_clip {
-                        self.copy_to_clipboard(&text, cid);
+                        self.copy_to_clipboard(pane, &text);
                     }
                     if !no_paste && !text.is_empty() {
                         self.add_buffer(None, text.into_bytes(), false);
@@ -250,19 +277,23 @@ impl Server {
                 }
             }
             Action::Prompt { label, command } => {
-                if let Some(c) = cid {
-                    // the pane is the prompt's context target (a %id in the template would read as %N)
+                if cid.is_some() {
+                    // the pane is the prompt's context target (a %id in the template would read as %N);
+                    // tmux 3.8's copy-mode bindings prompt in the pane (command-prompt -P)
                     let template = format!("send-keys -X {command} -- '%%'");
-                    self.open_prompt(c, PromptKind::Command, vec![(label, String::new())], template, Some(pane), false, false);
+                    let mut pr = Prompt::new(PromptKind::Command, vec![(format!("{label} "), String::new())], template, Some(pane));
+                    pr.id = self.next_prompt_id();
+                    // the default copy-mode search bindings use command-prompt -T search
+                    pr.history_type = usize::from(command.starts_with("search"));
+                    pr.host = Some(pane);
                     if command.ends_with("-incremental") {
                         self.copy_sync_options(pane);
                         if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
                             cm.begin_incremental_search(command.starts_with("search-forward"));
                         }
-                        if let Some(pr) = self.clients.get_mut(&c).and_then(|c| c.prompt.as_mut()) {
-                            pr.copy_incremental = Some((pane, command.starts_with("search-forward")));
-                        }
+                        pr.copy_incremental = Some((pane, command.starts_with("search-forward")));
                     }
+                    self.set_pane_prompt(pane, pr);
                 }
             }
         }
@@ -271,13 +302,20 @@ impl Server {
         }
     }
 
-    /// The clipboard half of copy_text (set-clipboard, OSC 52 to the client).
-    fn copy_to_clipboard(&self, text: &str, cid: Option<ClientId>) {
+    /// window_copy_copy_buffer's clipboard half (set-clipboard): screen_write_setselection
+    /// on the pane, so the terminals of the attached clients showing its window get the
+    /// OSC 52 (Ms), whichever client (or command) did the copy.
+    fn copy_to_clipboard(&self, pane: PaneId, text: &str) {
         if text.is_empty() || self.opt_server("set-clipboard") == "off" {
             return;
         }
-        if let Some(c) = cid.and_then(|c| self.clients.get(&c)).filter(|c| c.control == 0 && c.features.has("clipboard")) {
-            c.send(S_OUTPUT, format!("\x1b]52;c;{}\x07", base64(text.as_bytes())).as_bytes());
+        let Some(wid) = self.window_of(pane) else { return };
+        let enc = base64(text.as_bytes());
+        for c in self.clients.values().filter(|c| c.attached && c.control == 0 && c.features.has("clipboard")) {
+            let shown = c.session.and_then(|s| self.sessions.get(&s)).and_then(|s| s.links.get(&s.active)).is_some_and(|w| *w == wid);
+            if shown {
+                c.send(S_OUTPUT, features::string_capability(&c.term_caps, "Ms", "\x1b]52;%p1%s;%p2%s\x07", &["c", &enc]).as_bytes());
+            }
         }
     }
 
@@ -328,26 +366,27 @@ impl Server {
         }).min()
     }
 
-    /// copy-mode -S and scroll-to-mouse: drag the scrollbar slider to the mouse.
-    pub(super) fn copy_scroll_to_mouse(&mut self, pane: PaneId, m: &MouseCtx, exit: bool) {
-        let Some(r) = self.pane_rect(pane) else { return };
-        let mut y = m.y;
-        if m.statusat == Some(0) && y >= m.statuslines {
-            y -= m.statuslines;
-        }
-        let my = y as i64 - r.y as i64;
-        // where in the slider the drag started is not tracked (there is no scrollbar here)
-        let sl_mpos = 0;
+    /// copy-mode -S and scroll-to-mouse (window_copy_scroll): drag the scrollbar slider so
+    /// the point of it the drag started on (the client's slider_mpos) follows the mouse.
+    /// Later drag events of the same drag go here too (DragKind::Scrollbar keeps `exit`).
+    pub(super) fn copy_scroll_to_mouse(&mut self, cid: ClientId, pane: PaneId, m: &MouseCtx, exit: bool) {
+        let Some(wid) = self.window_of(pane) else { return };
+        let Some((_, r)) = self.rects(wid).0.into_iter().find(|(p, _)| *p == pane) else { return };
+        let area = self.scrollbar_area(wid, r);
+        let Some(c) = self.clients.get_mut(&cid) else { return };
+        c.drag = Some(Drag { kind: DragKind::Scrollbar { pane, exit } });
+        let sl_mpos = c.slider_mpos as usize;
+        let my = m.y.saturating_sub(if m.statusat == Some(0) { m.statuslines } else { 0 }) as i64 - area.y as i64;
         let leave = match self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
             Some(PaneMode::Copy(cm)) => cm.scroll_to_slider(sl_mpos, my, exit),
             _ => return,
         };
         if leave {
             self.exit_mode(pane);
+        } else {
+            self.show_scrollbar(pane);
         }
-        if let Some(wid) = self.window_of(pane) {
-            self.mark_window_dirty(wid);
-        }
+        self.mark_window_dirty(wid);
     }
 
     /// The copy-mode-*-style options for a pane, and its position indicator.

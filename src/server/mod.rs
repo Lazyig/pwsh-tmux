@@ -670,7 +670,8 @@ pub enum DragKind {
     Border,
     /// A copy-mode selection (copy-mode -M, begin-selection from the mouse).
     Copy { pane: PaneId },
-    Scrollbar { pane: PaneId },
+    /// A scrollbar slider drag (copy-mode -S or scroll-to-mouse, with -e).
+    Scrollbar { pane: PaneId, exit: bool },
 }
 
 /// Multi-click detection, as tmux's CLIENT_DOUBLECLICK / CLIENT_TRIPLECLICK and click timer.

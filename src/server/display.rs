@@ -57,7 +57,7 @@ impl Server {
         let left = self.opt_window(Some(wid), "pane-scrollbars-position") == "left";
         let x = if left { r.x } else { r.right().saturating_sub(width) };
         let (history, offset) = match &p.mode {
-            Some(PaneMode::Copy(cm)) => (cm.history_size(), cm.scroll_offset()),
+            Some(PaneMode::Copy(cm)) => (cm.hsize_lines(), cm.scroll_offset()),
             // other modes draw their own screen, which has no history
             Some(_) => (0, 0),
             None => (p.screen().history_rows_len().saturating_sub(p.size.1 as usize), 0),
@@ -102,23 +102,6 @@ impl Server {
         if after.is_some() && (always || after != before) {
             self.show_scrollbar(pane);
         }
-    }
-
-    /// window_copy_scroll1: drag the slider so the point of it grabbed (the client's
-    /// slider_mpos) follows the mouse, stopping at the ends of the bar.
-    pub fn scrollbar_to_mouse(&mut self, cid: ClientId, pane: PaneId, m: &super::mouse::MouseCtx) {
-        let Some(wid) = self.window_of(pane) else { return };
-        let Some((_, r)) = self.rects(wid).0.into_iter().find(|(p, _)| *p == pane) else { return };
-        let area = self.scrollbar_area(wid, r);
-        let Some(sb) = self.scrollbar(wid, pane, area) else { return };
-        let mpos = self.clients.get(&cid).map_or(0, |c| c.slider_mpos) as i32;
-        let my = m.y.saturating_sub(if m.statusat == Some(0) { m.statuslines } else { 0 }) as i32;
-        let (top, h, sh) = (area.y as i32, area.h as i32, sb.slider_h as i32);
-        let slider_y = if my <= top + mpos { 0 } else if my - mpos > top + h - sh { h - sh } else { my - top - mpos };
-        if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
-            cm.scroll_to_slider(slider_y.max(0) as usize, area.h as usize);
-        }
-        self.show_scrollbar(pane);
     }
 }
 

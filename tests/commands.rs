@@ -1937,6 +1937,39 @@ fn copy_mode_command_arguments_like_tmux() {
 
 #[test]
 #[cfg(unix)]
+fn copy_mode_tables_counts_and_formats_with_the_server() {
+    // checked against tmux 3.8: the default tables print as list-keys does, -N is the
+    // mode's count for one -X command, display -a lists the mode's variables (callbacks
+    // without a value empty) and a copy by a command writes no clipboard to it
+    let ctx = Ctx::new("copyint");
+    ctx.ok(&["new", "-d", "-s", "c", "-x", "30", "-y", "6", "printf 'a\nb\nc\nd\ne\n'; sleep 100"]);
+    wait_for("copy text", || ctx.capture("c").contains("e"));
+    let keys = ctx.ok(&["list-keys", "-T", "copy-mode-vi"]);
+    for want in [
+        r#"bind-key  -T copy-mode-vi F                 command-prompt -1P -p "(jump backward)" { send-keys -X jump-backward -- "%%" }"#,
+        r"bind-key  -T copy-mode-vi MouseDrag1Pane    select-pane \; send-keys -X begin-selection",
+        r##"bind-key  -T copy-mode-vi \#                send-keys -FX search-backward -- "#{copy_cursor_word}""##,
+    ] {
+        assert!(keys.lines().any(|l| l == want), "{want} not in {keys}");
+    }
+    ctx.ok(&["copy-mode", "-t", "c"]);
+    ctx.ok(&["send", "-t", "c", "-N", "3", "-X", "cursor-up"]);
+    assert_eq!(ctx.fmt("c", "#{copy_cursor_y}"), "2");
+    ctx.ok(&["send", "-t", "c", "-X", "select-line"]);
+    assert_eq!(ctx.ok(&["send", "-t", "c", "-X", "copy-selection"]), "");
+    let all = ctx.ok(&["display-message", "-a", "-t", "c"]);
+    for want in ["copy_cursor_hyperlink=\n", "copy_cursor_word=\n", "refresh_active=0\n", "search_count=0\n", "search_match=\n"] {
+        assert!(all.contains(want), "{want} in {all}");
+    }
+    assert_eq!(ctx.ok(&["show-buffer"]), "c");
+    // run-shell -b output is shown in view-mode
+    ctx.ok(&["new-window", "-d", "-t", "c:1", "sleep 100"]);
+    ctx.ok(&["run-shell", "-b", "-t", "c:1", "echo hi"]);
+    wait_for("view mode", || ctx.fmt("c:1", "#{pane_in_mode} #{pane_mode}") == "1 view-mode");
+}
+
+#[test]
+#[cfg(unix)]
 fn copy_mode_automatic_refresh_waits_for_selection() {
     let ctx = Ctx::new("copyrefresh");
     let marker = std::env::temp_dir().join(&ctx.socket);

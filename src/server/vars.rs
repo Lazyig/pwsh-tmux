@@ -473,7 +473,7 @@ impl Vars for VarCtx<'_> {
             "pane_dead_signal" => pane.and_then(|p| p.dead).and_then(|d| d.0).filter(|s| *s < 0).map(|s| (-s).to_string()),
             "pane_in_mode" => pane.map(|p| b(p.mode.is_some())),
             "pane_mode" => pane.and_then(|p| match &p.mode {
-                Some(PaneMode::Copy(_)) => Some("copy-mode".into()),
+                Some(PaneMode::Copy(c)) => Some(if c.is_view_mode() { "view-mode" } else { "copy-mode" }.into()),
                 Some(PaneMode::Clock) => Some("clock-mode".into()),
                 Some(PaneMode::Tree(_)) => Some("tree-mode".into()),
                 None => None,

@@ -679,6 +679,11 @@ impl CopyMode {
         self.line_numbers = 0;
     }
 
+    /// The mode is view-mode (window_view_mode), not copy-mode.
+    pub fn is_view_mode(&self) -> bool {
+        self.view
+    }
+
     /// `copy-mode -e`: leave copy mode once scrolled back to the bottom.
     pub fn set_exit_on_bottom(&mut self, on: bool) {
         self.exit_on_bottom = on;
