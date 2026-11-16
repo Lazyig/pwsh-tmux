@@ -612,10 +612,7 @@ impl Server {
         }
 
         for (id, r) in &rects {
-            let mut r = *r;
-            if border_status == "top" && r.y == 0 && r.h > 1 { r.y += 1; r.h -= 1; }
-            if border_status == "bottom" && r.bottom() == win.sy && r.h > 1 { r.h -= 1; }
-            if let Some(sb) = self.scrollbar(wid, *id, r) { super::display::draw_scrollbar(&mut f, sb, oy); }
+            if let Some(sb) = self.pane_scrollbar(wid, *id, *r) { super::display::draw_scrollbar(&mut f, sb, oy); }
         }
 
         // borders with junctions

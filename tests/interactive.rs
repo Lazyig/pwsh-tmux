@@ -804,3 +804,57 @@ fn display_border_lines_spaces_none_and_numbers() {
     assert_eq!(t.row(y).chars().nth(x + 1), Some('2'));
     assert_eq!(t.row(y + 1).chars().nth(x), Some('2'));
 }
+
+#[test]
+fn display_scrollbar_clicks_slider_drag_and_modes_like_tmux_3_8() {
+    let ctx = Ctx::new("display-sb38");
+    let t = start(&ctx, "s");
+    let bg = |y: u16, x: u16| t.screen.lock().unwrap().screen().cell(y, x).unwrap().bgcolor();
+    ctx.ok(&["set", "-g", "status", "off"]);
+    ctx.ok(&["set", "-g", "mouse", "on"]);
+    t.send(b"printf 'line\\n%.0s' {1..120}\r");
+    wait_for("history", || ctx.fmt("s", "#{history_size}").parse::<usize>().unwrap_or(0) > 30);
+    ctx.ok(&["setw", "-t", "s", "pane-scrollbars-style", "fg=red,bg=blue"]);
+    ctx.ok(&["setw", "-t", "s", "pane-scrollbars-timeout", "300"]);
+    ctx.ok(&["setw", "-t", "s", "pane-scrollbars", "auto-hide"]);
+    // history-bottom at the bottom does not scroll, so the bar stays hidden
+    ctx.ok(&["copy-mode", "-t", "s"]);
+    ctx.ok(&["send-keys", "-t", "s", "-X", "history-bottom"]);
+    std::thread::sleep(Duration::from_millis(150));
+    assert_ne!(bg(20, 99), vt100::Color::Idx(4));
+    ctx.ok(&["send-keys", "-t", "s", "-X", "cancel"]);
+    // a hidden auto-hide bar takes no clicks
+    wait_for("out of copy mode", || ctx.fmt("s", "#{pane_in_mode}") == "0");
+    t.mouse(0, 99, 10, false);
+    t.mouse(0, 99, 10, true);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(ctx.fmt("s", "#{pane_in_mode}"), "0");
+    // with a pane status line at the top, its row is a border, not the bar
+    ctx.ok(&["setw", "-t", "s", "pane-scrollbars", "on"]);
+    ctx.ok(&["setw", "-t", "s", "pane-border-status", "top"]);
+    wait_for("bar", || bg(10, 99) != vt100::Color::Default);
+    t.mouse(0, 99, 0, false);
+    t.mouse(0, 99, 0, true);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(ctx.fmt("s", "#{pane_in_mode}"), "0");
+    ctx.ok(&["setw", "-t", "s", "pane-border-status", "off"]);
+    // dragging the slider keeps the grabbed point under the mouse
+    ctx.ok(&["copy-mode", "-t", "s"]);
+    let hsize: i64 = ctx.fmt("s", "#{history_size}").parse().unwrap();
+    let h = 30i64;
+    let (slider_h, slider_y) = ((h * h / (hsize + h)).max(1), (h + 1) * hsize / (hsize + h));
+    let grab = (slider_y + slider_h - 1) as u16;
+    wait_for("slider drawn", || bg(grab, 99) == vt100::Color::Idx(1));
+    t.mouse(0, 99, grab, false);
+    t.mouse(32, 99, grab - 1, false);
+    let top = ((slider_y - 1) as f64 * ((hsize + h) as f64 / h as f64)) as i64;
+    wait_for("dragged one row", || ctx.fmt("s", "#{scroll_position}") == (hsize - top).to_string());
+    t.mouse(32, 99, 0, false);
+    t.mouse(0, 99, 0, true);
+    wait_for("dragged to the top", || ctx.fmt("s", "#{scroll_position}") == hsize.to_string());
+    ctx.ok(&["send-keys", "-t", "s", "-X", "cancel"]);
+    // clock mode keeps the bar, with a slider the full height (no history)
+    ctx.ok(&["clock-mode", "-t", "s"]);
+    wait_for("clock bar", || bg(0, 99) == vt100::Color::Idx(1) && bg(29, 99) == vt100::Color::Idx(1));
+    assert_eq!(ctx.fmt("s", "#{pane_width}"), "99");
+}

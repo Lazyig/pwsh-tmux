@@ -40,6 +40,8 @@ pub struct MouseCtx {
     /// First row of the status lines and how many there are (m->statusat, m->statuslines).
     pub statusat: Option<u16>,
     pub statuslines: u16,
+    /// The row of the scrollbar slider under the mouse (sl_mpos).
+    pub slider_mpos: u16,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -127,10 +129,10 @@ impl Server {
             // of a visible one; it hides on the timer even while hovered
             for (pane, r) in self.rects(wid).0 {
                 if m.kind != MouseKind::Move { break; }
-                let Some(sb) = self.scrollbar(wid, pane, r) else { continue };
+                let Some(sb) = self.pane_scrollbar(wid, pane, r) else { continue };
                 let total = (sb.width + sb.pad).min(r.w);
                 let x0 = if sb.left { r.x } else { r.right() - total };
-                let hover = m.x >= x0 && m.x < x0 + total && m.y >= oy + r.y && m.y < oy + r.bottom();
+                let hover = m.x >= x0 && m.x < x0 + total && m.y >= oy + sb.y && m.y < oy + sb.y + sb.height;
                 if hover || self.panes[&pane].scrollbar_until.is_some() {
                     self.show_scrollbar(pane);
                 }
@@ -237,6 +239,12 @@ impl Server {
             }
         };
         let Some((wh, mut ctx)) = self.mouse_where(cid, x, y) else { return };
+        // a slider drag keeps the point of the slider it started on
+        if wh == Where::ScrollbarSlider {
+            if let Some(c) = self.clients.get_mut(&cid).filter(|c| !matches!(c.drag, Some(Drag { kind: DragKind::Scrollbar { .. } }))) {
+                c.slider_mpos = ctx.slider_mpos;
+            }
+        }
         ctx.x = m.x;
         ctx.y = m.y;
         ctx.lx = lx;
@@ -327,11 +335,15 @@ impl Server {
             return None;
         }
         for (pane, r) in self.rects(wid).0 {
-            if let Some(sb) = self.scrollbar(wid, pane, r) {
+            // a hidden auto-hide bar takes no clicks (window_pane_scrollbar_visible)
+            if let Some(sb) = self.pane_scrollbar(wid, pane, r).filter(|sb| sb.visible) {
                 if x >= sb.x && x < sb.x + sb.width && py >= sb.y && py < sb.y + sb.height {
                     ctx.pane = Some(pane);
                     let y = py - sb.y;
                     let where_ = if y < sb.slider_y { Where::ScrollbarUp } else if y >= sb.slider_y + sb.slider_h { Where::ScrollbarDown } else { Where::ScrollbarSlider };
+                    if where_ == Where::ScrollbarSlider {
+                        ctx.slider_mpos = y - sb.slider_y;
+                    }
                     return Some((where_, ctx));
                 }
             }
@@ -518,7 +530,7 @@ impl Server {
 
     fn mouse_drag_update(&mut self, cid: ClientId, m: &MouseCtx) {
         if let Some(Drag { kind: DragKind::Scrollbar { pane } }) = self.clients.get(&cid).and_then(|c| c.drag.as_ref()) {
-            self.scrollbar_to_mouse(*pane, m);
+            self.scrollbar_to_mouse(cid, *pane, m);
             return;
         }
         match self.clients.get(&cid).and_then(|c| c.drag.as_ref()).map(|d| match d.kind {
@@ -844,7 +856,8 @@ impl Server {
             if c.overlay.is_none() {
                 mode = if self.windows[&wid].panes().iter().any(|p| pane_mode(*p) == 1003) { 1003 } else { 0 };
             }
-            if c.overlay.is_none() && matches!(self.opt_window(Some(wid), "pane-scrollbars").as_str(), "auto-hide" | "modal") { mode = 1003; }
+            // focus-follows-mouse and modal/auto-hide scrollbars need movement, overlay or not
+            if self.opt_session_on(Some(sid), "focus-follows-mouse") || matches!(self.opt_window(Some(wid), "pane-scrollbars").as_str(), "auto-hide" | "modal") { mode = 1003; }
             if mode != 1003 {
                 mode = 1002;
             }

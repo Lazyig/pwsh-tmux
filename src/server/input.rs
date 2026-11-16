@@ -463,9 +463,10 @@ impl Server {
             Some(self.opt_server("copy-command")).filter(|c| !c.is_empty())
         };
         let run_args: Vec<String> = if piped && !args.is_empty() { args[1..].to_vec() } else { args.to_vec() };
-        // these always show an auto-hide scrollbar; others when the view scrolled
+        // these always show an auto-hide scrollbar; others (history-top and
+        // history-bottom too) when the view scrolled
         let always = matches!(name, "page-up" | "page-down" | "page-down-and-cancel" | "halfpage-up" | "halfpage-down"
-            | "halfpage-down-and-cancel" | "history-top" | "history-bottom" | "scroll-to-mouse");
+            | "halfpage-down-and-cancel" | "scroll-to-mouse");
         let before = self.copy_scroll_offset(pane);
         self.copy_mode_command_inner(pane, cid, name, pipe, run_args);
         self.show_scrollbar_if_scrolled(pane, before, always);
@@ -477,7 +478,7 @@ impl Server {
             if let Some(cid) = cid {
                 if let Some(m) = self.cur_mouse.clone() {
                     if let Some(c) = self.clients.get_mut(&cid) { c.drag = Some(Drag { kind: DragKind::Scrollbar { pane } }); }
-                    self.scrollbar_to_mouse(pane, &m);
+                    self.scrollbar_to_mouse(cid, pane, &m);
                 }
             }
             return;

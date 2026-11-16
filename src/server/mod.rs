@@ -620,6 +620,8 @@ pub struct Client {
     pub created: u64,
     pub activity: u64,
     pub drag: Option<Drag>,
+    /// Where in the scrollbar slider a drag started (mouse_slider_mpos).
+    pub slider_mpos: u16,
     pub title: String,
     pub suspended: bool,
     pub click: ClickState,
@@ -1274,6 +1276,7 @@ impl Server {
                 created: now,
                 activity: now,
                 drag: None,
+                slider_mpos: 0,
                 title: String::new(),
                 suspended: false,
                 click: ClickState::default(),
@@ -2335,11 +2338,7 @@ impl Server {
 
     /// Content rect of a pane (minus a pane-border-status line).
     pub fn content_rect(&self, wid: WinId, r: Rect) -> Rect {
-        let mut cr = match self.opt_window(Some(wid), "pane-border-status").as_str() {
-            "top" if r.y == 0 && r.h > 1 => Rect { y: r.y + 1, h: r.h - 1, ..r },
-            "bottom" if r.bottom() == self.windows[&wid].sy && r.h > 1 => Rect { h: r.h - 1, ..r },
-            _ => r,
-        };
+        let mut cr = self.scrollbar_area(wid, r);
         if self.opt_window(Some(wid), "pane-scrollbars") == "on" {
             if let Some((id, _)) = self.rects(wid).0.into_iter().find(|(_, rect)| *rect == r) {
                 if let Some(sb) = self.scrollbar(wid, id, cr) {

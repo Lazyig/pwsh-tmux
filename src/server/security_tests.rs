@@ -36,6 +36,7 @@ fn fixture() -> (Server, mpsc::Receiver<Event>) {
             created: now,
             activity: now,
             drag: None,
+            slider_mpos: 0,
             title: String::new(),
             suspended: false,
             click: Default::default(),

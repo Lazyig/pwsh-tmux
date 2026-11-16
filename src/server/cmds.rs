@@ -2550,7 +2550,7 @@ impl Server {
                 if o.has('S') {
                     if let (Some(cid), Some(m)) = (ctx.client, ctx.mouse.as_ref()) {
                         self.clients.get_mut(&cid).unwrap().drag = Some(Drag { kind: DragKind::Scrollbar { pane } });
-                        self.scrollbar_to_mouse(pane, m);
+                        self.scrollbar_to_mouse(cid, pane, m);
                     }
                 }
                 // window_copy_pageup/pagedown and the scrollbar drag show an

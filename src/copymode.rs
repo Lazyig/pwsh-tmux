@@ -241,9 +241,13 @@ impl CopyMode {
 
     pub fn history_size(&self) -> usize { self.hsize() }
 
-    pub fn scroll_fraction(&mut self, y: usize, height: usize) {
-        self.top = (y * (self.hsize() + self.height) / height.max(1)).min(self.hsize());
-        self.cy = self.cy.clamp(self.top, self.top + self.height - 1);
+    /// The view for a scrollbar slider at row `y` of a bar `height` rows high (the
+    /// inverse of the slider position); the cursor keeps its row in the view.
+    pub fn scroll_to_slider(&mut self, y: usize, height: usize) {
+        let top = ((y as f64 * ((self.hsize() + height) as f64 / height.max(1) as f64)) as usize).min(self.hsize());
+        let row = self.cy.saturating_sub(self.top);
+        self.top = top;
+        self.cy = (top + row).clamp(self.top, self.top + self.height - 1);
     }
 
     pub fn scroll_offset(&self) -> usize {
