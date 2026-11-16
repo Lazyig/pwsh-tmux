@@ -12,6 +12,7 @@ mod input;
 mod modes;
 mod mouse;
 pub mod procinfo;
+mod display;
 mod render;
 mod vars;
 mod transport;
@@ -38,6 +39,8 @@ use std::time::{Duration, Instant, SystemTime};
 /// Largest window/client dimension accepted. tmux allows 10000, but vt100 allocates
 /// every cell up front, so a smaller bound keeps a hostile size from exhausting memory.
 pub const MAX_SIZE: u16 = 1000;
+/// A message without a timer (delay 0) stays until a key press.
+pub const MESSAGE_FOREVER: Duration = Duration::from_secs(86_400 * 365);
 
 pub type PaneId = u32;
 pub type WinId = u32;
@@ -70,6 +73,7 @@ pub enum Event {
     ClientMsg(ClientId, u8, Vec<u8>),
     ClientGone(ClientId),
     PaneData(PaneId, u32, Vec<u8>),
+    /// The exit status: negative for a signal (pane_dead_signal), see [`exit_status`].
     PaneExit(PaneId, u32, Option<i32>),
     Job(u32, i32, String),
     /// A `#(command)` from a format finished: (command, output).
@@ -384,7 +388,10 @@ pub struct Pane {
     pub start_path: String,
     pub title: String,
     pub dead: Option<(Option<i32>, u64)>,
+    pub scrollbar_until: Option<Instant>,
     pub mode: Option<PaneMode>,
+    /// command-prompt -P: a prompt drawn on the pane's last line.
+    pub prompt: Option<Prompt>,
     pub options: Options,
     /// Hooks set on the pane (set-hook -p).
     pub hooks: BTreeMap<String, Vec<String>>,
@@ -587,6 +594,10 @@ pub enum PromptKind {
 }
 
 pub struct Prompt {
+    pub vi_command: bool,
+    /// C-v: the next key is inserted as it is
+    pub quote_next: bool,
+    pub copied: Vec<char>,
     pub kind: PromptKind,
     pub prompts: Vec<(String, String)>,
     pub answers: Vec<String>,
@@ -595,20 +606,43 @@ pub struct Prompt {
     pub cursor: usize,
     pub template: String,
     pub history_pos: Option<usize>,
-    /// The history this prompt reads and adds to (command-prompt -T).
+    /// The history this prompt reads and adds to (command-prompt -T, an index of
+    /// input::PROMPT_TYPES).
     pub history_type: usize,
-    /// vi command mode (status-keys vi after Escape).
-    pub command_mode: bool,
-    /// Text cut with C-w, pasted again by C-y.
-    pub copied: Option<Vec<char>>,
+    /// Set when the prompt is opened (Server::next_prompt_id): a waiting
+    /// command-prompt or confirm-before goes on once no prompt has it.
+    pub id: u64,
     pub pane: Option<PaneId>,
     pub numeric: bool,
     pub single_key: bool,
+    /// command-prompt -i: the template runs on every change (PROMPT_INCREMENTAL);
+    /// `last` is the -I text, restored by C-r/C-s on an empty prompt.
+    pub incremental: bool,
+    pub last: String,
+    /// Inline Tab completion matches drawn after the input (complete_list).
+    pub complete: Vec<String>,
+    /// The prompt finished (prompt_closed).
+    pub closed: bool,
+    /// The pane a command-prompt -P prompt belongs to.
+    pub host: Option<PaneId>,
     pub copy_incremental: Option<(PaneId, bool)>,
     /// command-prompt -e: backspace on an empty prompt closes it.
     pub bspace_exit: bool,
     /// confirm-before: the key that confirms (-c) and whether Enter does too (-y).
     pub confirm: (char, bool),
+}
+
+impl Prompt {
+    /// A prompt showing the first of `prompts` (label, initial input).
+    pub fn new(kind: PromptKind, prompts: Vec<(String, String)>, template: String, pane: Option<PaneId>) -> Prompt {
+        let (label, init) = prompts.first().cloned().unwrap_or_default();
+        let input: Vec<char> = init.chars().collect();
+        Prompt {
+            vi_command: false, quote_next: false, copied: Vec::new(), kind, prompts, answers: Vec::new(), label, cursor: input.len(), input,
+            template, history_pos: None, history_type: 0, id: 0, pane, numeric: false, single_key: false, incremental: false, last: String::new(),
+            complete: Vec::new(), closed: false, host: None, copy_incremental: None, bspace_exit: false, confirm: ('y', false),
+        }
+    }
 }
 
 pub enum Overlay {
@@ -635,6 +669,7 @@ pub enum DragKind {
     Border,
     /// A copy-mode selection (copy-mode -M, begin-selection from the mouse).
     Copy { pane: PaneId },
+    Scrollbar { pane: PaneId },
 }
 
 /// Multi-click detection, as tmux's CLIENT_DOUBLECLICK / CLIENT_TRIPLECLICK and click timer.
@@ -664,10 +699,11 @@ pub struct Client {
     pub prompt: Option<Prompt>,
     pub overlay: Option<Overlay>,
     pub overlay_epoch: u64,
-    /// Counts the prompts opened on this client (a waiting command-prompt is done when
-    /// its prompt is closed or replaced).
-    pub prompt_epoch: u64,
     pub message: Option<(String, Instant)>,
+    /// display-message -N: keys do not clear the message (only with a timer)
+    pub message_ignore_keys: bool,
+    /// The message is text: its # are not styles (all but display-message).
+    pub message_ignore_styles: bool,
     pub prev: Option<RenderState>,
     pub dirty: bool,
     pub last_session: Option<SessId>,
@@ -676,6 +712,8 @@ pub struct Client {
     /// activity_seq() at the last key: tmux compares activity timevals, finer than seconds.
     pub activity_seq: u64,
     pub drag: Option<Drag>,
+    /// Where in the scrollbar slider a drag started (mouse_slider_mpos).
+    pub slider_mpos: u16,
     pub title: String,
     pub suspended: bool,
     pub click: ClickState,
@@ -926,7 +964,10 @@ pub struct Server {
     /// wait-for channels signalled while nobody waited (the next wait returns at once).
     pub waits_woken: std::collections::HashSet<String>,
     pub overlay_waits: Vec<(ClientId, u64, String, Queue)>,
+    /// Queues waiting for a prompt to close: (client, prompt id, command, queue).
     pub prompt_waits: Vec<(ClientId, u64, String, Queue)>,
+    /// The last prompt id given out (Server::next_prompt_id).
+    pub prompt_ids: u64,
     /// Copy-mode panes scrolling while a selection drag rests at an edge.
     pub copy_drag_timers: HashMap<PaneId, Instant>,
     /// A lookup of what the panes run is in progress (at most one at a time).
@@ -1075,6 +1116,7 @@ impl Server {
             waits_woken: Default::default(),
             overlay_waits: Vec::new(),
             prompt_waits: Vec::new(),
+            prompt_ids: 0,
             copy_drag_timers: HashMap::new(),
             pane_info_busy: false,
             delayed: Vec::new(),
@@ -1248,15 +1290,38 @@ impl Server {
         }
     }
 
+    /// A status message that is text, not a format (status_message_set with ignore_styles).
     pub fn set_message(&mut self, cid: ClientId, msg: &str) {
-        let ms = self.client_session(cid).map(|s| self.opt_session_num(Some(s), "display-time")).unwrap_or(750).max(1) as u64;
-        // status_message_set
+        self.set_message_for(cid, msg, None, false);
+        if let Some(c) = self.clients.get_mut(&cid) {
+            c.message_ignore_styles = true;
+        }
+    }
+
+    /// A command error for an attached client (cmdq_error): the first letter is upper case.
+    pub fn set_error(&mut self, cid: ClientId, msg: &str) {
+        let mut chars = msg.chars();
+        let msg: String = chars.next().map(|c| c.to_ascii_uppercase()).into_iter().chain(chars).collect();
+        self.set_message(cid, &msg);
+    }
+
+    /// tmux status_message_set: `delay` None uses display-time; zero waits for a
+    /// key press (which clears any message unless `ignore_keys` and a timer is set).
+    pub fn set_message_for(&mut self, cid: ClientId, msg: &str, delay: Option<u64>, ignore_keys: bool) {
+        let ms = delay.unwrap_or_else(|| self.client_session(cid).map(|s| self.opt_session_num(Some(s), "display-time")).unwrap_or(750).max(0) as u64);
+        // status_message_set logs it with the client's name
         match self.clients.get(&cid).map(|c| c.name()) {
             Some(n) => self.add_message(&format!("{n} message: {msg}")),
             None => self.add_message(&format!("message: {msg}")),
         }
         if let Some(c) = self.clients.get_mut(&cid) {
-            c.message = Some((msg.to_string(), Instant::now() + Duration::from_millis(ms)));
+            let until = if ms == 0 { MESSAGE_FOREVER } else { Duration::from_millis(ms) };
+            c.message = Some((msg.to_string(), Instant::now() + until));
+            c.message_ignore_styles = false;
+            // as tmux, a message without a timer keeps the previous setting
+            if ms != 0 {
+                c.message_ignore_keys = ignore_keys;
+            }
             c.dirty = true;
         }
     }
@@ -1391,8 +1456,9 @@ impl Server {
                 prompt: None,
                 overlay: None,
                 overlay_epoch: 0,
-                prompt_epoch: 0,
                 message: None,
+                message_ignore_keys: false,
+                message_ignore_styles: true,
                 prev: None,
                 dirty: false,
                 last_session: None,
@@ -1400,6 +1466,7 @@ impl Server {
                 activity: now,
                 activity_seq: activity_seq(),
                 drag: None,
+                slider_mpos: 0,
                 title: String::new(),
                 suspended: false,
                 click: ClickState::default(),
@@ -1604,6 +1671,7 @@ impl Server {
         p.parser.screen_mut().set_alternate_screen_allowed(alternate);
         p.parser.screen_mut().set_codepoint_widths(widths, variation_wide);
         p.parser.callbacks_mut().colours.update(colours);
+        let was_alternate = p.screen().alternate_screen();
         p.parser.screen_mut().set_scroll_on_clear(scroll_on_clear);
         // capture-pane -I: rows entering the history record when
         p.parser.screen_mut().set_time(now_secs());
@@ -1667,6 +1735,9 @@ impl Server {
             }
             return;
         };
+        if was_alternate != self.panes[&id].screen().alternate_screen() && self.opt_window(Some(wid), "pane-scrollbars") == "on" {
+            self.apply_layout(wid);
+        }
         if let Some(w) = self.windows.get_mut(&wid) {
             w.activity = now_secs();
         }
@@ -1754,7 +1825,13 @@ impl Server {
             }
             let msg = self.expand_for_pane(id, &fmt);
             if let Some(p) = self.panes.get_mut(&id) {
-                p.parser.process(format!("\r\n\x1b[0m{msg}").as_bytes());
+                if !fmt.is_empty() {
+                    let cells = crate::format::layout_line(&crate::format::spans(&msg, Default::default()), p.size.0 as usize, Default::default());
+                    let line = render::line_with_escapes(&Line { cells, wrapped: false });
+                    // format_draw leaves the cursor where it started, at the line's start
+                    p.parser.process(format!("\x1b[r\x1b[{};1H\r\n\x1b[0m{line}\x1b[0m\r", p.size.1).as_bytes());
+                }
+                p.parser.process(b"\x1b[?25l");
             }
             if let Some(wid) = self.window_of(id) {
                 self.mark_window_dirty(wid);
@@ -1868,6 +1945,7 @@ impl Server {
     pub fn next_timeout(&self) -> Duration {
         let mut t = Duration::from_millis(1000);
         let now = Instant::now();
+        for d in self.panes.values().filter_map(|p| p.scrollbar_until) { t = t.min(d.saturating_duration_since(now)); }
         for d in self.copy_drag_timers.values().chain(self.delayed.iter().map(|(d, _)| d)) {
             t = t.min(d.saturating_duration_since(now));
         }
@@ -1888,6 +1966,10 @@ impl Server {
     fn timers(&mut self) {
         self.input_timers();
         let now = Instant::now();
+        let expired: Vec<_> = self.panes.iter_mut().filter_map(|(id, p)| {
+            if p.scrollbar_until.is_some_and(|d| d <= now) { p.scrollbar_until = None; Some(*id) } else { None }
+        }).collect();
+        for id in expired { if let Some(w) = self.window_of(id) { self.mark_window_dirty(w); } }
         let cids: Vec<ClientId> = self.clients.keys().copied().collect();
         for cid in cids {
             let Some(c) = self.clients.get_mut(&cid) else { continue };
@@ -1931,7 +2013,7 @@ impl Server {
         }
         let waiting = std::mem::take(&mut self.prompt_waits);
         for (cid, epoch, name, queue) in waiting {
-            if self.clients.get(&cid).is_none_or(|c| c.prompt.is_none() || c.prompt_epoch != epoch) {
+            if !self.prompt_open(epoch) {
                 self.after_command(&name, &queue.ctx);
                 self.run_queue(queue);
             } else {
@@ -2193,7 +2275,7 @@ impl Server {
         if let Some(mut child) = child {
             let tx = self.tx.clone();
             thread::spawn(move || {
-                let status = child.wait().ok().map(|s| s.exit_code() as i32);
+                let status = child.wait().ok().map(|s| exit_status(&s));
                 let _ = tx.send(Event::PaneExit(id, generation, status));
             });
         }
@@ -2229,7 +2311,9 @@ impl Server {
                 start_path: dir.clone(),
                 title,
                 dead: None,
+                scrollbar_until: None,
                 mode: None,
+                prompt: None,
                 options: existing_opts,
                 hooks: existing_hooks,
                 pipe: None,
@@ -2465,7 +2549,7 @@ impl Server {
         c.attached = true;
         c.prev = None;
         c.dirty = true;
-        c.key_table = "root".into();
+        c.set_key_table("root");
         if !was_attached {
             c.send(S_ATTACHED, if clear { b"" } else { b"no-clear" });
             self.start_terminal_queries(cid);
@@ -2570,11 +2654,25 @@ impl Server {
 
     /// Content rect of a pane (minus a pane-border-status line).
     pub fn content_rect(&self, wid: WinId, r: Rect) -> Rect {
-        match self.opt_window(Some(wid), "pane-border-status").as_str() {
-            "top" if r.y == 0 && r.h > 1 => Rect { y: r.y + 1, h: r.h - 1, ..r },
-            "bottom" if r.bottom() == self.windows[&wid].sy && r.h > 1 => Rect { h: r.h - 1, ..r },
-            _ => r,
+        match self.rects(wid).0.into_iter().find(|(_, rect)| *rect == r) {
+            Some((id, _)) => self.pane_content_rect(wid, id, r),
+            None => self.scrollbar_area(wid, r),
         }
+    }
+
+    /// The content of pane `id` in layout cell `r` (also a cell of the unzoomed
+    /// layout for a pane hidden by zoom): less a pane status line and a reserved
+    /// scrollbar.
+    pub fn pane_content_rect(&self, wid: WinId, id: PaneId, r: Rect) -> Rect {
+        let mut cr = self.scrollbar_area(wid, r);
+        if self.opt_window(Some(wid), "pane-scrollbars") == "on" {
+            if let Some(sb) = self.scrollbar(wid, id, cr) {
+                let width = sb.width.saturating_add(sb.pad).min(cr.w.saturating_sub(1));
+                cr.w -= width;
+                if self.opt_window(Some(wid), "pane-scrollbars-position") == "left" { cr.x += width; }
+            }
+        }
+        cr
     }
 
     pub fn apply_layout(&mut self, wid: WinId) {
@@ -2803,7 +2901,7 @@ impl Server {
                     }
                 }
                 if let Some(e) = err {
-                    self.set_message(rc, &e);
+                    self.set_error(rc, &e);
                 }
                 return;
             }
@@ -2832,11 +2930,7 @@ impl Server {
         if attached {
             let cid = ctx.client.unwrap();
             if let Some(e) = err {
-                // cmdq_error: an attached client shows it as a status message,
-                // capitalised
-                let mut chars = e.chars();
-                let e: String = chars.next().map(|f| f.to_uppercase().chain(chars).collect()).unwrap_or_default();
-                self.set_message(cid, &e);
+                self.set_error(cid, &e);
             } else if !ctx.out.is_empty() {
                 if ctx.readonly || self.client_is_readonly(Some(cid)) {
                     self.set_message(cid, &ctx.out);
@@ -2940,3 +3034,30 @@ fn strip_delay(cmd: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod input_tests;
+
+/// A child's exit status as tmux reports it: the exit code, or minus the signal
+/// number when a signal ended it (pane_dead_signal, pane_dead_status empty).
+fn exit_status(s: &portable_pty::ExitStatus) -> i32 {
+    match s.signal().and_then(signal_number) {
+        Some(n) => -n,
+        None => s.exit_code() as i32,
+    }
+}
+
+/// The number of a signal from the strsignal(3) text portable-pty reports.
+#[cfg(unix)]
+fn signal_number(name: &str) -> Option<i32> {
+    if let Some(n) = name.strip_prefix("Signal ").and_then(|n| n.parse().ok()) {
+        return Some(n);
+    }
+    (1..65).find(|n| {
+        let s = unsafe { libc::strsignal(*n) };
+        !s.is_null() && unsafe { std::ffi::CStr::from_ptr(s) }.to_string_lossy() == name
+    })
+}
+
+#[cfg(not(unix))]
+fn signal_number(_name: &str) -> Option<i32> {
+    None
+}
+

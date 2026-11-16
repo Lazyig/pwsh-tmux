@@ -306,7 +306,15 @@ impl Vars for VarCtx<'_> {
             "buffer_mode_format" => Some("#{t/p:buffer_created}: #{buffer_sample}".into()),
             "client_mode_format" => Some("#[fg=themelightgrey]#{t/p:client_activity}: session #[default]#{session_name}".into()),
             "tree_mode_format" => Some(TREE_MODE_FORMAT.into()),
-            "buffer_full" => self.extra.get("buffer_name").and_then(|n| srv.buffers.iter().find(|b| &b.name == n)).map(|b| String::from_utf8_lossy(&b.data).into_owned()),
+            // outside a buffer list, buffer_* describe the most recent automatic
+            // buffer (format_defaults: paste_get_top)
+            "buffer_name" | "buffer_size" | "buffer_sample" | "buffer_created" => {
+                srv.buffers.iter().find(|b| b.automatic).and_then(|b| super::cmds::buffer_vars(b).remove(name))
+            }
+            "buffer_full" => match self.extra.get("buffer_name") {
+                Some(n) => srv.buffers.iter().find(|b| &b.name == n),
+                None => srv.buffers.iter().find(|b| b.automatic),
+            }.map(|b| String::from_utf8_lossy(&b.data).into_owned()),
             // session
             "session_name" => sess.map(|s| s.name.clone()),
             "session_id" => sess.map(|s| format!("${}", s.id)),
@@ -458,10 +466,11 @@ impl Vars for VarCtx<'_> {
             "pane_marked" => Some(b(t.pane.is_some() && srv.marked == t.pane)),
             "pane_marked_set" => Some(b(srv.marked.is_some())),
             "pane_dead" => pane.map(|p| b(p.dead.is_some())),
-            "pane_dead_status" => pane.and_then(|p| p.dead).and_then(|d| d.0).map(|s| s.to_string()),
+            // a negative status is the signal that ended the pane
+            "pane_dead_status" => pane.and_then(|p| p.dead).and_then(|d| d.0).filter(|s| *s >= 0).map(|s| s.to_string()),
             "pane_dead_time" => pane.and_then(|p| p.dead).map(|d| d.1.to_string()),
-            // the exit signal is not tracked, and only a signalled pane has one
-            "pane_dead_signal" => None,
+            // only a pane ended by a signal has one (sig2name: the number here)
+            "pane_dead_signal" => pane.and_then(|p| p.dead).and_then(|d| d.0).filter(|s| *s < 0).map(|s| (-s).to_string()),
             "pane_in_mode" => pane.map(|p| b(p.mode.is_some())),
             "pane_mode" => pane.and_then(|p| match &p.mode {
                 Some(PaneMode::Copy(_)) => Some("copy-mode".into()),
@@ -530,7 +539,7 @@ impl Vars for VarCtx<'_> {
                     srv.rects(w.id).0.into_iter().find(|(id, _)| *id == p)?.1
                 };
                 // position of the pane's content (below a pane-border-status line)
-                let c = srv.content_rect(w.id, r);
+                let c = srv.pane_content_rect(w.id, p, r);
                 Some(match name {
                     "pane_left" | "pane_x" => c.x.to_string(),
                     "pane_top" | "pane_y" => c.y.to_string(),

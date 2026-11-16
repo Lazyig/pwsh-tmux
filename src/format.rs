@@ -989,6 +989,15 @@ fn relative_time(age: i64) -> String {
     if b == 0 { format!("{a}{unit}") } else { format!("{a}{unit}{b}{next}") }
 }
 
+/// The RGB of a colour, None for the default.
+pub fn color_rgb(c: Color) -> Option<(u8, u8, u8)> {
+    match c {
+        Color::Idx(n) => Some(palette_rgb(n)),
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+        Color::Default => None,
+    }
+}
+
 /// RGB of a 256-colour palette entry (colour_256toRGB).
 fn palette_rgb(n: u8) -> (u8, u8, u8) {
     const BASIC: [u32; 16] = [
@@ -2084,6 +2093,9 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
     let mut range: Option<Range> = None;
     let mut range_start = 0;
     let mut buf = String::new();
+    // list=left-marker/right-marker text is only shown by tmux when the list is
+    // cut; lists are never cut here, so it is dropped
+    let mut in_marker = false;
 
     fn flush(out: &mut Vec<Span>, buf: &mut String, style: Style, align: Align, range: &Option<Range>, link: &Option<String>) {
         if buf.is_empty() {
@@ -2107,7 +2119,9 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
     while i < text.len() {
         let rest = &text[i..];
         if rest.starts_with("##") {
-            buf.push('#');
+            if !in_marker {
+                buf.push('#');
+            }
             i += 2;
         } else if rest.starts_with("#[")
             && let Some(e) = rest.find(']')
@@ -2138,6 +2152,8 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
                     }
                     "pop-default" => default = defaults.pop().unwrap_or(base),
                     "norange" => range = None,
+                    "list=left-marker" | "list=right-marker" => in_marker = true,
+                    "list=on" | "list=focus" | "nolist" => in_marker = false,
                     _ if lower.starts_with("range=") => {
                         if let Ok(r) = Range::parse(&w[6..]) {
                             range = r;
@@ -2167,7 +2183,9 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
             i += e + 1;
         } else {
             let c = rest.chars().next().unwrap();
-            buf.push(c);
+            if !in_marker {
+                buf.push(c);
+            }
             i += c.len_utf8();
         }
     }
@@ -3028,6 +3046,13 @@ mod tests {
         // Unterminated directive is text.
         assert_eq!(spans("#[fg=red", base)[0].text, "#[fg=red");
         assert!(spans("", base).is_empty());
+    }
+
+    #[test]
+    fn list_markers_are_not_drawn() {
+        let base = Style::default();
+        let text: String = spans("P: #[list=on]#[list=left-marker]<#[list=right-marker]>#[list=on]a b#[nolist] R", base).iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(text, "P: a b R");
     }
 
     #[test]

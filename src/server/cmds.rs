@@ -12,6 +12,11 @@ mod json;
 mod sort;
 mod vis;
 
+/// The names of all commands, for prompt completion.
+pub fn command_names() -> impl Iterator<Item = &'static str> {
+    COMMANDS.iter().map(|c| c.0)
+}
+
 /// (name, alias, flags without value, flags with value)
 const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("attach-session", "attach", "dErx", "cfst"),
@@ -24,7 +29,7 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("clear-history", "clearhist", "H", "t"),
     ("clear-prompt-history", "clearphist", "", "T"),
     ("clock-mode", "", "", "t"),
-    ("command-prompt", "", "1bCeFkilN", "IpTt"),
+    ("command-prompt", "", "1bCeFkilNP", "IpTt"),
     ("confirm-before", "confirm", "by", "cpt"),
     ("copy-mode", "", "deHMqSu", "st"),
     ("customize-mode", "", "NZy", "Fft"),
@@ -187,6 +192,25 @@ pub fn print_command_string(v: &str, aliases: &[String], escaped: bool) -> Strin
     out.join(if escaped { " \\; " } else { " ; " })
 }
 
+/// The command string of bind-key's arguments after the key. Separate arguments:
+/// ";" separates commands as cmd_parse_from_arguments does ("{" and "}" are plain
+/// strings there); { } blocks of a parsed command come marked and stay blocks.
+pub fn binding_command(args: &[String]) -> String {
+    let block = |a: &str| a.strip_prefix(cmdparse::BLOCK_MARK).map(str::to_string);
+    if args.len() == 1 {
+        return block(&args[0]).unwrap_or_else(|| args[0].clone());
+    }
+    cmdparse::split_arguments(args).iter().map(|c| {
+        c.iter().map(|a| block(a).map_or_else(|| cmdparse::quote(a), |b| format!("{{ {b} }}"))).collect::<Vec<_>>().join(" ")
+    }).collect::<Vec<_>>().join(" ; ")
+}
+
+/// Flags whose value is optional ("D::" in the tmux template): without a value
+/// args_print shows them bare and ends the flags with "--".
+fn optional_value_flag(cmd: &str, c: char) -> bool {
+    matches!(cmd, "resize-pane" | "move-pane") && "DLRU".contains(c)
+}
+
 /// Whether positional argument `idx` of a command may be a { } block
 /// (ARGS_PARSE_COMMANDS_OR_STRING in the command's args_parse callback).
 fn takes_commands(cmd: &str, idx: usize, flags: &[char]) -> bool {
@@ -240,7 +264,21 @@ fn print_parsed_command(words: Vec<(String, bool)>, aliases: &[String], expand: 
         if a == "--" { break; }
         let chars: Vec<char> = a[1..].chars().collect();
         for (j, &c) in chars.iter().enumerate() {
-            if spec.2.contains(c) {
+            if optional_value_flag(full, c) {
+                // args_parse_flag_argument: the next word is the value unless it looks like a flag
+                let inline: String = chars[j + 1..].iter().collect();
+                let v = if !inline.is_empty() { Some(inline) } else {
+                    match args.get(i) {
+                        Some((v, false)) if !(v.starts_with('-') && v[1..].starts_with(|n: char| n == '-' || n.is_ascii_alphabetic())) => {
+                            i += 1;
+                            Some(v.clone())
+                        }
+                        _ => None,
+                    }
+                };
+                valued.push((c, v));
+                break;
+            } else if spec.2.contains(c) {
                 bare.push(c);
             } else if spec.3.contains(c) {
                 let inline: String = chars[j + 1..].iter().collect();
@@ -253,7 +291,7 @@ fn print_parsed_command(words: Vec<(String, bool)>, aliases: &[String], expand: 
                     i += 1;
                     v
                 };
-                valued.push((c, v));
+                valued.push((c, Some(v)));
                 break;
             } else {
                 return Err(fail(format!("unknown flag -{c}")));
@@ -265,7 +303,14 @@ fn print_parsed_command(words: Vec<(String, bool)>, aliases: &[String], expand: 
     valued.sort_by_key(|(c, _)| *c);
     let mut out = vec![full.to_string()];
     if !bare.is_empty() { out.push(format!("-{}", bare.iter().collect::<String>())); }
-    out.extend(valued.into_iter().map(|(c, v)| format!("-{c} {}", options::escape_arg(&v))));
+    let ends_optional = valued.last().is_some_and(|(_, v)| v.is_none());
+    out.extend(valued.into_iter().map(|(c, v)| match v {
+        Some(v) => format!("-{c} {}", options::escape_arg(&v)),
+        None => format!("-{c}"),
+    }));
+    if ends_optional {
+        out.push("--".into());
+    }
     for (k, (a, brace)) in args[i..].iter().enumerate() {
         if *brace && !takes_commands(full, k, &bare) {
             return Err(fail(format!("argument {} must be \"string\"", k + 1)));
@@ -1156,6 +1201,7 @@ impl Server {
         let vi = self.opt_window(wid, "mode-keys") == "vi";
         let sid = self.session_of_pane(pane).map(|x| x.0);
         let mut cm = CopyMode::new(lines, w, h, (cy, cx), vi);
+        cm.wrap_search = self.opt_window_on(wid, "wrap-search");
         cm.set_word_separators(&self.opt_session(sid, "word-separators"));
         self.panes.get_mut(&pane).unwrap().mode = Some(PaneMode::Copy(Box::new(cm)));
         if let Some(wid) = wid {
@@ -2057,9 +2103,15 @@ impl Server {
                 let wt = if cmd == "select-layout" { self.resolve_pane(ctx, t)? } else { self.resolve_window(ctx, t)? };
                 let wid = wt.wid.unwrap();
                 let area = self.window_area(wid);
-                let main_size = |s: &Server, name: &str| -> Option<u16> {
-                    let v = s.opt_window_num(Some(wid), if name.starts_with("main-horizontal") { "main-pane-height" } else { "main-pane-width" });
-                    (v > 0).then_some(v as u16)
+                // args_string_percentage(value, 0, total, total): anything over the
+                // available size is an error, and the layout uses its default
+                let size_option = |s: &Server, name: &str, total: u16| -> Option<u16> {
+                    let v = s.opt_window(Some(wid), name);
+                    let n = match v.strip_suffix('%') {
+                        Some(pct) => pct.parse::<u32>().ok().filter(|p| *p <= 1000).map(|p| total as u32 * p / 100),
+                        None => v.parse::<u32>().ok(),
+                    };
+                    n.filter(|n| *n <= total as u32).map(|n| n as u16)
                 };
                 let w = &self.windows[&wid];
                 let panes = w.panes();
@@ -2084,7 +2136,13 @@ impl Server {
                 };
                 let node = if let Some(name) = name {
                     if let Some(preset) = layout::preset_name(&name).filter(|_| !o.has('o')) {
-                        let n = layout::preset(preset, &panes, area, main_size(self, preset)).unwrap();
+                        let horizontal = preset.starts_with("main-horizontal");
+                        let dimension = if horizontal { "height" } else { "width" };
+                        let total = if horizontal { area.h } else { area.w }.saturating_sub(1);
+                        let main = size_option(self, &format!("main-pane-{dimension}"), total);
+                        let other = size_option(self, &format!("other-pane-{dimension}"), total);
+                        let columns = self.opt_window_num(Some(wid), "tiled-layout-max-columns").max(0) as usize;
+                        let n = layout::preset_with_options(preset, &panes, area, main, other, columns).unwrap();
                         let w = self.windows.get_mut(&wid).unwrap();
                         w.layout_cycle = layout::PRESETS.iter().position(|p| *p == preset);
                         n
@@ -2751,7 +2809,7 @@ impl Server {
                     self.exit_mode(pane);
                     return Ok(Flow::Next);
                 }
-                if o.has('M') {
+                if o.has('M') || o.has('S') {
                     // the pane under the mouse, for a client attached to that session
                     let Some(m) = ctx.mouse.clone() else { return Ok(Flow::Next) };
                     let Some(p) = self.mouse_pane(&m) else { return Ok(Flow::Next) };
@@ -2786,9 +2844,18 @@ impl Server {
                         }
                     }
                 }
-                if let Some(w) = tt.wid {
-                    self.mark_window_dirty(w);
+                if o.has('S') {
+                    if let (Some(cid), Some(m)) = (ctx.client, ctx.mouse.as_ref()) {
+                        self.clients.get_mut(&cid).unwrap().drag = Some(Drag { kind: DragKind::Scrollbar { pane } });
+                        self.scrollbar_to_mouse(cid, pane, m);
+                    }
                 }
+                // window_copy_pageup/pagedown and the scrollbar drag show an
+                // auto-hide scrollbar; just entering copy mode does not
+                if o.has('u') || o.has('d') || o.has('S') {
+                    self.show_scrollbar(pane);
+                }
+                if let Some(w) = tt.wid { self.mark_window_dirty(w); }
                 Ok(Flow::Next)
             }
             "clock-mode" => {
@@ -2860,7 +2927,7 @@ impl Server {
                 }
                 let title = o.get('T').map(|s| self.expand(tt, Some(cid), s)).unwrap_or_default();
                 let (w, h) = Menu::box_size(&title, &items);
-                let Some((x, y)) = self.overlay_position(cid, tt, ctx.mouse.as_ref(), o.get('x'), o.get('y'), w, h) else { return Ok(Flow::Next) };
+                let Some((x, y)) = self.menu_position(cid, tt, ctx.mouse.as_ref(), o.get('x'), o.get('y'), w, h) else { return Ok(Flow::Next) };
                 let nomouse = ctx.mouse.is_none() && !o.has('M');
                 let mut menu = Menu::at(title, items, x, y, tt.pane, nomouse, o.has('O'), start);
                 menu.look = super::modes::OverlayLook {
@@ -2900,17 +2967,18 @@ impl Server {
                 }
                 let w = dim(o.get('w'), cw).clamp(3, cw);
                 let h = dim(o.get('h'), ch).clamp(3, ch);
-                let x = o.get('x').and_then(|v| v.parse().ok()).unwrap_or(((cw - 1) / 2).saturating_sub(w / 2)).min(cw - w);
-                let y = o.get('y').and_then(|v| v.parse().ok()).unwrap_or(((ch - 1) / 2).saturating_sub(h / 2)).min(ch - h);
-                // -B, or -b none: no border
-                let border = !o.has('B') && o.get('b') != Some("none");
-                let (iw, ih) = if border { (w - 2, h - 2) } else { (w, h) };
                 let tt = self.resolve_pane(ctx, t).unwrap_or_else(|_| self.current(ctx));
+                // cmd_display_menu_get_popup_pos: -x/-y are formats (or letters standing
+                // for them), y is the bottom row
+                let Some((x, y)) = self.overlay_position(cid, tt, ctx.mouse.as_ref(), o.get('x'), o.get('y'), w, h) else { return Ok(Flow::Next) };
+                // -B, or border lines (-b or popup-border-lines) none: no border
+                let border = !o.has('B') && o.get('b').map(String::from).unwrap_or_else(|| self.opt_window(self.current(ctx).wid, "popup-border-lines")) != "none";
+                let (iw, ih) = if border { (w - 2, h - 2) } else { (w, h) };
                 let cwd = o.get('d').map(|d| self.expand(tt, Some(cid), d)).or_else(|| tt.pane.and_then(|p| self.panes.get(&p)).map(|p| p.current_path.clone()));
                 let pane = self.spawn_pane(tt.sid, iw.max(1), ih.max(1), &o.rest, cwd.as_deref(), &env)?;
                 let title = o.get('T').map(|s| self.expand(tt, Some(cid), s)).unwrap_or_default();
                 let epoch = self.replace_overlay(cid, Some(Overlay::Popup(Popup {
-                    pane, x, y, w, h, border, close_on_exit: o.has('E'), title, any_key: o.has('k') && !o.has('N'),
+                    pane, x, y, w, h, border, close_on_exit: o.has('E'), close_any_key: o.has('k'), title,
                     look: super::modes::OverlayLook { style: o.get('s').map(String::from), border_style: o.get('S').map(String::from), lines: o.get('b').map(String::from), ..Default::default() },
                 })))?;
                 Ok(Flow::WaitOverlay(cid, epoch))
@@ -2918,41 +2986,71 @@ impl Server {
             // ---------------------------------------------------------------- prompts & messages
             "command-prompt" => {
                 let cid = self.resolve_client(ctx, t)?;
-                // a client shows one prompt at a time
-                if self.clients.get(&cid).is_some_and(|c| c.prompt.is_some()) {
+                let tt = self.current(&Ctx { client: Some(cid), ..ctx.clone() });
+                // -P: the prompt belongs to the pane and is drawn over its last line
+                let host = if o.has('P') { ctx.pane.or(tt.pane) } else { None };
+                if o.has('P') {
+                    if host.is_none_or(|p| self.panes.get(&p).is_none_or(|p| p.prompt.is_some())) {
+                        return Ok(Flow::Next);
+                    }
+                } else if self.clients.get(&cid).is_some_and(|c| c.prompt.is_some()) {
                     return Ok(Flow::Next);
                 }
-                let tt = self.current(&Ctx { client: Some(cid), ..ctx.clone() });
                 let template = o.rest.first().cloned().unwrap_or_else(|| "%1".into());
                 // -F: the template is a format, expanded now
                 let template = if o.has('F') { self.expand(tt, Some(cid), &template) } else { template };
-                // -l: one prompt and input taken literally, not split at commas
-                let split = |v: &str| -> Vec<String> { if o.has('l') { vec![v.to_string()] } else { v.split(',').map(String::from).collect() } };
-                let labels: Vec<String> = match o.get('p') {
-                    Some(p) => split(p).iter().map(|s| self.expand(tt, Some(cid), s)).collect(),
-                    None => vec![if o.rest.is_empty() { ":".into() } else { format!("({})", template.split_whitespace().next().unwrap_or("")) }],
+                // -l: one prompt and input taken literally, not split at commas; others
+                // get a space after the prompt, except the default ':' (prompts are
+                // formats expanded when drawn, inputs are expanded now)
+                let (labels, space): (Vec<String>, bool) = match o.get('p') {
+                    Some(p) if o.has('l') => (vec![p.to_string()], false),
+                    Some(p) => (p.split(',').map(String::from).collect(), true),
+                    None if o.rest.is_empty() => (vec![":".into()], false),
+                    None => (vec![format!("({})", template.split_whitespace().next().unwrap_or(""))], true),
                 };
                 let inits: Vec<String> = match o.get('I') {
-                    Some(i) => split(i).iter().map(|s| self.expand(tt, Some(cid), s)).collect(),
+                    Some(i) if o.has('l') => vec![self.expand(tt, Some(cid), i)],
+                    Some(i) => i.split(',').map(|s| self.expand(tt, Some(cid), s)).collect(),
                     None => Vec::new(),
                 };
-                let prompts: Vec<(String, String)> = labels.into_iter().enumerate().map(|(i, l)| (l, inits.get(i).cloned().unwrap_or_default())).collect();
-                let kind = if o.has('k') { PromptKind::Key } else { PromptKind::Command };
+                let prompts: Vec<(String, String)> = labels.into_iter().enumerate()
+                    .map(|(i, l)| (if space { format!("{l} ") } else { l }, inits.get(i).cloned().unwrap_or_default())).collect();
                 let history_type = match o.get('T') { Some(ty) => input::prompt_type(ty).ok_or_else(|| format!("unknown type: {ty}"))?, None => 0 };
-                self.open_prompt(cid, kind, prompts, template, ctx.pane, o.has('N'), o.has('1'));
-                // -e: backspace on empty input closes the prompt; -C (keep updating panes) is
-                // how prompts behave here anyway
-                if let Some(pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
-                    pr.bspace_exit = o.has('e') && !o.has('1') && !o.has('N') && !o.has('i') && !o.has('k');
-                    pr.history_type = history_type;
+                let kind = if o.has('k') && !o.has('1') && !o.has('N') && !o.has('i') { PromptKind::Key } else { PromptKind::Command };
+                // -1, -N, -i, -k and -e exclude each other in this order
+                let mut pr = Prompt::new(kind, prompts, template, ctx.pane);
+                pr.single_key = o.has('1');
+                pr.numeric = o.has('N') && !o.has('1');
+                pr.history_type = history_type;
+                pr.incremental = o.has('i') && !o.has('1') && !o.has('N');
+                if pr.incremental {
+                    // the -I text is kept for C-r/C-s, the prompt starts empty
+                    pr.last = pr.input.drain(..).collect();
+                    pr.cursor = 0;
                 }
-                // without -b (or -i) the command waits until the prompt is done
-                self.prompt_wait(cid, o.has('b') || o.has('i'))
+                pr.bspace_exit = o.has('e') && !o.has('1') && !o.has('N') && !o.has('i') && !o.has('k');
+                let id = self.next_prompt_id();
+                pr.id = id;
+                match host {
+                    Some(pane) => {
+                        pr.host = Some(pane);
+                        self.set_pane_prompt(pane, pr);
+                    }
+                    None => {
+                        if let Some(c) = self.clients.get_mut(&cid) {
+                            c.prompt = Some(pr);
+                            c.dirty = true;
+                        }
+                    }
+                }
+                self.prompt_incremental_start(cid, host);
+                // -C (keep updating panes) is how prompts behave here anyway; without -b
+                // (or -i) the command waits until the prompt is done
+                self.prompt_wait(cid, id, o.has('b') || o.has('i'))
             }
             "confirm-before" => {
                 let cid = self.resolve_client(ctx, t)?;
                 let command = o.rest.first().ok_or("confirm-before needs a command")?.clone();
-                let tt = self.current(&Ctx { client: Some(cid), ..ctx.clone() });
                 // -c: the confirming key (printable ASCII), -y: Enter confirms too
                 let key = match o.get('c') {
                     Some(c) => match c.as_bytes() {
@@ -2961,19 +3059,20 @@ impl Server {
                     },
                     None => 'y',
                 };
+                // the prompt is a format expanded when drawn, followed by a space
                 let label = match o.get('p') {
-                    Some(p) => self.expand(tt, Some(cid), p),
+                    Some(p) => format!("{p} "),
                     None => {
                         // tmux names the first command, not the whole command line
                         let name = cmdparse::parse(&command).ok().and_then(|c| c.first().and_then(|c| c.first()).cloned()).map(|n| canonical(&n).map(String::from).unwrap_or(n));
-                        format!("Confirm '{}'? ({key}/n)", name.unwrap_or_else(|| command.clone()))
+                        format!("Confirm '{}'? ({key}/n) ", name.unwrap_or_else(|| command.clone()))
                     }
                 };
-                self.open_prompt(cid, PromptKind::Confirm, vec![(label, String::new())], command, ctx.pane, false, true);
+                let id = self.open_prompt(cid, PromptKind::Confirm, vec![(label, String::new())], command, ctx.pane, false, true);
                 if let Some(pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.as_mut()) {
                     pr.confirm = (key, o.has('y'));
                 }
-                self.prompt_wait(cid, o.has('b'))
+                self.prompt_wait(cid, id, o.has('b'))
             }
             "display-message" => {
                 let tt = self.cmd_find(ctx, t, Find::Pane, FIND_CANFAIL)?;
@@ -3027,7 +3126,7 @@ impl Server {
                     None => "[#{session_name}] #{window_index}:#{window_name}, current pane #{pane_index} - (%H:%M %d-%b-%y)",
                 };
                 // -l: literal, -j: JSON printed back in tmux's form; -C (keep updating the
-                // pane) and -N (ignore keys) are how messages behave here anyway
+                // pane) is how messages behave here anyway; -N: keys don't clear it
                 let msg = if o.has('l') { fmt.to_string() } else if o.has('v') {
                     // -v: the expansion steps are printed first
                     let (msg, log) = crate::format::expand_time_verbose(fmt, &super::vars::VarCtx { srv: self, t: tt, client: fc, extra });
@@ -3050,14 +3149,7 @@ impl Server {
                 } else if let Some(c) = attached_client.filter(|c| self.is_control(*c)) {
                     self.control_write(c, &format!("%message {msg}\n"));
                 } else if let Some(c) = attached_client {
-                    self.set_message(c, &msg);
-                    if let Some(ms) = delay.map(|d| d as u64) {
-                        if let Some(cl) = self.clients.get_mut(&c) {
-                            if let Some(m) = &mut cl.message {
-                                m.1 = Instant::now() + Duration::from_millis(if ms == 0 { 86_400_000 } else { ms });
-                            }
-                        }
-                    }
+                    self.set_message_for(c, &msg, delay.map(|d| d as u64), o.has('N'));
                 }
                 Ok(Flow::Next)
             }
@@ -3128,15 +3220,7 @@ impl Server {
                 }
                 let kname = parsed.map(|k| keys::key_name(&k)).unwrap_or(key.clone());
                 let table = if o.has('n') { "root".to_string() } else { o.get('T').unwrap_or("prefix").to_string() };
-                // separate arguments: ";" separates commands as cmd_parse_from_arguments
-                // does ("{" and "}" are plain strings there); { } blocks of a parsed
-                // command come marked and stay blocks
-                let block = |a: &str| a.strip_prefix(cmdparse::BLOCK_MARK).map(str::to_string);
-                let command = if args.len() == 1 { block(&args[0]).unwrap_or_else(|| args[0].clone()) } else {
-                    cmdparse::split_arguments(&args).iter().map(|c| {
-                        c.iter().map(|a| block(a).map_or_else(|| cmdparse::quote(a), |b| format!("{{ {b} }}"))).collect::<Vec<_>>().join(" ")
-                    }).collect::<Vec<_>>().join(" ; ")
-                };
+                let command = binding_command(&args);
                 if command.is_empty() {
                     return err("bind-key needs a command");
                 }
@@ -3227,6 +3311,7 @@ impl Server {
                 let aliases = self.command_aliases();
                 let mut lines = Vec::new();
                 for (table, key, b) in &l {
+                    let cmd = print_command_string(&b.cmd, &aliases, true);
                     let line = match o.get('F') {
                         Some(f) => {
                             let vars = HashMap::from([
@@ -3239,14 +3324,14 @@ impl Server {
                                 ("key_prefix".to_string(), prefix.clone()),
                                 ("key_table".to_string(), table.to_string()),
                                 ("key_string".to_string(), key.to_string()),
-                                ("key_command".to_string(), print_command_string(&b.cmd, &aliases, true)),
+                                ("key_command".to_string(), cmd.clone()),
                             ]);
                             self.expand_extra(self.current(ctx), ctx.client, f, vars)
                         }
-                        None if notes_only => format!("{prefix} {} {}", pad(key, key_width), if b.note.is_empty() { print_command_string(&b.cmd, &aliases, true) } else { b.note.clone() }),
+                        None if notes_only => format!("{prefix} {} {}", pad(key, key_width), if b.note.is_empty() { &cmd } else { &b.note }),
                         None => {
                             let r = if !has_repeat { "" } else if b.repeat { "-r" } else { "  " };
-                            format!("bind-key {r} -T {} {} {}", pad(table, table_width), pad(&vis::args_escape(key), key_width), print_command_string(&b.cmd, &aliases, true))
+                            format!("bind-key {r} -T {} {} {}", pad(table, table_width), pad(&vis::args_escape(key), key_width), cmd)
                         }
                     };
                     if !line.is_empty() {
@@ -4301,7 +4386,7 @@ impl Server {
         }
         // side effects
         match name.as_str() {
-            "status" | "status-position" | "pane-border-status" | "window-size" => {
+            "status" | "status-position" | "pane-border-status" | "window-size" | "pane-scrollbars" | "pane-scrollbars-style" | "pane-scrollbars-position" => {
                 let sids: Vec<SessId> = self.sessions.keys().copied().collect();
                 for s in sids {
                     self.update_session_size(s);
@@ -4528,24 +4613,49 @@ impl Server {
         }
     }
 
-    /// CMD_RETURN_WAIT for a prompt just opened (unless `background`): the queue goes
-    /// on when that prompt is closed.
-    fn prompt_wait(&self, cid: ClientId, background: bool) -> Result<Flow, String> {
-        match self.clients.get(&cid) {
-            Some(c) if !background && c.prompt.is_some() => Ok(Flow::WaitPrompt(cid, c.prompt_epoch)),
-            _ => Ok(Flow::Next),
+    /// CMD_RETURN_WAIT for the prompt `id` just opened (unless `background`): the
+    /// queue goes on when that prompt is closed.
+    fn prompt_wait(&self, cid: ClientId, id: u64, background: bool) -> Result<Flow, String> {
+        if !background && self.prompt_open(id) {
+            Ok(Flow::WaitPrompt(cid, id))
+        } else {
+            Ok(Flow::Next)
         }
     }
 
-    pub fn open_prompt(&mut self, cid: ClientId, kind: PromptKind, prompts: Vec<(String, String)>, template: String, pane: Option<PaneId>, numeric: bool, single: bool) {
-        let (label, init) = prompts.first().cloned().unwrap_or_default();
-        let input: Vec<char> = init.chars().collect();
-        let cursor = input.len();
+    /// A new prompt id (see Prompt::id); zero is never used.
+    pub fn next_prompt_id(&mut self) -> u64 {
+        self.prompt_ids += 1;
+        self.prompt_ids
+    }
+
+    /// Whether the prompt with this id is still shown, on a client or as a pane prompt.
+    pub fn prompt_open(&self, id: u64) -> bool {
+        id != 0 && (self.clients.values().any(|c| c.prompt.as_ref().is_some_and(|p| p.id == id))
+            || self.panes.values().any(|p| p.prompt.as_ref().is_some_and(|p| p.id == id)))
+    }
+
+    pub fn set_pane_prompt(&mut self, pane: PaneId, pr: Prompt) {
+        if let Some(p) = self.panes.get_mut(&pane) {
+            p.prompt = Some(pr);
+        }
+        if let Some(wid) = self.window_of(pane) {
+            self.mark_window_dirty(wid);
+        }
+    }
+
+    /// Shows a status line prompt on a client; returns its id.
+    pub fn open_prompt(&mut self, cid: ClientId, kind: PromptKind, prompts: Vec<(String, String)>, template: String, pane: Option<PaneId>, numeric: bool, single: bool) -> u64 {
+        let mut pr = Prompt::new(kind, prompts, template, pane);
+        pr.numeric = numeric;
+        pr.single_key = single;
+        pr.id = self.next_prompt_id();
+        let id = pr.id;
         if let Some(c) = self.clients.get_mut(&cid) {
-            c.prompt_epoch = c.prompt_epoch.wrapping_add(1);
-            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, history_type: 0, command_mode: false, copied: None, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false, confirm: ('y', false) });
+            c.prompt = Some(pr);
             c.dirty = true;
         }
+        id
     }
 }
 

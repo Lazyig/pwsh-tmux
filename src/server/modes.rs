@@ -425,6 +425,11 @@ const SESSION_INFO: &[&str] = &[
 
 // ---- menu ------------------------------------------------------------------------
 
+/// Width of a menu item name drawn as a format (format_width).
+fn styled_width(name: &str) -> usize {
+    crate::format::spans(name, Style::default()).iter().map(|s| crate::format::width(&s.text)).sum()
+}
+
 pub struct MenuItem {
     pub name: String,
     pub key: String,
@@ -471,7 +476,7 @@ impl Menu {
     pub fn box_size(title: &str, items: &[MenuItem]) -> (u16, u16) {
         let inner = items
             .iter()
-            .map(|i| crate::format::width(&i.name) + if i.key.is_empty() { 0 } else { crate::format::width(&i.key) + 3 })
+            .map(|i| styled_width(&i.name) + if i.key.is_empty() { 0 } else { crate::format::width(&i.key) + 3 })
             .chain(std::iter::once(crate::format::spans(title, Style::default()).iter().map(|s| crate::format::width(&s.text)).sum()))
             .max()
             .unwrap_or(0) as u16;
@@ -518,7 +523,7 @@ impl Menu {
     pub fn new(title: String, items: Vec<MenuItem>, x: Option<&str>, y: Option<&str>, cw: u16, ch: u16, mouse: Option<(u16, u16)>, pane: Option<PaneId>) -> Menu {
         let inner = items
             .iter()
-            .map(|i| crate::format::width(&i.name) + if i.key.is_empty() { 0 } else { crate::format::width(&i.key) + 3 })
+            .map(|i| styled_width(&i.name) + if i.key.is_empty() { 0 } else { crate::format::width(&i.key) + 3 })
             .chain(std::iter::once(crate::format::spans(&title, Style::default()).iter().map(|s| crate::format::width(&s.text)).sum()))
             .max()
             .unwrap_or(10) as u16;
@@ -575,10 +580,10 @@ impl Menu {
         }
     }
 
-    pub fn draw(&self, f: &mut super::render::Frame, style: Style, border: Style, selected_style: Style, lines: &str) {
+    pub fn draw(&self, f: &mut super::render::Frame, style: Style, border: Style, selected_style: Style, lines_kind: &str) {
         let (x0, y0, w, h) = (self.x, self.y, self.w, self.h);
-        let set = super::render::box_lines(lines);
-        super::render::draw_box_lines(f, x0, y0, w, h, border, &self.title, lines);
+        let lines = super::render::box_lines(lines_kind);
+        super::render::draw_box_lines(f, x0, y0, w, h, border, &self.title, lines_kind);
         for (i, it) in self.items.iter().enumerate() {
             let y = y0 + 1 + i as u16;
             if y + 1 >= y0 + h {
@@ -591,14 +596,18 @@ impl Menu {
             }
             if it.name.is_empty() {
                 for x in x0 + 1..x0 + w - 1 {
-                    f.set(x, y, Cell { text: set[0].into(), style: border });
+                    f.set(x, y, Cell { text: lines[0].into(), style: border });
                 }
-                f.set(x0, y, Cell { text: set[6].into(), style: border });
-                f.set(x0 + w - 1, y, Cell { text: set[7].into(), style: border });
+                f.set(x0, y, Cell { text: lines[7].into(), style: border });
+                f.set(x0 + w - 1, y, Cell { text: lines[8].into(), style: border });
                 continue;
             }
+            // names are formats (menu_add_item: "Paste #[underscore]..."), drawn
+            // like format_draw over the item's style
             let dim = Style { attrs: style.attrs | crate::cells::DIM, ..st };
-            f.text(x0 + 2, y, &it.name, if it.cmd.is_empty() { dim } else { st }, x0 + w - 1);
+            let base = if it.cmd.is_empty() { dim } else { st };
+            let cells = crate::format::layout_line(&crate::format::spans(&it.name, base), w.saturating_sub(4) as usize, st);
+            f.put_cells(x0 + 2, y, &cells);
             if !it.key.is_empty() {
                 let k = format!("({})", it.key);
                 let kw = crate::format::width(&k) as u16;
@@ -618,9 +627,9 @@ pub struct Popup {
     pub h: u16,
     pub border: bool,
     pub close_on_exit: bool,
+    /// -k: after the command exits any key closes the popup.
+    pub close_any_key: bool,
     pub title: String,
-    /// -k: any key closes the popup once its command has exited.
-    pub any_key: bool,
     pub look: OverlayLook,
 }
 
@@ -685,13 +694,51 @@ fn big_text_cells(f: &mut super::render::Frame, r: Rect, text: &str, block: Cell
     true
 }
 
-pub fn clock_text(style24: bool) -> String {
+pub fn clock_text(style: &str) -> String {
+    clock_text_at(style, chrono::Local::now())
+}
+
+fn clock_text_at(style: &str, now: chrono::DateTime<chrono::Local>) -> String {
     use chrono::Timelike;
-    let now = chrono::Local::now();
-    if style24 {
-        format!("{:02}:{:02}", now.hour(), now.minute())
+    let seconds = if style.ends_with("-with-seconds") { format!(":{:02}", now.second()) } else { String::new() };
+    if style.starts_with("24") {
+        format!("{:02}:{:02}{seconds}", now.hour(), now.minute())
     } else {
+        // strftime "%l:%M " (or "%l:%M:%S ") then AM or PM
         let (pm, h) = now.hour12();
-        format!("{:2}:{:02} {}", h, now.minute(), if pm { "PM" } else { "AM" }).trim_start().replace(' ', "")
+        format!("{h:>2}:{:02}{seconds} {}", now.minute(), if pm { "PM" } else { "AM" })
+    }
+}
+
+#[cfg(test)]
+mod menu_format_tests {
+    use super::*;
+    #[test]
+    fn menu_names_are_drawn_as_formats() {
+        let items = vec![MenuItem { name: "Paste #[underscore]abc".into(), key: "p".into(), cmd: "paste-buffer".into() }];
+        let (w, h) = Menu::box_size("", &items);
+        assert_eq!((w, h), (9 + 4 + 4, 3));
+        let m = Menu::at(String::new(), items, 0, 0, None, true, false, None);
+        let mut f = super::super::render::Frame::new(30, 4);
+        m.draw(&mut f, Style::default(), Style::default(), Style::default(), "single");
+        let row: String = (0..w).map(|x| f.cells[(30 + x) as usize].text.clone()).collect();
+        assert_eq!(row, "│ Paste abc (p) │");
+        assert_ne!(f.cells[30 + 8].style.attrs & crate::cells::UNDERLINE, 0);
+    }
+}
+
+#[cfg(test)]
+mod clock_display_tests {
+    use super::*;
+    use chrono::TimeZone;
+    #[test]
+    fn clock_seconds_and_monochrome() {
+        let now = chrono::Local.with_ymd_and_hms(2026, 11, 13, 13, 2, 3).unwrap();
+        for (style, text) in [("12", " 1:02 PM"), ("24", "13:02"), ("12-with-seconds", " 1:02:03 PM"), ("24-with-seconds", "13:02:03")] {
+            assert_eq!(clock_text_at(style, now), text);
+        }
+        let mut f = super::super::render::Frame::new(80, 10);
+        assert!(big_clock(&mut f, Rect { x: 0, y: 0, w: 80, h: 10 }, "12:34", Color::Default));
+        assert!(f.cells.iter().any(|c| c.text == "#"));
     }
 }

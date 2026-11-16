@@ -3,6 +3,7 @@
 use super::modes::{MenuAction, TreeAction};
 use super::*;
 use crate::copymode::Action;
+use crate::{cmdparse, format, opts};
 use crate::keys::{Input, Key, KeyCode};
 
 pub use super::mouse::MouseCtx;
@@ -73,15 +74,6 @@ pub struct InputState {
     pub(super) tty_appesc: bool,
 }
 
-// The default mouse menus of tmux 3.6a (key-bindings.c).
-const PANE_MENU: &str = r##"display-menu -T "#[align=centre]#{pane_index} (#{pane_id})" -t = -x M -y M "#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Top,}" < { send-keys -X history-top } "#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Bottom,}" > { send-keys -X history-bottom } '' "#{?mouse_word,Search For #[underscore]#{=/9/...:mouse_word},}" C-r { if-shell -F "#{?#{m/r:(copy|view)-mode,#{pane_mode}},0,1}" "copy-mode -t=" ; send-keys -X -t = search-backward -- "#{q:mouse_word}" } "#{?mouse_word,Type #[underscore]#{=/9/...:mouse_word},}" C-y { copy-mode -q ; send-keys -l "#{q:mouse_word}" } "#{?mouse_word,Copy #[underscore]#{=/9/...:mouse_word},}" c { copy-mode -q ; set-buffer "#{q:mouse_word}" } "#{?mouse_line,Copy Line,}" l { copy-mode -q ; set-buffer "#{q:mouse_line}" } '' "#{?mouse_hyperlink,Type #[underscore]#{=/9/...:mouse_hyperlink},}" C-h { copy-mode -q ; send-keys -l "#{q:mouse_hyperlink}" } "#{?mouse_hyperlink,Copy #[underscore]#{=/9/...:mouse_hyperlink},}" h { copy-mode -q ; set-buffer "#{q:mouse_hyperlink}" } '' "Horizontal Split" h { split-window -h } "Vertical Split" v { split-window -v } '' "#{?#{>:#{window_panes},1},,-}Swap Up" u { swap-pane -U } "#{?#{>:#{window_panes},1},,-}Swap Down" d { swap-pane -D } "#{?pane_marked_set,,-}Swap Marked" s { swap-pane } '' Kill X { kill-pane } Respawn R { respawn-pane -k } "#{?pane_marked,Unmark,Mark}" m { select-pane -m } "#{?#{>:#{window_panes},1},,-}#{?window_zoomed_flag,Unzoom,Zoom}" z { resize-pane -Z }"##;
-
-const WINDOW_MENU: &str = r##"display-menu -T "#[align=centre]#{window_index}:#{window_name}" -t = -x W -y W "#{?#{>:#{session_windows},1},,-}Swap Left" l { swap-window -t :-1 } "#{?#{>:#{session_windows},1},,-}Swap Right" r { swap-window -t :+1 } "#{?pane_marked_set,,-}Swap Marked" s { swap-window } '' Kill X { kill-window } Respawn R { respawn-window -k } "#{?pane_marked,Unmark,Mark}" m { select-pane -m } Rename n { command-prompt -F -I "#W" { rename-window -t "#{window_id}" "%%" } } '' "New After" w { new-window -a } "New At End" W { new-window }"##;
-
-const SESSION_MENU: &str = r##"display-menu -T "#[align=centre]#{session_name}" -t = -x M -y W Next n { switch-client -n } Previous p { switch-client -p } '' Renumber N { move-window -r } Rename n { command-prompt -I "#S" { rename-session "%%" } } '' "New Session" s { new-session } "New Window" w { new-window }"##;
-
-const IN_MODE: &str = "#{||:#{pane_in_mode},#{mouse_any_flag}}";
-
 /// Mouse bindings of the copy-mode and copy-mode-vi tables.
 const COPY_MODE_MOUSE: &[(&str, &str)] = &[
     ("MouseDown1Pane", "select-pane"),
@@ -95,113 +87,25 @@ const COPY_MODE_MOUSE: &[(&str, &str)] = &[
 
 pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
     let mut t: BTreeMap<String, BTreeMap<String, Binding>> = BTreeMap::new();
-    let mut add = |table: &str, key: &str, cmd: &str, repeat: bool, note: &str| {
-        let kname = keys::parse_key_name(key).map(|k| keys::key_name(&k)).unwrap_or_else(|| key.to_string());
-        t.entry(table.to_string()).or_default().insert(kname, Binding { cmd: cmd.to_string(), repeat, note: note.to_string() });
-    };
-    let prefix: &[(&str, &str, bool, &str)] = &[
-        ("C-b", "send-prefix", false, "Send the prefix key"),
-        ("C-o", "rotate-window", false, "Rotate through the panes"),
-        ("C-z", "suspend-client", false, "Suspend the current client"),
-        ("Space", "next-layout", false, "Select next layout"),
-        ("!", "break-pane", false, "Break pane to a new window"),
-        ("\"", "split-window", false, "Split window vertically"),
-        ("#", "list-buffers", false, "List all paste buffers"),
-        ("$", "command-prompt -I '#S' { rename-session -- '%%' }", false, "Rename current session"),
-        ("%", "split-window -h", false, "Split window horizontally"),
-        ("&", "confirm-before -p \"kill-window #W? (y/n)\" kill-window", false, "Kill current window"),
-        ("'", "command-prompt -p index { select-window -t ':%%' }", false, "Prompt for window index to select"),
-        ("(", "switch-client -p", false, "Switch to previous client"),
-        (")", "switch-client -n", false, "Switch to next client"),
-        (",", "command-prompt -I '#W' { rename-window -- '%%' }", false, "Rename current window"),
-        ("-", "delete-buffer", false, "Delete the most recent paste buffer"),
-        (".", "command-prompt { move-window -t '%%' }", false, "Move the current window"),
-        ("/", "command-prompt -k -p key { list-keys -1N '%%' }", false, "Describe key binding"),
-        (":", "command-prompt", false, "Prompt for a command"),
-        (";", "last-pane", false, "Move to the previously active pane"),
-        ("<", &WINDOW_MENU.replacen(" -t = -x W -y W", " -x W -y W", 1), false, "Display window menu"),
-        ("=", "choose-buffer -Z", false, "Choose a paste buffer from a list"),
-        (">", &PANE_MENU.replacen(" -t = -x M -y M", " -x P -y P", 1), false, "Display pane menu"),
-        ("?", "list-keys -N", false, "List key bindings"),
-        ("C", "customize-mode -Z", false, "Customize options"),
-        ("D", "choose-client -Z", false, "Choose and detach a client from a list"),
-        ("E", "select-layout -E", false, "Spread panes out evenly"),
-        ("L", "switch-client -l", false, "Switch to the last client"),
-        ("M", "select-pane -M", false, "Clear the marked pane"),
-        ("[", "copy-mode", false, "Enter copy mode"),
-        ("]", "paste-buffer -p", false, "Paste the most recent paste buffer"),
-        ("c", "new-window", false, "Create a new window"),
-        ("d", "detach-client", false, "Detach the current client"),
-        ("f", "command-prompt { find-window -Z -- '%%' }", false, "Search for a pane"),
-        ("i", "display-message", false, "Display window information"),
-        ("l", "last-window", false, "Select the previously current window"),
-        ("m", "select-pane -m", false, "Toggle the marked pane"),
-        ("n", "next-window", false, "Select the next window"),
-        ("o", "select-pane -t :.+", false, "Select the next pane"),
-        ("p", "previous-window", false, "Select the previous window"),
-        ("q", "display-panes", false, "Display pane numbers"),
-        ("r", "refresh-client", false, "Redraw the current client"),
-        ("s", "choose-tree -Zs", false, "Choose a session from a list"),
-        ("t", "clock-mode", false, "Show a clock"),
-        ("w", "choose-tree -Zw", false, "Choose a window from a list"),
-        ("x", "confirm-before -p \"kill-pane #P? (y/n)\" kill-pane", false, "Kill the active pane"),
-        ("z", "resize-pane -Z", false, "Zoom the active pane"),
-        ("{", "swap-pane -U", false, "Swap the active pane with the pane above"),
-        ("}", "swap-pane -D", false, "Swap the active pane with the pane below"),
-        ("~", "show-messages", false, "Show messages"),
-        ("PPage", "copy-mode -u", false, "Enter copy mode and scroll up"),
-        ("Up", "select-pane -U", true, "Select the pane above the active pane"),
-        ("Down", "select-pane -D", true, "Select the pane below the active pane"),
-        ("Left", "select-pane -L", true, "Select the pane to the left of the active pane"),
-        ("Right", "select-pane -R", true, "Select the pane to the right of the active pane"),
-        ("M-1", "select-layout even-horizontal", false, "Set the even-horizontal layout"),
-        ("M-2", "select-layout even-vertical", false, "Set the even-vertical layout"),
-        ("M-3", "select-layout main-horizontal", false, "Set the main-horizontal layout"),
-        ("M-4", "select-layout main-vertical", false, "Set the main-vertical layout"),
-        ("M-5", "select-layout tiled", false, "Select the tiled layout"),
-        ("M-n", "next-window -a", false, "Select the next window with an alert"),
-        ("M-o", "rotate-window -D", false, "Rotate through the panes in reverse"),
-        ("M-p", "previous-window -a", false, "Select the previous window with an alert"),
-        ("M-Up", "resize-pane -U 5", true, "Resize the pane up by 5"),
-        ("M-Down", "resize-pane -D 5", true, "Resize the pane down by 5"),
-        ("M-Left", "resize-pane -L 5", true, "Resize the pane left by 5"),
-        ("M-Right", "resize-pane -R 5", true, "Resize the pane right by 5"),
-        ("C-Up", "resize-pane -U", true, "Resize the pane up"),
-        ("C-Down", "resize-pane -D", true, "Resize the pane down"),
-        ("C-Left", "resize-pane -L", true, "Resize the pane left"),
-        ("C-Right", "resize-pane -R", true, "Resize the pane right"),
-        ("S-Up", "refresh-client -U 10", true, ""),
-        ("S-Down", "refresh-client -D 10", true, ""),
-    ];
-    for (k, c, r, n) in prefix {
-        add("prefix", k, c, *r, n);
+    for words in cmdparse::parse(include_str!("display-defaults.conf")).expect("tmux default bindings") {
+        let o = opts::getopt(&words[1..], "nr", "TN").expect("default binding options");
+        let table = if o.has('n') { "root" } else { o.get('T').unwrap_or("prefix") };
+        let key = &o.rest[0];
+        let key = keys::parse_key_name(key).map(|k| keys::key_name(&k)).unwrap_or_else(|| key.clone());
+        let cmd = super::cmds::binding_command(&o.rest[1..]).trim().to_string();
+        t.entry(table.into()).or_default().insert(key, Binding {
+            cmd, repeat: o.has('r'), note: o.get('N').unwrap_or("").into(),
+        });
     }
-    for i in 0..10 {
-        add("prefix", &i.to_string(), &format!("select-window -t :={i}"), false, &format!("Select window {i}"));
-    }
-    let root: Vec<(&str, String)> = vec![
-        ("MouseDown1Pane", "select-pane -t = ; send-keys -M".into()),
-        ("MouseDown1Status", "switch-client -t =".into()),
-        ("MouseDown1ScrollbarUp", "copy-mode -u".into()),
-        ("MouseDown1ScrollbarDown", "copy-mode -d".into()),
-        ("MouseDrag1ScrollbarSlider", "copy-mode -S".into()),
-        ("MouseDown2Pane", format!("select-pane -t = ; if-shell -F '{IN_MODE}' {{ send-keys -M }} {{ paste-buffer -p }}")),
-        ("MouseDown3Pane", format!("if-shell -F -t = '#{{||:#{{mouse_any_flag}},#{{&&:#{{pane_in_mode}},#{{?#{{m/r:(copy|view)-mode,#{{pane_mode}}}},0,1}}}}}}' {{ select-pane -t = ; send-keys -M }} {{ {PANE_MENU} }}")),
-        ("M-MouseDown3Pane", PANE_MENU.to_string()),
-        ("MouseDown3Status", WINDOW_MENU.to_string()),
-        ("M-MouseDown3Status", WINDOW_MENU.to_string()),
-        ("MouseDown3StatusLeft", SESSION_MENU.to_string()),
-        ("M-MouseDown3StatusLeft", SESSION_MENU.to_string()),
-        ("MouseDrag1Pane", format!("if-shell -F '{IN_MODE}' {{ send-keys -M }} {{ copy-mode -M }}")),
-        ("MouseDrag1Border", "resize-pane -M".into()),
-        ("WheelUpPane", "if-shell -F '#{||:#{alternate_on},#{pane_in_mode},#{mouse_any_flag}}' { send-keys -M } { copy-mode -e }".into()),
-        ("WheelUpStatus", "previous-window".into()),
-        ("WheelDownStatus", "next-window".into()),
-        ("DoubleClick1Pane", format!("select-pane -t = ; if-shell -F '{IN_MODE}' {{ send-keys -M }} {{ copy-mode -H ; send-keys -X select-word ; run-shell -d 0.3 ; send-keys -X copy-pipe-and-cancel }}")),
-        ("TripleClick1Pane", format!("select-pane -t = ; if-shell -F '{IN_MODE}' {{ send-keys -M }} {{ copy-mode -H ; send-keys -X select-line ; run-shell -d 0.3 ; send-keys -X copy-pipe-and-cancel }}")),
-    ];
-    for (k, c) in &root {
-        add("root", k, c, false, "");
+    // Tiled-only forms of the floating-aware resize bindings (the fixture leaves
+    // the tmux 3.8 if-shell versions to the floating pane package).
+    for (key, cmd, note) in [
+        ("M-Up", "resize-pane -U 5", "Resize the pane up by 5"),
+        ("M-Left", "resize-pane -L 5", "Resize the pane left by 5"),
+        ("C-Up", "resize-pane -U", "Resize the pane up"),
+        ("C-Left", "resize-pane -L", "Resize the pane left"),
+    ] {
+        t.entry("prefix".into()).or_default().entry(key.into()).or_insert(Binding { cmd: cmd.into(), repeat: true, note: note.into() });
     }
     for (table, vi) in [("copy-mode", false), ("copy-mode-vi", true)] {
         for (k, c) in CopyMode::default_bindings(vi) {
@@ -214,42 +118,54 @@ pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
     t
 }
 
-fn escape_for(template: &str, at: usize, input: &str) -> String {
-    let before = template[..at].chars().last();
-    match before {
-        Some('\'') => input.replace('\'', "'\\''"),
-        Some('"') => input.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$"),
-        // unquoted: inserted as-is, so a bare %% / %1 template runs the input as a command
-        _ => input.to_string(),
+/// cmd_template_replace: in `template` replace %N (and %N%) with `s`, and the
+/// first %% (or %%%) left. %% escapes single quotes, %%% and %N% escape
+/// characters special inside double quotes.
+fn template_replace(template: &str, s: &str, idx: usize) -> String {
+    if !template.contains('%') {
+        return template.to_string();
     }
-}
-
-/// Replaces %1..%9 and successive %% in a prompt template.
-pub fn fill_template(template: &str, answers: &[String]) -> String {
-    let mut out = String::new();
-    let mut next = 0;
     let b = template.as_bytes();
-    let mut i = 0;
+    let mut out: Vec<u8> = Vec::new();
+    let (mut i, mut replaced) = (0, false);
     while i < b.len() {
-        if b[i] == b'%' && i + 1 < b.len() {
-            let c = b[i + 1];
-            if c == b'%' {
-                let a = answers.get(next).or(answers.last()).cloned().unwrap_or_default();
-                next += 1;
-                out.push_str(&escape_for(template, i, &a));
-                i += 2;
-                continue;
-            }
-            if c.is_ascii_digit() && c != b'0' {
-                let a = answers.get((c - b'1') as usize).cloned().unwrap_or_default();
-                out.push_str(&escape_for(template, i, &a));
-                i += 2;
+        let ch = b[i];
+        i += 1;
+        if ch == b'%' {
+            let quote = if i < b.len() && (b'1'..=b'9').contains(&b[i]) && (b[i] - b'0') as usize == idx {
+                i += 1;
+                Some(if i < b.len() && b[i] == b'%' { i += 1; '"' } else { ' ' })
+            } else if i < b.len() && b[i] == b'%' && !replaced {
+                replaced = true;
+                i += 1;
+                Some(if i < b.len() && b[i] == b'%' { i += 1; '"' } else { '\'' })
+            } else {
+                None
+            };
+            if let Some(quote) = quote {
+                for c in s.bytes() {
+                    if quote == '\'' && c == b'\'' {
+                        out.extend_from_slice(b"'\\''");
+                        continue;
+                    }
+                    if quote == '"' && b"\"\\$;~".contains(&c) {
+                        out.push(b'\\');
+                    }
+                    out.push(c);
+                }
                 continue;
             }
         }
-        let ch = template[i..].chars().next().unwrap();
         out.push(ch);
-        i += ch.len_utf8();
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// args_make_commands: each answer replaces %N and the next %% of the template.
+pub fn fill_template(template: &str, answers: &[String]) -> String {
+    let mut out = template.to_string();
+    for (i, a) in answers.iter().enumerate() {
+        out = template_replace(&out, a, i + 1);
     }
     out
 }
@@ -686,11 +602,20 @@ impl Server {
         let name = keys::key_name(&k);
         let Some(c) = self.clients.get(&cid) else { return };
         if c.is_readonly() && (c.prompt.is_some() || c.overlay.is_some()) { return; }
-        if c.prompt.is_some() {
-            let prompt_key = match k.code { KeyCode::KP('\r') => Key::plain(KeyCode::Enter), KeyCode::KP(ch) => Key::plain(KeyCode::Char(ch)), _ => k.clone() };
-            self.prompt_key(cid, &prompt_key, &name);
-            return;
+        // a key clears a message (and is then handled), unless display -N
+        if c.message.is_some() && !c.is_readonly() {
+            if c.message_ignore_keys { return; }
+            let c = self.clients.get_mut(&cid).unwrap();
+            c.message = None;
+            c.dirty = true;
         }
+        if self.clients[&cid].prompt.is_some() {
+            let prompt_key = match k.code { KeyCode::KP('\r') => Key::plain(KeyCode::Enter), KeyCode::KP(ch) => Key::plain(KeyCode::Char(ch)), _ => k.clone() };
+            if self.prompt_key(cid, &prompt_key, &name) {
+                return;
+            }
+        }
+        let Some(c) = self.clients.get(&cid) else { return };
         // overlays
         match &c.overlay {
             Some(Overlay::Menu(_)) => {
@@ -722,22 +647,30 @@ impl Server {
                 return;
             }
             Some(Overlay::Popup(p)) => {
-                let pane = p.pane;
-                let dead = self.panes.get(&pane).is_none_or(|x| x.dead.is_some());
-                // popup_key_cb: Escape and C-c close it unless it closes when its command
-                // exits (and that is still running); -k: any key once the command exited
-                let esc = (k.code == KeyCode::Escape && k.mods.is_empty()) || (k.code == KeyCode::Char('c') && k.mods.ctrl && !k.mods.meta);
-                if (esc && (!p.close_on_exit || dead)) || (dead && p.any_key) {
+                // popup_key_cb: Escape and C-c close the popup unless -E leaves them
+                // to its running command; after the command exits only they (or with
+                // -k any key) do
+                let (pane, close_on_exit, any_key) = (p.pane, p.close_on_exit, p.close_any_key);
+                let exited = self.panes.get(&pane).is_none_or(|x| x.dead.is_some());
+                let cancel = name == "Escape" || name == "C-c";
+                if ((!close_on_exit || exited) && cancel) || (exited && any_key) {
                     let c = self.clients.get_mut(&cid).unwrap();
                     c.overlay = None;
                     c.dirty = true;
                     self.destroy_pane(pane);
                     return;
                 }
-                self.send_key_to_pane(cid, pane, &k, raw);
+                if !exited {
+                    self.send_key_to_pane(cid, pane, &k, raw);
+                }
                 return;
             }
             None => {}
+        }
+        if let Some(pane) = self.pane_prompt_target(cid) {
+            if self.pane_prompt_key(cid, pane, &k, &name) {
+                return;
+            }
         }
         let Some(sid) = self.client_session(cid) else { return };
         let now = Instant::now();
@@ -862,7 +795,7 @@ impl Server {
                 let ctx = Ctx { client: Some(cid), pane, from_key: true, ..Ctx::default() };
                 self.run_queue(Queue { cmds: cmds.into(), ctx , soft: 0 });
             }
-            Err(e) => self.set_message(cid, &e),
+            Err(e) => self.set_error(cid, &e),
         }
     }
 
@@ -942,6 +875,7 @@ impl Server {
                 }
             }
             Some(PaneMode::Copy(_)) => {
+                let wrap = self.opt_window_on(self.window_of(pane), "wrap-search");
                 let vi = self.opt_window(self.window_of(pane), "mode-keys") == "vi";
                 let table = if vi { "copy-mode-vi" } else { "copy-mode" };
                 let binding = self.bindings.get(table).and_then(|t| t.get(name)).map(|b| (b.cmd.clone(), b.note == "default"));
@@ -953,11 +887,13 @@ impl Server {
                         }
                     }
                     _ => {
+                        let before = self.copy_scroll_offset(pane);
                         let action = match self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
-                            Some(PaneMode::Copy(cm)) => cm.key(name),
+                            Some(PaneMode::Copy(cm)) => { cm.wrap_search = wrap; cm.key(name) },
                             _ => return,
                         };
                         self.copy_action(pane, cid, action, None);
+                        self.show_scrollbar_if_scrolled(pane, before, false);
                     }
                 }
             }
@@ -976,6 +912,26 @@ impl Server {
             Some(self.opt_server("copy-command")).filter(|c| !c.is_empty())
         };
         let run_args: Vec<String> = if piped && !args.is_empty() { args[1..].to_vec() } else { args.to_vec() };
+        // these always show an auto-hide scrollbar; others (history-top and
+        // history-bottom too) when the view scrolled
+        let always = matches!(name, "page-up" | "page-down" | "page-down-and-cancel" | "halfpage-up" | "halfpage-down"
+            | "halfpage-down-and-cancel" | "scroll-to-mouse");
+        let before = self.copy_scroll_offset(pane);
+        self.copy_mode_command_inner(pane, cid, name, pipe, run_args);
+        self.show_scrollbar_if_scrolled(pane, before, always);
+    }
+
+    fn copy_mode_command_inner(&mut self, pane: PaneId, cid: Option<ClientId>, name: &str, pipe: Option<String>, run_args: Vec<String>) {
+        let wrap = options::is_on(&self.opt_window(self.window_of(pane), "wrap-search"));
+        if name == "scroll-to-mouse" {
+            if let Some(cid) = cid {
+                if let Some(m) = self.cur_mouse.clone() {
+                    if let Some(c) = self.clients.get_mut(&cid) { c.drag = Some(Drag { kind: DragKind::Scrollbar { pane } }); }
+                    self.scrollbar_to_mouse(cid, pane, &m);
+                }
+            }
+            return;
+        }
         let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) else {
             if let Some(PaneMode::Tree(_)) = self.panes.get(&pane).and_then(|p| p.mode.as_ref()) {
                 // tree mode understands a few -X commands
@@ -991,6 +947,7 @@ impl Server {
             }
             return;
         };
+        cm.wrap_search = wrap;
         let action = cm.run(name, &run_args);
         self.copy_action(pane, cid, action, pipe);
     }
@@ -1019,22 +976,21 @@ impl Server {
                 }
             }
             Action::Prompt { label, command } => {
-                if let Some(c) = cid {
+                if cid.is_some() {
                     // the pane is the prompt's context target (a %id in the template would read as %N)
+                    // tmux 3.8 copy-mode bindings prompt in the pane (command-prompt -P)
                     let template = format!("send-keys -X {command} '%%'");
-                    self.open_prompt(c, PromptKind::Command, vec![(label, String::new())], template, Some(pane), false, false);
+                    let mut pr = Prompt::new(PromptKind::Command, vec![(format!("{label} "), String::new())], template, Some(pane));
                     // the default copy-mode search bindings use command-prompt -T search
-                    if let Some(pr) = self.clients.get_mut(&c).and_then(|c| c.prompt.as_mut()) {
-                        pr.history_type = usize::from(command.starts_with("search-"));
-                    }
+                    pr.history_type = usize::from(command.starts_with("search"));
+                    pr.host = Some(pane);
                     if command.ends_with("-incremental") {
                         if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
                             cm.begin_incremental_search();
                         }
-                        if let Some(pr) = self.clients.get_mut(&c).and_then(|c| c.prompt.as_mut()) {
-                            pr.copy_incremental = Some((pane, command.starts_with("search-forward")));
-                        }
+                        pr.copy_incremental = Some((pane, command.starts_with("search-forward")));
                     }
+                    self.set_pane_prompt(pane, pr);
                 }
             }
         }
@@ -1045,230 +1001,39 @@ impl Server {
 
     // ---- prompt ----------------------------------------------------------------------
 
-    fn prompt_key(&mut self, cid: ClientId, k: &Key, name: &str) {
-        let vi = self.opt_session(self.client_session(cid), "status-keys") == "vi";
-        let separators: Vec<char> = self.opt_session(self.client_session(cid), "word-separators").chars().collect();
-        let top_buffer = self.buffers.iter().find(|b| b.automatic).map(|b| b.data.clone());
-        let history_type = self.clients.get(&cid).and_then(|c| c.prompt.as_ref()).map_or(0, |p| p.history_type);
-        let history = self.prompt_history.get(history_type).cloned().unwrap_or_default();
-        let hist_len = history.len();
-        let c = self.clients.get_mut(&cid).unwrap();
+    /// A key for the status line prompt (status_prompt_key): false when the
+    /// prompt does not use it and it goes on to the key tables.
+    fn prompt_key(&mut self, cid: ClientId, k: &Key, name: &str) -> bool {
+        let Some(c) = self.clients.get_mut(&cid) else { return false };
+        let Some(mut pr) = c.prompt.take() else { return false };
         c.dirty = true;
-        let pr = c.prompt.as_mut().unwrap();
+        let result = self.prompt_process(cid, &mut pr, k, name);
+        self.prompt_done_key(cid, pr);
+        matches!(result, PromptResult::Handled | PromptResult::Close)
+    }
+
+    /// Puts an edited prompt back unless it finished, and follows a copy-mode
+    /// incremental search.
+    fn prompt_done_key(&mut self, cid: ClientId, pr: Prompt) {
         let incremental = pr.copy_incremental;
-        match pr.kind {
-            PromptKind::Confirm => {
-                let (key, default_yes) = pr.confirm;
-                let yes = (k.code == KeyCode::Char(key) && !k.mods.ctrl && !k.mods.meta) || (k.code == KeyCode::Enter && default_yes);
-                let pr = c.prompt.take().unwrap();
-                if yes {
-                    self.run_string(cid, &pr.template, pr.pane);
-                }
-                return;
-            }
-            PromptKind::Key => {
-                let pr = c.prompt.take().unwrap();
-                let cmd = fill_template(&pr.template, &[name.to_string()]);
-                self.run_string(cid, &cmd, pr.pane);
-                return;
-            }
-            PromptKind::Command => {}
-        }
-        let translated;
-        let k = if vi {
-            // prompt_translate_key: vi insert mode passes keys through, Escape enters command
-            // mode; command mode maps vi keys to the emacs ones and drops the rest.
-            let ctrl_key = |ch: char| Key::new(KeyCode::Char(ch), keys::Mods::CTRL);
-            if !pr.command_mode {
-                if k.code == KeyCode::Escape && k.mods.is_empty() {
-                    pr.command_mode = true;
-                    pr.cursor = pr.cursor.saturating_sub(1);
-                    return;
-                }
-                k
-            } else {
-                let ch = match &k.code { KeyCode::Char(ch) if k.mods.is_empty() => Some(*ch), _ => None };
-                if matches!(ch, Some('A' | 'I' | 'C' | 's' | 'a' | 'S' | 'i')) { pr.command_mode = false; }
-                let vi_motion = |pr: &mut Prompt, m: char| match m {
-                    'w' => pr.cursor = prompt_forward_word(&pr.input, pr.cursor, true, &separators),
-                    'W' => pr.cursor = prompt_forward_word(&pr.input, pr.cursor, true, &[]),
-                    'e' => pr.cursor = prompt_end_word(&pr.input, pr.cursor, &separators),
-                    'E' => pr.cursor = prompt_end_word(&pr.input, pr.cursor, &[]),
-                    _ => pr.cursor = prompt_backward_word(&pr.input, pr.cursor, &[]),
-                };
-                translated = match ch {
-                    Some('i') => return,
-                    Some('S') | Some('d') => ctrl_key('u'),
-                    Some('A' | '$') => Key::plain(KeyCode::End),
-                    Some('I' | '0' | '^') => Key::plain(KeyCode::Home),
-                    Some('C' | 'D') => ctrl_key('k'),
-                    Some('X') => Key::plain(KeyCode::BSpace),
-                    Some('b') => Key::new(KeyCode::Char('b'), keys::Mods::META),
-                    Some(m @ ('B' | 'e' | 'E' | 'w' | 'W')) => { vi_motion(pr, m); return; }
-                    Some('p') => ctrl_key('y'),
-                    Some('q') => ctrl_key('c'),
-                    Some('s' | 'x') => Key::plain(KeyCode::Delete),
-                    Some('j') => Key::plain(KeyCode::Down),
-                    Some('h') => Key::plain(KeyCode::Left),
-                    Some('a' | 'l') => Key::plain(KeyCode::Right),
-                    Some('k') => Key::plain(KeyCode::Up),
-                    Some(_) => return,
-                    None => match k.code {
-                        KeyCode::BSpace if k.mods.is_empty() => Key::plain(KeyCode::Left),
-                        KeyCode::Delete | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Enter if k.mods.is_empty() => k.clone(),
-                        KeyCode::Char('h' | 'c') if k.mods == keys::Mods::CTRL => k.clone(),
-                        _ => return,
-                    },
-                };
-                &translated
-            }
-        } else { k };
-        let ctrl = |ch: char| k.mods.ctrl && k.code == KeyCode::Char(ch);
-        match &k.code {
-            KeyCode::Enter => {
-                let mut pr = c.prompt.take().unwrap();
-                let input: String = pr.input.iter().collect();
-                // prompt_key: every non-empty answer goes in the history of the prompt's
-                // type, incremental copy-mode searches too
-                if !input.is_empty() { self.add_prompt_history(&input, pr.history_type); }
-                if let Some((pane, _)) = incremental {
-                    if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
-                        cm.finish_incremental_search(false);
-                    }
-                    return;
-                }
-                pr.answers.push(input.clone());
-                if pr.answers.len() < pr.prompts.len() {
-                    let (label, init) = pr.prompts[pr.answers.len()].clone();
-                    pr.label = label;
-                    pr.input = init.chars().collect();
-                    pr.cursor = pr.input.len();
-                    self.clients.get_mut(&cid).unwrap().prompt = Some(pr);
-                    return;
-                }
-                if pr.answers.iter().all(|a| a.is_empty()) && pr.template != "%1" && pr.template.contains('%') {
-                    return; // empty input cancels, like tmux
-                }
-                let cmd = fill_template(&pr.template, &pr.answers);
-                self.run_string(cid, &cmd, pr.pane);
-            }
-            KeyCode::Escape => {
-                c.prompt = None;
-            }
-            _ if ctrl('c') || ctrl('g') => {
-                c.prompt = None;
-            }
-            KeyCode::BSpace | KeyCode::Char('h') if pr.bspace_exit && pr.input.is_empty() && (k.code == KeyCode::BSpace || ctrl('h')) => {
-                c.prompt = None;
-            }
-            KeyCode::BSpace => {
-                if pr.cursor > 0 {
-                    pr.cursor -= 1;
-                    pr.input.remove(pr.cursor);
+        let text = (!pr.closed).then(|| pr.input.iter().collect::<String>());
+        if let Some(host) = pr.host {
+            if !pr.closed {
+                if let Some(p) = self.panes.get_mut(&host) {
+                    if p.prompt.is_none() { p.prompt = Some(pr); }
                 }
             }
-            _ if ctrl('h') => {
-                if pr.cursor > 0 {
-                    pr.cursor -= 1;
-                    pr.input.remove(pr.cursor);
-                }
+            if let Some(wid) = self.window_of(host) { self.mark_window_dirty(wid); }
+        } else if !pr.closed {
+            if let Some(c) = self.clients.get_mut(&cid) {
+                if c.prompt.is_none() { c.prompt = Some(pr); }
+                c.dirty = true;
             }
-            KeyCode::Delete => {
-                if pr.cursor < pr.input.len() {
-                    pr.input.remove(pr.cursor);
-                }
-            }
-            _ if ctrl('d') => {
-                if pr.cursor < pr.input.len() {
-                    pr.input.remove(pr.cursor);
-                }
-            }
-            KeyCode::Left if !k.mods.ctrl => pr.cursor = pr.cursor.saturating_sub(1),
-            _ if ctrl('b') => pr.cursor = pr.cursor.saturating_sub(1),
-            KeyCode::Right if !k.mods.ctrl => pr.cursor = (pr.cursor + 1).min(pr.input.len()),
-            _ if ctrl('f') => pr.cursor = (pr.cursor + 1).min(pr.input.len()),
-            KeyCode::Home => pr.cursor = 0,
-            _ if ctrl('a') => pr.cursor = 0,
-            KeyCode::End => pr.cursor = pr.input.len(),
-            _ if ctrl('e') => pr.cursor = pr.input.len(),
-            _ if ctrl('k') => pr.input.truncate(pr.cursor),
-            // C-u clears the whole line, as in tmux
-            _ if ctrl('u') => {
-                pr.input.clear();
-                pr.cursor = 0;
-            }
-            _ if ctrl('w') => {
-                let i = prompt_backward_word(&pr.input, pr.cursor, &separators);
-                pr.copied = Some(pr.input.drain(i..pr.cursor).collect());
-                pr.cursor = i;
-            }
-            // prompt_paste: the C-w text, else the newest automatic buffer up to a control char
-            _ if ctrl('y') => {
-                let text: Vec<char> = match &pr.copied {
-                    Some(copied) => copied.clone(),
-                    None => String::from_utf8_lossy(&top_buffer.unwrap_or_default()).chars().take_while(|c| !c.is_control()).collect(),
-                };
-                let n = text.len();
-                pr.input.splice(pr.cursor..pr.cursor, text);
-                pr.cursor += n;
-            }
-            KeyCode::Right if k.mods == keys::Mods::CTRL => pr.cursor = prompt_forward_word(&pr.input, pr.cursor, false, &separators),
-            KeyCode::Char('f') if k.mods == keys::Mods::META => pr.cursor = prompt_forward_word(&pr.input, pr.cursor, false, &separators),
-            KeyCode::Left if k.mods == keys::Mods::CTRL => pr.cursor = prompt_backward_word(&pr.input, pr.cursor, &separators),
-            KeyCode::Char('b') if k.mods == keys::Mods::META => pr.cursor = prompt_backward_word(&pr.input, pr.cursor, &separators),
-            _ if k.code == KeyCode::Up || ctrl('p') => {
-                if hist_len > 0 {
-                    let pos = pr.history_pos.map(|p| p.min(hist_len).saturating_sub(1)).unwrap_or(hist_len - 1);
-                    pr.history_pos = Some(pos);
-                    pr.input = history[pos].chars().collect();
-                    pr.cursor = pr.input.len();
-                }
-            }
-            _ if k.code == KeyCode::Down || ctrl('n') => {
-                if let Some(p) = pr.history_pos.map(|p| p.min(hist_len)) {
-                    if p + 1 < hist_len {
-                        pr.history_pos = Some(p + 1);
-                        pr.input = history[p + 1].chars().collect();
-                    } else {
-                        pr.history_pos = None;
-                        pr.input.clear();
-                    }
-                    pr.cursor = pr.input.len();
-                }
-            }
-            KeyCode::Tab => {
-                // complete a command name at the start
-                let text: String = pr.input.iter().collect();
-                if !text.contains(' ') {
-                    let names: Vec<&str> = COMMAND_NAMES.iter().copied().filter(|n| n.starts_with(&text)).collect();
-                    if names.len() == 1 {
-                        pr.input = format!("{} ", names[0]).chars().collect();
-                        pr.cursor = pr.input.len();
-                    }
-                }
-            }
-            KeyCode::Space => {
-                pr.input.insert(pr.cursor, ' ');
-                pr.cursor += 1;
-            }
-            KeyCode::Char(ch) if !k.mods.ctrl && !k.mods.meta => {
-                if pr.numeric && !ch.is_ascii_digit() {
-                    return;
-                }
-                pr.input.insert(pr.cursor, *ch);
-                pr.cursor += 1;
-                if pr.single_key {
-                    let mut pr = c.prompt.take().unwrap();
-                    pr.answers.push(pr.input.iter().collect());
-                    let cmd = fill_template(&pr.template, &pr.answers);
-                    self.run_string(cid, &cmd, pr.pane);
-                }
-            }
-            _ => {}
         }
         if let Some((pane, forward)) = incremental {
-            let text = self.clients.get(&cid).and_then(|c| c.prompt.as_ref()).map(|pr| pr.input.iter().collect::<String>());
+            let wrap = self.opt_window_on(self.window_of(pane), "wrap-search");
             if let Some(PaneMode::Copy(cm)) = self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
+                cm.wrap_search = wrap;
                 match text {
                     Some(text) => cm.preview_search(&text, forward),
                     None => cm.finish_incremental_search(false),
@@ -1278,29 +1043,807 @@ impl Server {
         }
     }
 
+    /// A prompt mouse event (prompt_mouse): button 1 presses on the prompt
+    /// line move the cursor or pick an inline completion. Others are not used.
+    pub(crate) fn prompt_mouse(&mut self, cid: ClientId, m: &keys::Mouse) -> bool {
+        if m.kind != keys::MouseKind::Down || m.button != 1 || self.message_row(cid) != Some(m.y) {
+            return false;
+        }
+        let Some(sid) = self.client_session(cid) else { return false };
+        let cw = self.clients[&cid].size.0.max(1);
+        let style_text = self.expand_time(self.current(&Ctx { client: Some(cid), ..Ctx::default() }), Some(cid), &self.opt_session(Some(sid), "message-style"));
+        let (ax, aw) = super::render::message_area(cw, &style_text);
+        let Some(mut pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.take()) else { return false };
+        let used = self.prompt_mouse_at(cid, &mut pr, m.x as usize, ax, aw);
+        if let Some(c) = self.clients.get_mut(&cid) {
+            if c.prompt.is_none() { c.prompt = Some(pr); }
+            c.dirty = true;
+        }
+        used
+    }
+
+    fn prompt_mouse_at(&mut self, cid: ClientId, pr: &mut Prompt, x: usize, ax: u16, aw: u16) -> bool {
+        if x < ax as usize || x >= (ax + aw) as usize {
+            return false;
+        }
+        let l = self.prompt_layout(cid, pr, ax, aw);
+        if l.input_width == 0 {
+            return true;
+        }
+        let pwidth = super::render::prompt_width(&pr.input) + pr.quote_next as usize;
+        // prompt_mouse_complete: a click on one of the inline matches
+        let (cx, cax, caw) = (l.cursor_x, l.content_x, l.content_width);
+        if !pr.complete.is_empty() && pr.cursor == pr.input.len() && cx >= cax && cx - cax < caw && x >= cx {
+            let avail = caw - (cx - cax);
+            let clicked = x - cx;
+            let width = format::width(&super::render::prompt_complete_display(&pr.complete)).min(avail);
+            if clicked < width {
+                let mut end = 0;
+                for i in 0..pr.complete.len() {
+                    let start = end + 1;
+                    end = start + format::width(&pr.complete[i]);
+                    if clicked >= start && clicked < end {
+                        let replace = format!("{} ", pr.complete[i]);
+                        if prompt_replace_word(pr, &replace) {
+                            pr.complete.clear();
+                        }
+                        break;
+                    }
+                }
+                return true;
+            }
+        }
+        let target = if x <= l.input_x { l.input_offset } else { l.input_offset + x - l.input_x }.min(pwidth);
+        let mut width = 0;
+        let mut idx = 0;
+        while idx < pr.input.len() && width < target {
+            width += super::render::prompt_width(&pr.input[idx..idx + 1]);
+            idx += 1;
+        }
+        if idx != pr.cursor {
+            pr.cursor = idx;
+            pr.complete.clear();
+        }
+        true
+    }
+
+    /// The prompt's input callback (cmd_command_prompt_callback,
+    /// cmd_confirm_before_callback): `s` None cancels. True when the prompt closes.
+    fn prompt_fire(&mut self, cid: ClientId, pr: &mut Prompt, s: Option<&str>, fire: Fire) -> bool {
+        let close = match pr.kind {
+            PromptKind::Key => {
+                if let Some(s) = s {
+                    let cmd = fill_template(&pr.template, &[s.to_string()]);
+                    self.run_string(cid, &cmd, pr.pane);
+                }
+                true
+            }
+            PromptKind::Confirm => {
+                let first = s.and_then(|s| s.chars().next());
+                if first == Some(pr.confirm.0) || (first == Some('\r') && pr.confirm.1) {
+                    let template = pr.template.clone();
+                    self.run_string(cid, &template, pr.pane);
+                }
+                true
+            }
+            PromptKind::Command => match s {
+                None => true,
+                Some(_) if fire == Fire::Move => true,
+                // a copy-mode search ends where the incremental search got to
+                Some(_) if pr.copy_incremental.is_some() => fire == Fire::Close,
+                Some(_) if fire == Fire::Close && pr.incremental => true,
+                Some(s) => {
+                    let mut argv = pr.answers.clone();
+                    argv.push(s.to_string());
+                    if fire == Fire::Close {
+                        pr.answers.push(s.to_string());
+                        if pr.answers.len() < pr.prompts.len() {
+                            let (label, init) = pr.prompts[pr.answers.len()].clone();
+                            pr.label = label;
+                            pr.input = init.chars().collect();
+                            pr.cursor = pr.input.len();
+                            pr.history_pos = None;
+                            pr.complete.clear();
+                            return false;
+                        }
+                    }
+                    let cmd = fill_template(&pr.template, &argv);
+                    self.run_string(cid, &cmd, pr.pane);
+                    // an incremental prompt stays open for more typing
+                    !pr.incremental
+                }
+            },
+        };
+        if close {
+            pr.closed = true;
+        }
+        close
+    }
+
+    /// tmux 3.8 prompt_key: edit the prompt with a key, firing the callback.
+    fn prompt_process(&mut self, cid: ClientId, pr: &mut Prompt, k: &Key, name: &str) -> PromptResult {
+        pr.closed = false;
+        // inline completion matches are dropped by any key (Tab rebuilds them)
+        pr.complete.clear();
+        if matches!(pr.kind, PromptKind::Key) {
+            self.prompt_fire(cid, pr, Some(name), Fire::Close);
+            pr.closed = true;
+            return PromptResult::Close;
+        }
+        let k = &prompt_keypad_key(k);
+        if pr.numeric {
+            // a digit is typed, anything else runs the command and is then handled
+            if let KeyCode::Char(d @ '0'..='9') = k.code {
+                if k.mods.is_empty() {
+                    return self.prompt_append(cid, pr, d);
+                }
+            }
+            let s: String = pr.input.iter().collect();
+            self.prompt_fire(cid, pr, Some(&s), Fire::Close);
+            pr.closed = true;
+            return PromptResult::NotHandled;
+        }
+        if pr.single_key || pr.quote_next || matches!(pr.kind, PromptKind::Confirm) {
+            let Some(ch) = prompt_key_char(k) else { return PromptResult::Handled };
+            pr.quote_next = false;
+            return self.prompt_append(cid, pr, ch);
+        }
+        let vi = self.opt_session(self.client_session(cid), "status-keys") == "vi";
+        let op = if vi { prompt_vi_op(pr, k) } else { prompt_emacs_op(k) };
+        // prompt_check_move: cursor keys end an incremental prompt
+        if pr.incremental && matches!(op, PromptOp::Up | PromptOp::Down | PromptOp::Page | PromptOp::Left | PromptOp::Right) {
+            let s: String = pr.input.iter().collect();
+            if self.prompt_fire(cid, pr, Some(&s), Fire::Move) {
+                return PromptResult::Close;
+            }
+            return PromptResult::Move;
+        }
+        let seps: Vec<char> = self.opt_session(self.client_session(cid), "word-separators").chars().collect();
+        let n = pr.input.len();
+        let mut prefix = '=';
+        let changed = match op {
+            PromptOp::None | PromptOp::Page => false,
+            PromptOp::Insert(ch) => return self.prompt_append(cid, pr, ch),
+            PromptOp::Enter => {
+                let input: String = pr.input.iter().collect();
+                // every non-empty answer goes in the history of the prompt's type,
+                // copy-mode searches too (prompt_add_history)
+                if !input.is_empty() { self.add_prompt_history(&input, pr.history_type); }
+                return self.prompt_done(cid, pr, Some(&input));
+            }
+            PromptOp::Cancel => return self.prompt_done(cid, pr, None),
+            PromptOp::BSpace if pr.bspace_exit && n == 0 => return self.prompt_done(cid, pr, None),
+            PromptOp::BSpace => {
+                let moved = pr.cursor > 0;
+                if moved {
+                    pr.cursor -= 1;
+                    pr.input.remove(pr.cursor);
+                }
+                moved
+            }
+            PromptOp::Delete => {
+                if pr.cursor < n {
+                    pr.input.remove(pr.cursor);
+                }
+                pr.cursor < n
+            }
+            PromptOp::Left => {
+                pr.cursor = pr.cursor.saturating_sub(1);
+                false
+            }
+            PromptOp::Right => {
+                pr.cursor = (pr.cursor + 1).min(n);
+                false
+            }
+            PromptOp::Home => {
+                pr.cursor = 0;
+                false
+            }
+            PromptOp::End => {
+                pr.cursor = n;
+                false
+            }
+            // C-u and C-k don't fill the C-y buffer in tmux; only C-w does
+            PromptOp::ClearLine => {
+                pr.input.clear();
+                pr.cursor = 0;
+                true
+            }
+            PromptOp::KillLine => {
+                pr.input.truncate(pr.cursor);
+                pr.cursor < n
+            }
+            PromptOp::DeleteWord => {
+                let i = prompt_backward_word(&pr.input, pr.cursor, &seps);
+                pr.copied = pr.input.drain(i..pr.cursor).collect();
+                pr.cursor = i;
+                true
+            }
+            PromptOp::ForwardWord => {
+                pr.cursor = prompt_forward_word(&pr.input, pr.cursor, false, &seps);
+                true
+            }
+            PromptOp::ViForward(big) => {
+                pr.cursor = prompt_forward_word(&pr.input, pr.cursor, true, if big { &[] } else { &seps });
+                true
+            }
+            PromptOp::ViEnd(big) => {
+                pr.cursor = prompt_end_word(&pr.input, pr.cursor, if big { &[] } else { &seps });
+                true
+            }
+            PromptOp::BackWord(big) => {
+                pr.cursor = prompt_backward_word(&pr.input, pr.cursor, if big { &[] } else { &seps });
+                true
+            }
+            PromptOp::Up => {
+                let history = self.prompt_history.get(pr.history_type).cloned().unwrap_or_default();
+                let hist_len = history.len();
+                if hist_len > 0 && pr.history_pos != Some(0) {
+                    let pos = pr.history_pos.map(|p| p.min(hist_len).saturating_sub(1)).unwrap_or(hist_len - 1);
+                    pr.history_pos = Some(pos);
+                    pr.input = history[pos].chars().collect();
+                    pr.cursor = pr.input.len();
+                    true
+                } else {
+                    false
+                }
+            }
+            PromptOp::Down => {
+                // past the newest entry the line is empty (prompt_down_history)
+                let history = self.prompt_history.get(pr.history_type).cloned().unwrap_or_default();
+                let hist_len = history.len();
+                match pr.history_pos.map(|p| p.min(hist_len)) {
+                    Some(p) if p + 1 < hist_len => {
+                        pr.history_pos = Some(p + 1);
+                        pr.input = history[p + 1].chars().collect();
+                    }
+                    _ => {
+                        pr.history_pos = None;
+                        pr.input.clear();
+                    }
+                }
+                pr.cursor = pr.input.len();
+                true
+            }
+            PromptOp::Yank => {
+                // prompt_paste: the C-w text, else the top buffer up to a control character
+                let value: Option<Vec<char>> = if !pr.copied.is_empty() {
+                    Some(pr.copied.clone())
+                } else {
+                    self.buffers.iter().find(|b| b.automatic).map(|b| prompt_paste_text(&b.data))
+                };
+                match value {
+                    Some(value) => {
+                        let len = value.len();
+                        pr.input.splice(pr.cursor..pr.cursor, value);
+                        pr.cursor += len;
+                        true
+                    }
+                    None => false,
+                }
+            }
+            PromptOp::Transpose => {
+                let i = if pr.cursor < n { pr.cursor + 1 } else { pr.cursor };
+                if i >= 2 {
+                    pr.input.swap(i - 2, i - 1);
+                    pr.cursor = i;
+                }
+                i >= 2
+            }
+            PromptOp::QuoteNext => {
+                pr.quote_next = true;
+                false
+            }
+            PromptOp::Tab => self.prompt_complete(pr),
+            // C-r/C-s in an incremental prompt: search again, an empty prompt takes the -I text
+            PromptOp::Search(back) if pr.incremental => {
+                if pr.input.is_empty() {
+                    pr.input = pr.last.chars().collect();
+                    pr.cursor = pr.input.len();
+                } else {
+                    prefix = if back { '-' } else { '+' };
+                }
+                true
+            }
+            PromptOp::Search(_) => false,
+        };
+        if changed {
+            self.prompt_changed(cid, pr, prefix);
+        }
+        PromptResult::Handled
+    }
+
+    /// prompt_done: fire the callback for a finished prompt.
+    fn prompt_done(&mut self, cid: ClientId, pr: &mut Prompt, s: Option<&str>) -> PromptResult {
+        if self.prompt_fire(cid, pr, s, Fire::Close) { PromptResult::Close } else { PromptResult::Handled }
+    }
+
+    /// The append_key path of prompt_key: insert a character; a single key
+    /// prompt (-1, confirm-before) then finishes.
+    fn prompt_append(&mut self, cid: ClientId, pr: &mut Prompt, ch: char) -> PromptResult {
+        pr.input.insert(pr.cursor.min(pr.input.len()), ch);
+        pr.cursor += 1;
+        let mut result = PromptResult::Handled;
+        if pr.single_key || matches!(pr.kind, PromptKind::Confirm) {
+            if pr.input.len() != 1 {
+                // with -I text there is no single key to report
+                pr.closed = true;
+                result = PromptResult::Close;
+            } else {
+                let s: String = pr.input.iter().collect();
+                result = self.prompt_done(cid, pr, Some(&s));
+            }
+        }
+        self.prompt_changed(cid, pr, '=');
+        result
+    }
+
+    /// An incremental prompt runs its template on every change, the input
+    /// after a '=', '+' (C-s) or '-' (C-r).
+    fn prompt_changed(&mut self, cid: ClientId, pr: &mut Prompt, prefix: char) {
+        if pr.incremental && !pr.closed {
+            let s = format!("{prefix}{}", pr.input.iter().collect::<String>());
+            self.prompt_fire(cid, pr, Some(&s), Fire::Handled);
+        }
+    }
+
+    /// The pane prompt a client's keys go to (server_client_handle_key): the
+    /// active pane's, else that of a visible pane of the window.
+    pub(crate) fn pane_prompt_target(&self, cid: ClientId) -> Option<PaneId> {
+        let sid = self.client_session(cid)?;
+        let wid = self.sessions[&sid].active_window();
+        let win = self.windows.get(&wid)?;
+        let has = |p: &PaneId| self.panes.get(p).is_some_and(|p| p.prompt.is_some());
+        if has(&win.active) {
+            return Some(win.active);
+        }
+        self.rects(wid).0.into_iter().map(|(p, _)| p).find(has)
+    }
+
+    /// A key for a pane prompt (window_pane_prompt_key): false when not used.
+    fn pane_prompt_key(&mut self, cid: ClientId, pane: PaneId, k: &Key, name: &str) -> bool {
+        let Some(mut pr) = self.panes.get_mut(&pane).and_then(|p| p.prompt.take()) else { return false };
+        let result = self.prompt_process(cid, &mut pr, k, name);
+        self.prompt_done_key(cid, pr);
+        result != PromptResult::NotHandled
+    }
+
+    /// A mouse event while a pane prompt shows: a button 1 press on its line
+    /// moves the cursor; every mouse event is used.
+    pub(crate) fn pane_prompt_mouse(&mut self, cid: ClientId, pane: PaneId, m: &keys::Mouse) {
+        let Some(wid) = self.window_of(pane) else { return };
+        let Some((_, r)) = self.rects(wid).0.into_iter().find(|(p, _)| *p == pane) else { return };
+        let r = self.content_rect(wid, r);
+        let sid = self.client_session(cid);
+        let oy = if self.opt_session(sid, "status-position") == "top" { self.status_lines(sid) } else { 0 };
+        let row = oy + if oy > 0 { r.y } else { r.bottom().saturating_sub(1) };
+        if m.kind != keys::MouseKind::Down || m.button != 1 || m.y != row || m.x < r.x || m.x >= r.right() {
+            return;
+        }
+        let Some(mut pr) = self.panes.get_mut(&pane).and_then(|p| p.prompt.take()) else { return };
+        self.prompt_mouse_at(cid, &mut pr, (m.x - r.x) as usize, 0, r.w);
+        self.prompt_done_key(cid, pr);
+    }
+
+    /// prompt_incremental_start: an incremental prompt fires once when opened.
+    pub(crate) fn prompt_incremental_start(&mut self, cid: ClientId, host: Option<PaneId>) {
+        let pr = match host {
+            Some(p) => self.panes.get_mut(&p).and_then(|p| p.prompt.take()),
+            None => self.clients.get_mut(&cid).and_then(|c| c.prompt.take()),
+        };
+        let Some(mut pr) = pr else { return };
+        if pr.incremental {
+            let s = format!("={}", pr.input.iter().collect::<String>());
+            self.prompt_fire(cid, &mut pr, Some(&s), Fire::Handled);
+        }
+        self.prompt_done_key(cid, pr);
+    }
+
+    /// prompt_replace_complete: Tab completes a command name at the start of
+    /// the prompt to the longest common prefix of the matches, or keeps the
+    /// matches for drawing after the input when there is nothing to add.
+    fn prompt_complete(&self, pr: &mut Prompt) -> bool {
+        let Some((first, last)) = prompt_word_bounds(pr) else { return false };
+        let word: String = pr.input[first..last].iter().collect();
+        if word.len() >= 64 || pr.history_type != 0 || first != 0 || word.is_empty() {
+            return false;
+        }
+        let mut list: Vec<String> = super::cmds::command_names().filter(|n| n.starts_with(&word)).map(String::from).collect();
+        for (_, alias) in self.opts_server.array_items("command-alias") {
+            if let Some((name, _)) = alias.split_once('=') {
+                if name.starts_with(&word) && !list.iter().any(|l| l == name) {
+                    list.push(name.to_string());
+                }
+            }
+        }
+        if list.is_empty() {
+            return false;
+        }
+        list.sort();
+        let out = if list.len() == 1 {
+            format!("{} ", list[0])
+        } else {
+            let mut prefix = list[0].clone();
+            for item in &list[1..] {
+                let common = prefix.chars().zip(item.chars()).take_while(|(a, b)| a == b).count();
+                prefix = prefix.chars().take(common).collect();
+            }
+            prefix
+        };
+        if out == word {
+            if list.len() > 1 {
+                pr.complete = list;
+            }
+            return false;
+        }
+        prompt_replace_word(pr, &out)
+    }
 }
 
-pub const COMMAND_NAMES: &[&str] = &[
-    "attach-session", "bind-key", "break-pane", "capture-pane", "choose-buffer", "choose-client", "choose-tree", "clear-history", "clock-mode", "command-prompt",
-    "confirm-before", "copy-mode", "customize-mode", "delete-buffer", "detach-client", "display-menu", "display-message", "display-panes", "display-popup", "find-window",
-    "has-session", "if-shell", "join-pane", "kill-pane", "kill-server", "kill-session", "kill-window", "last-pane", "last-window", "link-window", "list-buffers",
-    "list-clients", "list-commands", "list-keys", "list-panes", "list-sessions", "list-windows", "load-buffer", "lock-client", "lock-server", "lock-session", "move-pane",
-    "move-window", "new-session", "new-window", "next-layout", "next-window", "paste-buffer", "pipe-pane", "previous-layout", "previous-window", "refresh-client",
-    "rename-session", "rename-window", "resize-pane", "resize-window", "respawn-pane", "respawn-window", "rotate-window", "run-shell", "save-buffer", "select-layout",
-    "select-pane", "select-window", "send-keys", "send-prefix", "set-buffer", "set-environment", "set-hook", "set-option", "set-window-option", "show-buffer",
-    "show-environment", "show-hooks", "show-messages", "show-options", "show-window-options", "source-file", "split-window", "start-server", "suspend-client",
-    "swap-pane", "swap-window", "switch-client", "unbind-key", "unlink-window", "wait-for",
-];
+/// A command prompt editing operation (the emacs keys of tmux prompt_key).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PromptOp {
+    None, Left, Right, Home, End, Tab, BSpace, Delete, ClearLine, KillLine, DeleteWord,
+    ForwardWord, ViForward(bool), ViEnd(bool), BackWord(bool), Up, Down, Yank, Transpose,
+    Enter, Cancel, QuoteNext, Insert(char), Page, Search(bool),
+}
+
+/// What a prompt did with a key (enum prompt_key_result).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PromptResult {
+    Handled,
+    Close,
+    NotHandled,
+    Move,
+}
+
+/// Why the prompt callback runs (PROMPT_KEY_CLOSE, _HANDLED, _MOVE).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Fire {
+    Close,
+    Handled,
+    Move,
+}
+
+/// prompt_keypad_key: unmodified keypad keys are their characters.
+fn prompt_keypad_key(k: &Key) -> Key {
+    match k.code {
+        KeyCode::KP('\r') if k.mods.is_empty() => Key { code: KeyCode::Enter, mods: k.mods },
+        KeyCode::KP(c) if k.mods.is_empty() => Key { code: KeyCode::Char(c), mods: k.mods },
+        _ => k.clone(),
+    }
+}
+
+/// A key as the character a single key prompt (or C-v) takes: BSpace is
+/// 0x7f, C-x the control character and other modifiers are dropped; keys
+/// without a character give None and are ignored.
+fn prompt_key_char(k: &Key) -> Option<char> {
+    let c = match k.code {
+        KeyCode::BSpace => return Some('\x7f'),
+        KeyCode::Char(c) => c,
+        KeyCode::Space => ' ',
+        KeyCode::Enter => '\r',
+        KeyCode::Tab => '\t',
+        KeyCode::Escape => '\x1b',
+        _ => return None,
+    };
+    Some(if k.mods.ctrl && c.is_ascii() { ((c as u8) & 0x1f) as char } else { c })
+}
+
+/// The top buffer as prompt_paste inserts it: up to the first control character.
+fn prompt_paste_text(data: &[u8]) -> Vec<char> {
+    let end = data.iter().position(|b| *b <= 31 || *b == 127).unwrap_or(data.len());
+    String::from_utf8_lossy(&data[..end]).chars().collect()
+}
+
+/// The word around the cursor that completion replaces (prompt_replace_complete).
+fn prompt_word_bounds(pr: &Prompt) -> Option<(usize, usize)> {
+    let n = pr.input.len();
+    let sp = |i: usize| i < n && pr.input[i] == ' ';
+    let idx = pr.cursor.min(n).saturating_sub(1);
+    let mut first = idx;
+    while first > 0 && !sp(first) {
+        first -= 1;
+    }
+    while first < n && sp(first) {
+        first += 1;
+    }
+    let mut last = idx;
+    while last < n && !sp(last) {
+        last += 1;
+    }
+    while last > 0 && sp(last) {
+        last -= 1;
+    }
+    if last < n {
+        last += 1;
+    }
+    (last >= first).then_some((first, last))
+}
+
+/// Replaces the word around the cursor with `s`, the cursor after it.
+fn prompt_replace_word(pr: &mut Prompt, s: &str) -> bool {
+    let Some((first, last)) = prompt_word_bounds(pr) else { return false };
+    let new: Vec<char> = s.chars().collect();
+    let len = new.len();
+    pr.input.splice(first..last, new);
+    pr.cursor = first + len;
+    true
+}
+
+fn prompt_emacs_op(k: &Key) -> PromptOp {
+    let m = k.mods;
+    let plain = !m.ctrl && !m.meta;
+    match &k.code {
+        KeyCode::Char(c) if m.ctrl && !m.meta => match c {
+            'b' => PromptOp::Left,
+            'f' => PromptOp::Right,
+            'a' => PromptOp::Home,
+            'e' => PromptOp::End,
+            'h' => PromptOp::BSpace,
+            'd' => PromptOp::Delete,
+            'u' => PromptOp::ClearLine,
+            'k' => PromptOp::KillLine,
+            'w' => PromptOp::DeleteWord,
+            'p' => PromptOp::Up,
+            'n' => PromptOp::Down,
+            'y' => PromptOp::Yank,
+            't' => PromptOp::Transpose,
+            'm' | 'j' => PromptOp::Enter,
+            'c' | 'g' | '[' => PromptOp::Cancel,
+            'v' => PromptOp::QuoteNext,
+            'i' => PromptOp::Tab,
+            'r' => PromptOp::Search(true),
+            's' => PromptOp::Search(false),
+            _ => PromptOp::None,
+        },
+        KeyCode::Char('f') if m.meta && !m.ctrl => PromptOp::ForwardWord,
+        KeyCode::Char('b') if m.meta && !m.ctrl => PromptOp::BackWord(false),
+        KeyCode::Right if m.ctrl && !m.meta => PromptOp::ForwardWord,
+        KeyCode::Left if m.ctrl && !m.meta => PromptOp::BackWord(false),
+        _ if !plain || m.shift && !matches!(k.code, KeyCode::Char(_)) => PromptOp::None,
+        KeyCode::Char(c) => PromptOp::Insert(*c),
+        KeyCode::KP('\r') | KeyCode::Enter => PromptOp::Enter,
+        KeyCode::KP(c) => PromptOp::Insert(*c),
+        KeyCode::Space => PromptOp::Insert(' '),
+        KeyCode::Left => PromptOp::Left,
+        KeyCode::Right => PromptOp::Right,
+        KeyCode::Home => PromptOp::Home,
+        KeyCode::End => PromptOp::End,
+        KeyCode::Tab => PromptOp::Tab,
+        KeyCode::BSpace => PromptOp::BSpace,
+        KeyCode::Delete => PromptOp::Delete,
+        KeyCode::Up => PromptOp::Up,
+        KeyCode::Down => PromptOp::Down,
+        KeyCode::PageUp | KeyCode::PageDown => PromptOp::Page,
+        KeyCode::Escape => PromptOp::Cancel,
+        _ => PromptOp::None,
+    }
+}
+
+/// tmux prompt_translate_key: vi keys as emacs operations, switching between
+/// insert and command mode. Escape in insert mode moves the cursor left.
+fn prompt_vi_op(pr: &mut Prompt, k: &Key) -> PromptOp {
+    let name = keys::key_name(k);
+    if !pr.vi_command {
+        return match name.as_str() {
+            "C-a" | "C-c" | "C-e" | "C-g" | "C-h" | "Tab" | "C-k" | "C-n" | "C-p" | "C-t" | "C-u" | "C-v" | "C-w" | "C-y" | "Enter" | "KPEnter"
+            | "C-m" | "C-j" | "C-Left" | "C-Right" | "BSpace" | "DC" | "Down" | "End" | "Home" | "Left" | "Right" | "Up" => prompt_emacs_op(k),
+            "Escape" | "C-[" => {
+                pr.vi_command = true;
+                pr.cursor = pr.cursor.saturating_sub(1);
+                PromptOp::None
+            }
+            // anything else is typed (only plain characters insert anything)
+            _ => match prompt_emacs_op(k) {
+                op @ PromptOp::Insert(_) => op,
+                _ => PromptOp::None,
+            },
+        };
+    }
+    match name.as_str() {
+        "BSpace" => return PromptOp::Left,
+        "A" | "I" | "C" | "s" | "a" => pr.vi_command = false,
+        "S" => {
+            pr.vi_command = false;
+            return PromptOp::ClearLine;
+        }
+        "i" => {
+            pr.vi_command = false;
+            return PromptOp::None;
+        }
+        _ => {}
+    }
+    match name.as_str() {
+        "A" | "$" => PromptOp::End,
+        "I" | "0" | "^" => PromptOp::Home,
+        "C" | "D" => PromptOp::KillLine,
+        "X" => PromptOp::BSpace,
+        "b" => PromptOp::BackWord(false),
+        "B" => PromptOp::BackWord(true),
+        "d" => PromptOp::ClearLine,
+        "e" => PromptOp::ViEnd(false),
+        "E" => PromptOp::ViEnd(true),
+        "w" => PromptOp::ViForward(false),
+        "W" => PromptOp::ViForward(true),
+        "p" => PromptOp::Yank,
+        "q" | "C-c" => PromptOp::Cancel,
+        "s" | "DC" | "x" => PromptOp::Delete,
+        "Down" | "j" => PromptOp::Down,
+        "Left" | "h" => PromptOp::Left,
+        "a" | "Right" | "l" => PromptOp::Right,
+        "Up" | "k" => PromptOp::Up,
+        "C-h" => PromptOp::BSpace,
+        "Enter" | "KPEnter" | "C-m" | "C-j" => PromptOp::Enter,
+        _ => PromptOp::None,
+    }
+}
+
+// Word movement over the prompt input as tmux prompt.c: separators (single
+// characters from word-separators) form words of their own, spaces end words.
+fn prompt_space(s: &[char], i: usize) -> bool {
+    s.get(i) == Some(&' ')
+}
+
+fn prompt_in_list(s: &[char], i: usize, seps: &[char]) -> bool {
+    s.get(i).is_some_and(|c| c.is_ascii() && seps.contains(c))
+}
+
+/// prompt_forward_word: vi stops at the start of the next word, emacs at the end.
+fn prompt_forward_word(s: &[char], mut i: usize, vi: bool, seps: &[char]) -> usize {
+    let n = s.len();
+    if !vi {
+        while i < n && prompt_space(s, i) {
+            i += 1;
+        }
+    }
+    if i >= n {
+        return n;
+    }
+    let class = prompt_in_list(s, i, seps) && !prompt_space(s, i);
+    loop {
+        i += 1;
+        if prompt_space(s, i) {
+            if vi {
+                while i < n && prompt_space(s, i) {
+                    i += 1;
+                }
+            }
+            break;
+        }
+        if i >= n || class != prompt_in_list(s, i, seps) {
+            break;
+        }
+    }
+    i
+}
+
+/// prompt_end_word: to the last character of this or the next word.
+fn prompt_end_word(s: &[char], mut i: usize, seps: &[char]) -> usize {
+    let n = s.len();
+    if i >= n {
+        return i;
+    }
+    loop {
+        i += 1;
+        if i >= n {
+            return n;
+        }
+        if !prompt_space(s, i) {
+            break;
+        }
+    }
+    let class = prompt_in_list(s, i, seps);
+    loop {
+        i += 1;
+        if i >= n || prompt_space(s, i) || class != prompt_in_list(s, i, seps) {
+            break;
+        }
+    }
+    i - 1
+}
+
+/// prompt_backward_word (and the start of the word C-w deletes).
+fn prompt_backward_word(s: &[char], mut i: usize, seps: &[char]) -> usize {
+    while i != 0 {
+        i -= 1;
+        if !prompt_space(s, i) {
+            break;
+        }
+    }
+    let class = prompt_in_list(s, i, seps);
+    while i != 0 {
+        i -= 1;
+        if prompt_space(s, i) || class != prompt_in_list(s, i, seps) {
+            i += 1;
+            break;
+        }
+    }
+    i
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn prompt_words_like_tmux() {
+        // positions from tmux 3.8 with the default word-separators
+        let seps: Vec<char> = "!\"#$%&'()*+,-./:;<=>?@[\\]^`{|}~".chars().collect();
+        let s: Vec<char> = "set foo-bar.baz qux/quux end".chars().collect();
+        assert_eq!(prompt_forward_word(&s, 4, true, &seps), 7);
+        assert_eq!(prompt_forward_word(&s, 7, true, &seps), 8);
+        assert_eq!(prompt_forward_word(&s, 4, true, &[]), 16);
+        assert_eq!(prompt_end_word(&s, 4, &seps), 6);
+        assert_eq!(prompt_end_word(&s, 6, &seps), 7);
+        assert_eq!(prompt_end_word(&s, 4, &[]), 14);
+        assert_eq!(prompt_backward_word(&s, 27, &seps), 25);
+        assert_eq!(prompt_backward_word(&s, 25, &seps), 20);
+        assert_eq!(prompt_backward_word(&s, 20, &seps), 19);
+        assert_eq!(prompt_backward_word(&s, 25, &[]), 16);
+        // emacs M-f goes to the end of the word
+        assert_eq!(prompt_forward_word(&s, 0, false, &seps), 3);
+        assert_eq!(prompt_forward_word(&s, 3, false, &seps), 7);
+        assert_eq!(prompt_forward_word(&s, 28, false, &seps), 28);
+        assert_eq!(prompt_backward_word(&[], 0, &seps), 0);
+    }
+
+    #[test]
+    fn prompt_vi_translation() {
+        let mut pr = Prompt::new(PromptKind::Command, vec![(String::new(), "ab".into())], String::new(), None);
+        let key = |n: &str| keys::parse_key_name(n).unwrap();
+        // insert mode: Escape is command mode and one to the left; M-f is dropped
+        assert_eq!(prompt_vi_op(&mut pr, &key("M-f")), PromptOp::None);
+        assert_eq!(prompt_vi_op(&mut pr, &key("Escape")), PromptOp::None);
+        assert!(pr.vi_command && pr.cursor == 1);
+        // command mode: Escape does nothing, BSpace is left, S clears and inserts
+        assert_eq!(prompt_vi_op(&mut pr, &key("Escape")), PromptOp::None);
+        assert_eq!(prompt_vi_op(&mut pr, &key("BSpace")), PromptOp::Left);
+        assert_eq!(prompt_vi_op(&mut pr, &key("j")), PromptOp::Down);
+        assert_eq!(prompt_vi_op(&mut pr, &key("C-a")), PromptOp::None);
+        assert_eq!(prompt_vi_op(&mut pr, &key("S")), PromptOp::ClearLine);
+        assert!(!pr.vi_command);
+        assert_eq!(prompt_vi_op(&mut pr, &key("C-a")), PromptOp::Home);
+        assert_eq!(prompt_emacs_op(&key("M-BSpace")), PromptOp::None);
+        assert_eq!(prompt_emacs_op(&key("C-Left")), PromptOp::BackWord(false));
+        assert_eq!(prompt_emacs_op(&key("C-r")), PromptOp::Search(true));
+        // single keys: C-x is the control character, BSpace 0x7f, special keys none
+        assert_eq!(prompt_key_char(&key("C-a")), Some('\x01'));
+        assert_eq!(prompt_key_char(&key("BSpace")), Some('\x7f'));
+        assert_eq!(prompt_key_char(&key("Escape")), Some('\x1b'));
+        assert_eq!(prompt_key_char(&key("M-y")), Some('y'));
+        assert_eq!(prompt_key_char(&key("Up")), None);
+    }
+
+    #[test]
+    fn prompt_completion_word() {
+        let mut pr = Prompt::new(PromptKind::Command, vec![(String::new(), "kill-se".into())], String::new(), None);
+        assert_eq!(prompt_word_bounds(&pr), Some((0, 7)));
+        pr.input = "set -g sta".chars().collect();
+        pr.cursor = 10;
+        assert_eq!(prompt_word_bounds(&pr), Some((7, 10)));
+        pr.input = "kill-server ".chars().collect();
+        pr.cursor = 12;
+        assert_eq!(prompt_word_bounds(&pr), None);
+        pr.input = "sel".chars().collect();
+        pr.cursor = 3;
+        assert!(prompt_replace_word(&mut pr, "select-"));
+        assert_eq!((pr.input.iter().collect::<String>(), pr.cursor), ("select-".to_string(), 7));
+    }
+
+    #[test]
     fn templates() {
         assert_eq!(fill_template("rename-window -- '%%'", &["it's".into()]), "rename-window -- 'it'\\''s'");
         assert_eq!(fill_template("a %1 b %2", &["x".into(), "y z".into()]), "a x b y z");
         assert_eq!(fill_template("%%", &["new-window -n x".into()]), "new-window -n x");
+        // cmd_template_replace: %%% and %N% escape for double quotes, each answer takes the next %%
+        assert_eq!(fill_template("display \"[%%%]\"", &["a\"b$c".into()]), "display \"[a\\\"b\\$c]\"");
+        assert_eq!(fill_template("x %1% %1", &["a;b".into()]), "x a\\;b a;b");
+        assert_eq!(fill_template("\"%%\"", &["it's".into()]), "\"it'\\''s\"");
+        assert_eq!(fill_template("%% %%", &["q".into()]), "q %%");
+        assert_eq!(fill_template("%% %%", &["q".into(), "r".into()]), "q r");
+        assert_eq!(fill_template("100%", &["q".into()]), "100%");
         let b = default_bindings();
         assert!(b["prefix"].contains_key("%"));
         assert!(b["prefix"].contains_key("\""));
@@ -1371,55 +1914,3 @@ pub fn prompt_type(name: &str) -> Option<usize> {
     PROMPT_TYPES.iter().position(|t| *t == name)
 }
 
-fn prompt_in(separators: &[char], c: char) -> bool { separators.contains(&c) }
-
-/// prompt_forward_word: emacs skips leading spaces first; vi goes on to the next word start.
-fn prompt_forward_word(input: &[char], cursor: usize, vi: bool, separators: &[char]) -> usize {
-    let size = input.len();
-    let mut idx = cursor.min(size);
-    if !vi { while idx != size && input[idx] == ' ' { idx += 1; } }
-    if idx == size { return idx; }
-    let word_is_separators = prompt_in(separators, input[idx]) && input[idx] != ' ';
-    loop {
-        idx += 1;
-        if idx < size && input[idx] == ' ' {
-            if vi { while idx != size && input[idx] == ' ' { idx += 1; } }
-            break;
-        }
-        if idx == size || word_is_separators != prompt_in(separators, input[idx]) { break; }
-    }
-    idx
-}
-
-/// prompt_end_word: to the last character of the next word.
-fn prompt_end_word(input: &[char], cursor: usize, separators: &[char]) -> usize {
-    let size = input.len();
-    let mut idx = cursor.min(size);
-    if idx == size { return idx; }
-    loop {
-        idx += 1;
-        if idx == size { return idx; }
-        if input[idx] != ' ' { break; }
-    }
-    let word_is_separators = prompt_in(separators, input[idx]);
-    loop {
-        idx += 1;
-        if idx == size || input[idx] == ' ' || word_is_separators != prompt_in(separators, input[idx]) { break; }
-    }
-    idx - 1
-}
-
-/// prompt_backward_word: to the start of the previous word.
-fn prompt_backward_word(input: &[char], cursor: usize, separators: &[char]) -> usize {
-    let mut idx = cursor.min(input.len());
-    while idx != 0 {
-        idx -= 1;
-        if input[idx] != ' ' { break; }
-    }
-    let word_is_separators = input.get(idx).is_some_and(|c| prompt_in(separators, *c));
-    while idx != 0 {
-        idx -= 1;
-        if input[idx] == ' ' || word_is_separators != prompt_in(separators, input[idx]) { idx += 1; break; }
-    }
-    idx
-}

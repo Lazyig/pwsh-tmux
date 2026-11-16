@@ -72,6 +72,7 @@ pub struct CopyMode {
     /// Desired column for vertical motion.
     lastcx: usize,
     vi: bool,
+    pub wrap_search: bool,
     /// Selection anchor; the other end is the cursor.
     anchor: Option<Pos>,
     line_mode: bool,
@@ -111,6 +112,7 @@ impl CopyMode {
             cx: 0,
             lastcx: 0,
             vi,
+            wrap_search: true,
             anchor: None,
             line_mode: false,
             word_mode: false,
@@ -238,6 +240,17 @@ impl CopyMode {
 
     pub fn set_word_separators(&mut self, s: &str) {
         self.separators = s.to_string();
+    }
+
+    pub fn history_size(&self) -> usize { self.hsize() }
+
+    /// The view for a scrollbar slider at row `y` of a bar `height` rows high (the
+    /// inverse of the slider position); the cursor keeps its row in the view.
+    pub fn scroll_to_slider(&mut self, y: usize, height: usize) {
+        let top = ((y as f64 * ((self.hsize() + height) as f64 / height.max(1) as f64)) as usize).min(self.hsize());
+        let row = self.cy.saturating_sub(self.top);
+        self.top = top;
+        self.cy = (top + row).clamp(self.top, self.top + self.height - 1);
     }
 
     pub fn scroll_offset(&self) -> usize {
@@ -1452,6 +1465,7 @@ impl CopyMode {
         let (cy, cx) = (self.cy, self.cx);
         if forward {
             for i in 0..=total {
+                if !self.wrap_search && cy + i >= total { break; }
                 let y = (cy + i) % total;
                 let m = self.row_matches(y, needle);
                 let found = if i == 0 {
@@ -1467,6 +1481,7 @@ impl CopyMode {
             }
         } else {
             for i in 0..=total {
+                if !self.wrap_search && i > cy { break; }
                 let y = (cy + total * 2 - i) % total;
                 let m = self.row_matches(y, needle);
                 let found = if i == 0 {
@@ -2328,5 +2343,24 @@ mod tests {
         let emacs = CopyMode::default_bindings(false);
         assert!(emacs.contains(&("C-Space", "begin-selection")));
         assert!(emacs.contains(&("M-w", "copy-selection-and-cancel")));
+    }
+}
+
+#[cfg(test)]
+mod display_search_tests {
+    use super::*;
+    #[test]
+    fn wrap_search_can_be_disabled() {
+        let lines = ["target", "middle", "target"].into_iter().map(|s| Line { cells: s.chars().map(|c| crate::cells::Cell { text: c.to_string(), style: Default::default() }).collect(), wrapped: false }).collect();
+        let mut cm = CopyMode::new(lines, 10, 3, (2, 0), false);
+        cm.wrap_search = false;
+        cm.run("search-forward", &["target".into()]);
+        assert_eq!(cm.cy, 2);
+        cm.wrap_search = true;
+        cm.run("search-forward", &["target".into()]);
+        assert_eq!(cm.cy, 0);
+        cm.wrap_search = false;
+        cm.run("search-backward", &["target".into()]);
+        assert_eq!(cm.cy, 0);
     }
 }

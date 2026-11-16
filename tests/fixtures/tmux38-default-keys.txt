@@ -1,0 +1,219 @@
+# tmux 3.8 (-f /dev/null): list-keys -T prefix
+bind-key    -T prefix Tab     new-pane -E -X 0 -Y 0 -x "75%" -y "30%" \; move-pane -P bottom-centre \; switch-mode -kw
+bind-key    -T prefix Space   next-layout
+bind-key    -T prefix !       break-pane
+bind-key    -T prefix \"      split-window
+bind-key    -T prefix \#      list-buffers
+bind-key    -T prefix \$      command-prompt -I "#S" { rename-session "%%" }
+bind-key    -T prefix \%      split-window -h
+bind-key    -T prefix &       confirm-before -p "kill-window #W? (y/n)" kill-window
+bind-key    -T prefix \'      command-prompt -p index { select-window -t ":%%" }
+bind-key    -T prefix (       switch-client -p
+bind-key    -T prefix )       switch-client -n
+bind-key    -T prefix *       new-pane
+bind-key    -T prefix ,       command-prompt -I "#W" { rename-window "%%" }
+bind-key    -T prefix -       delete-buffer
+bind-key    -T prefix .       command-prompt { move-window -t "%%" }
+bind-key    -T prefix /       command-prompt -k -p key { list-keys -1N "%%" }
+bind-key    -T prefix 0       select-window -t :=0
+bind-key    -T prefix 1       select-window -t :=1
+bind-key    -T prefix 2       select-window -t :=2
+bind-key    -T prefix 3       select-window -t :=3
+bind-key    -T prefix 4       select-window -t :=4
+bind-key    -T prefix 5       select-window -t :=5
+bind-key    -T prefix 6       select-window -t :=6
+bind-key    -T prefix 7       select-window -t :=7
+bind-key    -T prefix 8       select-window -t :=8
+bind-key    -T prefix 9       select-window -t :=9
+bind-key    -T prefix :       command-prompt
+bind-key    -T prefix \;      last-pane
+bind-key    -T prefix <       display-menu -T "#[align=centre]#{window_index}:#{window_name}" -x W -y W "#{?#{>:#{session_windows},1},,-}Swap Left" l { swap-window -t :-1 } "#{?#{>:#{session_windows},1},,-}Swap Right" r { swap-window -t :+1 } "#{?pane_marked_set,,-}Swap Marked" s { swap-window } '' Kill X { kill-window } Respawn R { respawn-window -k } "#{?pane_marked,Unmark,Mark}" m { select-pane -m } Rename n { command-prompt -F -I "#W" { rename-window -t "#{window_id}" "%%" } } '' "New After" w { new-window -a } "New At End" W { new-window }
+bind-key    -T prefix =       choose-buffer -Z
+bind-key    -T prefix >       display-menu -T "#[align=centre]#{pane_index} (#{pane_id})" -x P -y P "#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Top,}" < { send-keys -X history-top } "#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Bottom,}" > { send-keys -X history-bottom } '' "#{?#{==:#{pane_mode},copy-mode},#{?copy_line_numbers,Hide Line Numbers,Show Line Numbers},}" L { send-keys -X line-numbers-toggle } "#{?#{==:#{pane_mode},copy-mode},#{?refresh_active,Refresh Off,Refresh On},}" r { send-keys -X refresh-toggle } '' "#{?#{&&:#{buffer_size},#{!:#{pane_in_mode}}},Paste #[underscore]#{=/9/...:buffer_sample},}" p { paste-buffer } '' "#{?mouse_word,Search For #[underscore]#{=/9/...:mouse_word},}" C-r { if-shell -F "#{?#{m/r:(copy|view)-mode,#{pane_mode}},0,1}" "copy-mode -t=" ; send-keys -X -t = search-backward -- "#{q:mouse_word}" } "#{?mouse_word,Type #[underscore]#{=/9/...:mouse_word},}" C-y { copy-mode -q ; send-keys -l "#{q:mouse_word}" } "#{?mouse_word,Copy #[underscore]#{=/9/...:mouse_word},}" c { copy-mode -q ; set-buffer "#{q:mouse_word}" } "#{?mouse_line,Copy Line,}" l { copy-mode -q ; set-buffer "#{q:mouse_line}" } '' "#{?mouse_hyperlink,Type #[underscore]#{=/9/...:mouse_hyperlink},}" C-h { copy-mode -q ; send-keys -l "#{q:mouse_hyperlink}" } "#{?mouse_hyperlink,Copy #[underscore]#{=/9/...:mouse_hyperlink},}" h { copy-mode -q ; set-buffer "#{q:mouse_hyperlink}" } '' "#{?#{#{pane_floating_flag}},Move,}" '' { display-menu -T "#[align=centre]Move" -x L -y L Centre c { move-pane -P centre } '' "Top Left" 1 { move-pane -P top-left } "Top Right" 2 { move-pane -P top-right } "Bottom Left" 3 { move-pane -P bottom-left } "Bottom Right" 4 { move-pane -P bottom-right } '' Top t { move-pane -P top-centre } Bottom b { move-pane -P bottom-centre } Left l { move-pane -P centre-left } Right r { move-pane -P centre-right } } "#{?#{#{pane_floating_flag}},Move & Resize,}" '' { display-menu -T "#[align=centre]Move & Resize" -x L -y L Fill 0 { resize-pane -x "100%" -y "100%" ; move-pane -P top-left } '' "Top Left" 1 { resize-pane -x "50%" -y "50%" ; move-pane -P top-left } "Top Right" 2 { resize-pane -x "50%" -y "50%" ; move-pane -P top-right } "Bottom Left" 3 { resize-pane -x "50%" -y "50%" ; move-pane -P bottom-left } "Bottom Right" 4 { resize-pane -x "50%" -y "50%" ; move-pane -P bottom-right } '' Top t { resize-pane -x "100%" -y "50%" ; move-pane -P top-centre } Bottom b { resize-pane -x "100%" -y "50%" ; move-pane -P bottom-centre } Left l { resize-pane -x "50%" -y "100%" ; move-pane -P centre-left } Right r { resize-pane -x "50%" -y "100%" ; move-pane -P centre-right } } "#{?#{#{pane_floating_flag}},Tile,}" t { join-pane } "#{?#{!:#{pane_floating_flag}},Float,}" f { break-pane -W } "#{?#{!:#{pane_floating_flag}},Horizontal Split,}" h { split-window -h } "#{?#{!:#{pane_floating_flag}},Vertical Split,}" v { split-window -v } '' "#{?#{&&:#{!:#{pane_floating_flag}},#{>:#{window_panes},1}},Swap Up,}" u { swap-pane -U } "#{?#{&&:#{!:#{pane_floating_flag}},#{>:#{window_panes},1}},Swap Down,}" d { swap-pane -D } "#{?pane_marked_set,,-}Swap Marked" s { swap-pane } '' Kill X { kill-pane } Respawn R { respawn-pane -k } "#{?pane_marked,Unmark,Mark}" m { select-pane -m } "#{?#{>:#{window_panes},1},,-}#{?window_zoomed_flag,Unzoom,Zoom}" z { resize-pane -Z }
+bind-key    -T prefix ?       list-keys -N
+bind-key    -T prefix @       if-shell -F "#{pane_floating_flag}" { join-pane } { break-pane -W }
+bind-key    -T prefix C       customize-mode -Z
+bind-key    -T prefix D       choose-client -Z
+bind-key    -T prefix E       select-layout -E
+bind-key    -T prefix L       switch-client -l
+bind-key    -T prefix M       select-pane -M
+bind-key    -T prefix T       command-prompt -I "#T" { select-pane -T "%%" }
+bind-key    -T prefix [       copy-mode
+bind-key    -T prefix ]       paste-buffer -p
+bind-key    -T prefix c       new-window
+bind-key    -T prefix d       detach-client
+bind-key    -T prefix f       command-prompt { find-window -Z "%%" }
+bind-key    -T prefix g       switch-client -T move
+bind-key    -T prefix i       display-message
+bind-key    -T prefix l       last-window
+bind-key    -T prefix m       select-pane -m
+bind-key    -T prefix n       next-window
+bind-key    -T prefix o       select-pane -t :.+
+bind-key    -T prefix p       previous-window
+bind-key    -T prefix q       display-panes
+bind-key    -T prefix r       refresh-client
+bind-key    -T prefix s       choose-tree -Zs
+bind-key    -T prefix t       clock-mode
+bind-key    -T prefix w       choose-tree -Zw
+bind-key    -T prefix x       confirm-before -p "kill-pane #P? (y/n)" kill-pane
+bind-key    -T prefix z       resize-pane -Z
+bind-key    -T prefix \{      swap-pane -U
+bind-key    -T prefix \}      swap-pane -D
+bind-key    -T prefix \~      show-messages
+bind-key -r -T prefix DC      refresh-client -c
+bind-key    -T prefix PPage   copy-mode -u
+bind-key    -T prefix BTab    new-pane -E -X 0 -Y 0 -x "75%" -y "30%" \; move-pane -P bottom-centre \; switch-mode -ks
+bind-key -r -T prefix Up      select-pane -U
+bind-key -r -T prefix Down    select-pane -D
+bind-key -r -T prefix Left    select-pane -L
+bind-key -r -T prefix Right   select-pane -R
+bind-key    -T prefix M-1     select-layout even-horizontal
+bind-key    -T prefix M-2     select-layout even-vertical
+bind-key    -T prefix M-3     select-layout main-horizontal
+bind-key    -T prefix M-4     select-layout main-vertical
+bind-key    -T prefix M-5     select-layout tiled
+bind-key    -T prefix M-6     select-layout main-horizontal-mirrored
+bind-key    -T prefix M-7     select-layout main-vertical-mirrored
+bind-key    -T prefix M-n     next-window -a
+bind-key    -T prefix M-o     rotate-window -D
+bind-key    -T prefix M-p     previous-window -a
+bind-key -r -T prefix M-Up    if-shell -F "#{?floating_pane_flag}" { resize-pane -D -5 } { resize-pane -U 5 }
+bind-key -r -T prefix M-Down  resize-pane -D 5
+bind-key -r -T prefix M-Left  if-shell -F "#{?floating_pane_flag}" { resize-pane -R -5 } { resize-pane -L 5 }
+bind-key -r -T prefix M-Right resize-pane -R 5
+bind-key    -T prefix C-b     send-prefix
+bind-key    -T prefix C-o     rotate-window
+bind-key    -T prefix C-z     suspend-client
+bind-key -r -T prefix C-Up    if-shell -F "#{?floating_pane_flag}" { resize-pane -D -1 } { resize-pane -U -- }
+bind-key -r -T prefix C-Down  resize-pane -D --
+bind-key -r -T prefix C-Left  if-shell -F "#{?floating_pane_flag}" { resize-pane -R -1 } { resize-pane -L -- }
+bind-key -r -T prefix C-Right resize-pane -R --
+bind-key -r -T prefix S-Up    refresh-client -U 10
+bind-key -r -T prefix S-Down  refresh-client -D 10
+bind-key -r -T prefix S-Left  refresh-client -L 10
+bind-key -r -T prefix S-Right refresh-client -R 10
+# list-keys -T root
+bind-key  -T root MouseDown1Pane            select-pane -t = \; send-keys -M
+bind-key  -T root MouseDown1Status          switch-client -t =
+bind-key  -T root MouseDown1Border          select-pane -t =
+bind-key  -T root MouseDown1ScrollbarUp     if-shell -F -t = "#{pane_in_mode}" { send-keys -X page-up } { copy-mode -u }
+bind-key  -T root MouseDown1ScrollbarDown   if-shell -F -t = "#{pane_in_mode}" { send-keys -X page-down } { copy-mode -d }
+bind-key  -T root MouseDown1Control7        if-shell -F -t = "#{pane_floating_flag}" { join-pane } { break-pane -W }
+bind-key  -T root MouseDown1Control8        resize-pane -Z
+bind-key  -T root MouseDown1Control9        display-menu -O -T "Kill pane #{pane_index}?" -t = -x M -y M Yes y { kill-pane -t = } No n {  }
+bind-key  -T root MouseDown2Pane            select-pane -t = \; if-shell -F "#{||:#{pane_in_mode},#{mouse_any_flag}}" { send-keys -M } { paste-buffer -p }
+bind-key  -T root MouseDown3Pane            if-shell -F -t = "#{||:#{mouse_any_flag},#{&&:#{pane_in_mode},#{?#{m/r:(copy|view)-mode,#{pane_mode}},0,1}}}" { select-pane -t = ; send-keys -M } { display-menu -T "#[align=centre]#{pane_index} (#{pane_id})" -t = -x M -y M "#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Top,}" < { send-keys -X history-top } "#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Bottom,}" > { send-keys -X history-bottom } '' "#{?#{==:#{pane_mode},copy-mode},#{?copy_line_numbers,Hide Line Numbers,Show Line Numbers},}" L { send-keys -X line-numbers-toggle } "#{?#{==:#{pane_mode},copy-mode},#{?refresh_active,Refresh Off,Refresh On},}" r { send-keys -X refresh-toggle } '' "#{?#{&&:#{buffer_size},#{!:#{pane_in_mode}}},Paste #[underscore]#{=/9/...:buffer_sample},}" p { paste-buffer } '' "#{?mouse_word,Search For #[underscore]#{=/9/...:mouse_word},}" C-r { if-shell -F "#{?#{m/r:(copy|view)-mode,#{pane_mode}},0,1}" "copy-mode -t=" ; send-keys -X -t = search-backward -- "#{q:mouse_word}" } "#{?mouse_word,Type #[underscore]#{=/9/...:mouse_word},}" C-y { copy-mode -q ; send-keys -l "#{q:mouse_word}" } "#{?mouse_word,Copy #[underscore]#{=/9/...:mouse_word},}" c { copy-mode -q ; set-buffer "#{q:mouse_word}" } "#{?mouse_line,Copy Line,}" l { copy-mode -q ; set-buffer "#{q:mouse_line}" } '' "#{?mouse_hyperlink,Type #[underscore]#{=/9/...:mouse_hyperlink},}" C-h { copy-mode -q ; send-keys -l "#{q:mouse_hyperlink}" } "#{?mouse_hyperlink,Copy #[underscore]#{=/9/...:mouse_hyperlink},}" h { copy-mode -q ; set-buffer "#{q:mouse_hyperlink}" } '' "#{?#{#{pane_floating_flag}},Move,}" '' { display-menu -T "#[align=centre]Move" -x L -y L Centre c { move-pane -P centre } '' "Top Left" 1 { move-pane -P top-left } "Top Right" 2 { move-pane -P top-right } "Bottom Left" 3 { move-pane -P bottom-left } "Bottom Right" 4 { move-pane -P bottom-right } '' Top t { move-pane -P top-centre } Bottom b { move-pane -P bottom-centre } Left l { move-pane -P centre-left } Right r { move-pane -P centre-right } } "#{?#{#{pane_floating_flag}},Move & Resize,}" '' { display-menu -T "#[align=centre]Move & Resize" -x L -y L Fill 0 { resize-pane -x "100%" -y "100%" ; move-pane -P top-left } '' "Top Left" 1 { resize-pane -x "50%" -y "50%" ; move-pane -P top-left } "Top Right" 2 { resize-pane -x "50%" -y "50%" ; move-pane -P top-right } "Bottom Left" 3 { resize-pane -x "50%" -y "50%" ; move-pane -P bottom-left } "Bottom Right" 4 { resize-pane -x "50%" -y "50%" ; move-pane -P bottom-right } '' Top t { resize-pane -x "100%" -y "50%" ; move-pane -P top-centre } Bottom b { resize-pane -x "100%" -y "50%" ; move-pane -P bottom-centre } Left l { resize-pane -x "50%" -y "100%" ; move-pane -P centre-left } Right r { resize-pane -x "50%" -y "100%" ; move-pane -P centre-right } } "#{?#{#{pane_floating_flag}},Tile,}" t { join-pane } "#{?#{!:#{pane_floating_flag}},Float,}" f { break-pane -W } "#{?#{!:#{pane_floating_flag}},Horizontal Split,}" h { split-window -h } "#{?#{!:#{pane_floating_flag}},Vertical Split,}" v { split-window -v } '' "#{?#{&&:#{!:#{pane_floating_flag}},#{>:#{window_panes},1}},Swap Up,}" u { swap-pane -U } "#{?#{&&:#{!:#{pane_floating_flag}},#{>:#{window_panes},1}},Swap Down,}" d { swap-pane -D } "#{?pane_marked_set,,-}Swap Marked" s { swap-pane } '' Kill X { kill-pane } Respawn R { respawn-pane -k } "#{?pane_marked,Unmark,Mark}" m { select-pane -m } "#{?#{>:#{window_panes},1},,-}#{?window_zoomed_flag,Unzoom,Zoom}" z { resize-pane -Z } }
+bind-key  -T root MouseDown3Status          display-menu -T "#[align=centre]#{window_index}:#{window_name}" -t = -x W -y W "#{?#{>:#{session_windows},1},,-}Swap Left" l { swap-window -t :-1 } "#{?#{>:#{session_windows},1},,-}Swap Right" r { swap-window -t :+1 } "#{?pane_marked_set,,-}Swap Marked" s { swap-window } '' Kill X { kill-window } Respawn R { respawn-window -k } "#{?pane_marked,Unmark,Mark}" m { select-pane -m } Rename n { command-prompt -F -I "#W" { rename-window -t "#{window_id}" "%%" } } '' "New After" w { new-window -a } "New At End" W { new-window }
+bind-key  -T root MouseDown3StatusLeft      run-shell -C "display-menu -t= -xM -yW -T '#[align=centre]#{session_name}'  #{S/t:#{?#{&&:#{<:#{loop_index},6},#{!:#{session_active}}},'Switch To #[underscore]#{session_name}' '' {switch-client -t=#{session_id}#} ,}} '' 'Renumber' 'N' {move-window -r} 'Rename' 'r' {command-prompt -I '#S' {rename-session -- '%%'}} 'Detach' 'd' {detach-client} '' 'New Session' 's' {new-session} 'New Window' 'w' {new-window}"
+bind-key  -T root MouseDown3Empty           display-menu -T "#[align=centre]#{window_index}:#{window_name}" -t = -x M -y M "New Pane" p { new-pane ; join-pane } "New Window" w { new-window }
+bind-key  -T root MouseDrag1Pane            if-shell -F "#{||:#{pane_in_mode},#{mouse_any_flag}}" { send-keys -M } { copy-mode -M }
+bind-key  -T root MouseDrag1Border          resize-pane -M
+bind-key  -T root MouseDrag1ScrollbarSlider if-shell -F -t = "#{pane_in_mode}" { send-keys -X scroll-to-mouse } { copy-mode -S }
+bind-key  -T root WheelDownStatus           next-window
+bind-key  -T root WheelUpPane               if-shell -F "#{||:#{alternate_on},#{pane_in_mode},#{mouse_any_flag}}" { send-keys -M } { copy-mode -e }
+bind-key  -T root WheelUpStatus             previous-window
+bind-key  -T root DoubleClick1Pane          select-pane -t = \; if-shell -F "#{||:#{pane_in_mode},#{mouse_any_flag}}" { send-keys -M } { copy-mode -H ; send-keys -X select-word ; run-shell -d 0.3 ; send-keys -X copy-pipe-and-cancel }
+bind-key  -T root TripleClick1Pane          select-pane -t = \; if-shell -F "#{||:#{pane_in_mode},#{mouse_any_flag}}" { send-keys -M } { copy-mode -H ; send-keys -X select-line ; run-shell -d 0.3 ; send-keys -X copy-pipe-and-cancel }
+bind-key  -T root M-MouseDown3Pane          display-menu -T "#[align=centre]#{pane_index} (#{pane_id})" -t = -x M -y M "#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Top,}" < { send-keys -X history-top } "#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Bottom,}" > { send-keys -X history-bottom } '' "#{?#{==:#{pane_mode},copy-mode},#{?copy_line_numbers,Hide Line Numbers,Show Line Numbers},}" L { send-keys -X line-numbers-toggle } "#{?#{==:#{pane_mode},copy-mode},#{?refresh_active,Refresh Off,Refresh On},}" r { send-keys -X refresh-toggle } '' "#{?#{&&:#{buffer_size},#{!:#{pane_in_mode}}},Paste #[underscore]#{=/9/...:buffer_sample},}" p { paste-buffer } '' "#{?mouse_word,Search For #[underscore]#{=/9/...:mouse_word},}" C-r { if-shell -F "#{?#{m/r:(copy|view)-mode,#{pane_mode}},0,1}" "copy-mode -t=" ; send-keys -X -t = search-backward -- "#{q:mouse_word}" } "#{?mouse_word,Type #[underscore]#{=/9/...:mouse_word},}" C-y { copy-mode -q ; send-keys -l "#{q:mouse_word}" } "#{?mouse_word,Copy #[underscore]#{=/9/...:mouse_word},}" c { copy-mode -q ; set-buffer "#{q:mouse_word}" } "#{?mouse_line,Copy Line,}" l { copy-mode -q ; set-buffer "#{q:mouse_line}" } '' "#{?mouse_hyperlink,Type #[underscore]#{=/9/...:mouse_hyperlink},}" C-h { copy-mode -q ; send-keys -l "#{q:mouse_hyperlink}" } "#{?mouse_hyperlink,Copy #[underscore]#{=/9/...:mouse_hyperlink},}" h { copy-mode -q ; set-buffer "#{q:mouse_hyperlink}" } '' "#{?#{#{pane_floating_flag}},Move,}" '' { display-menu -T "#[align=centre]Move" -x L -y L Centre c { move-pane -P centre } '' "Top Left" 1 { move-pane -P top-left } "Top Right" 2 { move-pane -P top-right } "Bottom Left" 3 { move-pane -P bottom-left } "Bottom Right" 4 { move-pane -P bottom-right } '' Top t { move-pane -P top-centre } Bottom b { move-pane -P bottom-centre } Left l { move-pane -P centre-left } Right r { move-pane -P centre-right } } "#{?#{#{pane_floating_flag}},Move & Resize,}" '' { display-menu -T "#[align=centre]Move & Resize" -x L -y L Fill 0 { resize-pane -x "100%" -y "100%" ; move-pane -P top-left } '' "Top Left" 1 { resize-pane -x "50%" -y "50%" ; move-pane -P top-left } "Top Right" 2 { resize-pane -x "50%" -y "50%" ; move-pane -P top-right } "Bottom Left" 3 { resize-pane -x "50%" -y "50%" ; move-pane -P bottom-left } "Bottom Right" 4 { resize-pane -x "50%" -y "50%" ; move-pane -P bottom-right } '' Top t { resize-pane -x "100%" -y "50%" ; move-pane -P top-centre } Bottom b { resize-pane -x "100%" -y "50%" ; move-pane -P bottom-centre } Left l { resize-pane -x "50%" -y "100%" ; move-pane -P centre-left } Right r { resize-pane -x "50%" -y "100%" ; move-pane -P centre-right } } "#{?#{#{pane_floating_flag}},Tile,}" t { join-pane } "#{?#{!:#{pane_floating_flag}},Float,}" f { break-pane -W } "#{?#{!:#{pane_floating_flag}},Horizontal Split,}" h { split-window -h } "#{?#{!:#{pane_floating_flag}},Vertical Split,}" v { split-window -v } '' "#{?#{&&:#{!:#{pane_floating_flag}},#{>:#{window_panes},1}},Swap Up,}" u { swap-pane -U } "#{?#{&&:#{!:#{pane_floating_flag}},#{>:#{window_panes},1}},Swap Down,}" d { swap-pane -D } "#{?pane_marked_set,,-}Swap Marked" s { swap-pane } '' Kill X { kill-pane } Respawn R { respawn-pane -k } "#{?pane_marked,Unmark,Mark}" m { select-pane -m } "#{?#{>:#{window_panes},1},,-}#{?window_zoomed_flag,Unzoom,Zoom}" z { resize-pane -Z }
+bind-key  -T root M-MouseDown3Status        display-menu -T "#[align=centre]#{window_index}:#{window_name}" -t = -x W -y W "#{?#{>:#{session_windows},1},,-}Swap Left" l { swap-window -t :-1 } "#{?#{>:#{session_windows},1},,-}Swap Right" r { swap-window -t :+1 } "#{?pane_marked_set,,-}Swap Marked" s { swap-window } '' Kill X { kill-window } Respawn R { respawn-window -k } "#{?pane_marked,Unmark,Mark}" m { select-pane -m } Rename n { command-prompt -F -I "#W" { rename-window -t "#{window_id}" "%%" } } '' "New After" w { new-window -a } "New At End" W { new-window }
+bind-key  -T root M-MouseDown3StatusLeft    run-shell -C "display-menu -t= -xM -yW -T '#[align=centre]#{session_name}'  #{S/t:#{?#{&&:#{<:#{loop_index},6},#{!:#{session_active}}},'Switch To #[underscore]#{session_name}' '' {switch-client -t=#{session_id}#} ,}} '' 'Renumber' 'N' {move-window -r} 'Rename' 'r' {command-prompt -I '#S' {rename-session -- '%%'}} 'Detach' 'd' {detach-client} '' 'New Session' 's' {new-session} 'New Window' 'w' {new-window}"
+bind-key  -T root M-MouseDown3Empty         display-menu -T "#[align=centre]#{window_index}:#{window_name}" -t = -x M -y M "New Pane" p { new-pane ; join-pane } "New Window" w { new-window }
+bind-key  -T root M-MouseDrag1Pane          move-pane -M
+bind-key  -T root M-MouseDrag1Border        move-pane -M
+bind-key  -T root C-MouseDown1Status        swap-window -t @
+bind-key  -T root C-MouseDrag1Pane          new-pane -M
+bind-key  -T root C-MouseDrag1Empty         new-pane -M
+# list-keys -N
+C-b Tab     Switch to a window
+C-b Space   Select next layout
+C-b !       Break pane to a new window
+C-b "       Split window vertically
+C-b #       List all paste buffers
+C-b $       Rename current session
+C-b %       Split window horizontally
+C-b &       Kill current window
+C-b '       Prompt for window index to select
+C-b (       Switch to previous client
+C-b )       Switch to next client
+C-b *       New floating pane
+C-b ,       Rename current window
+C-b -       Delete the most recent paste buffer
+C-b .       Move the current window
+C-b /       Describe key binding
+C-b 0       Select window 0
+C-b 1       Select window 1
+C-b 2       Select window 2
+C-b 3       Select window 3
+C-b 4       Select window 4
+C-b 5       Select window 5
+C-b 6       Select window 6
+C-b 7       Select window 7
+C-b 8       Select window 8
+C-b 9       Select window 9
+C-b :       Prompt for a command
+C-b ;       Move to the previously active pane
+C-b <       Display window menu
+C-b =       Choose a paste buffer from a list
+C-b >       Display pane menu
+C-b ?       List key bindings
+C-b @       Toggle pane between floating and tiled
+C-b C       Customize options
+C-b D       Choose and detach a client from a list
+C-b E       Spread panes out evenly
+C-b L       Switch to the last client
+C-b M       Clear the marked pane
+C-b T       Change the pane title
+C-b [       Enter copy mode
+C-b ]       Paste the most recent paste buffer
+C-b c       Create a new window
+C-b d       Detach the current client
+C-b f       Search for a pane
+C-b g       Move a floating pane
+C-b i       Display window information
+C-b l       Select the previously current window
+C-b m       Toggle the marked pane
+C-b n       Select the next window
+C-b o       Select the next pane
+C-b p       Select the previous window
+C-b q       Display pane numbers
+C-b r       Redraw the current client
+C-b s       Choose a session from a list
+C-b t       Show a clock
+C-b w       Choose a window from a list
+C-b x       Kill the active pane
+C-b z       Zoom the active pane
+C-b {       Swap the active pane with the pane above
+C-b }       Swap the active pane with the pane below
+C-b ~       Show messages
+C-b DC      Reset so the visible part of the window follows the cursor
+C-b PPage   Enter copy mode and scroll up
+C-b BTab    Switch to a session
+C-b Up      Select the pane above the active pane
+C-b Down    Select the pane below the active pane
+C-b Left    Select the pane to the left of the active pane
+C-b Right   Select the pane to the right of the active pane
+C-b M-1     Set the even-horizontal layout
+C-b M-2     Set the even-vertical layout
+C-b M-3     Set the main-horizontal layout
+C-b M-4     Set the main-vertical layout
+C-b M-5     Select the tiled layout
+C-b M-6     Set the main-horizontal-mirrored layout
+C-b M-7     Set the main-vertical-mirrored layout
+C-b M-n     Select the next window with an alert
+C-b M-o     Rotate through the panes in reverse
+C-b M-p     Select the previous window with an alert
+C-b M-Up    Resize the pane up by 5
+C-b M-Down  Resize the pane down by 5
+C-b M-Left  Resize the pane left by 5
+C-b M-Right Resize the pane right by 5
+C-b C-b     Send the prefix key
+C-b C-o     Rotate through the panes
+C-b C-z     Suspend the current client
+C-b C-Up    Resize the pane up
+C-b C-Down  Resize the pane down
+C-b C-Left  Resize the pane left
+C-b C-Right Resize the pane right
+C-b S-Up    Move the visible part of the window up
+C-b S-Down  Move the visible part of the window down
+C-b S-Left  Move the visible part of the window left
+C-b S-Right Move the visible part of the window right

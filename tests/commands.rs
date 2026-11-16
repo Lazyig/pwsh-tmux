@@ -519,14 +519,19 @@ fn keys_config_and_capture() {
     let conf = std::env::temp_dir().join(format!("pt-conf-{}.conf", std::process::id()));
     std::fs::write(
         &conf,
-        "# comment\nset -g @conf loaded\nbind -n F5 { set -g @f5 pressed ; display done }\nset -g status-right '#[fg=yellow]%H:%M'\n%if #{==:#{host},#{host}}\nset -g @cond yes\n%endif\n",
+        "# comment\nset -g @conf loaded\nbind -n F5 { set -g @f5 pressed ; display done }\nbind -T mytab z if -F 1 { display a } 'display b'\nbind -T mytab y display-menu -T x A a {send -X history-top} B b { new-window }\nset -g status-right '#[fg=yellow]%H:%M'\n%if #{==:#{host},#{host}}\nset -g @cond yes\n%endif\n",
     )
     .unwrap();
     ctx.ok(&["source-file", &conf.to_string_lossy()]);
     let _ = std::fs::remove_file(&conf);
     assert_eq!(ctx.fmt("k", "#{@conf} #{@cond}"), "loaded yes");
-    // bindings are parsed when bound, so list-keys prints the canonical command
-    assert!(ctx.ok(&["list-keys", "-T", "root", "F5"]).contains("set-option -g @f5 pressed"));
+    // list-keys prints the parsed command list: full names, " \; " between commands
+    assert!(ctx.ok(&["list-keys", "-T", "root", "F5"]).contains("set-option -g @f5 pressed \\; display-message done"));
+    // blocks among bind-key's arguments stay blocks
+    assert_eq!(
+        ctx.ok(&["list-keys", "-T", "mytab"]),
+        "bind-key  -T mytab y display-menu -T x A a { send-keys -X history-top } B b { new-window }\nbind-key  -T mytab z if-shell -F 1 { display-message a } \"display b\"\n"
+    );
     ctx.fails(&["source-file", "/no/such/file.conf"]);
     ctx.ok(&["source-file", "-q", "/no/such/file.conf"]);
     // #{current_file} and assignments used by the next lines, as theme plugins
@@ -1734,4 +1739,144 @@ fn global_colour_flags_accumulate_in_both_orders() {
         child.stdin.take().unwrap().write_all(b"\n").unwrap();
         wait_for("control client exit", || child.try_wait().unwrap().is_some());
     }
+}
+
+#[test]
+fn display_defaults_match_tmux_38_source() {
+    // The bindings fixture is the key-bindings.c string array with DEFAULT_* macros
+    // expanded, with only the delegated floating/switch-mode bindings excluded.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    #[cfg(unix)]
+    {
+        let fixture = root.join("src/server/display-defaults.conf");
+        let reference = root.join("../ref/tmux-3.8/key-bindings.c");
+        if reference.exists() {
+            let generated = std::process::Command::new("python3").arg("tools/extract-display-defaults.py").arg(reference).output().unwrap();
+            assert!(generated.status.success());
+            assert_eq!(generated.stdout, std::fs::read(&fixture).unwrap(), "regenerate the fixture from tmux 3.8");
+        }
+    }
+    // list-keys of a tmux 3.8 server started with -f /dev/null
+    let expected = std::fs::read_to_string(root.join("tests/fixtures/tmux38-default-keys.txt")).unwrap();
+    let mut sections: Vec<Vec<&str>> = Vec::new();
+    for l in expected.lines() {
+        if l.starts_with('#') { sections.push(Vec::new()) } else { sections.last_mut().unwrap().push(l) }
+    }
+    let ctx = Ctx::new("display-defaults");
+    ctx.ok(&["new-session", "-d", "-s", "s"]);
+    let actual = [ctx.ok(&["list-keys", "-T", "prefix"]), ctx.ok(&["list-keys", "-T", "root"]), ctx.ok(&["list-keys", "-N"])];
+    // Bindings of the floating pane (and switch-mode) packages; the floating
+    // commands' flags are needed to print the default menus' floating items.
+    const DELEGATED: &[&str] = &["Tab", "BTab", "*", "@", "g", "M-Up", "M-Left", "C-Up", "C-Left", "MouseDown1Control7",
+        "M-MouseDrag1Pane", "M-MouseDrag1Border", "C-MouseDrag1Pane", "C-MouseDrag1Empty"];
+    let floating = !ctx.ok(&["list-commands", "new-pane"]).trim().is_empty();
+    let key = |l: &str| -> String {
+        let w: Vec<&str> = l.split_whitespace().collect();
+        if w[0] == "bind-key" { w[if w[1] == "-r" { 4 } else { 3 }].to_string() } else { w[1].to_string() }
+    };
+    for (want, got) in sections.iter().zip(&actual) {
+        let want: Vec<&str> = want.iter().copied().filter(|l| !DELEGATED.contains(&key(l).as_str())).collect();
+        let got: Vec<&str> = got.lines().filter(|l| !DELEGATED.contains(&key(l).as_str())).collect();
+        assert_eq!(want.iter().map(|l| key(l)).collect::<Vec<_>>(), got.iter().map(|l| key(l)).collect::<Vec<_>>());
+        for (w, g) in want.iter().zip(&got) {
+            if floating || !(w.contains("new-pane") || w.contains("move-pane -P")) {
+                assert_eq!(w, g);
+            }
+        }
+    }
+    let prefix = &actual[0];
+    assert!(prefix.contains("bind-key    -T prefix T       command-prompt -I \"#T\" { select-pane -T \"%%\" }"), "{prefix}");
+    assert!(actual[1].contains("'Detach' 'd' {detach-client}"));
+    assert!(ctx.ok(&["list-keys", "-T", "root", "MouseDown3Pane"]).contains("Paste #[underscore]#{=/9/...:buffer_sample},}"));
+}
+
+#[test]
+fn display_formats_see_the_top_buffer_and_drop_list_markers() {
+    let ctx = Ctx::new("display-buffer-vars");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "80", "-y", "24"]);
+    assert_eq!(ctx.fmt("s", "[#{buffer_size}]"), "[]");
+    // format_defaults: buffer_* describe the most recent automatic buffer
+    ctx.ok(&["set-buffer", "hello buffer"]);
+    ctx.ok(&["set-buffer", "-b", "named", "not automatic"]);
+    assert_eq!(ctx.fmt("s", "#{buffer_size}:#{buffer_sample}:#{buffer_name}"), "12:hello buffer:buffer0");
+    assert_eq!(ctx.fmt("s", "#{?#{&&:#{buffer_size},#{!:#{pane_in_mode}}},Paste,}"), "Paste");
+}
+
+#[test]
+fn display_layout_options_and_session_styles() {
+    let ctx = Ctx::new("display-layouts");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "120", "-y", "50"]);
+    for _ in 0..5 { ctx.ok(&["split-window", "-h", "-t", "s"]); ctx.ok(&["select-layout", "-t", "s", "tiled"]); }
+    ctx.ok(&["setw", "-t", "s", "tiled-layout-max-columns", "1"]);
+    ctx.ok(&["select-layout", "-t", "s", "tiled"]);
+    let rows = ctx.ok(&["list-panes", "-t", "s", "-F", "#{pane_left}:#{pane_width}"]);
+    assert!(rows.lines().all(|s| s == "0:120"), "{rows}");
+    ctx.ok(&["setw", "-t", "s", "main-pane-width", "30%"]);
+    ctx.ok(&["setw", "-t", "s", "other-pane-width", "25%"]);
+    ctx.ok(&["select-layout", "-t", "s", "main-vertical"]);
+    assert_eq!(ctx.fmt("s.0", "#{pane_width}"), "90");
+    ctx.ok(&["setw", "-t", "s", "main-pane-height", "10"]);
+    ctx.ok(&["setw", "-t", "s", "other-pane-height", "20%"]);
+    ctx.ok(&["select-layout", "-t", "s", "main-horizontal"]);
+    assert_eq!(ctx.fmt("s.0", "#{pane_height}"), "40");
+    // a size over the available space is invalid and the default 24 is used
+    ctx.ok(&["setw", "-t", "s", "main-pane-height", "100"]);
+    ctx.ok(&["setw", "-t", "s", "other-pane-height", "0"]);
+    ctx.ok(&["select-layout", "-t", "s", "main-horizontal"]);
+    assert_eq!(ctx.fmt("s.0", "#{pane_height}"), "24");
+    ctx.ok(&["setw", "-t", "s", "session-status-style", "fg=red"]);
+    ctx.ok(&["setw", "-t", "s", "session-status-current-style", "bold"]);
+    assert_eq!(ctx.fmt("s", "#{E:session-status-style}/#{E:session-status-current-style}"), "fg=red/bold");
+}
+
+#[test]
+fn remain_on_exit_format_is_styled_on_bottom_line_and_empty_is_silent() {
+    let ctx = Ctx::new("display-dead");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "60", "-y", "10"]);
+    ctx.ok(&["set", "-p", "-t", "s", "remain-on-exit", "on"]);
+    ctx.ok(&["set", "-p", "-t", "s", "remain-on-exit-format", "#[fg=red]EXIT=#{pane_dead_status}"]);
+    ctx.ok(&["respawn-pane", "-k", "-t", "s", "sh", "-c", "exit 7"]);
+    wait_for("dead pane", || ctx.fmt("s", "#{pane_dead}") == "1");
+    let captured = ctx.ok(&["capture-pane", "-pe", "-t", "s"]);
+    assert!(captured.lines().last().unwrap().contains("EXIT=7"), "{captured:?}");
+    assert!(!captured.contains("#[fg="));
+    assert!(captured.contains("\x1b["));
+    ctx.ok(&["set", "-p", "-t", "s", "remain-on-exit-format", ""]);
+    ctx.ok(&["respawn-pane", "-k", "-t", "s", "sh", "-c", "printf marker; exit 0"]);
+    // the exit can be seen before the pane's last output is read
+    wait_for("empty dead format", || ctx.fmt("s", "#{pane_dead}") == "1" && ctx.capture("s").starts_with("marker"));
+    let captured = ctx.capture("s");
+    assert!(captured.starts_with("marker"), "{captured:?}");
+    assert!(!captured.contains("Pane is dead"));
+}
+
+#[cfg(unix)]
+#[test]
+fn pane_dead_signal_and_status_like_tmux_3_8() {
+    let ctx = Ctx::new("dead-signal");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "80", "-y", "24"]);
+    ctx.wait_prompt("s");
+    ctx.ok(&["set", "-g", "remain-on-exit", "on"]);
+    ctx.ok(&["new-window", "-d", "-n", "k", "-t", "s", "kill -TERM $$"]);
+    ctx.ok(&["new-window", "-d", "-n", "e", "-t", "s", "exit 7"]);
+    let f = "#{pane_dead}:[#{pane_dead_status}]:[#{pane_dead_signal}]";
+    wait_for("dead panes", || ctx.fmt("s:k", "#{pane_dead}") == "1" && ctx.fmt("s:e", "#{pane_dead}") == "1");
+    assert_eq!(ctx.fmt("s:k", f), "1:[]:[15]");
+    assert_eq!(ctx.fmt("s:e", f), "1:[7]:[]");
+    wait_for("default format", || ctx.capture("s:k").contains("Pane is dead (signal 15, "));
+}
+
+#[test]
+fn zoom_keeps_hidden_panes_beside_their_left_scrollbars() {
+    let ctx = Ctx::new("zoom-sb-left");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "80", "-y", "24", "sleep 300"]);
+    ctx.ok(&["split-window", "-h", "-t", "s", "sleep 300"]);
+    ctx.ok(&["split-window", "-v", "-t", "s", "sleep 300"]);
+    ctx.ok(&["set", "-g", "pane-scrollbars", "on"]);
+    ctx.ok(&["set", "-g", "pane-scrollbars-position", "left"]);
+    let g = "#{P:#{pane_index}=#{pane_width}x#{pane_height}+#{pane_left}+#{pane_top} }";
+    let before = ctx.fmt("s", g);
+    assert_eq!(before, "0=39x24+1+0 1=38x12+42+0 2=38x11+42+13 ");
+    ctx.ok(&["resize-pane", "-Z", "-t", "s:0.0"]);
+    assert_eq!(ctx.fmt("s", g), "0=79x24+1+0 1=38x12+42+0 2=38x11+42+13 ");
 }

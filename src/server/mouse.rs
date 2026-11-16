@@ -40,12 +40,17 @@ pub struct MouseCtx {
     /// First row of the status lines and how many there are (m->statusat, m->statuslines).
     pub statusat: Option<u16>,
     pub statuslines: u16,
+    /// The row of the scrollbar slider under the mouse (sl_mpos).
+    pub slider_mpos: u16,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Where {
     Pane,
     Border,
+    ScrollbarUp,
+    ScrollbarDown,
+    ScrollbarSlider,
     Status,
     StatusLeft,
     StatusRight,
@@ -59,6 +64,9 @@ impl Where {
         match self {
             Where::Pane => "Pane",
             Where::Border => "Border",
+            Where::ScrollbarUp => "ScrollbarUp",
+            Where::ScrollbarDown => "ScrollbarDown",
+            Where::ScrollbarSlider => "ScrollbarSlider",
             Where::Status => "Status",
             Where::StatusLeft => "StatusLeft",
             Where::StatusRight => "StatusRight",
@@ -90,11 +98,45 @@ impl Server {
         if self.client_is_readonly(Some(cid)) {
             return;
         }
+        // like a key, a mouse event clears a message unless display -N
+        // (server_client_handle_key)
+        if let Some(c) = self.clients.get_mut(&cid) {
+            if c.message.is_some() {
+                if c.message_ignore_keys {
+                    return;
+                }
+                c.message = None;
+                c.dirty = true;
+            }
+        }
         if self.mouse_overlay(cid, &m) {
             return;
         }
-        if self.clients.get(&cid).is_none_or(|c| c.prompt.is_some()) {
+        // the prompt takes button 1 presses on its line; other events go on
+        if self.clients.get(&cid).is_some_and(|c| c.prompt.is_some()) && self.prompt_mouse(cid, &m) {
             return;
+        }
+        // an open pane prompt takes all mouse events
+        if let Some(pane) = self.pane_prompt_target(cid) {
+            self.pane_prompt_mouse(cid, pane, &m);
+            return;
+        }
+        if let Some(sid) = self.client_session(cid) {
+            let wid = self.sessions[&sid].active_window();
+            let oy = if self.opt_session(Some(sid), "status-position") == "top" { self.status_lines(Some(sid)) } else { 0 };
+            // server_client_update_scrollbar_hover: moving over the scrollbar
+            // area (width + pad) shows it, any other movement restarts the timer
+            // of a visible one; it hides on the timer even while hovered
+            for (pane, r) in self.rects(wid).0 {
+                if m.kind != MouseKind::Move { break; }
+                let Some(sb) = self.pane_scrollbar(wid, pane, r) else { continue };
+                let total = (sb.width + sb.pad).min(r.w);
+                let x0 = if sb.left { r.x } else { r.right() - total };
+                let hover = m.x >= x0 && m.x < x0 + total && m.y >= oy + sb.y && m.y < oy + sb.y + sb.height;
+                if hover || self.panes[&pane].scrollbar_until.is_some() {
+                    self.show_scrollbar(pane);
+                }
+            }
         }
         self.mouse_event(cid, m, last, false);
     }
@@ -197,6 +239,12 @@ impl Server {
             }
         };
         let Some((wh, mut ctx)) = self.mouse_where(cid, x, y) else { return };
+        // a slider drag keeps the point of the slider it started on
+        if wh == Where::ScrollbarSlider {
+            if let Some(c) = self.clients.get_mut(&cid).filter(|c| !matches!(c.drag, Some(Drag { kind: DragKind::Scrollbar { .. } }))) {
+                c.slider_mpos = ctx.slider_mpos;
+            }
+        }
         ctx.x = m.x;
         ctx.y = m.y;
         ctx.lx = lx;
@@ -286,6 +334,20 @@ impl Server {
         if x > w.sx || py > w.sy {
             return None;
         }
+        for (pane, r) in self.rects(wid).0 {
+            // a hidden auto-hide bar takes no clicks (window_pane_scrollbar_visible)
+            if let Some(sb) = self.pane_scrollbar(wid, pane, r).filter(|sb| sb.visible) {
+                if x >= sb.x && x < sb.x + sb.width && py >= sb.y && py < sb.y + sb.height {
+                    ctx.pane = Some(pane);
+                    let y = py - sb.y;
+                    let where_ = if y < sb.slider_y { Where::ScrollbarUp } else if y >= sb.slider_y + sb.slider_h { Where::ScrollbarDown } else { Where::ScrollbarSlider };
+                    if where_ == Where::ScrollbarSlider {
+                        ctx.slider_mpos = y - sb.slider_y;
+                    }
+                    return Some((where_, ctx));
+                }
+            }
+        }
         let rects: Vec<(PaneId, Rect)> = self.rects(wid).0.into_iter().map(|(p, r)| (p, self.content_rect(wid, r))).collect();
         // window_get_active_at: the pane including its right and bottom border
         let (pane, r) = *rects.iter().find(|(_, r)| x >= r.x && x <= r.right() && py >= r.y && py <= r.bottom())?;
@@ -344,7 +406,7 @@ impl Server {
                         let qctx = Ctx { client: Some(cid), pane: fs_pane, mouse: Some(ctx), from_key: true, ..Ctx::default() };
                         self.run_queue(Queue { cmds: cmds.into(), ctx: qctx, soft: 0 });
                     }
-                    Err(e) => self.set_message(cid, &e),
+                    Err(e) => self.set_error(cid, &e),
                 }
                 return;
             }
@@ -467,8 +529,12 @@ impl Server {
     }
 
     fn mouse_drag_update(&mut self, cid: ClientId, m: &MouseCtx) {
+        if let Some(Drag { kind: DragKind::Scrollbar { pane } }) = self.clients.get(&cid).and_then(|c| c.drag.as_ref()) {
+            self.scrollbar_to_mouse(cid, *pane, m);
+            return;
+        }
         match self.clients.get(&cid).and_then(|c| c.drag.as_ref()).map(|d| match d.kind {
-            DragKind::Border => None,
+            DragKind::Border | DragKind::Scrollbar { .. } => None,
             DragKind::Copy { pane } => Some(pane),
         }) {
             Some(None) => self.border_drag_update(cid, m),
@@ -633,6 +699,74 @@ impl Server {
         }
     }
 
+    /// Position of a menu of `w` x `h` (tmux 3.8 cmd_display_menu_get_menu_pos): menus
+    /// belong to the window, so -x/-y are window coordinates kept inside the window;
+    /// the result is moved below a status line at the top. None when it does not fit
+    /// on the client.
+    #[allow(clippy::too_many_arguments)]
+    pub fn menu_position(&self, cid: ClientId, t: vars::Target, m: Option<&MouseCtx>, xarg: Option<&str>, yarg: Option<&str>, w: u16, h: u16) -> Option<(u16, u16)> {
+        let c = self.clients.get(&cid)?;
+        if w > c.size.0 || h > c.size.1 {
+            return None;
+        }
+        // without a window (no session) the client is the area, as for popups
+        let Some(win) = t.wid.and_then(|w| self.windows.get(&w)) else {
+            return self.overlay_position(cid, t, m, xarg, yarg, w, h);
+        };
+        let (wsx, wsy, w, h) = (win.sx as i64, win.sy as i64, w as i64, h as i64);
+        let (max_x, max_y) = ((wsx - w).max(0), (wsy - h).max(0));
+        let sid = c.session;
+        let lines = self.status_lines(sid).min(c.size.1.saturating_sub(1)) as i64;
+        let at_top = self.opt_session(sid, "status-position") == "top";
+        let mut v: HashMap<String, String> = HashMap::new();
+        let mut set = |k: &str, n: i64| {
+            v.insert(k.to_string(), n.to_string());
+        };
+        let mouse = m.map(|m| {
+            let y = match m.statusat {
+                Some(0) => (m.y as i64 - m.statuslines as i64).max(0),
+                Some(at) if m.y >= at => wsy.min(c.size.1 as i64 - lines) - 1,
+                _ => m.y as i64,
+            };
+            (m.x as i64, y)
+        });
+        if let Some((mx, my)) = mouse {
+            set("popup_mouse_x", mx);
+            set("popup_mouse_y", my);
+        }
+        if lines > 0 {
+            let found = c.status_ranges.iter().any(|tags| tags.iter().any(|r| matches!(r, Some(Range::Window(i)) if Some(*i) == t.idx)));
+            if let Some(x) = c.status_ranges.iter().find_map(|tags| tags.iter().position(|r| matches!(r, Some(Range::Window(i)) if Some(*i) == t.idx))).filter(|_| found) {
+                set("popup_window_status_line_x", x as i64);
+                set("popup_window_status_line_y", if at_top { h } else { wsy });
+            }
+            set("popup_status_line_y", if at_top { h } else { wsy });
+        }
+        set("popup_width", w);
+        set("popup_height", h);
+        set("popup_centre_x", ((wsx - 1) / 2 - w / 2).max(0));
+        let n = (wsy - 1) / 2 + h / 2;
+        set("popup_centre_y", if n >= wsy { max_y } else { n });
+        if let Some((mx, my)) = mouse {
+            set("popup_mouse_centre_x", (mx - w / 2).max(0));
+            let n = my - h / 2;
+            set("popup_mouse_centre_y", if n + h >= wsy { max_y } else { n });
+            set("popup_mouse_top", (my + h).min(wsy - 1));
+            set("popup_mouse_bottom", (my - h).max(0));
+        }
+        if let Some(r) = t.pane.and_then(|p| self.pane_rect(p)) {
+            let n = r.y as i64 + h;
+            set("popup_pane_top", if n >= wsy { max_y } else { n });
+            set("popup_pane_bottom", r.bottom() as i64);
+            set("popup_pane_left", r.x as i64);
+            set("popup_pane_right", (r.right() as i64 - w).max(0));
+        }
+        let x = strtol(&self.expand_extra(t, Some(cid), position_format(xarg, true), v.clone())).clamp(0, max_x);
+        let y = strtol(&self.expand_extra(t, Some(cid), position_format(yarg, false), v));
+        let y = if y < h { 0 } else { y - h }.clamp(0, max_y);
+        Some((x as u16, (y + if at_top { lines } else { 0 }) as u16))
+    }
+
     /// Position of a menu or popup of `w` x `h` (cmd_display_menu_get_pos); None when it
     /// does not fit on the client.
     #[allow(clippy::too_many_arguments)]
@@ -686,34 +820,13 @@ impl Server {
             set("popup_pane_left", r.x as i64);
             set("popup_pane_right", (r.right() as i64 - w).max(0));
         }
-        let strtol = |s: &str| -> i64 {
-            let s = s.trim_start();
-            let end = s.char_indices().find(|(i, ch)| !(ch.is_ascii_digit() || (*i == 0 && (*ch == '-' || *ch == '+')))).map_or(s.len(), |(i, _)| i);
-            s[..end].parse().unwrap_or(0)
-        };
-        let xf = match xarg {
-            None | Some("C") => "#{popup_centre_x}",
-            Some("R") => "#{popup_pane_right}",
-            Some("P") => "#{popup_pane_left}",
-            Some("M") => "#{popup_mouse_centre_x}",
-            Some("W") => "#{popup_window_status_line_x}",
-            Some(other) => other,
-        };
-        let mut x = strtol(&self.expand_extra(t, Some(cid), xf, v.clone()));
+        let mut x = strtol(&self.expand_extra(t, Some(cid), position_format(xarg, true), v.clone()));
         if x + w >= sx {
             x = sx - w;
         } else if x < 0 {
             x = 0;
         }
-        let yf = match yarg {
-            None | Some("C") => "#{popup_centre_y}",
-            Some("P") => "#{popup_pane_bottom}",
-            Some("M") => "#{popup_mouse_top}",
-            Some("S") => "#{popup_status_line_y}",
-            Some("W") => "#{popup_window_status_line_y}",
-            Some(other) => other,
-        };
-        let mut y = strtol(&self.expand_extra(t, Some(cid), yf, v));
+        let mut y = strtol(&self.expand_extra(t, Some(cid), position_format(yarg, false), v));
         y = if y < h { 0 } else { y - h };
         if y + h >= sy {
             y = sy - h;
@@ -746,6 +859,8 @@ impl Server {
             if c.overlay.is_none() {
                 mode = if self.windows[&wid].panes().iter().any(|p| pane_mode(*p) == 1003) { 1003 } else { 0 };
             }
+            // focus-follows-mouse and modal/auto-hide scrollbars need movement, overlay or not
+            if self.opt_session_on(Some(sid), "focus-follows-mouse") || matches!(self.opt_window(Some(wid), "pane-scrollbars").as_str(), "auto-hide" | "modal") { mode = 1003; }
             if mode != 1003 {
                 mode = 1002;
             }
@@ -946,4 +1061,30 @@ mod tests {
         assert_eq!(super::super::strip_delay(&v(&["run-shell", "-d0.5", "-c", "/d", "echo -d"])), v(&["run-shell", "-c", "/d", "echo -d"]));
         assert_eq!(super::super::strip_delay(&v(&["run-shell", "-t", "%1", "-d", "2", "x"])), v(&["run-shell", "-t", "%1", "x"]));
     }
+}
+
+/// The format a display-menu/display-popup -x or -y letter stands for.
+fn position_format(arg: Option<&str>, x: bool) -> &str {
+    match (arg, x) {
+        (None | Some("C"), true) => "#{popup_centre_x}",
+        (None | Some("C"), false) => "#{popup_centre_y}",
+        (Some("R"), true) => "#{popup_pane_right}",
+        (Some("P"), true) => "#{popup_pane_left}",
+        (Some("P"), false) => "#{popup_pane_bottom}",
+        (Some("M"), true) => "#{popup_mouse_centre_x}",
+        (Some("M"), false) => "#{popup_mouse_top}",
+        (Some("L"), true) => "#{popup_last_x}",
+        (Some("L"), false) => "#{popup_last_y}",
+        (Some("S"), false) => "#{popup_status_line_y}",
+        (Some("W"), true) => "#{popup_window_status_line_x}",
+        (Some("W"), false) => "#{popup_window_status_line_y}",
+        (Some(other), _) => other,
+    }
+}
+
+/// strtol(3) of an expanded position: leading digits, 0 if none.
+fn strtol(s: &str) -> i64 {
+    let s = s.trim_start();
+    let end = s.char_indices().find(|(i, ch)| !(ch.is_ascii_digit() || (*i == 0 && (*ch == '-' || *ch == '+')))).map_or(s.len(), |(i, _)| i);
+    s[..end].parse().unwrap_or(0)
 }
