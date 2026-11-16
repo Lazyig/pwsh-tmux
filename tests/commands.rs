@@ -1151,9 +1151,9 @@ fn display_defaults_match_tmux_38_source() {
     // The bindings fixture is the key-bindings.c string array with DEFAULT_* macros
     // expanded, with only the delegated floating/switch-mode bindings excluded.
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let fixture = root.join("src/server/display-defaults.conf");
     #[cfg(unix)]
     {
+        let fixture = root.join("src/server/display-defaults.conf");
         let reference = root.join("../ref/tmux-3.8/key-bindings.c");
         if reference.exists() {
             let generated = std::process::Command::new("python3").arg("tools/extract-display-defaults.py").arg(reference).output().unwrap();

@@ -2,6 +2,10 @@
 
 Implemented:
 
+- Messages: `display-time 0` and `display -d 0` wait for a key; any key clears a message and is then handled; `display -N` with a timer ignores keys.
+- Command prompt editing follows tmux 3.8 prompt.c: vi translation (prompt_translate_key), word motions with `word-separators` (w/e/b/W/E/B, M-f/M-b, C-Left/C-Right, C-w), C-v quoting, history Down to an empty line, C-u/C-k not filling the C-y text.
+- `display-menu` returns without waiting for the menu (3.8); `-b`/`-s`/`-S`/`-H` for menus and `-b`/`-s`/`-S` for popups; menu item names are drawn as formats.
+- Format `buffer_*` variables describe the top automatic buffer outside buffer lists (default pane menu Paste item); `list=left-marker`/`right-marker` text is not drawn.
 - Messages and prompts use `message-format`, `message-line`, `message-style` fill/width/alignment and vi command-mode `message-command-style`. Unfilled formats preserve the underlying status cells. Prompt input scrolls horizontally; `status-keys` selects emacs or vi editing, including Escape's cursor-left transition. Session status style options remain available through the existing format-option lookup.
 - `fill-character` expands with `is_inside` for both window and extra client areas, including the default ACS outside character.
 - Menu/popup border line choices; pane border colour/arrows/both indicators.
@@ -9,7 +13,7 @@ Implemented:
 - Layout maximum tiled columns and other-pane width/height, including percentage main/other dimensions and mirrored layouts.
 - `wrap-search` lookup on copy-mode entry, search commands, keyboard actions and incremental search. Small CopyMode additions provide the wrap guard and scrollbar history/position helpers.
 - Dead-pane format text is formatted and written at the bottom with the cursor hidden; an empty format writes no text.
-- Clock seconds styles and visible glyphs on terminals that ignore colour escapes.
+- Clock seconds styles and visible glyphs on terminals that ignore colour escapes; the clock clears its pane, uses strftime's ` 1:02 PM` 12-hour text and centres the small fallback.
 - 109 prefix/root defaults extracted from tmux 3.8 C, with all three default menus, session Detach, pane Paste and prefix T. The regression test checks fixture regeneration against the local C source when available, then compares complete list-keys command and note dumps against source-file loading of that fixture.
 
 Delegated, as requested:
@@ -22,6 +26,8 @@ Delegated, as requested:
 Shared files touched:
 
 - `src/cmdparse.rs`: recognize compact `{command}` blocks required by the reference default menus.
+- `src/format.rs`: list marker text dropped in spans (format package file, minimal change).
+- `src/server/vars.rs`: top-buffer fallback for `buffer_*` (format package file, minimal change).
 - `src/copymode.rs`: search wrap guard and two scrollbar position helpers only; no key table changes.
 - `src/layout.rs`: option-aware preset builder and layout tests.
 - `src/server/cmds.rs`: layout/scrollbar/popup option wiring and prompt initialization.
@@ -37,5 +43,12 @@ New files: `src/server/display.rs`, `src/server/display-defaults.conf`, `tools/e
 Validation (all cargo commands use `CARGO_BUILD_JOBS=2`):
 
 - Windows: `cargo check --target x86_64-pc-windows-gnu --tests` passed.
-- Linux: `cargo test --release --no-fail-fast` completed: 244 unit tests passed; commands 35 passed with only known `format_loops_and_utf8_length` failing; interactive 15 passed with only known `readonly_terminal_blocks_keys_paste_mouse_and_shared_resize` failing; attach 3 passed; SSH 1 passed; UI recording 1 ignored. All new display regressions passed.
-- Reference behaviour was derived from the supplied tmux 3.8 C/man sources; the reference pod was unavailable as stated in the assignment.
+- Linux: `cargo test --release --no-fail-fast`: 249 unit tests passed; commands 36 passed with only known `format_loops_and_utf8_length` failing; interactive 19 passed with only known `readonly_terminal_blocks_keys_paste_mouse_and_shared_resize` failing; attach 3, SSH 1 passed; UI recording 1 ignored.
+- Compared live against tmux 3.8 in the reference pod (nested outer/inner client scenarios in the scratchpad `vd/` directory): layouts, borders/indicators, fill-character, scrollbars, messages, prompt editing, menus/popups, clock, dead panes, wrap-search and list-keys. Remaining differences belong to other packages (see below) or are terminal capture noise.
+
+Known differences left to other packages:
+
+- Copy mode: `page-up` scrolls by height-2 in tmux (scrollbar clicks too), search leaves the cursor at the match end, `copy-mode-position-format` shows the line time, `send -X` outside a mode is not an error here.
+- Input/terminal: `clear` does not push the screen into history (`scroll-on-clear`).
+- Modes: choose-tree drawing; help list lacks the delegated Tab/BTab/*/@/g bindings.
+- 3.8 "menus belong to the window" (shown on all clients) is not implemented; menus stay per client.
