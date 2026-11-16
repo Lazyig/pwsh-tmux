@@ -661,3 +661,24 @@ fn customize_mode_toggles_cycles_appends_and_describes() {
     t.send(b"\x1b[H\x1b[B\x1b[C");
     t.wait_screen("changed elements", |s| s.contains("zz=display hi") && !s.contains("command-alias[0]"));
 }
+
+#[test]
+fn pane_mode_hooks_fire_like_window_fire_pane_mode_changed() {
+    let ctx = Ctx::new("mode-hooks");
+    let _t = start(&ctx, "mh");
+    ctx.ok(&["set-hook", "-g", "pane-mode-entered", "set -ga @e e"]);
+    ctx.ok(&["set-hook", "-g", "pane-mode-exited", "set -ga @x x"]);
+    ctx.ok(&["set-hook", "-g", "pane-mode-changed", "set -ga @c +"]);
+    let v = |n: &str| ctx.cmd(&["show", "-gv", n]).1.trim().to_string();
+    ctx.ok(&["clock-mode", "-t", "mh"]);
+    ctx.ok(&["choose-tree", "-t", "mh"]);
+    wait_for("entered", || v("@e") == "ee" && v("@c") == "++");
+    // copy-mode -q leaves every mode: exited and changed for each
+    ctx.ok(&["copy-mode", "-q", "-t", "mh"]);
+    wait_for("exited", || v("@x") == "xx" && v("@c") == "++++");
+    // a mode further down the stack raised to the top counts as entered again
+    ctx.ok(&["clock-mode", "-t", "mh"]);
+    ctx.ok(&["choose-tree", "-t", "mh"]);
+    ctx.ok(&["clock-mode", "-t", "mh"]);
+    wait_for("raised", || v("@e") == "eeeee");
+}

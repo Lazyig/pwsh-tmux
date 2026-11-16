@@ -999,6 +999,8 @@ impl Server {
                     }
                 }
             }
+            // window_fire_pane_mode_changed
+            self.fire_pane_mode(pane, "pane-mode-exited");
             if mode.kill_on_exit() {
                 self.kill_pane(pane);
                 return;
@@ -1006,6 +1008,15 @@ impl Server {
         }
         if let Some(wid) = self.window_of(pane) {
             self.mark_window_dirty(wid);
+        }
+    }
+
+    /// window_fire_pane_mode_changed: `event` (pane-mode-entered or pane-mode-exited), then
+    /// pane-mode-changed, for the pane.
+    fn fire_pane_mode(&mut self, pane: PaneId, event: &str) {
+        let Some(sid) = self.session_of_pane(pane).map(|x| x.0) else { return };
+        for name in [event, "pane-mode-changed"] {
+            self.run_hook(Some(sid), name, Ctx { pane: Some(pane), ..Ctx::default() });
         }
     }
 
@@ -4113,18 +4124,19 @@ impl Server {
         if let Some(wid) = self.window_of(pane) {
             self.mark_window_dirty(wid);
         }
+        self.fire_pane_mode(pane, "pane-mode-entered");
         true
     }
 
     /// Put a pane into a new mode on top of any it is in (window_pane_set_mode).
     pub fn set_pane_mode(&mut self, pane: PaneId, mode: PaneMode) {
-        if let Some(p) = self.panes.get_mut(&pane) {
-            let old = std::mem::replace(&mut p.mode, Some(mode));
-            p.mode_stack.extend(old);
-        }
+        let Some(p) = self.panes.get_mut(&pane) else { return };
+        let old = std::mem::replace(&mut p.mode, Some(mode));
+        p.mode_stack.extend(old);
         if let Some(wid) = self.window_of(pane) {
             self.mark_window_dirty(wid);
         }
+        self.fire_pane_mode(pane, "pane-mode-entered");
     }
 
     pub fn open_tree(&mut self, pane: PaneId, mut tree: Tree, zoom: bool, ctx: &Ctx) {
