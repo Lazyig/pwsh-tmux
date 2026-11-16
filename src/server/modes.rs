@@ -6,6 +6,7 @@ use crate::cells::{Cell, Color, Style};
 use unicode_width::UnicodeWidthChar;
 
 mod customize;
+mod customize_text;
 mod fuzzy;
 mod panes;
 pub mod prompt;
@@ -15,6 +16,22 @@ mod tree;
 pub use panes::{Panes, DEFAULT_TEMPLATE as PANES_DEFAULT_TEMPLATE};
 pub use switch::Switch;
 pub use tree::{Collapse, Preview, Sort, Tree, TreeKind};
+
+/// The key a byte is when sent to a mode (send-keys -H and -l): control bytes as their
+/// C- names, Enter, Tab, Escape and BSpace.
+pub fn byte_key_name(b: u8) -> String {
+    match b {
+        b'\r' => "Enter".into(),
+        b'\t' => "Tab".into(),
+        0x1b => "Escape".into(),
+        0x7f => "BSpace".into(),
+        b' ' => "Space".into(),
+        0 => "C-Space".into(),
+        1..=26 => format!("C-{}", (b'a' + b - 1) as char),
+        28..=31 => format!("C-{}", (b + 0x40) as char),
+        _ => (b as char).to_string(),
+    }
+}
 
 /// What a mode wants done after a key.
 #[derive(Debug, PartialEq)]

@@ -2723,6 +2723,10 @@ impl Server {
                 };
                 let prompts: Vec<(String, String)> = labels.into_iter().enumerate().map(|(i, l)| (l, inits.get(i).cloned().unwrap_or_default())).collect();
                 let kind = if o.has('k') { PromptKind::Key } else { PromptKind::Command };
+                let history_type = match o.get('T') {
+                    Some(ty) => input::prompt_type(ty).ok_or_else(|| format!("unknown type: {ty}"))?,
+                    None => 0,
+                };
                 // -P: the prompt belongs to the pane and is drawn over its last line; a pane
                 // has one prompt at a time, as a client has one status prompt; the two are
                 // separate (window_pane_set_prompt), so both can be open
@@ -2743,6 +2747,7 @@ impl Server {
                 if let Some(pr) = c.prompt.as_mut() {
                     pr.bspace_exit = o.has('e') && !o.has('1') && !o.has('N') && !o.has('i') && !o.has('k');
                     pr.in_pane = in_pane.is_some();
+                    pr.history_type = history_type;
                 }
                 if let Some(pane) = in_pane {
                     let pr = std::mem::replace(&mut c.prompt, saved);
@@ -2827,13 +2832,20 @@ impl Server {
                 }
                 Ok(Flow::Next)
             }
-            "clear-prompt-history" => {
-                self.prompt_history.clear();
-                Ok(Flow::Next)
-            }
-            "show-prompt-history" => {
-                for h in &self.prompt_history {
-                    ctx.out.push_str(h);
+            "clear-prompt-history" | "show-prompt-history" => {
+                let types: Vec<usize> = match o.get('T') {
+                    Some(t) => vec![input::prompt_type(t).ok_or_else(|| format!("invalid type: {t}"))?],
+                    None => (0..input::PROMPT_TYPES.len()).collect(),
+                };
+                for ty in types {
+                    if cmd == "clear-prompt-history" {
+                        self.prompt_history[ty].clear();
+                        continue;
+                    }
+                    ctx.out.push_str(&format!("History for {}:\n\n", input::PROMPT_TYPES[ty]));
+                    for (i, h) in self.prompt_history[ty].iter().enumerate() {
+                        ctx.out.push_str(&format!("{}: {h}\n", i + 1));
+                    }
                     ctx.out.push('\n');
                 }
                 Ok(Flow::Next)
@@ -3046,9 +3058,11 @@ impl Server {
                 for _ in 0..n {
                     all.extend_from_slice(&data);
                 }
-                // keys sent to a pane in copy mode are interpreted by the mode
+                // keys sent to a pane in a mode are interpreted by the mode, one key at a time
+                // (cmd_send_keys_inject_string): -H bytes and -l text, or a string that is
+                // not a key name, go as one key per character
                 let in_mode = self.panes.get(&pane).is_some_and(|p| p.mode.is_some());
-                if in_mode && !o.has('l') && !o.has('H') {
+                if in_mode {
                     // the target client (cmd_find_current_client) gets the keys: modes
                     // without a key table see none when there is no client (window_pane_key)
                     let tc = self.resolve_client(ctx, None).ok();
@@ -3056,9 +3070,38 @@ impl Server {
                     if tc.is_none() && !copy {
                         return Ok(Flow::Next);
                     }
+                    let mut names = Vec::new();
                     for k in &o.rest {
-                        for _ in 0..n {
-                            self.mode_key(pane, tc.or(ctx.client), k);
+                        let k = if o.has('F') { self.expand(tt, ctx.client, k) } else { k.clone() };
+                        if o.has('H') {
+                            for h in k.split_whitespace() {
+                                if let Ok(b) = u8::from_str_radix(h, 16) {
+                                    names.push(super::modes::byte_key_name(b));
+                                }
+                            }
+                            continue;
+                        }
+                        if !o.has('l') {
+                            if let Some(key) = keys::parse_key_name(&k) {
+                                names.push(keys::key_name(&key));
+                                continue;
+                            }
+                        }
+                        names.extend(k.chars().map(|c| if (c as u32) < 0x80 { super::modes::byte_key_name(c as u8) } else { c.to_string() }));
+                    }
+                    for _ in 0..n {
+                        for k in &names {
+                            match self.panes.get(&pane) {
+                                Some(p) if p.mode.is_some() => self.mode_key(pane, tc.or(ctx.client), k),
+                                // the mode has gone: the rest goes to the pane itself
+                                Some(p) => {
+                                    let app = p.screen().application_cursor();
+                                    if let Some(key) = keys::parse_key_name(k) {
+                                        p.send(keys::encode_key(&key, app));
+                                    }
+                                }
+                                None => break,
+                            }
                         }
                     }
                 } else if let Some(p) = self.panes.get(&pane) {
@@ -4118,7 +4161,7 @@ impl Server {
         let input: Vec<char> = init.chars().collect();
         let cursor = input.len();
         if let Some(c) = self.clients.get_mut(&cid) {
-            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false, confirm: ('y', false), in_pane: false });
+            c.prompt = Some(Prompt { kind, prompts, answers: Vec::new(), label, input, cursor, template, history_pos: None, history_type: 0, pane, numeric, single_key: single, copy_incremental: None, bspace_exit: false, confirm: ('y', false), in_pane: false });
             c.dirty = true;
         }
     }

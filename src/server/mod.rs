@@ -580,6 +580,8 @@ pub struct Prompt {
     pub cursor: usize,
     pub template: String,
     pub history_pos: Option<usize>,
+    /// command-prompt -T: the history the prompt uses (an index into PROMPT_TYPES).
+    pub history_type: usize,
     pub pane: Option<PaneId>,
     pub numeric: bool,
     pub single_key: bool,
@@ -832,7 +834,8 @@ pub struct Server {
     pub buffer_seq: u32,
     pub bindings: BTreeMap<String, BTreeMap<String, Binding>>,
     pub messages: VecDeque<(u64, String)>,
-    pub prompt_history: Vec<String>,
+    /// Prompt history for each prompt type (command, search), oldest first.
+    pub prompt_history: [Vec<String>; 2],
     pub jobs: HashMap<u32, Parked>,
     pub waits: HashMap<String, (bool, Vec<Queue>)>,
     /// wait-for channels signalled while nobody waited (the next wait returns at once).
@@ -973,7 +976,7 @@ impl Server {
             buffer_seq: 0,
             bindings: input::default_bindings(),
             messages: VecDeque::new(),
-            prompt_history: Vec::new(),
+            prompt_history: Default::default(),
             jobs: HashMap::new(),
             waits: HashMap::new(),
             waits_woken: Default::default(),

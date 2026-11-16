@@ -59,7 +59,8 @@ impl Switch {
             windows,
             format: format.unwrap_or_else(|| DEFAULT_FORMAT.to_string()),
             command: command.unwrap_or_else(|| DEFAULT_COMMAND.to_string()),
-            prompt: PanePrompt::new("(search) ", ""),
+            // PROMPT_INCREMENTAL|PROMPT_NOFORMAT|PROMPT_ISMODE|PROMPT_EDITARROWS
+            prompt: PanePrompt { incremental: true, editarrows: true, noformat: true, ismode: true, ptype: super::prompt::TYPE_SEARCH, ..PanePrompt::new("(search) ", "") },
             filter: String::new(),
             current: 0,
             offset: 0,
@@ -164,18 +165,18 @@ impl Switch {
             "Escape" | "C-[" | "C-c" | "C-g" => return ModeAction::Exit,
             _ => {}
         }
-        match self.prompt.key(name) {
-            PromptKey::Handled => {
-                // window_switch_prompt_callback: every handled key builds the list again
+        match self.prompt.key(name, &srv.prompt_history[super::prompt::TYPE_SEARCH]) {
+            PromptKey::Changed => {
+                // window_switch_prompt_callback: a change to the input builds the list again
                 self.filter = self.prompt.text();
                 self.snapshot(srv, w);
                 self.current = 0;
                 self.offset = 0;
                 return ModeAction::None;
             }
-            PromptKey::Done(_) | PromptKey::Cancel => return ModeAction::None,
-            PromptKey::NotHandled if !matches!(name, "Up" | "Down" | "PPage" | "NPage" | "Home" | "End") => return ModeAction::None,
-            PromptKey::NotHandled => {}
+            // cursor movement and ignored keys leave the list and the selection alone
+            PromptKey::Handled | PromptKey::Done(_) | PromptKey::Cancel | PromptKey::Numeric(_) => return ModeAction::None,
+            PromptKey::Move => {}
         }
         let size = self.items(srv, w).len();
         let current = self.current;
@@ -196,14 +197,7 @@ impl Switch {
         let size = self.items(srv, w).len();
         if h != 0 && y as usize == h - 1 && key == "MouseDown1Pane" {
             // a click on the prompt line moves its cursor
-            let label = crate::format::width(&self.prompt.label);
-            let mut col = label;
-            let mut i = 0;
-            while i < self.prompt.input.len() && col < x as usize {
-                col += crate::format::width(&self.prompt.input[i].to_string());
-                i += 1;
-            }
-            self.prompt.cursor = i;
+            self.prompt.mouse(x as usize);
             return ModeAction::None;
         }
         match key {
@@ -253,10 +247,12 @@ impl Switch {
             }
             lines[i].cells = cells;
         }
-        let sid = t.sid;
-        let pstyle = mode_style(srv, &srv.opt_session(sid, "message-style"), Style::default(), t);
-        let (cells, cx) = self.prompt.draw(wu, pstyle);
-        lines[hu - 1].cells = cells;
+        let (cells, cx) = self.prompt.draw(srv, t, self.client, wu, false);
+        for (x, c) in cells.into_iter().enumerate() {
+            if let Some(c) = c {
+                lines[hu - 1].cells[x] = c;
+            }
+        }
         (lines, Some((cx as u16, h - 1)))
     }
 }

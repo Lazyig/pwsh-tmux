@@ -151,16 +151,18 @@ fn customize_mode_groups_changed_only_and_keys() {
     t.wait_screen("search prompt", |s| s.contains("(search)"));
     t.send(b"@mine\r");
     t.wait_screen("user option", |s| s.contains("@mine") && s.contains("value-1"));
+    // s on a global session option sets it for the mode's session (window_customize_set_option)
     t.send(b"s");
-    t.wait_screen("set prompt", |s| s.contains("(@mine) value-1"));
+    t.wait_screen("set prompt", |s| s.contains("(@mine, for session c) value-1"));
     t.send(b"\x15value-2\r");
-    wait_for("set", || ctx.ok(&["show", "-gv", "@mine"]).trim() == "value-2");
+    wait_for("set", || ctx.ok(&["show", "-v", "-t", "c", "@mine"]).trim() == "value-2");
+    assert_eq!(ctx.ok(&["show", "-gv", "@mine"]).trim(), "value-1");
     // e edits the value with the editor option's program, in a popup
     #[cfg(unix)]
     {
         ctx.ok(&["set", "-s", "editor", "sed -i s/value-2/value-3/"]);
         t.send(b"e");
-        wait_for("edited", || ctx.ok(&["show", "-gv", "@mine"]).trim() == "value-3");
+        wait_for("edited", || ctx.ok(&["show", "-v", "-t", "c", "@mine"]).trim() == "value-3");
     }
     t.send(b"C");
     t.wait_screen("all again", |s| s.contains("Server Options"));
@@ -487,4 +489,175 @@ fn pane_in_mode_counts_the_mode_stack_and_only_copy_mode_takes_commands() {
     ctx.ok(&["copy-mode", "-t", "n"]);
     ctx.ok(&["send-keys", "-t", "n", "-X", "cancel"]);
     assert_eq!(ctx.fmt("n", "#{pane_in_mode}"), "0");
+}
+
+#[test]
+fn tree_swap_keeps_the_current_window_like_window_tree_swap() {
+    let ctx = Ctx::new("tree-swap");
+    let t = start(&ctx, "sw");
+    ctx.ok(&["set", "-g", "automatic-rename", "off"]);
+    ctx.ok(&["rename-window", "-t", "sw:0", "first"]);
+    ctx.ok(&["new-window", "-d", "-t", "sw:1", "-n", "second"]);
+    ctx.ok(&["choose-tree", "-w", "-t", "sw:0"]);
+    t.wait_screen("tree", |s| s.contains("1: second"));
+    // the selection is on window 0 (the current one): J swaps it with window 1, and the
+    // session's current window follows it, so the client still sees the tree
+    t.send(b"J");
+    wait_for("swapped", || ctx.ok(&["list-windows", "-t", "sw", "-F", "#{window_index}:#{window_name}:#{window_active}:#{window_last_flag}"]) == "0:second:0:1\n1:first:1:0\n");
+    assert_eq!(ctx.fmt("sw", "#{pane_mode}"), "tree-mode");
+    t.send(b"K");
+    wait_for("back", || ctx.ok(&["list-windows", "-t", "sw", "-F", "#{window_index}:#{window_name}:#{window_active}:#{window_last_flag}"]) == "0:first:1:0\n1:second:0:1\n");
+}
+
+#[test]
+fn send_keys_strings_go_to_the_mode_one_character_at_a_time() {
+    let ctx = Ctx::new("send-mode");
+    let t = start(&ctx, "sk");
+    let c = client(&ctx);
+    ctx.ok(&["choose-tree", "-t", "sk"]);
+    t.wait_screen("tree", |s| s.contains("(0) - sk"));
+    // -l text goes to the mode's prompt rather than the program under the mode
+    ctx.ok(&["send-keys", "-c", &c, "-t", "sk", "C-s"]);
+    ctx.ok(&["send-keys", "-c", &c, "-t", "sk", "-l", "thi"]);
+    t.wait_screen("search text", |s| s.contains("(search) thi"));
+    ctx.ok(&["send-keys", "-c", &c, "-t", "sk", "Escape"]);
+    // a string that is not a key name is typed a character at a time
+    ctx.ok(&["send-keys", "-c", &c, "-t", "sk", "f", "abc"]);
+    t.wait_screen("filter text", |s| s.contains("(filter) abc"));
+    ctx.ok(&["send-keys", "-c", &c, "-t", "sk", "Escape"]);
+    // -H bytes too: q leaves the mode
+    ctx.ok(&["send-keys", "-c", &c, "-t", "sk", "-H", "71"]);
+    wait_for("left", || ctx.fmt("sk", "#{pane_in_mode}") == "0");
+    ctx.ok(&["choose-tree", "-t", "sk"]);
+    ctx.ok(&["send-keys", "-c", &c, "-t", "sk", "-l", "q"]);
+    wait_for("left with -l", || ctx.fmt("sk", "#{pane_in_mode}") == "0");
+}
+
+#[test]
+fn numeric_prompts_take_the_input_at_the_first_other_key() {
+    let ctx = Ctx::new("numeric");
+    let t = start(&ctx, "nu");
+    ctx.ok(&["bind", "-n", "F7", "command-prompt", "-N", "-p", "num", "set -g @n '%%'"]);
+    ctx.ok(&["bind", "-n", "F8", "command-prompt", "-P", "-N", "-p", "num", "set -g @p '%%'"]);
+    // PROMPT_NUMERIC: b runs the template with 5 and closes the prompt; b goes on to the pane
+    t.send(b"\x1b[18~");
+    t.wait_screen("prompt", |s| s.contains("num"));
+    t.send(b"5b6");
+    wait_for("status prompt", || ctx.ok(&["show", "-gv", "@n"]).trim() == "5");
+    t.send(b"\x1b[19~");
+    t.wait_screen("pane prompt", |s| s.lines().any(|l| l.starts_with("num")));
+    t.send(b"7x");
+    wait_for("pane prompt", || ctx.ok(&["show", "-gv", "@p"]).trim() == "7");
+    t.wait_screen("keys went on to the shell", |s| s.contains("b6x"));
+}
+
+#[test]
+fn mode_prompts_take_every_key_and_keep_a_history() {
+    let ctx = Ctx::new("mode-prompt");
+    let t = start(&ctx, "mp");
+    ctx.ok(&["new-window", "-d", "-t", "mp", "-n", "alpha"]);
+    ctx.ok(&["choose-tree", "-t", "mp"]);
+    t.wait_screen("tree", |s| s.contains("alpha"));
+    // keys the prompt does not use are not passed to the tree: no tags, no movement
+    t.send(b"/");
+    t.wait_screen("search", |s| s.contains("(search)"));
+    t.send(b"\x1b[B\x1b[B\x14");
+    t.send(b"\x1b");
+    t.wait_screen("closed", |s| !s.contains("(search)"));
+    t.send(b"X");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!t.contents().contains("tagged?"), "{}", t.contents());
+    // accepted input goes to the search history and Up recalls it
+    t.send(b"f\x15xyz\r");
+    t.wait_screen("filtered", |s| s.contains("(filter: "));
+    t.send(b"f\x15");
+    t.wait_screen("empty filter", |s| s.lines().any(|l| l.trim_end().ends_with("(filter)") || l.starts_with("(filter) ─")));
+    t.send(b"\x1b[A");
+    t.wait_screen("recalled", |s| s.contains("(filter) xyz"));
+    t.send(b"\x1b");
+    let h = ctx.ok(&["show-prompt-history", "-T", "search"]);
+    assert_eq!(h, "History for search:\n\n1: xyz\n\n");
+    // the prompts are drawn with message-format, and prompt_flags says what they are
+    ctx.ok(&["set", "-g", "message-format", "#{prompt_type}|#{prompt_flags}|#{message}"]);
+    t.send(b"f");
+    t.wait_screen("format", |s| s.contains("search|NOFORMAT,ISMODE|(filter) xyz"));
+    t.send(b"\x1b");
+    ctx.ok(&["bind", "-n", "F8", "command-prompt", "-P", "-N", "-p", "num", "set -g @p '%%'"]);
+    t.send(b"q\x1b[19~");
+    t.wait_screen("pane prompt format", |s| s.contains("command|NUMERIC,ISPANE|num"));
+}
+
+#[test]
+fn switch_mode_cursor_keys_keep_the_selection() {
+    let ctx = Ctx::new("switch-keys");
+    ctx.ok(&["new-session", "-d", "-s", "beta"]);
+    let t = start(&ctx, "alpha");
+    ctx.ok(&["switch-mode", "-t", "alpha"]);
+    t.wait_screen("list", |s| s.lines().nth(1).is_some_and(|r| r.starts_with("beta ")));
+    // a, then Down to beta; Left, Home and C-a only move the prompt cursor
+    t.send(b"a\x1b[B");
+    std::thread::sleep(Duration::from_millis(200));
+    t.send(b"\x1b[D\x1b[H\x01\x05");
+    std::thread::sleep(Duration::from_millis(200));
+    t.send(b"\r");
+    wait_for("switched to beta", || ctx.ok(&["list-clients", "-F", "#{client_session}"]).trim() == "beta");
+}
+
+#[test]
+fn customize_mode_toggles_cycles_appends_and_describes() {
+    let ctx = Ctx::new("customize-set");
+    let t = start(&ctx, "cu");
+    ctx.ok(&["set", "-g", "mouse", "off"]);
+    ctx.ok(&["set", "-g", "status-left-length", "44"]);
+    ctx.ok(&["customize-mode", "-t", "cu", "-f", "#{||:#{==:#{option_name},mouse},#{||:#{==:#{option_name},status-position},#{||:#{==:#{option_name},status-left-length},#{m:command-alias*,#{option_name}}}}}"]);
+    t.wait_screen("groups", |s| s.contains("Session Options"));
+    t.send(b"\x1b+");
+    t.wait_screen("expanded", |s| s.contains("mouse: off"));
+    // the preview has the option table's text and the global value
+    // the line of an item counted from the first item (the status line may be at the top)
+    let line_of = |f: &dyn Fn(&str) -> bool| {
+        let c = t.contents();
+        let first = c.lines().position(|l| l.starts_with("(0)")).unwrap();
+        c.lines().position(f).unwrap() - first
+    };
+    let find = |name: &str| line_of(&|l: &str| l.contains(&format!("{name}:")));
+    t.send(b"\x1b[H");
+    for _ in 0..find("mouse") {
+        t.send(b"\x1b[B");
+    }
+    t.wait_screen("description", |s| s.contains("Whether the mouse is recognised"));
+    // a flag toggles at once, for the session
+    t.send(b"\r");
+    wait_for("toggled", || ctx.ok(&["show", "-v", "-t", "cu", "mouse"]).trim() == "on");
+    assert_eq!(ctx.ok(&["show", "-gv", "mouse"]).trim(), "off");
+    t.wait_screen("global value", |s| s.contains("Global value: off"));
+    // a choice moves to the next value
+    t.send(b"\x1b[H");
+    for _ in 0..find("status-position") {
+        t.send(b"\x1b[B");
+    }
+    t.send(b"s");
+    wait_for("cycled", || ctx.ok(&["show", "-v", "-t", "cu", "status-position"]).trim() == "top");
+    // other options get a prompt naming where the value goes
+    t.send(b"\x1b[H");
+    for _ in 0..find("status-left-length") {
+        t.send(b"\x1b[B");
+    }
+    t.send(b"S");
+    t.wait_screen("global prompt", |s| s.contains("(status-left-length, global) 44"));
+    t.send(b"\x1b");
+    // a whole array gets the [+] prompt, which adds an element
+    t.send(b"\x1b[H");
+    for _ in 0..line_of(&|l: &str| l.contains("command-alias") && !l.contains('[')) {
+        t.send(b"\x1b[B");
+    }
+    t.send(b"s");
+    t.wait_screen("append prompt", |s| s.contains("(command-alias[+]) "));
+    t.send(b"\x15zz=display hi\r");
+    wait_for("appended", || ctx.ok(&["show", "-sv", "command-alias"]).contains("zz=display hi"));
+    // C keeps only the elements that differ from the default
+    t.send(b"C");
+    t.wait_screen("changed only", |s| s.contains("+ command-alias"));
+    t.send(b"\x1b[H\x1b[B\x1b[C");
+    t.wait_screen("changed elements", |s| s.contains("zz=display hi") && !s.contains("command-alias[0]"));
 }

@@ -306,6 +306,8 @@ pub struct Tree {
     /// The last list drawn: mode_tree_draw leaves the screen alone when the list is empty
     /// (customize C with nothing changed), so the old items stay on screen.
     last_grid: std::cell::RefCell<Option<Vec<Vec<Cell>>>>,
+    /// Prompt answers for the prompt history, taken by the server after each key.
+    history: Vec<(usize, String)>,
 }
 
 impl Tree {
@@ -348,6 +350,7 @@ impl Tree {
             kill: false,
             client: None,
             last_grid: std::cell::RefCell::new(None),
+            history: Vec::new(),
         }
     }
 
@@ -817,10 +820,19 @@ impl Tree {
         }
     }
 
-    fn set_prompt(&mut self, kind: TreePrompt, label: &str, input: &str, single: bool) {
+    /// mode_tree_set_prompt: PROMPT_NOFORMAT and PROMPT_ISMODE, search or command history.
+    pub fn set_prompt(&mut self, kind: TreePrompt, label: &str, input: &str, single: bool) {
         let mut p = PanePrompt::new(label, input);
         p.single = single;
+        p.noformat = true;
+        p.ismode = true;
+        p.ptype = if matches!(kind, TreePrompt::Search | TreePrompt::Filter) { super::prompt::TYPE_SEARCH } else { super::prompt::TYPE_COMMAND };
         self.prompt = Some((kind, p));
+    }
+
+    /// The prompt answers to add to the prompt history (prompt_add_history), as (type, line).
+    pub fn take_history(&mut self) -> Vec<(usize, String)> {
+        std::mem::take(&mut self.history)
     }
 
     // ---- keys ------------------------------------------------------------------------
@@ -845,18 +857,23 @@ impl Tree {
 
     fn key_inner(&mut self, name: &str, srv: &Server, b: &mut Built, height: usize) -> ModeAction {
         let n = b.lines.len();
+        // prompt_key takes every key while the prompt is open (mode_tree_key)
         if let Some((_, prompt)) = &mut self.prompt {
-            match prompt.key(name) {
-                PromptKey::Handled => return ModeAction::None,
+            let ty = prompt.ptype.min(1);
+            match prompt.key(name, &srv.prompt_history[ty]) {
+                PromptKey::Handled | PromptKey::Changed | PromptKey::Move => return ModeAction::None,
                 PromptKey::Cancel => {
                     self.prompt = None;
                     return ModeAction::None;
                 }
-                PromptKey::Done(s) => {
-                    let (kind, _) = self.prompt.take().unwrap();
+                PromptKey::Done(s) | PromptKey::Numeric(s) => {
+                    let (kind, p) = self.prompt.take().unwrap();
+                    // prompt_add_history for what was typed (not a single-key answer)
+                    if !s.is_empty() && !p.single {
+                        self.history.push((ty, s.clone()));
+                    }
                     return self.prompt_done(kind, s, srv, b);
                 }
-                PromptKey::NotHandled => {}
             }
         }
         if self.help {
@@ -1051,7 +1068,15 @@ impl Tree {
             }
         }
         self.cur_tag = Some(format!("w{s1}:{i2}"));
-        ModeAction::RunKeep(format!("swap-window -d -s '${s1}:{i1}' -t '${s1}:{i2}'"))
+        // session_set_current: the session's current window follows its window to the
+        // other index (and the old index becomes the last window)
+        let active = srv.sessions.get(s1).map(|s| s.active);
+        let select = match active {
+            Some(a) if a == *i1 => format!(" ; select-window -t '${s1}:{i2}'"),
+            Some(a) if a == *i2 => format!(" ; select-window -t '${s1}:{i1}'"),
+            _ => String::new(),
+        };
+        ModeAction::RunKeep(format!("swap-window -d -s '${s1}:{i1}' -t '${s1}:{i2}'{select}"))
     }
 
     fn kill_command(srv: &Server, d: &ItemData) -> Option<String> {
@@ -1244,10 +1269,17 @@ impl Tree {
 
     /// Mouse keys at (x, y) in the pane (the mouse part of mode_tree_key and window_tree_mouse).
     pub fn mouse(&mut self, key: &str, x: u16, y: u16, srv: &Server, w: usize, h: usize) -> ModeAction {
-        if self.prompt.is_some() || self.help {
-            if self.help {
+        // with a prompt open, a press of the first button on its line moves its cursor and
+        // other mouse keys go on to the tree (mode_tree_key)
+        if let Some((_, p)) = &mut self.prompt {
+            let top = srv.opt_session(srv.target_for_pane(self.owner).sid, "status-position") == "top";
+            let py = if top { 0 } else { h.saturating_sub(1) };
+            if key == "MouseDown1Pane" && y as usize == py {
+                p.mouse(x as usize);
                 return ModeAction::None;
             }
+        }
+        if self.help {
             return ModeAction::None;
         }
         let b = self.build(srv);
@@ -1377,9 +1409,13 @@ impl Tree {
             let top = srv.opt_session(t.sid, "status-position") == "top";
             let py = if top { 0 } else { hu.saturating_sub(1) };
             if hu != 0 && wu != 0 {
-                let style = mode_style(srv, &srv.opt_session(t.sid, "message-style"), Style::default(), t);
-                let (cells, cx) = p.draw(wu, style);
-                grid[py] = cells;
+                // mode_tree_draw_prompt: cells the prompt style does not fill stay as drawn
+                let (cells, cx) = p.draw(srv, t, self.client, wu, false);
+                for (x, c) in cells.into_iter().enumerate() {
+                    if let Some(c) = c {
+                        grid[py][x] = c;
+                    }
+                }
                 cursor = Some((cx as u16, py as u16));
             }
         }

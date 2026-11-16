@@ -308,18 +308,19 @@ impl Server {
             self.menu_action(cid, wid, action);
             return;
         }
-        if c.prompt.is_some() {
-            self.prompt_key(cid, &k, &name);
+        // a numeric prompt passes on the key that closed it (PROMPT_KEY_NOT_HANDLED)
+        if c.prompt.is_some() && !self.prompt_key(cid, &k, &name) {
             return;
         }
         // then a pane prompt (command-prompt -P) in the client's window: the key edits it as
         // this client's, and it goes back to the pane while it stays open; read-only clients
         // skip it like the other special cases of server_client_handle_key
-        if c.overlay.is_none() && !c.is_readonly() {
+        let Some(c) = self.clients.get(&cid) else { return };
+        if c.overlay.is_none() && !c.is_readonly() && c.prompt.is_none() {
             if let Some(pane) = self.key_pane_prompt(cid) {
                 let pr = self.panes.get_mut(&pane).and_then(|p| p.prompt.take());
                 self.clients.get_mut(&cid).unwrap().prompt = pr;
-                self.prompt_key(cid, &k, &name);
+                let pass = self.prompt_key(cid, &k, &name);
                 let Some(c) = self.clients.get_mut(&cid) else { return };
                 c.dirty = true;
                 if c.prompt.as_ref().is_some_and(|p| p.in_pane && p.pane == Some(pane)) {
@@ -330,9 +331,12 @@ impl Server {
                 } else if let Some(wid) = self.window_of(pane) {
                     self.mark_window_dirty(wid);
                 }
-                return;
+                if !pass {
+                    return;
+                }
             }
         }
+        let Some(c) = self.clients.get(&cid) else { return };
         match &c.overlay {
             Some(Overlay::Popup(p)) => {
                 let pane = p.pane;
@@ -474,7 +478,13 @@ impl Server {
                 let (w, h) = (p.size.0 as usize, p.size.1 as usize);
                 let Some(mut mode) = p.mode.take() else { return };
                 let action = match &mut mode {
-                    PaneMode::Tree(t) => t.key(name, self, w, h),
+                    PaneMode::Tree(t) => {
+                        let a = t.key(name, self, w, h);
+                        for (ty, line) in t.take_history() {
+                            self.add_prompt_history(&line, ty);
+                        }
+                        a
+                    }
                     PaneMode::Switch(s) => s.key(name, self, w, h),
                     PaneMode::Panes(m) => m.key(name, self),
                     _ => ModeAction::None,
@@ -708,8 +718,48 @@ impl Server {
 
     // ---- prompt ----------------------------------------------------------------------
 
-    fn prompt_key(&mut self, cid: ClientId, k: &Key, name: &str) {
-        let hist_len = self.prompt_history.len();
+    /// prompt_add_history: a line equal to the newest entry is not added again; the oldest
+    /// entries go once prompt-history-limit is reached.
+    pub(crate) fn add_prompt_history(&mut self, line: &str, ty: usize) {
+        let limit = self.opt_server_num("prompt-history-limit").max(0) as usize;
+        let Some(history) = self.prompt_history.get_mut(ty) else { return };
+        if history.last().is_none_or(|last| last != line) {
+            history.push(line.to_string());
+        }
+        let excess = history.len().saturating_sub(limit);
+        history.drain(..excess);
+    }
+
+    /// A key for the client's prompt; true when the key is not the prompt's and goes on
+    /// to the key tables (a numeric prompt closed by a key that is not a digit).
+    fn prompt_key(&mut self, cid: ClientId, k: &Key, name: &str) -> bool {
+        let digit = matches!(k.code, KeyCode::Char(ch) if ch.is_ascii_digit()) && !k.mods.ctrl && !k.mods.meta;
+        let numeric = self.clients.get(&cid).and_then(|c| c.prompt.as_ref()).is_some_and(|p| p.numeric && matches!(p.kind, PromptKind::Command));
+        if numeric && !digit {
+            // PROMPT_NUMERIC: any other key accepts the input (even empty) and goes on
+            let Some(mut pr) = self.clients.get_mut(&cid).and_then(|c| c.prompt.take()) else { return true };
+            self.clients.get_mut(&cid).unwrap().dirty = true;
+            pr.answers.push(pr.input.iter().collect());
+            if pr.answers.len() < pr.prompts.len() {
+                let (label, init) = pr.prompts[pr.answers.len()].clone();
+                pr.label = label;
+                pr.input = init.chars().collect();
+                pr.cursor = pr.input.len();
+                self.clients.get_mut(&cid).unwrap().prompt = Some(pr);
+                return true;
+            }
+            let cmd = fill_template(&pr.template, &pr.answers);
+            self.run_string(cid, &cmd, pr.pane);
+            return true;
+        }
+        self.prompt_key_inner(cid, k, name);
+        false
+    }
+
+    fn prompt_key_inner(&mut self, cid: ClientId, k: &Key, name: &str) {
+        let history_type = self.clients.get(&cid).and_then(|c| c.prompt.as_ref()).map_or(0, |p| p.history_type.min(1));
+        let history = self.prompt_history[history_type].clone();
+        let hist_len = history.len();
         let c = self.clients.get_mut(&cid).unwrap();
         c.dirty = true;
         let pr = c.prompt.as_mut().unwrap();
@@ -745,12 +795,7 @@ impl Server {
                 let input: String = pr.input.iter().collect();
                 pr.answers.push(input.clone());
                 if !input.is_empty() && !pr.template.starts_with("send-keys -X ") {
-                    self.prompt_history.retain(|h| h != &input);
-                    self.prompt_history.push(input);
-                    let lim = self.opt_server_num("prompt-history-limit").max(1) as usize;
-                    while self.prompt_history.len() > lim {
-                        self.prompt_history.remove(0);
-                    }
+                    self.add_prompt_history(&input, pr.history_type.min(1));
                 }
                 if pr.answers.len() < pr.prompts.len() {
                     let (label, init) = pr.prompts[pr.answers.len()].clone();
@@ -825,7 +870,7 @@ impl Server {
                 if hist_len > 0 {
                     let pos = pr.history_pos.map(|p| p.min(hist_len).saturating_sub(1)).unwrap_or(hist_len - 1);
                     pr.history_pos = Some(pos);
-                    pr.input = self.prompt_history[pos].chars().collect();
+                    pr.input = history[pos].chars().collect();
                     pr.cursor = pr.input.len();
                 }
             }
@@ -833,7 +878,7 @@ impl Server {
                 if let Some(p) = pr.history_pos.map(|p| p.min(hist_len)) {
                     if p + 1 < hist_len {
                         pr.history_pos = Some(p + 1);
-                        pr.input = self.prompt_history[p + 1].chars().collect();
+                        pr.input = history[p + 1].chars().collect();
                     } else {
                         pr.history_pos = None;
                         pr.input.clear();
@@ -857,9 +902,6 @@ impl Server {
                 pr.cursor += 1;
             }
             KeyCode::Char(ch) if !k.mods.ctrl && !k.mods.meta => {
-                if pr.numeric && !ch.is_ascii_digit() {
-                    return;
-                }
                 pr.input.insert(pr.cursor, *ch);
                 pr.cursor += 1;
                 if pr.single_key {
@@ -883,6 +925,13 @@ impl Server {
         }
     }
 
+}
+
+/// The prompt types (prompt_type_string), which have a history each.
+pub const PROMPT_TYPES: [&str; 2] = ["command", "search"];
+
+pub fn prompt_type(name: &str) -> Option<usize> {
+    PROMPT_TYPES.iter().position(|t| *t == name)
 }
 
 pub const COMMAND_NAMES: &[&str] = &[
