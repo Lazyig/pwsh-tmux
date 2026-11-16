@@ -340,9 +340,21 @@ pub fn push_sgr(out: &mut String, st: &Style) {
 
 /// capture-pane -e: text with SGR escapes.
 pub fn line_with_escapes(line: &Line) -> String {
+    line_with_escapes_from(line, &mut None, false)
+}
+
+/// [`line_with_escapes`] after lines that ended in link `last` (grid_string_cells keeps
+/// lastgc from line to line: a line that goes on with the link the line before ended in
+/// does not open it again, though each line closes what it opened); `last` becomes the
+/// link of the last cell read: the last used one, or with `allocated`
+/// (GRID_STRING_EMPTY_CELLS) the last the line has room for, which grid_expand_line
+/// grows to a quarter, half or all of the width (more than the text written at once).
+pub fn line_with_escapes_from(line: &Line, last: &mut Option<u64>, allocated: bool) -> String {
     let mut out = String::new();
     let mut cur = Style::default();
-    let mut link = None;
+    let mut link = *last;
+    let mut open = false;
+    let used = (0..line.cells.len()).rposition(|x| line.cells[x].text != " " || line.cells[x].style != Style::default() || line.metadata.contains_key(&(x as u16))).map_or(0, |x| x + 1);
     for (x, c) in line.cells.iter().enumerate() {
         if line.is_padding(x) {
             continue;
@@ -351,16 +363,29 @@ pub fn line_with_escapes(line: &Line) -> String {
             push_sgr(&mut out, &c.style);
             cur = c.style;
         }
-        // grid_string_cells_code: an OSC 8 link (with its own id) follows the attributes
+        // grid_string_cells_code: an OSC 8 link (with its own id) follows the attributes;
+        // a cell without one closes the link only if this line opened it
         let next = line.metadata.get(&(x as u16)).and_then(|m| m.hyperlink.as_ref());
         if next.map(|l| l.inner) != link {
-            let (id, uri) = next.map_or(("", ""), |l| (l.id.as_str(), l.uri.as_str()));
-            let _ = write!(out, "\x1b]8;{}{id};{uri}\x1b\\", if id.is_empty() { "" } else { "id=" });
+            if let Some(l) = next {
+                let _ = write!(out, "\x1b]8;{}{};{}\x1b\\", if l.id.is_empty() { "" } else { "id=" }, l.id, l.uri);
+                open = true;
+            } else if open {
+                out.push_str("\x1b]8;;\x1b\\");
+                open = false;
+            }
             link = next.map(|l| l.inner);
+        }
+        if x < used {
+            *last = link;
         }
         out.push_str(line.cell_text(x));
     }
-    if link.is_some() {
+    let w = line.cells.len();
+    if allocated && used > 0 && used < [w / 4, w / 2, w].into_iter().find(|&n| used < n).unwrap_or(w) {
+        *last = None;
+    }
+    if open {
         out.push_str("\x1b]8;;\x1b\\");
     }
     let trimmed = out.trim_end_matches(' ').to_string();
@@ -657,7 +682,7 @@ impl Server {
                         let mut cell = lines.get(y as usize).and_then(|l| l.cells.get(x as usize)).cloned().unwrap_or_default();
                         overlay_style(&mut cell.style, wstyle);
                         f.set(ax, oy + ay, cell);
-                        f.set_link(ax, oy + ay, lines.get(y as usize).and_then(|l| l.metadata.get(&x)?.hyperlink.as_ref()));
+                        f.set_link(ax, oy + ay, lines.get(y as usize).and_then(|l| l.tab_at(x as usize).map_or(l.metadata.get(&x), |(at, _)| l.metadata.get(&(at as u16)))?.hyperlink.as_ref()));
                     }
                 }
             }
@@ -677,7 +702,7 @@ impl Server {
                         }
                         overlay_style(&mut cell.style, wstyle);
                         f.set(ax, oy + ay, cell);
-                        f.set_link(ax, oy + ay, row.as_ref().and_then(|r| r.cell_metadata(x)?.hyperlink.as_ref()));
+                        f.set_link(ax, oy + ay, row.as_ref().and_then(|r| r.hyperlink_at(x)));
                     }
                 }
             }
@@ -1199,7 +1224,7 @@ impl Server {
                                     }
                                     overlay_style(&mut cell.style, st);
                                     f.set(ix + x, iy + y, cell);
-                                    f.set_link(ix + x, iy + y, row.as_ref().and_then(|r| r.cell_metadata(x)?.hyperlink.as_ref()));
+                                    f.set_link(ix + x, iy + y, row.as_ref().and_then(|r| r.hyperlink_at(x)));
                                 }
                             }
                         }

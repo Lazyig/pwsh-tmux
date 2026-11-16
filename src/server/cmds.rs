@@ -2926,6 +2926,7 @@ impl Server {
                     // -H: the links of each line not listed on an earlier one, at most one
                     // per column in all (cmd_capture_pane_hyperlinks)
                     let mut links = std::collections::HashSet::new();
+                    let mut last_link = None;
                     for i in a..=b {
                         // plain text does not need the cells
                         let cells = o.has('e') || o.has('N') || o.has('C') || o.has('a') || o.has('H') || mode_lines.is_some();
@@ -2945,7 +2946,7 @@ impl Server {
                                 }
                                 (uris.join(" "), line.wrapped)
                             }
-                            Some(line) => (capture_line(line, o.has('e'), o.has('N') && !o.has('J'), o.has('T'), o.has('C')), line.wrapped),
+                            Some(line) => (capture_line(line, o.has('e'), o.has('N') && !o.has('J'), o.has('T'), o.has('C'), &mut last_link, !o.has('J') && !o.has('T')), line.wrapped),
                             None => crate::cells::text_at(screen, i as usize),
                         };
                         if o.has('H') && text.is_empty() {
@@ -5219,7 +5220,7 @@ fn row_line(row: &vt100::capture::RowContents, cols: u16) -> crate::cells::Line 
 
 /// One captured line: -e adds attribute sequences, `keep` (-N) keeps trailing spaces (up to
 /// the last styled cell with -T), -C escapes backslashes and writes ESC as \033.
-fn capture_line(line: &crate::cells::Line, escapes: bool, keep: bool, trim_unused: bool, escape: bool) -> String {
+fn capture_line(line: &crate::cells::Line, escapes: bool, keep: bool, trim_unused: bool, escape: bool, last_link: &mut Option<u64>, allocated: bool) -> String {
     let mut line = line.clone();
     if escape {
         for c in &mut line.cells {
@@ -5236,7 +5237,7 @@ fn capture_line(line: &crate::cells::Line, escapes: bool, keep: bool, trim_unuse
         }
     }
     let text = if escapes {
-        render::line_with_escapes(&line)
+        render::line_with_escapes_from(&line, last_link, allocated)
     } else {
         (0..line.cells.len()).map(|x| line.cell_text(x)).collect()
     };

@@ -439,7 +439,16 @@ impl Server {
             "search_count_partial" => cm.search_count().map(|_| b(cm.search_count_partial()))?,
             "search_match" => cm.search_match()?,
             "top_line_time" => cm.top_line_time().to_string(),
-            "copy_cursor_hyperlink" => cm.cursor_hyperlink()?,
+            "copy_cursor_hyperlink" => {
+                // the drawn screen has the position indicator, whose format may ask for this
+                thread_local!(static DRAWING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+                if DRAWING.with(|d| d.replace(true)) {
+                    return None;
+                }
+                let style = self.copy_render_style(pane, None);
+                DRAWING.with(|d| d.set(false));
+                cm.cursor_hyperlink(&style)?
+            }
             "copy_cursor_word" => {
                 let ws = self.opt_session(self.session_of_pane(pane).map(|s| s.0), "word-separators");
                 super::mouse::grid_word(|i| cm.line(i).cloned(), cm.line_count(), cx, cm.view_top() + cy, &ws)?

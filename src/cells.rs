@@ -70,9 +70,10 @@ impl Line {
         }
     }
 
-    /// Columns up to the end of the last tab (a tab is not a trailing blank).
+    /// Columns up to the end of the last tab (a tab is not a trailing blank; one wider
+    /// than the row, kept by a reflow, ends with it).
     pub fn tabs_end(&self) -> usize {
-        self.metadata.iter().filter(|(_, m)| m.tab_width > 0).map(|(&x, m)| usize::from(x) + usize::from(m.tab_width)).max().unwrap_or(0)
+        self.metadata.iter().filter(|(_, m)| m.tab_width > 0).map(|(&x, m)| usize::from(x) + usize::from(m.tab_width)).max().unwrap_or(0).min(self.cells.len())
     }
 
     /// format_grid_hyperlink: the link of the cell at `x`, from the start of a wide
@@ -111,7 +112,17 @@ pub fn cell_from_vt(c: &vt100::Cell) -> Cell {
 
 /// Every row of a screen including its scrollback, oldest first.
 pub fn snapshot(screen: &vt100::Screen) -> Vec<Line> {
-    (0..screen.history_rows_len()).map(|i| line_at(screen, i)).collect()
+    (0..screen.history_rows_len()).map(|i| {
+        let mut line = line_at(screen, i);
+        // a row that wrapped early (a wide character or tab moved on) ends at its last
+        // used cell, so rejoining it in copy mode adds no blanks (grid_reflow reads cellused)
+        if line.wrapped {
+            if let Some(row) = screen.history_row(i) {
+                line.cells.truncate(usize::from(row.used_len()));
+            }
+        }
+        line
+    }).collect()
 }
 
 /// Row `index` of [`snapshot`] (oldest history row = 0) without building the others.

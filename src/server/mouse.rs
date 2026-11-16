@@ -1017,7 +1017,7 @@ impl Server {
                 let (p, (x, y)) = at?;
                 let pane = self.panes.get(&p)?;
                 let line = match &pane.mode {
-                    Some(PaneMode::Copy(cm)) => cm.render().0.into_iter().nth(y as usize)?,
+                    Some(PaneMode::Copy(cm)) => cm.render_with(&self.copy_render_style(p, None)).0.into_iter().nth(y as usize)?,
                     Some(_) => return None,
                     None => crate::cells::line_at(pane.screen(), pane.screen().scrollback_len() + y as usize),
                 };
