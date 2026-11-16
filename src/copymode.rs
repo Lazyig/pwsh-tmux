@@ -2458,7 +2458,11 @@ impl CopyMode {
         let space = set.contains(' ');
         match self.cell(y, x) {
             None => space,
-            Some(c) if c.is_continuation() => false,
+            // the padding half of a wide character is whitespace when that character is
+            Some(c) if c.is_continuation() => {
+                (space || set.contains('\t')) && (0..x).rev().map(|i| self.cell(y, i)).find(|c| !c.is_some_and(Cell::is_continuation))
+                    .flatten().is_some_and(|c| space && c.text.chars().any(char::is_whitespace))
+            }
             Some(c) if space && c.text.chars().any(char::is_whitespace) => true,
             Some(c) => {
                 let mut chars = c.text.chars();
@@ -4525,6 +4529,25 @@ mod tests {
         assert_eq!(copied(cm.run("copy-selection", &[])), "yy");
         assert!(cm.in_set((0, 1), " "));
         assert!(!cm.in_set((0, 1), "-"));
+        // grid_in_set: the padding half of U+3000 is whitespace too (tmux 3.8 probe)
+        assert!(cm.in_set((0, 2), " ") && !cm.in_set((0, 2), "-"));
+        let text = "ab\u{3000}\u{3000}cd\u{a0}ef\u{2003}gh-ij  \u{3000}kl";
+        for (vi, want) in [(true, [1, 7, 10, 13, 14, 16, 22]), (false, [2, 8, 11, 14, 15, 17, 23])] {
+            // line() keeps W cells; this line is longer
+            let mut l = Line { cells: Vec::new(), wrapped: false };
+            for ch in text.chars() {
+                l.cells.push(Cell { text: ch.to_string(), style: Style::default() });
+                if ch.width() == Some(2) {
+                    l.cells.push(Cell { text: String::new(), style: Style::default() });
+                }
+            }
+            l.cells.resize(40, Cell::default());
+            let mut cm = CopyMode::new(vec![l, line("DONE", false)], 40, 6, (0, 0), vi);
+            cm.set_word_separators("!\"#$%&'()*+,-./:;<=>?@[\\]^`{|}~");
+            cm.run("history-top", &[]);
+            let stops: Vec<usize> = (0..7).map(|_| { cm.run("next-word-end", &[]); cm.cx }).collect();
+            assert_eq!(stops, want, "vi={vi}");
+        }
     }
 
     #[test]
