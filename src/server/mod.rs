@@ -802,6 +802,8 @@ pub struct Parked {
     /// The job's command and process (show-messages -J), and when it started.
     pub cmd: String,
     pub pid: Option<u32>,
+    /// The descriptor the server reads the job's output from (-1 where there is none).
+    pub fd: i64,
     pub started: u64,
 }
 
@@ -2739,6 +2741,10 @@ impl Server {
         // started here so the job's process id is known while it runs
         let child = cmd.spawn();
         let pid = child.as_ref().ok().map(|c| c.id());
+        #[cfg(unix)]
+        let fd = child.as_ref().ok().and_then(|c| c.stdout.as_ref()).map_or(-1, |o| std::os::fd::AsRawFd::as_raw_fd(o) as i64);
+        #[cfg(not(unix))]
+        let fd = -1;
         thread::spawn(move || {
             let (status, out) = match child.and_then(|c| c.wait_with_output()) {
                 // a signal is passed on as its negated number
@@ -2747,7 +2753,7 @@ impl Server {
             };
             let _ = tx.send(Event::Job(id, status, out));
         });
-        self.jobs.insert(id, Parked { queue, kind, cmd: command.to_string(), pid, started: now_ms() });
+        self.jobs.insert(id, Parked { queue, kind, cmd: command.to_string(), pid, fd, started: now_ms() });
         id
     }
 }

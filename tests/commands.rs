@@ -1283,7 +1283,10 @@ fn message_log_jobs_and_prompt_history_types() {
     // -J: running jobs
     ctx.ok(&["run-shell", "-b", "sleep 5"]);
     let jobs = ctx.ok(&["show-messages", "-J"]);
-    assert!(jobs.starts_with("Job 0: sleep 5 [fd=-1, pid="), "{jobs}");
+    assert!(jobs.starts_with("Job 0: sleep 5 [fd="), "{jobs}");
+    // the descriptor its output is read from
+    let fd: i64 = jobs.split("fd=").nth(1).and_then(|r| r.split(',').next()).and_then(|n| n.parse().ok()).unwrap();
+    assert!(if cfg!(unix) { fd >= 0 } else { fd == -1 }, "{jobs}");
     // no attached clients: -T lists no terminals
     assert_eq!(ctx.ok(&["show-messages", "-T"]), "");
     // tmux 3.8 has a command and a search history

@@ -3070,7 +3070,12 @@ impl Server {
                     let mut n = 0;
                     for c in self.clients.values().filter(|c| c.attached && c.control == 0 && only.is_none_or(|o| o == c.id)) {
                         let term = c.ident.as_ref().map(|i| i.term.as_str()).unwrap_or("");
-                        ctx.out.push_str(&format!("Terminal {n}: {term} for {}, flags=0x0:\n", c.name()));
+                        // tty_term's flags from what the terminal supports: 256 and RGB
+                        // colours, margins (DECSLRM), rectfill (DECFRA); the output is
+                        // always VT100-like
+                        let f = |name: &str, bit: u32| if c.features.has(name) { bit } else { 0 };
+                        let flags = f("256", 0x1) | f("margins", 0x4) | f("rectfill", 0x8) | f("RGB", 0x11) | 0x20;
+                        ctx.out.push_str(&format!("Terminal {n}: {term} for {}, flags=0x{flags:x}:\n", c.name()));
                         n += 1;
                     }
                     blank = n != 0;
@@ -3083,7 +3088,7 @@ impl Server {
                             ctx.out.push('\n');
                         }
                         let pid = j.pid.map_or(-1, |p| p as i64);
-                        ctx.out.push_str(&format!("Job {n}: {} [fd=-1, pid={pid}, status=0]\n", j.cmd));
+                        ctx.out.push_str(&format!("Job {n}: {} [fd={}, pid={pid}, status=0]\n", j.cmd, j.fd));
                     }
                 }
                 if o.has('T') || o.has('J') {

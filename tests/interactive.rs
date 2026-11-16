@@ -614,5 +614,9 @@ fn message_log_names_keys_messages_and_errors() {
     assert!(log.iter().any(|l| l.ends_with(" message: command new-window: unknown flag -Q")), "{log:?}");
     let f6 = log.iter().find(|l| l.ends_with("command: set-option -g @f6 1")).expect("F6 logged");
     assert!(!f6.starts_with(&format!("{client} ")), "{f6}");
+    // -T: the terminal and its tty_term flags (VT100-like, 0x20)
+    let term = ctx.ok(&["show-messages", "-T"]);
+    let flags = term.split("flags=0x").nth(1).and_then(|r| r.split(':').next()).and_then(|h| u32::from_str_radix(h, 16).ok()).unwrap();
+    assert!(term.starts_with("Terminal 0: ") && flags & 0x20 != 0, "{term}");
     drop(t);
 }
