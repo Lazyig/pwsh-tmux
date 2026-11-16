@@ -709,7 +709,10 @@ impl Server {
         if w > c.size.0 || h > c.size.1 {
             return None;
         }
-        let win = self.windows.get(&t.wid?)?;
+        // without a window (no session) the client is the area, as for popups
+        let Some(win) = t.wid.and_then(|w| self.windows.get(&w)) else {
+            return self.overlay_position(cid, t, m, xarg, yarg, w, h);
+        };
         let (wsx, wsy, w, h) = (win.sx as i64, win.sy as i64, w as i64, h as i64);
         let (max_x, max_y) = ((wsx - w).max(0), (wsy - h).max(0));
         let sid = c.session;
