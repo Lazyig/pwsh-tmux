@@ -2307,11 +2307,20 @@ impl Server {
                     self.update_session_size(sid);
                     return Ok(Flow::Next);
                 }
+                // args_strtonum(args, 'x', WINDOW_MINIMUM, WINDOW_MAXIMUM): "width invalid"
+                let num = |c: char, what: &str| o.get(c).map(|v| match v.parse::<i64>() {
+                    Err(_) => Err("invalid"),
+                    Ok(n) if n < 1 => Err("too small"),
+                    Ok(n) if n > 10000 => Err("too large"),
+                    Ok(n) => Ok(n as u16),
+                }.map_err(|e| format!("{what} {e}"))).transpose();
+                let (x, y) = (num('x', "width")?, num('y', "height")?);
+                let w = self.windows.get_mut(&wid).unwrap();
                 w.options.set("window-size", "manual".into());
-                if let Some(x) = o.get('x').and_then(|v| v.parse::<u16>().ok()) {
+                if let Some(x) = x {
                     w.sx = x.clamp(1, MAX_SIZE);
                 }
-                if let Some(y) = o.get('y').and_then(|v| v.parse::<u16>().ok()) {
+                if let Some(y) = y {
                     w.sy = y.clamp(1, MAX_SIZE);
                 }
                 if o.has('L') {
@@ -2516,19 +2525,29 @@ impl Server {
                 }
                 self.unzoom(wid);
                 let area = self.window_area(wid);
-                let parse_size = |v: &str, total: u16| -> Option<u16> {
-                    if let Some(p) = v.strip_suffix('%') {
-                        p.parse::<u32>().ok().map(|p| (total as u32 * p / 100) as u16)
-                    } else {
-                        v.parse().ok()
-                    }
-                };
-                let x = o.get('x').and_then(|v| parse_size(v, area.w));
-                let y = o.get('y').and_then(|v| parse_size(v, area.h));
+                // args_percentage(args, 'x', 0, PANE_MAXIMUM, w->sx): "width invalid" and so on
+                let size = |c: char, total: u16, what: &str| o.get(c).map(|v| {
+                    super::float::percentage(v, 0, 10000, total as i64).map(|n| n.min(u16::MAX as i64) as u16).map_err(|e| format!("{what} {e}"))
+                }).transpose();
+                let x = size('x', area.w, "width");
+                let y = size('y', area.h, "height");
                 // server_unzoom_window first
                 self.unzoom_window(wid);
+                let x = x?;
                 let before = self.windows[&wid].layout.to_layout_string(area);
                 let w = self.windows.get_mut(&wid).unwrap();
+                // -x is applied before -y is checked
+                let y = match y {
+                    Ok(y) => y,
+                    Err(e) => {
+                        if x.is_some() {
+                            w.layout.set_size(pane, x, None, area);
+                            self.apply_layout(wid);
+                            self.mark_window_dirty(wid);
+                        }
+                        return err(e);
+                    }
+                };
                 if x.is_some() || y.is_some() {
                     w.layout.set_size(pane, x, y, area);
                 }
@@ -2758,20 +2777,26 @@ impl Server {
                 let (rects, _) = self.rects(dwid);
                 let r = if o.has('f') { self.window_area(dwid) } else { rects.iter().find(|(p, _)| *p == dpane).map(|(_, r)| *r).ok_or("target pane not visible")? };
                 let total = if horizontal { r.w } else { r.h };
-                if total < 3 {
-                    return err("target pane too small");
-                }
+                // layout_get_tiled_cell: args_percentage_and_expand(args, 'l', 0, INT_MAX, ...)
+                let geometry = |e: String| format!("size or position invalid tiled geometry {e}");
                 let size = match (o.get('l'), o.get('p')) {
-                    (Some(l), _) if l.ends_with('%') => l.trim_end_matches('%').parse::<u32>().ok().map(|p| (total as u32 * p / 100) as u16),
-                    (Some(l), _) => l.parse().ok(),
+                    (Some(l), _) => Some(self.pct_expand(l, 0, i32::MAX as i64, total as i64, dst).map_err(geometry)?.min(u16::MAX as i64) as u16),
                     // -p: a percentage of the target (tmux's older form of -l N%)
                     (None, Some(p)) => {
                         let v = self.expand(dst, ctx.client, p);
-                        let pct = v.parse::<u32>().ok().filter(|v| *v <= 100).ok_or_else(|| format!("size or position invalid tiled geometry {v}"))?;
-                        Some((total as u32 * pct / 100) as u16)
+                        let pct = match v.parse::<i64>() {
+                            Err(_) => Err("invalid"),
+                            Ok(n) if n < 0 => Err("too small"),
+                            Ok(n) if n > 100 => Err("too large"),
+                            Ok(n) => Ok(n),
+                        }.map_err(|e| geometry(e.into()))?;
+                        Some((total as i64 * pct / 100) as u16)
                     }
                     (None, None) => None,
                 };
+                if total < 3 {
+                    return err("target pane too small");
+                }
                 // detach from source window: layout_close_pane, then window_lost_pane
                 if self.detach_pane(swid, spane) {
                     self.apply_layout(swid);

@@ -668,8 +668,10 @@ fn review_regressions() {
     }
     assert!(child.wait().unwrap().success());
     assert_eq!(ctx.ok(&["show-buffer", "-b", "stdin"]), "from stdin");
-    // absurd sizes are clamped instead of exhausting memory
-    ctx.ok(&["resize-window", "-t", "r", "-x", "60000", "-y", "60000"]);
+    // sizes over WINDOW_MAXIMUM fail (tmux 3.8); large ones are clamped instead of
+    // exhausting memory
+    assert_eq!(ctx.fails(&["resize-window", "-t", "r", "-x", "60000", "-y", "60000"]).trim(), "width too large");
+    ctx.ok(&["resize-window", "-t", "r", "-x", "10000", "-y", "10000"]);
     assert_eq!(ctx.fmt("r", "#{window_width}x#{window_height}"), "1000x1000");
     ctx.ok(&["resize-window", "-A", "-t", "r"]);
 }
@@ -3074,4 +3076,22 @@ fn startup_config_source_file_resolves_against_the_client_directory() {
     std::fs::remove_dir_all(&dir).unwrap();
     assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
     assert_eq!(ctx.ok(&["show-options", "-gv", "@rel"]).trim(), "1");
+}
+
+#[test]
+fn size_arguments_are_checked_like_args_percentage() {
+    let ctx = Ctx::new("wq-sizes");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "80", "-y", "24", "sleep 100"]);
+    ctx.ok(&["split-window", "-d", "-t", "s", "sleep 100"]);
+    assert_eq!(ctx.fails(&["resize-pane", "-t", "s", "-x", "abc"]).trim(), "width invalid");
+    assert_eq!(ctx.fails(&["resize-pane", "-t", "s", "-y", "abc"]).trim(), "height invalid");
+    assert_eq!(ctx.fails(&["resize-pane", "-t", "s", "-x", ""]).trim(), "width empty");
+    assert_eq!(ctx.fails(&["resize-pane", "-t", "s", "-x", "-3"]).trim(), "width too small");
+    assert_eq!(ctx.fails(&["resize-pane", "-t", "s", "-y", "5000%"]).trim(), "height too large");
+    ctx.ok(&["resize-pane", "-t", "s", "-x", "2000"]);
+    ctx.ok(&["resize-pane", "-t", "s", "-y", "50%"]);
+    assert_eq!(ctx.fails(&["resize-window", "-t", "s", "-x", "abc"]).trim(), "width invalid");
+    assert_eq!(ctx.fails(&["resize-window", "-t", "s", "-x", "0"]).trim(), "width too small");
+    assert_eq!(ctx.fails(&["resize-window", "-t", "s", "-y", "20000"]).trim(), "height too large");
+    assert_eq!(ctx.fails(&["join-pane", "-l", "abc", "-s", "s:0.1", "-t", "s:0.0"]).trim(), "size or position invalid tiled geometry invalid");
 }
