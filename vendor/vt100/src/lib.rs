@@ -156,17 +156,27 @@ mod metadata_tests {
         // writing inside a tab turns it into spaces
         p.process(b"\x1b[1;4H-");
         assert_eq!(p.screen().history_row(0).unwrap().cell_metadata(0).map(|m| m.tab_width), Some(0));
-        // reflow moves a tab as one cell: it goes to the next row when it does not fit
+        // an insert inside a tab keeps the part before it (capture-pane shows the tab)
+        let mut p = parser(4, 30);
+        p.process(b"\x1b[3gab\x1b[1Dcd\x1b[1;20H\x1bH\x1b[1;4H\tX\x1b[2D\x1b[@Y");
+        assert_eq!(tabs(&p, 0), [(3, 15)]);
+        // reflow moves a tab as one cell while it fits on the row, else it becomes spaces
         let mut p = parser(3, 20);
-        p.process(b"abcde\tf");
+        p.process(b"abcde\tf\r\nab\tcd");
         assert_eq!(tabs(&p, 0), [(5, 3)]);
-        p.set_size(NonZeroU16::new(3).unwrap(), NonZeroU16::new(6).unwrap());
+        assert_eq!(tabs(&p, 1), [(2, 6)]);
+        p.set_size(NonZeroU16::new(3).unwrap(), NonZeroU16::new(9).unwrap());
         let s = p.screen();
-        let text: alloc::vec::Vec<_> = (0..s.history_rows_len()).map(|y| { let mut t = alloc::string::String::new(); s.history_row(y).unwrap().write_plain(&mut t, 6); t }).collect();
-        assert_eq!(text[0], "abcde");
-        assert!(text[0..].iter().any(|t| t.starts_with("   f")), "{text:?}");
-        let y = text.iter().position(|t| t.starts_with("   f")).unwrap();
-        assert_eq!(tabs(&p, y), [(0, 3)]);
+        let text: alloc::vec::Vec<_> = (0..s.history_rows_len()).map(|y| { let mut t = alloc::string::String::new(); s.history_row(y).unwrap().write_plain(&mut t, 9); t }).collect();
+        assert_eq!(text[..2], ["abcde   f", "ab      c"], "{text:?}");
+        assert_eq!(tabs(&p, 0), [(5, 3)]);
+        assert_eq!(tabs(&p, 1), [(2, 6)]);
+        p.set_size(NonZeroU16::new(3).unwrap(), NonZeroU16::new(5).unwrap());
+        assert_eq!(tabs(&p, 0), []);
+        p.set_size(NonZeroU16::new(3).unwrap(), NonZeroU16::new(20).unwrap());
+        let mut t = alloc::string::String::new();
+        p.screen().history_row(0).unwrap().write_plain(&mut t, 20);
+        assert_eq!(t, "abcde   f");
         // clear-history -H: every link goes, tabs stay
         let mut p = parser(3, 20);
         p.process(b"\x1b]8;;http://a\x07ab\r\n\x1b]8;;\x07\tc\r\n\r\n\r\n\x1b]8;;http://b\x07d");

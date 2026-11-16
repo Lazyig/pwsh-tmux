@@ -214,8 +214,10 @@ impl Grid {
                 if cell.is_wide_continuation() { x += 1; continue; }
                 let metadata = old.cell_metadata(x);
                 let tab = metadata.map_or(0, |m| m.tab_width);
-                // a tab moves as one cell of its width (GRID_FLAG_TAB)
-                let width = if tab > 1 && tab <= size.cols() { tab } else if cell.is_wide() { 2 } else { 1 };
+                // a tab that fits on the row moves as one cell of its width; one the new
+                // width cuts becomes its spaces (wrapping it early would leave a gap that
+                // rejoining cannot tell from text)
+                let width = if tab > 1 && col + tab <= size.cols() { tab } else if cell.is_wide() { 2 } else { 1 };
                 if col + width > size.cols() {
                     row.wrap(true);
                     emit(row, &mut out, &mut produced);

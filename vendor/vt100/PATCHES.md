@@ -54,7 +54,8 @@ URI, anonymous links always new, URIs over 1024 bytes dropped) and HT tab cells
 (GRID_FLAG_TAB: HT over up to 32 blank cells that look alike keeps the tab with
 the first cell's style and link) live in an optional boxed map per row, so normal
 cells stay 32 bytes and ordinary rows allocate nothing. Rewriting a cell drops its
-entry and turns a tab covering it into spaces; inserts/deletes shift entries;
-reflow moves a tab as one cell. ROW_HYPERLINK / ROW_EXTENDED stay set until the
+entry and turns a tab covering it into spaces; an insert or delete inside a tab
+keeps the part before it; reflow moves a tab as one cell while it fits on the row
+and turns it into spaces when the new width cuts it. ROW_HYPERLINK / ROW_EXTENDED stay set until the
 row is cleared, as tmux's line flags. `Screen::reset_hyperlinks` is
 screen_reset_hyperlinks (clear-history -H). Tests: lib.rs::metadata_tests.

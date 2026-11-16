@@ -173,7 +173,9 @@ impl Row {
 
         if let Some(m) = self.metadata.take() {
             for (x, mut v) in *m {
-                if x < i && x.saturating_add(v.tab_width) > i { v.tab_width = 0; }
+                // a tab cut by the insert keeps the cells before it (the rest of its
+                // padding moves on as blanks, as tmux's moved padding cells print nothing)
+                if x < i && x.saturating_add(v.tab_width) > i { v.tab_width = i - x; }
                 let x = if x >= i { x.saturating_add(count as u16) } else { x };
                 if x < self.cols() { self.set_metadata(x, v); }
             }
@@ -209,7 +211,7 @@ impl Row {
 
         if let Some(m) = self.metadata.take() {
             for (x, mut v) in *m {
-                if x < range.start && x.saturating_add(v.tab_width) > range.start { v.tab_width = 0; }
+                if x < range.start && x.saturating_add(v.tab_width) > range.start { v.tab_width = range.start - x; }
                 if range.contains(&x) { continue; }
                 let x = if x >= range.end { x - (range.end - range.start) } else { x };
                 self.set_metadata(x, v);
