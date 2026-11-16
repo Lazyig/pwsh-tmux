@@ -29,6 +29,19 @@ pub fn getopt(args: &[String], bools: &str, vals: &str) -> Result<Opts, String> 
 /// [`getopt`] where the flags in `optional` (also listed in `bools`) take an optional value
 /// (tmux `D::`): attached (`-D5`), or the next argument unless it looks like a flag.
 /// Without one their value is empty.
+/// The flag tmux names in "invalid flag -%c": the first byte of the character (given
+/// back to the client as that byte).
+pub fn flag_byte(c: char) -> char {
+    match c.encode_utf8(&mut [0; 4]).as_bytes() {
+        [b] => *b as char,
+        [b, ..] => char::from_u32(0x10FF00 + *b as u32).unwrap_or(c),
+        [] => c,
+    }
+}
+
+/// The error of [`getopt_optional`] for -?: the caller prints the command's usage.
+pub const USAGE_ERROR: &str = "\0usage";
+
 pub fn getopt_optional(args: &[String], bools: &str, vals: &str, optional: &str) -> Result<Opts, String> {
     let mut flags = HashMap::new();
     let mut i = 0;
@@ -45,6 +58,13 @@ pub fn getopt_optional(args: &[String], bools: &str, vals: &str, optional: &str)
         let mut j = 0;
         while j < chars.len() {
             let c = chars[j];
+            // args_parse_flags: -? asks for the usage, other flags are letters or digits
+            if c == '?' {
+                return Err(USAGE_ERROR.into());
+            }
+            if !c.is_ascii_alphanumeric() {
+                return Err(format!("invalid flag -{}", flag_byte(c)));
+            }
             if optional.contains(c) {
                 let inline: String = chars[j + 1..].iter().collect();
                 let v = if !inline.is_empty() {

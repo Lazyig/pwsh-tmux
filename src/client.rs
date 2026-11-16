@@ -24,13 +24,13 @@ pub struct Global {
 
 fn spawn_server(config: Option<&str>) -> std::io::Result<()> {
     use std::process::{Command, Stdio};
-    // Resolve before changing the server's cwd. Preserve source-file's ~/ form.
+    // Preserve source-file's ~/ form. A relative path stays as given (errors and
+    // #{config_files} show it so); the server reads it relative to our cwd.
     let config = config.map(|path| {
-        let path = if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
-            crate::server::procinfo::home_dir().map(|home| std::path::PathBuf::from(home).join(rest)).unwrap_or_else(|| path.into())
-        } else { std::path::PathBuf::from(path) };
-        std::path::absolute(path).map(|path| path.to_string_lossy().into_owned())
-    }).transpose()?;
+        if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+            crate::server::procinfo::home_dir().map(|home| std::path::PathBuf::from(home).join(rest).to_string_lossy().into_owned()).unwrap_or_else(|| path.into())
+        } else { path.to_string() }
+    });
     let config = config.as_deref();
     let exe = std::env::current_exe()?;
     let make = || {
@@ -316,11 +316,13 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                     }
                     continue;
                 }
+                // bytes of arguments that were not UTF-8 are printed as they were
                 if code == 0 {
-                    print!("{text}");
+                    let _ = std::io::stdout().write_all(&crate::rawarg::to_bytes(&text));
                 } else if !text.is_empty() {
                     // a bare exit status (new-pane -W) prints nothing
-                    eprint!("{text}{}", if text.ends_with('\n') { "" } else { "\n" });
+                    let nl = if text.ends_with('\n') { "" } else { "\n" };
+                    let _ = std::io::stderr().write_all(&crate::rawarg::to_bytes(&format!("{text}{nl}")));
                 }
                 let _ = std::io::stdout().flush();
                 return code as i32;

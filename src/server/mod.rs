@@ -1078,6 +1078,10 @@ pub struct Ctx {
     pub readonly: bool,
     /// Files being sourced (innermost last), for #{current_file}.
     pub files: Vec<String>,
+    /// The line of the command running in each of `files` (0 before the first).
+    pub lines: Vec<usize>,
+    /// The startup configuration's queue (the global queue: errors never end it).
+    pub cfg: bool,
     /// The exit status for the command-line client (c->retval: run-shell and new-pane -W
     /// set it).
     pub retval: i32,
@@ -1118,6 +1122,10 @@ pub fn internal_mark(name: &str) -> String {
 }
 pub static FILE_PUSH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("file-push"));
 pub static FILE_POP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("file-pop"));
+/// Before each command of a file: its line (cmd_get_source), which also makes its group.
+pub static LINE_MARK: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("line"));
+/// The end of the startup configuration (cfg_done).
+pub static CFG_DONE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("cfg-done"));
 
 /// The tmux release whose behaviour this server matches (`#{version}`).
 pub const TMUX_VERSION: &str = "3.8";
@@ -1234,6 +1242,12 @@ pub struct Server {
     /// The working directory of the client that started the server: relative paths in
     /// the startup configuration resolve against it (cfg_client's cwd).
     pub cfg_cwd: Option<String>,
+    /// Errors of the startup configuration (cfg_causes), until they are shown.
+    pub cfg_causes: Vec<String>,
+    /// Client commands that arrived while the configuration loads: they run after it.
+    pub cfg_waiting: Vec<Queue>,
+    /// The configuration's queue has started and not finished.
+    pub cfg_loading: bool,
     /// Queues waiting for a pane's command to exit (new-pane -W).
     pub pane_waits: HashMap<PaneId, Vec<(Vec<String>, Queue)>>,
 }
@@ -1255,6 +1269,9 @@ pub fn run(config: Option<String>) -> io::Result<()> {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "cannot determine server owner"));
     }
     srv.cfg_cwd = std::env::var(CFG_CWD_ENV).ok().filter(|d| !d.is_empty());
+    // only for the server: jobs and panes started from it must not see it
+    // SAFETY: no other thread of this process reads the environment yet
+    unsafe { std::env::remove_var(CFG_CWD_ENV) };
     // config first: its server-access lines decide who may open the Windows pipe
     srv.load_config(config);
     srv.load_prompt_history();
@@ -1388,6 +1405,9 @@ impl Server {
             pipe_acl: None,
             cfg_files: Vec::new(),
             cfg_cwd: None,
+            cfg_causes: Vec::new(),
+            cfg_waiting: Vec::new(),
+            cfg_loading: false,
             pane_waits: HashMap::new(),
         };
         srv.opts_session.set("default-shell", procinfo::default_shell());
@@ -1428,16 +1448,82 @@ impl Server {
             }
         }
         self.cfg_files = files.iter().map(|f| f.0.clone()).collect();
+        // start_cfg/load_cfg: each file is parsed now and its commands go in the global
+        // queue, which goes on after errors; a missing default file is quiet. Errors
+        // name the file as given and wait in cfg_causes.
+        let ctx = Ctx { cfg: true, ..Ctx::default() };
+        let mut cmds = VecDeque::new();
         for (f, quiet) in files {
-            let mut args = vec!["source-file".to_string()];
-            if quiet {
-                args.push("-q".into());
+            let path = match &self.cfg_cwd {
+                Some(d) if std::path::Path::new(&f).is_relative() => std::path::Path::new(d).join(&f).to_string_lossy().into_owned(),
+                _ => f.clone(),
+            };
+            if !std::path::Path::new(&path).exists() {
+                if !quiet {
+                    self.cfg_causes.push(format!("{f}: No such file or directory"));
+                }
+                continue;
             }
-            args.push(f);
-            let ctx = Ctx::default();
-            self.run_queue(Queue { cmds: VecDeque::from([args]), ctx , soft: 0 });
+            match self.load_file(&path, &f, false, false, &ctx) {
+                Ok((c, _)) => cmds.extend(c),
+                Err(e) => self.cfg_causes.push(e),
+            }
+        }
+        cmds.push_back(vec![CFG_DONE.to_string()]);
+        let soft = cmds.len();
+        self.cfg_loading = true;
+        self.run_queue(Queue { cmds, ctx, soft });
+    }
+
+    /// cfg_done: the configuration is loaded. Its errors are shown (cfg_show_causes) and
+    /// the client commands that waited for it run.
+    pub fn cfg_done(&mut self) {
+        if self.cfg_finished {
+            return;
         }
         self.cfg_finished = true;
+        self.cfg_loading = false;
+        self.show_cfg_causes(None);
+        for q in std::mem::take(&mut self.cfg_waiting) {
+            self.run_queue(q);
+        }
+    }
+
+    /// cfg_show_causes: a control client gets them as %config-error, else they go in
+    /// view mode in the active pane of the session (the first client's, or the first
+    /// one) once it is attached.
+    pub fn show_cfg_causes(&mut self, sid: Option<SessId>) {
+        if self.cfg_causes.is_empty() {
+            return;
+        }
+        let first = self.clients.values().filter(|c| c.ident.is_some()).min_by_key(|c| c.id).map(|c| (c.id, c.control > 0, c.session));
+        if let Some((cid, true, _)) = first {
+            for c in std::mem::take(&mut self.cfg_causes) {
+                self.control_write(cid, &format!("%config-error {c}\n"));
+            }
+            return;
+        }
+        let sid = sid.or(first.and_then(|f| f.2)).or_else(|| self.sessions.values().min_by(|a, b| a.name.cmp(&b.name)).map(|s| s.id));
+        let Some(sid) = sid.filter(|s| self.clients.values().any(|c| c.attached && c.session == Some(*s))) else { return };
+        let wid = self.sessions[&sid].active_window();
+        let pane = self.windows[&wid].active;
+        let text = std::mem::take(&mut self.cfg_causes).join("\n");
+        self.view_output(pane, &format!("{text}\n"));
+    }
+
+    /// cmdq_error for a command without a client: during the configuration its error
+    /// waits in cfg_causes, later it goes in the message log, with the command's file
+    /// and line when it came from a file.
+    pub fn no_client_error(&mut self, ctx: &Ctx, e: &str) {
+        let msg = match (ctx.files.last(), ctx.lines.last()) {
+            (Some(f), Some(&l)) if l > 0 => format!("{f}:{l}: {e}"),
+            _ => e.to_string(),
+        };
+        if self.cfg_finished {
+            self.add_message(&format!("message: {msg}"));
+        } else {
+            self.cfg_causes.push(msg);
+        }
     }
 
     pub fn add_message(&mut self, msg: &str) {
@@ -1856,7 +1942,7 @@ impl Server {
                     return;
                 }
                 let cmds = if argv.is_empty() {
-                    match crate::cmdparse::parse(&self.opt_server("default-client-command")) {
+                    match self.parse_string(&self.opt_server("default-client-command")) {
                         Ok(cmds) => cmds,
                         Err(e) => { if let Some(c) = self.clients.get(&cid) { c.send(S_REPLY, &encode_reply(1, &e)); } return; }
                     }
@@ -1873,7 +1959,9 @@ impl Server {
                     self.finish_queue(Queue { cmds: VecDeque::new(), ctx, soft: 0 }, Some(e));
                     return;
                 }
-                self.run_queue(Queue { cmds: cmds.into_iter().filter(|c| !c.is_empty()).collect(), ctx , soft: 0 });
+                let q = Queue { cmds: cmds.into_iter().filter(|c| !c.is_empty()).collect(), ctx , soft: 0 };
+                // cfg_client_done: a client's command waits for the configuration
+                if self.cfg_loading { self.cfg_waiting.push(q) } else { self.run_queue(q) }
             }
             C_INPUT => {
                 if let Some(c) = self.clients.get_mut(&cid) {
@@ -2209,7 +2297,7 @@ impl Server {
             JobKind::IfShell { then, otherwise } => {
                 let branch = if status == 0 { Some(then) } else { otherwise };
                 if let Some(b) = branch {
-                    match crate::cmdparse::parse(&b) {
+                    match self.parse_string(&b) {
                         Ok(cmds) => {
                             for c in cmds.into_iter().rev() {
                                 queue.cmds.push_front(c);
@@ -3218,6 +3306,25 @@ impl Server {
         }
     }
 
+    /// Drops the commands left of the line (group) of a file whose command failed:
+    /// those up to the next line's mark.
+    fn skip_group(q: &mut Queue) {
+        let Some(&line) = q.ctx.lines.last() else { return };
+        if line == 0 {
+            return;
+        }
+        loop {
+            match q.cmds.front() {
+                Some(c) if c.first() == Some(&*LINE_MARK) && c.get(1).and_then(|n| n.parse().ok()) == Some(line) => {}
+                Some(c) if c.first().is_some_and(|n| n.starts_with('\0') && !n.starts_with("\0alias:")) => return,
+                Some(_) => {}
+                None => return,
+            }
+            q.cmds.pop_front();
+            q.soft = q.soft.saturating_sub(1);
+        }
+    }
+
     fn run_queue_inner(&mut self, mut q: Queue) {
         let mut hook_saved = std::mem::take(&mut q.ctx.hook_saved);
         // an error whose command-error hook runs first
@@ -3234,14 +3341,27 @@ impl Server {
                 events::apply_hook_mark(&cmd, &mut q.ctx, &mut hook_saved, &mut q.soft);
                 continue;
             }
-            let soft = q.soft > 0;
+            // errors never end the global queue the configuration runs in
+            let soft = q.soft > 0 || q.ctx.cfg;
             q.soft = q.soft.saturating_sub(1);
             if name == *FILE_PUSH {
                 q.ctx.files.push(cmd.get(1).cloned().unwrap_or_default());
+                q.ctx.lines.push(0);
                 continue;
             }
             if name == *FILE_POP {
                 q.ctx.files.pop();
+                q.ctx.lines.pop();
+                continue;
+            }
+            if name == *LINE_MARK {
+                if let Some(l) = q.ctx.lines.last_mut() {
+                    *l = cmd.get(1).and_then(|n| n.parse().ok()).unwrap_or(0);
+                }
+                continue;
+            }
+            if name == *CFG_DONE {
+                self.cfg_done();
                 continue;
             }
             let delay_cmd = (cmds::canonical(&name) == Some("run-shell")).then(|| cmd.clone());
@@ -3328,7 +3448,13 @@ impl Server {
                 }
                 Err(e) if soft && !e.starts_with('\0') => {
                     log(&format!("{e}"));
-                    self.log_error(q.ctx.client.or(q.ctx.reply), &e);
+                    if q.ctx.client.or(q.ctx.reply).is_some() {
+                        self.log_error(q.ctx.client.or(q.ctx.reply), &e);
+                    } else {
+                        self.no_client_error(&q.ctx, &e);
+                    }
+                    // cmdq_remove_group: the rest of the failed command's line is dropped
+                    Self::skip_group(&mut q);
                     let cli = q.ctx.control_seq.is_none() && q.ctx.reply.and_then(|r| self.clients.get(&r)).is_some_and(|c| !c.attached);
                     if cli {
                         q.ctx.soft_err.push_str(&e);
@@ -3472,6 +3598,10 @@ impl Server {
     }
 
     pub fn finish_queue(&mut self, q: Queue, mut err: Option<String>) {
+        // a configuration queue ended early still ends the configuration
+        if q.cmds.iter().any(|c| c.first() == Some(&*CFG_DONE)) {
+            self.cfg_done();
+        }
         let ctx = q.ctx;
         if ctx.out.overflowed() { err = Some("command output limit exceeded".into()); }
         if let (Some(seq), Some(cid)) = (ctx.control_seq, ctx.client) {
@@ -3555,7 +3685,9 @@ impl Server {
         }
         if let Some(e) = &err {
             log(&format!("command error: {e}"));
-            if !attached {
+            if ctx.client.is_none() {
+                self.no_client_error(&ctx, e);
+            } else if !attached {
                 self.log_error(None, e);
             }
         }

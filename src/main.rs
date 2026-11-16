@@ -31,8 +31,48 @@ Environment: PWSH_TMUX_SHELL overrides the default shell (pwsh, then powershell 
 Windows; pwsh, then $SHELL on Unix).
 ";
 
+/// Command-line arguments that are not valid UTF-8 (tmux takes any bytes and check_name
+/// rejects such names): each byte that is not part of a UTF-8 character becomes a
+/// private-use character, and back to the byte when the client prints a reply.
+pub mod rawarg {
+    const BASE: u32 = 0x10FF00;
+
+    pub fn is_raw(c: char) -> bool {
+        (BASE..=BASE + 0xFF).contains(&(c as u32))
+    }
+
+    pub fn from_os(a: std::ffi::OsString) -> String {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let mut out = String::new();
+            for chunk in a.as_bytes().utf8_chunks() {
+                out.push_str(chunk.valid());
+                out.extend(chunk.invalid().iter().map(|b| char::from_u32(BASE + *b as u32).unwrap()));
+            }
+            out
+        }
+        #[cfg(not(unix))]
+        {
+            a.to_string_lossy().into_owned()
+        }
+    }
+
+    pub fn to_bytes(s: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(s.len());
+        for c in s.chars() {
+            if is_raw(c) {
+                out.push((c as u32 - BASE) as u8);
+            } else {
+                out.extend(c.encode_utf8(&mut [0; 4]).as_bytes());
+            }
+        }
+        out
+    }
+}
+
 fn main() {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args_os().skip(1).map(rawarg::from_os).collect();
     if args.first().map(String::as_str) == Some("__server") {
         let config = args.get(1).cloned();
         let code = match server::run(config) {

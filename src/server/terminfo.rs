@@ -104,6 +104,17 @@ fn feature_capabilities(name: &str) -> &'static [&'static str] {
     }
 }
 
+/// tty_term_create's required capabilities: a terminal the terminfo database knows
+/// cannot be used without clear and cup (after terminal-overrides). pwsh-tmux draws
+/// without terminfo, so a terminal it has no entry for (any Windows console) is fine.
+pub fn missing_required(term: &str, overrides: &[String], features: &Features) -> Option<&'static str> {
+    if terminfo(term).is_empty() {
+        return None;
+    }
+    let caps = describe(term, overrides, features);
+    ["clear", "cup"].into_iter().find(|name| CODES.iter().position(|c| c.0 == *name).is_some_and(|i| caps[i] == Value::Missing))
+}
+
 /// The capabilities of `term` after tty_term_create: terminfo (what tty_term_read_list
 /// sends), terminal-overrides, the features' capabilities, terminal-overrides again.
 pub fn describe(term: &str, overrides: &[String], features: &Features) -> Vec<Value> {
