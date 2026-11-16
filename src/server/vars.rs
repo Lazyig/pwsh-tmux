@@ -495,7 +495,7 @@ impl Vars for VarCtx<'_> {
                     srv.rects(w.id).0.into_iter().find(|(id, _)| *id == p)?.1
                 };
                 // position of the pane's content (below a pane-border-status line)
-                let c = srv.content_rect(w.id, r);
+                let c = srv.pane_content_rect(w.id, p, r);
                 Some(match name {
                     "pane_left" | "pane_x" => c.x.to_string(),
                     "pane_top" | "pane_y" => c.y.to_string(),

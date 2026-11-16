@@ -2339,14 +2339,22 @@ impl Server {
 
     /// Content rect of a pane (minus a pane-border-status line).
     pub fn content_rect(&self, wid: WinId, r: Rect) -> Rect {
+        match self.rects(wid).0.into_iter().find(|(_, rect)| *rect == r) {
+            Some((id, _)) => self.pane_content_rect(wid, id, r),
+            None => self.scrollbar_area(wid, r),
+        }
+    }
+
+    /// The content of pane `id` in layout cell `r` (also a cell of the unzoomed
+    /// layout for a pane hidden by zoom): less a pane status line and a reserved
+    /// scrollbar.
+    pub fn pane_content_rect(&self, wid: WinId, id: PaneId, r: Rect) -> Rect {
         let mut cr = self.scrollbar_area(wid, r);
         if self.opt_window(Some(wid), "pane-scrollbars") == "on" {
-            if let Some((id, _)) = self.rects(wid).0.into_iter().find(|(_, rect)| *rect == r) {
-                if let Some(sb) = self.scrollbar(wid, id, cr) {
-                    let width = sb.width.saturating_add(sb.pad).min(cr.w.saturating_sub(1));
-                    cr.w -= width;
-                    if self.opt_window(Some(wid), "pane-scrollbars-position") == "left" { cr.x += width; }
-                }
+            if let Some(sb) = self.scrollbar(wid, id, cr) {
+                let width = sb.width.saturating_add(sb.pad).min(cr.w.saturating_sub(1));
+                cr.w -= width;
+                if self.opt_window(Some(wid), "pane-scrollbars-position") == "left" { cr.x += width; }
             }
         }
         cr

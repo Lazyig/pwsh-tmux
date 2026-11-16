@@ -1270,3 +1270,18 @@ fn pane_dead_signal_and_status_like_tmux_3_8() {
     assert_eq!(ctx.fmt("s:e", f), "1:[7]:[]");
     wait_for("default format", || ctx.capture("s:k").contains("Pane is dead (signal 15, "));
 }
+
+#[test]
+fn zoom_keeps_hidden_panes_beside_their_left_scrollbars() {
+    let ctx = Ctx::new("zoom-sb-left");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "80", "-y", "24", "sleep 300"]);
+    ctx.ok(&["split-window", "-h", "-t", "s", "sleep 300"]);
+    ctx.ok(&["split-window", "-v", "-t", "s", "sleep 300"]);
+    ctx.ok(&["set", "-g", "pane-scrollbars", "on"]);
+    ctx.ok(&["set", "-g", "pane-scrollbars-position", "left"]);
+    let g = "#{P:#{pane_index}=#{pane_width}x#{pane_height}+#{pane_left}+#{pane_top} }";
+    let before = ctx.fmt("s", g);
+    assert_eq!(before, "0=39x24+1+0 1=38x12+42+0 2=38x11+42+13 ");
+    ctx.ok(&["resize-pane", "-Z", "-t", "s:0.0"]);
+    assert_eq!(ctx.fmt("s", g), "0=79x24+1+0 1=38x12+42+0 2=38x11+42+13 ");
+}
