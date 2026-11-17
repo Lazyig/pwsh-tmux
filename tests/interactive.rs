@@ -1756,8 +1756,12 @@ fn send_keys_k_escape_reaches_a_popup_or_modal_pane_program() {
     ctx.ok(&["bind-key", "-n", "F7", "set", "-g", "@f7", "ran"]);
     let mut waiting = ctx.command().args(["send-keys", "-K", "-c", &client, "F5", "F7"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
     t.wait_screen("popup open", |s| s.contains('┌'));
-    ctx.ok(&["send-keys", "-K", "-c", &client, "q", "Escape", "w"]);
-    t.wait_screen("keys reach the popup program", |s| s.contains("q^[w"));
+    // (Escape goes last: ConPTY reads an Escape followed by a character as Alt and that
+    // character, so on Windows the program may see "qw")
+    ctx.ok(&["send-keys", "-K", "-c", &client, "q", "Escape"]);
+    t.wait_screen("keys reach the popup program", |s| s.contains(if cfg!(windows) { "q" } else { "q^[" }));
+    ctx.ok(&["send-keys", "-K", "-c", &client, "w"]);
+    t.wait_screen("the popup is still open after Escape", |s| s.contains("q^[w") || (cfg!(windows) && s.contains("qw")));
     assert!(waiting.try_wait().unwrap().is_none(), "the popup closed");
     assert_eq!(ctx.fmt("w", "[#{@f7}]"), "[]", "the key after the popup ran while it was open");
     ctx.ok(&["display-popup", "-C", "-c", &client]);
@@ -1770,7 +1774,9 @@ fn send_keys_k_escape_reaches_a_popup_or_modal_pane_program() {
     wait_for("modal pane", || ctx.ok(&["list-panes", "-t", "w"]).lines().count() == 2);
     let modal = ctx.ok(&["display-message", "-p", "-t", "w", "#{pane_id}"]).trim().to_string();
     ctx.ok(&["send-keys", "-K", "-c", &client, "x", "Escape"]);
-    wait_for("Escape reaches the modal pane", || ctx.capture(&modal).contains("x^["));
+    wait_for("Escape reaches the modal pane", || ctx.capture(&modal).contains(if cfg!(windows) { "x" } else { "x^[" }));
+    ctx.ok(&["send-keys", "-K", "-c", &client, "y"]);
+    wait_for("the modal pane is still open after Escape", || ctx.capture(&modal).contains("x^[y") || (cfg!(windows) && ctx.capture(&modal).contains("xy")));
     assert_eq!(ctx.ok(&["list-panes", "-t", "w"]).lines().count(), 2);
     t.send(b"\x1b");
     wait_for("typed Escape closes the modal pane", || ctx.ok(&["list-panes", "-t", "w"]).lines().count() == 1);
@@ -1988,4 +1994,74 @@ fn commands_after_errors_that_do_not_fail_the_command() {
     ctx.ok(&["send-keys", "-K", "-c", &client, "q", "Enter"]);
     wait_for("prompt closed", || !t.row(29).starts_with('x'));
     assert_eq!(ctx.fmt("w", "[#{@p}]"), "[]");
+}
+
+#[test]
+fn copy_mode_keys_drop_after_a_repeat_and_send_keys_queues_their_bindings() {
+    // window-copy.c has no key callback: a key that ends a repeat (or comes after
+    // prefix-timeout) without a binding of its own is dropped, not run by copy mode
+    let ctx = Ctx::new("copy-queue");
+    let t = start(&ctx, "w");
+    let client = only_client(&ctx);
+    ctx.ok(&["set-option", "-g", "mode-keys", "vi"]);
+    ctx.ok(&["set-option", "-g", "repeat-time", "2000"]);
+    ctx.ok(&["bind-key", "-r", "F9", "set", "-ga", "@h", "r"]);
+    ctx.ok(&["send-keys", "-t", "w", &typed_lines(60)]);
+    wait_for("history", || ctx.fmt("w", "#{history_size}").parse::<u32>().unwrap_or(0) > 20);
+    ctx.ok(&["copy-mode", "-t", "w"]);
+    ctx.ok(&["send-keys", "-t", "w", "-X", "-N", "3", "cursor-up"]);
+    let y = ctx.fmt("w", "#{copy_cursor_y}");
+    ctx.ok(&["send-keys", "-K", "-c", &client, "C-b", "F9", "F9", "k"]);
+    assert_eq!(ctx.fmt("w", "#{@h} #{copy_cursor_y}"), format!("rr {y}"));
+    // send-keys without -K: copy mode's bindings go in the queue after it, logged as the
+    // command-line client's commands, so the jump prompt f opens waits there
+    ctx.ok(&["set", "-s", "message-limit", "100"]);
+    let mut waiting = ctx.command().args(["send-keys", "-t", "w", "k", "f", "c"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    wait_for("cursor-up ran", || ctx.fmt("w", "#{copy_cursor_y}") != y);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(waiting.try_wait().unwrap().is_none(), "send-keys returned while the jump prompt waited");
+    ctx.ok(&["send-keys", "-K", "-c", &client, "Escape"]);
+    wait_for("send-keys returns", || waiting.try_wait().unwrap().is_some());
+    let log = ctx.ok(&["show-messages"]);
+    assert!(log.lines().any(|l| l.ends_with(" command: send-keys -X cursor-up")), "{log}");
+    assert!(!log.contains("key k:"), "{log}");
+    // the default mouse bindings run their commands for a mouse key sent by name
+    ctx.ok(&["send-keys", "-t", "w", "-X", "cancel"]);
+    ctx.ok(&["set-option", "-g", "mouse", "on"]);
+    ctx.ok(&["copy-mode", "-t", "w"]);
+    ctx.ok(&["send-keys", "-K", "-c", &client, "WheelUpPane"]);
+    assert_eq!(ctx.fmt("w", "#{scroll_position}"), "5");
+    ctx.ok(&["send-keys", "-t", "w", "WheelUpPane"]);
+    assert_eq!(ctx.fmt("w", "#{scroll_position}"), "10");
+    drop(t);
+}
+
+#[test]
+fn key_names_and_tables_as_key_string_lookup_string() {
+    // mouse key names are case-insensitive with modifiers for bind, list-keys and unbind
+    // alike; names that are not in tmux's table fail everywhere
+    let ctx = Ctx::new("mouse-names");
+    let _t = start(&ctx, "w");
+    let client = only_client(&ctx);
+    ctx.ok(&["bind-key", "-n", "s-c-m-wheeldownstatus", "set", "-g", "@m", "1"]);
+    assert!(ctx.ok(&["list-keys", "-T", "root", "C-M-S-WheelDownStatus"]).contains("C-M-S-WheelDownStatus"));
+    ctx.ok(&["unbind-key", "-n", "s-c-m-wheeldownstatus"]);
+    for bad in ["MouseMovePane", "MouseDown4Pane", "WheelUp1Pane"] {
+        assert!(ctx.fails(&["bind-key", "-n", bad, "set", "-g", "@m", "1"]).contains("unknown key"), "{bad}");
+        assert!(ctx.fails(&["list-keys", "-T", "root", bad]).contains("invalid key"), "{bad}");
+    }
+    // switch-client -T needs a table that exists
+    assert!(ctx.fails(&["switch-client", "-c", &client, "-T", "nosuch"]).contains("table nosuch doesn't exist"));
+    // the session's key-table is a new client's table, and the one a repeat goes back to
+    ctx.ok(&["set-option", "-g", "key-table", "foo"]);
+    ctx.ok(&["bind-key", "-T", "foo", "F7", "set", "-g", "@t", "foo"]);
+    ctx.ok(&["bind-key", "-r", "F8", "set", "-ga", "@r", "r"]);
+    ctx.ok(&["set-option", "-g", "repeat-time", "300"]);
+    let t2 = Term::attach(&ctx, &["attach-session", "-t", "w"], 100, 30);
+    t2.wait_screen("second client", |s| s.contains("[w]"));
+    let tables = ctx.ok(&["list-clients", "-F", "#{client_key_table}"]);
+    assert!(tables.lines().any(|l| l == "foo"), "{tables}");
+    ctx.ok(&["switch-client", "-c", &client, "-T", "root"]);
+    ctx.ok(&["send-keys", "-K", "-c", &client, "C-b", "F8"]);
+    wait_for("repeat ends", || ctx.ok(&["display-message", "-p", "-c", &client, "#{client_key_table}"]).trim() == "foo");
 }

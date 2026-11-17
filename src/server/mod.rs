@@ -1262,6 +1262,9 @@ pub struct Ctx {
     pub key_depth: usize,
     /// What each open KEY_GROUP replaced: the client, pane, key and logged client.
     pub key_saved: Vec<(Option<ClientId>, Option<PaneId>, Option<String>, Option<ClientId>)>,
+    /// The next command is run-shell resumed after its -d delay: it is in the message
+    /// log already.
+    pub resumed: bool,
 }
 
 /// Queue markers source-file puts around a file's commands. A parsed command can hold any
@@ -1372,6 +1375,9 @@ pub struct Server {
     /// send-keys -K: the bound commands of the keys it handles, which go in its own
     /// queue after it (server_client_handle_key_after) instead of a queue of their own.
     pub key_capture: Option<Vec<Vec<String>>>,
+    /// send-keys without -K to a pane in copy mode: the bindings of its keys go in its
+    /// queue (key_capture) for the queue's own client, without a key event.
+    pub key_plain: bool,
     /// send-keys -K keys waiting in a queue (KEY_EVENT items), by token.
     pub key_events: HashMap<u64, KeyEvent>,
     pub key_event_seq: u64,
@@ -1588,6 +1594,7 @@ impl Server {
             cfg_finished: false,
             key_origin: None,
             key_capture: None,
+            key_plain: false,
             key_events: HashMap::new(),
             key_event_seq: 0,
             queue_depth: 0,
@@ -2791,11 +2798,13 @@ impl Server {
             if self.clients.get(&cid).is_some_and(|c| c.click.deadline.is_some_and(|d| d <= now)) {
                 self.mouse_click_timer(cid);
             }
+            // server_client_repeat_timer: back to the default table (the session's key-table)
+            let default_table = self.clients.get(&cid).and_then(|c| c.session).map(|s| self.default_key_table(s)).unwrap_or_else(|| "root".into());
             let Some(c) = self.clients.get_mut(&cid) else { continue };
             if c.repeat_until.is_some_and(|d| d <= now) {
                 c.repeat_until = None;
-                if c.key_table != "root" {
-                    c.set_key_table("root");
+                if c.key_table != default_table {
+                    c.set_key_table(&default_table);
                     c.dirty = true;
                 }
             }
@@ -3452,6 +3461,8 @@ impl Server {
     /// update-environment.
     pub fn attach_client_env(&mut self, cid: ClientId, sid: SessId, update_env: bool) {
         let clear = options::is_on(&self.opt_server("clear-on-attach"));
+        // server_client_set_key_table(c, NULL): the session's key-table
+        let default_table = self.default_key_table(sid);
         let Some(c) = self.clients.get_mut(&cid) else { return };
         let was_attached = c.attached;
         c.focused = true;
@@ -3463,7 +3474,7 @@ impl Server {
         c.attached = true;
         c.prev = None;
         c.dirty = true;
-        c.set_key_table("root");
+        c.set_key_table(&default_table);
         if !was_attached {
             c.send(S_ATTACHED, if clear { b"" } else { b"no-clear" });
             self.start_terminal_queries(cid);
@@ -3984,11 +3995,14 @@ impl Server {
         ctx.key_saved.push((ctx.client, ctx.pane, ctx.key.clone(), ctx.log_client));
         // the queue's client (item->client) is the one the message log names
         ctx.log_client = ctx.log_client.or(ctx.client);
-        if let Some(c) = mark.get(2).and_then(|c| c.parse().ok()).filter(|c| self.clients.contains_key(c)) {
+        // (no client: send-keys without -K, whose bindings keep the queue's client)
+        if mark.get(2).is_some_and(|c| c.is_empty()) {
+            ctx.pane = mark.get(3).and_then(|p| p.parse().ok()).or(ctx.pane);
+        } else if let Some(c) = mark.get(2).and_then(|c| c.parse().ok()).filter(|c| self.clients.contains_key(c)) {
             ctx.client = Some(c);
             ctx.pane = mark.get(3).and_then(|p| p.parse().ok());
         }
-        ctx.key = mark.get(4).cloned();
+        ctx.key = mark.get(4).filter(|k| !k.is_empty()).cloned();
     }
 
     /// A KEY_GROUP end: back to what its start replaced.
@@ -4389,6 +4403,7 @@ impl Server {
                             let ms: u64 = get(2).parse().unwrap_or(0);
                             if let Some(c) = delay_cmd.as_ref().map(|c| strip_delay(c)) {
                                 q.cmds.push_front(c);
+                                q.ctx.resumed = true;
                             }
                             self.delayed.push((Instant::now() + Duration::from_millis(ms), q));
                             return;

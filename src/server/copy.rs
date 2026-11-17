@@ -102,7 +102,10 @@ impl Server {
                 cm.end_count();
             }
         }
-        let pending = matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(cm)) if cm.waiting_for_key());
+        // (send-keys without -K looks its keys up in the table only: a jump waiting for its
+        // character, a prompt in tmux, does not get them)
+        let plain = self.key_plain && self.key_capture.is_some();
+        let pending = !plain && matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(cm)) if cm.waiting_for_key());
         let binding = self.bindings.get(table).and_then(|t| t.get(name)).map(|b| b.cmd.clone());
         let default_raw = copymode::CopyMode::default_bindings(vi).iter().find(|(k, _)| keys::parse_key_name(k).map(|k| keys::key_name(&k)).as_deref().unwrap_or(k) == name).map(|(_, c)| *c);
         let default = default_raw.map(default_binding_command);
@@ -121,8 +124,11 @@ impl Server {
         // under send-keys -K the default prompts (jumps, searches, goto line) are the real
         // command-prompt, which waits and holds up the keys after it
         let queued_prompt = self.key_capture.is_some() && default_raw.is_some_and(|c| c.starts_with("command-prompt"));
+        // the default mouse bindings (select-pane, scrolling, selecting) are commands too,
+        // and send-keys without -K queues every binding as its commands
+        let queued = queued_prompt || keys::parse_mouse_key_name(name).is_some() || plain;
         match binding {
-            Some(cmd) if !pending && (Some(&cmd) != default.as_ref() || ((numeric || queued_prompt) && cid.is_some())) => {
+            Some(cmd) if !pending && (Some(&cmd) != default.as_ref() || ((numeric || queued) && cid.is_some())) => {
                 if let Some(c) = cid {
                     self.run_key_string(c, &cmd, Some(pane), name);
                 }

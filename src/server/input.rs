@@ -719,7 +719,7 @@ impl Server {
     }
 
     /// The default key table (server_client_get_key_table): the session's key-table.
-    fn default_key_table(&self, sid: SessId) -> String {
+    pub(super) fn default_key_table(&self, sid: SessId) -> String {
         let t = self.opt_session(Some(sid), "key-table");
         if t.is_empty() { "root".into() } else { t }
     }
@@ -856,11 +856,13 @@ impl Server {
         let Some(k) = k else { return };
         // before the read-only check, so read-only clients may dismiss it too
         if self.dead_key(pane) { return; }
-        if self.panes.get(&pane).is_some_and(|p| p.mode.is_some()) {
-            self.mode_key(pane, Some(cid), &name);
-            return;
+        match self.panes.get(&pane).and_then(|p| p.mode.as_ref()) {
+            // copy and view mode take keys only through their key table (window-copy.c
+            // has no .key callback), so a key that got here is dropped
+            Some(PaneMode::Copy(_)) => {}
+            Some(_) => self.mode_key(pane, Some(cid), &name),
+            None => self.send_key_to_pane(cid, pane, &k, raw),
         }
-        self.send_key_to_pane(cid, pane, &k, raw);
     }
 
     /// A send-keys -K key the queue reached (server_client_key_callback): the key tables
@@ -893,8 +895,11 @@ impl Server {
     pub fn run_key_string(&mut self, cid: ClientId, cmd: &str, pane: Option<PaneId>, key: &str) {
         match self.parse_string(cmd) {
             Ok(cmds) if self.key_capture.is_some() => {
+                // send-keys without -K (key_bindings_dispatch with no event): the queue's
+                // own client and no key, only the target pane
+                let (client, key) = if self.key_plain { (String::new(), String::new()) } else { (cid.to_string(), key.to_string()) };
                 let capture = self.key_capture.as_mut().unwrap();
-                capture.push(vec![KEY_GROUP.clone(), "1".into(), cid.to_string(), pane.map(|p| p.to_string()).unwrap_or_default(), key.to_string()]);
+                capture.push(vec![KEY_GROUP.clone(), "1".into(), client, pane.map(|p| p.to_string()).unwrap_or_default(), key]);
                 capture.extend(cmds);
                 capture.push(vec![KEY_GROUP.clone(), "0".into()]);
             }
