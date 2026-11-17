@@ -160,7 +160,7 @@ fn copy_mode_count_then_rebound_or_unbound_key() {
     let t = start(&ctx, "n");
     ctx.ok(&["set", "-g", "mode-keys", "vi"]);
     t.send(sh("clear; seq 1 60\r", "clear; 1..60\r").as_bytes());
-    wait_for("output", || ctx.capture("n").contains("60"));
+    wait_for("output", || sixty_printed(&ctx, "n"));
     ctx.ok(&["bind", "-T", "copy-mode-vi", "J", "send", "-X", "cursor-down"]);
     ctx.ok(&["unbind", "-T", "copy-mode-vi", "K"]);
     t.prefix(b"[");
@@ -190,7 +190,7 @@ fn copy_mode_repeat_count_shows_the_numeric_pane_prompt() {
     let t = start(&ctx, "r");
     ctx.ok(&["set", "-g", "mode-keys", "vi"]);
     t.send(sh("clear; seq 1 60\r", "clear; 1..60\r").as_bytes());
-    wait_for("output", || ctx.capture("r").contains("60"));
+    wait_for("output", || sixty_printed(&ctx, "r"));
     t.prefix(b"[");
     wait_for("copy mode", || ctx.fmt("r", "#{pane_in_mode}") == "1");
     let y: usize = ctx.fmt("r", "#{copy_cursor_y}").parse().unwrap();
@@ -2093,4 +2093,12 @@ fn popup_command_ended_by_a_signal_gives_its_signal_number() {
     }
     let out = ctx.command().args(["display-popup", "-c", &client, "-E", "-w", "30", "-h", "6", "exit 5"]).output().unwrap();
     assert_eq!(out.status.code(), Some(5));
+}
+
+/// After `seq 1 60` (`1..60` in PowerShell): the line "60" and the prompt after it are on the
+/// screen. The typed command line also holds "60" in PowerShell, so a plain contains("60")
+/// can pass before the output, and copy mode would start without the history.
+fn sixty_printed(ctx: &Ctx, target: &str) -> bool {
+    let lines: Vec<String> = ctx.capture(target).lines().map(|l| l.trim_end().to_string()).collect();
+    lines.iter().position(|l| l == "60").is_some_and(|i| lines[i + 1..].iter().any(|l| !l.is_empty()))
 }
