@@ -817,6 +817,15 @@ fn pasted_input_never_reaches_a_pane_in_a_mode() {
     f.handle_input(1, b"\x1b[200~hi\x1b[201~");
     assert!(f.panes[&pane].mode.is_none());
     assert_eq!(f.pane_input.try_iter().flatten().collect::<Vec<u8>>(), b"hi");
+    // clock mode stacked on copy mode: ending it brings copy mode back, which drops
+    // the text (tmux 3.8, pod)
+    run(&mut f, &["copy-mode"]);
+    run(&mut f, &["clock-mode"]);
+    f.pane_input.try_iter().for_each(drop);
+    f.handle_input(1, b"\x1b[200~b1\r\x1b[201~");
+    assert!(matches!(f.panes[&pane].mode, Some(PaneMode::Copy(_))));
+    assert!(f.pane_input.try_recv().is_err());
+    run(&mut f, &["send-keys", "-X", "cancel"]);
     // a dead pane kept by remain-on-exit key closes on typed (or guessed pasted) input
     // too: server_client_handle_key checks it before the paste guess (tmux 3.8, pod)
     f.panes.get_mut(&pane).unwrap().options.set("remain-on-exit", "key".into());
@@ -950,6 +959,16 @@ fn window_names_follow_mode_changes_at_most_every_name_interval() {
     // lookup has found it)
     let g = f.panes[&pane].generation;
     f.name_known.insert((pane, g));
+    // (the name is checked once the pane's shell has started: before its exec has finished
+    // what it runs is not known yet, and the check would take its start command)
+    #[cfg(unix)]
+    {
+        let start = Instant::now();
+        let (pid, pgrp) = (f.panes[&pane].pid, f.panes[&pane].fg_pgrp());
+        while procinfo::pane_programs(&[(pid, pgrp)]).pop().and_then(|r| r.0).is_none() && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     f.automatic_rename();
     let before = f.windows[&wid].name.clone();
     assert_ne!(before, "[tmux]");
@@ -1118,4 +1137,154 @@ fn run_shell_c_waits_for_its_delay_and_with_b_goes_in_the_clients_queue() {
     f.handle_input(1, b"\x1b[19~");
     assert_eq!(f.opts_session.get("@h"), Some("CEYX"));
     assert!(f.messages.iter().any(|(_, m)| m.ends_with(" command: set-option -ag @h X") && !m.contains(" key ")), "{:?}", f.messages);
+}
+
+/// The pane of the client's popup, its input taken over by the test.
+fn popup_input(f: &mut Fixture) -> (PaneId, mpsc::Receiver<Vec<u8>>) {
+    let Some(Overlay::Popup(p)) = &f.clients[&1].overlay else { panic!("no popup") };
+    let pane = p.pane;
+    let (tx, rx) = mpsc::channel();
+    f.panes.get_mut(&pane).unwrap().input = tx;
+    (pane, rx)
+}
+
+#[test]
+fn a_paste_goes_to_the_popup_a_key_opened() {
+    // server_client_handle_key0 hands every pasted key (PasteStart, the text, PasteEnd)
+    // to the overlay at once: a popup a key's binding opened gets the paste even though
+    // the client's queue waits for the popup, and nothing reaches the pane under it
+    let mut f = fixture();
+    let pane = f.pane;
+    run(&mut f, &["bind-key", "-n", "F5", "display-popup -E cat"]);
+    f.handle_input(1, b"\x1b[15~");
+    assert!(f.client_blocked(1));
+    let (popup, input) = popup_input(&mut f);
+    f.pane_input.try_iter().for_each(drop);
+    f.handle_input(1, b"typed\r");
+    f.handle_input(1, b"\x1b[200~pasted\r\x1b[201~");
+    // bytes the key parser does not know go to it too
+    f.handle_input(1, b"\x1b[16~");
+    let got: Vec<u8> = input.try_iter().flatten().collect();
+    assert_eq!(got, b"typed\rpasted\r\x1b[16~");
+    // the paste markers only when the popup's program asked for bracketed paste
+    let g = f.panes[&popup].generation;
+    f.pane_data(popup, g, b"\x1b[?2004h");
+    f.handle_input(1, b"\x1b[200~two\x1b[201~");
+    let got: Vec<u8> = input.try_iter().flatten().collect();
+    assert_eq!(got, b"\x1b[200~two\x1b[201~");
+    assert!(f.client_items.get(&1).is_none_or(|q| q.is_empty()));
+    // the popup closes: nothing was waiting for the pane
+    f.handle_input(1, b"\x1b[200~\x1b[201~");
+    run(&mut f, &["display-popup", "-C"]);
+    f.drain_clients();
+    assert!(f.clients[&1].overlay.is_none());
+    assert!(f.pane_input.try_recv().is_err());
+    assert!(f.panes.contains_key(&pane));
+}
+
+#[test]
+fn a_paste_with_a_cancel_key_closes_a_popup_without_e_and_the_rest_is_typed() {
+    // popup_key_cb: without -E the pasted C-c closes the popup; PasteStart was taken
+    // by the popup, so the keys after it are typed keys for the pane (not a paste)
+    let mut f = fixture();
+    run(&mut f, &["display-popup", "cat"]);
+    let (_, input) = popup_input(&mut f);
+    f.pane_input.try_iter().for_each(drop);
+    run(&mut f, &["bind-key", "-n", "z", "set-option -g @z yes"]);
+    f.handle_input(1, b"\x1b[200~ab\x03yz\x1b[201~");
+    assert_eq!(input.try_iter().flatten().collect::<Vec<u8>>(), b"ab");
+    assert!(f.clients[&1].overlay.is_none());
+    assert_eq!(f.pane_input.try_iter().flatten().collect::<Vec<u8>>(), b"y");
+    assert_eq!(f.opts_session.get("@z"), Some("yes"));
+}
+
+#[test]
+fn a_paste_goes_to_a_pane_prompt_and_a_status_prompt_key_by_key() {
+    // window_pane_prompt_key and status_prompt_key get each pasted key: a copy-mode
+    // search prompt (vi /) gets the text, a pasted Enter answers a status prompt and the
+    // keys after it are typed keys (the prompt took PasteStart)
+    let mut f = fixture();
+    let pane = f.pane;
+    run(&mut f, &["set-option", "-g", "mode-keys", "vi"]);
+    run(&mut f, &["copy-mode"]);
+    f.handle_input(1, b"/");
+    assert!(f.panes[&pane].prompt.is_some());
+    f.handle_input(1, b"\x1b[200~gamma\x1b[201~");
+    assert_eq!(f.panes[&pane].prompt.as_ref().map(|p| p.input.iter().collect::<String>()).as_deref(), Some("gamma"));
+    f.handle_input(1, b"\r");
+    assert!(f.panes[&pane].prompt.is_none());
+    run(&mut f, &["send-keys", "-X", "cancel"]);
+    f.pane_input.try_iter().for_each(drop);
+    f.handle_input(1, b"\x02:");
+    assert!(f.clients[&1].prompt.is_some());
+    f.handle_input(1, b"\x1b[200~set -g @pp yes\rabc\x1b[201~");
+    assert!(f.clients[&1].prompt.is_none());
+    assert_eq!(f.opts_session.get("@pp"), Some("yes"));
+    assert_eq!(f.pane_input.try_iter().flatten().collect::<Vec<u8>>(), b"abc");
+    // a numeric prompt ("(repeat) N") closes on PasteStart: the paste goes on to the
+    // pane, in copy mode, which drops it
+    run(&mut f, &["copy-mode"]);
+    f.handle_input(1, b"3");
+    assert!(f.panes[&pane].prompt.as_ref().is_some_and(|p| p.numeric));
+    f.handle_input(1, b"\x1b[200~12\x1b[201~");
+    assert!(f.panes[&pane].prompt.is_none());
+    assert!(f.pane_input.try_recv().is_err());
+}
+
+#[test]
+fn escape_waits_at_least_500ms_while_terminal_replies_are_awaited() {
+    // tty_keys_next: until the terminal has answered the device attribute, DECRPM and
+    // colour requests (or the start timer fires) a lone Escape waits 500ms, so an Escape
+    // and the key typed straight after it are one Meta key, as in tmux
+    let mut f = fixture(); let sid = f.sid;
+    f.clients.get_mut(&1).unwrap().ident = Some(Identity { cols: 80, rows: 24, tty: true, cwd: String::new(), term: "xterm-256color".into(), pid: 0, ctx_pane: None, utf8: true, env: Vec::new() });
+    f.clients.get_mut(&1).unwrap().attached = false;
+    f.clients.get_mut(&1).unwrap().terminal.vt100 = true;
+    f.attach_client(1, sid);
+    f.handle_input(1, b"\x1b");
+    assert!(f.clients[&1].esc_deadline.unwrap().duration_since(Instant::now()) > Duration::from_millis(400));
+    f.clients.get_mut(&1).unwrap().keyp.flush_pending();
+    f.clients.get_mut(&1).unwrap().esc_deadline = None;
+    for reply in [&b"\x1b[?62;22c"[..], b"\x1b[>0;10;1c", b"\x1bP>|xterm(1)\x1b\\", b"\x1b[?2026;2$y", b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\"] {
+        f.handle_input(1, reply);
+    }
+    // (the background colour is still awaited)
+    f.handle_input(1, b"\x1b");
+    assert!(f.clients[&1].esc_deadline.unwrap().duration_since(Instant::now()) > Duration::from_millis(400));
+    f.clients.get_mut(&1).unwrap().keyp.flush_pending();
+    f.clients.get_mut(&1).unwrap().esc_deadline = None;
+    f.handle_input(1, b"\x1b]11;rgb:0000/0000/0000\x1b\\");
+    f.handle_input(1, b"\x1b");
+    assert!(f.clients[&1].esc_deadline.unwrap().duration_since(Instant::now()) <= Duration::from_millis(100));
+    // a terminal that is not VT100-like is asked nothing
+    let mut f = fixture();
+    f.handle_input(1, b"\x1b");
+    assert!(f.clients[&1].esc_deadline.unwrap().duration_since(Instant::now()) <= Duration::from_millis(100));
+}
+
+#[test]
+fn an_unknown_csi_sequence_is_read_as_meta_bracket_and_a_key_per_byte() {
+    // tty_keys_next finds no key for it: ESC [ is M-[ and each byte after it is a key,
+    // so a status prompt gets the bytes as text, typed or pasted (tmux 3.8, pod)
+    let mut f = fixture();
+    f.handle_input(1, b"\x02:");
+    assert!(f.clients[&1].prompt.is_some());
+    f.handle_input(1, b"p\x1b[99~q\x1b[200~x\x1b[44~y\x1b[201~");
+    assert_eq!(f.clients[&1].prompt.as_ref().map(|p| p.input.iter().collect::<String>()).as_deref(), Some("p99~qx44~y"));
+    f.handle_input(1, b"\x03");
+    assert!(f.clients[&1].prompt.is_none());
+    // a binding of M-[ runs, and a pane still gets the bytes as they were
+    run(&mut f, &["bind", "-n", "M-[", "set", "-g", "@mb", "hit"]);
+    f.pane_input.try_iter().for_each(drop);
+    f.handle_input(1, b"a\x1b[99~b");
+    assert_eq!(f.opts_session.get("@mb"), Some("hit"));
+    assert_eq!(f.pane_input.try_iter().flatten().collect::<Vec<u8>>(), b"a99~b");
+    run(&mut f, &["unbind", "-n", "M-["]);
+    f.handle_input(1, b"a\x1b[99~b");
+    assert_eq!(f.pane_input.try_iter().flatten().collect::<Vec<u8>>(), b"a\x1b[99~b");
+    // replies, mouse reports and extended keys are not
+    assert!(input::unknown_csi_keys(b"\x1b[?5;6y").is_none());
+    assert!(input::unknown_csi_keys(b"\x1b[<66;1;1M").is_none());
+    assert!(input::unknown_csi_keys(b"\x1b[57441;2u").is_none());
+    assert!(input::unknown_csi_keys(b"\x1b[27;5;9999~").is_none());
 }
