@@ -4012,3 +4012,28 @@ fn last_session_destroyed_then_a_new_server() {
         ctx.ok(&["kill-server"]);
     }
 }
+
+#[test]
+fn control_client_errors_set_its_exit_status_and_run_shell_c_reports_after_the_block() {
+    // cmdq_error for a control client: control_write and c->retval = 1. run-shell -C
+    // waits (its %end is written at once), so its parse error comes after the block.
+    // A line that does not parse (control_error) leaves the status alone.
+    let ctx = Ctx::new("ctl-retval");
+    ctx.ok(&["new-session", "-d", "-s", "c"]);
+    let run = |input: &str| {
+        let mut child = ctx.command().args(["-C", "attach", "-t", "c"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).lines()
+            .filter(|l| ["%begin", "%end", "%error"].iter().any(|p| l.starts_with(p)) || !l.starts_with('%'))
+            .map(|l| l.split(' ').next().filter(|w| w.starts_with('%')).unwrap_or(l).to_string())
+            .collect::<Vec<_>>().join("\n");
+        (out.status.code(), text)
+    };
+    let (code, text) = run("run-shell -C 'bad\"q'\nset -g @h Z\n");
+    assert_eq!(code, Some(1), "{text}");
+    assert!(text.ends_with("%begin\n%end\nunknown command: badq\n%begin\n%end"), "{text}");
+    assert_eq!(run("select-pane -t nosuch\n").0, Some(1));
+    assert_eq!(run("nosuchcmd\n").0, Some(0));
+    assert_eq!(run("display-message -p hi\n").0, Some(0));
+}

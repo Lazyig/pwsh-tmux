@@ -1182,7 +1182,12 @@ impl Client {
             self.ctl.exiting.set(true);
             return;
         }
-        self.send(S_EXIT, msg.as_bytes());
+        self.send(S_EXIT, &self.control_exit_payload(&msg));
+    }
+
+    /// A control client's S_EXIT: the message, then NUL and its exit status (c->retval).
+    pub fn control_exit_payload(&self, msg: &str) -> Vec<u8> {
+        format!("{msg}\0{}", self.ctl.retval.get()).into_bytes()
     }
     pub fn name(&self) -> String {
         let id = self.ident.as_ref().filter(|i| !i.tty && i.pid != 0).map_or(self.id, |i| i.pid);
@@ -3959,7 +3964,12 @@ impl Server {
         // hook and key binding commands run with a new state, without CMDQ_STATE_CONTROL
         let typed = q.ctx.control_line && q.ctx.hook_depth == 0 && q.ctx.key_depth == 0;
         self.control_block(cid, seq, typed, &out, err);
+        // cmdq_error for a control client sets its exit status (c->retval)
+        if let Some(c) = self.clients.get(&cid).filter(|_| err.is_some_and(|e| !e.is_empty())) {
+            c.ctl.retval.set(1);
+        }
         self.control_flush(cid);
+        self.control_after_block(cid);
         q.ctx.control_done = true;
         if let Some(c) = self.clients.get_mut(&cid) {
             c.control_seq += 1;
@@ -4510,8 +4520,12 @@ impl Server {
             }
             if !ctx.control_done || !ctx.out.is_empty() || err.is_some() {
                 self.control_block(cid, seq, ctx.control_line && ctx.hook_depth == 0, &ctx.out, err.as_deref());
+                if let Some(c) = self.clients.get(&cid).filter(|_| err.as_deref().is_some_and(|e| !e.is_empty())) {
+                    c.ctl.retval.set(1);
+                }
             }
             self.control_flush(cid);
+            self.control_after_block(cid);
             if let Some(c) = self.clients.get(&cid) {
                 c.finish_exit();
             }

@@ -470,12 +470,14 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                     });
                 }
             }
-            Ok((S_EXIT, _)) if g.control > 0 => {
+            Ok((S_EXIT, p)) if g.control > 0 => {
                 if g.control == 2 {
                     let _ = out.write_all(b"\x1b\\");
                 }
                 let _ = out.flush();
-                std::process::exit(0);
+                // the exit status after the message's NUL (c->retval)
+                let code = p.iter().rposition(|b| *b == 0).and_then(|i| std::str::from_utf8(&p[i + 1..]).ok()?.parse().ok()).unwrap_or(0);
+                std::process::exit(code);
             }
             Ok((S_EXEC, p)) => {
                 // detach-client -E: the shell command replaces the client

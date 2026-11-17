@@ -4801,7 +4801,16 @@ impl Server {
                                 // cmdq_error: a control client's block, else the
                                 // configuration's causes (or the message log)
                                 let owner = self.queue_client(ctx).filter(|c| self.clients.contains_key(c));
-                                if ctx.control_seq.is_some() || owner.is_some_and(|c| self.clients[&c].control != 0) {
+                                if let Some(c) = owner.filter(|c| self.clients[c].control != 0) {
+                                    // the timer reports it after the command's reply block
+                                    // (CMD_RETURN_WAIT wrote %end), as a bare line, and the
+                                    // client's exit status is 1
+                                    self.log_error(owner, &e);
+                                    let c = self.clients.get_mut(&c).unwrap();
+                                    c.ctl.after_block.push_str(&e);
+                                    c.ctl.after_block.push('\n');
+                                    c.ctl.retval.set(1);
+                                } else if ctx.control_seq.is_some() {
                                     self.log_error(owner, &e);
                                     ctx.out.push_str(&e);
                                     ctx.out.push('\n');
