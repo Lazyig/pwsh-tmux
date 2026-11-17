@@ -118,8 +118,11 @@ impl Server {
                 return;
             }
         }
+        // under send-keys -K the default prompts (jumps, searches, goto line) are the real
+        // command-prompt, which waits and holds up the keys after it
+        let queued_prompt = self.key_capture.is_some() && default_raw.is_some_and(|c| c.starts_with("command-prompt"));
         match binding {
-            Some(cmd) if !pending && (Some(&cmd) != default.as_ref() || (numeric && cid.is_some())) => {
+            Some(cmd) if !pending && (Some(&cmd) != default.as_ref() || ((numeric || queued_prompt) && cid.is_some())) => {
                 if let Some(c) = cid {
                     self.run_key_string(c, &cmd, Some(pane), name);
                 }
@@ -129,6 +132,15 @@ impl Server {
             // the default prompts (and repeat counts) need a client, as command-prompt does
             Some(cmd) if !pending && cid.is_none() && cmd.starts_with("command-prompt") => {}
             _ => {
+                // the default binding's commands go in the message log as if they ran
+                if let (Some(cmd), Some(c), false) = (&binding, cid, pending) {
+                    let owner = self.key_origin.unwrap_or(c);
+                    for argv in crate::cmdparse::parse(cmd).unwrap_or_default() {
+                        if let Some(full) = argv.first().and_then(|n| super::cmds::canonical(n)) {
+                            self.log_command(Some(owner), Some(name), full, &argv[1..]);
+                        }
+                    }
+                }
                 let before = self.copy_scroll_offset(pane);
                 let action = match self.panes.get_mut(&pane).and_then(|p| p.mode.as_mut()) {
                     Some(PaneMode::Copy(cm)) => cm.key(name),

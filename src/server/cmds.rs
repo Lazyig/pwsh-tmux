@@ -1778,19 +1778,26 @@ impl Server {
         }
         // cmdq_add_message: each command goes in the message log (show-messages) once
         // the configuration is loaded, by key for a bound command of an attached client
-        if self.cfg_finished {
-            let words = std::iter::once(full.to_string()).chain(args.iter().cloned())
-                .map(|a| match a.strip_prefix(cmdparse::BLOCK_MARK) { Some(b) => (b.to_string(), true), None => (a, false) }).collect();
-            let printed = print_parsed_command(words, &[], false).ok().and_then(|v| v.into_iter().next())
-                .unwrap_or_else(|| std::iter::once(full).chain(args.iter().map(String::as_str)).collect::<Vec<_>>().join(" "));
-            let msg = match ctx.log_client.or(ctx.client).or(ctx.reply).and_then(|c| self.clients.get(&c)) {
-                Some(c) if c.attached && c.session.is_some() && ctx.key.is_some() => format!("{} key {}: {printed}", c.name(), ctx.key.as_deref().unwrap_or("")),
-                Some(c) => format!("{} command: {printed}", c.name()),
-                None => format!("command: {printed}"),
-            };
-            self.add_message(&msg);
-        }
+        self.log_command(ctx.log_client.or(ctx.client).or(ctx.reply), ctx.key.as_deref(), full, &args);
         self.command(full, o, env, ctx)
+    }
+
+    /// cmdq_add_message: a command in the message log (once the configuration is
+    /// loaded), by key for a bound command of an attached client.
+    pub(crate) fn log_command(&mut self, client: Option<ClientId>, key: Option<&str>, full: &str, args: &[String]) {
+        if !self.cfg_finished {
+            return;
+        }
+        let words = std::iter::once(full.to_string()).chain(args.iter().cloned())
+            .map(|a| match a.strip_prefix(cmdparse::BLOCK_MARK) { Some(b) => (b.to_string(), true), None => (a, false) }).collect();
+        let printed = print_parsed_command(words, &[], false).ok().and_then(|v| v.into_iter().next())
+            .unwrap_or_else(|| std::iter::once(full).chain(args.iter().map(String::as_str)).collect::<Vec<_>>().join(" "));
+        let msg = match client.and_then(|c| self.clients.get(&c)) {
+            Some(c) if c.attached && c.session.is_some() && key.is_some() => format!("{} key {}: {printed}", c.name(), key.unwrap_or("")),
+            Some(c) => format!("{} command: {printed}", c.name()),
+            None => format!("command: {printed}"),
+        };
+        self.add_message(&msg);
     }
 
     fn check_readonly_command(&self, cmd: &str, o: &Opts, ctx: &Ctx) -> Result<(), String> {
@@ -3782,6 +3789,7 @@ impl Server {
                     pane, x, y, w, h, border, close_on_exit: o.count('E') == 1, close_exit_zero: o.count('E') > 1, close_any_key: o.has('k'), title,
                     look: super::modes::OverlayLook { style: o.get('s').map(String::from), border_style: o.get('S').map(String::from), lines: o.get('b').map(String::from), ..Default::default() },
                 })))?;
+                self.popup_panes.insert(epoch, pane);
                 Ok(Flow::WaitOverlay(cid, epoch))
             }
             // ---------------------------------------------------------------- prompts & messages
@@ -4046,7 +4054,7 @@ impl Server {
                 if parsed.is_none() && (key.contains("User") || sort::key_code(&key) == u64::MAX >> 8) {
                     return err(format!("unknown key: {key}"));
                 }
-                let kname = parsed.map(|k| keys::key_name(&k)).unwrap_or(key.clone());
+                let kname = parsed.map(|k| keys::key_name(&k)).or_else(|| keys::parse_mouse_key_name(&key)).unwrap_or(key.clone());
                 let table = o.get('T').map(String::from).unwrap_or_else(|| (if o.has('n') { "root" } else { "prefix" }).to_string());
                 if args.is_empty() {
                     // key_bindings_add with no commands: the table is made and an existing
@@ -4097,11 +4105,18 @@ impl Server {
                     return Ok(Flow::Next);
                 }
                 let Some(key) = o.rest.first() else { return fail("missing key".into()) };
-                let Some(k) = keys::parse_key_name(key) else { return fail(format!("unknown key: {key}")) };
+                // key_string_lookup_string: a key, a mouse key or Any
+                let kname = match keys::parse_key_name(key) {
+                    Some(k) => keys::key_name(&k),
+                    None if key.eq_ignore_ascii_case("Any") => "Any".to_string(),
+                    None => match keys::parse_mouse_key_name(key) {
+                        Some(name) => name,
+                        None => return fail(format!("unknown key: {key}")),
+                    },
+                };
                 if o.has('T') && !self.bindings.contains_key(&table) {
                     return fail(format!("table {table} doesn't exist"));
                 }
-                let kname = keys::key_name(&k);
                 let removed = self.bindings.get_mut(&table).and_then(|t| t.remove(&kname)).is_some();
                 // key_bindings_remove: a table left with no bindings and no defaults goes
                 // (the defaults of the table as it is: one made again has none)
@@ -4114,7 +4129,7 @@ impl Server {
                 let crit = sort::Criteria::from_args(o.get('O'), o.has('r'))?;
                 let only_key = match o.rest.first() {
                     Some(k) if k.chars().count() > 1 && keys::parse_key_name(k).is_none() && sort::key_code(k) == u64::MAX >> 8 => return err(format!("invalid key: {k}")),
-                    Some(k) => Some(keys::parse_key_name(k).map(|k| keys::key_name(&k)).unwrap_or(k.clone())),
+                    Some(k) => Some(keys::parse_key_name(k).map(|k| keys::key_name(&k)).or_else(|| keys::parse_mouse_key_name(k)).unwrap_or(k.clone())),
                     None => None,
                 };
                 if let Some(tb) = o.get('T').filter(|tb| !self.bindings.contains_key(*tb)) {
@@ -4295,9 +4310,15 @@ impl Server {
                             let bytes = k.split_whitespace().map(|h| u8::from_str_radix(h, 16).map_err(|_| format!("invalid hex: {h}"))).collect::<Result<Vec<u8>, String>>()?;
                             String::from_utf8_lossy(&bytes).into_owned()
                         } else { k };
-                        match keys::parse_key_name(&text).filter(|_| !o.has('l') && !o.has('H')) {
-                            Some(key) => list.push(key),
-                            None => list.extend(text.chars().filter_map(|c| keys::parse_key_name(&c.to_string()))),
+                        let named = !o.has('l') && !o.has('H');
+                        match keys::parse_key_name(&text).filter(|_| named) {
+                            Some(key) => list.push((key, None)),
+                            // a mouse key by name (key_string_lookup_string): its event
+                            // has no position
+                            None => match keys::parse_mouse_key_name(&text).filter(|_| named) {
+                                Some(m) => list.push((keys::Key::plain(keys::KeyCode::User(0)), Some(m))),
+                                None => list.extend(text.chars().filter_map(|c| keys::parse_key_name(&c.to_string())).map(|k| (k, None))),
+                            },
                         }
                     }
                     // server_client_handle_key_after: an open overlay, menu or prompt
@@ -4308,20 +4329,25 @@ impl Server {
                     // output). So a binding that waits (command-prompt) holds up the keys
                     // after it and send-keys' client, and a menu or prompt a binding opens
                     // does not get the keys after it, as in tmux.
-                    let origin = ctx.client.or(ctx.reply).unwrap_or(cid);
+                    // (the queue's own client: the one a key group's commands log)
+                    let origin = ctx.log_client.or(ctx.client).or(ctx.reply).unwrap_or(cid);
                     let app = self.panes.get(&pane).is_some_and(|p| p.screen().application_cursor());
                     let mut items = Vec::with_capacity(n.saturating_mul(list.len()).min(4096));
                     // cmd_send_keys_inject_key: a key handled at once makes send-keys the
                     // item the next key goes after again
                     let mut at = 0;
                     for _ in 0..n {
-                        for key in &list {
-                            if self.handle_key_now(cid, key.clone(), keys::encode_key(key, app)).is_none() {
+                        for (key, mouse) in &list {
+                            let now = match mouse {
+                                Some(_) => self.handle_mouse_key_now(cid),
+                                None => self.handle_key_now(cid, key.clone(), keys::encode_key(key, app), true).is_none(),
+                            };
+                            if now {
                                 at = 0;
                                 continue;
                             }
                             self.key_event_seq += 1;
-                            self.key_events.insert(self.key_event_seq, KeyEvent { client: cid, pane, origin, key: key.clone() });
+                            self.key_events.insert(self.key_event_seq, KeyEvent { client: cid, pane, origin, key: key.clone(), mouse: mouse.clone() });
                             items.insert(at, vec![KEY_EVENT.clone(), self.key_event_seq.to_string()]);
                             at += 1;
                         }
@@ -4722,8 +4748,17 @@ impl Server {
                 let tt = resolved.unwrap_or_else(|| self.current(ctx));
                 if o.has('C') {
                     let c = o.rest.first().ok_or("run-shell -C needs a command")?;
-                    let cmds = self.parse_string(&self.expand(tt, ctx.client, c))?;
-                    return Ok(Flow::Inject(cmds, false));
+                    // cmd_run_shell_timer: a parse error is reported (cmdq_error) but the
+                    // command itself does not fail, so what follows it still runs
+                    return match self.parse_string(&self.expand(tt, ctx.client, c)) {
+                        Ok(cmds) => Ok(Flow::Inject(cmds, false)),
+                        Err(e) => {
+                            if !self.report_error_now(ctx, &e) {
+                                self.log_error(None, &e);
+                            }
+                            Ok(Flow::Next)
+                        }
+                    };
                 }
                 if let Some(d) = o.get('d') {
                     // like tmux, wait on a timer: the queue resumes without -d afterwards
@@ -5328,6 +5363,18 @@ impl Server {
             }
             // options_push_changes
             "monitor-silence" => self.alerts_reset_all(),
+            // every client goes to its session's new default key table
+            "key-table" => {
+                let cids: Vec<ClientId> = self.clients.keys().copied().collect();
+                for cid in cids {
+                    let t = match self.clients[&cid].session {
+                        Some(sid) => self.opt_session(Some(sid), "key-table"),
+                        None => String::new(),
+                    };
+                    let t = if t.is_empty() { "root".to_string() } else { t };
+                    self.clients.get_mut(&cid).unwrap().set_key_table(&t);
+                }
+            }
             "mode-keys" => {}
             _ => {}
         }

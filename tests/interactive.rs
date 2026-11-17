@@ -1736,3 +1736,256 @@ fn synchronize_panes_encodes_the_key_for_each_pane() {
     wait_for("application cursor keys", || ctx.capture("y.1").contains("^[OA"));
     assert!(!ctx.capture("y.1").contains("^[[A"));
 }
+
+/// The name of the only attached client.
+fn only_client(ctx: &Ctx) -> String {
+    ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string()
+}
+
+#[test]
+fn send_keys_k_escape_reaches_a_popup_or_modal_pane_program() {
+    // tmux 3.8: send-keys -K keys carry KEYC_SENT, so popup_key_cb's and the modal
+    // pane's Escape and C-c checks (which compare the whole key) do not match: the keys
+    // go to the program. A popup closed by display-popup -C before its command exits
+    // gives the waiting command-line client the status 129 (128 + SIGHUP).
+    let ctx = Ctx::new("sendk-sent");
+    let t = start(&ctx, "w");
+    let client = only_client(&ctx);
+    ctx.ok(&["set-option", "-s", "escape-time", "0"]);
+    ctx.ok(&["bind-key", "-n", "F5", "display-popup", "-w", "40", "-h", "8", CAT_V]);
+    ctx.ok(&["bind-key", "-n", "F7", "set", "-g", "@f7", "ran"]);
+    let mut waiting = ctx.command().args(["send-keys", "-K", "-c", &client, "F5", "F7"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    t.wait_screen("popup open", |s| s.contains('┌'));
+    ctx.ok(&["send-keys", "-K", "-c", &client, "q", "Escape", "w"]);
+    t.wait_screen("keys reach the popup program", |s| s.contains("q^[w"));
+    assert!(waiting.try_wait().unwrap().is_none(), "the popup closed");
+    assert_eq!(ctx.fmt("w", "[#{@f7}]"), "[]", "the key after the popup ran while it was open");
+    ctx.ok(&["display-popup", "-C", "-c", &client]);
+    wait_for("send-keys -K returns", || waiting.try_wait().unwrap().is_some());
+    assert_eq!(waiting.wait().unwrap().code(), Some(129));
+    wait_for("the key after the popup runs", || ctx.fmt("w", "#{@f7}") == "ran");
+    // a modal pane closing on Escape (-D) keeps a sent Escape; a typed one closes it
+    ctx.ok(&["bind-key", "-n", "F11", "new-pane", "-O", "-D", "-x", "30", "-y", "8", CAT_V]);
+    ctx.ok(&["send-keys", "-K", "-c", &client, "F11"]);
+    wait_for("modal pane", || ctx.ok(&["list-panes", "-t", "w"]).lines().count() == 2);
+    let modal = ctx.ok(&["display-message", "-p", "-t", "w", "#{pane_id}"]).trim().to_string();
+    ctx.ok(&["send-keys", "-K", "-c", &client, "x", "Escape"]);
+    wait_for("Escape reaches the modal pane", || ctx.capture(&modal).contains("x^["));
+    assert_eq!(ctx.ok(&["list-panes", "-t", "w"]).lines().count(), 2);
+    t.send(b"\x1b");
+    wait_for("typed Escape closes the modal pane", || ctx.ok(&["list-panes", "-t", "w"]).lines().count() == 1);
+}
+
+#[test]
+fn send_keys_k_keys_after_a_capturing_modal_pane_go_to_it() {
+    // server_client_key_callback: a pane capturing all keys (new-pane -K) that became
+    // active while the keys waited in the queue gets them, the prefix included
+    let ctx = Ctx::new("sendk-capture");
+    let _t = start(&ctx, "w");
+    let client = only_client(&ctx);
+    ctx.ok(&["bind-key", "-n", "F7", "set", "-g", "@f7", "ran"]);
+    ctx.ok(&["bind-key", "-n", "F11", "new-pane", "-O", "-D", "-K", "-x", "30", "-y", "8", CAT_V]);
+    ctx.ok(&["send-keys", "-K", "-c", &client, "F11", "a", "C-b", "c", "F7", "Enter"]);
+    wait_for("modal pane", || ctx.ok(&["list-panes", "-t", "w"]).lines().count() == 2);
+    let modal = ctx.ok(&["display-message", "-p", "-t", "w", "#{pane_id}"]).trim().to_string();
+    wait_for("keys reach the modal pane", || ctx.capture(&modal).contains("a^Bc"));
+    assert_eq!(ctx.ok(&["list-windows", "-t", "w"]).lines().count(), 1, "C-b c made a window");
+    assert_eq!(ctx.fmt("w", "[#{@f7}]"), "[]");
+}
+
+#[test]
+fn send_keys_k_copy_mode_prompts_wait_in_the_queue() {
+    // copy mode's f (jump forward) is command-prompt -1 without -b: it waits, and the
+    // keys sent after it wait behind it instead of being the character to jump to
+    let ctx = Ctx::new("sendk-copyprompt");
+    let t = start(&ctx, "w");
+    let client = only_client(&ctx);
+    ctx.ok(&["set-option", "-g", "mode-keys", "vi"]);
+    let mut waiting = ctx.command().args(["send-keys", "-K", "-c", &client, "C-b", "[", "0", "f", "a", "j"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    t.wait_screen("jump prompt", |s| s.contains("(jump forward)"));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(waiting.try_wait().unwrap().is_none(), "send-keys -K returned while the jump prompt was open");
+    let y = ctx.fmt("w", "#{copy_cursor_y}");
+    // the prompt takes a key sent now; then the keys behind it run (j moves down)
+    ctx.ok(&["send-keys", "-K", "-c", &client, "Escape"]);
+    wait_for("send-keys -K returns", || waiting.try_wait().unwrap().is_some());
+    assert_eq!(ctx.fmt("w", "#{pane_in_mode}"), "1");
+    assert_ne!(ctx.fmt("w", "#{copy_cursor_y}"), y, "j after the prompt did not move");
+}
+
+#[test]
+fn send_keys_k_menu_and_prompt_commands_run_after_the_queue() {
+    // a menu item or a prompt chosen by a key send-keys -K hands over at once is
+    // cmdq_append'ed to the attached client's queue: it runs after send-keys' own queue
+    // (the keys behind it and the after-send-keys hook)
+    let ctx = Ctx::new("sendk-menuq");
+    let t = start(&ctx, "w");
+    let client = only_client(&ctx);
+    ctx.ok(&["bind-key", "-n", "F7", "set", "-ga", "@h", "7"]);
+    ctx.ok(&["bind-key", "-n", "F6", "set", "-ga", "@h", "6"]);
+    ctx.ok(&["bind-key", "-n", "F8", "display-menu", "-T", "M", "-x", "0", "-y", "0", "One", "1", "set -ga @h 1", "Two", "2", "set -ga @h 2", "Win", "w", "new-window"]);
+    ctx.ok(&["set-hook", "-g", "after-send-keys", "set -ga @h H"]);
+    ctx.ok(&["send-keys", "-K", "-c", &client, "F8"]);
+    t.wait_screen("menu", |s| s.contains("Two"));
+    ctx.ok(&["set", "-g", "@h", ""]);
+    ctx.ok(&["send-keys", "-K", "-c", &client, "F7", "2", "F6"]);
+    wait_for("menu command", || ctx.fmt("w", "#{@h}").len() == 3);
+    assert_eq!(ctx.fmt("w", "#{@h}"), "H62");
+    ctx.ok(&["set-hook", "-gu", "after-send-keys"]);
+    // the new window comes after the keys behind the menu, which go to the old one
+    ctx.ok(&["send-keys", "-K", "-c", &client, "F8"]);
+    t.wait_screen("menu", |s| s.contains("Win"));
+    ctx.ok(&["send-keys", "-K", "-c", &client, "w", "Q", "Z"]);
+    wait_for("new window", || ctx.ok(&["list-windows", "-t", "w"]).lines().count() == 2);
+    wait_for("keys in the old window", || ctx.capture("w:0").contains("QZ"));
+    assert!(!ctx.capture("w:1").contains("QZ"));
+}
+
+#[test]
+fn send_keys_k_bindings_run_for_the_target_client() {
+    // key_bindings_dispatch: a sent key's binding runs with the state of the key, the
+    // -c client's pane, so formats and commands see that client and its session, while
+    // the output still goes to the command-line client
+    let ctx = Ctx::new("sendk-client");
+    let _t1 = start(&ctx, "w");
+    let c1 = only_client(&ctx);
+    ctx.ok(&["new-session", "-d", "-s", "s2"]);
+    let t2 = Term::attach(&ctx, &["attach-session", "-t", "s2"], 100, 30);
+    t2.wait_screen("second client", |s| s.contains("[s2]"));
+    let c2 = ctx.ok(&["list-clients", "-F", "#{client_name} #{session_name}"]).lines().find(|l| l.ends_with(" s2")).unwrap().split(' ').next().unwrap().to_string();
+    ctx.ok(&["bind-key", "-n", "F7", "set -gF @cn '#{client_name}' ; set -gF @sn '#{session_name}'"]);
+    ctx.ok(&["bind-key", "-n", "F6", "display-message", "-p", "#{client_name}"]);
+    ctx.ok(&["bind-key", "-n", "F5", "switch-client", "-t", "s2"]);
+    ctx.ok(&["send-keys", "-K", "-c", &c2, "F7"]);
+    assert_eq!(ctx.fmt("w", "#{@cn} #{@sn}"), format!("{c2} s2"));
+    ctx.ok(&["send-keys", "-K", "-c", &c1, "F7"]);
+    assert_eq!(ctx.fmt("w", "#{@cn} #{@sn}"), format!("{c1} w"));
+    assert_eq!(ctx.ok(&["send-keys", "-K", "-c", &c2, "F6"]).trim(), c2);
+    ctx.ok(&["send-keys", "-K", "-c", &c1, "F5"]);
+    wait_for("switch-client moves the -c client", || ctx.ok(&["display-message", "-p", "-c", &c1, "#{client_session}"]).trim() == "s2");
+}
+
+#[test]
+fn send_keys_k_binding_errors_show_at_once_and_log_their_key() {
+    // cmdq_error for an attached client's queue sets its status line straight away (a
+    // later message replaces it), and the message log names the key whose binding ran
+    let ctx = Ctx::new("sendk-errlog");
+    let t = start(&ctx, "w");
+    ctx.ok(&["bind-key", "-n", "F6", "select-pane -t nosuch ; set -g @never 1"]);
+    ctx.ok(&["bind-key", "-n", "F7", "display-message", "hello"]);
+    ctx.ok(&["bind-key", "-n", "F5", "send-keys", "-K", "F6", "F7"]);
+    t.send(b"\x1b[15~");
+    t.wait_screen("message", |s| s.lines().nth(29).is_some_and(|l| l.starts_with("hello")));
+    let log = ctx.ok(&["show-messages"]);
+    let lines: Vec<&str> = log.lines().collect();
+    let pos = |s: &str| lines.iter().position(|l| l.contains(s)).unwrap_or_else(|| panic!("{s} not in {log}"));
+    // (newest first)
+    assert!(pos("key F7: display-message hello") < pos("message: Can't find pane: nosuch"), "{log}");
+    assert!(pos("key F6: select-pane -t nosuch") > pos("message: Can't find pane: nosuch"), "{log}");
+    assert_eq!(ctx.fmt("w", "[#{@never}]"), "[]");
+    // a source-file error from a pressed binding goes to the status line too
+    let dir = std::env::temp_dir().join(format!("{}-src", ctx.socket));
+    std::fs::create_dir_all(&dir).unwrap();
+    let conf = dir.join("bad.conf");
+    std::fs::write(&conf, "set -g @a A ; select-pane -t nosuch ; set -g @a never\nset -g @b B\n").unwrap();
+    ctx.ok(&["bind-key", "-n", "F8", "source-file", &conf.to_string_lossy().replace('\\', "/")]);
+    t.send(b"\x1b[19~");
+    t.wait_screen("source-file error", |s| s.lines().nth(29).is_some_and(|l| l.starts_with("Can't find pane: nosuch")));
+    assert_eq!(ctx.fmt("w", "#{@a} #{@b}"), "A B");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prefix_wins_over_other_tables_and_copy_mode_table_over_root() {
+    // server_client_key_callback: the prefix always switches to the prefix table (from a
+    // switch-client -T table, and over a root binding of the prefix key), and a pane in
+    // copy mode looks keys up in the mode's table before the root table
+    let ctx = Ctx::new("keytables");
+    let t = start(&ctx, "w");
+    let client = only_client(&ctx);
+    ctx.ok(&["bind-key", "-n", "F6", "switch-client", "-T", "foo"]);
+    ctx.ok(&["bind-key", "-T", "foo", "a", "set", "-g", "@t", "a"]);
+    ctx.ok(&["bind-key", "y", "set", "-ga", "@h", "y"]);
+    ctx.ok(&["send-keys", "-K", "-c", &client, "F6", "C-b", "y"]);
+    assert_eq!(ctx.fmt("w", "#{@h}"), "y");
+    t.send(b"\x1b[17~");
+    wait_for("table foo", || ctx.ok(&["display-message", "-p", "-c", &client, "#{client_key_table}"]).trim() == "foo");
+    t.send(b"\x02");
+    wait_for("prefix table", || ctx.ok(&["display-message", "-p", "-c", &client, "#{client_key_table}"]).trim() == "prefix");
+    t.send(b"y");
+    wait_for("typed C-b y after a table switch", || ctx.fmt("w", "#{@h}") == "yy");
+    ctx.ok(&["bind-key", "-n", "C-b", "set", "-ga", "@h", "R"]);
+    ctx.ok(&["send-keys", "-K", "-c", &client, "C-b", "y"]);
+    assert_eq!(ctx.fmt("w", "#{@h}"), "yyy");
+    ctx.ok(&["unbind-key", "-n", "C-b"]);
+    // copy mode's k comes before a root binding of k (and is in the message log)
+    ctx.ok(&["set-option", "-g", "mode-keys", "vi"]);
+    ctx.ok(&["bind-key", "-n", "k", "set", "-g", "@rk", "1"]);
+    ctx.ok(&["copy-mode", "-t", "w"]);
+    for _ in 0..3 {
+        ctx.ok(&["send-keys", "-t", "w", "-X", "cursor-down"]);
+    }
+    let y = ctx.fmt("w", "#{copy_cursor_y}");
+    t.send(b"k");
+    wait_for("copy mode's k", || ctx.fmt("w", "#{copy_cursor_y}") != y);
+    assert_eq!(ctx.fmt("w", "[#{@rk}]"), "[]");
+    ctx.ok(&["send-keys", "-K", "-c", &client, "k"]);
+    assert_eq!(ctx.fmt("w", "[#{@rk}]"), "[]");
+    let log = ctx.ok(&["show-messages"]);
+    assert!(log.contains("key k: send-keys -X cursor-up"), "{log}");
+    assert!(log.contains("command: send-keys -X cursor-up"), "{log}");
+}
+
+#[test]
+fn send_keys_k_mouse_key_names() {
+    // key_string_lookup_string knows the mouse keys: send-keys -K handles them as keys
+    // (their event has no position), and bind, unbind and list-keys take them
+    let ctx = Ctx::new("sendk-mouse");
+    let _t = start(&ctx, "w");
+    let client = only_client(&ctx);
+    ctx.ok(&["bind-key", "-n", "MouseUp1Pane", "set", "-ga", "@m", "u"]);
+    ctx.ok(&["send-keys", "-K", "-c", &client, "MouseUp1Pane", "mouseup1pane"]);
+    assert_eq!(ctx.fmt("w", "#{@m}"), "uu");
+    assert!(!ctx.capture("w").contains("MouseUp1Pane"), "the name was typed");
+    assert!(ctx.ok(&["list-keys", "-T", "root", "MouseDown1Pane"]).contains("select-pane -t ="));
+    ctx.ok(&["unbind-key", "-n", "MouseDown1Pane"]);
+    ctx.ok(&["unbind-key", "-n", "m-mousedown3pane"]);
+    assert!(ctx.cmd(&["list-keys", "-T", "root", "MouseDown1Pane"]).1.contains("unknown key"));
+    // WheelUpPane's default binding enters copy mode
+    ctx.ok(&["send-keys", "-K", "-c", &client, "WheelUpPane"]);
+    assert_eq!(ctx.fmt("w", "#{pane_in_mode}"), "1");
+    // with the mouse off the key goes to the pane, which takes no mouse key without a
+    // position
+    ctx.ok(&["send-keys", "-X", "-t", "w", "cancel"]);
+    ctx.ok(&["set-option", "-g", "mouse", "off"]);
+    ctx.ok(&["send-keys", "-K", "-c", &client, "WheelUpPane", "MouseUp1Pane"]);
+    assert_eq!(ctx.fmt("w", "#{pane_in_mode} #{@m}"), "0 uu");
+}
+
+#[test]
+fn commands_after_errors_that_do_not_fail_the_command() {
+    // run-shell -C reports a parse error (cmdq_error) without failing, so the commands
+    // after it run; every failing hook prints its error; a command-line client that
+    // waited for a prompt and went away runs nothing when the prompt is answered
+    let ctx = Ctx::new("softerr");
+    let t = start(&ctx, "w");
+    let client = only_client(&ctx);
+    let out = ctx.command().args(["run-shell", "-C", "nosuchcmd", ";", "set", "-g", "@h", "N"]).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown command: nosuchcmd"));
+    assert_eq!(ctx.fmt("w", "#{@h}"), "N");
+    ctx.ok(&["set-hook", "-g", "after-set-option", "select-pane -t nosuch"]);
+    let out = ctx.command().args(["set", "-g", "@a", "a", ";", "set", "-g", "@b", "b"]).output().unwrap();
+    ctx.ok(&["set-hook", "-gu", "after-set-option"]);
+    assert!(!out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stderr).matches("can't find pane: nosuch").count(), 2, "{}", String::from_utf8_lossy(&out.stderr));
+    ctx.ok(&["bind-key", "-n", "F4", "command-prompt", "-p", "x", "set -g @p '%%'"]);
+    let mut waiting = ctx.command().args(["send-keys", "-K", "-c", &client, "F4"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    wait_for("prompt", || t.row(29).starts_with('x'));
+    waiting.kill().unwrap();
+    waiting.wait().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    ctx.ok(&["send-keys", "-K", "-c", &client, "q", "Enter"]);
+    wait_for("prompt closed", || !t.row(29).starts_with('x'));
+    assert_eq!(ctx.fmt("w", "[#{@p}]"), "[]");
+}

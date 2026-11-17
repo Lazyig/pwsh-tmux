@@ -1033,6 +1033,45 @@ fn lookup_name(name: &str) -> Option<KeyCode> {
     None
 }
 
+/// The mouse keys of tmux's key_string_table (KEYC_MOUSE_STRING): each type with buttons
+/// 1-3 and 6-11 (the wheel has none) at each location. MouseMove keys are not in it.
+static MOUSE_KEY_NAMES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+    let locations = ["Pane", "Status", "StatusLeft", "StatusRight", "StatusDefault", "ScrollbarUp", "ScrollbarSlider", "ScrollbarDown", "Empty", "Border",
+        "Control0", "Control1", "Control2", "Control3", "Control4", "Control5", "Control6", "Control7", "Control8", "Control9"];
+    let mut v = Vec::new();
+    for ty in ["MouseDown", "MouseUp", "MouseDrag", "MouseDragEnd", "WheelUp", "WheelDown", "SecondClick", "DoubleClick", "TripleClick"] {
+        let buttons: &[&str] = if ty.starts_with("Wheel") { &[""] } else { &["1", "2", "3", "6", "7", "8", "9", "10", "11"] };
+        for b in buttons {
+            for l in locations {
+                v.push(format!("{ty}{b}{l}"));
+            }
+        }
+    }
+    v
+});
+
+/// key_string_lookup_string for a mouse key ("MouseDown1Pane", "m-wheeluppane"): its name
+/// as tmux prints it (modifiers C-, M-, S- in that order), or None for any other string.
+pub fn parse_mouse_key_name(s: &str) -> Option<String> {
+    let mut mods = Mods::NONE;
+    let mut rest = s;
+    if let Some(r) = rest.strip_prefix('^').filter(|r| r.len() > 1) {
+        mods.ctrl = true;
+        rest = r;
+    }
+    while rest.len() >= 2 && rest.as_bytes()[1] == b'-' {
+        match rest.as_bytes()[0] {
+            b'C' | b'c' => mods.ctrl = true,
+            b'M' | b'm' => mods.meta = true,
+            b'S' | b's' => mods.shift = true,
+            _ => return None,
+        }
+        rest = &rest[2..];
+    }
+    let name = MOUSE_KEY_NAMES.iter().find(|n| n.eq_ignore_ascii_case(rest))?;
+    Some(format!("{}{name}", mods.prefix()))
+}
+
 /// Canonical tmux name for a key ("C-b", "M-Left", "Space", "F5", "\"" etc.) — inverse of
 /// [`parse_key_name`] for normalised keys.
 pub fn key_name(k: &Key) -> String {
@@ -2183,6 +2222,12 @@ mod tests {
         assert_eq!(p("KP0"), k(KeyCode::KP('0')));
         assert_eq!(p("KPEnter"), k(KeyCode::KP('\r')));
         assert_eq!(p("KP/"), k(KeyCode::KP('/')));
+        assert_eq!(parse_mouse_key_name("MouseDown1Pane").as_deref(), Some("MouseDown1Pane"));
+        assert_eq!(parse_mouse_key_name("m-c-wheeluppane").as_deref(), Some("C-M-WheelUpPane"));
+        assert_eq!(parse_mouse_key_name("DoubleClick11Control9").as_deref(), Some("DoubleClick11Control9"));
+        for bad in ["MouseDown4Pane", "WheelUp1Pane", "MouseMovePane", "MouseDown1", "x", "X-MouseDown1Pane"] {
+            assert_eq!(parse_mouse_key_name(bad), None, "{bad}");
+        }
         for bad in [
             "",
             "MouseDown1Pane",

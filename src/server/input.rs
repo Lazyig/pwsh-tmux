@@ -589,8 +589,9 @@ impl Server {
     }
 
     pub(super) fn handle_key(&mut self, cid: ClientId, k: Key, raw: Vec<u8>) {
-        if let Some((k, raw)) = self.handle_key_now(cid, k, raw) {
-            self.handle_key_queued(cid, k, raw, false);
+        if let Some((k, raw)) = self.handle_key_now(cid, k, raw, false) {
+            let name = keys::key_name(&k);
+            self.handle_key_queued(cid, Some(k), &name, raw, false);
         }
     }
 
@@ -600,7 +601,10 @@ impl Server {
     /// key when none of them took it; it then goes to handle_key_queued
     /// (server_client_key_callback), which send-keys -K runs only when its queue reaches
     /// the key, so a menu or prompt a binding opened in between does not get it.
-    pub(super) fn handle_key_now(&mut self, cid: ClientId, k: Key, raw: Vec<u8>) -> Option<(Key, Vec<u8>)> {
+    /// A key send-keys -K `sent` has KEYC_SENT, so it is never the Escape or C-c that
+    /// closes a popup or a modal pane (popup_key_cb and the modal check compare the
+    /// whole key): those go to the popup's program or the pane.
+    pub(super) fn handle_key_now(&mut self, cid: ClientId, k: Key, raw: Vec<u8>, sent: bool) -> Option<(Key, Vec<u8>)> {
         let name = keys::key_name(&k);
         let c = self.clients.get(&cid)?;
         let menu = if c.overlay.is_none() { self.client_window(cid).filter(|w| self.menus.contains_key(w)) } else { None };
@@ -622,7 +626,7 @@ impl Server {
                 // -k any key) do
                 let (pane, close_on_exit, any_key) = (p.pane, p.close_on_exit || p.close_exit_zero, p.close_any_key);
                 let exited = self.panes.get(&pane).is_none_or(|x| x.dead.is_some());
-                let cancel = name == "Escape" || name == "C-c";
+                let cancel = !sent && (name == "Escape" || name == "C-c");
                 if ((!close_on_exit || exited) && cancel) || (exited && any_key) {
                     let c = self.clients.get_mut(&cid).unwrap();
                     c.overlay = None;
@@ -649,7 +653,7 @@ impl Server {
             }
             let fl = self.panes.get(&pane).map_or(0, |p| p.fflags);
             let modal = self.window_of(pane).is_some_and(|w| self.windows[&w].modal == Some(pane));
-            if modal && fl & super::float::CLOSE_ON_CANCEL != 0 && (name == "Escape" || name == "C-c") {
+            if modal && !sent && fl & super::float::CLOSE_ON_CANCEL != 0 && (name == "Escape" || name == "C-c") {
                 self.kill_pane(pane);
                 return None;
             }
@@ -679,20 +683,67 @@ impl Server {
                 return None;
             }
         }
+        // a copy-mode jump waiting for its character (tmux's command-prompt -1 is a status
+        // prompt, which takes the key here)
+        if let Some(pane) = self.client_active_pane(cid) {
+            if matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(cm)) if cm.waiting_for_key()) {
+                self.copy_key(pane, Some(cid), &name);
+                return None;
+            }
+        }
         Some((k, raw))
     }
 
-    /// server_client_key_callback: assume-paste, the key tables and the prefix, then the
-    /// pane or its mode. A key send-keys -K `sent` (KEYC_SENT) is never taken for a paste.
-    fn handle_key_queued(&mut self, cid: ClientId, k: Key, raw: Vec<u8>, sent: bool) {
-        let name = keys::key_name(&k);
+    /// handle_key_now for a mouse key send-keys -K sent by name (MouseDown1Pane): its
+    /// mouse event is not valid (no position), so a popup or a menu takes it without
+    /// doing anything, a status prompt does not want it and a pane prompt drops it.
+    /// True when the key was taken.
+    pub(super) fn handle_mouse_key_now(&mut self, cid: ClientId) -> bool {
+        let Some(c) = self.clients.get(&cid) else { return true };
+        let menu = if c.overlay.is_none() { self.client_window(cid).filter(|w| self.menus.contains_key(w)) } else { None };
+        if c.is_readonly() && (c.prompt.is_some() || c.overlay.is_some() || menu.is_some()) { return true; }
+        if c.message.is_some() && !c.is_readonly() {
+            if c.message_ignore_keys { return true; }
+            let c = self.clients.get_mut(&cid).unwrap();
+            c.message = None;
+            c.dirty = true;
+        }
+        if self.clients[&cid].overlay.is_some() || self.client_session(cid).is_none() {
+            return true;
+        }
+        if let Some(wid) = menu {
+            self.menu_action(cid, wid, MenuAction::None);
+            return true;
+        }
+        self.pane_prompt_target(cid).is_some() && !self.client_is_readonly(Some(cid))
+    }
+
+    /// The default key table (server_client_get_key_table): the session's key-table.
+    fn default_key_table(&self, sid: SessId) -> String {
+        let t = self.opt_session(Some(sid), "key-table");
+        if t.is_empty() { "root".into() } else { t }
+    }
+
+    /// server_client_key_callback: assume-paste, a pane capturing all keys, the key tables
+    /// and the prefix, then the pane or its mode. A key send-keys -K `sent` (KEYC_SENT) is
+    /// never taken for a paste. `k` is None for a mouse key sent by name, whose event
+    /// has no position.
+    fn handle_key_queued(&mut self, cid: ClientId, k: Option<Key>, name: &str, raw: Vec<u8>, sent: bool) {
+        let name = name.to_string();
+        let mouse = k.is_none();
         if !self.clients.contains_key(&cid) { return; }
         let Some(sid) = self.client_session(cid) else { return };
+        let pane = self.client_active_pane(cid);
+        // mouse keys go to the pane when the mouse is off (an event without a position
+        // reaches none)
+        if mouse && !self.opt_session_on(Some(sid), "mouse") {
+            return;
+        }
         let now = Instant::now();
         let threshold = self.opt_session_num(Some(sid), "assume-paste-time").max(0) as u64;
         let c = self.clients.get_mut(&cid).unwrap();
         let mut paste = false;
-        if !sent {
+        if !sent && !mouse {
             let quick = threshold > 0 && !c.features.has("bpaste") && c.input_state.key_at.is_some_and(|t| now.duration_since(t) < Duration::from_millis(threshold));
             paste = quick && c.input_state.assume_paste;
             if quick && !c.input_state.assume_paste { c.input_state.guess_at = Some(now); }
@@ -705,44 +756,59 @@ impl Server {
             if let Some(pane) = self.input_target(cid) { self.paste_bytes(cid, pane, &raw); }
             return;
         }
-        let mut table = self.clients[&cid].key_table.clone();
+        // a pane capturing all keys (new-pane -K) gets them before the key tables
+        if let (Some(p), Some(k)) = (pane, k.as_ref()) {
+            if self.panes.get(&p).is_some_and(|x| x.fflags & super::float::CAPTURE_KEYS != 0 && x.dead.is_none() && x.mode.is_none()) {
+                if !self.dead_key(p) {
+                    self.send_key_to_pane(cid, p, k, raw);
+                }
+                return;
+            }
+        }
+        // the key table: a pane's mode table (copy mode) while the client is in its
+        // default table, else the client's
+        let default_table = self.default_key_table(sid);
+        let client_table = self.clients[&cid].key_table.clone();
+        let mode_table = pane.and_then(|p| self.mode_key_table(p));
+        let mut table = if client_table == default_table { mode_table.clone().unwrap_or(client_table) } else { client_table };
+        let mut first = table.clone();
         let mut repeating = self.clients[&cid].repeat_until.is_some_and(|d| d > Instant::now());
         let prefix_ms = self.opt_server_num("prefix-timeout").max(0) as u64;
-        let repeat_binding = self.bindings.get(&table).and_then(|t| t.get(&name)).is_some_and(|b| b.repeat);
-        // prefix-timeout counts from when the table was set, also by switch-client -T
-        if table == "prefix" && prefix_ms > 0 && !(repeating && repeat_binding)
-            && self.clients[&cid].input_state.table_at.is_some_and(|t| now.duration_since(t) > Duration::from_millis(prefix_ms)) {
-            table = "root".into();
-            let c = self.clients.get_mut(&cid).unwrap(); c.set_key_table("root"); c.repeat_until = None;
-        }
-        let pane = self.client_active_pane(cid);
+        let reset = |srv: &mut Self, t: &str| {
+            let c = srv.clients.get_mut(&cid).unwrap();
+            c.set_key_table(t);
+            c.repeat_until = None;
+            c.dirty = true;
+        };
         loop {
-            if table == "root" {
+            // table_changed: the prefix always switches to the prefix table, from any other
+            if !mouse && table != "prefix" {
                 let prefix = self.opt_session(Some(sid), "prefix");
                 let prefix2 = self.opt_session(Some(sid), "prefix2");
                 let is_prefix = |p: &str| p != "None" && keys::parse_key_name(p).is_some_and(|pk| keys::key_name(&pk) == name);
                 if is_prefix(&prefix) || is_prefix(&prefix2) {
-                    // root bindings for the prefix key itself take precedence (tmux checks root first)
-                    if !self.bindings.get("root").is_some_and(|t| t.contains_key(&name)) {
-                        let c = self.clients.get_mut(&cid).unwrap();
-                        c.set_key_table("prefix");
-                        c.repeat_until = None;
-                        c.dirty = true;
-                        return;
-                    }
+                    reset(self, "prefix");
+                    return;
                 }
             }
+            let was_repeating = repeating;
             let found = self.bindings.get(&table).and_then(|t| t.get(&name)).map(|b| (b.cmd.clone(), b.repeat));
+            // prefix-timeout counts from when the table was set, also by switch-client -T
+            if table == "prefix" && prefix_ms > 0 && !(repeating && found.as_ref().is_some_and(|b| b.1))
+                && self.clients[&cid].input_state.table_at.is_some_and(|t| now.duration_since(t) > Duration::from_millis(prefix_ms)) {
+                reset(self, &default_table);
+                table = default_table.clone();
+                first = table.clone();
+                continue;
+            }
             match found {
                 Some((_, false)) if repeating => {
                     // a binding that does not repeat ends the repeat; the key is looked up
-                    // again from the root table, where it may be the prefix
-                    let c = self.clients.get_mut(&cid).unwrap();
-                    c.set_key_table("root");
-                    c.repeat_until = None;
-                    c.dirty = true;
+                    // again from the default table, where it may be the prefix
+                    reset(self, &default_table);
                     repeating = false;
-                    table = "root".into();
+                    table = default_table.clone();
+                    first = table.clone();
                 }
                 Some((cmd, repeat)) => {
                     let mut ms = self.opt_session_num(Some(sid), "repeat-time").max(0) as u64;
@@ -750,33 +816,45 @@ impl Server {
                     if ms > 0 && initial > 0 && (!repeating || self.clients[&cid].input_state.last_key != name) { ms = initial; }
                     let c = self.clients.get_mut(&cid).unwrap();
                     c.input_state.last_key = name.clone();
-                    if repeat && ms > 0 && table != "root" {
+                    if repeat && ms > 0 && table != default_table {
                         c.repeat_until = Some(Instant::now() + Duration::from_millis(ms));
                     } else {
                         c.repeat_until = None;
-                        c.set_key_table("root");
+                        c.set_key_table(&default_table);
                     }
                     c.dirty = true;
-                    self.run_key_string(cid, &cmd, pane, &name);
+                    // copy mode's own table: copy mode runs it (its default bindings
+                    // directly)
+                    match pane.filter(|_| mode_table.as_deref() == Some(table.as_str())) {
+                        Some(p) => self.copy_key(p, Some(cid), &name),
+                        None => self.run_key_string(cid, &cmd, pane, &name),
+                    }
                     return;
                 }
-                None if table != "root" => {
-                    let c = self.clients.get_mut(&cid).unwrap();
-                    c.set_key_table("root");
-                    c.repeat_until = None;
-                    c.dirty = true;
-                    if !repeating {
-                        return; // unbound key after the prefix is discarded
+                // mouse movement is only reported when asked for: it leaves no table
+                None if mouse && name.contains("MouseMove") => break,
+                None if table != default_table || repeating => {
+                    // not found: back to the default table and try again
+                    reset(self, &default_table);
+                    table = default_table.clone();
+                    if repeating {
+                        first = table.clone();
                     }
                     repeating = false;
-                    table = "root".into();
+                }
+                // found in neither: a key that came through another table is dropped
+                None if first != table && !was_repeating => {
+                    reset(self, &default_table);
+                    return;
                 }
                 None => break,
             }
         }
-        // not bound: to the pane (or its mode)
+        // forward_key: to the pane (or its mode)
         let Some(pane) = pane else { return };
-        // forward_key: before the read-only check, so read-only clients may dismiss it too
+        // a mouse key without a position reaches no pane or mode
+        let Some(k) = k else { return };
+        // before the read-only check, so read-only clients may dismiss it too
         if self.dead_key(pane) { return; }
         if self.panes.get(&pane).is_some_and(|p| p.mode.is_some()) {
             self.mode_key(pane, Some(cid), &name);
@@ -796,17 +874,30 @@ impl Server {
         let app = self.panes.get(&ev.pane).is_some_and(|p| p.screen().application_cursor());
         let saved = self.key_origin.replace(ev.origin);
         let saved_capture = self.key_capture.replace(Vec::new());
-        let raw = keys::encode_key(&ev.key, app);
-        self.handle_key_queued(ev.client, ev.key, raw, true);
+        match ev.mouse {
+            Some(name) => self.handle_key_queued(ev.client, None, &name, Vec::new(), true),
+            None => {
+                let raw = keys::encode_key(&ev.key, app);
+                let name = keys::key_name(&ev.key);
+                self.handle_key_queued(ev.client, Some(ev.key), &name, raw, true);
+            }
+        }
         self.key_origin = saved;
         std::mem::replace(&mut self.key_capture, saved_capture).unwrap_or_default()
     }
 
     /// Runs a key binding's commands for a client: the message log names the key (or,
-    /// for send-keys -K, the client that sent it).
+    /// for send-keys -K, the client that sent it). Under send-keys -K the commands go
+    /// into its queue as a group (KEY_GROUP marks) that runs for this client, its pane
+    /// and the key, as key_bindings_dispatch's new item and state.
     pub fn run_key_string(&mut self, cid: ClientId, cmd: &str, pane: Option<PaneId>, key: &str) {
         match self.parse_string(cmd) {
-            Ok(cmds) if self.key_capture.is_some() => self.key_capture.as_mut().unwrap().extend(cmds),
+            Ok(cmds) if self.key_capture.is_some() => {
+                let capture = self.key_capture.as_mut().unwrap();
+                capture.push(vec![KEY_GROUP.clone(), "1".into(), cid.to_string(), pane.map(|p| p.to_string()).unwrap_or_default(), key.to_string()]);
+                capture.extend(cmds);
+                capture.push(vec![KEY_GROUP.clone(), "0".into()]);
+            }
             Ok(cmds) => {
                 let ctx = Ctx { client: Some(cid), pane, from_key: true, key: Some(key.to_string()), log_client: self.key_origin, ..Ctx::default() };
                 self.run_queue(Queue { cmds: cmds.into(), ctx , soft: 0 });
@@ -815,13 +906,20 @@ impl Server {
         }
     }
 
-    /// Runs a command string for a client (key bindings, prompts, menus).
+    /// Runs a command string for a client (prompts, menus, modes): cmdq_append to the
+    /// client's queue, so while a queue is running (send-keys -K handing a menu or a
+    /// prompt its key) the commands wait until that queue is done or waits.
     pub fn run_string(&mut self, cid: ClientId, cmd: &str, pane: Option<PaneId>) {
         // cmd_parse_from_string: the whole list is checked before any of it runs
         match self.parse_string(cmd) {
             Ok(cmds) => {
                 let ctx = Ctx { client: Some(cid), pane, from_key: true, ..Ctx::default() };
-                self.run_queue(Queue { cmds: cmds.into(), ctx , soft: 0 });
+                let q = Queue { cmds: cmds.into(), ctx , soft: 0 };
+                if self.queue_depth > 0 {
+                    self.client_queued.push_back(q);
+                } else {
+                    self.run_queue(q);
+                }
             }
             Err(e) => self.set_error(cid, &e),
         }
@@ -1180,6 +1278,10 @@ impl Server {
     /// The prompt's input callback (cmd_command_prompt_callback,
     /// cmd_confirm_before_callback): `s` None cancels. True when the prompt closes.
     fn prompt_fire(&mut self, cid: ClientId, pr: &mut Prompt, s: Option<&str>, fire: Fire) -> bool {
+        // the command-line client waiting for this prompt has gone: its queue (where the
+        // commands would go) runs nothing more
+        let gone = self.prompt_waits.iter().any(|(_, id, _, q)| *id == pr.id && q.ctx.reply.is_some_and(|r| !self.clients.contains_key(&r)));
+        let s = s.filter(|_| !gone);
         let close = match pr.kind {
             PromptKind::Key => {
                 if let Some(s) = s {

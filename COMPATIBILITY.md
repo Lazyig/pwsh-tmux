@@ -85,6 +85,9 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   have no tmux terminfo and ConPTY programs expect xterm. Panes therefore get
   `TERM=xterm-256color`, and Home and End are sent as xterm's `\e[H`/`\e[F` (`\eOH`/`\eOF`
   in application cursor mode) rather than tmux's `\e[1~`/`\e[4~`.
+- **`send-keys -K` special keys reach the pane.** tmux 3.8 drops function and cursor keys
+  (`F12`, `Up`, `Home`, `C-Up` and the like) that `send-keys -K` gives a pane, because
+  `input_key` does not strip the sent-key flag; here they are sent as typed keys are.
 - **Pane titles on Windows.** ConPTY sets the console title when the pane starts, so
   `pane_title` begins as the shell's executable path and changes with the console title.
   On Windows, titles and names set by the program in the pane (OSC 0/2, APC, `ESC k`) and
