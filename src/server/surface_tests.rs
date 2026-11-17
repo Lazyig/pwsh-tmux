@@ -167,12 +167,15 @@ fn client_termtype_and_terminal_capabilities() {
     assert!(f.terminal_report(1, b"\x1bP>|XTerm(400)\x1b\\"));
     assert_eq!(f.expand(t, Some(1), "[#{client_termtype}] #{client_termname}"), "[XTerm(400)] xterm-256color");
     // tty_term_has_name: what show-messages -T lists for the client's terminal, with
-    // terminal-overrides as they were when the features last changed
-    f.opts_server.set("terminal-overrides[90]", "xterm*:smcup=\\E[?1049h:Ms@".into());
-    assert_eq!(f.expand(t, Some(1), "#{I/c:smcup}|#{I/c:nosuch}|#{I/c:Ms}"), "1|0|1");
+    // terminal-overrides as they were when the features last changed (the XTVERSION
+    // reply above). Nobr is in neither xterm-256color's terminfo nor a feature, so only
+    // the override could add it; Ms comes from terminfo on Unix and from the clipboard
+    // feature where there is no terminfo (Windows), so only the override removes it.
+    f.opts_server.set("terminal-overrides[90]", "xterm*:Nobr=\\E[x:Ms@".into());
+    assert_eq!(f.expand(t, Some(1), "#{I/c:Nobr}|#{I/c:nosuch}|#{I/c:Ms}"), "0|0|1");
     // tty_update_features (here a DA reply with new features) applies them again
     assert!(f.terminal_report(1, b"\x1b[?62;52c"));
-    assert_eq!(f.expand(t, Some(1), "#{I/c:Ms}"), "0");
+    assert_eq!(f.expand(t, Some(1), "#{I/c:Nobr}|#{I/c:Ms}"), "1|0");
 }
 
 /// What a command prints.

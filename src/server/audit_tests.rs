@@ -72,9 +72,16 @@ fn buffer_names_are_checked_and_unnamed_commands_use_the_newest_automatic_buffer
     assert_eq!(run(&mut f, &["show-buffer"]).unwrap(), "two");
     run(&mut f, &["delete-buffer"]).unwrap();
     assert_eq!(run(&mut f, &["show-buffer"]).unwrap(), "one");
-    // file errors as file_read writes them
+    // file errors as file_read writes them: strerror and the path file_get_path resolved
     let e = run(&mut f, &["load-buffer", "/nonexistent/fx"]).unwrap_err();
-    assert_eq!(e, "No such file or directory: /nonexistent/fx");
+    if cfg!(windows) {
+        // a path with a root but no drive is on the drive of the directory it is
+        // resolved against (Path::join keeps that prefix): "C:/nonexistent/fx"
+        let p = e.strip_prefix("No such file or directory: ").unwrap_or_else(|| panic!("{e}"));
+        assert!(p.len() == 17 && p.as_bytes()[0].is_ascii_alphabetic() && &p[1..] == ":/nonexistent/fx", "{e}");
+    } else {
+        assert_eq!(e, "No such file or directory: /nonexistent/fx");
+    }
 }
 
 #[test]

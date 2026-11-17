@@ -589,20 +589,32 @@ impl Server {
     }
 
     pub(super) fn handle_key(&mut self, cid: ClientId, k: Key, raw: Vec<u8>) {
+        if let Some((k, raw)) = self.handle_key_now(cid, k, raw) {
+            self.handle_key_queued(cid, k, raw, false);
+        }
+    }
+
+    /// The part of server_client_handle_key0 that cannot wait in a queue (which may be
+    /// blocked): the message, the overlay, the active pane (dead, modal cancel,
+    /// capture-keys), the window's menu, the status prompt and a pane prompt. Returns the
+    /// key when none of them took it; it then goes to handle_key_queued
+    /// (server_client_key_callback), which send-keys -K runs only when its queue reaches
+    /// the key, so a menu or prompt a binding opened in between does not get it.
+    pub(super) fn handle_key_now(&mut self, cid: ClientId, k: Key, raw: Vec<u8>) -> Option<(Key, Vec<u8>)> {
         let name = keys::key_name(&k);
-        let Some(c) = self.clients.get(&cid) else { return };
+        let c = self.clients.get(&cid)?;
         let menu = if c.overlay.is_none() { self.client_window(cid).filter(|w| self.menus.contains_key(w)) } else { None };
-        if c.is_readonly() && (c.prompt.is_some() || c.overlay.is_some() || menu.is_some()) { return; }
+        if c.is_readonly() && (c.prompt.is_some() || c.overlay.is_some() || menu.is_some()) { return None; }
         // a key clears a message (and is then handled), unless display -N
         if c.message.is_some() && !c.is_readonly() {
-            if c.message_ignore_keys { return; }
+            if c.message_ignore_keys { return None; }
             let c = self.clients.get_mut(&cid).unwrap();
             c.message = None;
             c.dirty = true;
         }
         // server_client_handle_key0 order: the overlay, the active pane (dead, modal
         // cancel, capture-keys), the window's menu, the status prompt, then a pane prompt
-        let Some(c) = self.clients.get(&cid) else { return };
+        let Some(c) = self.clients.get(&cid) else { return None };
         match &c.overlay {
             Some(Overlay::Popup(p)) => {
                 // popup_key_cb: Escape and C-c close the popup unless -E leaves them
@@ -616,32 +628,34 @@ impl Server {
                     c.overlay = None;
                     c.dirty = true;
                     self.destroy_pane(pane);
-                    return;
+                    return None;
                 }
                 if !exited {
                     self.send_key_to_pane(cid, pane, &k, raw);
                 }
-                return;
+                return None;
             }
             None => {}
         }
-        let Some(sid) = self.client_session(cid) else { return };
+        if self.client_session(cid).is_none() {
+            return None;
+        }
         // a modal pane closes on Escape or C-c with -D; with -K it gets every key, the
         // prefix included, unless it is in a mode (tmux server_client_handle_key, not for
         // read-only clients)
         if let Some(pane) = self.client_active_pane(cid).filter(|_| !self.client_is_readonly(Some(cid))) {
             if self.dead_key(pane) {
-                return;
+                return None;
             }
             let fl = self.panes.get(&pane).map_or(0, |p| p.fflags);
             let modal = self.window_of(pane).is_some_and(|w| self.windows[&w].modal == Some(pane));
             if modal && fl & super::float::CLOSE_ON_CANCEL != 0 && (name == "Escape" || name == "C-c") {
                 self.kill_pane(pane);
-                return;
+                return None;
             }
             if fl & super::float::CAPTURE_KEYS != 0 && self.panes.get(&pane).is_some_and(|p| p.mode.is_none() && p.dead.is_none()) {
                 self.send_key_to_pane(cid, pane, &k, raw);
-                return;
+                return None;
             }
         }
         // the menu of the client's window comes before the prompt (server_client_handle_menu_key)
@@ -651,27 +665,39 @@ impl Server {
                 None => MenuAction::None,
             };
             self.menu_action(cid, wid, action);
-            return;
+            return None;
         }
         if self.clients[&cid].prompt.is_some() {
             let prompt_key = match k.code { KeyCode::KP('\r') => Key::plain(KeyCode::Enter), KeyCode::KP(ch) => Key::plain(KeyCode::Char(ch)), _ => k.clone() };
             if self.prompt_key(cid, &prompt_key, &name) {
-                return;
+                return None;
             }
         }
         // a pane prompt in the window; read-only clients skip it (server_client_handle_key)
         if let Some(pane) = self.pane_prompt_target(cid).filter(|_| !self.client_is_readonly(Some(cid))) {
             if self.pane_prompt_key(cid, pane, &k, &name) {
-                return;
+                return None;
             }
         }
+        Some((k, raw))
+    }
+
+    /// server_client_key_callback: assume-paste, the key tables and the prefix, then the
+    /// pane or its mode. A key send-keys -K `sent` (KEYC_SENT) is never taken for a paste.
+    fn handle_key_queued(&mut self, cid: ClientId, k: Key, raw: Vec<u8>, sent: bool) {
+        let name = keys::key_name(&k);
+        if !self.clients.contains_key(&cid) { return; }
+        let Some(sid) = self.client_session(cid) else { return };
         let now = Instant::now();
         let threshold = self.opt_session_num(Some(sid), "assume-paste-time").max(0) as u64;
         let c = self.clients.get_mut(&cid).unwrap();
-        let quick = threshold > 0 && !c.features.has("bpaste") && c.input_state.key_at.is_some_and(|t| now.duration_since(t) < Duration::from_millis(threshold));
-        let paste = quick && c.input_state.assume_paste;
-        if quick && !c.input_state.assume_paste { c.input_state.guess_at = Some(now); }
-        c.input_state.assume_paste = quick;
+        let mut paste = false;
+        if !sent {
+            let quick = threshold > 0 && !c.features.has("bpaste") && c.input_state.key_at.is_some_and(|t| now.duration_since(t) < Duration::from_millis(threshold));
+            paste = quick && c.input_state.assume_paste;
+            if quick && !c.input_state.assume_paste { c.input_state.guess_at = Some(now); }
+            c.input_state.assume_paste = quick;
+        }
         c.input_state.key_at = Some(now);
         if paste {
             // paste_key: the bytes as they came (window_pane_paste), never to a pane in a mode
@@ -757,6 +783,23 @@ impl Server {
             return;
         }
         self.send_key_to_pane(cid, pane, &k, raw);
+    }
+
+    /// A send-keys -K key the queue reached (server_client_key_callback): the key tables
+    /// and the pane, as the client typing it, encoded for its pane as it is now (menus and
+    /// prompts had it at send-keys time, handle_key_now). Returns the commands of the
+    /// binding it ran, which go in the queue after it.
+    pub(super) fn key_event(&mut self, ev: KeyEvent) -> Vec<Vec<String>> {
+        if !self.clients.contains_key(&ev.client) {
+            return Vec::new();
+        }
+        let app = self.panes.get(&ev.pane).is_some_and(|p| p.screen().application_cursor());
+        let saved = self.key_origin.replace(ev.origin);
+        let saved_capture = self.key_capture.replace(Vec::new());
+        let raw = keys::encode_key(&ev.key, app);
+        self.handle_key_queued(ev.client, ev.key, raw, true);
+        self.key_origin = saved;
+        std::mem::replace(&mut self.key_capture, saved_capture).unwrap_or_default()
     }
 
     /// Runs a key binding's commands for a client: the message log names the key (or,
