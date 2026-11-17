@@ -1280,6 +1280,20 @@ pub static LINE_MARK: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| 
 /// An error without a message (cmdq_error not called): it ends the command's group only.
 pub const QUIET_ERROR: &str = "\0quiet-error";
 pub static CFG_DONE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("cfg-done"));
+/// A key send-keys -K typed (server_client_key_callback): [KEY_EVENT, token of
+/// Server::key_events]. It is handled when the queue reaches it, so keys and the commands
+/// their bindings run happen in order, after any earlier command waits (a prompt).
+pub static KEY_EVENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("key"));
+
+/// A key waiting in a queue as a KEY_EVENT item.
+pub struct KeyEvent {
+    pub client: ClientId,
+    /// send-keys' target pane, whose cursor key mode encodes the key.
+    pub pane: PaneId,
+    /// The client that ran send-keys (key_origin while the key is handled).
+    pub origin: ClientId,
+    pub key: keys::Key,
+}
 
 /// The tmux release whose behaviour this server matches (`#{version}`).
 pub const TMUX_VERSION: &str = "3.8";
@@ -1346,6 +1360,9 @@ pub struct Server {
     /// send-keys -K: the bound commands of the keys it handles, which go in its own
     /// queue after it (server_client_handle_key_after) instead of a queue of their own.
     pub key_capture: Option<Vec<Vec<String>>>,
+    /// send-keys -K keys waiting in a queue (KEY_EVENT items), by token.
+    pub key_events: HashMap<u64, KeyEvent>,
+    pub key_event_seq: u64,
     /// Events: hook bookkeeping, wait-for -E, monitors, change detection.
     pub ev: events::State,
     pub buffers: Vec<Buffer>,
@@ -1549,6 +1566,8 @@ impl Server {
             cfg_finished: false,
             key_origin: None,
             key_capture: None,
+            key_events: HashMap::new(),
+            key_event_seq: 0,
             ev: Default::default(),
             buffers: Vec::new(),
             buffer_seq: 0,
@@ -3907,6 +3926,17 @@ impl Server {
                 self.cfg_done();
                 continue;
             }
+            if name == *KEY_EVENT {
+                // server_client_key_callback: the bound commands go after this item. The
+                // queue is its client's, so once that client has gone its keys go too.
+                let ev = cmd.get(1).and_then(|t| t.parse().ok()).and_then(|t| self.key_events.remove(&t));
+                let gone = q.ctx.reply.or(q.ctx.client).is_some_and(|c| !self.clients.contains_key(&c));
+                let bound = ev.filter(|_| !gone).map(|ev| self.key_event(ev)).unwrap_or_default();
+                for c in bound.into_iter().rev() {
+                    q.cmds.push_front(c);
+                }
+                continue;
+            }
             let delay_cmd = (cmds::canonical(&name) == Some("run-shell")).then(|| cmd.clone());
             // the command's arguments for its hooks: an alias's command under its own name
             let mut argv = cmd.clone();
@@ -3940,7 +3970,7 @@ impl Server {
                 if soft {
                     Self::skip_group(&mut q);
                 } else {
-                    q.cmds.retain(|c| c.first() == Some(&*CFG_DONE));
+                    q.cmds.retain(|c| c.first().is_some_and(|n| *n == *CFG_DONE || *n == *KEY_EVENT));
                     q.soft = 0;
                 }
                 self.control_item_done(&mut q, Some(""));
@@ -3974,16 +4004,19 @@ impl Server {
                     self.ev.cur_formats = saved_formats;
                     self.ev.in_hook = saved_hook;
                     self.control_item_done(&mut q, Some(e));
-                    q.cmds.clear();
+                    // (keys send-keys -K left are items of their own too)
+                    q.cmds.retain(|c| c.first() == Some(&*KEY_EVENT));
                     q.soft = 0;
-                    q.cmds.extend(hooks);
+                    for c in hooks.into_iter().rev() {
+                        q.cmds.push_front(c);
+                    }
                     continue;
                 }
                 if !hooks.is_empty() && failed.is_none() {
                     // the hook runs in place of the rest of the command list
                     if !soft {
                         // (the configuration's cfg_done stays)
-                        q.cmds.retain(|c| c.first() == Some(&*CFG_DONE));
+                        q.cmds.retain(|c| c.first().is_some_and(|n| *n == *CFG_DONE || *n == *KEY_EVENT));
                         failed = Some(e.clone());
                     }
                     for c in hooks.into_iter().rev() {

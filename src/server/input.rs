@@ -759,6 +759,22 @@ impl Server {
         self.send_key_to_pane(cid, pane, &k, raw);
     }
 
+    /// A send-keys -K key the queue reached (server_client_key_callback): handled as the
+    /// client typing it, encoded for its pane as it is now. Returns the commands of the
+    /// binding it ran, which go in the queue after it.
+    pub(super) fn key_event(&mut self, ev: KeyEvent) -> Vec<Vec<String>> {
+        if !self.clients.contains_key(&ev.client) {
+            return Vec::new();
+        }
+        let app = self.panes.get(&ev.pane).is_some_and(|p| p.screen().application_cursor());
+        let saved = self.key_origin.replace(ev.origin);
+        let saved_capture = self.key_capture.replace(Vec::new());
+        let raw = keys::encode_key(&ev.key, app);
+        self.handle_key(ev.client, ev.key, raw);
+        self.key_origin = saved;
+        std::mem::replace(&mut self.key_capture, saved_capture).unwrap_or_default()
+    }
+
     /// Runs a key binding's commands for a client: the message log names the key (or,
     /// for send-keys -K, the client that sent it).
     pub fn run_key_string(&mut self, cid: ClientId, cmd: &str, pane: Option<PaneId>, key: &str) {

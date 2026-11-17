@@ -4288,7 +4288,6 @@ impl Server {
                     // -K: the keys are handled as if the client (-c) typed them (prefix, key
                     // tables, bindings); bindings run before the commands after send-keys
                     let Ok(cid) = self.resolve_client(ctx, o.get('c')) else { return Ok(Flow::Next) };
-                    let app = self.panes.get(&pane).is_some_and(|p| p.screen().application_cursor());
                     let mut list = Vec::new();
                     for k in &o.rest {
                         let k = if o.has('F') { self.expand(tt, ctx.client, k) } else { k.clone() };
@@ -4301,19 +4300,21 @@ impl Server {
                             None => list.extend(text.chars().filter_map(|c| keys::parse_key_name(&c.to_string()))),
                         }
                     }
-                    // the bound commands are the sending client's: they go in this queue
-                    // after send-keys (server_client_handle_key_after), so their output is
-                    // its output
-                    let saved = self.key_origin.replace(ctx.client.or(ctx.reply).unwrap_or(cid));
-                    let saved_capture = self.key_capture.replace(Vec::new());
+                    // server_client_handle_key_after: each key is an item in this queue
+                    // after send-keys, handled when the queue reaches it, with its bound
+                    // commands after it (they are the sending client's, and their output is
+                    // its output). So a binding that waits (command-prompt) holds up the
+                    // keys after it and send-keys' client, as in tmux.
+                    let origin = ctx.client.or(ctx.reply).unwrap_or(cid);
+                    let mut items = Vec::with_capacity(n.saturating_mul(list.len()).min(4096));
                     for _ in 0..n {
                         for key in &list {
-                            self.handle_key(cid, key.clone(), keys::encode_key(key, app));
+                            self.key_event_seq += 1;
+                            self.key_events.insert(self.key_event_seq, KeyEvent { client: cid, pane, origin, key: key.clone() });
+                            items.push(vec![KEY_EVENT.clone(), self.key_event_seq.to_string()]);
                         }
                     }
-                    self.key_origin = saved;
-                    let bound = std::mem::replace(&mut self.key_capture, saved_capture).unwrap_or_default();
-                    return Ok(Flow::Inject(bound, false));
+                    return Ok(Flow::Inject(items, false));
                 }
                 if o.has('R') {
                     if let Some(p) = self.panes.get_mut(&pane) {
