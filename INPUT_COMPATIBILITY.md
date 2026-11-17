@@ -28,7 +28,12 @@ paste end markers receive at least 500ms before their escape timer expires. As i
 tmux 3.8 (tty_keys_next), so does a lone Escape while the terminal's replies to the
 attach requests (device attributes, DECRPM 2026, the OSC 10/11 colours) are awaited:
 until all have come or five seconds have passed, an Escape followed within 500ms by
-another key is that key with Meta.
+another key is that key with Meta. A paste is taken like the keys tmux reads for it
+(PasteStart, each pasted key, PasteEnd): a popup, a pane capturing keys, a dead pane
+waiting for a key, a menu, the status prompt and a pane prompt (a copy-mode search)
+take them at once even while the client's queue waits, so a paste goes into a popup
+a key opened, a pasted Enter answers a prompt and the keys pasted after it are typed
+keys; the rest is pasted into the active pane when the queue reaches it.
 `xterm-keys` is retained as an intentional no-op: tmux 3.8's options-table.c
 marks this option "no longer used"; modified function keys remain enabled.
 

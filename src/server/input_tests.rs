@@ -1130,6 +1130,98 @@ fn run_shell_c_waits_for_its_delay_and_with_b_goes_in_the_clients_queue() {
     assert!(f.messages.iter().any(|(_, m)| m.ends_with(" command: set-option -ag @h X") && !m.contains(" key ")), "{:?}", f.messages);
 }
 
+/// The pane of the client's popup, its input taken over by the test.
+fn popup_input(f: &mut Fixture) -> (PaneId, mpsc::Receiver<Vec<u8>>) {
+    let Some(Overlay::Popup(p)) = &f.clients[&1].overlay else { panic!("no popup") };
+    let pane = p.pane;
+    let (tx, rx) = mpsc::channel();
+    f.panes.get_mut(&pane).unwrap().input = tx;
+    (pane, rx)
+}
+
+#[test]
+fn a_paste_goes_to_the_popup_a_key_opened() {
+    // server_client_handle_key0 hands every pasted key (PasteStart, the text, PasteEnd)
+    // to the overlay at once: a popup a key's binding opened gets the paste even though
+    // the client's queue waits for the popup, and nothing reaches the pane under it
+    let mut f = fixture();
+    let pane = f.pane;
+    run(&mut f, &["bind-key", "-n", "F5", "display-popup -E cat"]);
+    f.handle_input(1, b"\x1b[15~");
+    assert!(f.client_blocked(1));
+    let (popup, input) = popup_input(&mut f);
+    f.pane_input.try_iter().for_each(drop);
+    f.handle_input(1, b"typed\r");
+    f.handle_input(1, b"\x1b[200~pasted\r\x1b[201~");
+    // bytes the key parser does not know go to it too
+    f.handle_input(1, b"\x1b[16~");
+    let got: Vec<u8> = input.try_iter().flatten().collect();
+    assert_eq!(got, b"typed\rpasted\r\x1b[16~");
+    // the paste markers only when the popup's program asked for bracketed paste
+    let g = f.panes[&popup].generation;
+    f.pane_data(popup, g, b"\x1b[?2004h");
+    f.handle_input(1, b"\x1b[200~two\x1b[201~");
+    let got: Vec<u8> = input.try_iter().flatten().collect();
+    assert_eq!(got, b"\x1b[200~two\x1b[201~");
+    assert!(f.client_items.get(&1).is_none_or(|q| q.is_empty()));
+    // the popup closes: nothing was waiting for the pane
+    f.handle_input(1, b"\x1b[200~\x1b[201~");
+    run(&mut f, &["display-popup", "-C"]);
+    f.drain_clients();
+    assert!(f.clients[&1].overlay.is_none());
+    assert!(f.pane_input.try_recv().is_err());
+    assert!(f.panes.contains_key(&pane));
+}
+
+#[test]
+fn a_paste_with_a_cancel_key_closes_a_popup_without_e_and_the_rest_is_typed() {
+    // popup_key_cb: without -E the pasted C-c closes the popup; PasteStart was taken
+    // by the popup, so the keys after it are typed keys for the pane (not a paste)
+    let mut f = fixture();
+    run(&mut f, &["display-popup", "cat"]);
+    let (_, input) = popup_input(&mut f);
+    f.pane_input.try_iter().for_each(drop);
+    run(&mut f, &["bind-key", "-n", "z", "set-option -g @z yes"]);
+    f.handle_input(1, b"\x1b[200~ab\x03yz\x1b[201~");
+    assert_eq!(input.try_iter().flatten().collect::<Vec<u8>>(), b"ab");
+    assert!(f.clients[&1].overlay.is_none());
+    assert_eq!(f.pane_input.try_iter().flatten().collect::<Vec<u8>>(), b"y");
+    assert_eq!(f.opts_session.get("@z"), Some("yes"));
+}
+
+#[test]
+fn a_paste_goes_to_a_pane_prompt_and_a_status_prompt_key_by_key() {
+    // window_pane_prompt_key and status_prompt_key get each pasted key: a copy-mode
+    // search prompt (vi /) gets the text, a pasted Enter answers a status prompt and the
+    // keys after it are typed keys (the prompt took PasteStart)
+    let mut f = fixture();
+    let pane = f.pane;
+    run(&mut f, &["set-option", "-g", "mode-keys", "vi"]);
+    run(&mut f, &["copy-mode"]);
+    f.handle_input(1, b"/");
+    assert!(f.panes[&pane].prompt.is_some());
+    f.handle_input(1, b"\x1b[200~gamma\x1b[201~");
+    assert_eq!(f.panes[&pane].prompt.as_ref().map(|p| p.input.iter().collect::<String>()).as_deref(), Some("gamma"));
+    f.handle_input(1, b"\r");
+    assert!(f.panes[&pane].prompt.is_none());
+    run(&mut f, &["send-keys", "-X", "cancel"]);
+    f.pane_input.try_iter().for_each(drop);
+    f.handle_input(1, b"\x02:");
+    assert!(f.clients[&1].prompt.is_some());
+    f.handle_input(1, b"\x1b[200~set -g @pp yes\rabc\x1b[201~");
+    assert!(f.clients[&1].prompt.is_none());
+    assert_eq!(f.opts_session.get("@pp"), Some("yes"));
+    assert_eq!(f.pane_input.try_iter().flatten().collect::<Vec<u8>>(), b"abc");
+    // a numeric prompt ("(repeat) N") closes on PasteStart: the paste goes on to the
+    // pane, in copy mode, which drops it
+    run(&mut f, &["copy-mode"]);
+    f.handle_input(1, b"3");
+    assert!(f.panes[&pane].prompt.as_ref().is_some_and(|p| p.numeric));
+    f.handle_input(1, b"\x1b[200~12\x1b[201~");
+    assert!(f.panes[&pane].prompt.is_none());
+    assert!(f.pane_input.try_recv().is_err());
+}
+
 #[test]
 fn escape_waits_at_least_500ms_while_terminal_replies_are_awaited() {
     // tty_keys_next: until the terminal has answered the device attribute, DECRPM and

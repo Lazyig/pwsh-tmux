@@ -7,6 +7,11 @@ use crate::keys::{Input, Key, KeyCode};
 
 pub use super::mouse::MouseCtx;
 
+/// KEYC_PASTE_START and KEYC_PASTE_END, the keys a bracketed paste starts and ends with
+/// (handle_paste): user keys past those user-keys can name, never queued or bound.
+const PASTE_START: KeyCode = KeyCode::User(u16::MAX - 1);
+const PASTE_END: KeyCode = KeyCode::User(u16::MAX);
+
 impl Client {
     /// tty_stop_tty: the reset sequences that depend on what the terminal was given (Se, or Ss 0,
     /// after a cursor style; Cr after a cursor colour; Dsesc for appesc). The client itself
@@ -401,48 +406,179 @@ impl Server {
                 }
                 self.handle_mouse(cid, m)
             },
-            Input::Paste(data) => {
-                let Some(c) = self.clients.get_mut(&cid) else { return };
-                if let Some(pr) = &mut c.prompt {
-                    for ch in String::from_utf8_lossy(&data).chars().filter(|c| !c.is_control()) {
-                        pr.input.insert(pr.cursor, ch);
-                        pr.cursor += 1;
-                    }
-                    c.dirty = true;
-                    return;
-                }
-                if c.is_readonly() {
-                    return;
-                }
-                // the pasted keys are items of the client's queue like typed keys
-                // (server_client_key_callback's paste_key), after the keys before them
-                self.client_append(cid, ClientItem::Paste(data));
-            }
+            Input::Paste(data) => self.handle_paste(cid, data),
             Input::Unknown(raw) => {
                 // focus reports reach panes through pane-focus-in/out (only those that asked)
                 if raw == b"\x1b[I" || raw == b"\x1b[O" {
                     self.client_focus(cid, raw == b"\x1b[I");
                     return;
                 }
-                // (keys too, in the client's queue)
-                self.client_append(cid, ClientItem::Raw(raw));
+                // what cannot wait is done now, the rest goes in the client's queue
+                if !self.raw_input_taken_now(cid, &raw) {
+                    self.client_append(cid, ClientItem::Raw(raw));
+                }
             }
         }
     }
 
-    /// A bracketed paste the client's queue reached (paste_key): to the pane, as it is.
+    /// A bracketed paste. tmux reads it as keys, PasteStart, each pasted key and
+    /// PasteEnd, and each goes through server_client_handle_key0: what an overlay, a
+    /// dead or capture-keys pane, a menu or a prompt takes is done at once (the queue may
+    /// be blocked), the rest goes in the client's queue. The keys queued are pasted
+    /// (paste_key) when PasteStart was queued too: CLIENT_BRACKETPASTING is set only as
+    /// the queue reaches it, so after a PasteStart something took they are plain keys.
+    fn handle_paste(&mut self, cid: ClientId, data: Vec<u8>) {
+        if !self.keys_taken_now(cid) {
+            self.client_append(cid, ClientItem::Paste(data));
+            return;
+        }
+        // a running popup or a pane capturing all keys takes the whole paste: in one
+        // write, unless a key in it could close the popup or the pane
+        if let Some(pane) = self.paste_sink(cid, &data) {
+            self.send_paste_marker(cid, pane, true);
+            if self.panes.get(&pane).is_some_and(|p| p.options.get("@input-disabled") != Some("on")) {
+                let mut targets = vec![pane];
+                targets.extend(self.sync_peers(pane));
+                for q in targets {
+                    if let Some(p) = self.panes.get(&q) { p.send(data.clone()); }
+                }
+            }
+            self.send_paste_marker(cid, pane, false);
+            return;
+        }
+        let mut parser = keys::Parser::new();
+        let mut inputs = parser.feed(&data);
+        inputs.extend(parser.flush_pending());
+        let pasting = self.handle_key_now(cid, Key::plain(PASTE_START), Vec::new(), false).is_some();
+        let mut pasted = Vec::new();
+        for i in inputs {
+            // (once nothing takes keys at once, the rest of a paste is queued as it is)
+            if pasting && !self.keys_taken_now(cid) {
+                let (Input::Key(_, raw) | Input::Mouse(_, raw) | Input::Unknown(raw) | Input::Paste(raw)) = i;
+                pasted.extend(raw);
+                continue;
+            }
+            match i {
+                Input::Key(k, raw) => {
+                    if let Some((k, raw)) = self.handle_key_now(cid, k, raw, false) {
+                        if pasting { pasted.extend(raw); } else { self.client_append(cid, ClientItem::Key(k, raw)); }
+                    }
+                }
+                Input::Mouse(_, raw) | Input::Unknown(raw) | Input::Paste(raw) => {
+                    if !self.raw_input_taken_now(cid, &raw) {
+                        if pasting { pasted.extend(raw); } else { self.client_append(cid, ClientItem::Raw(raw)); }
+                    }
+                }
+            }
+        }
+        // (a PasteEnd nothing took is dropped after a PasteStart something took: there
+        // was no paste start for the pane either)
+        self.handle_key_now(cid, Key::plain(PASTE_END), Vec::new(), false);
+        if pasting {
+            self.client_append(cid, ClientItem::Paste(pasted));
+        }
+    }
+
+    /// Whether server_client_handle_key0 could take a key at once: a message, an
+    /// overlay, a dead, modal or capture-keys active pane, the window's menu, the status
+    /// prompt, a pane prompt or a copy-mode jump waiting for its character.
+    fn keys_taken_now(&self, cid: ClientId) -> bool {
+        let Some(c) = self.clients.get(&cid) else { return false };
+        if c.message.is_some() || c.overlay.is_some() || c.prompt.is_some() {
+            return true;
+        }
+        if self.client_window(cid).is_some_and(|w| self.menus.contains_key(&w)) || self.pane_prompt_target(cid).is_some() {
+            return true;
+        }
+        let Some(pane) = self.client_active_pane(cid) else { return false };
+        let Some(p) = self.panes.get(&pane) else { return false };
+        p.dead.is_some()
+            || p.fflags & (super::float::CAPTURE_KEYS | super::float::CLOSE_ON_CANCEL) != 0
+            || matches!(&p.mode, Some(PaneMode::Copy(cm)) if cm.waiting_for_key())
+    }
+
+    /// The pane that takes a whole paste at once: a popup's running command, unless the
+    /// paste has an Escape or C-c that closes it, or an active pane capturing all keys
+    /// (not one Escape or C-c closes).
+    fn paste_sink(&self, cid: ClientId, data: &[u8]) -> Option<PaneId> {
+        let c = self.clients.get(&cid)?;
+        if c.message.is_some() || c.is_readonly() {
+            return None;
+        }
+        let cancel = data.iter().any(|b| *b == 0x1b || *b == 0x03);
+        if let Some(Overlay::Popup(p)) = &c.overlay {
+            let running = self.panes.get(&p.pane).is_some_and(|x| x.dead.is_none());
+            return (running && (!cancel || p.close_on_exit || p.close_exit_zero)).then_some(p.pane);
+        }
+        let pane = self.client_active_pane(cid)?;
+        let p = self.panes.get(&pane)?;
+        let modal = self.window_of(pane).is_some_and(|w| self.windows[&w].modal == Some(pane));
+        let closes = modal && p.fflags & super::float::CLOSE_ON_CANCEL != 0 && cancel;
+        (p.fflags & super::float::CAPTURE_KEYS != 0 && p.mode.is_none() && p.dead.is_none() && !closes).then_some(pane)
+    }
+
+    /// The paste start or end key for a pane (input_key_pane): its bracket marker, when
+    /// the application asked for bracketed paste.
+    fn send_paste_marker(&mut self, cid: ClientId, pane: PaneId, start: bool) {
+        if self.client_is_readonly(Some(cid)) { return; }
+        let Some(p) = self.panes.get(&pane).filter(|p| p.options.get("@input-disabled") != Some("on")) else { return };
+        if p.screen().bracketed_paste() {
+            p.send(if start { b"\x1b[200~".to_vec() } else { b"\x1b[201~".to_vec() });
+        }
+    }
+
+    /// Bytes the key parser did not know, for what takes keys at once (as
+    /// handle_key_now): a popup's command, a dead pane waiting for a key, a pane
+    /// capturing all keys; a menu or a prompt takes them without using them. False when
+    /// they go in the client's queue.
+    fn raw_input_taken_now(&mut self, cid: ClientId, raw: &[u8]) -> bool {
+        let Some(c) = self.clients.get(&cid) else { return true };
+        if c.is_readonly() { return true; }
+        if c.message.is_some() {
+            if c.message_ignore_keys { return true; }
+            let c = self.clients.get_mut(&cid).unwrap();
+            c.message = None;
+            c.dirty = true;
+        }
+        if let Some(Overlay::Popup(p)) = &self.clients[&cid].overlay {
+            let (pane, any_key) = (p.pane, p.close_any_key);
+            match self.panes.get(&pane).filter(|x| x.dead.is_none()) {
+                Some(x) => if x.options.get("@input-disabled") != Some("on") { x.send(raw.to_vec()); },
+                None => if any_key { self.close_popup(cid, pane); },
+            }
+            return true;
+        }
+        if self.client_session(cid).is_none() {
+            return true;
+        }
+        if let Some(pane) = self.client_active_pane(cid) {
+            if self.dead_key(pane) {
+                return true;
+            }
+            if let Some(p) = self.panes.get(&pane).filter(|p| p.fflags & super::float::CAPTURE_KEYS != 0 && p.mode.is_none() && p.dead.is_none()) {
+                if p.options.get("@input-disabled") != Some("on") { p.send(raw.to_vec()); }
+                return true;
+            }
+        }
+        self.keys_taken_now(cid)
+    }
+
+    /// popup_key_cb returned 1: the popup closes (server_client_clear_overlay).
+    fn close_popup(&mut self, cid: ClientId, pane: PaneId) {
+        if let Some(c) = self.clients.get_mut(&cid) {
+            c.overlay = None;
+            c.dirty = true;
+        }
+        self.destroy_pane(pane);
+    }
+
+    /// A bracketed paste the client's queue reached (paste_key): to the active pane
+    /// (cmd_find_from_client, never a popup), as it is.
     pub(super) fn paste_now(&mut self, cid: ClientId, data: Vec<u8>) {
         if self.client_is_readonly(Some(cid)) || self.client_session(cid).is_none() {
             return;
         }
-        // the first pasted key closes a pane waiting for one (tmux only skips the
-        // paste start and end markers)
-        if let Some(pane) = self.client_active_pane(cid).filter(|_| !data.is_empty()) {
-            if self.dead_key(pane) {
-                return;
-            }
-        }
-        if let Some(target) = self.input_target(cid) {
+        if let Some(target) = self.client_active_pane(cid) {
             // the paste-start key reaches the pane's mode first: it ends clock mode
             // like any key; in another mode the pasted text is dropped
             match self.panes.get(&target).map(|p| &p.mode) {
@@ -461,8 +597,8 @@ impl Server {
         if self.client_is_readonly(Some(cid)) {
             return;
         }
-        if let Some(t) = self.input_target(cid) {
-            if self.panes.get(&t).is_some_and(|p| p.mode.is_none()) {
+        if let Some(t) = self.client_active_pane(cid) {
+            if self.panes.get(&t).is_some_and(|p| p.mode.is_none() && p.dead.is_none() && p.options.get("@input-disabled") != Some("on")) {
                 self.panes[&t].send(raw);
             }
         }
@@ -634,7 +770,9 @@ impl Server {
     /// closes a popup or a modal pane (popup_key_cb and the modal check compare the
     /// whole key): those go to the popup's program or the pane.
     pub(super) fn handle_key_now(&mut self, cid: ClientId, k: Key, raw: Vec<u8>, sent: bool) -> Option<(Key, Vec<u8>)> {
-        let name = keys::key_name(&k);
+        // (the paste start and end keys of handle_paste)
+        let marker = match &k.code { c if *c == PASTE_START => Some(true), c if *c == PASTE_END => Some(false), _ => None };
+        let name = match marker { Some(true) => "PasteStart".into(), Some(false) => "PasteEnd".into(), None => keys::key_name(&k) };
         let c = self.clients.get(&cid)?;
         let menu = if c.overlay.is_none() { self.client_window(cid).filter(|w| self.menus.contains_key(w)) } else { None };
         if c.is_readonly() && (c.prompt.is_some() || c.overlay.is_some() || menu.is_some()) { return None; }
@@ -656,15 +794,16 @@ impl Server {
                 let (pane, close_on_exit, any_key) = (p.pane, p.close_on_exit || p.close_exit_zero, p.close_any_key);
                 let exited = self.panes.get(&pane).is_none_or(|x| x.dead.is_some());
                 let cancel = !sent && (name == "Escape" || name == "C-c");
-                if ((!close_on_exit || exited) && cancel) || (exited && any_key) {
-                    let c = self.clients.get_mut(&cid).unwrap();
-                    c.overlay = None;
-                    c.dirty = true;
-                    self.destroy_pane(pane);
+                // (-k: any key but the paste start and end, KEYC_IS_PASTE)
+                if ((!close_on_exit || exited) && cancel) || (exited && any_key && marker.is_none()) {
+                    self.close_popup(cid, pane);
                     return None;
                 }
                 if !exited {
-                    self.send_key_to_pane(cid, pane, &k, raw);
+                    match marker {
+                        Some(start) => self.send_paste_marker(cid, pane, start),
+                        None => self.send_key_to_pane(cid, pane, &k, raw),
+                    }
                 }
                 return None;
             }
@@ -677,7 +816,8 @@ impl Server {
         // prefix included, unless it is in a mode (tmux server_client_handle_key, not for
         // read-only clients)
         if let Some(pane) = self.client_active_pane(cid).filter(|_| !self.client_is_readonly(Some(cid))) {
-            if self.dead_key(pane) {
+            // (not the paste start or end key: server_client_handle_dead_key)
+            if marker.is_none() && self.dead_key(pane) {
                 return None;
             }
             let fl = self.panes.get(&pane).map_or(0, |p| p.fflags);
@@ -687,7 +827,10 @@ impl Server {
                 return None;
             }
             if fl & super::float::CAPTURE_KEYS != 0 && self.panes.get(&pane).is_some_and(|p| p.mode.is_none() && p.dead.is_none()) {
-                self.send_key_to_pane(cid, pane, &k, raw);
+                match marker {
+                    Some(start) => self.send_paste_marker(cid, pane, start),
+                    None => self.send_key_to_pane(cid, pane, &k, raw),
+                }
                 return None;
             }
         }
@@ -716,7 +859,10 @@ impl Server {
         // prompt, which takes the key here)
         if let Some(pane) = self.client_active_pane(cid) {
             if matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(cm)) if cm.waiting_for_key()) {
-                self.copy_key(pane, Some(cid), &name);
+                // (a single key prompt ignores the paste start and end keys)
+                if marker.is_none() {
+                    self.copy_key(pane, Some(cid), &name);
+                }
                 return None;
             }
         }
