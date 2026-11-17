@@ -3698,6 +3698,12 @@ impl Server {
         let (mw, mh) = w.layout.min_size();
         let (sx, sy) = (cols.max(1).max(mw), rows.max(1).max(mh));
         if (w.sx, w.sy) != (sx, sy) {
+            // layout_resize (the zoomed layout is the one pane)
+            if w.sx > 0 && w.sy > 0 && !w.zoomed {
+                let (old, new) = (Rect { x: 0, y: 0, w: w.sx, h: w.sy }, Rect { x: 0, y: 0, w: sx, h: sy });
+                w.layout.tmux_resize(old, new, 1);
+            }
+            let w = self.windows.get_mut(&wid).unwrap();
             w.sx = sx;
             w.sy = sy;
             self.clamp_floats(wid);

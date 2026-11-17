@@ -256,6 +256,83 @@ impl Node {
         }
     }
 
+    /// layout_resize: a window resized from `old` to `new` grows or shrinks its cells as
+    /// tmux does, one cell at a time to each child in turn (layout_resize_adjust), not in
+    /// proportion. The sizes found are kept as the splits' ratios. `min_w` is the narrowest
+    /// a pane can be (PANE_MINIMUM and a reserved scrollbar).
+    pub fn tmux_resize(&mut self, old: Rect, new: Rect, min_w: u16) {
+        let (mut panes, mut seps) = (Vec::new(), Vec::new());
+        self.layout(old, &mut panes, &mut seps);
+        let mut sizes: HashMap<PaneId, (i32, i32)> = panes.iter().map(|(p, r)| (*p, (i32::from(r.w), i32::from(r.h)))).collect();
+        let Some(mut cell) = self.cell(&sizes) else { return };
+        if (cell.sx, cell.sy) != (i32::from(old.w), i32::from(old.h)) {
+            return;
+        }
+        for (horizontal, size) in [(true, i32::from(new.w)), (false, i32::from(new.h))] {
+            let current = if horizontal { cell.sx } else { cell.sy };
+            let limit = cell.check(horizontal, i32::from(min_w));
+            let mut change = size - current;
+            if change < 0 && change < -limit {
+                change = -limit;
+            }
+            if limit == 0 {
+                change = if size <= current { 0 } else { size - current };
+            }
+            if change != 0 {
+                cell.adjust(horizontal, change, i32::from(min_w));
+            }
+        }
+        cell.store(&mut sizes);
+        self.set_ratios(&sizes);
+    }
+
+    /// The tiled part as tmux's cells: a run of splits in one direction is one cell.
+    fn cell(&self, sizes: &HashMap<PaneId, (i32, i32)>) -> Option<TCell> {
+        match self {
+            Node::Leaf(p) => sizes.get(p).map(|&(sx, sy)| TCell { pane: Some(*p), horizontal: false, kids: Vec::new(), sx, sy }),
+            Node::Float(..) => None,
+            Node::Split { horizontal, a, b, .. } => match (a.has_tiled(), b.has_tiled()) {
+                (true, false) => a.cell(sizes),
+                (false, true) => b.cell(sizes),
+                (false, false) => None,
+                _ => {
+                    let mut kids = Vec::new();
+                    for c in [a.cell(sizes)?, b.cell(sizes)?] {
+                        if c.pane.is_none() && c.horizontal == *horizontal { kids.extend(c.kids) } else { kids.push(c) }
+                    }
+                    let n = kids.len() as i32;
+                    let (sx, sy) = if *horizontal {
+                        (kids.iter().map(|k| k.sx).sum::<i32>() + n - 1, kids[0].sy)
+                    } else {
+                        (kids[0].sx, kids.iter().map(|k| k.sy).sum::<i32>() + n - 1)
+                    };
+                    Some(TCell { pane: None, horizontal: *horizontal, kids, sx, sy })
+                }
+            },
+        }
+    }
+
+    /// The splits' ratios for these pane sizes.
+    fn set_ratios(&mut self, sizes: &HashMap<PaneId, (i32, i32)>) -> Option<(i32, i32)> {
+        match self {
+            Node::Leaf(p) => sizes.get(p).copied(),
+            Node::Float(..) => None,
+            Node::Split { horizontal, ratio, a, b } => {
+                let (ea, eb) = (a.set_ratios(sizes), b.set_ratios(sizes));
+                match (ea, eb) {
+                    (Some((aw, ah)), Some((bw, bh))) => {
+                        let (x, y) = if *horizontal { (aw, bw) } else { (ah, bh) };
+                        if x > 0 && y > 0 {
+                            *ratio = x as f32 / (x + y) as f32;
+                        }
+                        Some(if *horizontal { (aw + 1 + bw, ah) } else { (aw, ah + 1 + bh) })
+                    }
+                    (e, None) | (None, e) => e,
+                }
+            }
+        }
+    }
+
     /// Replace leaf `target` with a split of `target` and `new`.
     pub fn split(&mut self, target: PaneId, new: PaneId, horizontal: bool) -> bool {
         match self {
@@ -2231,6 +2308,75 @@ mod display_option_tests {
             rects.clear(); node.layout(area, &mut rects, &mut Vec::new());
             let r = rects.iter().find(|(p, _)| *p == 0).unwrap().1;
             assert_eq!(if name.starts_with("main-horizontal") { r.h } else { r.w }, if name.starts_with("main-horizontal") { 34 } else { 104 });
+        }
+    }
+}
+
+/// A cell of tmux's layout tree for [`Node::tmux_resize`]: a pane, or children side by
+/// side (`horizontal`) or stacked.
+struct TCell {
+    pane: Option<PaneId>,
+    horizontal: bool,
+    kids: Vec<TCell>,
+    sx: i32,
+    sy: i32,
+}
+
+impl TCell {
+    /// layout_resize_check: how much the cell can shrink in that direction.
+    fn check(&self, horizontal: bool, min_w: i32) -> i32 {
+        if self.pane.is_some() {
+            let (available, minimum) = if horizontal { (self.sx, min_w) } else { (self.sy, 1) };
+            return if available > minimum { available - minimum } else { 0 };
+        }
+        if self.horizontal == horizontal {
+            self.kids.iter().map(|k| k.check(horizontal, min_w)).sum()
+        } else {
+            self.kids.iter().map(|k| k.check(horizontal, min_w)).min().unwrap_or(0)
+        }
+    }
+
+    /// layout_resize_adjust.
+    fn adjust(&mut self, horizontal: bool, change: i32, min_w: i32) {
+        if horizontal { self.sx += change } else { self.sy += change }
+        if self.pane.is_some() {
+            return;
+        }
+        if self.horizontal != horizontal {
+            for k in &mut self.kids {
+                k.adjust(horizontal, change, min_w);
+            }
+            return;
+        }
+        let mut change = change;
+        while change != 0 {
+            let mut changed = false;
+            for k in &mut self.kids {
+                if change == 0 {
+                    break;
+                }
+                if change > 0 {
+                    k.adjust(horizontal, 1, min_w);
+                    change -= 1;
+                    changed = true;
+                } else if k.check(horizontal, min_w) > 0 {
+                    k.adjust(horizontal, -1, min_w);
+                    change += 1;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn store(&self, sizes: &mut HashMap<PaneId, (i32, i32)>) {
+        match self.pane {
+            Some(p) => {
+                sizes.insert(p, (self.sx, self.sy));
+            }
+            None => self.kids.iter().for_each(|k| k.store(sizes)),
         }
     }
 }
