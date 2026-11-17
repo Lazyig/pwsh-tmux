@@ -4300,18 +4300,30 @@ impl Server {
                             None => list.extend(text.chars().filter_map(|c| keys::parse_key_name(&c.to_string()))),
                         }
                     }
-                    // server_client_handle_key_after: each key is an item in this queue
-                    // after send-keys, handled when the queue reaches it, with its bound
-                    // commands after it (they are the sending client's, and their output is
-                    // its output). So a binding that waits (command-prompt) holds up the
-                    // keys after it and send-keys' client, as in tmux.
+                    // server_client_handle_key_after: an open overlay, menu or prompt
+                    // takes the key now (handle_key_now), as the queue may be blocked.
+                    // Otherwise the key is an item in this queue after send-keys, handled
+                    // (key tables, pane) when the queue reaches it, with its bound commands
+                    // after it (they are the sending client's, and their output is its
+                    // output). So a binding that waits (command-prompt) holds up the keys
+                    // after it and send-keys' client, and a menu or prompt a binding opens
+                    // does not get the keys after it, as in tmux.
                     let origin = ctx.client.or(ctx.reply).unwrap_or(cid);
+                    let app = self.panes.get(&pane).is_some_and(|p| p.screen().application_cursor());
                     let mut items = Vec::with_capacity(n.saturating_mul(list.len()).min(4096));
+                    // cmd_send_keys_inject_key: a key handled at once makes send-keys the
+                    // item the next key goes after again
+                    let mut at = 0;
                     for _ in 0..n {
                         for key in &list {
+                            if self.handle_key_now(cid, key.clone(), keys::encode_key(key, app)).is_none() {
+                                at = 0;
+                                continue;
+                            }
                             self.key_event_seq += 1;
                             self.key_events.insert(self.key_event_seq, KeyEvent { client: cid, pane, origin, key: key.clone() });
-                            items.push(vec![KEY_EVENT.clone(), self.key_event_seq.to_string()]);
+                            items.insert(at, vec![KEY_EVENT.clone(), self.key_event_seq.to_string()]);
+                            at += 1;
                         }
                     }
                     return Ok(Flow::Inject(items, false));

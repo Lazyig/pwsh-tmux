@@ -627,6 +627,55 @@ fn send_keys_k_waits_for_a_command_prompt_its_keys_open() {
 }
 
 #[test]
+fn send_keys_k_menus_and_prompts_a_binding_opens_do_not_take_the_later_keys() {
+    // tmux 3.8 server_client_handle_key0: an open menu, overlay or prompt takes a key at
+    // send-keys time; other keys wait in the queue and then go only to the key tables
+    // and the pane (server_client_key_callback). So a menu or a command-prompt -b that a
+    // binding in the same send-keys opens does not get the keys after it.
+    let ctx = Ctx::new("sendk-later");
+    let t = start(&ctx, "w");
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    ctx.ok(&["send-keys", "-K", "-c", &client, "C-b", "<", "Q", "Z", "Q"]);
+    t.wait_screen("window menu", |s| s.contains("Kill"));
+    wait_for("keys after the menu reach the pane", || ctx.capture("w").contains("QZQ"));
+    t.wait_screen("menu still open", |s| s.contains("Kill"));
+    // the menu is open now, so it takes Escape at once
+    ctx.ok(&["send-keys", "-K", "-c", &client, "Escape"]);
+    t.wait_screen("menu closed", |s| !s.contains("Kill"));
+    ctx.ok(&["bind-key", "-n", "F6", "command-prompt", "-b", "-p", "xx", "set -g @v '%%'"]);
+    ctx.ok(&["bind-key", "-n", "F7", "set", "-g", "@f7", "yes"]);
+    ctx.ok(&["send-keys", "-K", "-c", &client, "F6", "W", "Y", "E", "F7"]);
+    wait_for("keys after the prompt reach the pane", || ctx.capture("w").contains("WYE"));
+    wait_for("the binding after the prompt runs", || ctx.fmt("w", "#{@f7}") == "yes");
+    assert_eq!(t.row(29).trim_end(), "xx");
+    ctx.ok(&["send-keys", "-K", "-c", &client, "Escape"]);
+    t.wait_screen("prompt closed", |s| !s.lines().nth(29).is_some_and(|l| l.starts_with("xx")));
+    assert_eq!(ctx.fmt("w", "[#{@v}]"), "[]");
+}
+
+#[test]
+fn send_keys_k_binding_error_ends_only_that_binding() {
+    // tmux 3.8: a key binding's commands are a group of their own (key_bindings_dispatch),
+    // so an error removes only the rest of that binding (cmdq_remove_group); the other
+    // keys and the commands after send-keys still run, and the exit status is 1
+    let ctx = Ctx::new("sendk-error");
+    let _t = start(&ctx, "w");
+    let client = ctx.ok(&["list-clients", "-F", "#{client_name}"]).trim().to_string();
+    ctx.ok(&["bind-key", "-n", "F1", "display -p b1; select-window -t nosuch; display -p b2"]);
+    ctx.ok(&["bind-key", "-n", "F2", "display -p c1"]);
+    let out = ctx.command().args(["send-keys", "-K", "-c", &client, "F1", "F2", ";", "display", "-p", "after"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert_eq!(stdout.lines().map(str::trim_end).collect::<Vec<_>>(), ["b1", "c1", "after"], "stderr: {stderr}");
+    assert!(stderr.contains("can't find window: nosuch"), "{stderr}");
+    // an error after send-keys still ends its own command list
+    let out = ctx.command().args(["send-keys", "-K", "-c", &client, "F2", ";", "select-window", "-t", "nosuch2", ";", "display", "-p", "after"]).output().unwrap();
+    assert!(!out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).lines().map(str::trim_end).collect::<Vec<_>>(), ["c1"]);
+}
+
+#[test]
 fn menu_and_popup_lines_styles_and_closing_keys() {
     let ctx = Ctx::new("menu-look");
     let t = start(&ctx, "m");

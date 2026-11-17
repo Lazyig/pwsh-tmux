@@ -1258,6 +1258,8 @@ pub struct Ctx {
     pub command_error: Option<String>,
     pub hook_error: Option<String>,
     pub skip_after: bool,
+    /// How many key bindings' command groups (KEY_GROUP) the queue is in.
+    pub key_depth: usize,
 }
 
 /// Queue markers source-file puts around a file's commands. A parsed command can hold any
@@ -1284,6 +1286,10 @@ pub static CFG_DONE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| i
 /// Server::key_events]. It is handled when the queue reaches it, so keys and the commands
 /// their bindings run happen in order, after any earlier command waits (a prompt).
 pub static KEY_EVENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("key"));
+/// [KEY_GROUP, "1"] and [KEY_GROUP, "0"] are put around the commands a KEY_EVENT's
+/// binding runs: they are a group of their own (key_bindings_dispatch makes a new
+/// cmdq item), so an error ends only the rest of that binding.
+pub static KEY_GROUP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("key-group"));
 
 /// A key waiting in a queue as a KEY_EVENT item.
 pub struct KeyEvent {
@@ -3838,8 +3844,8 @@ impl Server {
         let (Some(seq), Some(cid)) = (q.ctx.control_seq, q.ctx.client) else { return };
         q.ctx.control_open = false;
         let out = std::mem::take(&mut q.ctx.out);
-        // hook commands run with a new state, without CMDQ_STATE_CONTROL
-        let typed = q.ctx.control_line && q.ctx.hook_depth == 0;
+        // hook and key binding commands run with a new state, without CMDQ_STATE_CONTROL
+        let typed = q.ctx.control_line && q.ctx.hook_depth == 0 && q.ctx.key_depth == 0;
         self.control_block(cid, seq, typed, &out, err);
         self.control_flush(cid);
         q.ctx.control_done = true;
@@ -3864,6 +3870,62 @@ impl Server {
                 None => q.soft = q.soft.saturating_sub(1),
             }
         }
+    }
+
+    /// The group the next command is in, from the first group end without a start before
+    /// it: Some(true) for a key binding's (KEY_GROUP), Some(false) for a hook's.
+    fn innermost_group(q: &Queue) -> Option<bool> {
+        let mut depth = 0usize;
+        for c in &q.cmds {
+            let open = if let Some(open) = events::hook_mark_kind(c) {
+                (open, false)
+            } else if c.first() == Some(&*KEY_GROUP) {
+                (c.get(1).map(String::as_str) == Some("1"), true)
+            } else {
+                continue;
+            };
+            match open {
+                (true, _) => depth += 1,
+                (false, key) if depth == 0 => return Some(key),
+                (false, _) => depth -= 1,
+            }
+        }
+        None
+    }
+
+    /// cmdq_remove_group for a key binding's command: the rest of the binding, up to and
+    /// including its end mark.
+    fn skip_key_group(q: &mut Queue) {
+        let mut depth = 0usize;
+        while let Some(c) = q.cmds.pop_front() {
+            let mark = events::hook_mark_kind(&c).or_else(|| (c.first() == Some(&*KEY_GROUP)).then(|| c.get(1).map(String::as_str) == Some("1")));
+            match mark {
+                Some(true) => depth += 1,
+                Some(false) if depth == 0 => {
+                    q.ctx.key_depth = q.ctx.key_depth.saturating_sub(1);
+                    return;
+                }
+                Some(false) => depth -= 1,
+                None => q.soft = q.soft.saturating_sub(1),
+            }
+        }
+    }
+
+    /// When a command list fails, the items that are not of its group stay: the startup
+    /// configuration's end, send-keys -K keys and the key bindings' command groups.
+    fn keep_other_groups(q: &mut Queue) {
+        let mut depth = 0usize;
+        q.cmds.retain(|c| {
+            if c.first() == Some(&*KEY_GROUP) {
+                if c.get(1).map(String::as_str) == Some("1") {
+                    depth += 1;
+                } else {
+                    depth = depth.saturating_sub(1);
+                }
+                return true;
+            }
+            depth > 0 || c.first().is_some_and(|n| *n == *CFG_DONE || *n == *KEY_EVENT)
+        });
     }
 
     /// Drops the commands left of the line (group) of a file whose command failed:
@@ -3901,6 +3963,14 @@ impl Server {
                 events::apply_hook_mark(&cmd, &mut q.ctx, &mut hook_saved, &mut q.soft);
                 continue;
             }
+            if name == *KEY_GROUP {
+                if cmd.get(1).map(String::as_str) == Some("1") {
+                    q.ctx.key_depth += 1;
+                } else {
+                    q.ctx.key_depth = q.ctx.key_depth.saturating_sub(1);
+                }
+                continue;
+            }
             // errors never end the global queue the configuration runs in
             let soft = q.soft > 0 || q.ctx.cfg;
             q.soft = q.soft.saturating_sub(1);
@@ -3932,8 +4002,12 @@ impl Server {
                 let ev = cmd.get(1).and_then(|t| t.parse().ok()).and_then(|t| self.key_events.remove(&t));
                 let gone = q.ctx.reply.or(q.ctx.client).is_some_and(|c| !self.clients.contains_key(&c));
                 let bound = ev.filter(|_| !gone).map(|ev| self.key_event(ev)).unwrap_or_default();
-                for c in bound.into_iter().rev() {
-                    q.cmds.push_front(c);
+                if !bound.is_empty() {
+                    q.cmds.push_front(vec![KEY_GROUP.clone(), "0".into()]);
+                    for c in bound.into_iter().rev() {
+                        q.cmds.push_front(c);
+                    }
+                    q.cmds.push_front(vec![KEY_GROUP.clone(), "1".into()]);
                 }
                 continue;
             }
@@ -3953,6 +4027,34 @@ impl Server {
             let readonly = self.readonly_context.replace(q.ctx.readonly);
             self.detect_changes(cmds::canonical(&name));
             self.readonly_context.set(readonly);
+            if let Err(e) = &result && !soft && (e == QUIET_ERROR || !e.starts_with('\0')) && Self::innermost_group(&q) == Some(true) {
+                // a command of a send-keys -K key's binding: cmdq_error reports it, then
+                // command-error runs and the rest of that binding goes (cmdq_remove_group);
+                // the queue goes on after it
+                self.cur_mouse = saved_mouse;
+                self.cur_file = saved_file;
+                self.ev.cur_formats = saved_formats;
+                self.ev.in_hook = saved_hook;
+                let quiet = e == QUIET_ERROR;
+                let cli = q.ctx.control_seq.is_none() && q.ctx.reply.and_then(|r| self.clients.get(&r)).is_some_and(|c| !c.attached);
+                if q.ctx.control_seq.is_some() {
+                    self.control_item_done(&mut q, Some(if quiet { "" } else { e }));
+                } else if quiet {
+                } else if cli {
+                    self.log_error(q.ctx.client.or(q.ctx.reply), e);
+                    q.ctx.soft_err.push_str(e);
+                    q.ctx.soft_err.push('\n');
+                } else if hook_failed.is_none() {
+                    hook_failed = Some(e.clone());
+                }
+                self.command_hook("command-error", &argv, &q.ctx);
+                let hooks = std::mem::take(&mut self.ev.inject);
+                Self::skip_key_group(&mut q);
+                for c in hooks.into_iter().rev() {
+                    q.cmds.push_front(c);
+                }
+                continue;
+            }
             if matches!(&result, Err(e) if e == QUIET_ERROR) {
                 // a command that failed without cmdq_error (unbind-key -q): command-error
                 // still runs and the rest of its group goes, but the exit status stays 0
@@ -3970,7 +4072,7 @@ impl Server {
                 if soft {
                     Self::skip_group(&mut q);
                 } else {
-                    q.cmds.retain(|c| c.first().is_some_and(|n| *n == *CFG_DONE || *n == *KEY_EVENT));
+                    Self::keep_other_groups(&mut q);
                     q.soft = 0;
                 }
                 self.control_item_done(&mut q, Some(""));
@@ -4005,7 +4107,8 @@ impl Server {
                     self.ev.in_hook = saved_hook;
                     self.control_item_done(&mut q, Some(e));
                     // (keys send-keys -K left are items of their own too)
-                    q.cmds.retain(|c| c.first() == Some(&*KEY_EVENT));
+                    Self::keep_other_groups(&mut q);
+                    q.cmds.retain(|c| c.first() != Some(&*CFG_DONE));
                     q.soft = 0;
                     for c in hooks.into_iter().rev() {
                         q.cmds.push_front(c);
@@ -4016,7 +4119,7 @@ impl Server {
                     // the hook runs in place of the rest of the command list
                     if !soft {
                         // (the configuration's cfg_done stays)
-                        q.cmds.retain(|c| c.first().is_some_and(|n| *n == *CFG_DONE || *n == *KEY_EVENT));
+                        Self::keep_other_groups(&mut q);
                         failed = Some(e.clone());
                     }
                     for c in hooks.into_iter().rev() {
@@ -4201,6 +4304,12 @@ impl Server {
     }
 
     pub fn finish_queue(&mut self, q: Queue, mut err: Option<String>) {
+        // send-keys -K keys the queue did not reach
+        for c in q.cmds.iter().filter(|c| c.first() == Some(&*KEY_EVENT)) {
+            if let Some(t) = c.get(1).and_then(|t| t.parse().ok()) {
+                self.key_events.remove(&t);
+            }
+        }
         // the configuration's queue ended early: cfg_done still runs
         let cfg_done = q.cmds.iter().any(|c| c.first() == Some(&*CFG_DONE));
         let ctx = q.ctx;
