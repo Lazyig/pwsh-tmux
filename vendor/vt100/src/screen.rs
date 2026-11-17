@@ -206,14 +206,26 @@ impl Screen {
     /// whether it holds extended cells.
     #[must_use]
     pub fn history_row_flags(&self, index: usize) -> (u8, bool) {
-        self.grid().absolute_row(index).map_or((0, false), |r| (r.flags(), r.extended()))
+        self.base_row(index).map_or((0, false), |r| (r.flags(), r.extended()))
     }
 
     /// When row `index` (counted as for [`Screen::history_row`]) entered the
     /// history, 0 if it has not or no time was set.
     #[must_use]
     pub fn history_row_time(&self, index: usize) -> u64 {
-        self.grid().absolute_row(index).map_or(0, crate::row::Row::time)
+        self.base_row(index).map_or(0, crate::row::Row::time)
+    }
+
+    /// Row `index` of tmux's base grid: the normal screen's history, then the
+    /// active screen's rows (the alternate screen keeps the history above it).
+    fn base_row(&self, index: usize) -> Option<&crate::row::Row> {
+        let history = self.grid.scrollback_len();
+        if index < history {
+            self.grid.absolute_row(index)
+        } else {
+            let g = self.grid();
+            g.absolute_row(g.scrollback_len() + index - history)
+        }
     }
 
     /// Apply OSC 8 (input_osc_8, hyperlinks_put), retaining only links referenced by
@@ -290,10 +302,12 @@ impl Screen {
         (size.rows, size.cols)
     }
 
-    /// Returns the number of lines in the scrollback.
+    /// Returns the number of lines in the scrollback: the normal screen's,
+    /// also while the alternate screen is active (tmux keeps the history in
+    /// the grid the alternate screen is drawn in).
     #[must_use]
     pub fn scrollback_len(&self) -> usize {
-        self.grid().scrollback_len()
+        self.grid.scrollback_len()
     }
 
     /// Returns the maximum capacity of the scrollback.
@@ -324,7 +338,10 @@ impl Screen {
     /// clears both the visible display and scrollback history, process both
     /// `CSI 2 J` and `CSI 3 J`.
     pub fn clear_scrollback(&mut self) {
-        self.grid_mut().erase_all_scrollback(|_| {});
+        // grid_clear_history(wp->base.grid): the normal screen's history also
+        // while the alternate screen is active
+        self.grid.erase_all_scrollback(|_| {});
+        self.alternate_grid.erase_all_scrollback(|_| {});
     }
 
     /// Returns the current position in the scrollback.
@@ -813,7 +830,7 @@ impl Screen {
     /// followed by the visible screen. Index these with [`Screen::history_row`].
     #[must_use]
     pub fn history_rows_len(&self) -> usize {
-        self.grid().absolute_len()
+        self.base_history_len()
     }
 
     /// Row `index` of the active screen counted from the oldest scrollback row
@@ -822,7 +839,7 @@ impl Screen {
     /// can read history without cloning the screen.
     #[must_use]
     pub fn history_row(&self, index: usize) -> Option<crate::capture::RowContents<'_>> {
-        self.grid().absolute_row(index).map(crate::capture::RowContents)
+        self.base_row(index).map(crate::capture::RowContents)
     }
 
     /// tmux's base grid (wp->base.grid) as the history formats see it: the
@@ -848,14 +865,7 @@ impl Screen {
     /// Row `index` of [`Screen::base_history_len`].
     #[must_use]
     pub fn base_history_row(&self, index: usize) -> Option<crate::capture::RowContents<'_>> {
-        let history = self.grid.scrollback_len();
-        if index < history {
-            self.grid.absolute_row(index)
-        } else {
-            let g = self.grid();
-            g.absolute_row(g.scrollback_len() + index - history)
-        }
-        .map(crate::capture::RowContents)
+        self.history_row(index)
     }
 
     /// Visible row `row` of the normal screen while the alternate screen is
@@ -1255,15 +1265,13 @@ impl Screen {
             return None;
         }
         let text = cell.contents();
-        let mut chars = text.chars();
-        let single = match (chars.next(), chars.next()) {
-            (Some(l), None) => Some(l),
-            _ => None,
-        };
         let ri = |x: char| ('\u{1F1E6}'..='\u{1F1FF}').contains(&x);
         let modifier = |x: char| ('\u{1F3FB}'..='\u{1F3FF}').contains(&x);
-        if let Some(l) = single {
-            if (ri(c) && ri(l)) || (modifier(c) && EMOJI_MODIFIER_BASE.contains(&(l as u32))) || (modifier(l) && EMOJI_MODIFIER_BASE.contains(&(c as u32))) {
+        // utf8_towc reads the cell's first character; regional indicators pair only
+        // when the cell has one (utf8_regional_count)
+        if let Some(l) = text.chars().next() {
+            let pair = ri(c) && ri(l) && text.chars().filter(|x| ri(*x)).count() == 1;
+            if pair || (modifier(c) && EMOJI_MODIFIER_BASE.contains(&(l as u32))) || (modifier(l) && EMOJI_MODIFIER_BASE.contains(&(c as u32))) {
                 return Some(true);
             }
         }
@@ -1692,6 +1700,9 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
     // ESC 8
     pub fn decrc(&mut self) {
         self.screen.restore_cursor();
+        // input_restore_state moves with screen_write_cursormove, which keeps the cursor
+        // on the screen: a saved pending wrap is gone
+        self.leave_pending_wrap();
     }
 
     // ESC =

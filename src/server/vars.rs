@@ -811,7 +811,7 @@ impl Vars for VarCtx<'_> {
                 if caps.is_empty() || !flags_ok {
                     return Some(b(false));
                 }
-                let overrides: Vec<String> = self.srv.opts_server.array_items("terminal-overrides").into_iter().map(|(_, v)| v).collect();
+                let overrides: Vec<String> = c.term_overrides.clone().unwrap_or_else(|| self.srv.opts_server.array_items("terminal-overrides").into_iter().map(|(_, v)| v).collect());
                 let have = describe(&ident.term, &overrides, &c.features);
                 b(caps.iter().all(|cap| {
                     let n = cap.split('=').next().unwrap_or(cap);
@@ -822,7 +822,7 @@ impl Vars for VarCtx<'_> {
             // (show-messages -T), after terminal-overrides and the features
             _ => {
                 use super::terminfo::{describe, Value, CODES};
-                let overrides: Vec<String> = self.srv.opts_server.array_items("terminal-overrides").into_iter().map(|(_, v)| v).collect();
+                let overrides: Vec<String> = c.term_overrides.clone().unwrap_or_else(|| self.srv.opts_server.array_items("terminal-overrides").into_iter().map(|(_, v)| v).collect());
                 b(CODES.iter().position(|c| c.0 == name)
                     .is_some_and(|i| describe(&ident.term, &overrides, &c.features)[i] != Value::Missing))
             }

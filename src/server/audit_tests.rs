@@ -127,7 +127,8 @@ fn new_session_env_unbind_errors_and_respawn_empty() {
     let s = f.sessions.values().find(|s| s.name == "e2").unwrap();
     assert_eq!(s.env.get("FOO"), Some(&Some("bar".to_string())));
     assert_eq!(run(&mut f, &["unbind-key", "nosuchkey"]), Err("unknown key: nosuchkey".into()));
-    assert!(run(&mut f, &["unbind-key", "-q", "nosuchkey"]).is_ok());
+    // -q: no message, but the command still fails (the rest of its list goes)
+    assert_eq!(run(&mut f, &["unbind-key", "-q", "nosuchkey"]), Err(QUIET_ERROR.into()));
     run(&mut f, &["bind-key", "-T", "mytab", "x", "display", "hi"]).unwrap();
     run(&mut f, &["unbind-key", "-T", "mytab", "-a"]).unwrap();
     assert_eq!(run(&mut f, &["list-keys", "-T", "mytab"]), Err("table mytab doesn't exist".into()));

@@ -413,10 +413,6 @@ impl Grid {
     }
 
     /// Number of rows from the oldest history row through the bottom of the screen.
-    pub fn absolute_len(&self) -> usize {
-        self.scrollback_len() + self.rows.len()
-    }
-
     /// Row `index` counted from the oldest history row (0), ignoring the
     /// current scrollback view offset.
     pub fn absolute_row(&self, index: usize) -> Option<&crate::row::Row> {

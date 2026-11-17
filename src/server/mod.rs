@@ -727,8 +727,6 @@ pub fn nz(v: u16) -> NonZeroU16 {
 pub const ALERT_ACTIVITY: u8 = 1;
 pub const ALERT_BELL: u8 = 2;
 pub const ALERT_SILENCE: u8 = 4;
-/// Window::alerts: the silence timer fired since the last output.
-pub const ALERT_SILENCE_DONE: u8 = 0x80;
 
 pub struct Window {
     pub id: WinId,
@@ -752,9 +750,11 @@ pub struct Window {
     /// The cell a pane had when it last floated (tmux `layout_cell.fg`), for break-pane -W.
     pub float_saved: HashMap<PaneId, crate::layout::FGeom>,
     pub options: Options,
-    /// tmux w->flags: bell and activity seen but not yet checked (alerts_check_session
-    /// finds them later if monitoring is turned on), and ALERT_SILENCE_DONE.
+    /// tmux w->flags: bell, activity and silence seen but not yet checked
+    /// (alerts_check_session finds them later if monitoring is turned on).
     pub alerts: u8,
+    /// When the silence timer (alerts_timer) was last reset, in microseconds.
+    pub silence_reset_us: u64,
     pub layout_cycle: Option<usize>,
     pub old_layout: Option<String>,
     pub created: u64,
@@ -893,6 +893,16 @@ pub struct Identity {
     pub env: Vec<(String, String)>,
 }
 
+impl Identity {
+    /// server_client_check_nested: $TMUX is set and the client runs in one of this
+    /// server's panes (here: its pane and the server pid in $PWSH_TMUX), so a client in
+    /// another server's pane is not nested.
+    pub fn nested(&self) -> bool {
+        let ours = self.env.iter().find(|(k, _)| k == "PWSH_TMUX").and_then(|(_, v)| v.rsplit(',').nth(1)?.parse::<u32>().ok()) == Some(std::process::id());
+        ours && self.ctx_pane.is_some()
+    }
+}
+
 pub enum PromptKind {
     Command,
     Confirm,
@@ -1008,6 +1018,9 @@ pub struct Client {
     pub keyp: keys::Parser,
     pub input_state: input::InputState,
     pub term_caps: BTreeMap<String, String>,
+    /// terminal-overrides as they were when the terminal description was made
+    /// (tty_term_create) or its features last changed (tty_update_features).
+    pub term_overrides: Option<Vec<String>>,
     /// What the terminal called itself in its XTVERSION reply (c->term_type).
     pub term_type: String,
     pub esc_deadline: Option<Instant>,
@@ -1264,6 +1277,8 @@ pub static FILE_POP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| i
 /// Before each command of a file: its line (cmd_get_source), which also makes its group.
 pub static LINE_MARK: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("line"));
 /// The end of the startup configuration (cfg_done).
+/// An error without a message (cmdq_error not called): it ends the command's group only.
+pub const QUIET_ERROR: &str = "\0quiet-error";
 pub static CFG_DONE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("cfg-done"));
 
 /// The tmux release whose behaviour this server matches (`#{version}`).
@@ -1336,6 +1351,9 @@ pub struct Server {
     pub buffers: Vec<Buffer>,
     pub buffer_seq: u32,
     pub bindings: BTreeMap<String, BTreeMap<String, Binding>>,
+    /// The key tables that still have their default_key_bindings (a table removed and
+    /// made again has none).
+    pub default_tables: std::collections::BTreeSet<String>,
     pub messages: VecDeque<(u64, String)>,
     /// Prompt history per type (command, search).
     pub prompt_history: [Vec<String>; 2],
@@ -1480,15 +1498,17 @@ pub fn run(config: Option<String>, cwd: Option<String>) -> io::Result<()> {
         srv.ev.activity.clear();
         srv.control_notify();
         srv.render_all();
-        let exit_empty = options::is_on(srv.opts_server.get("exit-empty").unwrap_or("on"));
-        let idle = srv.sessions.is_empty() && exit_empty && (srv.had_session || started.elapsed() > Duration::from_secs(30));
-        let unattached = options::is_on(srv.opts_server.get("exit-unattached").unwrap_or("off"))
-            && srv.had_session
-            && !srv.clients.values().any(|c| c.attached);
-        if srv.quit || idle || unattached {
-            break;
+        // server_loop: the server goes only once every client has gone (here: has its
+        // reply), so a command that connected as the last session went is still served
+        if srv.quit || srv.would_exit(None, started.elapsed() > Duration::from_secs(30)) {
+            match rx.try_recv() {
+                Ok(ev) if !srv.quit => srv.handle(ev),
+                _ => break,
+            }
         }
     }
+    // no new clients from here: one started now finds no server and starts its own
+    ipc::cleanup();
     srv.shutdown();
     srv.save_prompt_history();
     ipc::cleanup();
@@ -1497,6 +1517,17 @@ pub fn run(config: Option<String>, cwd: Option<String>) -> io::Result<()> {
 }
 
 impl Server {
+    /// server_loop's exit test: no sessions (exit-empty) or no attached client
+    /// (exit-unattached), and no client other than `except` still waiting for its reply.
+    pub fn would_exit(&self, except: Option<ClientId>, timed_out: bool) -> bool {
+        let exit_empty = options::is_on(self.opts_server.get("exit-empty").unwrap_or("on"));
+        let idle = self.sessions.is_empty() && exit_empty && (self.had_session || timed_out);
+        let unattached = options::is_on(self.opts_server.get("exit-unattached").unwrap_or("off"))
+            && self.had_session
+            && !self.clients.values().any(|c| c.attached);
+        (idle || unattached) && self.clients.iter().all(|(id, c)| Some(*id) == except || c.io.exit_sent.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
     fn new(tx: mpsc::SyncSender<Event>) -> Self {
         let mut env = BTreeMap::new();
         for (k, v) in std::env::vars() {
@@ -1527,6 +1558,7 @@ impl Server {
             buffers: Vec::new(),
             buffer_seq: 0,
             bindings: input::default_bindings(),
+            default_tables: input::default_bindings().into_keys().collect(),
             messages: VecDeque::new(),
             prompt_history: Default::default(),
             jobs: HashMap::new(),
@@ -1955,6 +1987,7 @@ impl Server {
                 keyp: keys::Parser::new(),
                 input_state: Default::default(),
                 term_caps: Default::default(),
+                term_overrides: None,
                 term_type: String::new(),
                 esc_deadline: None,
                 prompt: None,
@@ -2092,9 +2125,6 @@ impl Server {
                 let a = decode_args(&payload);
                 let get = |i: usize| a.get(i).cloned().unwrap_or_default();
                 let env: Vec<(String, String)> = a.iter().skip(10).filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect();
-                // a pane of this server only (cmd_find_try_TMUX: the pid in $TMUX is ours;
-                // server_client_check_nested): a client in another server's pane is not nested
-                let ours = env.iter().find(|(k, _)| k == "PWSH_TMUX").and_then(|(_, v)| v.rsplit(',').nth(1)?.parse::<u32>().ok()) == Some(std::process::id());
                 let ident = Identity {
                     cols: get(0).parse::<u16>().unwrap_or(80).min(MAX_SIZE),
                     rows: get(1).parse::<u16>().unwrap_or(24).min(MAX_SIZE),
@@ -2102,7 +2132,8 @@ impl Server {
                     cwd: get(3),
                     term: get(4),
                     pid: get(5).parse().unwrap_or(0),
-                    ctx_pane: get(6).strip_prefix('%').and_then(|s| s.parse().ok()).filter(|_| ours),
+                    // cmd_find_inside_pane falls back to $TMUX_PANE whichever server set it
+                    ctx_pane: get(6).strip_prefix('%').and_then(|s| s.parse().ok()),
                     utf8: get(9) != "0",
                     env,
                 };
@@ -2116,6 +2147,7 @@ impl Server {
                 let vt100 = theme::vt100_like(&ident.term, &overrides);
                 let terminal = control > 0 || ident.tty;
                 if let Some(c) = self.clients.get_mut(&cid) {
+                    c.term_overrides = Some(overrides.clone());
                     c.term_caps = caps;
                     c.control = control;
                     c.features = features;
@@ -2318,24 +2350,49 @@ impl Server {
         if let Some(w) = self.windows.get_mut(&wid) {
             w.activity = now_secs();
             w.activity_us = now_us();
-            // alerts_queue sets the window flags even when nothing monitors them
+            // alerts_queue sets the window flags even when nothing monitors them, and
+            // alerts_reset restarts the silence timer
             w.alerts |= ALERT_ACTIVITY | if bell { ALERT_BELL } else { 0 };
-            w.alerts &= !ALERT_SILENCE_DONE;
+            w.alerts &= !ALERT_SILENCE;
+            w.silence_reset_us = now_us();
         }
         self.pane_output_events(id, osc_events, clip_set);
-        let monitor_bell = bell && self.opt_window_on(Some(wid), "monitor-bell");
-        let monitor_activity = self.opt_window_on(Some(wid), "monitor-activity");
-        if monitor_bell {
-            self.alert(wid, ALERT_BELL);
-        }
-        if monitor_activity {
-            self.alert(wid, ALERT_ACTIVITY);
-        }
-        if monitor_bell || monitor_activity {
-            // alerts_callback clears the flags of a window it checked
-            if let Some(w) = self.windows.get_mut(&wid) { w.alerts &= !(ALERT_BELL | ALERT_ACTIVITY); }
+        // alerts_enabled for the flags queued: then alerts_callback checks all of them
+        if (bell && self.opt_window_on(Some(wid), "monitor-bell")) || self.opt_window_on(Some(wid), "monitor-activity") {
+            self.alerts_callback(wid);
         }
         self.mark_window_dirty(wid);
+    }
+
+    /// alerts_check_all: each flag the window has whose monitor option is on.
+    pub fn alerts_check_all(&mut self, wid: WinId) {
+        let pending = self.windows.get(&wid).map_or(0, |w| w.alerts);
+        if pending & ALERT_BELL != 0 && self.opt_window_on(Some(wid), "monitor-bell") {
+            self.alert(wid, ALERT_BELL);
+        }
+        if pending & ALERT_ACTIVITY != 0 && self.opt_window_on(Some(wid), "monitor-activity") {
+            self.alert(wid, ALERT_ACTIVITY);
+        }
+        if pending & ALERT_SILENCE != 0 && self.windows.contains_key(&wid) && self.opt_window_num(Some(wid), "monitor-silence") != 0 {
+            self.alert(wid, ALERT_SILENCE);
+        }
+    }
+
+    /// alerts_callback: the window is checked, then its flags are cleared.
+    fn alerts_callback(&mut self, wid: WinId) {
+        self.alerts_check_all(wid);
+        if let Some(w) = self.windows.get_mut(&wid) {
+            w.alerts &= !(ALERT_BELL | ALERT_ACTIVITY | ALERT_SILENCE);
+        }
+    }
+
+    /// alerts_reset_all: monitor-silence changed, every silence timer starts again.
+    pub fn alerts_reset_all(&mut self) {
+        let now = now_us();
+        for w in self.windows.values_mut() {
+            w.alerts &= !ALERT_SILENCE;
+            w.silence_reset_us = now;
+        }
     }
 
     /// tmux alerts_check_{bell,activity,silence}: flags the window in every session where it is
@@ -2440,7 +2497,7 @@ impl Server {
             if let Some(p) = self.panes.get_mut(&id) {
                 if !fmt.is_empty() {
                     let cells = crate::format::layout_line(&crate::format::spans(&msg, Default::default()), p.size.0 as usize, Default::default());
-                    let line = render::line_with_escapes(&Line { cells, wrapped: false, ..Default::default() });
+                    let line = render::line_for_parser(&Line { cells, wrapped: false, ..Default::default() });
                     // format_draw leaves the cursor where it started, at the line's start
                     p.parser.process(format!("\x1b[r\x1b[{};1H\r\n\x1b[0m{line}\x1b[0m\r", p.size.1).as_bytes());
                 }
@@ -2633,11 +2690,42 @@ impl Server {
         if let Some(d) = self.copy_refresh_deadline() {
             t = t.min(d.saturating_duration_since(now));
         }
+        let now_us = now_us();
+        for (_, deadline, _) in self.silence_timers() {
+            t = t.min(Duration::from_micros(deadline.saturating_sub(now_us)));
+        }
         t.max(Duration::from_millis(5))
+    }
+
+    /// The windows with a silence timer (monitor-silence) and when it expires, in
+    /// microseconds, in window order.
+    fn silence_timers(&self) -> Vec<(WinId, u64, u64)> {
+        let mut v: Vec<(WinId, u64, u64)> = self.windows.values().filter_map(|w| {
+            let secs = self.opt_window_num(Some(w.id), "monitor-silence");
+            let period = (secs > 0).then(|| secs as u64 * 1_000_000)?;
+            Some((w.id, w.silence_reset_us.saturating_add(period), period))
+        }).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// alerts_timer: monitor-silence seconds after the last reset (output or the timer
+    /// itself) the window is queued for silence and the timer starts again, so the
+    /// current window of an attached session (never flagged) alerts again.
+    fn silence_check(&mut self) {
+        let now = now_us();
+        for (wid, deadline, period) in self.silence_timers() {
+            // (alert hooks may have removed windows)
+            let Some(w) = self.windows.get_mut(&wid).filter(|_| now >= deadline) else { continue };
+            w.silence_reset_us = if now - deadline < period { deadline } else { now };
+            w.alerts |= ALERT_SILENCE;
+            self.alerts_callback(wid);
+        }
     }
 
     fn timers(&mut self) {
         self.input_timers();
+        self.silence_check();
         if self.cfg_jobs_until.is_some_and(|t| Instant::now() >= t) {
             self.cfg_release_jobs();
         }
@@ -2738,28 +2826,6 @@ impl Server {
         self.check_monitors();
         self.request_pane_info();
         self.automatic_rename();
-        let wids: Vec<WinId> = self.windows.keys().copied().collect();
-        for wid in wids {
-            // silence (alert hooks run below may have removed windows)
-            if !self.windows.contains_key(&wid) {
-                continue;
-            }
-            let secs = self.opt_window_num(Some(wid), "monitor-silence");
-            if secs > 0 {
-                let Some(w) = self.windows.get(&wid) else { continue };
-                let quiet = w
-                    .layout
-                    .panes()
-                    .iter()
-                    .filter_map(|p| self.panes.get(p))
-                    .all(|p| p.last_output.elapsed() >= Duration::from_secs(secs as u64));
-                // alerts_timer fires once until the next output resets it
-                if quiet && self.windows.get(&wid).is_some_and(|w| w.alerts & ALERT_SILENCE_DONE == 0) {
-                    if let Some(w) = self.windows.get_mut(&wid) { w.alerts |= ALERT_SILENCE_DONE; }
-                    self.alert(wid, ALERT_SILENCE);
-                }
-            }
-        }
         // status-interval redraws (clock, status-right time)
         let now = now_secs();
         let sids: Vec<SessId> = self.sessions.keys().copied().collect();
@@ -3369,13 +3435,7 @@ impl Server {
         // alerts_check_session: flags left on the session's windows
         let wids: Vec<WinId> = self.sessions.get(&sid).map(|s| s.links.values().copied().collect()).unwrap_or_default();
         for wid in wids {
-            let pending = self.windows.get(&wid).map_or(0, |w| w.alerts);
-            if pending & ALERT_BELL != 0 && self.opt_window_on(Some(wid), "monitor-bell") {
-                self.alert(wid, ALERT_BELL);
-            }
-            if pending & ALERT_ACTIVITY != 0 && self.opt_window_on(Some(wid), "monitor-activity") {
-                self.alert(wid, ALERT_ACTIVITY);
-            }
+            self.alerts_check_all(wid);
         }
         // server_client_set_session: the client is focused (set above) and its window's
         // latest, then the sizes are recalculated
@@ -3868,6 +3928,32 @@ impl Server {
             let readonly = self.readonly_context.replace(q.ctx.readonly);
             self.detect_changes(cmds::canonical(&name));
             self.readonly_context.set(readonly);
+            if matches!(&result, Err(e) if e == QUIET_ERROR) {
+                // a command that failed without cmdq_error (unbind-key -q): command-error
+                // still runs and the rest of its group goes, but the exit status stays 0
+                self.cur_mouse = saved_mouse;
+                self.cur_file = saved_file;
+                self.ev.cur_formats = saved_formats;
+                self.ev.in_hook = saved_hook;
+                if !soft && !hook_saved.is_empty() {
+                    self.control_item_done(&mut q, Some(""));
+                    Self::skip_hook_list(&mut q, &mut hook_saved);
+                    continue;
+                }
+                self.command_hook("command-error", &argv, &q.ctx);
+                let hooks = std::mem::take(&mut self.ev.inject);
+                if soft {
+                    Self::skip_group(&mut q);
+                } else {
+                    q.cmds.retain(|c| c.first() == Some(&*CFG_DONE));
+                    q.soft = 0;
+                }
+                self.control_item_done(&mut q, Some(""));
+                for c in hooks.into_iter().rev() {
+                    q.cmds.push_front(c);
+                }
+                continue;
+            }
             if let Err(e) = &result && !e.starts_with('\0') && !soft && !hook_saved.is_empty() {
                 // a hook command: the error ends that hook's list, the rest goes on
                 self.cur_mouse = saved_mouse;
@@ -4154,6 +4240,14 @@ impl Server {
                 let msg = format!("{} message: {e}", c.name());
                 self.add_message(&msg);
             }
+            // the command client is lost next (server_client_lost): check now so the next
+            // command sees the result, and if the server goes with it, stop listening
+            // before the reply so that command starts a server of its own
+            self.check_destroy_unattached();
+            // (not while hooks, jobs or delayed commands could still make a session)
+            if self.would_exit(Some(rc), false) && self.ev.pending.is_empty() && self.jobs.is_empty() && self.delayed.is_empty() {
+                ipc::cleanup();
+            }
             let Some(c) = self.clients.get(&rc) else { return };
             // config file errors go to stderr too and make the exit status 1
             let err = match (err, ctx.soft_err.trim_end_matches('\n')) {
@@ -4175,9 +4269,6 @@ impl Server {
                 }
                 None => c.send(S_REPLY, &encode_reply(0, &ctx.out)),
             }
-            // the command client is lost next (server_client_lost); check now so the
-            // next command sees the result
-            self.check_destroy_unattached();
             return;
         }
         if let Some(e) = &err {

@@ -3297,7 +3297,8 @@ fn startup_config_runs_in_the_client_directory_and_keeps_its_errors() {
     let ok = conf_file(&ctx, "ok.conf", "set -g @ok 1\n");
     let out = ctx.command().args(["source-file", &ok]).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "a.conf:1: invalid option: nosuchopt\na.conf:5: invalid option: nosuch\n");
-    assert_eq!(out.status.code(), Some(1));
+    // the exit status is 1 only for errors of the command's own files
+    assert_eq!(out.status.code(), Some(0));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -3772,10 +3773,11 @@ fn pane_of_another_server_is_not_nested() {
     // $PWSH_TMUX names this server (its pid): attaching nests, and %0 is the current pane
     assert!(run(&format!("/x,{pid},0"), &["attach", "-t", "n"]).contains("sessions should be nested with care"));
     assert_eq!(run(&format!("/x,{pid},0"), &["display", "-p", "#{pane_id}"]).trim(), "%0");
-    // another server's pane (cmd_find_try_TMUX, server_client_check_nested)
+    // another server's pane is not nested (server_client_check_nested looks only at this
+    // server's panes), but cmd_find_inside_pane still takes $TMUX_PANE as the pane
     let other = format!("/x,{},0", pid.parse::<u32>().unwrap() + 1);
     assert!(!run(&other, &["attach", "-t", "n"]).contains("nested"));
-    assert_eq!(run(&other, &["display", "-p", "#{pane_id}"]).trim(), "%1");
+    assert_eq!(run(&other, &["display", "-p", "#{pane_id}"]).trim(), "%0");
 }
 
 #[test]
@@ -3820,4 +3822,117 @@ fn source_file_nesting_is_limited() {
     assert_eq!(ctx.ok(&["show", "-gv", "@n"]).trim().len(), 50);
     ctx.ok(&["display", "-p", "ok"]);
     let _ = std::fs::remove_file(&conf);
+}
+
+#[test]
+fn trailing_env_flag_and_quiet_unbind_errors() {
+    let ctx = Ctx::new("envq");
+    ctx.ok(&["new-session", "-d", "-s", "a"]);
+    // a trailing -e is left for getopt
+    assert!(ctx.fails(&["new-session", "-d", "-s", "x", "-e"]).contains("-e expects an argument"));
+    assert!(!ctx.ok(&["list-sessions", "-F", "#{session_name}"]).contains('x'));
+    assert!(ctx.fails(&["new-window", "-d", "-t", "a", "-e"]).contains("-e expects an argument"));
+    // unbind-key -q: no message and exit status 0, but the rest of the list is dropped
+    assert_eq!(ctx.ok(&["unbind", "-q", "nosuchkeyX", ";", "display", "-p", "after"]), "");
+    ctx.ok(&["set", "-g", "@x", "1", ";", "unbind", "-q", "-T", "nosuch", "x", ";", "set", "-g", "@x", "2"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@x"]), "1\n");
+}
+
+#[test]
+fn hex_key_names_and_key_tables() {
+    let ctx = Ctx::new("hexkeys");
+    ctx.ok(&["new-session", "-d", "-s", "a"]);
+    // below 0x20 the code itself (Tab, Enter and Escape, else a C0 key apart from C-x),
+    // 0x20 and 0x7f UTF-8 keys apart from Space and BSpace
+    for (k, v) in [("0x00", "n"), ("0x08", "b"), ("C-h", "h"), ("0x09", "t"), ("0x1f", "u"), ("0x20", "s"), ("0x7f", "d"), ("BSpace", "B")] {
+        ctx.ok(&["bind", "-n", k, "display", v]);
+    }
+    let keys: Vec<String> = ctx.ok(&["list-keys", "-T", "root"]).lines().filter(|l| l.contains("display-message")).map(|l| l.split_whitespace().nth(3).unwrap().to_string()).collect();
+    assert_eq!(keys, ["[NUL]", "[BS]", "Tab", "[US]", "\"", "\\177", "BSpace", "C-h"], "{keys:?}");
+    // a table made again has no defaults: emptied, it goes; root always stays
+    ctx.ok(&["unbind", "-a", "-T", "prefix"]);
+    ctx.ok(&["bind", "-T", "prefix", "x", "display", "x"]);
+    ctx.ok(&["unbind", "-T", "prefix", "x"]);
+    assert!(ctx.fails(&["list-keys", "-T", "prefix"]).contains("table prefix doesn't exist"));
+    ctx.ok(&["unbind", "-a", "-T", "root"]);
+    ctx.ok(&["list-keys", "-T", "root"]);
+}
+
+#[test]
+fn quiet_source_and_empty_load_buffer() {
+    let ctx = Ctx::new("srcq");
+    ctx.ok(&["new-session", "-d", "-s", "a"]);
+    let missing = std::env::temp_dir().join(format!("{}-missing.conf", ctx.socket));
+    let missing = missing.to_string_lossy().replace('\\', "/");
+    ctx.ok(&["source-file", "-q", &missing]);
+    assert!(ctx.fails(&["source-file", &missing]).contains("No such file or directory"));
+    // an empty file sets no buffer and its name is not checked
+    let empty = std::env::temp_dir().join(format!("{}-empty.txt", ctx.socket));
+    std::fs::write(&empty, b"").unwrap();
+    ctx.ok(&["load-buffer", "-b", "q\tz", &empty.to_string_lossy()]);
+    assert_eq!(ctx.ok(&["list-buffers"]), "");
+    let _ = std::fs::remove_file(&empty);
+}
+
+#[test]
+fn option_targets_and_break_pane_names() {
+    let ctx = Ctx::new("opttgt");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-n", "sleep"]);
+    ctx.ok(&["new-session", "-d", "-s", "t", "-n", "sleep"]);
+    // CMD_FIND_PANE: a bare name is a window of the current session (t) first
+    ctx.ok(&["set", "-t", "s", "@o", "1"]);
+    assert_eq!(ctx.ok(&["show", "-v", "-t", "t:", "@o"]), "1\n");
+    assert!(!ctx.cmd(&["show", "-v", "-t", "s:", "@o"]).1.contains('1'));
+    // default_window_name: the pane's command as given
+    ctx.ok(&["split-window", "-d", "-t", "s:0", sh("sleep 30", "Start-Sleep 30")]);
+    ctx.ok(&["break-pane", "-d", "-s", "s:0.1", "-t", "s:"]);
+    let name = ctx.ok(&["list-windows", "-t", "s", "-F", "#{window_name}"]);
+    assert_eq!(name.lines().nth(1), Some(sh("sleep", "Start-Sleep")), "{name}");
+}
+
+#[test]
+fn resize_pane_to_a_size_moves_nested_cells_as_layout_resize_pane() {
+    // the same as resize-pane -L/-R: layout_resize_pane_to ends in layout_resize_pane
+    let ctx = Ctx::new("resizeto");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "200", "-y", "50"]);
+    ctx.ok(&["set", "-g", "window-size", "manual"]);
+    for args in [&["-h", "-d"][..], &["-v", "-d", "-t", ".1"], &["-h", "-d", "-t", ".2"], &["-h", "-d", "-t", ".3"]] {
+        let mut a = vec!["split-window"];
+        a.extend_from_slice(args);
+        ctx.ok(&a);
+    }
+    for args in [["-t", ".3", "-x", "5"], ["-t", ".0", "-L", "50"], ["-t", ".0", "-R", "20"], ["-t", ".1", "-U", "10"], ["-t", ".0", "-x", "20"]] {
+        let mut a = vec!["resize-pane"];
+        a.extend_from_slice(&args);
+        ctx.ok(&a);
+    }
+    let sizes = ctx.ok(&["list-panes", "-F", "#{pane_width}x#{pane_height}"]);
+    assert_eq!(sizes.split_whitespace().collect::<Vec<_>>(), ["20x50", "179x15", "76x34", "32x34", "69x34"]);
+}
+
+#[test]
+fn styled_remain_on_exit_format_keeps_overline_and_line_drawing() {
+    let ctx = Ctx::new("roefmt");
+    ctx.ok(&["new-session", "-d", "-s", "s", "-x", "40", "-y", "5"]);
+    ctx.ok(&["set", "-g", "remain-on-exit", "on"]);
+    ctx.ok(&["set", "-g", "remain-on-exit-format", "#[fg=red,overline,double-underscore,us=blue]dead#[default] #[acs]lqk#[noacs] x"]);
+    ctx.ok(&["respawn-pane", "-k", "-t", "s", "exit 3"]);
+    wait_for("pane dead", || ctx.fmt("s", "#{pane_dead}") == "1");
+    let line = ctx.ok(&["capture-pane", "-p", "-e", "-t", "s", "-S", "4", "-E", "4"]);
+    assert_eq!(line, "\x1b[4:2;5:3m\x1b[31mdead\x1b[0m \x0elqk\x0f x\n");
+}
+
+#[test]
+#[cfg(unix)]
+fn last_session_destroyed_then_a_new_server() {
+    // the server stops listening before the reply that empties it, so the next command
+    // starts a server of its own
+    let ctx = Ctx::new("duserver");
+    for _ in 0..3 {
+        ctx.ok(&["new-session", "-d", "-s", "a"]);
+        ctx.ok(&["set", "-g", "destroy-unattached", "on"]);
+        ctx.ok(&["new-session", "-d", "-s", "b"]);
+        assert_eq!(ctx.ok(&["list-sessions", "-F", "#{session_name}"]), "b\n");
+        ctx.ok(&["kill-server"]);
+    }
 }

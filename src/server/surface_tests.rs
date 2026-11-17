@@ -166,9 +166,91 @@ fn client_termtype_and_terminal_capabilities() {
     f.start_terminal_queries(1);
     assert!(f.terminal_report(1, b"\x1bP>|XTerm(400)\x1b\\"));
     assert_eq!(f.expand(t, Some(1), "[#{client_termtype}] #{client_termname}"), "[XTerm(400)] xterm-256color");
-    // tty_term_has_name: what show-messages -T lists for the client's terminal
+    // tty_term_has_name: what show-messages -T lists for the client's terminal, with
+    // terminal-overrides as they were when the features last changed
     f.opts_server.set("terminal-overrides[90]", "xterm*:smcup=\\E[?1049h:Ms@".into());
-    assert_eq!(f.expand(t, Some(1), "#{I/c:smcup}|#{I/c:nosuch}|#{I/c:Ms}"), "1|0|0");
+    assert_eq!(f.expand(t, Some(1), "#{I/c:smcup}|#{I/c:nosuch}|#{I/c:Ms}"), "1|0|1");
+    // tty_update_features (here a DA reply with new features) applies them again
+    assert!(f.terminal_report(1, b"\x1b[?62;52c"));
+    assert_eq!(f.expand(t, Some(1), "#{I/c:Ms}"), "0");
+}
+
+/// What a command prints.
+fn out(f: &mut Fixture, args: &[&str]) -> String {
+    let mut ctx = Ctx::default();
+    f.exec(args.iter().map(|s| s.to_string()).collect(), &mut ctx).unwrap();
+    ctx.out.to_string()
+}
+
+#[test]
+fn silence_alerts_repeat_for_the_current_window() {
+    let mut f = fixture();
+    run(&mut f, &["set", "-g", "monitor-silence", "1"]);
+    run(&mut f, &["set", "-g", "silence-action", "any"]);
+    run(&mut f, &["set", "-g", "visual-silence", "on"]);
+    let (w0, w1) = (f.sessions[&f.sid].links[&0], f.sessions[&f.sid].links[&1]);
+    let back = |f: &mut Fixture, w: WinId| f.windows.get_mut(&w).unwrap().silence_reset_us = now_us() - 1_100_000;
+    // alerts_timer starts again each time: the current window (never flagged) alerts
+    // each period, another window once until its flag is cleared
+    for _ in 0..2 {
+        f.clients.get_mut(&1).unwrap().message = None;
+        back(&mut f, w0);
+        f.silence_check();
+        assert_eq!(message(&f), "Silence in current window");
+        assert_eq!(flags(&f, 0), 0);
+    }
+    back(&mut f, w1);
+    f.silence_check();
+    assert_eq!((message(&f), flags(&f, 1)), ("Silence in window 1".to_string(), ALERT_SILENCE));
+    f.clients.get_mut(&1).unwrap().message = None;
+    back(&mut f, w1);
+    f.silence_check();
+    assert_eq!(message(&f), "");
+}
+
+#[test]
+fn a_bell_left_on_the_window_is_found_by_the_next_check() {
+    let mut f = fixture();
+    run(&mut f, &["set", "-g", "visual-bell", "on"]);
+    run(&mut f, &["set", "-g", "monitor-bell", "off"]);
+    output(&mut f, 1, b"\x07");
+    assert_eq!(message(&f), "");
+    // alerts_callback checks every flag the window has once activity is queued
+    run(&mut f, &["set", "-g", "monitor-bell", "on"]);
+    run(&mut f, &["set", "-g", "monitor-activity", "on"]);
+    output(&mut f, 1, b"x");
+    assert_eq!(message(&f), "Bell in window 1");
+}
+
+#[test]
+fn alternate_screen_keeps_the_normal_history() {
+    let mut f = fixture();
+    let lines: String = (1..=40).map(|n| format!("{n}\r\n")).collect();
+    output(&mut f, 0, lines.as_bytes());
+    output(&mut f, 0, b"\x1b[?1049halt");
+    // capture-pane and copy mode read the history above the alternate screen
+    let p = pane(&f, 0);
+    let t = format!("%{p}");
+    assert_eq!(out(&mut f, &["capture-pane", "-p", "-t", &t, "-S", "-", "-E", "1"]).lines().take(2).collect::<Vec<_>>(), ["1", "2"]);
+    run(&mut f, &["copy-mode", "-t", &t]);
+    run(&mut f, &["send-keys", "-t", &t, "-X", "history-top"]);
+    assert!(f.expand_for_pane(p, "#{scroll_position}").parse::<usize>().unwrap() > 0);
+    run(&mut f, &["send-keys", "-t", &t, "-X", "cancel"]);
+    // clear-history clears it (grid_clear_history of the base grid)
+    run(&mut f, &["clear-history", "-t", &t]);
+    assert_eq!(f.expand_for_pane(p, "#{history_size}"), "0");
+}
+
+#[test]
+fn capture_escapes_keep_trailing_cells_with_n() {
+    let mut f = fixture();
+    output(&mut f, 0, b"\x1b[31mred\x1b[0m plain\r\n");
+    let t = format!("%{}", pane(&f, 0));
+    // -N: no GRID_STRING_TRIM_SPACES, the cells go on to what the line has room for
+    let w = f.panes[&pane(&f, 0)].size.0 as usize;
+    let kept = out(&mut f, &["capture-pane", "-p", "-e", "-N", "-t", &t, "-S", "0", "-E", "0"]);
+    assert_eq!(kept, format!("\x1b[31mred\x1b[39m plain{}\n", " ".repeat(w / 4 - 9)));
+    assert_eq!(out(&mut f, &["capture-pane", "-p", "-e", "-t", &t, "-S", "0", "-E", "0"]), "\x1b[31mred\x1b[39m plain\n");
 }
 
 /// What a pane answers for `input`, with cursor-style `style` (its DECSCUSR number).

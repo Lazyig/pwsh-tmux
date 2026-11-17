@@ -954,10 +954,16 @@ pub fn parse_key_name(s: &str) -> Option<Key> {
     if let Some(hex) = s.strip_prefix("0x") {
         let digits = hex.bytes().take_while(u8::is_ascii_hexdigit).count();
         let u = u32::from_str_radix(hex.get(..digits).filter(|d| !d.is_empty())?, 16).ok()?;
-        if u < 0x20 || u == 0x7f {
-            return Some(control_key(u as u8));
-        }
-        return char::from_u32(u).map(|c| normalize(Key::plain(KeyCode::Char(c))));
+        // below 32 the code itself: Tab, Enter and Escape, or a C0 key no terminal
+        // sends ([NUL], [BS], ...); from 32 a UTF-8 key apart from the ASCII key
+        // (0x20 is " ", not Space, and 0x7f is not BSpace)
+        return match u {
+            9 => Some(Key::plain(KeyCode::Tab)),
+            13 => Some(Key::plain(KeyCode::Enter)),
+            27 => Some(Key::plain(KeyCode::Escape)),
+            0x20..=0x7f => Some(Key::plain(KeyCode::Char(u as u8 as char))),
+            _ => char::from_u32(u).map(|c| normalize(Key::plain(KeyCode::Char(c)))),
+        };
     }
     let mut mods = Mods::NONE;
     let mut rest = s;
@@ -993,9 +999,18 @@ pub fn parse_key_name(s: &str) -> Option<Key> {
     Some(normalize(Key::new(code, mods)))
 }
 
+/// key_string_table's names for the C0 codes other than Tab, Enter and Escape.
+pub const C0_NAMES: [&str; 32] = [
+    "[NUL]", "[SOH]", "[STX]", "[ETX]", "[EOT]", "[ENQ]", "[ASC]", "[BEL]", "[BS]", "Tab", "[LF]", "[VT]", "[FF]", "Enter", "[SO]", "[SI]",
+    "[DLE]", "[DC1]", "[DC2]", "[DC3]", "[DC4]", "[NAK]", "[SYN]", "[ETB]", "[CAN]", "[EM]", "[SUB]", "Escape", "[FS]", "[GS]", "[RS]", "[US]",
+];
+
 fn lookup_name(name: &str) -> Option<KeyCode> {
     if let Some((_, c)) = NAMES.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
         return Some(c.clone());
+    }
+    if let Some(i) = C0_NAMES.iter().position(|n| n.starts_with('[') && n.eq_ignore_ascii_case(name)) {
+        return Some(KeyCode::Char(i as u8 as char));
     }
     // sscanf(string, "User%u") <= KEYC_NUSER: case-sensitive, trailing text ignored.
     if let Some(rest) = name.strip_prefix("User") {
@@ -1023,6 +1038,7 @@ fn lookup_name(name: &str) -> Option<KeyCode> {
 pub fn key_name(k: &Key) -> String {
     let mut s = k.mods.prefix();
     match &k.code {
+        KeyCode::Char(c) if (*c as u32) < 0x20 => s.push_str(C0_NAMES[*c as usize]),
         KeyCode::Char(c) => s.push(*c),
         KeyCode::Enter => s.push_str("Enter"),
         KeyCode::Tab => s.push_str("Tab"),
@@ -2153,7 +2169,13 @@ mod tests {
         assert_eq!(p("0x41"), ch('A'));
         assert_eq!(p("0x263a"), ch('☺'));
         assert_eq!(p("0x0d"), k(KeyCode::Enter));
-        assert_eq!(p("0x01"), ctrl('a'));
+        // below 0x20 the code itself: a C0 key apart from C-a, named as tmux names it
+        assert_eq!(p("0x01"), ch('\x01'));
+        assert_eq!(key_name(&p("0x01")), "[SOH]");
+        assert_eq!(p("[soh]"), ch('\x01'));
+        assert_eq!(p("0x09"), k(KeyCode::Tab));
+        assert_eq!(key_name(&p("0x20")), " ");
+        assert_eq!(key_name(&p("0x7f")), "\x7f");
         assert_eq!(parse_key_name("0x"), None);
         assert_eq!(p("C-["), Key::new(KeyCode::Char('['), Mods::CTRL));
         assert_eq!(key_name(&p("C-[")), "C-[");

@@ -360,9 +360,34 @@ pub fn push_sgr(out: &mut String, st: &Style) {
     }
 }
 
-/// capture-pane -e: text with SGR escapes.
-pub fn line_with_escapes(line: &Line) -> String {
-    line_with_escapes_from(line, &mut EscState::default(), false)
+/// A drawn line as sequences a pane's parser takes back (format_draw onto a pane, as
+/// remain-on-exit-format): the SGR of each style (overline as 53, the line drawing set
+/// as G0) and the text, up to the last used cell. A plain colour (no COLOUR_FLAG_256) as
+/// the underscore colour is left out, as grid_string_cells_us leaves it out.
+pub fn line_for_parser(line: &Line) -> String {
+    let mut out = String::new();
+    let used = (0..line.cells.len()).rposition(|x| line.cells[x].text != " " || line.cells[x].style != Style::default()).map_or(0, |x| x + 1);
+    let mut last: Option<Style> = None;
+    for (x, c) in line.cells.iter().enumerate().take(used) {
+        if line.is_padding(x) {
+            continue;
+        }
+        let mut st = c.style;
+        if matches!(st.us, Color::Idx(0..=15)) {
+            st.us = Color::Default;
+        }
+        if last != Some(st) {
+            push_sgr(&mut out, &st);
+            let acs = st.attrs & crate::cells::ACS != 0;
+            if last.is_none_or(|l| (l.attrs & crate::cells::ACS != 0) != acs) {
+                out.push_str(if acs { "\x1b(0" } else { "\x1b(B" });
+            }
+            last = Some(st);
+        }
+        out.push_str(line.cell_text(x));
+    }
+    out.push_str("\x1b(B");
+    out
 }
 
 /// What grid_string_cells carries from one line to the next: the last cell read (its
@@ -428,13 +453,13 @@ pub fn sgr_diff(last: &Style, cur: &Style) -> String {
     out
 }
 
-/// [`line_with_escapes`] after the lines before it (grid_string_cells keeps lastgc from
+/// capture-pane -e: a line with SGR escapes, after the lines before it (grid_string_cells keeps lastgc from
 /// line to line: a line goes on with the attributes and link the line before ended in,
 /// though each line closes the link it opened). With `allocated`
 /// (GRID_STRING_EMPTY_CELLS) the cells read go on to what the line has room for, which
 /// grid_expand_line grows to a quarter, half or all of the width; otherwise they end
-/// with the last used one.
-pub fn line_with_escapes_from(line: &Line, st: &mut EscState, allocated: bool) -> String {
+/// with the last used one. Trailing spaces go unless `keep` (-N: no GRID_STRING_TRIM_SPACES).
+pub fn line_with_escapes_from(line: &Line, st: &mut EscState, allocated: bool, keep: bool) -> String {
     let mut out = String::new();
     let mut open = false;
     let used = (0..line.cells.len()).rposition(|x| line.cells[x].text != " " || line.cells[x].style != Style::default() || line.metadata.contains_key(&(x as u16))).map_or(0, |x| x + 1);
@@ -463,7 +488,7 @@ pub fn line_with_escapes_from(line: &Line, st: &mut EscState, allocated: bool) -
     if open {
         out.push_str("\x1b]8;;\x1b\\");
     }
-    out.trim_end_matches(' ').to_string()
+    if keep { out } else { out.trim_end_matches(' ').to_string() }
 }
 
 fn overlay_style(cell: &mut Style, over: Style) {

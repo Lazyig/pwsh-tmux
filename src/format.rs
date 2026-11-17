@@ -2100,8 +2100,8 @@ enum ListWord {
 
 /// Split already-expanded text into styled spans: `#[fg=red]a#[default]b`.
 /// `#[default]` resets to the current default (initially `base`), `#[push-default]` makes the
-/// current style the default, `#[pop-default]` restores the previous one. A directive with an
-/// invalid word is ignored.
+/// style before its directive the default, `#[pop-default]` goes back to the base default
+/// (which `#[set-default]` sets). A directive with an invalid word is ignored.
 pub fn spans(text: &str, base: Style) -> Vec<Span> {
     spans_with(text, base, None)
 }
@@ -2111,8 +2111,9 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
     let mut out: Vec<Span> = Vec::new();
     let mut cur = base;
     let mut link = None;
+    // format_draw's current_default and base_default
     let mut default = base;
-    let mut defaults: Vec<Style> = Vec::new();
+    let mut base_default = base;
     let mut align = Align::Left;
     let mut range: Option<Range> = None;
     let mut range_start = 0;
@@ -2174,22 +2175,16 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
             }
             let before = range.clone();
             let saved = cur;
+            // style_parse keeps the last of push-default, pop-default and set-default;
+            // format_draw applies it after the whole directive
+            let mut default_type = None;
             for w in style_words(&rest[2..e]) {
                 let lower = w.to_ascii_lowercase();
                 match lower.as_str() {
                     // link= continues until nolink, default or an empty link=.
                     "nolink" => link = None,
                     _ if lower.starts_with("link=") => link = Some(w[5..].to_string()).filter(|l| !l.is_empty()),
-                    // The style before this directive becomes the default.
-                    "set-default" => {
-                        defaults.clear();
-                        default = saved;
-                    }
-                    "push-default" => {
-                        defaults.push(default);
-                        default = cur;
-                    }
-                    "pop-default" => default = defaults.pop().unwrap_or(base),
+                    "set-default" | "push-default" | "pop-default" => default_type = Some(lower.clone()),
                     "norange" => range = None,
                     "nolist" => list_word = ListWord::Off,
                     "noalign" => {
@@ -2223,6 +2218,17 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
                         let _ = apply_word(w, &mut cur, &mut align, default, vars);
                     }
                 }
+            }
+            // push-default: the style before this directive (saved_sy); pop-default: the
+            // base default; set-default: both become the style before the directive
+            match default_type.as_deref() {
+                Some("push-default") => default = saved,
+                Some("pop-default") => default = base_default,
+                Some(_) => {
+                    base_default = saved;
+                    default = saved;
+                }
+                None => {}
             }
             // The list state (format_draw): entering or leaving the list or a marker drops
             // a range still open, and the focus ends at the next list=on.
@@ -3393,6 +3399,14 @@ mod tests {
         let sp = spans("#[fg=red]#[push-default]a#[fg=blue]b#[default]c#[pop-default]#[default]d", base);
         let fgs: Vec<_> = sp.iter().map(|s| (s.text.as_str(), s.style.fg)).collect();
         assert_eq!(fgs, vec![("a", Color::Idx(1)), ("b", Color::Idx(4)), ("c", Color::Idx(1)), ("d", Color::Idx(2))]);
+        // push-default takes the style before its directive; pop-default goes back to the
+        // base even from a nested push
+        let fgs = |t: &str| spans(t, base).iter().map(|s| (s.text.clone(), s.style.fg)).collect::<Vec<_>>();
+        let red = |t: &str| format!("#[fg=red]#[push-default]{t}#[pop-default]#[default]");
+        assert_eq!(fgs(&red("#[fg=green,push-default]a#[default]b#[pop-default]#[default]c")), vec![("a".into(), Color::Idx(2)), ("b".into(), Color::Idx(1)), ("c".into(), Color::Idx(2))]);
+        assert_eq!(fgs(&red("a#[push-default]#[fg=blue]b#[default]c#[pop-default]#[default]d")), vec![("a".into(), Color::Idx(1)), ("b".into(), Color::Idx(4)), ("c".into(), Color::Idx(1)), ("d".into(), Color::Idx(2))]);
+        // set-default moves the base pop-default returns to
+        assert_eq!(fgs("#[fg=red]#[set-default]a#[fg=blue,push-default]b#[pop-default]#[default]c"), vec![("a".into(), Color::Idx(1)), ("b".into(), Color::Idx(4)), ("c".into(), Color::Idx(1))]);
     }
 
     // ----- width / layout -----

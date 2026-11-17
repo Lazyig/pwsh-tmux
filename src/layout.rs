@@ -370,6 +370,47 @@ impl Node {
         self.resize_pane(target, dir, cells, r, false)
     }
 
+    /// cmd_resize_pane_mouse_update: the cells layout_search_by_border finds next to the
+    /// previous mouse position (lx, ly) move by how far the mouse went along their
+    /// parent's direction (layout_resize_layout, without the other side).
+    pub fn resize_borders(&mut self, (lx, ly): (u16, u16), (x, y): (u16, u16), r: Rect) -> bool {
+        let (mut panes, mut seps) = (Vec::new(), Vec::new());
+        self.layout(r, &mut panes, &mut seps);
+        let mut sizes: HashMap<PaneId, (i32, i32)> = panes.iter().map(|(p, r)| (*p, (i32::from(r.w), i32::from(r.h)))).collect();
+        let Some(mut cell) = self.cell(&sizes) else { return false };
+        let mut found: Vec<Vec<usize>> = Vec::new();
+        for (dx, dy) in [(0, 0), (0, 1), (1, 0), (0, -1), (-1, 0)] {
+            let path = cell.search_border(r.x as i32, r.y as i32, i32::from(lx) + dx, i32::from(ly) + dy, &mut Vec::new());
+            if let Some(p) = path.filter(|p| !found.contains(p)) {
+                found.push(p);
+            }
+        }
+        let mut resized = false;
+        for path in found {
+            let Some((&idx, parent_path)) = path.split_last() else { continue };
+            let parent = cell.at_mut(parent_path);
+            let horizontal = parent.horizontal;
+            let change = if horizontal { i32::from(x) - i32::from(lx) } else { i32::from(y) - i32::from(ly) };
+            if change == 0 {
+                continue;
+            }
+            let mut needed = change;
+            while needed != 0 {
+                let size = if change > 0 { parent.grow(idx, horizontal, needed, false) } else { parent.shrink(idx, horizontal, needed) };
+                if size == 0 {
+                    break;
+                }
+                needed += if change > 0 { -size } else { size };
+            }
+            resized = true;
+        }
+        if resized {
+            cell.store(&mut sizes);
+            self.set_ratios(&sizes);
+        }
+        resized
+    }
+
     /// layout_resize_pane: `cells` right or down grows the pane's cell in the nearest
     /// parent of that direction (left or up shrinks it; the last cell moves the border
     /// before it), taking room from the next cell that has some, then with `opposite`
@@ -1626,87 +1667,51 @@ impl Node {
         true
     }
 
-    /// Number of items in the n-ary group rooted here (consecutive splits of
-    /// orientation `horizontal` flattened, as tmux stores them).
-    fn group_count(&self, horizontal: bool) -> usize {
-        match self {
-            _ if !self.has_tiled() => 0,
-            Node::Split { horizontal: h, a, b, .. } if *h == horizontal => a.group_count(horizontal) + b.group_count(horizontal),
-            _ => 1,
-        }
-    }
-
-    /// The flattened group items with their rects.
-    fn group_items<'a>(&'a mut self, horizontal: bool, r: Rect, out: &mut Vec<(&'a mut Node, Rect)>) {
-        if !self.has_tiled() {
-            return;
-        }
-        if self.is_split(horizontal) {
-            if let Node::Split { ratio, a, b, .. } = self {
-                let (ra, rb) = tiled_rects(horizontal, *ratio, a, b, r);
-                a.group_items(horizontal, ra, out);
-                b.group_items(horizontal, rb, out);
-            }
-        } else {
-            out.push((self, r));
-        }
-    }
-
-    /// Set the ratios of the group rooted here so its items get `sizes` cells.
-    /// Returns the total cell count of the group.
-    fn assign_group(&mut self, horizontal: bool, sizes: &[u16]) -> u16 {
-        match self {
-            Node::Split { horizontal: h, a, b, .. } if *h == horizontal && !a.has_tiled() => b.assign_group(horizontal, sizes),
-            Node::Split { horizontal: h, a, b, .. } if *h == horizontal && !b.has_tiled() => a.assign_group(horizontal, sizes),
-            Node::Split { horizontal: h, ratio, a, b } if *h == horizontal => {
-                let na = a.group_count(horizontal);
-                let ta = a.assign_group(horizontal, &sizes[..na]);
-                let tb = b.assign_group(horizontal, &sizes[na..]);
-                *ratio = exact_ratio(ta, tb);
-                ta.saturating_add(tb).saturating_add(1)
-            }
-            _ => sizes[0],
-        }
-    }
-
     /// Set the size of a pane (tmux `resize-pane -x/-y`): the cell containing
     /// the pane in the nearest enclosing split of the right orientation is
     /// resized, taking/giving space from its neighbours like tmux.
     pub fn set_size(&mut self, target: PaneId, width: Option<u16>, height: Option<u16>, area: Rect) -> bool {
         let mut done = false;
         if let Some(w) = width {
-            done |= self.set_size_axis(target, true, w, area) == Some(true);
+            done |= self.set_size_axis(target, true, w, area);
         }
         if let Some(h) = height {
-            done |= self.set_size_axis(target, false, h, area) == Some(true);
+            done |= self.set_size_axis(target, false, h, area);
         }
         done
     }
 
-    // Some(true) applied, Some(false) target found but no suitable split yet, None not found.
-    fn set_size_axis(&mut self, target: PaneId, horizontal: bool, want: u16, r: Rect) -> Option<bool> {
-        let h = match self {
-            Node::Leaf(p) => return (*p == target).then_some(false),
-            Node::Float(..) => return None,
-            Node::Split { horizontal, .. } => *horizontal,
+    /// layout_resize_pane_to: the cell under the nearest parent of the type changes by
+    /// the difference to `want` (moving the border before it for the last cell) as
+    /// layout_resize_pane does, taking room from both sides.
+    fn set_size_axis(&mut self, target: PaneId, horizontal: bool, want: u16, r: Rect) -> bool {
+        let (mut panes, mut seps) = (Vec::new(), Vec::new());
+        self.layout(r, &mut panes, &mut seps);
+        let sizes: HashMap<PaneId, (i32, i32)> = panes.iter().map(|(p, r)| (*p, (i32::from(r.w), i32::from(r.h)))).collect();
+        let Some(cell) = self.cell(&sizes) else { return false };
+        let Some(path) = cell.path(target) else { return false };
+        let mut depth = path.len();
+        loop {
+            if depth == 0 {
+                return false;
+            }
+            let parent = cell.at(&path[..depth - 1]);
+            if parent.pane.is_none() && parent.horizontal == horizontal {
+                break;
+            }
+            depth -= 1;
+        }
+        let lc = cell.at(&path[..depth]);
+        let size = if horizontal { lc.sx } else { lc.sy };
+        let last = path[depth - 1] + 1 == cell.at(&path[..depth - 1]).kids.len();
+        let change = if last { size - i32::from(want) } else { i32::from(want) - size };
+        let dir = match (horizontal, change > 0) {
+            (true, true) => Dir::Right,
+            (true, false) => Dir::Left,
+            (false, true) => Dir::Down,
+            (false, false) => Dir::Up,
         };
-        let mut items = Vec::new();
-        self.group_items(h, r, &mut items);
-        let idx = items.iter().position(|(n, _)| n.contains(target))?;
-        let (item, ir) = items.swap_remove(idx);
-        if item.set_size_axis(target, horizontal, want, ir) == Some(true) {
-            return Some(true);
-        }
-        if h != horizontal {
-            return Some(false);
-        }
-        let mut items = Vec::new();
-        self.group_items(h, r, &mut items);
-        let mut sizes: Vec<u16> = items.iter().map(|(_, r)| along(h, *r)).collect();
-        drop(items);
-        resize_in_group(&mut sizes, idx, want.max(PANE_MIN));
-        self.assign_group(h, &sizes);
-        Some(true)
+        change != 0 && self.resize_pane(target, dir, change.unsigned_abs().min(u32::from(u16::MAX)) as u16, r, true)
     }
 
     /// layout_spread_out: even out the cells of the pane's parent, or of the nearest
@@ -1769,34 +1774,6 @@ impl Node {
     }
 }
 
-/// Resize item `i` of a group to `want` cells, like tmux layout_resize_pane_to:
-/// growing takes space from the following items (then the preceding ones),
-/// or from the preceding items for the last one; shrinking gives the space to
-/// the adjacent item (the next one, or the previous one for the last item).
-fn resize_in_group(sizes: &mut [u16], i: usize, want: u16) {
-    let k = sizes.len();
-    let cur = sizes[i];
-    let last = i + 1 == k;
-    if want > cur {
-        let mut need = want - cur;
-        let order: Vec<usize> = if last { (0..i).rev().collect() } else { (i + 1..k).chain((0..i).rev()).collect() };
-        for j in order {
-            let take = need.min(sizes[j].saturating_sub(PANE_MIN));
-            sizes[j] -= take;
-            sizes[i] += take;
-            need -= take;
-            if need == 0 {
-                break;
-            }
-        }
-    } else if want < cur && k > 1 {
-        let give = cur - want;
-        let j = if last { i - 1 } else { i + 1 };
-        sizes[i] -= give;
-        sizes[j] += give;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1835,7 +1812,30 @@ mod tests {
         n.split(1, 2, false);
         n.set_size(0, Some(78), None, r(80, 24));
         assert!(!n.spread(0, r(80, 24)));
-        assert!(n.spread(1, r(80, 24)) || widths(&n, r(80, 24))[1].1 == 12);
+        // the column is even already and the root has one pane: nothing changes
+        assert!(!n.spread(1, r(80, 24)));
+        assert_eq!(widths(&n, r(80, 24)), [(78, 24), (1, 12), (1, 11)]);
+    }
+
+    #[test]
+    fn border_drag_moves_the_cell_before_the_border() {
+        // {A,[{B,D},C],E}: dragging the D|E border moves the column's border with E
+        // (layout_search_by_border finds the column), not the B|D border
+        let r = Rect { x: 0, y: 0, w: 80, h: 24 };
+        let mut n = Node::Leaf(0);
+        n.split(0, 1, true);
+        n.split(1, 4, true);
+        n.split(1, 3, false);
+        n.split(1, 2, true);
+        let before = widths(&n, r);
+        let (mut panes, mut seps) = (vec![], vec![]);
+        n.layout(r, &mut panes, &mut seps);
+        let d = panes.iter().find(|(p, _)| *p == 2).unwrap().1;
+        assert!(n.resize_borders((d.right(), d.y), (d.right() + 3, d.y), r));
+        assert_eq!(before, [(40, 24), (9, 12), (9, 12), (19, 11), (19, 24)]);
+        // the column grows by 3 (its cells grow a cell at a time, layout_resize_adjust)
+        // and E gives the room
+        assert_eq!(widths(&n, r), [(40, 24), (11, 12), (10, 12), (22, 11), (16, 24)]);
     }
 
     #[test]
@@ -2402,6 +2402,29 @@ struct TCell {
 }
 
 impl TCell {
+    /// layout_search_by_border: the path to the cell before the border at (x, y), the
+    /// cell's offsets being (xoff, yoff).
+    fn search_border(&self, xoff: i32, yoff: i32, x: i32, y: i32, path: &mut Vec<usize>) -> Option<Vec<usize>> {
+        let (mut cx, mut cy) = (xoff, yoff);
+        let mut last: Option<(usize, i32, i32)> = None;
+        for (i, k) in self.kids.iter().enumerate() {
+            if x >= cx && x < cx + k.sx && y >= cy && y < cy + k.sy {
+                path.push(i);
+                return k.search_border(cx, cy, x, y, path);
+            }
+            if let Some((li, lx, ly)) = last {
+                let l = &self.kids[li];
+                if (self.horizontal && x < cx && x >= lx + l.sx) || (!self.horizontal && y < cy && y >= ly + l.sy) {
+                    path.push(li);
+                    return Some(path.clone());
+                }
+            }
+            last = Some((i, cx, cy));
+            if self.horizontal { cx += k.sx + 1 } else { cy += k.sy + 1 }
+        }
+        None
+    }
+
     /// layout_resize_check: how much the cell can shrink in that direction.
     fn check(&self, horizontal: bool, min_w: i32) -> i32 {
         if self.pane.is_some() {

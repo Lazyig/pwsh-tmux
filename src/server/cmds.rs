@@ -496,7 +496,11 @@ fn take_env(full: &str, args: &mut Vec<String>) -> Vec<(String, String)> {
                 } else {
                     Some(attached.clone())
                 };
-                if c == 'e' {
+                if c == 'e' && value.is_none() {
+                    // a trailing -e is left for getopt: "-e expects an argument"
+                    kept.push(c);
+                    next_taken = false;
+                } else if c == 'e' {
                     if let Some((k, v)) = value.as_deref().and_then(|v| v.split_once('=')) {
                         env.push((k.to_string(), v.to_string()));
                     }
@@ -1290,6 +1294,7 @@ impl Server {
                 float_saved: HashMap::new(),
                 options: Options::default(),
                 alerts: 0,
+                silence_reset_us: now_us(),
                 layout_cycle: None,
                 old_layout: None,
                 created: now,
@@ -1894,7 +1899,7 @@ impl Server {
                 if !detached {
                     // already attached clients switch, CLI clients attach
                     if let Some(c) = cid.and_then(|c| self.clients.get(&c)) {
-                        if !c.attached && c.ident.as_ref().is_some_and(|i| i.ctx_pane.is_some()) {
+                        if !c.attached && c.ident.as_ref().is_some_and(|i| i.nested()) {
                             return err("sessions should be nested with care, unset PWSH_TMUX to force");
                         }
                     }
@@ -3112,7 +3117,12 @@ impl Server {
                 self.flush_active_pane(swid);
                 self.flush_window_layout(swid);
                 let (sx, sy) = (self.windows[&swid].sx, self.windows[&swid].sy);
-                let wname = name.clone().unwrap_or_else(|| self.panes.get(&pane).map(|p| p.current_cmd.clone()).unwrap_or_default());
+                // default_window_name: the pane's command as given, else its shell
+                let wname = name.clone().unwrap_or_else(|| match self.panes.get(&pane).map(|p| &p.track.argv) {
+                    Some(argv) if argv.iter().any(|a| !a.is_empty()) => self.window_name_for(argv, Some(ssid)),
+                    Some(_) => procinfo::program_name(&self.opt_session(Some(ssid), "default-shell")),
+                    None => String::new(),
+                });
                 let nwid = self.new_window_obj(wname, pane, sx, sy);
                 if name.is_some() {
                     self.windows.get_mut(&nwid).unwrap().options.set("automatic-rename", "off".into());
@@ -3979,7 +3989,7 @@ impl Server {
                         // tmux names a client by its tty
                         let tty = c.ident.as_ref().filter(|i| i.tty).and_then(|i| super::terminfo::tty_path(i.pid)).unwrap_or_else(|| c.name());
                         ctx.out.push_str(&format!("Terminal {n}: {term} for {tty}, flags=0x{flags:x}:\n"));
-                        for (i, v) in super::terminfo::describe(term, &overrides, &c.features).into_iter().enumerate() {
+                        for (i, v) in super::terminfo::describe(term, c.term_overrides.as_deref().unwrap_or(&overrides), &c.features).into_iter().enumerate() {
                             ctx.out.push_str(&describe_capability(i, &v));
                         }
                         n += 1;
@@ -4054,9 +4064,10 @@ impl Server {
                 Ok(Flow::Next)
             }
             "unbind-key" => {
-                // cmd_unbind_key_exec: -q silences the errors (and so the exit status, which cmdq_error sets)
+                // cmd_unbind_key_exec: -q silences the errors (and so the exit status, which cmdq_error
+                // sets), but the command still fails and the rest of its list is dropped
                 let quiet = o.has('q');
-                let fail = |e: String| if quiet { Ok(Flow::Next) } else { Err(e) };
+                let fail = |e: String| if quiet { Err(super::QUIET_ERROR.to_string()) } else { Err(e) };
                 let table = if o.has('T') { o.get('T').unwrap().to_string() } else if o.has('n') { "root".to_string() } else { "prefix".to_string() };
                 if o.has('a') {
                     if !o.rest.is_empty() {
@@ -4067,6 +4078,12 @@ impl Server {
                     }
                     // key_bindings_remove_table: the table goes, and clients in it leave it
                     self.bindings.remove(&table);
+                    self.default_tables.remove(&table);
+                    // every client holds the root table (server_client_create makes it
+                    // again), so it is there again at once, empty
+                    if table == "root" {
+                        self.bindings.insert(table.clone(), BTreeMap::new());
+                    }
                     let cids: Vec<ClientId> = self.clients.values().filter(|c| c.key_table == table).map(|c| c.id).collect();
                     for cid in cids {
                         let sid = self.clients[&cid].session;
@@ -4083,7 +4100,8 @@ impl Server {
                 let kname = keys::key_name(&k);
                 let removed = self.bindings.get_mut(&table).and_then(|t| t.remove(&kname)).is_some();
                 // key_bindings_remove: a table left with no bindings and no defaults goes
-                if removed && self.bindings.get(&table).is_some_and(|t| t.is_empty()) && !input::default_bindings().contains_key(&table) {
+                // (the defaults of the table as it is: one made again has none)
+                if removed && table != "root" && self.bindings.get(&table).is_some_and(|t| t.is_empty()) && !self.default_tables.contains(&table) {
                     self.bindings.remove(&table);
                 }
                 Ok(Flow::Next)
@@ -4503,12 +4521,14 @@ impl Server {
                     // file_read: "<strerror>: <path>"
                     std::fs::read(&p).map_err(|e| format!("{}: {p}", strerror(&e)))?
                 };
+                // cmd_load_buffer_done: an empty file sets nothing (the name is not checked),
+                // and -w copies only what paste_set took
+                if data.is_empty() {
+                    return Ok(Flow::Next);
+                }
                 let name = o.get('b').map(buffer_name).transpose()?;
                 if o.has('w') {
                     if let Ok(cid) = self.resolve_client(ctx, o.get('t')) { self.set_selection(cid, "", &data); }
-                }
-                if data.is_empty() {
-                    return Ok(Flow::Next);
                 }
                 self.add_buffer(name, data, false);
                 Ok(Flow::Next)
@@ -4631,17 +4651,20 @@ impl Server {
                         }
                     }
                 }
-                if found == 0 && !errors.is_empty() {
-                    return err(errors.join("\n"));
-                }
-                for e in errors {
-                    self.soft_error(ctx, &e);
+                let fatal = found == 0 && !errors.is_empty();
+                // cdata->retval: a path that matched nothing or a file that did not parse
+                let failed = !errors.is_empty() || !causes.is_empty();
+                if !fatal {
+                    for e in &errors {
+                        self.soft_error(ctx, e);
+                    }
                 }
                 self.cfg_causes.extend(causes);
                 // cmd_source_file_complete_cb: once the configuration is loaded, the causes
-                // so far are printed (cfg_print_causes) and the exit status is 1
-                if self.cfg_finished && !self.cfg_causes.is_empty() {
-                    if ctx.reply.and_then(|r| self.clients.get(&r)).is_some_and(|c| c.session.is_none()) {
+                // so far (also those of earlier files) are printed (cfg_print_causes); the
+                // exit status is 1 only if this command failed
+                if self.cfg_finished {
+                    if failed && ctx.reply.and_then(|r| self.clients.get(&r)).is_some_and(|c| c.session.is_none()) {
                         ctx.retval = 1;
                     }
                     let control = ctx.client.or(ctx.reply).filter(|c| self.is_control(*c));
@@ -4654,6 +4677,9 @@ impl Server {
                             }
                         }
                     }
+                }
+                if fatal {
+                    return err(errors.join("\n"));
                 }
                 Ok(Flow::Inject(injected, true))
             }
@@ -4950,7 +4976,7 @@ impl Server {
         let c = self.clients.get(&cid).ok_or("no client")?;
         if !c.attached {
             let ident = c.ident.as_ref();
-            if ident.is_some_and(|i| i.ctx_pane.is_some()) {
+            if ident.is_some_and(|i| i.nested()) {
                 return err("sessions should be nested with care, unset PWSH_TMUX to force");
             }
             if !ident.is_some_and(|i| i.tty) && c.control == 0 {
@@ -5042,9 +5068,11 @@ impl Server {
     /// CMD_FIND_CANFAIL, so its own error is not shown).
     fn option_target(&self, scope: Scope, global: bool, ctx: &Ctx, t: Option<&str>) -> Result<Target, String> {
         let cause = |what: &str| t.map_or_else(|| format!("no current {what}"), |t| format!("no such {what}: {t}"));
+        // the target is CMD_FIND_PANE for every scope (so a bare name is a window in the
+        // current session before it is a session); options_scope_from_name takes its parts
         Ok(match scope {
-            Scope::Session if !global => Target { sid: Some(self.resolve_session(ctx, t).map_err(|_| cause("session"))?), ..Target::default() },
-            Scope::Window if !global => self.resolve_window(ctx, t).map_err(|_| cause("window"))?,
+            Scope::Session if !global => Target { sid: Some(self.resolve_pane(ctx, t).ok().and_then(|t| t.sid).ok_or_else(|| cause("session"))?), ..Target::default() },
+            Scope::Window if !global => self.resolve_pane(ctx, t).ok().filter(|t| t.wid.is_some()).ok_or_else(|| cause("window"))?,
             Scope::Pane => self.resolve_pane(ctx, t).map_err(|_| cause("pane"))?,
             _ => Target::default(),
         })
@@ -5281,6 +5309,8 @@ impl Server {
                     }
                 }
             }
+            // options_push_changes
+            "monitor-silence" => self.alerts_reset_all(),
             "mode-keys" => {}
             _ => {}
         }
@@ -5922,7 +5952,7 @@ fn capture_line(line: &crate::cells::Line, escapes: bool, keep: bool, trim_unuse
         }
     }
     let text = if escapes {
-        render::line_with_escapes_from(&line, last_link, allocated)
+        render::line_with_escapes_from(&line, last_link, allocated, keep)
     } else {
         (0..line.cells.len()).map(|x| line.cell_text(x)).collect()
     };
@@ -5955,7 +5985,8 @@ fn capture_grid(screen: &vt100::Screen, limit: usize) -> String {
         let Some(row) = screen.history_row(yy) else { continue };
         let p = if yy < hsize { "-".to_string() } else { (yy - hsize).to_string() };
         let cells: Vec<Option<&vt100::Cell>> = (0..sx).map(|x| row.cell(x)).collect();
-        let used = cells.iter().rposition(|c| c.is_some_and(|c| c.has_contents())).map_or(0, |i| i + 1);
+        // gl->cellused: a wide character's padding cell is written too
+        let used = cells.iter().rposition(|c| c.is_some_and(|c| c.has_contents() || c.is_wide_continuation())).map_or(0, |i| i + 1);
         let written = cells.iter().rposition(|c| c.is_some_and(|c| c.has_contents() || c.bgcolor() != vt100::Color::Default)).map_or(0, |i| i + 1);
         // GRID_LINE_* from the row's flags (the OSC 133 columns are not kept)
         let (marks, extended) = screen.history_row_flags(yy);

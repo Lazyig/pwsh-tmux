@@ -305,6 +305,8 @@ mod metadata_tests {
         for (input, cursor, cell) in [
             ("👋🏽", 2, "👋🏽"), ("🏽👋", 2, "🏽👋"), ("👨\u{200D}👩", 2, "👨\u{200D}👩"), ("🇰🇷🇯", 3, "🇰🇷"),
             ("a🏽", 3, "a"), ("x\u{200D}y", 2, "x\u{200D}"),
+            // utf8_should_combine reads the cell's first character: a second modifier joins
+            ("👋🏽🏽", 2, "👋🏽🏽"),
         ] {
             let mut p = Parser::new(NonZeroU16::new(5).unwrap(), NonZeroU16::new(20).unwrap(), 0);
             p.process(input.as_bytes());
@@ -350,6 +352,9 @@ mod metadata_tests {
         // IND, NEL, CBT, SCOSC and SCORC
         let p = p30("ab\x1bDcd\x1bEe\x1b[4;1Habcdefghijkl\x1b[Zx\x1b[5;1Ha\x1b[sbc\x1b[u|");
         assert_eq!(p.screen().contents(), "ab\n  cd\ne\nabcdefghxjkl\na|c");
+        // DECRC keeps the cursor on the screen: a saved pending wrap is dropped
+        let p = p30(&("a".repeat(29) + "x\x1b7\x1b[1;1H\x1b8z"));
+        assert_eq!((p.screen().contents(), p.screen().cursor_position()), ("a".repeat(29) + "z", (0, 30)));
     }
 }
 

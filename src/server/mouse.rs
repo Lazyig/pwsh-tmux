@@ -10,7 +10,6 @@ use super::modes::MenuAction;
 use super::*;
 use crate::format::Range;
 use crate::keys::{Mouse, MouseKind};
-use crate::layout::Dir;
 
 /// tmux KEYC_CLICK_TIMEOUT: the window for second and third clicks.
 pub const CLICK_TIMEOUT: Duration = Duration::from_millis(300);
@@ -711,46 +710,11 @@ impl Server {
             _ => v,
         };
         let (x, y, lx, ly) = (m.x.saturating_add(m.ox), adjust(m.y.saturating_add(m.oy)), m.lx.saturating_add(m.ox), adjust(m.ly.saturating_add(m.oy)));
-        let (rects, _) = self.rects(wid);
         if self.windows[&wid].zoomed {
             return;
         }
-        let mut cells: Vec<(PaneId, bool)> = Vec::new();
-        for (dx, dy) in [(0i32, 0i32), (0, 1), (1, 0), (0, -1), (-1, 0)] {
-            let (bx, by) = (lx as i32 + dx, ly as i32 + dy);
-            if bx < 0 || by < 0 {
-                continue;
-            }
-            let (bx, by) = (bx as u16, by as u16);
-            // layout_search_by_border: the cell left of / above a border at (bx, by)
-            let found = rects
-                .iter()
-                .find(|(_, r)| r.right() == bx && by >= r.y && by < r.bottom())
-                .map(|(p, _)| (*p, true))
-                .or_else(|| rects.iter().find(|(_, r)| r.bottom() == by && bx >= r.x && bx < r.right()).map(|(p, _)| (*p, false)));
-            if let Some(cell) = found {
-                if !cells.contains(&cell) {
-                    cells.push(cell);
-                }
-            }
-        }
         let area = self.window_area(wid);
-        let mut resized = false;
-        for (pane, vertical) in cells {
-            let delta = if vertical { x as i32 - lx as i32 } else { y as i32 - ly as i32 };
-            if delta == 0 {
-                continue;
-            }
-            let dir = match (vertical, delta > 0) {
-                (true, true) => Dir::Right,
-                (true, false) => Dir::Left,
-                (false, true) => Dir::Down,
-                (false, false) => Dir::Up,
-            };
-            let w = self.windows.get_mut(&wid).unwrap();
-            w.layout.resize(pane, dir, delta.unsigned_abs() as u16, area);
-            resized = true;
-        }
+        let resized = self.windows.get_mut(&wid).unwrap().layout.resize_borders((lx, ly), (x, y), area);
         if resized {
             self.apply_layout(wid);
             self.mark_window_dirty(wid);

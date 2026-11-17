@@ -87,7 +87,16 @@ pub fn key_code(name: &str) -> u64 {
     let function = ty(2);
     let mut chars = rest.chars();
     let base = match (chars.next(), chars.next()) {
-        (Some(c), None) => c as u64,
+        // " " and \177 are named only from 0x20 and 0x7f, which are UTF-8 keys
+        (Some(c), None) if c.is_ascii() && c != ' ' && c != '\x7f' => c as u64,
+        // a UTF-8 key is its utf8_char: size and width in the high bits, then the bytes
+        (Some(c), None) => {
+            let mut b = [0u8; 4];
+            let bytes = c.encode_utf8(&mut b).as_bytes();
+            let width = if c.is_ascii() { 1 } else { unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as u64 };
+            let index = bytes.iter().take(3).rev().fold(0u64, |n, b| (n << 8) | u64::from(*b));
+            ((bytes.len() as u64) << 24) | (width << 29) | index
+        }
         _ => match rest {
             "Space" => b' ' as u64,
             "Tab" => 9,
@@ -106,7 +115,10 @@ pub fn key_code(name: &str) -> u64 {
             "Down" => function + 28,
             "Left" => function + 29,
             "Right" => function + 30,
-            _ => special_code(rest).unwrap_or(u64::MAX >> 8),
+            _ => match crate::keys::C0_NAMES.iter().position(|n| *n == rest) {
+                Some(i) => i as u64,
+                None => special_code(rest).unwrap_or(u64::MAX >> 8),
+            },
         },
     };
     base | mods
