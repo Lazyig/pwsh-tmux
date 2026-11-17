@@ -2197,8 +2197,9 @@ mod tests {
         assert_eq!(rect_of(&t, a, 1), first, "unrelated group must stay unchanged");
         let col: Vec<u16> = r[3..].iter().map(|(_, r)| r.h).collect();
         assert_eq!(col, vec![16, 15, 15]);
+        // already even siblings: the parent's panes are spread (tmux counts only panes)
         assert!(t.spread(5, a), "already even siblings: spread the parent group");
-        assert_eq!(rect_of(&t, a, 1).w, 39);
+        assert_eq!(rect_of(&t, a, 1).w, 46);
         assert_eq!(t.panes(), vec![1, 2, 3, 4, 5, 6]);
         assert_cover(&t, a);
         let mut l = Node::Leaf(1);
@@ -2497,14 +2498,18 @@ impl TCell {
     }
 
     /// layout_spread_cell: each child the same size, the remainder to the first ones.
-    /// As in tmux only panes count (layout_cell_is_tiled is false for a cell of cells).
+    /// As in tmux only panes count (layout_cell_is_tiled is false for a cell of cells), so
+    /// a cell with fewer than two panes is left alone. tmux then shares out the whole
+    /// size among the panes, over what the cells of cells already take; here the panes
+    /// share what those leave.
     fn spread_cell(&mut self) -> bool {
         let number = self.kids.iter().filter(|k| k.pane.is_some()).count() as i32;
         if self.pane.is_some() || number <= 1 {
             return false;
         }
         let horizontal = self.horizontal;
-        let size = if horizontal { self.sx } else { self.sy };
+        let others: i32 = self.kids.iter().filter(|k| k.pane.is_none()).map(|k| 1 + if horizontal { k.sx } else { k.sy }).sum();
+        let size = if horizontal { self.sx } else { self.sy } - others;
         if size < number - 1 {
             return false;
         }
