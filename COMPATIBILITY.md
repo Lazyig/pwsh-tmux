@@ -116,11 +116,6 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   never set there. A popup whose command was ended (TerminateProcess) gives its waiting
   command-line client that process's exit code, where on Unix it is the signal number
   (WTERMSIG), as in tmux.
-- **Automatic rename and the pane's program.** tmux reads `pane_current_command` as it
-  checks a window's name; here what a pane runs is looked up in the background about once
-  a second, so a new pane's window is first checked once that lookup has found its
-  program. Otherwise names are checked as tmux does: when the active pane changes (output,
-  a mode, another active pane), at most every 500 ms.
 - **History line times** record the real time a line entered the history; tmux uses
   a time cached at the start of its event loop, which can be older.
 - **Terminal descriptions.** pwsh-tmux draws without terminfo, so a client terminal the
@@ -178,6 +173,13 @@ These do not match tmux 3.8 yet:
   on a pane of about 5000 by 5000 takes seconds.
 - **`backspace C-?`:** the option value `C-?` is read as the BSpace key; tmux's default is
   a raw `\177` that also prints as `C-?`.
+- **The pane's program on Windows.** tmux reads `pane_current_command` when it is used
+  (a format, a window's name check), as Unix does here. On Windows a process snapshot is
+  too slow for that, so what a pane runs is looked up in the background about once a
+  second: `pane_current_command` and automatic rename follow a new program up to a second
+  late, and a new pane's window name is first checked once that lookup has found its
+  program. Window names are otherwise checked as tmux does: when the active pane changes
+  (output, a mode, another active pane), at most every 500 ms.
 
 ## Earlier baseline: tmux 3.6a
 
