@@ -2069,6 +2069,9 @@ pub struct Span {
     pub part: Part,
     /// In the list's focus (`list=focus` up to the next `list=on`), kept visible when trimmed.
     pub focus: bool,
+    /// The fill colour of the styles so far (fill=, the last one that is not default):
+    /// format_draw first clears the whole width with it.
+    pub fill: Option<Color>,
 }
 
 /// The format_draw screen of a span outside its alignment group.
@@ -2124,9 +2127,10 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
     // focus: 0 not started, 1 open (from this span index), 2 ended
     let mut focus = (0, 0);
     let (mut have_left, mut have_right) = (false, false);
+    let mut fill: Option<Color> = None;
 
     #[allow(clippy::too_many_arguments)]
-    fn flush(out: &mut Vec<Span>, buf: &mut String, style: Style, align: Align, range: &Option<Range>, link: &Option<String>, part: Part, focus: bool) {
+    fn flush(out: &mut Vec<Span>, buf: &mut String, style: Style, align: Align, range: &Option<Range>, link: &Option<String>, part: Part, focus: bool, fill: Option<Color>) {
         if buf.is_empty() {
             return;
         }
@@ -2138,10 +2142,11 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
             && !last.range_end
             && last.part == part
             && last.focus == focus
+            && last.fill == fill
         {
             last.text.push_str(buf);
         } else {
-            out.push(Span { text: buf.clone(), link: link.clone(), style, align, range: range.clone(), range_end: false, part, focus });
+            out.push(Span { text: buf.clone(), link: link.clone(), style, align, range: range.clone(), range_end: false, part, focus, fill });
         }
         buf.clear();
     }
@@ -2161,7 +2166,7 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
                 i += e + 1;
                 continue;
             }
-            flush(&mut out, &mut buf, cur, if part == Part::Normal { align } else { list_align }, &range, &link, part, part == Part::List && focus.0 == 1);
+            flush(&mut out, &mut buf, cur, if part == Part::Normal { align } else { list_align }, &range, &link, part, part == Part::List && focus.0 == 1, fill);
             match out.last().map(|l| l.part) {
                 Some(Part::ListLeft) => have_left = true,
                 Some(Part::ListRight) => have_right = true,
@@ -2202,6 +2207,11 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
                     _ if lower.starts_with("range=") => {
                         if let Ok(r) = Range::parse(&w[6..]) {
                             range = r;
+                        }
+                    }
+                    _ if lower.starts_with("fill=") => {
+                        if let Some(c) = parse_color_with(&lower[5..], vars).filter(|c| *c != Color::Default) {
+                            fill = Some(c);
                         }
                     }
                     // as style_parse in 3.8, default keeps the range
@@ -2295,7 +2305,7 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
             i += c.len_utf8();
         }
     }
-    flush(&mut out, &mut buf, cur, if part == Part::Normal { align } else { list_align }, &range, &link, part, part == Part::List && focus.0 == 1);
+    flush(&mut out, &mut buf, cur, if part == Part::Normal { align } else { list_align }, &range, &link, part, part == Part::List && focus.0 == 1, fill);
     // a range still open at the end is dropped, as tmux does
     if range.is_some() {
         for sp in &mut out[range_start..] {
@@ -2449,6 +2459,10 @@ pub fn layout_line_ranged(spans: &[Span], width: usize, fill: Style) -> (Vec<Cel
 /// (tmux leaves what was there, such as the border line under a pane status line).
 pub fn draw_line(spans: &[Span], width: usize, fill: Style) -> (Vec<Option<Cell>>, Vec<Option<Range>>) {
     let mut out = Out { cells: vec![None; width], tags: vec![None; width], fill };
+    // a fill colour clears the available area first (the default cell with that background)
+    if let Some(bg) = spans.iter().rev().find_map(|s| s.fill) {
+        out.cells = vec![Some(Cell { text: " ".into(), style: Style { bg, ..Style::default() } }); width];
+    }
     let normal = |a: Align| Screen::of(spans.iter().filter(move |s| s.part == Part::Normal && s.align == a));
     let part = |p: Part| Screen::of(spans.iter().filter(move |s| s.part == p));
     let (mut left, mut centre, mut right, abs) = (normal(Align::Left), normal(Align::Centre), normal(Align::Right), normal(Align::AbsoluteCentre));
@@ -3320,8 +3334,8 @@ mod tests {
         assert_eq!(
             sp,
             vec![
-                Span { text: "a".into(), link: None, style: st(Color::Idx(1), 0), align: Align::Left, range: None, range_end: false, part: Part::Normal, focus: false },
-                Span { text: "b".into(), link: None, style: base, align: Align::Left, range: None, range_end: false, part: Part::Normal, focus: false },
+                Span { text: "a".into(), link: None, style: st(Color::Idx(1), 0), align: Align::Left, range: None, range_end: false, part: Part::Normal, focus: false, fill: None },
+                Span { text: "b".into(), link: None, style: base, align: Align::Left, range: None, range_end: false, part: Part::Normal, focus: false, fill: None },
             ]
         );
         // Merging of identical styles, `##` → `#`, `##[` is literal.

@@ -767,118 +767,6 @@ impl Server {
         base
     }
 
-    /// The default status line and the mouse range of each cell (status-left is `left`,
-    /// each window entry `window|N` and status-right `right`, as in tmux's status-format).
-    fn status_line(&self, cid: ClientId, sid: SessId, width: u16) -> (Vec<Cell>, Vec<Option<format::Range>>) {
-        let s = &self.sessions[&sid];
-        let width = width as usize;
-        let base = self.status_style(sid, cid);
-        let cur = Target { sid: Some(sid), idx: Some(s.active), wid: Some(s.active_window()), pane: Some(self.windows[&s.active_window()].active) };
-        let left_style = self.style_option(&self.opt_session(Some(sid), "status-left-style"), base, cur, Some(cid)).unwrap_or(base);
-        let right_style = self.style_option(&self.opt_session(Some(sid), "status-right-style"), base, cur, Some(cid)).unwrap_or(base);
-        let left = self.expand_status_time(cur, cid, &self.opt_session(Some(sid), "status-left"), "");
-        let right = self.expand_status_time(cur, cid, &self.opt_session(Some(sid), "status-right"), "");
-        let left_len = self.opt_session_num(Some(sid), "status-left-length").max(0) as usize;
-        let right_len = self.opt_session_num(Some(sid), "status-right-length").max(0) as usize;
-        let lcells = spans_cells(&self.styled_spans(&left, left_style, cur, cid), left_len.min(width), base);
-        let mut rcells = spans_cells(&self.styled_spans(&right, right_style, cur, cid), right_len, base);
-        let available = width.saturating_sub(lcells.len());
-        if rcells.len() > available { rcells.drain(..rcells.len() - available); }
-
-        // window list
-        let sep = self.opt_window(None, "window-status-separator");
-        let mut wcells: Vec<Cell> = Vec::new();
-        let mut wtags: Vec<Option<format::Range>> = Vec::new();
-        let mut cur_range = (0, 0);
-        let n = s.links.len();
-        for (k, (idx, wid)) in s.links.iter().enumerate() {
-            let wid = *wid;
-            let t = Target { sid: Some(sid), idx: Some(*idx), wid: Some(wid), pane: Some(self.windows[&wid].active) };
-            let is_cur = *idx == s.active;
-            let fmt = self.opt_window(Some(wid), if is_cur { "window-status-current-format" } else { "window-status-format" });
-            let wst = |name: &str, base: Style| self.style_option(&self.opt_window(Some(wid), name), base, t, Some(cid)).unwrap_or(base);
-            let mut st = wst("window-status-style", base);
-            if is_cur {
-                st = wst("window-status-current-style", st);
-            } else if s.last.first() == Some(idx) {
-                st = wst("window-status-last-style", st);
-            }
-            let alerts = s.alerts.get(idx).copied().unwrap_or(0);
-            if alerts & ALERT_BELL != 0 {
-                st = wst("window-status-bell-style", st);
-            } else if alerts & (ALERT_ACTIVITY | ALERT_SILENCE) != 0 {
-                st = wst("window-status-activity-style", st);
-            }
-            let text = self.expand_status_time(t, cid, &fmt, "W");
-            let start = wcells.len();
-            wcells.extend(spans_cells(&self.styled_spans(&text, st, t, cid), usize::MAX, st));
-            wtags.resize(wcells.len(), Some(format::Range::Window(*idx)));
-            if is_cur {
-                cur_range = (start, wcells.len());
-            }
-            if k + 1 < n {
-                wcells.extend(spans_cells(&self.styled_spans(&sep, base, t, cid), usize::MAX, base));
-                wtags.resize(wcells.len(), None);
-            }
-        }
-        let avail = width.saturating_sub(lcells.len() + rcells.len());
-        // keep the current window visible when the list is too long
-        let (wstart, wlen) = if wcells.len() <= avail {
-            (0, wcells.len())
-        } else {
-            let centre = cur_range.0 + (cur_range.1 - cur_range.0) / 2;
-            let start = centre.saturating_sub(avail / 2).min(wcells.len().saturating_sub(avail));
-            (start, avail)
-        };
-        let mut wslice: Vec<Cell> = wcells[wstart..wstart + wlen].to_vec();
-        if let Some(c) = wslice.first_mut() {
-            if c.text.is_empty() {
-                *c = Cell { text: " ".into(), style: c.style };
-            }
-        }
-        if wstart > 0 {
-            if let Some(c) = wslice.first_mut() {
-                *c = Cell { text: "<".into(), style: c.style };
-            }
-        }
-        if wstart + wlen < wcells.len() {
-            if let Some(c) = wslice.last_mut() {
-                *c = Cell { text: ">".into(), style: c.style };
-            }
-        }
-        let mut line = vec![Cell { text: " ".into(), style: base }; width];
-        let mut tags: Vec<Option<format::Range>> = vec![None; width];
-        let justify = self.opt_session(Some(sid), "status-justify");
-        let wpos = match justify.as_str() {
-            "centre" => lcells.len() + (avail - wslice.len()) / 2,
-            "absolute-centre" => (width.saturating_sub(wslice.len()) / 2).max(lcells.len()),
-            "right" => lcells.len() + avail - wslice.len(),
-            _ => lcells.len(),
-        };
-        for (i, c) in lcells.into_iter().enumerate() {
-            line[i] = c;
-            tags[i] = Some(format::Range::Left);
-        }
-        for (i, c) in wslice.into_iter().enumerate() {
-            if wpos + i < width {
-                line[wpos + i] = c;
-                tags[wpos + i] = wtags[wstart + i].clone();
-            }
-        }
-        let rstart = width - rcells.len();
-        for (i, c) in rcells.into_iter().enumerate() {
-            line[rstart + i] = c;
-            tags[rstart + i] = Some(format::Range::Right);
-        }
-        // a wide char cut by a region boundary
-        for i in 0..width {
-            if line[i].text.is_empty() && (i == 0 || line[i - 1].text.chars().next().and_then(|c| char_width(c)) != Some(2)) {
-                line[i].text = " ".into();
-            }
-        }
-        (line, tags)
-    }
-
     /// Draw a pane's content (or its mode) with its top left at (x0, y0) of the window,
     /// clipped to `clip` (window columns and rows on the client); sets the cursor and the
     /// terminal modes for the active pane.
@@ -1369,13 +1257,12 @@ impl Server {
                 let y = sy0 + i;
                 let custom = &formats[i as usize];
                 // The built-in first line has a dedicated renderer for list clipping.
-                let (line, tags) = if !custom.is_empty() && !(i == 0 && custom == options::STATUS_FORMATS[0]) {
+                // the default first line too: its window list is a list= of format_draw
+                let (line, tags) = if !custom.is_empty() {
                     let base = self.status_style(sid, cid);
                     let cur = Target { sid: Some(sid), idx: Some(s.active), wid: Some(wid), pane: Some(win.active) };
                     let text = self.expand_status_time(cur, cid, custom, "");
                     format::layout_line_ranged(&self.styled_spans(&text, base, cur, cid), cw as usize, base)
-                } else if i == 0 {
-                    self.status_line(cid, sid, cw)
                 } else {
                     (vec![Cell { text: " ".into(), style: self.status_style(sid, cid) }; cw as usize], vec![None; cw as usize])
                 };
