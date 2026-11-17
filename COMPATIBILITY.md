@@ -120,27 +120,31 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   tty.c:428-450). Windows Terminal never answers XTVERSION (microsoft/terminal#18382,
   closed as not planned), nor do Alacritty, Terminal.app or conhost; Konsole does not
   answer DECRQM. This is treated as a bug: the 500 ms wait protects a reply on its way,
-  and a terminal (or ssh, or ConPTY, which leaves replies to the terminal) returns replies
-  in the order it was asked, so once a reply to a later request has come, an earlier
-  request without a reply will not get one. The maintainer agrees that the replies' order
-  can end the wait (tmux/tmux#5886: put DA last "and use it as a marker for having
-  received everything") but tmux master still waits for the timer (see also
-  tmux/tmux#4822). Here a complete DA2, XTVERSION, DECRPM 2026 or OSC 10/11 reply settles
-  the requests sent before it that have no reply, and those are no longer waited for; an
-  OSC 11 reply settles OSC 10 too, as OSC 10 is asked first. With Windows Terminal the
-  wait ends as the OSC 11 reply comes. What is settled is not taken as received: a reply
-  to it that still comes (out of order) is read as a reply until the start timer, as in
-  tmux, and a partial one (`ESC P > |`, `ESC [ >`, or `ESC [ ?` for DA1 or DECRPM) waits
-  500 ms for the rest. Everything else is as in tmux 3.8: the same requests in the same
-  order, the start timer and what happens after it (a late reply is then read as keys),
-  the wait for a terminal that answers nothing, or nothing after its last missing reply
-  (PuTTY, the Linux console: no OSC 10/11 reply), the wait for a colour asked again, and
-  the waits for clipboard requests, a partial paste end and partial theme or colour
-  replies. (Sending DA1 last as a marker, as #5886 suggests, would end the wait for
-  those terminals too, but it changes the bytes sent, and multiplexers such as GNU screen
-  and Zellij answer DA1 themselves before the colours they ask the outer terminal for.)
-  A partial theme or colour reply and a partial paste end also wait 500 ms after the start
-  timer, where tmux decides by its request flags alone.
+  and a terminal (or ssh, or ConPTY, which passes replies on, or as the older inbox ConPTY
+  answers what it knows itself and drops the rest) returns replies in the order it was
+  asked, so once a reply to a later request has come, an earlier request without a reply
+  will not get one. The maintainer agrees that the replies' order can end the wait
+  (tmux/tmux#5886: put DA last "and use it as a marker for having received everything")
+  but tmux master still waits for the timer (see also tmux/tmux#4822). Here a complete
+  DA2, XTVERSION, DECRPM 2026 or OSC 10/11 reply settles the requests sent before it that
+  have no reply, and those are no longer waited for; an OSC 11 reply settles OSC 10 too,
+  as OSC 10 is asked first, and colours asked again before the reply to an earlier OSC 11
+  came (a theme report asks at once) are waited for until each OSC 11 has its reply. With
+  Windows Terminal the wait ends as the OSC 11 reply comes. What is settled is not taken
+  as received: a reply to it that still comes (out of order) is read as a reply until the
+  start timer, as in tmux, and a partial one waits 500 ms for the rest from its second
+  byte (`ESC P` or `ESC [`), also when an Escape typed just before it is held as a
+  possible Meta prefix (`ESC ESC [`); a reply split after its first byte cannot be told
+  from an Escape and is read as keys, as tmux reads any late reply after the start timer.
+  Everything else is as in tmux 3.8: the same requests in the same order, the start timer
+  and what happens after it (a late reply is then read as keys), the wait for a terminal
+  that answers nothing, or nothing after its last missing reply (PuTTY, the Linux console:
+  no OSC 10/11 reply), the wait for a colour asked again, and the waits for clipboard
+  requests, a partial paste end and partial theme or colour replies. (Sending DA1 last as
+  a marker, as #5886 suggests, would end the wait for those terminals too, but it changes
+  the bytes sent, and multiplexers such as GNU screen and Zellij answer DA1 themselves
+  before the colours they ask the outer terminal for.) A partial theme or colour reply
+  also waits 500 ms after the start timer, where tmux decides by its request flags alone.
 - **No signal information on Windows:** `pane_dead_signal` and other signal values are
   never set there. A popup whose command was ended (TerminateProcess) gives its waiting
   command-line client that process's exit code, where on Unix it is the signal number

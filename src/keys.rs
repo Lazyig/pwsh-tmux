@@ -203,13 +203,15 @@ impl Parser {
 
     /// A partial terminal theme/colour response needs a longer deadline than a bare Escape.
     pub fn theme_reply_pending(&self) -> bool {
-        [b"\x1b]10;".as_slice(), b"\x1b]11;", b"\x1b[?997;", b"\x1bP>|", b"\x1b[>"].iter().any(|prefix| self.reply_pending(prefix))
+        [b"\x1b]10;".as_slice(), b"\x1b]11;", b"\x1b[?997;", b"\x1bP>|", b"\x1b[>"].iter().any(|prefix| self.reply_pending(prefix, 3))
     }
 
-    /// The bytes held back may be the start of a reply beginning with prefix (three bytes
-    /// or more of it: a lone Escape, or Escape and one key, is not).
-    pub fn reply_pending(&self, prefix: &[u8]) -> bool {
-        self.buf.starts_with(prefix) || (self.buf.len() >= 3 && prefix.starts_with(&self.buf))
+    /// The bytes held back may be the start of a reply beginning with prefix: at least min
+    /// bytes of it (a lone Escape is a key), or all of it. An Escape typed just before the
+    /// reply, held as a possible Meta prefix of what follows (ESC ESC [), is not counted.
+    pub fn reply_pending(&self, prefix: &[u8], min: usize) -> bool {
+        let held = if self.buf.starts_with(&[ESC, ESC]) { &self.buf[1..] } else { &self.buf[..] };
+        held.starts_with(prefix) || (held.len() >= min && prefix.starts_with(held))
     }
 
     pub fn feed(&mut self, data: &[u8]) -> Vec<Input> {

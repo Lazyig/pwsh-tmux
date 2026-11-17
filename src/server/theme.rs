@@ -33,6 +33,10 @@ pub struct Terminal {
     started: Option<Instant>,
     /// TTY_WAITFG, TTY_WAITBG: the colour replies still awaited.
     wait_colours: u8,
+    /// The OSC 11 requests (each the last of its pair) without a reply yet: while one is
+    /// outstanding, the colours asked again before it (a theme report asks at once) are
+    /// still on their way, though a reply to an earlier pair settled the rest.
+    colour_requests: u8,
 }
 
 /// Terminal::wait_colours: the OSC 10 and OSC 11 replies.
@@ -46,6 +50,9 @@ pub const HAVE_DA2: u8 = 2;
 pub const HAVE_XDA: u8 = 4;
 pub const HAVE_SYNC: u8 = 8;
 const HAVE_ALL: u8 = HAVE_DA | HAVE_DA2 | HAVE_XDA | HAVE_SYNC;
+
+/// The start of the reply to each request of Terminal::have.
+pub const REPLY_PREFIXES: [(u8, &[u8]); 4] = [(HAVE_DA, b"\x1b[?"), (HAVE_DA2, b"\x1b[>"), (HAVE_XDA, b"\x1bP>|"), (HAVE_SYNC, b"\x1b[?2026;")];
 
 /// tmux TTY_QUERY_TIMEOUT: how long replies to the requests are waited for.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -93,6 +100,7 @@ impl Terminal {
         if self.started.is_some_and(|t| t.elapsed() > QUERY_TIMEOUT) {
             self.have = HAVE_ALL;
             self.wait_colours = 0;
+            self.colour_requests = 0;
         }
     }
     /// A complete OSC 10 or 11 reply, whether its colour parsed or not (tty_keys_colours
@@ -102,7 +110,10 @@ impl Terminal {
     /// (tty_keys_colours clears TTY_WAITFG or TTY_WAITBG).
     pub fn colour_reply(&mut self, fg: bool, parsed: bool) {
         self.settled = HAVE_ALL;
-        if !fg { self.wait_colours &= !WAIT_FG; }
+        if !fg {
+            self.wait_colours &= !WAIT_FG;
+            self.colour_requests = self.colour_requests.saturating_sub(1);
+        }
         if parsed { self.wait_colours &= if fg { !WAIT_FG } else { !WAIT_BG }; }
     }
     /// tty_keys_next: while replies to the requests are awaited (not all of TTY_ALL_REQUEST_FLAGS,
@@ -111,14 +122,13 @@ impl Terminal {
     /// the start timer).
     pub fn replies_pending(&mut self) -> bool {
         self.start_timer();
-        self.started.is_some() && ((self.have | self.settled) & HAVE_ALL != HAVE_ALL || self.wait_colours != 0)
+        self.started.is_some() && ((self.have | self.settled) & HAVE_ALL != HAVE_ALL || self.wait_colours != 0 || self.colour_requests != 0)
     }
-    /// A settled request whose reply may still come (out of order) and is still read as
-    /// one: DA1 or DECRPM 2026, both CSI ?. (DA2, XDA and colour replies have their own
-    /// partial reply delay: keys::Parser::theme_reply_pending.)
-    pub fn late_csi_reply(&mut self) -> bool {
+    /// The settled requests whose reply may still come (out of order) and is then still
+    /// read as one (bits of Terminal::have; REPLY_PREFIXES has how each reply starts).
+    pub fn late_replies(&mut self) -> u8 {
         self.start_timer();
-        self.started.is_some() && self.settled & !self.have & (HAVE_DA | HAVE_SYNC) != 0
+        if self.started.is_some() { self.settled & !self.have } else { 0 }
     }
     /// tty_repeat_requests: ask for the colours again, unless asked within REQUEST_LIMIT
     /// (tty_start_start_timer starts the timer again).
@@ -129,6 +139,7 @@ impl Terminal {
         self.start_timer();
         self.last_requests = Some(Instant::now());
         self.wait_colours = WAIT_FG | WAIT_BG;
+        self.colour_requests = self.colour_requests.saturating_add(1);
         if self.started.is_some() { self.started = self.last_requests; }
         Some(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\")
     }
@@ -818,16 +829,16 @@ mod tests {
         assert!(t.replies_pending());
         t.colour_reply(false, true);
         assert!(!t.replies_pending());
-        assert!(t.waiting(HAVE_XDA) && !t.late_csi_reply());
+        assert!(t.waiting(HAVE_XDA) && t.late_replies() == HAVE_XDA);
         timer(&mut t);
-        assert!(!t.waiting(HAVE_XDA));
+        assert!(!t.waiting(HAVE_XDA) && t.late_replies() == 0);
         // DA1 settled by the DA2 reply: a late DA1 reply may still come
         let mut t = Terminal { vt100: true, ..Default::default() };
         t.start();
         t.received(HAVE_DA2);
-        assert!(t.late_csi_reply() && t.replies_pending());
+        assert!(t.late_replies() == HAVE_DA && t.replies_pending());
         t.received(HAVE_DA);
-        assert!(!t.late_csi_reply());
+        assert!(t.late_replies() == 0);
         // only the background colour answered (an unparsed one counts): the foreground,
         // asked before it, is not waited for
         let mut t = Terminal { vt100: true, ..Default::default() };
@@ -852,6 +863,28 @@ mod tests {
         let again = t.start().unwrap();
         assert!(again.windows(4).any(|w| w == b"\x1b[>q") && !again.windows(3).any(|w| w == b"\x1b[c"));
         assert!(t.replies_pending());
+        // a theme report asks for the colours again at once (server-client.c, force): the
+        // replies to the first pair settle the requests, but the second pair is still
+        // waited for
+        let mut t = Terminal { vt100: true, ..Default::default() };
+        t.start();
+        t.requests(true);
+        for bit in [HAVE_DA, HAVE_DA2, HAVE_SYNC] { t.received(bit); }
+        t.colour_reply(true, true);
+        t.colour_reply(false, true);
+        assert!(t.replies_pending());
+        t.colour_reply(true, true);
+        assert!(t.replies_pending());
+        t.colour_reply(false, true);
+        assert!(!t.replies_pending());
+        // and the timer ends that wait too
+        let mut t = Terminal { vt100: true, ..Default::default() };
+        t.start();
+        t.requests(true);
+        t.colour_reply(false, true);
+        assert!(t.replies_pending());
+        timer(&mut t);
+        assert!(!t.replies_pending());
     }
 
     #[test]

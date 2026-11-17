@@ -347,8 +347,11 @@ impl Server {
         if c.keyp.in_paste() && c.input_state.paste_at.is_none() { c.input_state.paste_at = Some(Instant::now()); }
         if !c.keyp.in_paste() { c.input_state.paste_at = None; }
         // a partial paste end or theme/colour reply restarts the deadline at 500ms or more,
-        // as does a DA1 or DECRPM reply that may still come after a later reply settled it
-        let reply = c.keyp.partial_paste_end() || c.keyp.theme_reply_pending() || (c.keyp.reply_pending(b"\x1b[?") && c.terminal.late_csi_reply());
+        // as does a reply that may still come after a later reply settled its request,
+        // from its second byte (ESC [ or ESC P)
+        let late = c.terminal.late_replies();
+        let reply = c.keyp.partial_paste_end() || c.keyp.theme_reply_pending()
+            || theme::REPLY_PREFIXES.iter().any(|(bit, prefix)| late & bit != 0 && c.keyp.reply_pending(prefix, 2));
         c.esc_deadline = if c.keyp.has_pending() || c.keyp.partial_paste_end() {
             let mut ms = self.opts_server.get("escape-time").and_then(|v| v.parse().ok()).unwrap_or(10u64).max(1);
             // tty_keys_next: also while a clipboard request (TTY_OSC52QUERY) or a reply to

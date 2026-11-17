@@ -34,7 +34,8 @@ answers in order), so with Windows Terminal, which answers all but XTVERSION, th
 ends once its colour replies come instead of five seconds after each attach. A reply to
 a settled request that still comes is read as a reply until the five seconds pass, and
 a terminal that answers nothing, or nothing after the request it skips, is waited for
-five seconds as in tmux (COMPATIBILITY.md, Escape timing after attach). A paste is taken like the keys tmux reads for it
+five seconds as in tmux (COMPATIBILITY.md, Escape timing after attach). A paste is
+taken like the keys tmux reads for it
 (PasteStart, each pasted key, PasteEnd): a popup, a pane capturing keys, a dead pane
 waiting for a key, a menu, the status prompt and a pane prompt (a copy-mode search)
 take them at once even while the client's queue waits, so a paste goes into a popup

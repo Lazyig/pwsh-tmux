@@ -1334,6 +1334,54 @@ fn a_reply_after_one_that_settled_its_request_is_still_read() {
 }
 
 #[test]
+fn a_late_reply_split_after_two_bytes_or_after_an_escape_is_still_read() {
+    let deadline = |f: &Fixture| f.clients[&1].esc_deadline.unwrap().duration_since(Instant::now());
+    // Windows Terminal replies, then an XTVERSION reply split after ESC P
+    let mut f = attach_vt100();
+    f.handle_input(1, b"\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c\x1b[>0;10;1c\x1b[?2026;2$y\x1b]10;rgb:cccc/cccc/cccc\x1b\\\x1b]11;rgb:0c0c/0c0c/0c0c\x1b\\");
+    assert!(escape_delay(&mut f) <= Duration::from_millis(100));
+    f.handle_input(1, b"\x1bP");
+    assert!(deadline(&f) > Duration::from_millis(400));
+    f.handle_input(1, b">|Late(1)\x1b\\");
+    assert_eq!(f.clients[&1].term_type, "Late(1)");
+    assert!(f.pane_input.try_recv().is_err());
+    // (no CSI reply may still come: ESC [ is the usual escape-time)
+    f.handle_input(1, b"\x1b[");
+    assert!(deadline(&f) <= Duration::from_millis(100));
+    // a DA1 reply after the others, split after ESC [, and one an Escape typed just before
+    // it holds back as a possible Meta prefix (ESC ESC [): both are read as replies
+    for (first, typed) in [(&b"\x1b["[..], false), (b"\x1b", true)] {
+        let mut f = attach_vt100();
+        f.clients.get_mut(&1).unwrap().features.0.remove("margins");
+        f.handle_input(1, b"\x1b[>0;10;1c\x1bP>|XTerm(400)\x1b\\\x1b[?2026;2$y\x1b]10;rgb:cccc/cccc/cccc\x1b\\\x1b]11;rgb:0c0c/0c0c/0c0c\x1b\\");
+        f.handle_input(1, first);
+        if typed {
+            assert!(deadline(&f) <= Duration::from_millis(100));
+            f.handle_input(1, b"\x1b[");
+        }
+        assert!(deadline(&f) > Duration::from_millis(400));
+        f.handle_input(1, b"?64;21c");
+        assert!(f.clients[&1].features.has("margins"));
+        if typed { f.clients.get_mut(&1).unwrap().keyp.flush_pending(); }
+    }
+}
+
+#[test]
+fn colours_asked_again_at_once_are_waited_for_after_the_first_replies() {
+    // a theme report (DSR 997) asks for the colours again at once (tty_repeat_requests
+    // with force): the first pair's replies settle every request, but the second pair is
+    // still waited for, so a reply to it split after ESC is not read as keys
+    let deadline = |f: &Fixture| f.clients[&1].esc_deadline.unwrap().duration_since(Instant::now());
+    let mut f = attach_vt100();
+    f.handle_input(1, b"\x1b[?997;1n\x1b[?61;22c\x1b[>0;10;1c\x1b[?2026;2$y\x1b]10;rgb:cccc/cccc/cccc\x1b\\\x1b]11;rgb:0c0c/0c0c/0c0c\x1b\\");
+    f.handle_input(1, b"\x1b");
+    assert!(deadline(&f) > Duration::from_millis(400));
+    f.handle_input(1, b"]10;rgb:cccc/cccc/cccc\x1b\\\x1b]11;rgb:0c0c/0c0c/0c0c\x1b\\");
+    assert!(f.pane_input.try_recv().is_err());
+    assert!(escape_delay(&mut f) <= Duration::from_millis(100));
+}
+
+#[test]
 fn escape_waits_for_requests_without_a_later_reply() {
     // a terminal that answers nothing, or only DA1 and DA2 (no reply after the others):
     // as in tmux 3.8 the Escape delay is 500ms until the start timer
