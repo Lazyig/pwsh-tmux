@@ -3222,16 +3222,48 @@ impl Server {
         s.alerts = std::mem::take(&mut s.alerts).into_iter().filter_map(|(i, a)| map.get(&i).map(|n| (*n, a))).collect();
     }
 
+    /// server_destroy_session: where the clients of a destroyed session go by its
+    /// detach-on-destroy (off: the newest other session; no-detached: the newest one
+    /// with no clients; previous and next: by name), and where a client that must not
+    /// detach goes when that finds none (the newest other session, with on or no-detached).
+    fn destroy_session_targets(&self, sid: SessId) -> (Option<SessId>, Option<SessId>) {
+        let Some(s) = self.sessions.get(&sid) else { return (None, None) };
+        let mode = s.options.get("detach-on-destroy").map(String::from).unwrap_or_else(|| self.opt_session(None, "detach-on-destroy"));
+        let newer = |detached: bool| {
+            self.sessions
+                .values()
+                .filter(|o| o.id != sid && !(detached && self.clients.values().any(|c| c.attached && c.session == Some(o.id))))
+                .max_by_key(|o| o.activity_seq)
+                .map(|o| o.id)
+        };
+        let by_name = |step: isize| {
+            let mut names: Vec<&Session> = self.sessions.values().collect();
+            names.sort_by(|a, b| a.name.cmp(&b.name));
+            let i = names.iter().position(|o| o.id == sid)? as isize;
+            let n = names[(i + step).rem_euclid(names.len() as isize) as usize].id;
+            (n != sid).then_some(n)
+        };
+        let s_new = match mode.as_str() {
+            "off" => newer(false),
+            "no-detached" => newer(true),
+            "previous" => by_name(-1),
+            "next" => by_name(1),
+            _ => None,
+        };
+        let cs_new = if s_new.is_none() && matches!(mode.as_str(), "on" | "no-detached") { newer(false) } else { None };
+        (s_new, cs_new)
+    }
+
     pub fn kill_session(&mut self, sid: SessId, _empty: bool) {
         // session-closed fires with the session's unlinks once the change is seen
         // (session_destroy), after what the command did before
         let closed = self.sessions.contains_key(&sid).then(|| self.payload_session(sid));
+        let (s_new, cs_new) = self.destroy_session_targets(sid);
         let Some(s) = self.sessions.remove(&sid) else { return };
         if let Some(mut p) = closed {
             p.target = vars::Target::default();
             self.ev.closed.push((sid, p));
         }
-        let detach_mode = s.options.get("detach-on-destroy").map(String::from).unwrap_or_else(|| self.opt_session(None, "detach-on-destroy"));
         for (_, wid) in &s.links {
             if self.links_of(*wid).is_empty() {
                 if let Some(w) = self.windows.remove(wid) {
@@ -3243,17 +3275,8 @@ impl Server {
         }
         let cids: Vec<ClientId> = self.clients.values().filter(|c| c.session == Some(sid)).map(|c| c.id).collect();
         for cid in cids {
-            let next = match detach_mode.as_str() {
-                "off" | "no-detached" | "previous" | "next" => self
-                    .clients
-                    .get(&cid)
-                    .and_then(|c| c.last_session)
-                    .filter(|s| self.sessions.contains_key(s))
-                    .or_else(|| self.current_session()),
-                // a no-detach-on-destroy client goes to any other session
-                _ if self.clients.get(&cid).is_some_and(|c| c.ctl.no_detach_on_destroy) => self.current_session(),
-                _ => None,
-            };
+            // a no-detach-on-destroy client goes to any other session
+            let next = s_new.or(cs_new.filter(|_| self.clients.get(&cid).is_some_and(|c| c.ctl.no_detach_on_destroy))).filter(|n| self.sessions.contains_key(n));
             match next {
                 Some(n) => self.switch_client(cid, n),
                 None => {

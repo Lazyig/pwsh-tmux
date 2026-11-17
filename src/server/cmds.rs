@@ -160,7 +160,7 @@ pub fn check_command(argv: &[String]) -> Result<(), String> {
     let full = canonical(name).ok_or_else(|| format!("unknown command: {name}"))?;
     let mut args = rest.to_vec();
     if ENV_COMMANDS.contains(&full) {
-        take_env(&mut args);
+        take_env(full, &mut args);
     }
     parse_args(full, &args).map(|_| ())
 }
@@ -469,30 +469,57 @@ fn err<T>(s: impl Into<String>) -> Result<T, String> {
 }
 
 /// Extracts every `-e VAR=value` (repeatable) before getopt sees them.
-fn take_env(args: &mut Vec<String>) -> Vec<(String, String)> {
+/// The -e VAR=value arguments of an environment command, taken out of its arguments as
+/// getopt reads them (after flags with values too: `new -d -s x -e A=1`).
+fn take_env(full: &str, args: &mut Vec<String>) -> Vec<(String, String)> {
+    let vals = COMMANDS.iter().find(|c| c.0 == full).map_or("", |c| c.3);
     let mut env = Vec::new();
+    let mut out = Vec::new();
     let mut i = 0;
     while i < args.len() {
-        let a = &args[i];
-        if a == "--" || !a.starts_with('-') {
+        let a = args[i].clone();
+        if a == "--" || !a.starts_with('-') || a.len() < 2 {
             break;
         }
-        if a == "-e" && i + 1 < args.len() {
-            if let Some((k, v)) = args[i + 1].split_once('=') {
-                env.push((k.to_string(), v.to_string()));
+        // rebuild the cluster without its -e
+        let chars: Vec<char> = a[1..].chars().collect();
+        let mut kept = String::from("-");
+        let mut j = 0;
+        let mut next_taken = false;
+        while j < chars.len() {
+            let c = chars[j];
+            if vals.contains(c) {
+                let attached: String = chars[j + 1..].iter().collect();
+                let value = if attached.is_empty() {
+                    next_taken = true;
+                    args.get(i + 1).cloned()
+                } else {
+                    Some(attached.clone())
+                };
+                if c == 'e' {
+                    if let Some((k, v)) = value.as_deref().and_then(|v| v.split_once('=')) {
+                        env.push((k.to_string(), v.to_string()));
+                    }
+                } else {
+                    kept.push(c);
+                    kept.push_str(&attached);
+                    if next_taken {
+                        if kept.len() > 1 { out.push(std::mem::take(&mut kept)); }
+                        if let Some(v) = value { out.push(v); }
+                    }
+                }
+                break;
             }
-            args.drain(i..i + 2);
-            continue;
+            kept.push(c);
+            j += 1;
         }
-        if let Some(kv) = a.strip_prefix("-e").filter(|s| s.contains('=')) {
-            if let Some((k, v)) = kv.split_once('=') {
-                env.push((k.to_string(), v.to_string()));
-            }
-            args.remove(i);
-            continue;
+        if kept.len() > 1 {
+            out.push(kept);
         }
-        i += 1;
+        i += if next_taken { 2 } else { 1 };
     }
+    out.extend(args.drain(i.min(args.len())..));
+    *args = out;
     env
 }
 
@@ -833,6 +860,133 @@ impl Server {
         }
     }
 
+    /// cmd_find_target with CMD_FIND_WINDOW_INDEX (new-window, link-window, break-pane
+    /// -t): the session, the index asked for (None for -1: the next free one) and the
+    /// winlink found (the current window when only an index or offset was given), which
+    /// -a and -b shuffle up from; an unused index finds none.
+    pub(crate) fn find_index(&self, ctx: &Ctx, target: Option<&str>) -> Result<(SessId, Option<u32>, Option<u32>), String> {
+        let t = target.unwrap_or("");
+        let cur = self.current(ctx);
+        let csid = cur.sid.ok_or("no current target")?;
+        if t.is_empty() {
+            return Ok((csid, None, Some(self.sessions[&csid].active)));
+        }
+        let whole = |r: Target| -> Result<(SessId, Option<u32>, Option<u32>), String> {
+            let (sid, idx) = (r.sid.ok_or("no current target")?, r.idx.ok_or("no current target")?);
+            Ok((sid, Some(idx), Some(idx)))
+        };
+        if matches!(t, "{mouse}" | "=" | "{marked}" | "~") || self.client_current(ctx, t).is_some() {
+            return whole(self.cmd_find(ctx, Some(t), Find::Window, 0)?);
+        }
+        let (copy, colon) = match t.split_once(':') {
+            Some((a, b)) => (a, Some(b)),
+            None => (t, None),
+        };
+        let (session, window, pane, window_only) = match colon {
+            Some(rest) => match rest.split_once('.') {
+                Some((w, p)) => (Some(copy), Some(w), Some(p), true),
+                None => (Some(copy), Some(rest), None, true),
+            },
+            None => match copy.split_once('.') {
+                Some((w, p)) => (None, Some(w), Some(p), false),
+                None if copy.starts_with('$') => (Some(copy), None, None, false),
+                None if copy.starts_with('%') => (None, None, Some(copy), false),
+                None => (None, Some(copy), None, false),
+            },
+        };
+        let exact_session = session.is_some_and(|s| s.starts_with('='));
+        let session = session.map(|s| s.strip_prefix('=').unwrap_or(s)).filter(|s| !s.is_empty());
+        let exact_window = window.is_some_and(|w| w.starts_with('='));
+        let window = window.map(|w| w.strip_prefix('=').unwrap_or(w)).filter(|w| !w.is_empty());
+        if pane.is_some_and(|p| !p.is_empty()) {
+            return err("can't specify pane here");
+        }
+        if let Some(sn) = session {
+            let sid = self.get_session(sn, exact_session).ok_or_else(|| format!("can't find session: {sn}"))?;
+            return match window {
+                None => Ok((sid, None, Some(self.sessions[&sid].active))),
+                Some(w) => self.index_in(sid, w, exact_window).map(|(i, wl)| (sid, i, wl)).ok_or_else(|| format!("can't find window: {w}")),
+            };
+        }
+        let Some(w) = window else { return Ok((csid, None, Some(self.sessions[&csid].active))) };
+        // cmd_find_get_window: an id, a window of the current session, else a session
+        if let Some(id) = w.strip_prefix('@') {
+            let (sid, idx) = id.parse::<WinId>().ok().filter(|w| self.windows.contains_key(w)).and_then(|wid| self.best_link(wid, None)).ok_or_else(|| format!("can't find window: {w}"))?;
+            return Ok((sid, Some(idx), Some(idx)));
+        }
+        if let Some((i, wl)) = self.index_in(csid, w, exact_window) {
+            return Ok((csid, i, wl));
+        }
+        if !window_only {
+            if let Some(sid) = self.get_session(w, exact_session) {
+                return Ok((sid, None, Some(self.sessions[&sid].active)));
+            }
+        }
+        err(format!("can't find window: {w}"))
+    }
+
+    /// cmd_find_get_window_with_session with CMD_FIND_WINDOW_INDEX: an offset or an
+    /// unused index is only an index (the winlink stays the current window).
+    fn index_in(&self, sid: SessId, w: &str, exact: bool) -> Option<(Option<u32>, Option<u32>)> {
+        let s = &self.sessions[&sid];
+        let cur = s.active;
+        let found = |i: u32| Some((Some(i), Some(i)));
+        let w = match w {
+            "{start}" => "^",
+            "{end}" => "$",
+            "{last}" => "!",
+            "{next}" => "+",
+            "{previous}" => "-",
+            _ => w,
+        };
+        if let Some(id) = w.strip_prefix('@') {
+            let wid = id.parse::<WinId>().ok()?;
+            return s.links.iter().find(|(_, x)| **x == wid).and_then(|(i, _)| found(*i));
+        }
+        if !exact && (w.starts_with('+') || w.starts_with('-')) {
+            let n = if w.len() > 1 { w[1..].parse::<u32>().ok().filter(|n| *n >= 1 && *n <= i32::MAX as u32)? } else { 1 };
+            let idx = if w.starts_with('+') { cur.checked_add(n).filter(|i| *i <= i32::MAX as u32)? } else { cur.checked_sub(n)? };
+            return Some((Some(idx), Some(cur)));
+        }
+        if !exact {
+            match w {
+                "!" => return s.last.first().and_then(|i| found(*i)),
+                "^" => return s.links.keys().next().and_then(|i| found(*i)),
+                "$" => return s.links.keys().next_back().and_then(|i| found(*i)),
+                _ => {}
+            }
+        }
+        if let Ok(i) = w.parse::<u32>().map_err(|_| ()).and_then(|i| if w.starts_with('+') || i > i32::MAX as u32 { Err(()) } else { Ok(i) }) {
+            return Some((Some(i), s.links.contains_key(&i).then_some(i)));
+        }
+        let one = |f: &dyn Fn(&str) -> bool| -> Option<Option<(Option<u32>, Option<u32>)>> {
+            let m: Vec<u32> = s.links.iter().filter(|(_, wid)| f(&self.windows[wid].name)).map(|(i, _)| *i).collect();
+            match m.len() {
+                0 => None,
+                1 => Some(found(m[0])),
+                _ => Some(None),
+            }
+        };
+        if let Some(r) = one(&|n| n == w) {
+            return r;
+        }
+        if exact {
+            return None;
+        }
+        if let Some(r) = one(&|n| n.starts_with(w)) {
+            return r;
+        }
+        one(&|n| fnmatch(w, n)).flatten()
+    }
+
+    /// winlink_shuffle_up: -a puts a window after `wl`, -b at it, moving the windows
+    /// from there up to the next free index along.
+    fn shuffle_up(&mut self, sid: SessId, wl: u32, before: bool) -> u32 {
+        let idx = if before { wl } else { wl + 1 };
+        self.shift_up(sid, idx);
+        idx
+    }
+
     fn find_window_in(&self, sid: SessId, w: &str, ctx: &Ctx) -> Result<u32, String> {
         let s = &self.sessions[&sid];
         let keys: Vec<u32> = s.links.keys().copied().collect();
@@ -1092,18 +1246,24 @@ impl Server {
         if !s.links.contains_key(&idx) {
             return;
         }
-        let moved: Vec<(u32, WinId)> = s.links.range(idx..).map(|(i, w)| (*i, *w)).collect();
-        for (i, _) in &moved {
-            s.links.remove(i);
+        // winlink_shuffle_up: only the windows up to the next free index move
+        let mut end = idx;
+        while s.links.contains_key(&end) {
+            end += 1;
         }
-        for (i, w) in moved {
+        let moved = idx..end;
+        for i in moved.clone().rev() {
+            let w = s.links.remove(&i).unwrap();
             s.links.insert(i + 1, w);
+            if let Some(a) = s.alerts.remove(&i) {
+                s.alerts.insert(i + 1, a);
+            }
         }
-        if s.active >= idx {
+        if moved.contains(&s.active) {
             s.active += 1;
         }
         for l in s.last.iter_mut() {
-            if *l >= idx {
+            if moved.contains(l) {
                 *l += 1;
             }
         }
@@ -1599,7 +1759,7 @@ impl Server {
             return err("too many waiting overlays");
         }
         let mut args = rest.to_vec();
-        let env = if ENV_COMMANDS.contains(&full) { take_env(&mut args) } else { Vec::new() };
+        let env = if ENV_COMMANDS.contains(&full) { take_env(full, &mut args) } else { Vec::new() };
         // read-only users (server-access -r) may only look
         if ctx.readonly && !READ_ONLY_OK.contains(&full) {
             return err("client is read-only");
@@ -1741,11 +1901,13 @@ impl Server {
                 if let (Some(ds), Some(s)) = (default_size, self.sessions.get_mut(&sid)) {
                     s.options.set("default-size", ds);
                 }
-                if o.has('E') {
-                    // -E: no update-environment, only the -e variables
-                    if let Some(s) = self.sessions.get_mut(&sid) {
-                        s.env = env.iter().map(|(k, v)| (k.clone(), Some(v.clone()))).collect();
+                // the -e variables go in the session environment (environ_put); -E: no
+                // update-environment, only them
+                if let Some(s) = self.sessions.get_mut(&sid) {
+                    if o.has('E') {
+                        s.env.clear();
                     }
+                    s.env.extend(env.iter().map(|(k, v)| (k.clone(), Some(v.clone()))));
                 }
                 if o.has('P') {
                     let fmt = o.get('F').unwrap_or("#{session_name}:");
@@ -2068,18 +2230,7 @@ impl Server {
             // ---------------------------------------------------------------- windows
             "new-window" => {
                 let command = spawn_command(&o, false)?;
-                let (sid, base_idx) = match t {
-                    Some(tt) if tt.contains(':') => {
-                        let (s, w) = tt.split_once(':').unwrap();
-                        let sid = self.find_session(ctx, s)?;
-                        (sid, if w.is_empty() { None } else { Some(w.trim_start_matches('=').parse::<u32>().map_err(|_| format!("bad index: {w}"))?) })
-                    }
-                    Some(tt) => match tt.trim_start_matches('=').parse::<u32>() {
-                        Ok(i) => (self.current(ctx).sid.ok_or("no current session")?, Some(i)),
-                        Err(_) => (self.find_session(ctx, tt)?, None),
-                    },
-                    None => (self.current(ctx).sid.ok_or("no current session")?, None),
-                };
+                let (sid, base_idx, wl) = self.find_index(ctx, t)?;
                 // -n is a format of the target session, checked (check_name) and cleaned
                 let name = match o.get('n') {
                     Some(n) => {
@@ -2091,13 +2242,30 @@ impl Server {
                     }
                     None => None,
                 };
-                let s = &self.sessions[&sid];
-                let cur_idx = s.active;
+                // -S selects the window at the -t index, else the one named by -n
+                if o.has('S') {
+                    let existing = match (base_idx, name.as_deref()) {
+                        (Some(i), _) => self.sessions[&sid].links.contains_key(&i).then_some(i),
+                        (None, Some(n)) => {
+                            let named: Vec<u32> = self.sessions[&sid].links.iter().filter(|(_, w)| self.windows[w].name == n).map(|(i, _)| *i).collect();
+                            if named.len() > 1 {
+                                return err(format!("multiple windows named {n}"));
+                            }
+                            named.first().copied()
+                        }
+                        _ => None,
+                    };
+                    if let Some(i) = existing {
+                        if !o.has('d') {
+                            self.select_window(sid, i);
+                            self.select_window_latest(ctx, sid);
+                        }
+                        return Ok(Flow::Next);
+                    }
+                }
                 let mut replaced = None;
-                let idx = if o.has('a') || o.has('b') {
-                    let at = base_idx.unwrap_or(cur_idx) + if o.has('a') { 1 } else { 0 };
-                    self.shift_up(sid, at);
-                    at
+                let idx = if let Some(wl) = wl.filter(|_| o.has('a') || o.has('b')) {
+                    self.shuffle_up(sid, wl, o.has('b'))
                 } else if let Some(i) = base_idx {
                     if self.sessions[&sid].links.contains_key(&i) {
                         if !o.has('k') {
@@ -2113,18 +2281,6 @@ impl Server {
                 };
                 if !self.sessions.contains_key(&sid) {
                     return err("session gone");
-                }
-                if o.has('S') {
-                    if let Some(n) = name.as_deref() {
-                        let existing = self.sessions[&sid].links.iter().find(|(_, w)| self.windows[w].name == n).map(|(i, _)| *i);
-                        if let Some(i) = existing {
-                            if !o.has('d') {
-                                self.select_window(sid, i);
-                                self.select_window_latest(ctx, sid);
-                            }
-                            return Ok(Flow::Next);
-                        }
-                    }
                 }
                 // spawn_window: default_window_size for the target client
                 let (sx, sy) = self.default_window_size(self.resolve_client(ctx, None).ok(), sid, None, None);
@@ -2203,36 +2359,16 @@ impl Server {
                 }
                 let src = self.resolve_window(ctx, o.get('s'))?;
                 let wid = src.wid.unwrap();
-                let (dsid, didx) = match t {
-                    Some(tt) => {
-                        let (s, w) = tt.split_once(':').unwrap_or((tt, ""));
-                        let sid = if s.is_empty() {
-                            self.current(ctx).sid.ok_or("no session")?
-                        } else {
-                            match self.find_session(ctx, s) {
-                                Ok(sid) => sid,
-                                Err(_) if !tt.contains(':') && tt.parse::<u32>().is_ok() => self.current(ctx).sid.ok_or("no session")?,
-                                Err(error) => return Err(error),
-                            }
-                        };
-                        let idx = if w.is_empty() {
-                            if tt.contains(':') || self.find_session(ctx, tt).is_ok() { None } else { tt.parse().ok() }
-                        } else {
-                            w.parse().ok().or_else(|| self.find_window_in(sid, w, ctx).ok())
-                        };
-                        (sid, idx)
-                    }
-                    None => (self.current(ctx).sid.ok_or("no session")?, None),
-                };
+                let (dsid, didx, dwl) = self.find_index(ctx, t)?;
                 let idx = if o.has('a') || o.has('b') {
-                    let base = didx.unwrap_or(self.sessions[&dsid].active) + if o.has('a') { 1 } else { 0 };
-                    self.shift_up(dsid, base);
-                    base
+                    let wl = dwl.unwrap_or(self.sessions[&dsid].active);
+                    self.shuffle_up(dsid, wl, o.has('b'))
                 } else {
                     match didx {
                         Some(i) if self.sessions[&dsid].links.contains_key(&i) => {
+                            // server_link_window
                             if self.sessions[&dsid].links[&i] == wid {
-                                return Ok(Flow::Next);
+                                return err(format!("same index: {i}"));
                             }
                             if !o.has('k') {
                                 return err(format!("index in use: {i}"));
@@ -2389,7 +2525,8 @@ impl Server {
                 Ok(Flow::Next)
             }
             "respawn-window" | "respawn-pane" => {
-                let requested = spawn_command(&o, false)?;
+                // SPAWN_EMPTY: respawn -E ignores a command (only new panes refuse one)
+                let requested = if o.has('E') { vec![EMPTY_PANE.to_string()] } else { spawn_command(&o, false)? };
                 let tt = if cmd == "respawn-window" { self.resolve_window(ctx, t)? } else { self.resolve_pane(ctx, t)? };
                 let wid = tt.wid.unwrap();
                 let pane = if cmd == "respawn-window" {
@@ -2910,6 +3047,7 @@ impl Server {
             }
             "break-pane" => {
                 let src = self.resolve_pane(ctx, o.get('s'))?;
+                let (dsid, didx, dwl) = self.find_index(ctx, t)?;
                 let (swid, pane) = (src.wid.unwrap(), src.pane.unwrap());
                 if self.windows[&swid].modal == Some(pane) {
                     return err("pane is modal");
@@ -2918,24 +3056,47 @@ impl Server {
                     return self.cmd_float_pane(&o, swid, pane, src);
                 }
                 let ssid = src.sid.ok_or("no session")?;
-                let (dsid, didx) = match t {
-                    Some(tt) => {
-                        let (s, w) = tt.split_once(':').unwrap_or((tt, ""));
-                        let sid = if s.is_empty() { ssid } else { self.find_session(ctx, s)? };
-                        (sid, w.parse::<u32>().ok())
-                    }
-                    None => (ssid, None),
-                };
                 let name = o.get('n').map(String::from);
                 if let Some(n) = name.as_deref().filter(|n| !check_name(n)) {
                     return err(format!("invalid window name: {n}"));
                 }
+                let didx = match o.has('a') || o.has('b') {
+                    true => Some(self.shuffle_up(dsid, dwl.unwrap_or(self.sessions[&dsid].active), o.has('b'))),
+                    false => didx,
+                };
                 if self.windows[&swid].panes().len() == 1 {
-                    // already alone: just move the window
+                    // already alone: server_link_window moves the window to the index
+                    // (the next free one without -t)
+                    self.unzoom_window(swid);
+                    let sidx = self.sessions[&ssid].links.iter().find(|(_, w)| **w == swid).map(|(i, _)| *i).or(src.idx).ok_or("no window")?;
+                    let idx = match didx {
+                        Some(i) if self.sessions[&dsid].links.get(&i) == Some(&swid) => return err(format!("same index: {i}")),
+                        Some(i) if self.sessions[&dsid].links.contains_key(&i) => return err(format!("index in use: {i}")),
+                        Some(i) => i,
+                        None => self.next_index(dsid, None),
+                    };
+                    self.link(dsid, idx, swid, !o.has('d'));
                     if let Some(n) = name {
-                        self.windows.get_mut(&swid).unwrap().name = n;
+                        let w = self.windows.get_mut(&swid).unwrap();
+                        w.name = clean_name(&n);
+                        w.options.set("automatic-rename", "off".into());
+                    }
+                    if self.sessions[&ssid].links.get(&sidx) == Some(&swid) && (ssid != dsid || sidx != idx) {
+                        self.unlink(ssid, sidx);
+                    }
+                    self.update_session_size(dsid);
+                    self.pane_moved_now(pane);
+                    self.mark_all_dirty();
+                    if o.has('P') {
+                        let fmt = o.get('F').unwrap_or("#{session_name}:#{window_index}.#{pane_index}");
+                        let line = self.expand_for_pane(pane, fmt);
+                        ctx.out.push_str(&line);
+                        ctx.out.push('\n');
                     }
                     return Ok(Flow::Next);
+                }
+                if let Some(i) = didx.filter(|i| self.sessions[&dsid].links.contains_key(i)) {
+                    return err(format!("index in use: {i}"));
                 }
                 // cmd-break-pane.c: server_unzoom_window, window_lost_pane (the new
                 // active pane), layout_close_pane, then the new window is attached,
@@ -2951,13 +3112,7 @@ impl Server {
                 if name.is_some() {
                     self.windows.get_mut(&nwid).unwrap().options.set("automatic-rename", "off".into());
                 }
-                let idx = if o.has('a') || o.has('b') {
-                    let at = didx.unwrap_or(self.sessions[&dsid].active) + if o.has('a') { 1 } else { 0 };
-                    self.shift_up(dsid, at);
-                    at
-                } else {
-                    didx.filter(|i| !self.sessions[&dsid].links.contains_key(i)).unwrap_or_else(|| self.next_index(dsid, None))
-                };
+                let idx = didx.unwrap_or_else(|| self.next_index(dsid, None));
                 self.link(dsid, idx, nwid, !o.has('d'));
                 self.link_now(dsid, idx, nwid);
                 self.apply_layout(nwid);
@@ -3893,18 +4048,37 @@ impl Server {
                 Ok(Flow::Next)
             }
             "unbind-key" => {
-                let table = if o.has('n') { "root".to_string() } else { o.get('T').unwrap_or("prefix").to_string() };
+                // cmd_unbind_key_exec: -q silences the errors (and so the exit status, which cmdq_error sets)
+                let quiet = o.has('q');
+                let fail = |e: String| if quiet { Ok(Flow::Next) } else { Err(e) };
+                let table = if o.has('T') { o.get('T').unwrap().to_string() } else if o.has('n') { "root".to_string() } else { "prefix".to_string() };
                 if o.has('a') {
-                    if let Some(tb) = self.bindings.get_mut(&table) {
-                        tb.clear();
+                    if !o.rest.is_empty() {
+                        return fail("key given with -a".into());
+                    }
+                    if !self.bindings.contains_key(&table) {
+                        return fail(format!("table {table} doesn't exist"));
+                    }
+                    // key_bindings_remove_table: the table goes, and clients in it leave it
+                    self.bindings.remove(&table);
+                    let cids: Vec<ClientId> = self.clients.values().filter(|c| c.key_table == table).map(|c| c.id).collect();
+                    for cid in cids {
+                        let sid = self.clients[&cid].session;
+                        let t = self.opt_session(sid, "key-table");
+                        self.clients.get_mut(&cid).unwrap().set_key_table(&t);
                     }
                     return Ok(Flow::Next);
                 }
-                let key = o.rest.first().ok_or("unbind-key needs a key")?;
-                let kname = keys::parse_key_name(key).map(|k| keys::key_name(&k)).unwrap_or(key.clone());
+                let Some(key) = o.rest.first() else { return fail("missing key".into()) };
+                let Some(k) = keys::parse_key_name(key) else { return fail(format!("unknown key: {key}")) };
+                if o.has('T') && !self.bindings.contains_key(&table) {
+                    return fail(format!("table {table} doesn't exist"));
+                }
+                let kname = keys::key_name(&k);
                 let removed = self.bindings.get_mut(&table).and_then(|t| t.remove(&kname)).is_some();
-                if !removed && !o.has('q') {
-                    // tmux is silent here too
+                // key_bindings_remove: a table left with no bindings and no defaults goes
+                if removed && self.bindings.get(&table).is_some_and(|t| t.is_empty()) && !input::default_bindings().contains_key(&table) {
+                    self.bindings.remove(&table);
                 }
                 Ok(Flow::Next)
             }
@@ -5864,8 +6038,13 @@ mod tests {
         assert_eq!(canonical("neww"), Some("new-window"));
         assert_eq!(canonical("list-k"), Some("list-keys"));
         let mut a: Vec<String> = ["-e", "A=1", "-eB=2", "-d", "cmd"].iter().map(|s| s.to_string()).collect();
-        let env = take_env(&mut a);
+        let env = take_env("new-session", &mut a);
         assert_eq!(env.len(), 2);
         assert_eq!(a, vec!["-d", "cmd"]);
+        // after a flag with a value, and in a cluster
+        let mut a: Vec<String> = ["-d", "-s", "x", "-e", "A=1", "-de", "B=2", "-n", "-e", "--", "-e"].iter().map(|s| s.to_string()).collect();
+        let env = take_env("new-session", &mut a);
+        assert_eq!(env, vec![("A".into(), "1".into()), ("B".into(), "2".into())]);
+        assert_eq!(a, vec!["-d", "-s", "x", "-d", "-n", "-e", "--", "-e"]);
     }
 }
