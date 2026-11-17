@@ -364,9 +364,55 @@ impl Node {
     }
 
     /// Grow/shrink the pane by moving the nearest enclosing separator of the
-    /// matching orientation `cells` cells toward `dir`.
+    /// matching orientation `cells` cells toward `dir` (the mouse: layout_resize_pane
+    /// without taking from the other side).
     pub fn resize(&mut self, target: PaneId, dir: Dir, cells: u16, r: Rect) -> bool {
-        self.resize_inner(target, dir, cells, r) == Some(true)
+        self.resize_pane(target, dir, cells, r, false)
+    }
+
+    /// layout_resize_pane: `cells` right or down grows the pane's cell in the nearest
+    /// parent of that direction (left or up shrinks it; the last cell moves the border
+    /// before it), taking room from the next cell that has some, then with `opposite`
+    /// the ones before; shrinking gives it to the cell after.
+    pub fn resize_pane(&mut self, target: PaneId, dir: Dir, cells: u16, r: Rect, opposite: bool) -> bool {
+        let (mut panes, mut seps) = (Vec::new(), Vec::new());
+        self.layout(r, &mut panes, &mut seps);
+        let mut sizes: HashMap<PaneId, (i32, i32)> = panes.iter().map(|(p, r)| (*p, (i32::from(r.w), i32::from(r.h)))).collect();
+        let Some(mut cell) = self.cell(&sizes) else { return false };
+        let horizontal = matches!(dir, Dir::Left | Dir::Right);
+        let change = if matches!(dir, Dir::Right | Dir::Down) { i32::from(cells) } else { -i32::from(cells) };
+        let Some(path) = cell.path(target) else { return false };
+        // the nearest parent of the same type
+        let mut depth = path.len();
+        loop {
+            if depth == 0 {
+                return false;
+            }
+            let parent = cell.at(&path[..depth - 1]);
+            if parent.pane.is_none() && parent.horizontal == horizontal {
+                break;
+            }
+            depth -= 1;
+        }
+        let parent = cell.at_mut(&path[..depth - 1]);
+        let mut idx = path[depth - 1];
+        if idx + 1 == parent.kids.len() && idx > 0 {
+            idx -= 1;
+        }
+        let mut needed = change;
+        while needed != 0 {
+            let size = if change > 0 { parent.grow(idx, horizontal, needed, opposite) } else { parent.shrink(idx, horizontal, needed) };
+            if size == 0 {
+                break;
+            }
+            needed += if change > 0 { -size } else { size };
+        }
+        if needed == change {
+            return false;
+        }
+        cell.store(&mut sizes);
+        self.set_ratios(&sizes);
+        true
     }
 
     // Some(true) done, Some(false) target found below but not yet adjusted, None not found.
@@ -2369,6 +2415,53 @@ impl TCell {
                 break;
             }
         }
+    }
+
+    fn path(&self, pane: PaneId) -> Option<Vec<usize>> {
+        if self.pane == Some(pane) {
+            return Some(Vec::new());
+        }
+        self.kids.iter().enumerate().find_map(|(i, k)| k.path(pane).map(|mut p| {
+            p.insert(0, i);
+            p
+        }))
+    }
+
+    fn at(&self, path: &[usize]) -> &TCell {
+        path.iter().fold(self, |c, &i| &c.kids[i])
+    }
+
+    fn at_mut(&mut self, path: &[usize]) -> &mut TCell {
+        path.iter().fold(self, |c, &i| &mut c.kids[i])
+    }
+
+    /// layout_resize_pane_grow: from the next cell with room after `idx`, else (with
+    /// `opposite`) before it.
+    fn grow(&mut self, idx: usize, horizontal: bool, needed: i32, opposite: bool) -> i32 {
+        let min_w = 1;
+        let mut found = (idx + 1..self.kids.len()).find_map(|j| Some((j, self.kids[j].check(horizontal, min_w))).filter(|(_, s)| *s > 0));
+        if found.is_none() && opposite {
+            found = (0..idx).rev().find_map(|j| Some((j, self.kids[j].check(horizontal, min_w))).filter(|(_, s)| *s > 0));
+        }
+        let Some((j, size)) = found else { return 0 };
+        let size = size.min(needed);
+        self.kids[idx].adjust(horizontal, size, min_w);
+        self.kids[j].adjust(horizontal, -size, min_w);
+        size
+    }
+
+    /// layout_resize_pane_shrink: from `idx` or the nearest cell with room before it,
+    /// onto the cell after `idx`.
+    fn shrink(&mut self, idx: usize, horizontal: bool, needed: i32) -> i32 {
+        let min_w = 1;
+        let Some((j, size)) = (0..=idx).rev().find_map(|j| Some((j, self.kids[j].check(horizontal, min_w))).filter(|(_, s)| *s > 0)) else { return 0 };
+        if idx + 1 >= self.kids.len() {
+            return 0;
+        }
+        let size = size.min(-needed);
+        self.kids[idx + 1].adjust(horizontal, size, min_w);
+        self.kids[j].adjust(horizontal, -size, min_w);
+        size
     }
 
     fn store(&self, sizes: &mut HashMap<PaneId, (i32, i32)>) {

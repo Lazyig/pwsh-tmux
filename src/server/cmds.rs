@@ -2941,7 +2941,7 @@ impl Server {
                         let d = if n < 0 {
                             match d { Dir::Left => Dir::Right, Dir::Right => Dir::Left, Dir::Up => Dir::Down, Dir::Down => Dir::Up }
                         } else { d };
-                        w.layout.resize(pane, d, n.unsigned_abs().min(u16::MAX as u64) as u16, area);
+                        w.layout.resize_pane(pane, d, n.unsigned_abs().min(u16::MAX as u64) as u16, area, true);
                     }
                 }
                 let moved = self.windows[&wid].layout.to_layout_string(area) != before;
