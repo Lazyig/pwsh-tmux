@@ -946,6 +946,11 @@ fn window_names_follow_mode_changes_at_most_every_name_interval() {
     let mut f = fixture();
     let pane = f.pane;
     let wid = f.window_of(pane).unwrap();
+    // (the pane's program is known once a lookup has found it)
+    f.automatic_rename();
+    assert!(f.name_changed.contains(&pane));
+    let g = f.panes[&pane].generation;
+    f.name_known.insert((pane, g));
     f.automatic_rename();
     let before = f.windows[&wid].name.clone();
     assert_ne!(before, "[tmux]");

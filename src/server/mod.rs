@@ -1440,6 +1440,9 @@ pub struct Server {
     pub name_changed: std::collections::HashSet<PaneId>,
     /// Each window's automatic-rename state (check_window_name).
     pub name_state: HashMap<WinId, NameState>,
+    /// Panes (and their generation) whose program a lookup has found: tmux reads it as it
+    /// checks the name, so a pane's name is not checked before that.
+    pub name_known: std::collections::HashSet<(PaneId, u32)>,
     /// Queues paused by `run-shell -d`.
     pub delayed: Vec<(Instant, Queue)>,
     /// Mouse event of the command being run, for the mouse_* formats.
@@ -1644,6 +1647,7 @@ impl Server {
             pane_info_busy: false,
             name_changed: Default::default(),
             name_state: HashMap::new(),
+            name_known: Default::default(),
             delayed: Vec::new(),
             cur_mouse: None,
             cur_file: None,
@@ -2977,7 +2981,7 @@ impl Server {
             };
             // (tmux reads these as it checks the name: a change found here is checked
             // like output)
-            let mut changed = false;
+            let mut changed = self.name_known.insert((r.id, r.generation));
             if let Some(c) = r.cmd.filter(|c| *c != p.current_cmd) {
                 p.current_cmd = c;
                 changed = true;
@@ -3002,6 +3006,7 @@ impl Server {
         self.name_state.retain(|w, _| wids.contains(w));
         let panes = &self.panes;
         self.name_changed.retain(|p| panes.contains_key(p));
+        self.name_known.retain(|(p, g)| panes.get(p).is_some_and(|p| p.generation == *g));
         for wid in wids {
             let Some(active) = self.windows.get(&wid).map(|w| w.active) else { continue };
             let seen = self.panes.get(&active).map(|p| (active, p.mode.as_ref().map(std::mem::discriminant), p.dead.is_some()));
@@ -3013,6 +3018,10 @@ impl Server {
             }
             st.auto = auto;
             if !auto || !self.name_changed.contains(&active) {
+                continue;
+            }
+            // what the pane runs is not known yet (the lookup takes up to a second)
+            if self.panes.get(&active).is_some_and(|p| p.dead.is_none() && !self.name_known.contains(&(active, p.generation))) {
                 continue;
             }
             // name_time_expired: checked less than NAME_INTERVAL ago, the timer does it
