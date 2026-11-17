@@ -1169,7 +1169,10 @@ fn empty_panes(ctx: &Ctx) {
 fn pane_and_target_flags() {
     let ctx = Ctx::new("paneflags");
     ctx.ok(&["new-session", "-d", "-s", "p", "-x", "80", "-y", "31"]);
-    ctx.ok(&["new-window", "-d", "-t", "p"]);
+    // "p:": a bare "p" is tried as a window of the current session first, and on Windows
+    // window 0 is named "powershell", which "p" matches as a prefix (tmux 3.8 then fails
+    // too: "create window failed: index 0 in use")
+    ctx.ok(&["new-window", "-d", "-t", "p:"]);
     // join-pane -p: a percentage of the target pane
     ctx.ok(&["join-pane", "-p", "30", "-s", "p:1", "-t", "p:0"]);
     assert_eq!(ctx.ok(&["lsp", "-t", "p:0", "-F", "#{pane_height}"]), "21\n9\n");
@@ -1190,6 +1193,22 @@ fn pane_and_target_flags() {
     let names: Vec<String> = ctx.ok(&["lscm", "-F", "#{command_list_name}"]).lines().map(String::from).collect();
     let pos = |n: &str| names.iter().position(|x| x == n).unwrap();
     assert!(pos("display-popup") < pos("display-panes") && pos("attach-session") == 0, "{names:?}");
+}
+
+#[test]
+fn window_index_target_prefers_a_window_name_prefix_to_the_session() {
+    // cmd_find_get_window: a window of the current session (here by name prefix) before
+    // a session; tmux 3.8 prints the same errors
+    let ctx = Ctx::new("winprefix");
+    ctx.ok(&["new-session", "-d", "-s", "p", "-n", "powershell"]);
+    assert!(ctx.fails(&["new-window", "-d", "-t", "p"]).contains("create window failed: index 0 in use"));
+    ctx.ok(&["new-session", "-d", "-s", "q", "-n", "powershell"]);
+    // the current session is now q, whose window 0 matches
+    assert!(ctx.fails(&["new-window", "-d", "-t", "p"]).contains("create window failed: index 0 in use"));
+    ctx.ok(&["new-window", "-d", "-t", "p:"]);
+    ctx.ok(&["new-session", "-d", "-s", "r", "-n", "other"]);
+    ctx.ok(&["new-window", "-d", "-t", "p"]);
+    assert_eq!(ctx.ok(&["list-windows", "-t", "p", "-F", "#{window_index}"]), "0\n1\n2\n");
 }
 
 #[cfg(unix)]
