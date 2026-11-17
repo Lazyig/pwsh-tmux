@@ -2102,3 +2102,47 @@ fn sixty_printed(ctx: &Ctx, target: &str) -> bool {
     let lines: Vec<String> = ctx.capture(target).lines().map(|l| l.trim_end().to_string()).collect();
     lines.iter().position(|l| l == "60").is_some_and(|i| lines[i + 1..].iter().any(|l| !l.is_empty()))
 }
+
+// (Unix only: on Windows ConPTY stands between this terminal and the client, renders the
+// client's output again and reads the terminal's input as console keys, so the queries
+// and replies do not pass through as they are)
+#[cfg(unix)]
+#[test]
+fn escape_is_not_delayed_once_later_replies_show_xtversion_will_not_come() {
+    // tmux 3.8 waits 500ms on an Escape until the start timer (5s) when XTVERSION is not
+    // answered; here the DECRPM and colour replies (asked after it) end that wait, and an
+    // XTVERSION reply that still comes is read as one, not typed
+    // Windows Terminal's replies to the attach requests: it answers all but XTVERSION
+    const WT_REPLIES: [(&[u8], &[u8]); 5] = [
+        (b"\x1b[c", b"\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c"),
+        (b"\x1b[>c", b"\x1b[>0;10;1c"),
+        (b"\x1b[?2026$p", b"\x1b[?2026;2$y"),
+        (b"\x1b]10;?\x1b\\", b"\x1b]10;rgb:cccc/cccc/cccc\x1b\\"),
+        (b"\x1b]11;?\x1b\\", b"\x1b]11;rgb:0c0c/0c0c/0c0c\x1b\\"),
+    ];
+    let ctx = Ctx::new("late-xda");
+    ctx.ok(&["new-session", "-d", "-s", "wt", "-x", "80", "-y", "23", CAT_V]);
+    ctx.ok(&["set-option", "-s", "escape-time", "10"]);
+    ctx.ok(&["bind-key", "-n", "M-x", "set", "-g", "@k", "meta"]);
+    let t = Term::attach_answering(&ctx, &["attach-session", "-t", "wt"], 80, 24, &WT_REPLIES);
+    t.wait_screen("attached", |s| s.contains("[wt]"));
+    let client = only_client(&ctx);
+    let fmt = |f: &str| ctx.ok(&["display-message", "-p", "-c", &client, f]).trim().to_string();
+    wait_for("the replies are read", || fmt("#{client_termfeatures}").split(',').any(|f| f == "sync"));
+    std::thread::sleep(Duration::from_millis(200));
+    // Escape, then x after 150ms: two keys, not M-x
+    t.type_now(b"\x1b");
+    std::thread::sleep(Duration::from_millis(150));
+    t.type_now(b"x");
+    wait_for("Escape and x reach the pane", || ctx.capture("wt").contains("^[x"));
+    assert_eq!(ctx.fmt("wt", "[#{@k}]"), "[]");
+    // a late XTVERSION reply, in two reads, is a reply
+    t.type_now(b"\x1bP>");
+    std::thread::sleep(Duration::from_millis(100));
+    t.type_now(b"|Late(1)\x1b\\");
+    wait_for("the late reply is read", || fmt("#{client_termtype}") == "Late(1)");
+    t.type_now(b"y");
+    wait_for("y reaches the pane", || ctx.capture("wt").contains("^[xy"));
+    let pane = ctx.capture("wt");
+    assert!(!pane.contains("Late") && !pane.contains("P>"), "{pane}");
+}

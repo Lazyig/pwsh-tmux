@@ -203,8 +203,13 @@ impl Parser {
 
     /// A partial terminal theme/colour response needs a longer deadline than a bare Escape.
     pub fn theme_reply_pending(&self) -> bool {
-        [b"\x1b]10;".as_slice(), b"\x1b]11;", b"\x1b[?997;", b"\x1bP>|", b"\x1b[>"].iter()
-            .any(|prefix| self.buf.starts_with(prefix) || (self.buf.len() >= 3 && prefix.starts_with(&self.buf)))
+        [b"\x1b]10;".as_slice(), b"\x1b]11;", b"\x1b[?997;", b"\x1bP>|", b"\x1b[>"].iter().any(|prefix| self.reply_pending(prefix))
+    }
+
+    /// The bytes held back may be the start of a reply beginning with prefix (three bytes
+    /// or more of it: a lone Escape, or Escape and one key, is not).
+    pub fn reply_pending(&self, prefix: &[u8]) -> bool {
+        self.buf.starts_with(prefix) || (self.buf.len() >= 3 && prefix.starts_with(&self.buf))
     }
 
     pub fn feed(&mut self, data: &[u8]) -> Vec<Input> {

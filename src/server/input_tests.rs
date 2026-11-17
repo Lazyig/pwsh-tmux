@@ -1235,7 +1235,8 @@ fn a_paste_goes_to_a_pane_prompt_and_a_status_prompt_key_by_key() {
 fn escape_waits_at_least_500ms_while_terminal_replies_are_awaited() {
     // tty_keys_next: until the terminal has answered the device attribute, DECRPM and
     // colour requests (or the start timer fires) a lone Escape waits 500ms, so an Escape
-    // and the key typed straight after it are one Meta key, as in tmux
+    // and the key typed straight after it are one Meta key, as in tmux (here a request a
+    // later reply shows will not be answered is not waited for: the next test)
     let mut f = fixture(); let sid = f.sid;
     f.clients.get_mut(&1).unwrap().ident = Some(Identity { cols: 80, rows: 24, tty: true, cwd: String::new(), term: "xterm-256color".into(), pid: 0, ctx_pane: None, utf8: true, env: Vec::new() });
     f.clients.get_mut(&1).unwrap().attached = false;
@@ -1260,6 +1261,93 @@ fn escape_waits_at_least_500ms_while_terminal_replies_are_awaited() {
     let mut f = fixture();
     f.handle_input(1, b"\x1b");
     assert!(f.clients[&1].esc_deadline.unwrap().duration_since(Instant::now()) <= Duration::from_millis(100));
+}
+
+/// A VT100-like client attaching: it is sent the requests (tty_send_requests).
+fn attach_vt100() -> Fixture {
+    let mut f = fixture(); let sid = f.sid;
+    f.clients.get_mut(&1).unwrap().ident = Some(Identity { cols: 80, rows: 24, tty: true, cwd: String::new(), term: "xterm-256color".into(), pid: 0, ctx_pane: None, utf8: true, env: Vec::new() });
+    f.clients.get_mut(&1).unwrap().attached = false;
+    f.clients.get_mut(&1).unwrap().terminal.vt100 = true;
+    f.attach_client(1, sid);
+    f.pane_input.try_iter().for_each(drop);
+    f
+}
+/// The Escape delay of a lone Escape typed now, which is then dropped.
+fn escape_delay(f: &mut Fixture) -> Duration {
+    f.handle_input(1, b"\x1b");
+    let d = f.clients[&1].esc_deadline.unwrap().duration_since(Instant::now());
+    f.clients.get_mut(&1).unwrap().keyp.flush_pending();
+    f.clients.get_mut(&1).unwrap().esc_deadline = None;
+    d
+}
+
+#[test]
+fn escape_does_not_wait_for_a_request_a_later_reply_shows_will_not_be_answered() {
+    // Windows Terminal answers DA1, DA2, DECRPM 2026 and the colours but not XTVERSION,
+    // which tty_send_requests asks for before DECRPM: a terminal answers in order, so once
+    // the replies after it came, no XTVERSION reply is waited for (tmux 3.8 waits until
+    // its 5s start timer)
+    let mut f = attach_vt100();
+    for reply in [&b"\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c"[..], b"\x1b[>0;10;1c", b"\x1b[?2026;2$y"] {
+        f.handle_input(1, reply);
+    }
+    // (the colours, asked after DECRPM, are still awaited)
+    assert!(escape_delay(&mut f) > Duration::from_millis(400));
+    // a colour reply in two reads
+    f.handle_input(1, b"\x1b]10;rgb:cc");
+    assert!(f.clients[&1].esc_deadline.unwrap().duration_since(Instant::now()) > Duration::from_millis(400));
+    f.handle_input(1, b"cc/cccc/cccc\x1b\\\x1b]11;rgb:0c0c/0c0c/0c0c\x1b\\");
+    assert!(escape_delay(&mut f) <= Duration::from_millis(100));
+    assert!(f.pane_input.try_recv().is_err());
+    // an XTVERSION reply that still comes, in two reads, is read as one: the partial reply
+    // waits 500ms, and nothing is typed
+    f.handle_input(1, b"\x1bP>");
+    assert!(f.clients[&1].esc_deadline.unwrap().duration_since(Instant::now()) > Duration::from_millis(400));
+    f.handle_input(1, b"|XTerm(400)\x1b\\");
+    assert_eq!(f.clients[&1].term_type, "XTerm(400)");
+    assert!(f.pane_input.try_recv().is_err());
+    assert!(escape_delay(&mut f) <= Duration::from_millis(100));
+    // resizing asks for the colours again (tty_repeat_requests): they are waited for again
+    f.clients.get_mut(&1).unwrap().terminal.requests(true);
+    assert!(escape_delay(&mut f) > Duration::from_millis(400));
+    f.handle_input(1, b"\x1b]10;rgb:cccc/cccc/cccc\x1b\\\x1b]11;rgb:0c0c/0c0c/0c0c\x1b\\");
+    assert!(escape_delay(&mut f) <= Duration::from_millis(100));
+}
+
+#[test]
+fn a_reply_after_one_that_settled_its_request_is_still_read() {
+    // the DA1 reply coming after the others (out of order): once they settled DA1 an
+    // Escape does not wait, but a DA1 reply in two reads still waits 500ms and is read
+    let mut f = attach_vt100();
+    f.clients.get_mut(&1).unwrap().features.0.remove("margins");
+    f.handle_input(1, b"\x1b[>0;10;1c\x1b[?2026;2$y\x1b]10;rgb:cccc/cccc/cccc\x1b\\\x1b]11;rgb:0c0c/0c0c/0c0c\x1b\\");
+    assert!(escape_delay(&mut f) <= Duration::from_millis(100));
+    f.handle_input(1, b"\x1b[?64;2");
+    assert!(f.clients[&1].esc_deadline.unwrap().duration_since(Instant::now()) > Duration::from_millis(400));
+    f.handle_input(1, b"1c");
+    assert!(f.clients[&1].features.has("margins"));
+    assert!(f.pane_input.try_recv().is_err());
+    // (once DA1 has come, only the usual escape-time)
+    f.handle_input(1, b"\x1b[?6");
+    assert!(f.clients[&1].esc_deadline.unwrap().duration_since(Instant::now()) <= Duration::from_millis(100));
+}
+
+#[test]
+fn escape_waits_for_requests_without_a_later_reply() {
+    // a terminal that answers nothing, or only DA1 and DA2 (no reply after the others):
+    // as in tmux 3.8 the Escape delay is 500ms until the start timer
+    let mut f = attach_vt100();
+    assert!(escape_delay(&mut f) > Duration::from_millis(400));
+    f.handle_input(1, b"\x1b[?62;22c\x1b[>0;136;0c");
+    assert!(escape_delay(&mut f) > Duration::from_millis(400));
+    // a terminal answering everything: no wait once all came
+    let mut f = attach_vt100();
+    f.handle_input(1, b"\x1b[?62;22c\x1b[>0;10;1c\x1bP>|XTerm(400)\x1b\\\x1b[?2026;2$y\x1b]10;rgb:cccc/cccc/cccc\x1b\\");
+    assert!(escape_delay(&mut f) > Duration::from_millis(400));
+    f.handle_input(1, b"\x1b]11;rgb:0c0c/0c0c/0c0c\x1b\\");
+    assert!(escape_delay(&mut f) <= Duration::from_millis(100));
+    assert!(f.pane_input.try_recv().is_err());
 }
 
 #[test]

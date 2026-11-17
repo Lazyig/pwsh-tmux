@@ -22,8 +22,13 @@ pub struct Terminal {
     style_bg: StyleColour,
     active_style: Option<(StyleColour, StyleColour)>,
     /// TTY_HAVEDA, TTY_HAVEDA2, TTY_HAVEXDA, TTY_HAVESYNC: the replies received, or no
-    /// longer waited for.
+    /// longer taken once the start timer fired.
     have: u8,
+    /// The requests a reply to a later request has shown will not be answered (a
+    /// terminal answers in the order it was asked): no longer waited for, but a reply
+    /// to one is still read as a reply until the start timer fires. Not in tmux 3.8,
+    /// which waits for each until the timer (COMPATIBILITY.md).
+    settled: u8,
     /// When the requests were sent (tty_start_start_timer).
     started: Option<Instant>,
     /// TTY_WAITFG, TTY_WAITBG: the colour replies still awaited.
@@ -34,7 +39,8 @@ pub struct Terminal {
 const WAIT_FG: u8 = 1;
 const WAIT_BG: u8 = 2;
 
-/// The request flags of Terminal::have (TTY_ALL_REQUEST_FLAGS is all of them).
+/// The request flags of Terminal::have (TTY_ALL_REQUEST_FLAGS is all of them), in the
+/// order tty_send_requests asks for them: each request is sent after those of lower bits.
 pub const HAVE_DA: u8 = 1;
 pub const HAVE_DA2: u8 = 2;
 pub const HAVE_XDA: u8 = 4;
@@ -66,6 +72,7 @@ impl Terminal {
         }
         out.extend(self.requests(true)?);
         self.started = Some(Instant::now());
+        self.settled = 0;
         Some(out)
     }
     /// A reply of this kind is still taken: not received yet, and the start timer has
@@ -74,8 +81,11 @@ impl Terminal {
         self.start_timer();
         self.have & bit == 0
     }
+    /// A reply that parsed: the requests sent before it in the batch that have no reply
+    /// by now will not get one.
     pub fn received(&mut self, bit: u8) {
         self.have |= bit;
+        self.settled |= bit - 1;
     }
     /// tty_start_timer_callback, QUERY_TIMEOUT after the requests were last sent: no reply
     /// is waited for any more.
@@ -85,15 +95,30 @@ impl Terminal {
             self.wait_colours = 0;
         }
     }
-    /// A colour reply that parsed (tty_keys_colours clears TTY_WAITFG or TTY_WAITBG).
-    pub fn colour_received(&mut self, fg: bool) {
-        self.wait_colours &= if fg { !WAIT_FG } else { !WAIT_BG };
+    /// A complete OSC 10 or 11 reply, whether its colour parsed or not (tty_keys_colours
+    /// consumes both): the colour requests are sent after all the others, so no request of
+    /// the start batch without a reply yet will get one; OSC 11 is asked after OSC 10, so
+    /// neither will the foreground. A colour that parsed is no longer awaited
+    /// (tty_keys_colours clears TTY_WAITFG or TTY_WAITBG).
+    pub fn colour_reply(&mut self, fg: bool, parsed: bool) {
+        self.settled = HAVE_ALL;
+        if !fg { self.wait_colours &= !WAIT_FG; }
+        if parsed { self.wait_colours &= if fg { !WAIT_FG } else { !WAIT_BG }; }
     }
     /// tty_keys_next: while replies to the requests are awaited (not all of TTY_ALL_REQUEST_FLAGS,
     /// or TTY_WAITFG or TTY_WAITBG) a key that may be the start of one waits at least 500ms.
+    /// Requests that a later reply settled are not awaited (tmux 3.8 waits for them until
+    /// the start timer).
     pub fn replies_pending(&mut self) -> bool {
         self.start_timer();
-        self.started.is_some() && (self.have & HAVE_ALL != HAVE_ALL || self.wait_colours != 0)
+        self.started.is_some() && ((self.have | self.settled) & HAVE_ALL != HAVE_ALL || self.wait_colours != 0)
+    }
+    /// A settled request whose reply may still come (out of order) and is still read as
+    /// one: DA1 or DECRPM 2026, both CSI ?. (DA2, XDA and colour replies have their own
+    /// partial reply delay: keys::Parser::theme_reply_pending.)
+    pub fn late_csi_reply(&mut self) -> bool {
+        self.start_timer();
+        self.started.is_some() && self.settled & !self.have & (HAVE_DA | HAVE_SYNC) != 0
     }
     /// tty_repeat_requests: ask for the colours again, unless asked within REQUEST_LIMIT
     /// (tty_start_start_timer starts the timer again).
@@ -437,9 +462,9 @@ impl Server {
             // Requery colours, but explicit theme reports notify panes immediately.
             if let Some(q) = c.terminal.requests(true) { c.send(S_OUTPUT, q); }
         }
+        if is_colour_reply(raw) { c.terminal.colour_reply(raw[3] == b'0', colour.is_some()); }
         if let Some((fg, colour)) = colour {
             if fg { c.terminal.fg = Some(colour) } else { c.terminal.bg = Some(colour); }
-            c.terminal.colour_received(fg);
         }
         c.prev = None;
         c.dirty = true;
@@ -772,6 +797,62 @@ mod tests {
         assert!(t.requests(true).is_some());
     }
 
+
+    #[test]
+    fn a_later_reply_settles_the_requests_before_it() {
+        let timer = |t: &mut Terminal| t.started = Some(Instant::now() - QUERY_TIMEOUT - Duration::from_millis(1));
+        // no reply: waited for until the start timer, as in tmux
+        let mut t = Terminal { vt100: true, ..Default::default() };
+        t.start();
+        assert!(t.replies_pending());
+        timer(&mut t);
+        assert!(!t.replies_pending() && !t.waiting(HAVE_XDA));
+        // Windows Terminal (no XTVERSION reply): DECRPM settles it, the colours end the wait;
+        // a late XTVERSION reply is still taken until the timer, then it is not
+        let mut t = Terminal { vt100: true, ..Default::default() };
+        t.start();
+        for bit in [HAVE_DA, HAVE_DA2, HAVE_SYNC] { t.received(bit); }
+        assert_eq!(t.settled, HAVE_DA | HAVE_DA2 | HAVE_XDA);
+        assert!(t.replies_pending());
+        t.colour_reply(true, true);
+        assert!(t.replies_pending());
+        t.colour_reply(false, true);
+        assert!(!t.replies_pending());
+        assert!(t.waiting(HAVE_XDA) && !t.late_csi_reply());
+        timer(&mut t);
+        assert!(!t.waiting(HAVE_XDA));
+        // DA1 settled by the DA2 reply: a late DA1 reply may still come
+        let mut t = Terminal { vt100: true, ..Default::default() };
+        t.start();
+        t.received(HAVE_DA2);
+        assert!(t.late_csi_reply() && t.replies_pending());
+        t.received(HAVE_DA);
+        assert!(!t.late_csi_reply());
+        // only the background colour answered (an unparsed one counts): the foreground,
+        // asked before it, is not waited for
+        let mut t = Terminal { vt100: true, ..Default::default() };
+        t.start();
+        t.colour_reply(false, false);
+        assert!(t.replies_pending());
+        t.colour_reply(false, true);
+        assert!(!t.replies_pending());
+        // only the foreground: the background is waited for until the timer
+        let mut t = Terminal { vt100: true, ..Default::default() };
+        t.start();
+        t.colour_reply(true, true);
+        assert!(t.replies_pending());
+        timer(&mut t);
+        assert!(!t.replies_pending());
+        // starting again asks again for what did not come, and waits for it again
+        let mut t = Terminal { vt100: true, ..Default::default() };
+        t.start();
+        for bit in [HAVE_DA, HAVE_DA2, HAVE_SYNC] { t.received(bit); }
+        t.colour_reply(true, true);
+        t.colour_reply(false, true);
+        let again = t.start().unwrap();
+        assert!(again.windows(4).any(|w| w == b"\x1b[>q") && !again.windows(3).any(|w| w == b"\x1b[c"));
+        assert!(t.replies_pending());
+    }
 
     #[test]
     fn resize_path_does_not_repeat_queries_inside_thirty_seconds() {

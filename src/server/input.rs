@@ -346,12 +346,14 @@ impl Server {
         let inputs = c.keyp.feed(data);
         if c.keyp.in_paste() && c.input_state.paste_at.is_none() { c.input_state.paste_at = Some(Instant::now()); }
         if !c.keyp.in_paste() { c.input_state.paste_at = None; }
-        // a partial paste end or theme/colour reply restarts the deadline at 500ms or more
-        let reply = c.keyp.partial_paste_end() || c.keyp.theme_reply_pending();
+        // a partial paste end or theme/colour reply restarts the deadline at 500ms or more,
+        // as does a DA1 or DECRPM reply that may still come after a later reply settled it
+        let reply = c.keyp.partial_paste_end() || c.keyp.theme_reply_pending() || (c.keyp.reply_pending(b"\x1b[?") && c.terminal.late_csi_reply());
         c.esc_deadline = if c.keyp.has_pending() || c.keyp.partial_paste_end() {
             let mut ms = self.opts_server.get("escape-time").and_then(|v| v.parse().ok()).unwrap_or(10u64).max(1);
             // tty_keys_next: also while a clipboard request (TTY_OSC52QUERY) or a reply to
-            // the terminal requests (device attributes, DECRPM, colours) is outstanding
+            // the terminal requests (device attributes, DECRPM, colours) is outstanding;
+            // not for a request a reply to a later one settled (COMPATIBILITY.md)
             let clipboard = !c.input_state.clipboard.is_empty() || c.clipboard_query.is_some_and(|d| Instant::now() < d);
             if reply || clipboard || c.terminal.replies_pending() { ms = ms.max(500); }
             if reply { Some(Instant::now() + Duration::from_millis(ms)) }

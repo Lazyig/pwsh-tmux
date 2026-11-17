@@ -132,6 +132,12 @@ pub struct Term {
 
 impl Term {
     pub fn attach(ctx: &Ctx, args: &[&str], cols: u16, rows: u16) -> Term {
+        Term::attach_answering(ctx, args, cols, rows, &[])
+    }
+
+    /// attach, in a terminal that answers each query in `answers` with its reply, in the
+    /// order the queries came (as a real terminal does).
+    pub fn attach_answering(ctx: &Ctx, args: &[&str], cols: u16, rows: u16, answers: &[(&[u8], &[u8])]) -> Term {
         let mut cb = CommandBuilder::new(binary());
         cb.args(args);
         cb.env("PWSH_TMUX_SOCKET", &ctx.socket);
@@ -145,13 +151,18 @@ impl Term {
         let copy = std::env::temp_dir().join(format!("pwsh-tmux-out-{}-{}", ctx.socket, SEQ.fetch_add(1, Ordering::SeqCst)));
         let _ = std::fs::remove_file(&copy);
         cb.env("PWSH_TMUX_OUTPUT_COPY", &copy);
-        let mut t = Term::spawn(cb, cols, rows);
+        let mut t = Term::spawn_answering(cb, cols, rows, answers);
         t.output_copy = Some(copy);
         t
     }
 
     /// Runs any program (e.g. `ssh -tt host pwsh-tmux ...`) in a pty.
     pub fn spawn(cb: CommandBuilder, cols: u16, rows: u16) -> Term {
+        Term::spawn_answering(cb, cols, rows, &[])
+    }
+
+    fn spawn_answering(cb: CommandBuilder, cols: u16, rows: u16, answers: &[(&[u8], &[u8])]) -> Term {
+        let answers: Vec<(Vec<u8>, Vec<u8>)> = answers.iter().map(|(q, r)| (q.to_vec(), r.to_vec())).collect();
         let pty = native_pty_system();
         let pair = pty.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).unwrap();
         let child = pair.slave.spawn_command(cb).unwrap();
@@ -171,6 +182,13 @@ impl Term {
                     // Act like a real terminal: ConPTY waits for a cursor position report.
                     if buf[..n].windows(4).any(|w| w == b"\x1b[6n") {
                         let _ = writer.lock().unwrap().write_all(b"\x1b[1;1R");
+                    }
+                    let mut replies: Vec<(usize, &[u8])> = answers.iter().flat_map(|(q, r)| {
+                        buf[..n].windows(q.len()).enumerate().filter(move |(_, w)| *w == &q[..]).map(move |(i, _)| (i, &r[..]))
+                    }).collect();
+                    replies.sort_by_key(|(i, _)| *i);
+                    if !replies.is_empty() {
+                        let _ = writer.lock().unwrap().write_all(&replies.into_iter().flat_map(|(_, r)| r.to_vec()).collect::<Vec<u8>>());
                     }
                     screen.lock().unwrap().process(&buf[..n]);
                     raw.lock().unwrap().extend_from_slice(&buf[..n]);
@@ -205,10 +223,17 @@ impl Term {
         drop(w);
         // an Escape at the end is a key only once the server's escape delay passes:
         // at least 500ms while the terminal's replies to the attach requests are awaited
-        // (tmux 3.8 tty_keys_next; this terminal does not answer them), so the next key
-        // is not read as that key with Meta
+        // (tmux 3.8 tty_keys_next; this terminal does not answer them, so for the first
+        // five seconds), so the next key is not read as that key with Meta
         let pause = if b.ends_with(b"\x1b") { 650 } else { 120 };
         std::thread::sleep(Duration::from_millis(pause));
+    }
+
+    /// Writes the bytes as typed, without waiting after them.
+    pub fn type_now(&self, b: &[u8]) {
+        let mut w = self.writer.lock().unwrap();
+        w.write_all(b).unwrap();
+        w.flush().unwrap();
     }
 
     /// Prefix (C-b) then keys.

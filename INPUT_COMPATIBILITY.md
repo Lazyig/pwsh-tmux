@@ -26,9 +26,15 @@ Bracketed-paste terminals do not
 use paste guessing. Unterminated pastes recover after five seconds, and partial
 paste end markers receive at least 500ms before their escape timer expires. As in
 tmux 3.8 (tty_keys_next), so does a lone Escape while the terminal's replies to the
-attach requests (device attributes, DECRPM 2026, the OSC 10/11 colours) are awaited:
-until all have come or five seconds have passed, an Escape followed within 500ms by
-another key is that key with Meta. A paste is taken like the keys tmux reads for it
+attach requests (DA1, DA2, XTVERSION, DECRPM 2026 and the OSC 10/11 colours, asked in
+that order) are awaited: an Escape followed within 500ms by another key is then that
+key with Meta. tmux 3.8 waits until all have come or five seconds have passed; here a
+reply also settles the requests asked before it that have no reply yet (a terminal
+answers in order), so with Windows Terminal, which answers all but XTVERSION, the wait
+ends once its colour replies come instead of five seconds after each attach. A reply to
+a settled request that still comes is read as a reply until the five seconds pass, and
+a terminal that answers nothing, or nothing after the request it skips, is waited for
+five seconds as in tmux (COMPATIBILITY.md, Escape timing after attach). A paste is taken like the keys tmux reads for it
 (PasteStart, each pasted key, PasteEnd): a popup, a pane capturing keys, a dead pane
 waiting for a key, a menu, the status prompt and a pane prompt (a copy-mode search)
 take them at once even while the client's queue waits, so a paste goes into a popup
