@@ -173,6 +173,12 @@ These do not match tmux 3.8 yet:
   on a pane of about 5000 by 5000 takes seconds.
 - **`backspace C-?`:** the option value `C-?` is read as the BSpace key; tmux's default is
   a raw `\177` that also prints as `C-?`.
+- **Pastes, small cases:** the client turns on bracketed paste whenever the terminal has
+  the `bpaste` feature, where tmux follows the mode of the active pane or popup; with
+  `synchronize-panes`, the other panes of a `-K` pane get pasted text without the
+  `\e[200~`/`\e[201~` markers tmux also copies to them.
+- **Window names on Linux** come from `/proc/PID/comm` (cut at 15 characters), where tmux
+  reads the program from the command line.
 - **The pane's program on Windows.** tmux reads `pane_current_command` when it is used
   (a format, a window's name check), as Unix does here. On Windows a process snapshot is
   too slow for that, so what a pane runs is looked up in the background about once a
