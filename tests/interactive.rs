@@ -2065,3 +2065,20 @@ fn key_names_and_tables_as_key_string_lookup_string() {
     ctx.ok(&["send-keys", "-K", "-c", &client, "C-b", "F8"]);
     wait_for("repeat ends", || ctx.ok(&["display-message", "-p", "-c", &client, "#{client_key_table}"]).trim() == "foo");
 }
+
+#[test]
+#[cfg(unix)] // a command ended by a signal: Windows has no signals
+fn popup_command_ended_by_a_signal_gives_its_signal_number() {
+    // popup_job_complete_cb: WTERMSIG for a command a signal ended, which the waiting
+    // command-line client exits with
+    let ctx = Ctx::new("popup-signal");
+    let _t = start(&ctx, "w");
+    let client = only_client(&ctx);
+    for (sig, code) in [("TERM", 15), ("KILL", 9)] {
+        let cmd = format!("kill -{sig} $$");
+        let out = ctx.command().args(["display-popup", "-c", &client, "-E", "-w", "30", "-h", "6", &cmd]).output().unwrap();
+        assert_eq!(out.status.code(), Some(code), "{sig}");
+    }
+    let out = ctx.command().args(["display-popup", "-c", &client, "-E", "-w", "30", "-h", "6", "exit 5"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(5));
+}

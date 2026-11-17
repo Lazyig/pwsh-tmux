@@ -2541,7 +2541,10 @@ impl Server {
         let popup_owner = self.clients.values().find(|c| matches!(&c.overlay, Some(Overlay::Popup(p)) if p.pane == id)).map(|c| c.id);
         if let Some(cid) = popup_owner {
             if self.popup_panes.values().any(|p| *p == id) {
-                self.popup_status.insert(id, status.unwrap_or(129));
+                // popup_job_complete_cb: WEXITSTATUS, or WTERMSIG for a command a signal
+                // ended (Windows has no signals: a process ended by TerminateProcess
+                // reports the exit code it was given)
+                self.popup_status.insert(id, status.map_or(129, |s| exit_signal(s).unwrap_or(s)));
             }
             // popup_job_complete_cb: -E closes it, -EE only for status 0
             let close = matches!(&self.clients[&cid].overlay, Some(Overlay::Popup(p)) if p.close_on_exit || (p.close_exit_zero && status == Some(0)));
