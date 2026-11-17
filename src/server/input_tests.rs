@@ -950,6 +950,16 @@ fn window_names_follow_mode_changes_at_most_every_name_interval() {
     // lookup has found it)
     let g = f.panes[&pane].generation;
     f.name_known.insert((pane, g));
+    // (the name is checked once the pane's shell has started: before its exec has finished
+    // what it runs is not known yet, and the check would take its start command)
+    #[cfg(unix)]
+    {
+        let start = Instant::now();
+        let (pid, pgrp) = (f.panes[&pane].pid, f.panes[&pane].fg_pgrp());
+        while procinfo::pane_programs(&[(pid, pgrp)]).pop().and_then(|r| r.0).is_none() && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     f.automatic_rename();
     let before = f.windows[&wid].name.clone();
     assert_ne!(before, "[tmux]");

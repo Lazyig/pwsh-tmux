@@ -130,6 +130,9 @@ pub fn pane_programs(panes: &[(Option<u32>, Option<i32>)]) -> Vec<(Option<String
             .iter()
             .map(|&(pid, fg_pgrp)| {
                 let Some(p) = fg_pgrp.map(|p| p as u32).or(pid) else { return (None, None) };
+                if exec_pending(p) {
+                    return (None, None);
+                }
                 let comm = std::fs::read_to_string(format!("/proc/{p}/comm")).ok().map(|c| c.trim().to_string());
                 let cwd = std::fs::read_link(format!("/proc/{p}/cwd")).ok().map(|p| p.to_string_lossy().into_owned());
                 (comm, cwd)
@@ -145,6 +148,26 @@ pub fn pane_programs(panes: &[(Option<u32>, Option<i32>)]) -> Vec<(Option<String
         // the working directory comes from the shell's OSC 7 reports instead
         panes.iter().map(|&(pid, _)| (pid.and_then(|p| table.deepest_descendant(p)).map(|n| program_name(&n)), None)).collect()
     }
+}
+
+/// A pane's process that has not finished exec yet: what it runs is not known (the
+/// caller uses the pane's start command). Between fork and exec it still runs the
+/// server's image (its program and command line are the server's own) with the name of
+/// the server thread that forked it, and during exec it has the new program but no
+/// arguments yet and still the old name (the kernel sets the name before the arguments).
+/// Checked before the name is read.
+#[cfg(unix)]
+pub fn exec_pending(pid: u32) -> bool {
+    use std::sync::OnceLock;
+    static SERVER: OnceLock<Option<(std::path::PathBuf, Vec<u8>)>> = OnceLock::new();
+    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else { return false };
+    if cmdline.is_empty() {
+        return true;
+    }
+    let Some((exe, own)) = SERVER.get_or_init(|| Some((std::fs::read_link("/proc/self/exe").ok()?, std::fs::read("/proc/self/cmdline").ok()?))) else {
+        return false;
+    };
+    cmdline == *own && std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|e| e == *exe)
 }
 
 #[cfg(windows)]
@@ -282,5 +305,49 @@ pub mod win {
             assert_eq!(t.deepest_descendant(20).as_deref(), Some("esbuild.exe"));
             assert_eq!(t.deepest_descendant(30).as_deref(), Some("pwsh.exe"));
         }
+    }
+}
+
+// (Linux only: the process's program, arguments and name are read from /proc)
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_process_that_has_not_exec_yet_has_no_program() {
+        // this process stands for the server: its own image is what a pane's process
+        // runs between fork and exec
+        assert!(exec_pending(std::process::id()));
+        // a child forked but not exec'd has the forking thread's name, not a program
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            loop {
+                unsafe { libc::pause() };
+            }
+        }
+        let forked = pane_programs(&[(Some(child as u32), None)]);
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+            libc::waitpid(child, std::ptr::null_mut(), 0);
+        }
+        assert_eq!(forked, vec![(None, None)]);
+        // a spawned program: nothing (spawn may return while exec is still going on), then
+        // the program it runs, never the name it had before exec
+        let mut sleep = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let start = std::time::Instant::now();
+        let mut seen = Vec::new();
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            let name = pane_programs(&[(Some(sleep.id()), None)]).remove(0).0;
+            seen.push(name.clone());
+            if name.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let _ = sleep.kill();
+        let _ = sleep.wait();
+        assert!(seen.iter().all(|n| n.is_none() || n.as_deref() == Some("sleep")), "{seen:?}");
+        assert_eq!(seen.last(), Some(&Some("sleep".to_string())));
     }
 }
