@@ -263,6 +263,9 @@ pub struct State {
     pub spawned: Vec<Spawned>,
     /// swap-pane fires movement for the source before the destination.
     pub pane_move_order: Vec<PaneId>,
+    /// Windows given a name (rename-window, ESC k, break-pane -n) since the last check:
+    /// window-renamed fires that many times even when the name is the same.
+    pub renamed: HashMap<WinId, usize>,
     /// session-closed payloads of sessions destroyed since the last check.
     pub closed: Vec<(SessId, Payload)>,
     /// Group members synchronized from a changed session: (changed, others).
@@ -1727,7 +1730,7 @@ impl Server {
             let Some(w) = self.windows.get(&wid) else { continue };
             let now = WinSeen { name: w.name.clone(), active: w.active, zoomed: w.zoomed, size: (w.sx, w.sy), layout: w.layout.to_layout_string(self.window_area(wid)), floats: self.float_key(wid) };
             let Some(old) = self.ev.seen.windows.get(&wid).cloned() else { continue };
-            if old != now {
+            if old != now || self.ev.renamed.contains_key(&wid) {
                 self.ev.seen.windows.insert(wid, now.clone());
                 changed.push((wid, old, now));
             }
@@ -1765,9 +1768,11 @@ impl Server {
         }
         let mut layout_seen = Vec::new();
         for (wid, old, now) in changed {
-            if old.name != now.name {
+            // window_set_name fires each time a name is set, the same name too
+            let forced = self.ev.renamed.remove(&wid).unwrap_or(0);
+            for i in 0..forced.max((old.name != now.name) as usize) {
                 let mut p = self.payload_window(wid);
-                p.str("old_name", old.name.clone()).str("new_name", now.name.clone());
+                p.str("old_name", if i == 0 { old.name.clone() } else { now.name.clone() }).str("new_name", now.name.clone());
                 self.fire("window-renamed", p);
             }
             // resizing a zoomed window unzooms it and zooms it again (resize_window)

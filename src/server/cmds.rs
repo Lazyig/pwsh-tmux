@@ -2432,8 +2432,9 @@ impl Server {
                     return err(format!("invalid window name: {name}"));
                 }
                 let w = self.windows.get_mut(&wt.wid.unwrap()).unwrap();
-                w.name = name;
+                w.name = clean_name(&name);
                 w.options.set("automatic-rename", "off".into());
+                *self.ev.renamed.entry(w.id).or_default() += 1;
                 self.mark_window_dirty(wt.wid.unwrap());
                 Ok(Flow::Next)
             }
@@ -2900,7 +2901,9 @@ impl Server {
                 if self.windows[&wid].is_floating(pane) && self.zoomed_pane(wid) != Some(pane) {
                     return self.cmd_resize_float(&o, wid, pane, tt);
                 }
-                self.unzoom(wid);
+                // server_unzoom_window first: its pane-resized and window-unzoomed come
+                // before the resize's own events
+                self.unzoom_window(wid);
                 let area = self.window_area(wid);
                 // args_percentage(args, 'x', 0, PANE_MAXIMUM, w->sx): "width invalid" and so on
                 let size = |c: char, total: u16, what: &str| o.get(c).map(|v| {
@@ -2908,8 +2911,6 @@ impl Server {
                 }).transpose();
                 let x = size('x', area.w, "width");
                 let y = size('y', area.h, "height");
-                // server_unzoom_window first
-                self.unzoom_window(wid);
                 let x = x?;
                 let before = self.windows[&wid].layout.to_layout_string(area);
                 let w = self.windows.get_mut(&wid).unwrap();
@@ -3080,6 +3081,7 @@ impl Server {
                         let w = self.windows.get_mut(&swid).unwrap();
                         w.name = clean_name(&n);
                         w.options.set("automatic-rename", "off".into());
+                        *self.ev.renamed.entry(swid).or_default() += 1;
                     }
                     if self.sessions[&ssid].links.get(&sidx) == Some(&swid) && (ssid != dsid || sidx != idx) {
                         self.unlink(ssid, sidx);

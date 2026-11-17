@@ -2287,6 +2287,7 @@ impl Server {
         // automatic-rename's inherited value, or to an empty name when that is off
         if let Some(n) = rename.filter(|_| options::is_on(&self.opt_pane(id, "allow-rename"))) {
             if let Some(wid) = self.window_of(id) {
+                *self.ev.renamed.entry(wid).or_default() += 1;
                 if n.is_empty() {
                     if let Some(w) = self.windows.get_mut(&wid) { w.options.unset("automatic-rename"); }
                     if !self.opt_window_on(Some(wid), "automatic-rename") {
