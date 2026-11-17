@@ -80,7 +80,7 @@ PowerShell prompt hook described below.
 - **Floating panes** (tmux 3.7/3.8): `new-pane` (bound to `*`), modal panes (`new-pane -O`),
   moving and resizing with `move-pane`/`resize-pane` or the mouse, `break-pane` and
   `join-pane` between floating and tiled.
-- **Key tables**: tmux's default `prefix`, `root`, `copy-mode` and `copy-mode-vi` tables,
+- **Key tables**: tmux's default `prefix`, `root`, `copy-mode`, `copy-mode-vi` and `move` tables,
   `bind -n/-r/-T/-N`, `unbind`, `switch-client -T`, `prefix2`, repeat-time, extended keys
   (`extended-keys`, `extended-keys-format`).
 - **Copy mode** (emacs and vi keys): motions, word/line/rectangle selection, search, jumps,
@@ -128,8 +128,8 @@ PowerShell prompt hook described below.
   remaining differences are documented in [`COMPATIBILITY.md`](COMPATIBILITY.md). These
   checks cover specific behaviours, not every command, flag, format modifier or copy-mode
   command in tmux.
-- Measured terminal UI comparisons and remaining Windows Unicode/ConPTY
-  differences are documented in [`UI_COMPARISON.md`](UI_COMPARISON.md).
+- Measured terminal UI comparisons against tmux 3.6a (the earlier baseline) and remaining
+  Windows Unicode/ConPTY differences are documented in [`UI_COMPARISON.md`](UI_COMPARISON.md).
 
 ## Tests
 

@@ -30,11 +30,14 @@ marks this option "no longer used"; modified function keys remain enabled.
 
 Terminal features are parsed like tty_parse_features: a trailing `@` removes a
 feature and keeps later entries from adding it back, and an unknown name ends the
-list. `client_termfeatures` lists features in tmux's table order. Features read
-from the outer terminal's device attributes in tmux come from `TERM_PROGRAM` (or a
-WezTerm/Ghostty TERM) here, using tmux's tty_default_features table; pwsh-tmux sends
-no DA/XDA queries. It does send tmux's `CSI ? 2026 $ p` (DECRQM) on attach, and a
-DECRPM reply of 1 to 3 adds the `sync` feature. Clients are UTF-8 with `-u`, inside tmux (`$TMUX`), with a UTF-8
+list. `client_termfeatures` lists features in tmux's table order. As in tmux 3.8, a
+VT100-like terminal is asked on attach for its primary, secondary and extended device
+attributes (`CSI c`, `CSI > c`, `CSI > q`) and for synchronized output (`CSI ? 2026 $ p`).
+The replies add features as tty_keys_device_attributes and tty_default_features do (a
+DA1 reply of level 61 to 65 lists features such as margins and clipboard; DA2 and
+XTVERSION name the terminal), and a DECRPM reply of 1 to 3 adds the `sync` feature.
+`TERM_PROGRAM` (or a WezTerm/Ghostty TERM) also selects the terminal's default
+features. Clients are UTF-8 with `-u`, inside tmux (`$TMUX`), with a UTF-8
 locale (LC_ALL, LC_CTYPE, LANG) or on Windows; the `utf8` feature also turns it on,
 and `utf8@` never turns it off. A non-UTF-8 client gets line drawing through the
 ACS charset and underscores for other characters. `appesc` enables application

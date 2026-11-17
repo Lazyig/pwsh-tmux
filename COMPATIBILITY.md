@@ -21,8 +21,8 @@ How it was checked:
   `show-hooks -g`/`-B`/`-F` are byte-identical to 3.8 except for three platform defaults:
   `default-terminal`, `default-shell` and `lock-command` (see
   [Intentional differences](#intentional-differences)). No 3.8 command, flag or option is
-  missing, and all 183 options in the option table are read by code (`xterm-keys` is
-  accepted and ignored, as in 3.8).
+  missing, and every option in the 183-option table except `xterm-keys` is read by code
+  (`xterm-keys` is accepted and ignored, as in 3.8).
   `set-option` gives the same error messages and exit status in 190 validation cases, and
   the 214 format variables were compared with a detached session, a nested attached
   client, and dead, piped, zoomed, marked, linked and alternate-screen panes.
@@ -78,8 +78,8 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   `pwsh`, falling back to `powershell.exe` on Windows and to `$SHELL` (then `/bin/sh`)
   on Unix. `editor` is `notepad.exe`
   on Windows (`/usr/bin/vi` elsewhere). `lock-command` is empty by default on every
-  platform (tmux uses its build's lock command, `lock -np` unless configured otherwise),
-  since Windows has no lock program, so `lock-*` needs one to be set.
+  platform (tmux uses a default chosen when it is built: `vlock` if vlock was found,
+  otherwise `lock -np`), since Windows has no lock program, so `lock-*` needs one to be set.
   Windows has no job control, so `suspend-client` does nothing there.
 - **`default-terminal` is `xterm-256color`**, not `tmux-256color`: Windows hosts usually
   have no tmux terminfo and ConPTY programs expect xterm. Panes therefore get
@@ -87,13 +87,17 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   in application cursor mode) rather than tmux's `\e[1~`/`\e[4~`.
 - **Pane titles on Windows.** ConPTY sets the console title when the pane starts, so
   `pane_title` begins as the shell's executable path and changes with the console title.
-  On Windows `clean_name` keeps backslashes in titles and names (they are paths); on Unix
-  they are escaped as in 3.8.
+  On Windows, titles and names set by the program in the pane (OSC 0/2, APC, `ESC k`) and
+  OSC 7 paths keep their backslashes (they are paths); on Unix they are escaped as in 3.8.
+  Titles and names given by commands (`select-pane -T`, `rename-window`, session and
+  buffer names) are escaped as in 3.8 on every platform.
 - **Names that coexist with tmux.** The server listens on `/tmp/pwsh-tmux-UID/NAME`
   (under `PWSH_TMUX_TMPDIR` or `TMUX_TMPDIR` if set) on Unix and on a named pipe on
-  Windows. Panes get `PWSH_TMUX` and `PWSH_TMUX_PANE` instead of `TMUX` and `TMUX_PANE`,
+  Windows. Panes get `PWSH_TMUX` and `PWSH_TMUX_PANE` in place of `TMUX` and `TMUX_PANE`,
   and `TERM_PROGRAM=pwsh-tmux` with the project version as `TERM_PROGRAM_VERSION`
-  (`#{version}` reports 3.8). Configuration, executable and environment variable names
+  (`#{version}` reports 3.8). `TMUX` and `TMUX_PANE` are neither set nor cleared, so a
+  pane inherits whatever values the server was started with (for example an outer tmux's);
+  tmux always sets `TMUX` itself. Configuration, executable and environment variable names
   use `pwsh-tmux`; the deployed executable may separately be named `tmux.exe`. Scripts
   that test `$TMUX` or `TERM_PROGRAM` see these names.
 - **Client names** are `client-N` rather than the client's tty path, on every platform;
@@ -109,9 +113,11 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   never set there.
 - **History line times** record the real time a line entered the history; tmux uses
   a time cached at the start of its event loop, which can be older.
-- **Terminal descriptions.** Windows console clients have no terminfo, so refusing a
-  terminal without `clear` or `cup` happens on Unix only. The `grid_metadata` tests also
-  run on Unix only, because ConPTY re-renders pane output (tabs, OSC 133 and OSC 8).
+- **Terminal descriptions.** pwsh-tmux draws without terminfo, so a client terminal the
+  terminfo database does not know is accepted on every platform, where tmux 3.8 refuses it
+  with "missing or unsuitable terminal". A terminal terminfo does know is refused without
+  `clear` or `cup`; Windows console clients have no terminfo, so this happens on Unix only.
+- **Tests.** The `grid_metadata` tests run on Unix only, because their panes run `printf`.
 - **Server shutdown on Windows.** On Unix the server unlinks its socket before the last
   reply, so a new client starts a fresh server. On Windows a client connecting to a named
   pipe during server shutdown can still race. To narrow this, the server sends the last
@@ -130,8 +136,10 @@ These do not match tmux 3.8 yet:
 - **Long UTF-8 sequences:** a cell holds 23 bytes, where tmux's `UTF8_SIZE` is 32, so tag
   sequences longer than 23 bytes (such as the England flag) are cut. Raising it would grow
   every cell (see [`MEMORY_COMPARISON.md`](MEMORY_COMPARISON.md)).
-- **Hex key names `0x41` to `0x7e`** are the same key as the typed ASCII character here;
-  in tmux they are separate keys. Only their place in `list-keys` differs.
+- **Hex key names `0x21` to `0x7e`** are the same key as the typed ASCII character here;
+  in tmux they are separate keys that list under the same name. Binding one therefore
+  replaces the binding of the other (after `bind 0x31 ...` and `bind 1 ...` only the
+  second is left, where tmux keeps both).
 - **Sixel** is not implemented: `#{sixel_support}` is 0 and the DA1 reply has no `;4`.
 - **`history_bytes` and `history_all_bytes`** on the alternate screen with a scroll region
   count one row of cells fewer than tmux.
@@ -146,9 +154,13 @@ These do not match tmux 3.8 yet:
   nested cells leave.
 - **Session groups:** `new-session -t` with an unknown name fails with "can't find
   session"; tmux 3.8 creates a new group of that name.
-- **Reflow:** tabs in a pane 3 columns wide give a different number of blank rows (4
-  columns and more match), and the pane grid counts a wide character as 2 columns where
-  tmux's reflow also counts its padding (copy mode's reflow follows tmux).
+- **Reflow:** widening a pane with tabs from 3 columns to 4 gives fewer blank rows than
+  tmux (shrinking to 3, 2 or 1 columns, and widening from there to the full width, match),
+  and the pane grid counts a wide character as 2 columns where tmux's reflow also counts
+  its padding (copy mode's reflow follows tmux).
+- **Resizing a zoomed window:** after `resize-window` on a zoomed window, unzooming gives
+  pane sizes that differ from tmux's (the zoomed layout keeps the older proportional
+  resize). The same resize without zoom matches.
 - **Blank cells in the status line and after prompts** are written with a foreground reset
   (an extra `\e[39m` in a nested `capture-pane -e`), where tmux clears them with a
   background-only erase. Nothing visible changes.
@@ -273,16 +285,15 @@ require changing the user's tmux installation, configuration or active servers.
 
 This is a bounded investigation, not certification of complete tmux compatibility.
 Every command flag, copy-mode command, locale-specific regex rule and newer tmux
-feature has not been exhaustively tested. In particular, the complete default key
-tables and generic `command-prompt -i` callbacks require
-separate compatibility coverage. Unsupported details are implementation gaps,
+feature has not been exhaustively tested. Unsupported details are implementation gaps,
 not justified platform differences.
 
 Security restrictions are deliberate differences: read-only control clients cannot
 execute commands, remove read-only flags, run shell formats or change shared pane
-state. Read-only sizes do not influence shared window sizes, and hooks caused by
-restricted requests are suppressed. Resource bounds also reject oversized or
-excessively costly input. See [`SECURITY.md`](SECURITY.md).
+state, and hooks caused by restricted requests are suppressed. As in tmux, a read-only
+client still sizes windows unless it is also ignore-size (`attach -r` and
+`switch-client -r` set both; `server-access -r` sets only read-only). Resource bounds
+also reject oversized or excessively costly input. See [`SECURITY.md`](SECURITY.md).
 
 The existing repository does not follow default rustfmt formatting, so
 `cargo fmt --all -- --check` reports differences throughout unchanged files as well.

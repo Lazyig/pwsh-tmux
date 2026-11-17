@@ -8,9 +8,11 @@ users you trust with that account.
 Read-only clients cannot clear that restriction, start shell jobs through format
 strings, modify shared pane state, or operate on other clients. Their format
 queries do not reveal cached shell-job output. Hooks triggered by restricted
-requests are suppressed, and their terminal sizes do not resize shared windows.
-This is intentionally stricter than same-user read-only control-mode behaviour
-observed in tmux 3.6a.
+requests are suppressed. This is intentionally stricter than same-user read-only
+control-mode behaviour observed in tmux 3.6a. Window sizing follows tmux 3.8: a
+read-only client still sizes shared windows unless it is also ignore-size.
+`attach-session -r` and `switch-client -r` set both flags; `server-access -r` sets
+only read-only.
 
 Read-only access still exposes session contents and permitted query results,
 including buffers, options and environment values. It does not isolate secrets
