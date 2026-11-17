@@ -3403,7 +3403,8 @@ fn terminals_without_clear_cannot_attach() {
     ctx.ok(&["set", "-g", "terminal-overrides", "xterm*:clear@"]);
     let mut t = Term::attach(&ctx, &["attach", "-t", "t"], 80, 24);
     t.wait_exit();
-    assert!(t.raw_text().contains("open terminal failed: terminal does not support clear"), "{}", t.raw_text());
+    // the child can exit before the pty reader has stored its last output
+    t.wait("refusal", || t.raw_text().contains("open terminal failed: terminal does not support clear"));
     assert!(ctx.ok(&["list-clients"]).is_empty());
 }
 
