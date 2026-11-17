@@ -1302,6 +1302,9 @@ impl Server {
                 new_size: None,
             },
         );
+        // layout_init and layout_fix_panes: the pane is laid out at once (less a
+        // scrollbar with pane-scrollbars on)
+        self.apply_layout(wid);
         wid
     }
 
