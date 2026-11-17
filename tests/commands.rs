@@ -1362,6 +1362,14 @@ fn message_log_jobs_and_prompt_history_types() {
     let lines: Vec<&str> = log.lines().collect();
     assert!(lines[0].ends_with(" command: show-messages"), "{log}");
     assert!(lines[1].ends_with(" command: display-message \"hello msg\""), "{log}");
+    // cmd_print: { } blocks are printed as blocks, not as strings
+    let conf = std::env::temp_dir().join(format!("pt-msg-blocks-{}.conf", std::process::id()));
+    std::fs::write(&conf, "if-shell -F 1 { set -g @a 1 } { set -g @a 2 }\n").unwrap();
+    ctx.ok(&["source-file", &conf.to_string_lossy()]);
+    let _ = std::fs::remove_file(&conf);
+    let log = ctx.ok(&["show-messages"]);
+    assert!(log.contains(" command: if-shell -F 1 { set-option -g @a 1 } { set-option -g @a 2 }\n"), "{log}");
+    assert!(log.contains(" command: set-option -g @a 1\n"), "{log}");
     // -J: running jobs
     ctx.ok(&["run-shell", "-b", "sleep 5"]);
     let jobs = ctx.ok(&["show-messages", "-J"]);
@@ -4003,4 +4011,55 @@ fn last_session_destroyed_then_a_new_server() {
         assert_eq!(ctx.ok(&["list-sessions", "-F", "#{session_name}"]), "b\n");
         ctx.ok(&["kill-server"]);
     }
+}
+
+#[test]
+fn control_client_errors_set_its_exit_status_and_run_shell_c_reports_after_the_block() {
+    // cmdq_error for a control client: control_write and c->retval = 1. run-shell -C
+    // waits (its %end is written at once), so its parse error comes after the block.
+    // A line that does not parse (control_error) leaves the status alone.
+    let ctx = Ctx::new("ctl-retval");
+    ctx.ok(&["new-session", "-d", "-s", "c"]);
+    let run = |input: &str| {
+        let mut child = ctx.command().args(["-C", "attach", "-t", "c"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).lines()
+            .filter(|l| ["%begin", "%end", "%error"].iter().any(|p| l.starts_with(p)) || !l.starts_with('%'))
+            .map(|l| l.split(' ').next().filter(|w| w.starts_with('%')).unwrap_or(l).to_string())
+            .collect::<Vec<_>>().join("\n");
+        (out.status.code(), text)
+    };
+    let (code, text) = run("run-shell -C 'bad\"q'\nset -g @h Z\n");
+    assert_eq!(code, Some(1), "{text}");
+    assert!(text.ends_with("%begin\n%end\nunknown command: badq\n%begin\n%end"), "{text}");
+    assert_eq!(run("select-pane -t nosuch\n").0, Some(1));
+    assert_eq!(run("nosuchcmd\n").0, Some(0));
+    assert_eq!(run("display-message -p hi\n").0, Some(0));
+}
+
+#[test]
+fn source_file_reads_the_command_line_clients_stdin_and_aliases_log_their_blocks() {
+    // file_read asks the command-line client for "-" (and /dev/stdin): its stdin
+    let ctx = Ctx::new("src-stdin");
+    ctx.ok(&["new-session", "-d", "-s", "s"]);
+    let mut child = ctx.command().args(["source-file", "-"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"if -F 1 { set -g @sf 1 }\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(ctx.ok(&["show-options", "-gv", "@sf"]).trim(), "1");
+    // (a parse error names the file "-", cfg_print_causes)
+    let mut child = ctx.command().args(["source-file", "-"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"set -g @x {\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(text.starts_with("-:2: "), "{text}");
+    assert_eq!(out.status.code(), Some(1));
+    // a command alias run from the command line: its { } blocks are logged as blocks
+    ctx.ok(&["set", "-s", "command-alias[100]", "zz=if -F 1 { set -g @al 1 }"]);
+    ctx.ok(&["zz"]);
+    let log = ctx.ok(&["show-messages"]);
+    assert!(log.contains(" command: source-file -\n"), "{log}");
+    assert!(log.contains(" command: if-shell -F 1 { set-option -g @al 1 }\n"), "{log}");
+    assert_eq!(ctx.ok(&["show-options", "-gv", "@al"]).trim(), "1");
 }

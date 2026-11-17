@@ -1764,7 +1764,7 @@ impl Server {
             self.exec_inner(argv, ctx)
         } else if argv.first().is_some_and(|name| self.command_aliases().iter().any(|a| a.split_once('=').is_some_and(|(n, _)| n == name))) {
             print_parsed_command(argv.into_iter().map(|s| (s, false)).collect(), &self.command_aliases(), true)
-                .and_then(|cmds| cmdparse::parse(&cmds.join(" ; ")))
+                .and_then(|cmds| cmdparse::parse_marked(&cmds.join(" ; ")))
                 .map(|mut cmds| { for cmd in &mut cmds { if let Some(name) = cmd.first_mut() { *name = format!("\0alias:{name}"); } } Flow::Inject(cmds, false) })
         } else { self.exec_inner(argv, ctx) };
         self.readonly_context.set(previous);
@@ -1783,6 +1783,14 @@ impl Server {
         if ctx.readonly && !READ_ONLY_OK.contains(&full) {
             return err("client is read-only");
         }
+        // the queue's { } blocks are marked (cmd_print shows them as blocks); the command
+        // gets their text (bind-key keeps them)
+        let marked = (full != "bind-key" && args.iter().any(|a| a.starts_with(cmdparse::BLOCK_MARK))).then(|| args.clone());
+        if marked.is_some() {
+            for a in &mut args {
+                if let Some(b) = a.strip_prefix(cmdparse::BLOCK_MARK) { *a = b.to_string(); }
+            }
+        }
         let o = parse_args(full, &args)?;
         if ctx.readonly {
             self.check_readonly_command(full, &o, ctx)?;
@@ -1790,7 +1798,7 @@ impl Server {
         // cmdq_add_message: each command goes in the message log (show-messages) once
         // the configuration is loaded, by key for a bound command of an attached client
         if !std::mem::take(&mut ctx.resumed) {
-            self.log_command(ctx.log_client.or(ctx.client).or(ctx.reply), ctx.key.as_deref(), full, &args);
+            self.log_command(ctx.log_client.or(ctx.client).or(ctx.reply), ctx.key.as_deref(), full, marked.as_deref().unwrap_or(&args));
         }
         self.command(full, o, env, ctx)
     }
@@ -1801,6 +1809,12 @@ impl Server {
         if !self.cfg_finished {
             return;
         }
+        // (stdin the command-line client read is logged as the path it was given)
+        let stdin_name = |a: String| match a.strip_prefix(STDIN_BUFFER_PREFIX) {
+            Some(r) => r.rsplit_once('\x01').map_or_else(|| "-".to_string(), |(_, n)| n.to_string()),
+            None => a,
+        };
+        let args: Vec<String> = args.iter().cloned().map(stdin_name).collect();
         let words = std::iter::once(full.to_string()).chain(args.iter().cloned())
             .map(|a| match a.strip_prefix(cmdparse::BLOCK_MARK) { Some(b) => (b.to_string(), true), None => (a, false) }).collect();
         let printed = print_parsed_command(words, &[], false).ok().and_then(|v| v.into_iter().next())
@@ -4313,6 +4327,18 @@ impl Server {
                     self.window_pane_mouse(p, ctx.client, &m);
                     return Ok(Flow::Next);
                 }
+                // no keys (count == 0, without -N or -R): the key of the binding's event
+                // (event->key; none from the command line), at a pane without its mouse
+                // event for a mouse key
+                let event_key = ctx.key.clone().filter(|k| !k.is_empty() && (o.has('K') || keys::parse_mouse_key_name(k).is_none()));
+                let o = match event_key {
+                    Some(k) if o.rest.is_empty() && !o.has('N') && !o.has('R') => {
+                        // (a key, not text: -l, -H and -F do not apply to it)
+                        let flags = o.flags.iter().filter(|(c, _)| !matches!(c, 'l' | 'H' | 'F')).map(|(c, v)| (*c, v.clone())).collect();
+                        Opts { flags, rest: vec![k] }
+                    }
+                    _ => o,
+                };
                 if o.has('K') {
                     // -K: the keys are handled as if the client (-c) typed them (prefix, key
                     // tables, bindings); bindings run before the commands after send-keys
@@ -4700,6 +4726,26 @@ impl Server {
                 let mut found = 0;
                 for pat in &o.rest {
                     let pat = if o.has('F') { self.expand(self.current(ctx), ctx.client, pat) } else { pat.clone() };
+                    // the command-line client's stdin (- or /dev/stdin), read by the client
+                    if let Some((enc, name)) = pat.strip_prefix(STDIN_BUFFER_PREFIX).and_then(|r| r.rsplit_once('\x01')) {
+                        let text = decode_stdin_buffer(&format!("{STDIN_BUFFER_PREFIX}{enc}"))?;
+                        let text = String::from_utf8(text).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+                        found += 1;
+                        match self.load_text(&text, name, o.has('n'), o.has('v'), ctx) {
+                            Ok((mut cmds, verbose)) => {
+                                for v in verbose {
+                                    ctx.out.push_str(&v);
+                                    ctx.out.push('\n');
+                                }
+                                if let Some(push) = cmds.first_mut() {
+                                    push.push("s".into());
+                                }
+                                injected.extend(cmds);
+                            }
+                            Err(e) => causes.push(e),
+                        }
+                        continue;
+                    }
                     let path = self.resolve_path(ctx, &pat);
                     let files = glob_files(&path);
                     // cmdq_error(item, "%s: %s", strerror(ENOENT), path): the path as given
@@ -4777,12 +4823,33 @@ impl Server {
                 // the target is CMD_FIND_CANFAIL: one that does not resolve leaves no pane
                 let resolved = self.resolve_pane(ctx, t).ok();
                 let tt = resolved.unwrap_or_else(|| self.current(ctx));
+                if let Some(d) = o.get('d') {
+                    // like tmux, wait on a timer (also for -C): the queue resumes without -d
+                    // afterwards (with -b only the command waits)
+                    let secs = d.parse::<f64>().ok().filter(|s| s.is_finite() && *s >= 0.0).ok_or_else(|| format!("invalid delay time: {d}"))?;
+                    return Err(format!(" delay {} {}", (secs * 1000.0).min(u32::MAX as f64) as u64, if o.has('b') { "b" } else { "" }));
+                }
                 if o.has('C') {
                     let c = o.rest.first().ok_or("run-shell -C needs a command")?;
                     // cmd_run_shell_timer: a parse error is reported (cmdq_error) but the
                     // command itself does not fail, so what follows it still runs
+                    // -b: the commands are appended to the target client's queue, with no
+                    // state (cmdq_append(c, cmdq_get_command(cmdlist, NULL)))
+                    let tc = o.has('b').then(|| self.resolve_client(ctx, None).ok()).flatten()
+                        .filter(|c| self.clients.get(c).is_some_and(|c| c.attached && c.session.is_some()));
                     return match self.parse_string(&self.expand(tt, ctx.client, c)) {
+                        Ok(cmds) if tc.is_some() => {
+                            let tc = tc.unwrap();
+                            let qctx = Ctx { client: Some(tc), ..Ctx::default() };
+                            self.client_append(tc, ClientItem::Queue(Queue { cmds: cmds.into(), ctx: qctx, soft: 0 }));
+                            Ok(Flow::Next)
+                        }
                         Ok(cmds) => Ok(Flow::Inject(cmds, false)),
+                        Err(e) if tc.is_some() => {
+                            // (no waiting item: status_message_set on the client)
+                            self.set_error(tc.unwrap(), &e);
+                            Ok(Flow::Next)
+                        }
                         Err(e) => {
                             // (the commands are parsed as from the file run-shell is in)
                             let e = match (ctx.files.last(), ctx.lines.last()) {
@@ -4793,7 +4860,16 @@ impl Server {
                                 // cmdq_error: a control client's block, else the
                                 // configuration's causes (or the message log)
                                 let owner = self.queue_client(ctx).filter(|c| self.clients.contains_key(c));
-                                if ctx.control_seq.is_some() || owner.is_some_and(|c| self.clients[&c].control != 0) {
+                                if let Some(c) = owner.filter(|c| self.clients[c].control != 0) {
+                                    // the timer reports it after the command's reply block
+                                    // (CMD_RETURN_WAIT wrote %end), as a bare line, and the
+                                    // client's exit status is 1
+                                    self.log_error(owner, &e);
+                                    let c = self.clients.get_mut(&c).unwrap();
+                                    c.ctl.after_block.push_str(&e);
+                                    c.ctl.after_block.push('\n');
+                                    c.ctl.retval.set(1);
+                                } else if ctx.control_seq.is_some() {
                                     self.log_error(owner, &e);
                                     ctx.out.push_str(&e);
                                     ctx.out.push('\n');
@@ -4804,11 +4880,6 @@ impl Server {
                             Ok(Flow::Next)
                         }
                     };
-                }
-                if let Some(d) = o.get('d') {
-                    // like tmux, wait on a timer: the queue resumes without -d afterwards
-                    let secs = d.parse::<f64>().ok().filter(|s| s.is_finite() && *s >= 0.0).ok_or_else(|| format!("invalid delay time: {d}"))?;
-                    return Err(format!(" delay {}", (secs * 1000.0).min(u32::MAX as f64) as u64));
                 }
                 // arguments after the command are #{1}, #{2}, ...
                 let args: HashMap<String, String> = o.rest.iter().skip(1).enumerate().map(|(i, a)| ((i + 1).to_string(), a.clone())).collect();
@@ -5200,9 +5271,14 @@ impl Server {
             Err(e) if e.kind() == std::io::ErrorKind::IsADirectory || std::path::Path::new(path).is_dir() => return err(format!("I/O error: {name}")),
             Err(e) => return err(format!("{}: {name}", strerror(&e))),
         };
+        self.load_text(&text, name, parse_only, verbose, ctx)
+    }
+
+    /// load_file for a file's text, read already.
+    pub(crate) fn load_text(&mut self, text: &str, name: &str, parse_only: bool, verbose: bool, ctx: &Ctx) -> Result<(Vec<Vec<String>>, Vec<String>), String> {
         // #{current_file} is this file while its %if lines are evaluated
         let saved_file = self.cur_file.replace(name.to_string());
-        let parsed = self.parse_tree_lines(&text, ctx);
+        let parsed = self.parse_tree_lines(text, ctx);
         self.cur_file = saved_file;
         let p = parsed.map_err(|(line, e)| format!("{name}:{line}: {e}"))?;
         let built = self.build_commands(p, Some(name), false)?;
@@ -5274,14 +5350,14 @@ impl Server {
             let is_alias = st.aliases.iter().any(|a| a.split_once('=').is_some_and(|(n, _)| n == words[0].0));
             let argv = if is_alias {
                 // the alias's commands, already expanded (exec does not expand them again)
-                let mut cmds = cmdparse::parse(&printed.join(" ; ")).map_err(|e| st.error(e))?;
+                let mut cmds = cmdparse::parse_marked(&printed.join(" ; ")).map_err(|e| st.error(e))?;
                 for cmd in &mut cmds {
                     cmd[0] = format!("\0alias:{}", cmd[0]);
                 }
                 cmds
             } else {
-                let bind = cmdparse::is_bind_key(&words[0].0);
-                vec![words.into_iter().map(|(w, b)| if b && bind { format!("{}{w}", cmdparse::BLOCK_MARK) } else { w }).collect()]
+                // { } blocks stay marked as blocks (exec gives a command their text)
+                vec![words.into_iter().map(|(w, b)| if b { format!("{}{w}", cmdparse::BLOCK_MARK) } else { w }).collect()]
             };
             Ok(((argv, c.line), printed.join(" ; ")))
         })?;

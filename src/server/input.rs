@@ -60,7 +60,8 @@ impl Client {
 pub struct InputState {
     /// When the key table was last set (keytable->activity_time), for prefix-timeout.
     pub(super) table_at: Option<Instant>,
-    last_key: String,
+    /// The key of the last binding run (c->last_key: Any for the Any binding).
+    pub(super) last_key: String,
     key_at: Option<Instant>,
     assume_paste: bool,
     guess_at: Option<Instant>,
@@ -352,9 +353,15 @@ impl Server {
         } else {
             None
         };
+        // tty_keys_next takes every key of the read (server_client_handle_key0) before
+        // the client's queue runs them, so a prompt a key's binding opens does not get
+        // the keys after it in the same read: they wait behind the prompt in the queue
+        let reading = self.reading.replace(cid);
         for i in inputs {
             self.dispatch_input(cid, i);
         }
+        self.reading = reading;
+        self.drain_clients();
     }
 
     pub fn dispatch_input(&mut self, cid: ClientId, input: Input) {
@@ -406,24 +413,9 @@ impl Server {
                 if c.is_readonly() {
                     return;
                 }
-                // the first pasted key closes a pane waiting for one (tmux only skips the
-                // paste start and end markers)
-                if let Some(pane) = self.client_active_pane(cid).filter(|_| !data.is_empty()) {
-                    if self.dead_key(pane) {
-                        return;
-                    }
-                }
-                if let Some(target) = self.input_target(cid) {
-                    // the paste-start key reaches the pane's mode first: it ends clock mode
-                    // like any key; in another mode the pasted text is dropped
-                    match self.panes.get(&target).map(|p| &p.mode) {
-                        Some(Some(PaneMode::Clock)) => self.exit_mode(target),
-                        Some(Some(_)) => return,
-                        _ => {}
-                    }
-                    if self.panes.get(&target).is_some_and(|p| p.options.get("@input-disabled") == Some("on")) { return; }
-                    self.paste(target, &data, true, true, None);
-                }
+                // the pasted keys are items of the client's queue like typed keys
+                // (server_client_key_callback's paste_key), after the keys before them
+                self.client_append(cid, ClientItem::Paste(data));
             }
             Input::Unknown(raw) => {
                 // focus reports reach panes through pane-focus-in/out (only those that asked)
@@ -431,11 +423,46 @@ impl Server {
                     self.client_focus(cid, raw == b"\x1b[I");
                     return;
                 }
-                if let Some(t) = self.input_target(cid) {
-                    if self.panes.get(&t).is_some_and(|p| p.mode.is_none()) {
-                        self.panes[&t].send(raw);
-                    }
-                }
+                // (keys too, in the client's queue)
+                self.client_append(cid, ClientItem::Raw(raw));
+            }
+        }
+    }
+
+    /// A bracketed paste the client's queue reached (paste_key): to the pane, as it is.
+    pub(super) fn paste_now(&mut self, cid: ClientId, data: Vec<u8>) {
+        if self.client_is_readonly(Some(cid)) || self.client_session(cid).is_none() {
+            return;
+        }
+        // the first pasted key closes a pane waiting for one (tmux only skips the
+        // paste start and end markers)
+        if let Some(pane) = self.client_active_pane(cid).filter(|_| !data.is_empty()) {
+            if self.dead_key(pane) {
+                return;
+            }
+        }
+        if let Some(target) = self.input_target(cid) {
+            // the paste-start key reaches the pane's mode first: it ends clock mode
+            // like any key; in another mode the pasted text is dropped
+            match self.panes.get(&target).map(|p| &p.mode) {
+                Some(Some(PaneMode::Clock)) => self.exit_mode(target),
+                Some(Some(_)) => return,
+                _ => {}
+            }
+            if self.panes.get(&target).is_some_and(|p| p.options.get("@input-disabled") == Some("on")) { return; }
+            self.paste(target, &data, true, true, None);
+        }
+    }
+
+    /// Bytes the key parser did not know, reached in the client's queue: to the pane
+    /// when it is not in a mode.
+    pub(super) fn raw_input_now(&mut self, cid: ClientId, raw: Vec<u8>) {
+        if self.client_is_readonly(Some(cid)) {
+            return;
+        }
+        if let Some(t) = self.input_target(cid) {
+            if self.panes.get(&t).is_some_and(|p| p.mode.is_none()) {
+                self.panes[&t].send(raw);
             }
         }
     }
@@ -588,10 +615,11 @@ impl Server {
         })
     }
 
+    /// server_client_handle_key: what cannot wait is done now, the rest of the key goes
+    /// in the client's queue (cmdq_append), after any commands of earlier keys.
     pub(super) fn handle_key(&mut self, cid: ClientId, k: Key, raw: Vec<u8>) {
         if let Some((k, raw)) = self.handle_key_now(cid, k, raw, false) {
-            let name = keys::key_name(&k);
-            self.handle_key_queued(cid, Some(k), &name, raw, false);
+            self.client_append(cid, ClientItem::Key(k, raw));
         }
     }
 
@@ -728,7 +756,7 @@ impl Server {
     /// and the prefix, then the pane or its mode. A key send-keys -K `sent` (KEYC_SENT) is
     /// never taken for a paste. `k` is None for a mouse key sent by name, whose event
     /// has no position.
-    fn handle_key_queued(&mut self, cid: ClientId, k: Option<Key>, name: &str, raw: Vec<u8>, sent: bool) {
+    pub(super) fn handle_key_queued(&mut self, cid: ClientId, k: Option<Key>, name: &str, raw: Vec<u8>, sent: bool) {
         let name = name.to_string();
         let mouse = k.is_none();
         if !self.clients.contains_key(&cid) { return; }
@@ -792,7 +820,7 @@ impl Server {
                 }
             }
             let was_repeating = repeating;
-            let found = self.bindings.get(&table).and_then(|t| t.get(&name)).map(|b| (b.cmd.clone(), b.repeat));
+            let found = self.bindings.get(&table).and_then(|t| t.get(&name)).map(|b| (b.cmd.clone(), b.repeat, name.clone()));
             // prefix-timeout counts from when the table was set, also by switch-client -T
             if table == "prefix" && prefix_ms > 0 && !(repeating && found.as_ref().is_some_and(|b| b.1))
                 && self.clients[&cid].input_state.table_at.is_some_and(|t| now.duration_since(t) > Duration::from_millis(prefix_ms)) {
@@ -801,8 +829,11 @@ impl Server {
                 first = table.clone();
                 continue;
             }
+            // no match: the Any key of the same table (KEYC_ANY, try_again)
+            // (the binding's key, KEYC_ANY, is what repeat compares with c->last_key)
+            let found = found.or_else(|| self.bindings.get(&table).and_then(|t| t.get("Any")).map(|b| (b.cmd.clone(), b.repeat, "Any".to_string())));
             match found {
-                Some((_, false)) if repeating => {
+                Some((_, false, _)) if repeating => {
                     // a binding that does not repeat ends the repeat; the key is looked up
                     // again from the default table, where it may be the prefix
                     reset(self, &default_table);
@@ -810,12 +841,12 @@ impl Server {
                     table = default_table.clone();
                     first = table.clone();
                 }
-                Some((cmd, repeat)) => {
+                Some((cmd, repeat, bkey)) => {
                     let mut ms = self.opt_session_num(Some(sid), "repeat-time").max(0) as u64;
                     let initial = self.opt_session_num(Some(sid), "initial-repeat-time").max(0) as u64;
-                    if ms > 0 && initial > 0 && (!repeating || self.clients[&cid].input_state.last_key != name) { ms = initial; }
+                    if ms > 0 && initial > 0 && (!repeating || self.clients[&cid].input_state.last_key != bkey) { ms = initial; }
                     let c = self.clients.get_mut(&cid).unwrap();
-                    c.input_state.last_key = name.clone();
+                    c.input_state.last_key = bkey;
                     if repeat && ms > 0 && table != default_table {
                         c.repeat_until = Some(Instant::now() + Duration::from_millis(ms));
                     } else {
@@ -912,21 +943,41 @@ impl Server {
     }
 
     /// Runs a command string for a client (prompts, menus, modes): cmdq_append to the
-    /// client's queue, so while a queue is running (send-keys -K handing a menu or a
-    /// prompt its key) the commands wait until that queue is done or waits.
+    /// client's queue, so the commands wait behind a command of the client that waits
+    /// (a prompt a key opened), and while a queue is running (send-keys -K handing a menu
+    /// or a prompt its key) until that queue is done or waits.
     pub fn run_string(&mut self, cid: ClientId, cmd: &str, pane: Option<PaneId>) {
         // cmd_parse_from_string: the whole list is checked before any of it runs
         match self.parse_string(cmd) {
             Ok(cmds) => {
                 let ctx = Ctx { client: Some(cid), pane, from_key: true, ..Ctx::default() };
-                let q = Queue { cmds: cmds.into(), ctx , soft: 0 };
-                if self.queue_depth > 0 {
-                    self.client_queued.push_back(q);
-                } else {
-                    self.run_queue(q);
-                }
+                self.client_append(cid, ClientItem::Queue(Queue { cmds: cmds.into(), ctx , soft: 0 }));
             }
-            Err(e) => self.set_error(cid, &e),
+            // cmdq_get_error: an item of the client's queue
+            Err(e) => self.client_append(cid, ClientItem::Error(e)),
+        }
+    }
+
+    /// A prompt's answer (cmd_command_prompt_callback, cmd_confirm_before_callback):
+    /// with a command waiting for the prompt, its commands go straight after it, with
+    /// its state (client, key) and as a group of their own (cmdq_insert_after with
+    /// cmdq_get_state); else they are appended to the client's queue with none.
+    fn run_prompt_answer(&mut self, cid: ClientId, pr: &Prompt, cmd: &str) {
+        let Some(ctx) = self.prompt_waits.iter().find(|w| w.1 == pr.id).map(|w| w.3.ctx.clone()) else {
+            self.run_string(cid, cmd, pr.pane);
+            return;
+        };
+        match self.parse_string(cmd) {
+            Ok(cmds) => {
+                let pane = pr.pane.or(ctx.pane).map(|p| p.to_string()).unwrap_or_default();
+                let client = ctx.client.map(|c| c.to_string()).unwrap_or_default();
+                let mut group = vec![vec![KEY_GROUP.clone(), "1".into(), client, pane, ctx.key.clone().unwrap_or_default()]];
+                group.extend(cmds);
+                group.push(vec![KEY_GROUP.clone(), "0".into()]);
+                self.prompt_inserts.entry(pr.id).or_default().extend(group);
+            }
+            // cmdq_get_error: appended to the client's queue
+            Err(e) => self.client_append(cid, ClientItem::Error(e)),
         }
     }
 
@@ -1291,7 +1342,7 @@ impl Server {
             PromptKind::Key => {
                 if let Some(s) = s {
                     let cmd = fill_template(&pr.template, &[s.to_string()]);
-                    self.run_string(cid, &cmd, pr.pane);
+                    self.run_prompt_answer(cid, pr, &cmd);
                 }
                 true
             }
@@ -1299,7 +1350,7 @@ impl Server {
                 let first = s.and_then(|s| s.chars().next());
                 if first == Some(pr.confirm.0) || (first == Some('\r') && pr.confirm.1) {
                     let template = pr.template.clone();
-                    self.run_string(cid, &template, pr.pane);
+                    self.run_prompt_answer(cid, pr, &template);
                 }
                 true
             }
@@ -1325,7 +1376,7 @@ impl Server {
                         }
                     }
                     let cmd = fill_template(&pr.template, &argv);
-                    self.run_string(cid, &cmd, pr.pane);
+                    self.run_prompt_answer(cid, pr, &cmd);
                     // an incremental prompt stays open for more typing
                     !pr.incremental
                 }

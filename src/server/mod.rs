@@ -1182,7 +1182,12 @@ impl Client {
             self.ctl.exiting.set(true);
             return;
         }
-        self.send(S_EXIT, msg.as_bytes());
+        self.send(S_EXIT, &self.control_exit_payload(&msg));
+    }
+
+    /// A control client's S_EXIT: the message, then NUL and its exit status (c->retval).
+    pub fn control_exit_payload(&self, msg: &str) -> Vec<u8> {
+        format!("{msg}\0{}", self.ctl.retval.get()).into_bytes()
     }
     pub fn name(&self) -> String {
         let id = self.ident.as_ref().filter(|i| !i.tty && i.pid != 0).map_or(self.id, |i| i.pid);
@@ -1265,6 +1270,9 @@ pub struct Ctx {
     /// The next command is run-shell resumed after its -d delay: it is in the message
     /// log already.
     pub resumed: bool,
+    /// What a background job (run-shell -b, if-shell -b) runs when it is done: no
+    /// client's queue waits for it.
+    pub detached: bool,
 }
 
 /// Queue markers source-file puts around a file's commands. A parsed command can hold any
@@ -1310,6 +1318,21 @@ pub struct KeyEvent {
     pub mouse: Option<String>,
 }
 
+/// An item of an attached client's command queue (c->queue) waiting behind a command
+/// that waits (a prompt, a popup, run-shell): a key it typed, which goes through the key
+/// tables when reached (server_client_key_callback), or commands appended for it
+/// (cmdq_append: a menu item, a mode's choice, a prompt without a waiting command).
+pub enum ClientItem {
+    Key(keys::Key, Vec<u8>),
+    Mouse(String, input::MouseCtx),
+    /// A bracketed paste, and bytes the key parser did not know (both for the pane).
+    Paste(Vec<u8>),
+    Raw(Vec<u8>),
+    Queue(Queue),
+    /// A parse error (cmdq_get_error): reported when the queue reaches it.
+    Error(String),
+}
+
 /// The tmux release whose behaviour this server matches (`#{version}`).
 pub const TMUX_VERSION: &str = "3.8";
 
@@ -1335,6 +1358,21 @@ pub enum JobKind {
     RunShell { pane: Option<PaneId>, background: bool, stderr: bool },
     IfShell { then: String, otherwise: Option<String> },
 }
+
+/// check_window_name's state of a window: when its name was last checked (name_time),
+/// its pending name timer, what its active pane was then (window_set_active_pane, a mode
+/// set or reset and a pane exit set PANE_CHANGED) and whether automatic-rename was on
+/// (turning it on sets PANE_CHANGED).
+#[derive(Default)]
+pub struct NameState {
+    pub time: Option<Instant>,
+    pub timer: Option<Instant>,
+    pub seen: Option<(PaneId, Option<std::mem::Discriminant<PaneMode>>, bool)>,
+    pub auto: bool,
+}
+
+/// NAME_INTERVAL: a window's name is checked at most this often.
+pub const NAME_INTERVAL: Duration = Duration::from_millis(500);
 
 pub struct Parked {
     pub queue: Queue,
@@ -1383,10 +1421,21 @@ pub struct Server {
     pub key_event_seq: u64,
     /// How many queues are running (run_queue nesting).
     pub queue_depth: usize,
-    /// Commands for a client's queue (cmdq_append) given while a queue was running: a
-    /// menu item or a prompt chosen by a key send-keys -K handed over at once. They run
-    /// when the running queue is done or waits.
-    pub client_queued: VecDeque<Queue>,
+    /// Each attached client's queue (c->queue) behind its running command: keys it typed
+    /// and commands appended for it. They run in order once no command of the client's
+    /// waits and no queue is running (a menu item chosen by a key send-keys -K hands over
+    /// runs when that queue is done or waits).
+    pub client_items: HashMap<ClientId, VecDeque<ClientItem>>,
+    /// The client whose terminal input is being read: its keys are all queued before any
+    /// of them is handled (tty_keys_next runs for the whole read before cmdq_next).
+    pub reading: Option<ClientId>,
+    /// resume_waits is running.
+    pub resuming: bool,
+    /// drain_clients is running.
+    pub draining: bool,
+    /// Commands a prompt's answer gives the command waiting for it (cmdq_insert_after the
+    /// waiting item), by prompt id, run before the rest of its queue.
+    pub prompt_inserts: HashMap<u64, Vec<Vec<String>>>,
     /// Events: hook bookkeeping, wait-for -E, monitors, change detection.
     pub ev: events::State,
     pub buffers: Vec<Buffer>,
@@ -1416,6 +1465,13 @@ pub struct Server {
     pub copy_drag_timers: HashMap<PaneId, Instant>,
     /// A lookup of what the panes run is in progress (at most one at a time).
     pub pane_info_busy: bool,
+    /// Panes changed since their window's name was last checked (PANE_CHANGED).
+    pub name_changed: std::collections::HashSet<PaneId>,
+    /// Each window's automatic-rename state (check_window_name).
+    pub name_state: HashMap<WinId, NameState>,
+    /// Panes (and their generation) whose program a lookup has found: tmux reads it as it
+    /// checks the name, so a pane's name is not checked before that.
+    pub name_known: std::collections::HashSet<(PaneId, u32)>,
     /// Queues paused by `run-shell -d`.
     pub delayed: Vec<(Instant, Queue)>,
     /// Mouse event of the command being run, for the mouse_* formats.
@@ -1535,6 +1591,8 @@ pub fn run(config: Option<String>, cwd: Option<String>) -> io::Result<()> {
             srv.detect_changes(None);
         }
         srv.drain_hooks();
+        // server_client_loop: check_window_name
+        srv.automatic_rename();
         srv.ev.activity.clear();
         srv.control_notify();
         srv.render_all();
@@ -1598,7 +1656,11 @@ impl Server {
             key_events: HashMap::new(),
             key_event_seq: 0,
             queue_depth: 0,
-            client_queued: VecDeque::new(),
+            client_items: HashMap::new(),
+            reading: None,
+            resuming: false,
+            draining: false,
+            prompt_inserts: HashMap::new(),
             ev: Default::default(),
             buffers: Vec::new(),
             buffer_seq: 0,
@@ -1616,6 +1678,9 @@ impl Server {
             menus: HashMap::new(),
             copy_drag_timers: HashMap::new(),
             pane_info_busy: false,
+            name_changed: Default::default(),
+            name_state: HashMap::new(),
+            name_known: Default::default(),
             delayed: Vec::new(),
             cur_mouse: None,
             cur_file: None,
@@ -2332,10 +2397,14 @@ impl Server {
         p.parser.process(data);
         p.last_output = Instant::now();
         if !data.is_empty() {
+            // input_parse_buffer: PANE_CHANGED
+            self.name_changed.insert(id);
+            let p = self.panes.get_mut(&id).unwrap();
             p.track.last_output_time = now_secs();
             p.track.output_generation += 1;
             p.track.unseen_changes |= p.mode.is_some();
         }
+        let p = self.panes.get_mut(&id).unwrap();
         let sync = p.parser.screen().synchronized_output();
         if sync != p.track.sync_since.is_some() {
             p.track.sync_since = sync.then(Instant::now);
@@ -2514,7 +2583,10 @@ impl Server {
         let popup_owner = self.clients.values().find(|c| matches!(&c.overlay, Some(Overlay::Popup(p)) if p.pane == id)).map(|c| c.id);
         if let Some(cid) = popup_owner {
             if self.popup_panes.values().any(|p| *p == id) {
-                self.popup_status.insert(id, status.unwrap_or(129));
+                // popup_job_complete_cb: WEXITSTATUS, or WTERMSIG for a command a signal
+                // ended (Windows has no signals: a process ended by TerminateProcess
+                // reports the exit code it was given)
+                self.popup_status.insert(id, status.map_or(129, |s| exit_signal(s).unwrap_or(s)));
             }
             // popup_job_complete_cb: -E closes it, -EE only for status 0
             let close = matches!(&self.clients[&cid].overlay, Some(Overlay::Popup(p)) if p.close_on_exit || (p.close_exit_zero && status == Some(0)));
@@ -2740,6 +2812,13 @@ impl Server {
         if let Some(d) = self.copy_refresh_deadline() {
             t = t.min(d.saturating_duration_since(now));
         }
+        for d in self.name_state.values().filter_map(|n| n.timer) {
+            t = t.min(d.saturating_duration_since(now));
+        }
+        // a closed prompt's or popup's queue goes on in the next turn, at once
+        if self.waits_resumable() {
+            t = Duration::ZERO;
+        }
         let now_us = now_us();
         for (_, deadline, _) in self.silence_timers() {
             t = t.min(Duration::from_micros(deadline.saturating_sub(now_us)));
@@ -2832,40 +2911,7 @@ impl Server {
             let windows = &self.windows;
             self.menus.retain(|w, _| windows.contains_key(w));
         }
-        let waiting = std::mem::take(&mut self.prompt_waits);
-        for (cid, epoch, argv, queue) in waiting {
-            if !self.prompt_open(epoch) {
-                let mut queue = queue;
-                self.after_command(&argv, &queue.ctx);
-                for c in std::mem::take(&mut self.ev.inject).into_iter().rev() {
-                    queue.cmds.push_front(c);
-                }
-                self.run_queue(queue);
-            } else {
-                self.prompt_waits.push((cid, epoch, argv, queue));
-            }
-        }
-        let waiting = std::mem::take(&mut self.overlay_waits);
-        for (cid, epoch, argv, queue) in waiting {
-            if self.clients.get(&cid).is_none_or(|c| c.overlay.is_none() || c.overlay_epoch != epoch) {
-                let mut queue = queue;
-                // popup_free_cb: a command-line client exits with the popup's status, 129
-                // (128 + SIGHUP) when it was closed before its command exited
-                if let Some(pane) = self.popup_panes.remove(&epoch) {
-                    let status = self.popup_status.remove(&pane).unwrap_or(129);
-                    if queue.ctx.reply.and_then(|r| self.clients.get(&r)).is_some_and(|c| c.session.is_none()) {
-                        queue.ctx.retval = status;
-                    }
-                }
-                self.after_command(&argv, &queue.ctx);
-                for c in std::mem::take(&mut self.ev.inject).into_iter().rev() {
-                    queue.cmds.push_front(c);
-                }
-                self.run_queue(queue);
-            } else {
-                self.overlay_waits.push((cid, epoch, argv, queue));
-            }
-        }
+        self.drain_clients();
         // Animation cycles request a one-shot status redraw every 100ms.
         self.animation_deadlines.borrow_mut().retain(|cid, deadline| {
             if *deadline > now { return self.clients.contains_key(cid); }
@@ -2885,7 +2931,6 @@ impl Server {
         self.control_subscriptions();
         self.check_monitors();
         self.request_pane_info();
-        self.automatic_rename();
         // status-interval redraws (clock, status-right time)
         let now = now_secs();
         let sids: Vec<SessId> = self.sessions.keys().copied().collect();
@@ -2938,24 +2983,87 @@ impl Server {
             let Some(p) = self.panes.get_mut(&r.id).filter(|p| p.generation == r.generation && p.pid == r.pid && p.dead.is_none()) else {
                 continue;
             };
-            if let Some(c) = r.cmd {
+            // (tmux reads these as it checks the name: a change found here is checked
+            // like output)
+            let mut changed = self.name_known.insert((r.id, r.generation));
+            if let Some(c) = r.cmd.filter(|c| *c != p.current_cmd) {
                 p.current_cmd = c;
+                // (on Unix the name check reads the program itself, as tmux does)
+                changed |= !cfg!(unix);
             }
             // a directory the pane reported meanwhile is newer than this lookup
-            if let Some(path) = r.path.filter(|_| p.cwd_seq == r.cwd_seq) {
+            if let Some(path) = r.path.filter(|path| p.cwd_seq == r.cwd_seq && *path != p.current_path) {
                 p.current_path = path;
+                changed = true;
+            }
+            if changed {
+                self.name_changed.insert(r.id);
             }
         }
-        self.automatic_rename();
     }
 
-    fn automatic_rename(&mut self) {
+    /// osdep_get_name for a pane's name check: on Unix its foreground program, read now
+    /// (quick). False where it could not be read (Windows uses the background lookup).
+    fn read_program_now(&mut self, pane: PaneId) -> bool {
+        #[cfg(unix)]
+        {
+            let Some(p) = self.panes.get(&pane).filter(|p| p.dead.is_none()) else { return false };
+            let Some(cmd) = procinfo::pane_programs(&[(p.pid, p.fg_pgrp())]).pop().and_then(|r| r.0) else { return false };
+            let generation = p.generation;
+            self.panes.get_mut(&pane).unwrap().current_cmd = cmd;
+            self.name_known.insert((pane, generation));
+            true
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pane;
+            false
+        }
+    }
+
+    /// check_window_name for every window, each time round the loop: a window whose
+    /// active pane changed is renamed at once, or when NAME_INTERVAL has passed since its
+    /// name was last checked (its timer).
+    pub(crate) fn automatic_rename(&mut self) {
+        let now = Instant::now();
         let wids: Vec<WinId> = self.windows.keys().copied().collect();
+        self.name_state.retain(|w, _| wids.contains(w));
+        let panes = &self.panes;
+        self.name_changed.retain(|p| panes.contains_key(p));
+        self.name_known.retain(|(p, g)| panes.get(p).is_some_and(|p| p.generation == *g));
         for wid in wids {
             let Some(active) = self.windows.get(&wid).map(|w| w.active) else { continue };
-            if !self.opt_window_on(Some(wid), "automatic-rename") {
+            let seen = self.panes.get(&active).map(|p| (active, p.mode.as_ref().map(std::mem::discriminant), p.dead.is_some()));
+            let auto = self.opt_window_on(Some(wid), "automatic-rename");
+            let st = self.name_state.entry(wid).or_default();
+            if st.seen != seen || (auto && !st.auto) {
+                st.seen = seen;
+                self.name_changed.insert(active);
+            }
+            st.auto = auto;
+            // (a timer that has fired is gone: it is a one-shot evtimer)
+            if st.timer.is_some_and(|t| t <= now) {
+                st.timer = None;
+            }
+            if !auto || !self.name_changed.contains(&active) {
                 continue;
             }
+            // name_time_expired: checked less than NAME_INTERVAL ago, the timer does it
+            if let Some(t) = st.time.filter(|t| now.duration_since(*t) <= NAME_INTERVAL) {
+                st.timer.get_or_insert(t + NAME_INTERVAL);
+                continue;
+            }
+            // tmux reads what the pane runs as it checks the name (osdep_get_name); where
+            // that is slow (Windows) the name waits for the background lookup to find it
+            let known = self.read_program_now(active)
+                || self.panes.get(&active).is_none_or(|p| p.dead.is_some() || self.name_known.contains(&(active, p.generation)));
+            if !known {
+                continue;
+            }
+            let st = self.name_state.entry(wid).or_default();
+            st.time = Some(now);
+            st.timer = None;
+            self.name_changed.remove(&active);
             let fmt = self.opt_window(Some(wid), "automatic-rename-format");
             let name = self.expand_for_pane(active, &fmt);
             if !name.is_empty() && self.windows.get(&wid).is_some_and(|w| w.name != name) {
@@ -3880,10 +3988,140 @@ impl Server {
         self.drain_hooks();
         self.queue_depth -= 1;
         if self.queue_depth == 0 {
-            while let Some(q) = self.client_queued.pop_front() {
-                self.run_queue(q);
+            self.drain_clients();
+        }
+    }
+
+    /// The attached client whose queue (c->queue) a queue is: none for the global queue
+    /// (the configuration, event hooks) and background jobs.
+    pub(crate) fn queue_owner(&self, ctx: &Ctx) -> Option<ClientId> {
+        if ctx.cfg || ctx.detached || ctx.hook_depth > 1 {
+            return None;
+        }
+        self.queue_client(ctx)
+    }
+
+    /// A command of the client's queue waits (CMDQ_WAITING): a prompt, a popup, a job,
+    /// a delay, wait-for, a pane.
+    pub(crate) fn client_blocked(&self, cid: ClientId) -> bool {
+        let own = |q: &Queue| self.queue_owner(&q.ctx) == Some(cid);
+        self.prompt_waits.iter().any(|w| own(&w.3))
+            || self.overlay_waits.iter().any(|w| own(&w.3))
+            || self.jobs.values().any(|j| own(&j.queue))
+            || self.delayed.iter().any(|d| own(&d.1))
+            || self.waits.values().any(|c| c.waiters.iter().chain(&c.lockers).any(own))
+            || self.ev.waiters.iter().any(|w| own(&w.queue))
+            || self.pane_waits.values().flatten().any(|w| own(&w.1))
+    }
+
+    /// cmdq_append for an attached client: runs at once unless the client's queue has
+    /// items or waits, a queue is running or its input is being read.
+    pub(crate) fn client_append(&mut self, cid: ClientId, item: ClientItem) {
+        self.client_items.entry(cid).or_default().push_back(item);
+        self.drain_clients();
+    }
+
+    /// Whether a key for the client would wait behind items of its queue.
+    pub(crate) fn client_busy(&self, cid: ClientId) -> bool {
+        self.queue_depth > 0 || self.client_items.get(&cid).is_some_and(|q| !q.is_empty()) || self.client_blocked(cid)
+    }
+
+    /// server_loop's cmdq_next for each client: every client's items in order, each
+    /// until one of its commands waits. (Not while a queue runs or input is read: the
+    /// outermost caller does it, so the items are not handled recursively.)
+    pub(crate) fn drain_clients(&mut self) {
+        if self.queue_depth > 0 || self.reading.is_some() || self.draining {
+            return;
+        }
+        self.draining = true;
+        loop {
+            self.resume_waits();
+            let mut ran = false;
+            let cids: Vec<ClientId> = self.client_items.keys().copied().collect();
+            for cid in cids {
+                // (the items of a client that has gone go with it)
+                if !self.clients.contains_key(&cid) {
+                    self.client_items.remove(&cid);
+                    continue;
+                }
+                if self.client_blocked(cid) {
+                    continue;
+                }
+                let Some(item) = self.client_items.get_mut(&cid).and_then(|q| q.pop_front()) else { continue };
+                if self.client_items.get(&cid).is_some_and(|q| q.is_empty()) {
+                    self.client_items.remove(&cid);
+                }
+                ran = true;
+                match item {
+                    ClientItem::Key(k, raw) => {
+                        let name = keys::key_name(&k);
+                        self.handle_key_queued(cid, Some(k), &name, raw, false);
+                    }
+                    ClientItem::Mouse(key, ctx) => self.mouse_key_now(cid, key, ctx),
+                    ClientItem::Paste(data) => self.paste_now(cid, data),
+                    ClientItem::Raw(raw) => self.raw_input_now(cid, raw),
+                    ClientItem::Error(e) => self.set_error(cid, &e),
+                    ClientItem::Queue(q) => self.run_queue(q),
+                }
+            }
+            if !ran {
+                break;
             }
         }
+        self.draining = false;
+    }
+
+    /// The queues whose prompt or popup has closed go on (cmdq_continue), at once.
+    pub(crate) fn resume_waits(&mut self) {
+        if self.resuming || self.queue_depth > 0 {
+            return;
+        }
+        self.resuming = true;
+        let waiting = std::mem::take(&mut self.prompt_waits);
+        for (cid, epoch, argv, queue) in waiting {
+            if !self.prompt_open(epoch) {
+                let mut queue = queue;
+                self.after_command(&argv, &queue.ctx);
+                for c in std::mem::take(&mut self.ev.inject).into_iter().rev() {
+                    queue.cmds.push_front(c);
+                }
+                // the answer's commands come straight after the prompt, before its hook
+                for c in self.prompt_inserts.remove(&epoch).unwrap_or_default().into_iter().rev() {
+                    queue.cmds.push_front(c);
+                }
+                self.run_queue(queue);
+            } else {
+                self.prompt_waits.push((cid, epoch, argv, queue));
+            }
+        }
+        let waiting = std::mem::take(&mut self.overlay_waits);
+        for (cid, epoch, argv, queue) in waiting {
+            if self.clients.get(&cid).is_none_or(|c| c.overlay.is_none() || c.overlay_epoch != epoch) {
+                let mut queue = queue;
+                // popup_free_cb: a command-line client exits with the popup's status, 129
+                // (128 + SIGHUP) when it was closed before its command exited
+                if let Some(pane) = self.popup_panes.remove(&epoch) {
+                    let status = self.popup_status.remove(&pane).unwrap_or(129);
+                    if queue.ctx.reply.and_then(|r| self.clients.get(&r)).is_some_and(|c| c.session.is_none()) {
+                        queue.ctx.retval = status;
+                    }
+                }
+                self.after_command(&argv, &queue.ctx);
+                for c in std::mem::take(&mut self.ev.inject).into_iter().rev() {
+                    queue.cmds.push_front(c);
+                }
+                self.run_queue(queue);
+            } else {
+                self.overlay_waits.push((cid, epoch, argv, queue));
+            }
+        }
+        self.resuming = false;
+    }
+
+    /// Whether a waiting prompt or popup has closed (its queue goes on at once).
+    fn waits_resumable(&self) -> bool {
+        self.prompt_waits.iter().any(|w| !self.prompt_open(w.1))
+            || self.overlay_waits.iter().any(|(cid, epoch, ..)| self.clients.get(cid).is_none_or(|c| c.overlay.is_none() || c.overlay_epoch != *epoch))
     }
 
     /// A control client's reply for the item just run (cmdq_guard): each command,
@@ -3897,7 +4135,12 @@ impl Server {
         // hook and key binding commands run with a new state, without CMDQ_STATE_CONTROL
         let typed = q.ctx.control_line && q.ctx.hook_depth == 0 && q.ctx.key_depth == 0;
         self.control_block(cid, seq, typed, &out, err);
+        // cmdq_error for a control client sets its exit status (c->retval)
+        if let Some(c) = self.clients.get(&cid).filter(|_| err.is_some_and(|e| !e.is_empty())) {
+            c.ctl.retval.set(1);
+        }
         self.control_flush(cid);
+        self.control_after_block(cid);
         q.ctx.control_done = true;
         if let Some(c) = self.clients.get_mut(&cid) {
             c.control_seq += 1;
@@ -4128,6 +4371,7 @@ impl Server {
             if let Some(first) = argv.first_mut() {
                 *first = name.clone();
             }
+            crate::cmdparse::unmark_blocks(&mut argv);
             let saved_mouse = std::mem::replace(&mut self.cur_mouse, q.ctx.mouse.clone());
             let saved_file = std::mem::replace(&mut self.cur_file, q.ctx.files.last().cloned());
             let saved_formats = std::mem::replace(&mut self.ev.cur_formats, q.ctx.formats.clone());
@@ -4323,7 +4567,7 @@ impl Server {
                         "job-if" => {
                             let kind = JobKind::IfShell { then: get(3), otherwise: Some(get(4)).filter(|s| !s.is_empty()) };
                             if get(5) == "b" {
-                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: Default::default(), control_seq: None, ..q.ctx.clone() }, soft: 0 };
+                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: Default::default(), control_seq: None, detached: true, ..q.ctx.clone() }, soft: 0 };
                                 self.spawn_job(&get(2), None, kind, sub);
                                 self.control_item_done(&mut q, None);
                                 continue;
@@ -4342,7 +4586,7 @@ impl Server {
                             let cwd = Some(get(3)).filter(|s| !s.is_empty());
                             let kind = JobKind::RunShell { pane, background, stderr: get(4).contains('E') };
                             if background {
-                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: Default::default(), control_seq: None, ..q.ctx.clone() }, soft: 0 };
+                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: Default::default(), control_seq: None, detached: true, ..q.ctx.clone() }, soft: 0 };
                                 self.spawn_job(&get(2), cwd, kind, sub);
                                 self.control_item_done(&mut q, None);
                                 continue;
@@ -4394,6 +4638,20 @@ impl Server {
                                 _ => self.finish_queue(q, None),
                             }
                             return;
+                        }
+                        "delay" if get(3) == "b" => {
+                            // run-shell -b -d: only the command waits for its timer, in a
+                            // queue of no client's (JOB_NOWAIT); the rest goes on now
+                            if let Some(c) = delay_cmd.as_ref().map(|c| strip_delay(c)) {
+                                let ms: u64 = get(2).parse().unwrap_or(0);
+                                // (a command-line client that has gone by then is not the
+                                // queue's client: cdata->client is the target client)
+                                let client = q.ctx.client.filter(|c| self.clients.get(c).is_some_and(|c| c.attached));
+                                let ctx = Ctx { client, reply: None, out: Default::default(), control_seq: None, detached: true, resumed: true, ..q.ctx.clone() };
+                                self.delayed.push((Instant::now() + Duration::from_millis(ms), Queue { cmds: VecDeque::from([c]), ctx, soft: 0 }));
+                            }
+                            self.control_item_done(&mut q, None);
+                            continue;
                         }
                         "delay" => {
                             // run-shell -d: the rest of the queue (and the command) runs later
@@ -4447,8 +4705,12 @@ impl Server {
             }
             if !ctx.control_done || !ctx.out.is_empty() || err.is_some() {
                 self.control_block(cid, seq, ctx.control_line && ctx.hook_depth == 0, &ctx.out, err.as_deref());
+                if let Some(c) = self.clients.get(&cid).filter(|_| err.as_deref().is_some_and(|e| !e.is_empty())) {
+                    c.ctl.retval.set(1);
+                }
             }
             self.control_flush(cid);
+            self.control_after_block(cid);
             if let Some(c) = self.clients.get(&cid) {
                 c.finish_exit();
             }

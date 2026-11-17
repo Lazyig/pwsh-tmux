@@ -230,6 +230,33 @@ fn prepare_stdin_buffers(args: &mut [String], input: &mut impl Read) -> std::io:
                 args[last] = encode_stdin_buffer(&data) + separator;
             }
         }
+        // source-file - or /dev/stdin: file_read asks the command-line client for the
+        // file, so it is this client's stdin (its name goes after a \x01)
+        if end > start + 1 && matches!(args[start].as_str(), "source-file" | "source") {
+            let mut options = true;
+            let mut i = start + 1;
+            while i < end {
+                let suffix = if i + 1 == end && suffixed { ";" } else { "" };
+                let word = args[i][..args[i].len() - suffix.len()].to_string();
+                if options && word == "--" {
+                    options = false;
+                } else if options && word.len() > 1 && word.starts_with('-') {
+                    // -t takes a value (the rest of the word or the next one)
+                    if word.ends_with('t') && !word[1..word.len() - 1].contains('t') {
+                        i += 1;
+                    }
+                } else {
+                    options = false;
+                    if word == "-" || word == "/dev/stdin" {
+                        let mut data = Vec::new();
+                        input.take(MAX_STDIN_BUFFER as u64 + 1).read_to_end(&mut data)?;
+                        if data.len() > MAX_STDIN_BUFFER { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "stdin buffer exceeds command frame limit")); }
+                        args[i] = format!("{}\x01{word}{suffix}", encode_stdin_buffer(&data));
+                    }
+                }
+                i += 1;
+            }
+        }
         start = index + 1;
     }
     Ok(())
@@ -470,12 +497,14 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                     });
                 }
             }
-            Ok((S_EXIT, _)) if g.control > 0 => {
+            Ok((S_EXIT, p)) if g.control > 0 => {
                 if g.control == 2 {
                     let _ = out.write_all(b"\x1b\\");
                 }
                 let _ = out.flush();
-                std::process::exit(0);
+                // the exit status after the message's NUL (c->retval)
+                let code = p.iter().rposition(|b| *b == 0).and_then(|i| std::str::from_utf8(&p[i + 1..]).ok()?.parse().ok()).unwrap_or(0);
+                std::process::exit(code);
             }
             Ok((S_EXEC, p)) => {
                 // detach-client -E: the shell command replaces the client

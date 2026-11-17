@@ -34,6 +34,11 @@ pub struct Flags {
     /// Told to exit (CLIENT_EXIT): the exit is sent once the reply of the running
     /// command is written.
     pub deferred_exit: std::cell::RefCell<Option<String>>,
+    /// Lines written after the reply block of the running command (an error reported
+    /// once the command has returned, as run-shell -C's from its timer).
+    pub after_block: String,
+    /// The exit status (c->retval): 1 after such an error.
+    pub retval: std::cell::Cell<i32>,
     pub panes: HashMap<PaneId, PaneOutput>,
     /// name -> (what, format, last value per target)
     pub subs: BTreeMap<String, (String, String, HashMap<String, String>)>,
@@ -60,6 +65,12 @@ impl Server {
         self.clients.get(&cid).is_some_and(|c| c.control > 0)
     }
 
+    /// Writes what was held for after the running command's reply block.
+    pub fn control_after_block(&mut self, cid: ClientId) {
+        let Some(text) = self.clients.get_mut(&cid).map(|c| std::mem::take(&mut c.ctl.after_block)).filter(|t| !t.is_empty()) else { return };
+        self.control_write(cid, &text);
+    }
+
     /// Sends a protocol line (or several) to a control client.
     pub fn control_write(&self, cid: ClientId, text: &str) {
         if let Some(c) = self.clients.get(&cid) {
@@ -73,7 +84,7 @@ impl Server {
         // wait-exit: after %exit the client is let go by its next line
         if self.clients.get(&cid).is_some_and(|c| c.ctl.exiting.get()) {
             if let Some(c) = self.clients.get(&cid) {
-                c.send(S_EXIT, b"");
+                c.send(S_EXIT, &c.control_exit_payload(""));
             }
             return;
         }

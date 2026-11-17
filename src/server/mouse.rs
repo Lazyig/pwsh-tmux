@@ -460,7 +460,17 @@ impl Server {
 
     /// Look a mouse key up in the key tables and run it, or give the event to the pane
     /// (the mouse half of server_client_key_callback).
-    fn mouse_key(&mut self, cid: ClientId, key: String, mut ctx: MouseCtx) {
+    fn mouse_key(&mut self, cid: ClientId, key: String, ctx: MouseCtx) {
+        // server_client_handle_key: the key callback is an item of the client's queue
+        // (behind a command that waits); with nothing in it, it runs at once
+        if self.client_busy(cid) {
+            self.client_append(cid, ClientItem::Mouse(key, ctx));
+        } else {
+            self.mouse_key_now(cid, key, ctx);
+        }
+    }
+
+    pub(super) fn mouse_key_now(&mut self, cid: ClientId, key: String, mut ctx: MouseCtx) {
         ctx.key = key.clone();
         let Some(sid) = self.client_session(cid) else { return };
         let fs_pane = self.mouse_pane(&ctx);
@@ -482,10 +492,17 @@ impl Server {
         let mut first = first;
         let mut table = first.clone();
         loop {
-            if let Some(b) = self.bindings.get(&table).and_then(|t| t.get(&key)) {
+            // (no match: the table's Any key, KEYC_ANY)
+            let found = self.bindings.get(&table).and_then(|t| t.get(&key).map(|b| (b, key.clone())).or_else(|| t.get("Any").map(|b| (b, "Any".to_string()))));
+            if let Some((b, bkey)) = found {
                 let (cmd, repeat) = (b.cmd.clone(), b.repeat);
-                let ms = self.opt_session_num(Some(sid), "repeat-time").max(0) as u64;
+                // server_client_repeat_time: initial-repeat-time unless this binding's key
+                // is repeating
+                let mut ms = self.opt_session_num(Some(sid), "repeat-time").max(0) as u64;
+                let initial = self.opt_session_num(Some(sid), "initial-repeat-time").max(0) as u64;
+                if ms > 0 && initial > 0 && (!repeating || self.clients[&cid].input_state.last_key != bkey) { ms = initial; }
                 let c = self.clients.get_mut(&cid).unwrap();
+                c.input_state.last_key = bkey;
                 if repeat && ms > 0 {
                     c.repeat_until = Some(Instant::now() + Duration::from_millis(ms));
                 } else {

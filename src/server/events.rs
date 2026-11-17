@@ -576,7 +576,7 @@ impl Server {
         let mut lists = Vec::new();
         for value in self.hook_commands(level, name) {
             let value = if expand { self.expand_extra(target, client, &value, formats.clone()) } else { value };
-            match crate::cmdparse::parse(&value) {
+            match crate::cmdparse::parse_marked(&value) {
                 Ok(v) if !v.is_empty() => lists.push(VecDeque::from(v)),
                 Ok(_) => {}
                 Err(e) => log(&format!("hook {name}: {e}")),
@@ -619,7 +619,7 @@ impl Server {
         let formats = HashMap::from([("hook".to_string(), name.to_string())]);
         let mut out = Vec::new();
         for value in self.hook_commands(level, name) {
-            match crate::cmdparse::parse(&value) {
+            match crate::cmdparse::parse_marked(&value) {
                 Ok(v) => out.extend(wrap_hook(v.into(), target, &formats)),
                 Err(e) => log(&format!("hook {name}: {e}")),
             }

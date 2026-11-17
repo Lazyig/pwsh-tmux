@@ -106,7 +106,8 @@ impl Server {
         // character, a prompt in tmux, does not get them)
         let plain = self.key_plain && self.key_capture.is_some();
         let pending = !plain && matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(cm)) if cm.waiting_for_key());
-        let binding = self.bindings.get(table).and_then(|t| t.get(name)).map(|b| b.cmd.clone());
+        // (an unbound key runs the table's Any binding, KEYC_ANY)
+        let binding = self.bindings.get(table).and_then(|t| t.get(name).or_else(|| t.get("Any"))).map(|b| b.cmd.clone());
         let default_raw = copymode::CopyMode::default_bindings(vi).iter().find(|(k, _)| keys::parse_key_name(k).map(|k| keys::key_name(&k)).as_deref().unwrap_or(k) == name).map(|(_, c)| *c);
         let default = default_raw.map(default_binding_command);
         // the repeat count bindings open the real numeric pane prompt ("(repeat) N"): it
@@ -121,9 +122,10 @@ impl Server {
                 return;
             }
         }
-        // under send-keys -K the default prompts (jumps, searches, goto line) are the real
-        // command-prompt, which waits and holds up the keys after it
-        let queued_prompt = self.key_capture.is_some() && default_raw.is_some_and(|c| c.starts_with("command-prompt"));
+        // the default prompts (jumps, searches, goto line) are the real command-prompt,
+        // which waits and holds up the keys after it in the client's queue (typed in the
+        // same read, or sent by send-keys -K)
+        let queued_prompt = (self.key_capture.is_some() || cid.is_some()) && default_raw.is_some_and(|c| c.starts_with("command-prompt"));
         // the default mouse bindings (select-pane, scrolling, selecting) are commands too,
         // and send-keys without -K queues every binding as its commands
         let queued = queued_prompt || keys::parse_mouse_key_name(name).is_some() || plain;
@@ -141,7 +143,7 @@ impl Server {
                 // the default binding's commands go in the message log as if they ran
                 if let (Some(cmd), Some(c), false) = (&binding, cid, pending) {
                     let owner = self.key_origin.unwrap_or(c);
-                    for argv in crate::cmdparse::parse(cmd).unwrap_or_default() {
+                    for argv in crate::cmdparse::parse_marked(cmd).unwrap_or_default() {
                         if let Some(full) = argv.first().and_then(|n| super::cmds::canonical(n)) {
                             self.log_command(Some(owner), Some(name), full, &argv[1..]);
                         }
