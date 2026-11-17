@@ -1336,6 +1336,21 @@ pub enum JobKind {
     IfShell { then: String, otherwise: Option<String> },
 }
 
+/// check_window_name's state of a window: when its name was last checked (name_time),
+/// its pending name timer, what its active pane was then (window_set_active_pane, a mode
+/// set or reset and a pane exit set PANE_CHANGED) and whether automatic-rename was on
+/// (turning it on sets PANE_CHANGED).
+#[derive(Default)]
+pub struct NameState {
+    pub time: Option<Instant>,
+    pub timer: Option<Instant>,
+    pub seen: Option<(PaneId, Option<std::mem::Discriminant<PaneMode>>, bool)>,
+    pub auto: bool,
+}
+
+/// NAME_INTERVAL: a window's name is checked at most this often.
+pub const NAME_INTERVAL: Duration = Duration::from_millis(500);
+
 pub struct Parked {
     pub queue: Queue,
     pub kind: JobKind,
@@ -1416,6 +1431,10 @@ pub struct Server {
     pub copy_drag_timers: HashMap<PaneId, Instant>,
     /// A lookup of what the panes run is in progress (at most one at a time).
     pub pane_info_busy: bool,
+    /// Panes changed since their window's name was last checked (PANE_CHANGED).
+    pub name_changed: std::collections::HashSet<PaneId>,
+    /// Each window's automatic-rename state (check_window_name).
+    pub name_state: HashMap<WinId, NameState>,
     /// Queues paused by `run-shell -d`.
     pub delayed: Vec<(Instant, Queue)>,
     /// Mouse event of the command being run, for the mouse_* formats.
@@ -1535,6 +1554,8 @@ pub fn run(config: Option<String>, cwd: Option<String>) -> io::Result<()> {
             srv.detect_changes(None);
         }
         srv.drain_hooks();
+        // server_client_loop: check_window_name
+        srv.automatic_rename();
         srv.ev.activity.clear();
         srv.control_notify();
         srv.render_all();
@@ -1616,6 +1637,8 @@ impl Server {
             menus: HashMap::new(),
             copy_drag_timers: HashMap::new(),
             pane_info_busy: false,
+            name_changed: Default::default(),
+            name_state: HashMap::new(),
             delayed: Vec::new(),
             cur_mouse: None,
             cur_file: None,
@@ -2332,10 +2355,14 @@ impl Server {
         p.parser.process(data);
         p.last_output = Instant::now();
         if !data.is_empty() {
+            // input_parse_buffer: PANE_CHANGED
+            self.name_changed.insert(id);
+            let p = self.panes.get_mut(&id).unwrap();
             p.track.last_output_time = now_secs();
             p.track.output_generation += 1;
             p.track.unseen_changes |= p.mode.is_some();
         }
+        let p = self.panes.get_mut(&id).unwrap();
         let sync = p.parser.screen().synchronized_output();
         if sync != p.track.sync_since.is_some() {
             p.track.sync_since = sync.then(Instant::now);
@@ -2740,6 +2767,9 @@ impl Server {
         if let Some(d) = self.copy_refresh_deadline() {
             t = t.min(d.saturating_duration_since(now));
         }
+        for d in self.name_state.values().filter_map(|n| n.timer) {
+            t = t.min(d.saturating_duration_since(now));
+        }
         let now_us = now_us();
         for (_, deadline, _) in self.silence_timers() {
             t = t.min(Duration::from_micros(deadline.saturating_sub(now_us)));
@@ -2885,7 +2915,6 @@ impl Server {
         self.control_subscriptions();
         self.check_monitors();
         self.request_pane_info();
-        self.automatic_rename();
         // status-interval redraws (clock, status-right time)
         let now = now_secs();
         let sids: Vec<SessId> = self.sessions.keys().copied().collect();
@@ -2938,24 +2967,54 @@ impl Server {
             let Some(p) = self.panes.get_mut(&r.id).filter(|p| p.generation == r.generation && p.pid == r.pid && p.dead.is_none()) else {
                 continue;
             };
-            if let Some(c) = r.cmd {
+            // (tmux reads these as it checks the name: a change found here is checked
+            // like output)
+            let mut changed = false;
+            if let Some(c) = r.cmd.filter(|c| *c != p.current_cmd) {
                 p.current_cmd = c;
+                changed = true;
             }
             // a directory the pane reported meanwhile is newer than this lookup
-            if let Some(path) = r.path.filter(|_| p.cwd_seq == r.cwd_seq) {
+            if let Some(path) = r.path.filter(|path| p.cwd_seq == r.cwd_seq && *path != p.current_path) {
                 p.current_path = path;
+                changed = true;
+            }
+            if changed {
+                self.name_changed.insert(r.id);
             }
         }
-        self.automatic_rename();
     }
 
-    fn automatic_rename(&mut self) {
+    /// check_window_name for every window, each time round the loop: a window whose
+    /// active pane changed is renamed at once, or when NAME_INTERVAL has passed since its
+    /// name was last checked (its timer).
+    pub(crate) fn automatic_rename(&mut self) {
+        let now = Instant::now();
         let wids: Vec<WinId> = self.windows.keys().copied().collect();
+        self.name_state.retain(|w, _| wids.contains(w));
+        let panes = &self.panes;
+        self.name_changed.retain(|p| panes.contains_key(p));
         for wid in wids {
             let Some(active) = self.windows.get(&wid).map(|w| w.active) else { continue };
-            if !self.opt_window_on(Some(wid), "automatic-rename") {
+            let seen = self.panes.get(&active).map(|p| (active, p.mode.as_ref().map(std::mem::discriminant), p.dead.is_some()));
+            let auto = self.opt_window_on(Some(wid), "automatic-rename");
+            let st = self.name_state.entry(wid).or_default();
+            if st.seen != seen || (auto && !st.auto) {
+                st.seen = seen;
+                self.name_changed.insert(active);
+            }
+            st.auto = auto;
+            if !auto || !self.name_changed.contains(&active) {
                 continue;
             }
+            // name_time_expired: checked less than NAME_INTERVAL ago, the timer does it
+            if let Some(t) = st.time.filter(|t| now.duration_since(*t) <= NAME_INTERVAL) {
+                st.timer.get_or_insert(t + NAME_INTERVAL);
+                continue;
+            }
+            st.time = Some(now);
+            st.timer = None;
+            self.name_changed.remove(&active);
             let fmt = self.opt_window(Some(wid), "automatic-rename-format");
             let name = self.expand_for_pane(active, &fmt);
             if !name.is_empty() && self.windows.get(&wid).is_some_and(|w| w.name != name) {

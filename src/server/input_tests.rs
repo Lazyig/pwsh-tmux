@@ -937,3 +937,31 @@ fn any_key_bindings_catch_keys_a_table_does_not_bind() {
     assert_eq!(f.opts_session.get("@h"), Some("PZRRT"));
     assert_eq!(f.clients[&1].key_table, "root");
 }
+
+#[test]
+fn window_names_follow_mode_changes_at_most_every_name_interval() {
+    // check_window_name: a mode set or reset marks the pane changed and the window is
+    // renamed when the loop next checks it, unless its name was checked less than
+    // NAME_INTERVAL ago (then its timer does it)
+    let mut f = fixture();
+    let pane = f.pane;
+    let wid = f.window_of(pane).unwrap();
+    f.automatic_rename();
+    let before = f.windows[&wid].name.clone();
+    assert_ne!(before, "[tmux]");
+    std::thread::sleep(NAME_INTERVAL + Duration::from_millis(20));
+    run(&mut f, &["copy-mode", "-t", &format!("%{pane}")]);
+    f.automatic_rename();
+    assert_eq!(f.windows[&wid].name, "[tmux]");
+    // straight after: the timer, not the loop, renames it back
+    run(&mut f, &["send-keys", "-t", &format!("%{pane}"), "-X", "cancel"]);
+    f.automatic_rename();
+    assert_eq!(f.windows[&wid].name, "[tmux]");
+    assert!(f.next_timeout() <= NAME_INTERVAL);
+    std::thread::sleep(NAME_INTERVAL + Duration::from_millis(20));
+    f.automatic_rename();
+    assert_eq!(f.windows[&wid].name, before);
+    // nothing changed: nothing to check, no timer
+    f.automatic_rename();
+    assert!(f.name_state[&wid].timer.is_none());
+}
