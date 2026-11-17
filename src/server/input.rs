@@ -413,6 +413,14 @@ impl Server {
                     self.client_focus(cid, raw == b"\x1b[I");
                     return;
                 }
+                // a CSI sequence tmux does not know is read as M-[ and then a key for
+                // each byte (tty_keys_next), so a prompt, a menu or a binding gets them
+                if let Some(keys) = unknown_csi_keys(&raw) {
+                    for (k, raw) in keys {
+                        self.handle_key(cid, k, raw);
+                    }
+                    return;
+                }
                 // what cannot wait is done now, the rest goes in the client's queue
                 if !self.raw_input_taken_now(cid, &raw) {
                     self.client_append(cid, ClientItem::Raw(raw));
@@ -449,6 +457,13 @@ impl Server {
         let mut parser = keys::Parser::new();
         let mut inputs = parser.feed(&data);
         inputs.extend(parser.flush_pending());
+        let inputs: Vec<Input> = inputs.into_iter().flat_map(|i| match &i {
+            Input::Unknown(raw) => match unknown_csi_keys(raw) {
+                Some(keys) => keys.into_iter().map(|(k, raw)| Input::Key(k, raw)).collect(),
+                None => vec![i],
+            },
+            _ => vec![i],
+        }).collect();
         let pasting = self.handle_key_now(cid, Key::plain(PASTE_START), Vec::new(), false).is_some();
         let mut pasted = Vec::new();
         for i in inputs {
@@ -2140,6 +2155,33 @@ fn prompt_backward_word(s: &[char], mut i: usize, seps: &[char]) -> usize {
     i
 }
 
+/// The keys tmux reads an unknown CSI sequence as: tty_keys_next finds no key, reply
+/// or mouse event for it, so it takes ESC and the next byte as M-[ and each byte
+/// after that as a key of its own. Sequences tmux does take as something else are
+/// left alone: private ones (<, =, >, ? after the CSI: mouse and terminal replies),
+/// mouse reports (M, m), extended keys (u, and 27;...~) and ones with sub-parameters.
+pub(super) fn unknown_csi_keys(raw: &[u8]) -> Option<Vec<(Key, Vec<u8>)>> {
+    let body = raw.strip_prefix(b"\x1b[")?;
+    let (&f, mid) = body.split_last()?;
+    if !(0x40..=0x7e).contains(&f) || matches!(f, b'u' | b'M' | b'm') || body.first().is_some_and(|b| (0x3c..=0x3f).contains(b)) {
+        return None;
+    }
+    let p = mid.iter().position(|b| !(0x30..=0x3f).contains(b)).unwrap_or(mid.len());
+    let (params, inter) = mid.split_at(p);
+    if params.contains(&b':') || !inter.iter().all(|b| (0x20..=0x2f).contains(b)) || (f == b'~' && params.starts_with(b"27;")) {
+        return None;
+    }
+    let mut keys = vec![(Key::new(KeyCode::Char('['), keys::Mods::META), raw[..2].to_vec())];
+    // (each byte is a printable character, read as the parser reads a typed one)
+    let mut parser = keys::Parser::new();
+    let mut rest = parser.feed(body);
+    rest.extend(parser.flush_pending());
+    for i in rest {
+        let Input::Key(k, raw) = i else { return None };
+        keys.push((k, raw));
+    }
+    Some(keys)
+}
 
 #[cfg(test)]
 mod tests {

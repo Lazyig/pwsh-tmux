@@ -1261,3 +1261,30 @@ fn escape_waits_at_least_500ms_while_terminal_replies_are_awaited() {
     f.handle_input(1, b"\x1b");
     assert!(f.clients[&1].esc_deadline.unwrap().duration_since(Instant::now()) <= Duration::from_millis(100));
 }
+
+#[test]
+fn an_unknown_csi_sequence_is_read_as_meta_bracket_and_a_key_per_byte() {
+    // tty_keys_next finds no key for it: ESC [ is M-[ and each byte after it is a key,
+    // so a status prompt gets the bytes as text, typed or pasted (tmux 3.8, pod)
+    let mut f = fixture();
+    f.handle_input(1, b"\x02:");
+    assert!(f.clients[&1].prompt.is_some());
+    f.handle_input(1, b"p\x1b[99~q\x1b[200~x\x1b[44~y\x1b[201~");
+    assert_eq!(f.clients[&1].prompt.as_ref().map(|p| p.input.iter().collect::<String>()).as_deref(), Some("p99~qx44~y"));
+    f.handle_input(1, b"\x03");
+    assert!(f.clients[&1].prompt.is_none());
+    // a binding of M-[ runs, and a pane still gets the bytes as they were
+    run(&mut f, &["bind", "-n", "M-[", "set", "-g", "@mb", "hit"]);
+    f.pane_input.try_iter().for_each(drop);
+    f.handle_input(1, b"a\x1b[99~b");
+    assert_eq!(f.opts_session.get("@mb"), Some("hit"));
+    assert_eq!(f.pane_input.try_iter().flatten().collect::<Vec<u8>>(), b"a99~b");
+    run(&mut f, &["unbind", "-n", "M-["]);
+    f.handle_input(1, b"a\x1b[99~b");
+    assert_eq!(f.pane_input.try_iter().flatten().collect::<Vec<u8>>(), b"a\x1b[99~b");
+    // replies, mouse reports and extended keys are not
+    assert!(input::unknown_csi_keys(b"\x1b[?5;6y").is_none());
+    assert!(input::unknown_csi_keys(b"\x1b[<66;1;1M").is_none());
+    assert!(input::unknown_csi_keys(b"\x1b[57441;2u").is_none());
+    assert!(input::unknown_csi_keys(b"\x1b[27;5;9999~").is_none());
+}

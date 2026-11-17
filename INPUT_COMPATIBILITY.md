@@ -33,7 +33,10 @@ another key is that key with Meta. A paste is taken like the keys tmux reads for
 waiting for a key, a menu, the status prompt and a pane prompt (a copy-mode search)
 take them at once even while the client's queue waits, so a paste goes into a popup
 a key opened, a pasted Enter answers a prompt and the keys pasted after it are typed
-keys; the rest is pasted into the active pane when the queue reaches it.
+keys; the rest is pasted into the active pane when the queue reaches it. A CSI
+sequence tmux does not know (such as `ESC [ 99 ~`) is read as tmux reads it, M-[
+and then a key for each byte, typed or pasted: a prompt gets the bytes as text, a
+binding of M-[ runs, and a pane gets the bytes unchanged.
 `xterm-keys` is retained as an intentional no-op: tmux 3.8's options-table.c
 marks this option "no longer used"; modified function keys remain enabled.
 
