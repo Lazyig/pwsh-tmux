@@ -210,8 +210,10 @@ impl Vars for VarCtx<'_> {
             }
             'P' => {
                 if let Some(w) = self.t.wid.and_then(|w| self.srv.windows.get(&w)) {
-                    let mut panes = w.panes();
-                    panes.sort_unstable();
+                    // format_loop_panes: creation order, or i (pane index) or z (z order);
+                    // r reverses whichever it is
+                    let order = if flags.contains('i') { super::cmds::sort::Order::Index } else if flags.contains('z') { super::cmds::sort::Order::Z } else { super::cmds::sort::Order::Creation };
+                    let panes = self.srv.sorted_panes(w.id, super::cmds::sort::Criteria { order: Some(order), reversed: flags.contains('r') });
                     for pane in panes {
                         targets.push((Target { pane: Some(pane), ..self.t }, pane == w.active));
                     }
@@ -224,7 +226,7 @@ impl Vars for VarCtx<'_> {
         } else if kind == 'W' && flags.contains('t') {
             targets.sort_by_key(|(t, _)| std::cmp::Reverse(self.srv.windows[&t.wid.unwrap()].activity));
         }
-        if flags.contains('r') { targets.reverse(); }
+        if flags.contains('r') && kind != 'P' { targets.reverse(); }
         // the loops' format_defaults pass the session, the winlink, or the pane
         let mut extra = self.extra.clone();
         extra.insert(FORMAT_TYPE.to_string(), match kind { 'S' => "S", 'W' => "W", _ => "P" }.to_string());
@@ -789,7 +791,33 @@ impl Vars for VarCtx<'_> {
         let ident = c.ident.as_ref()?;
         Some(match kind {
             'e' => ident.env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()).unwrap_or_default(),
-            'f' => b(c.features.list().split(',').any(|f| f == name)),
+            // tty_feature_present: utf8 is the client's UTF-8 flag; another feature not
+            // applied is present when the terminal has all its capabilities (and the
+            // colours or flags it needs)
+            'f' => {
+                use super::terminfo::{describe, feature_capabilities, Value, CODES};
+                if name == "utf8" {
+                    return Some(b(c.utf8()));
+                }
+                if c.features.list().split(',').any(|f| f == name) {
+                    return Some(b(true));
+                }
+                let caps = feature_capabilities(name);
+                let flags_ok = match name {
+                    "256" => c.features.render_256(),
+                    "RGB" | "cstyle" | "margins" | "rectfill" | "sixel" | "ignorefkeys" => false,
+                    _ => true,
+                };
+                if caps.is_empty() || !flags_ok {
+                    return Some(b(false));
+                }
+                let overrides: Vec<String> = self.srv.opts_server.array_items("terminal-overrides").into_iter().map(|(_, v)| v).collect();
+                let have = describe(&ident.term, &overrides, &c.features);
+                b(caps.iter().all(|cap| {
+                    let n = cap.split('=').next().unwrap_or(cap);
+                    CODES.iter().position(|c| c.0 == n).is_some_and(|i| have[i] != Value::Missing)
+                }))
+            }
             // tty_term_has_name: the capability in the client's terminal description
             // (show-messages -T), after terminal-overrides and the features
             _ => {

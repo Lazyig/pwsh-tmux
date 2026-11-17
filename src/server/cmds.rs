@@ -1188,7 +1188,7 @@ impl Server {
     /// The panes of a window sorted by the -O order. Activity is tmux's active_point
     /// (the order panes were last made active, never-active panes first), which the
     /// last-panes stack holds most recent first.
-    fn sorted_panes(&self, wid: WinId, crit: sort::Criteria) -> Vec<PaneId> {
+    pub(crate) fn sorted_panes(&self, wid: WinId, crit: sort::Criteria) -> Vec<PaneId> {
         let w = &self.windows[&wid];
         let order_of = w.panes();
         let mut v = order_of.clone();

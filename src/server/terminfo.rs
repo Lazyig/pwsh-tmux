@@ -62,7 +62,7 @@ pub const CODES: &[(&str, Kind)] = &[
 
 /// The capabilities each terminal feature adds (tty_features, in its order: features::KNOWN);
 /// cstyle (TERM_NOREPLACE) keeps what terminfo has.
-fn feature_capabilities(name: &str) -> &'static [&'static str] {
+pub(super) fn feature_capabilities(name: &str) -> &'static [&'static str] {
     const SETAB: &str = "setab=\\E[%?%p1%{8}%<%t4%p1%d%e%p1%{16}%<%t10%p1%{8}%-%d%e48;5;%p1%d%;m";
     const SETAF: &str = "setaf=\\E[%?%p1%{8}%<%t3%p1%d%e%p1%{16}%<%t9%p1%{8}%-%d%e38;5;%p1%d%;m";
     const KF: &[&str] = &[
