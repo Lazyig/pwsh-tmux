@@ -1,18 +1,172 @@
-# tmux compatibility investigation
+# tmux compatibility
 
-The compatibility reference is now **tmux 3.8**: configs, themes and scripts written for
-3.8 should behave the same. Behaviour is compared against a stock tmux 3.8 build running
-in a separate reference environment, with the same scripts run against a local build, and
-the 3.8 C source is the authority for defaults and edge cases.
+## Baseline: tmux 3.8
 
-The sections below record the original investigation against **tmux 3.6a** (the Linux
-x86_64 static binary from the [official tmux builds release](https://github.com/tmux/tmux-builds/releases/tag/v3.6a),
+The compatibility baseline is **tmux 3.8**, the latest release: configs, themes and scripts
+written for 3.8 should behave the same. The baseline was previously tmux 3.6a; that
+investigation is kept below under [Earlier baseline: tmux 3.6a](#earlier-baseline-tmux-36a).
+The [3.8 C source](https://github.com/tmux/tmux/tree/3.8) is the authority for defaults
+and edge cases.
+
+How it was checked:
+
+- **Reference build.** tmux 3.8, built from the release for Linux (musl), runs in a
+  separate Linux container. The candidate is a local Linux build of this branch.
+- **Scripted ref/loc diffs.** The same POSIX `sh` script runs against the reference and
+  against the candidate, each on private `-L` sockets that it kills at the end, and the
+  two outputs are diffed. Cases that need an attached client attach it inside an outer
+  tmux and read what it was sent.
+- **Surface byte comparison.** `list-commands` (also with `-F`), `list-keys` (every table,
+  `-N`, `-F`, `-O`, `-r`), `show-options -s`/`-g`/`-wg`/`-A`/`-wA`/`-pA`/`-gH` and
+  `show-hooks -g`/`-B`/`-F` are byte-identical to 3.8 except for three platform defaults:
+  `default-terminal`, `default-shell` and `lock-command` (see
+  [Intentional differences](#intentional-differences)). No 3.8 command, flag or option is
+  missing, and all 183 options in the option table are read by code (`xterm-keys` is
+  accepted and ignored, as in 3.8).
+  `set-option` gives the same error messages and exit status in 190 validation cases, and
+  the 214 format variables were compared with a detached session, a nested attached
+  client, and dead, piped, zoomed, marked, linked and alternate-screen panes.
+
+The last full Linux run of `cargo test --release` passed 667 tests (unit 439, attach 3,
+commands 130, grid_metadata 10, input_options 2, interactive 53, modes 29, ssh 1; the
+ui_compat test is ignored). The fixes from the last audit round were checked for Windows
+with `cargo check --target x86_64-pc-windows-gnu --tests` only, not run there.
+
+## What tmux 3.7 and 3.8 added, now supported
+
+From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3.8):
+
+- **Floating panes:** `new-pane` (bound to `*`), with `-T` titles and `-B` border lines,
+  `-W` to wait for the command, `-A` to stay above a zoomed pane and modal panes (`-O`,
+  with `-C`, `-K`, `-D`). `move-pane` and `resize-pane` move and resize them, also with
+  the mouse. `break-pane` floats a tiled pane and `join-pane` tiles a floating one.
+  `pane-border-status` has `top-floating` and `bottom-floating`, and `C-b g` enters the
+  `move` key table.
+- **JSON layouts:** `#{window_layout}` is the 3.8 JSON form (`{"V":2,...}`), which includes
+  floating panes. The old layout strings are still accepted, and control clients get
+  them unless they set the `new-layouts` flag.
+- **Modes:** `switch-mode` (bound to `Tab` for windows and `BTab` for sessions),
+  `display-panes` as a mode, `command-prompt -P` prompts inside a pane, `choose-tree -h`
+  and `-k`, customize mode showing hooks and the environment with `e` (editor) and `C`
+  (changed items only), and menus that belong to the window.
+- **Themes:** the `theme` option, light and dark detection, `theme*` colour names in
+  styles, `tree-mode-selection-style`.
+- **Hooks and events:** hooks run as events with payloads; monitors (`set-hook -B`, `-T`,
+  `show-hooks -B`); `set-hook -E`; `wait-for -E`, `-F`, `-l`, `-v`, `-w`; the new hooks,
+  including `pane-shell-prompt`, `pane-command-started` and `pane-command-finished` from
+  OSC 133.
+- **Copy mode:** `refresh-on`, `refresh-off`, `refresh-toggle` and `refresh-now` (bound to
+  `r`), `copy-mode-current-line-style`, line numbers (`copy-mode-line-numbers`),
+  `recentre-top-bottom` and `scroll-exit-on`/`-off`/`-toggle`.
+- **Line metadata** for `capture-pane -F`/`-H`/`-I`, copy mode and the mouse formats: the
+  terminal emulator keeps OSC 133 prompt marks, OSC 8 hyperlinks, tab cells and history
+  line times.
+- **Display and options:** `pane-scrollbars auto-hide` and `pane-scrollbars-timeout`,
+  `clear-on-attach`, the two-part `fill-character`, `message-format`,
+  `remain-on-exit key` and `failed-key`, `mouse` on by default, and terminal features
+  disabled with `@` plus the `utf8` and `appesc` features.
+- **Commands and formats:** `new-window`/`respawn-pane`/`respawn-window -E`,
+  `capture-pane -F`/`-H`/`-I`/`-L`/`-R`, `show-options -F` and `show-hooks -F`, `-O`
+  sort orders and `-r` on the list commands, `-f` filters for `kill-pane`/`kill-window`/
+  `kill-session -a`, `kill-session -g`, `server-access -g`, `paste-buffer -S`,
+  `run-shell` arguments as `#{1}`, `#{2}`, ..., the `O:`, `V:`, `I/`, `t/d`, `c/f`, `c/b`
+  and `A/` modifiers, and the new format variables.
+
+## Intentional differences
+
+- **Shell and platform defaults.** `default-shell` is PowerShell, the project's purpose:
+  `pwsh`, falling back to `powershell.exe` on Windows and to `$SHELL` (then `/bin/sh`)
+  on Unix. `editor` is `notepad.exe`
+  on Windows (`/usr/bin/vi` elsewhere). `lock-command` is empty by default on every
+  platform (tmux uses its build's lock command, `lock -np` unless configured otherwise),
+  since Windows has no lock program, so `lock-*` needs one to be set.
+  Windows has no job control, so `suspend-client` does nothing there.
+- **`default-terminal` is `xterm-256color`**, not `tmux-256color`: Windows hosts usually
+  have no tmux terminfo and ConPTY programs expect xterm. Panes therefore get
+  `TERM=xterm-256color`, and Home and End are sent as xterm's `\e[H`/`\e[F` (`\eOH`/`\eOF`
+  in application cursor mode) rather than tmux's `\e[1~`/`\e[4~`.
+- **Pane titles on Windows.** ConPTY sets the console title when the pane starts, so
+  `pane_title` begins as the shell's executable path and changes with the console title.
+  On Windows `clean_name` keeps backslashes in titles and names (they are paths); on Unix
+  they are escaped as in 3.8.
+- **Names that coexist with tmux.** The server listens on `/tmp/pwsh-tmux-UID/NAME`
+  (under `PWSH_TMUX_TMPDIR` or `TMUX_TMPDIR` if set) on Unix and on a named pipe on
+  Windows. Panes get `PWSH_TMUX` and `PWSH_TMUX_PANE` instead of `TMUX` and `TMUX_PANE`,
+  and `TERM_PROGRAM=pwsh-tmux` with the project version as `TERM_PROGRAM_VERSION`
+  (`#{version}` reports 3.8). Configuration, executable and environment variable names
+  use `pwsh-tmux`; the deployed executable may separately be named `tmux.exe`. Scripts
+  that test `$TMUX` or `TERM_PROGRAM` see these names.
+- **Client names** are `client-N` rather than the client's tty path, on every platform;
+  `client_tty` gives the same name.
+- **Windows transport.** Windows uses ConPTY and named pipes and identifies users by SID;
+  Unix uses ptys, Unix sockets and uids. A Windows pipe's ACL is set when the pipe is
+  created, so `server-access` changes on Windows belong in the config file.
+- **Escape timing.** A pending Escape waits at least 500 ms when the buffered bytes start
+  a theme colour reply or a paste end, or while a clipboard request is outstanding. tmux
+  decides by its outstanding-request flags instead, so here a prompt's Escape timing does
+  not depend on whether theme detection is still waiting.
+- **No signal information on Windows:** `pane_dead_signal` and other signal values are
+  never set there.
+- **History line times** record the real time a line entered the history; tmux uses
+  a time cached at the start of its event loop, which can be older.
+- **Terminal descriptions.** Windows console clients have no terminfo, so refusing a
+  terminal without `clear` or `cup` happens on Unix only. The `grid_metadata` tests also
+  run on Unix only, because ConPTY re-renders pane output (tabs, OSC 133 and OSC 8).
+- **Server shutdown on Windows.** On Unix the server unlinks its socket before the last
+  reply, so a new client starts a fresh server. On Windows a client connecting to a named
+  pipe during server shutdown can still race. To narrow this, the server sends the last
+  command client a shutdown message (`S_SHUTDOWN`) and that client waits for the pipe to
+  close.
+- **Security restrictions** (read-only clients, resource bounds) are described in
+  [`SECURITY.md`](SECURITY.md).
+
+## Known differences
+
+These do not match tmux 3.8 yet:
+
+- **`capture-pane -R` cell sizes** only partly match. tmux's allocated size depends on how
+  text was written (collected runs, ICH/DCH/EL expansion) and on CLEARED cell flags; the
+  terminal emulator does not track per-row allocation.
+- **Long UTF-8 sequences:** a cell holds 23 bytes, where tmux's `UTF8_SIZE` is 32, so tag
+  sequences longer than 23 bytes (such as the England flag) are cut. Raising it would grow
+  every cell (see [`MEMORY_COMPARISON.md`](MEMORY_COMPARISON.md)).
+- **Hex key names `0x41` to `0x7e`** are the same key as the typed ASCII character here;
+  in tmux they are separate keys. Only their place in `list-keys` differs.
+- **Sixel** is not implemented: `#{sixel_support}` is 0 and the DA1 reply has no `;4`.
+- **`history_bytes` and `history_all_bytes`** on the alternate screen with a scroll region
+  count one row of cells fewer than tmux.
+- **Silence alerts with equal deadlines** fire in window id order; tmux's order comes from
+  its timer heap.
+- **Error output:** merged stdout and stderr can interleave in a different order, and
+  `load-buffer` of a directory says "Is a directory" where tmux says "I/O error". For a
+  socket that never existed the client says "no server running on SOCK", where tmux says
+  "error connecting to SOCK (No such file or directory)".
+- **`select-layout -E`** with a parent that also holds nested cells: tmux 3.8 shares the
+  whole size among the panes, which overflows the window; here the panes share what the
+  nested cells leave.
+- **Session groups:** `new-session -t` with an unknown name fails with "can't find
+  session"; tmux 3.8 creates a new group of that name.
+- **Reflow:** tabs in a pane 3 columns wide give a different number of blank rows (4
+  columns and more match), and the pane grid counts a wide character as 2 columns where
+  tmux's reflow also counts its padding (copy mode's reflow follows tmux).
+- **Blank cells in the status line and after prompts** are written with a foreground reset
+  (an extra `\e[39m` in a nested `capture-pane -e`), where tmux clears them with a
+  background-only erase. Nothing visible changes.
+- **Copy mode on huge panes:** copy mode stores every line at full width, so entering it
+  on a pane of about 5000 by 5000 takes seconds.
+- **`backspace C-?`:** the option value `C-?` is read as the BSpace key; tmux's default is
+  a raw `\177` that also prints as `C-?`.
+
+## Earlier baseline: tmux 3.6a
+
+This section records the original investigation against **tmux 3.6a** (the Linux x86_64
+static binary from the [official tmux builds release](https://github.com/tmux/tmux-builds/releases/tag/v3.6a),
 archive SHA256 `c0a772a5e6ca8f129b0111d10029a52e02bcbc8352d5a8c0d3de8466a1e59c2e`, run
 under WSL against the candidate on Windows with ConPTY). Each comparison creates separate
-private servers and shuts them down afterward. Where 3.8 changed behaviour, the code
+private servers and shuts them down afterward. Where 3.8 changed behaviour, the code now
 follows 3.8.
 
-## Differences corrected
+### Differences corrected
 
 | Area | Previous behaviour | Corrected behaviour |
 |---|---|---|
@@ -39,13 +193,13 @@ tmux 3.5a uses a different distribution; it was not adopted as a compatibility f
 Likewise, chained format conditions and two-argument conditions are valid in 3.6a
 and were retained after checking the reference.
 
-The reference implementations used for inspection are
-[layout.c](https://github.com/tmux/tmux/blob/3.6a/layout.c),
-[cmd-new-session.c](https://github.com/tmux/tmux/blob/3.6a/cmd-new-session.c),
-[format.c](https://github.com/tmux/tmux/blob/3.6a/format.c), and
-[window-copy.c](https://github.com/tmux/tmux/blob/3.6a/window-copy.c).
+The investigation read the 3.6a sources; the code now follows their 3.8 versions:
+[layout.c](https://github.com/tmux/tmux/blob/3.8/layout.c),
+[cmd-new-session.c](https://github.com/tmux/tmux/blob/3.8/cmd-new-session.c),
+[format.c](https://github.com/tmux/tmux/blob/3.8/format.c), and
+[window-copy.c](https://github.com/tmux/tmux/blob/3.8/window-copy.c).
 
-## Mouse (`set -g mouse on`)
+### Mouse (`set -g mouse on`)
 
 [`tests/mouse_compat.py`](tests/mouse_compat.py) attaches a client to private servers of
 both programs inside a pseudo terminal, writes the same SGR mouse reports and compares
@@ -82,26 +236,13 @@ through a client that was no longer connected, `display-menu`/`display-panes`/`d
 replaced an overlay already shown (tmux leaves it), and `pane_left`/`pane_top` ignored
 `pane-border-status` and zoom.
 
-Since then `pane-scrollbars` (with the `Scrollbar*` mouse areas, slider drags and
-`copy-mode -S`) is implemented, and the terminal emulator keeps tmux 3.8's line metadata
-(OSC 133 prompt marks, OSC 8 hyperlinks, tab cells and history line times) for copy mode,
-`capture-pane` and the mouse formats.
+Since then the default key tables, mouse bindings included, have moved to tmux 3.8's
+(`list-keys` is byte-identical), `pane-scrollbars` (with the `Scrollbar*` mouse areas,
+slider drags and `copy-mode -S`) is implemented, and the terminal emulator keeps tmux
+3.8's line metadata (OSC 133 prompt marks, OSC 8 hyperlinks, tab cells and history line
+times) for copy mode, `capture-pane` and the mouse formats.
 
-## Differences retained for a reason
-
-- PowerShell is the default shell: this is the project's stated purpose.
-- Windows uses ConPTY and named pipes, and identifies users with SIDs. Unix uses
-  ptys, Unix sockets and uids. Windows pipe access changes require recreating the
-  pipe because its ACL is established when the pipe is created.
-- Windows cannot perform Unix job-control suspension. `suspend-client` has no
-  equivalent there. Shell-dependent locking requires a usable `lock-command`.
-- Window dimensions follow tmux's WINDOW_MAXIMUM of 10000 by 10000. Screen rows are
-  allocated as they are written, so a large window that shows little costs little
-  (an empty 10000 by 10000 pane uses about 11 MB).
-- Configuration, executable and environment variable names use `pwsh-tmux` to
-  coexist with stock tmux. The deployed executable may separately be named `tmux.exe`.
-
-## Validation and limits
+### Validation and limits
 
 The initial CLI investigation passed all **62 differential cases**, **156 unit tests**, and
 **28 local integration tests** (3 attach, 17 commands, 8 interactive).

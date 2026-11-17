@@ -3,7 +3,9 @@
 A terminal multiplexer that follows tmux's commands, key bindings, options, formats and
 config syntax, written in Rust for **Windows** (ConPTY + named pipes) and **Linux/Unix**
 (pty + Unix sockets). The default shell is PowerShell (`pwsh`, falling back to
-`powershell.exe` on Windows; `pwsh`, then `$SHELL` on Unix).
+`powershell.exe` on Windows; `pwsh`, then `$SHELL` on Unix). The compatibility baseline is
+**tmux 3.8**; [COMPATIBILITY.md](COMPATIBILITY.md) describes how it is checked and lists the
+intentional and known differences.
 
 > [!IMPORTANT]
 > **This project was written entirely by AI.** All source code, tests, and documentation in
@@ -73,7 +75,11 @@ PowerShell prompt hook described below.
 - **Targets**: `session:window.pane`, `$id @id %id`, `{last} {next} {previous} {top} {left}
   {marked} {mouse}` ..., `+N/-N`, name prefixes and globs.
 - **Layouts**: even-horizontal/vertical, main-horizontal/vertical, tiled, `next-layout`,
-  `select-layout -E`, tmux layout strings (`#{window_layout}` round-trips).
+  `select-layout -E`, tmux layout strings in the 3.8 JSON form and the older form
+  (`#{window_layout}` round-trips).
+- **Floating panes** (tmux 3.7/3.8): `new-pane` (bound to `*`), modal panes (`new-pane -O`),
+  moving and resizing with `move-pane`/`resize-pane` or the mouse, `break-pane` and
+  `join-pane` between floating and tiled.
 - **Key tables**: tmux's default `prefix`, `root`, `copy-mode` and `copy-mode-vi` tables,
   `bind -n/-r/-T/-N`, `unbind`, `switch-client -T`, `prefix2`, repeat-time, extended keys
   (`extended-keys`, `extended-keys-format`).
@@ -86,15 +92,17 @@ PowerShell prompt hook described below.
   `status-left`, `window-status(-current)-format`, `status-right` and `status-format[]`.
 - **Options**: server/session/window/pane scopes, `set -g/-w/-s/-p/-u/-a/-o/-q/-F`,
   `show -A/-v/-g`, user `@options`.
-- **Interactive**: command prompt (history, completion), confirm-before, choose-tree /
-  choose-client / customize-mode, display-menu, display-popup, display-panes, clock-mode,
-  messages, `pane-border-status`.
-- **Mouse** (`set -g mouse on`): tmux 3.6a events (`SecondClick`, `DoubleClick`, `MouseDragEnd`,
-  status-line ranges, ...), default bindings and menus; select panes and windows, drag borders,
-  wheel into copy mode, drag selection with edge scrolling, double/triple click, middle-click
-  paste. See [COMPATIBILITY.md](COMPATIBILITY.md#mouse-set--g-mouse-on).
+- **Interactive**: command prompt (history, completion, pane prompts with `-P`),
+  confirm-before, choose-tree / choose-client / customize-mode, `switch-mode`, display-menu,
+  display-popup, display-panes (a mode, as in 3.8), clock-mode, messages,
+  `pane-border-status`, `pane-scrollbars`, and the 3.8 colour themes (`theme`).
+- **Mouse** (`mouse` is on by default, as in tmux 3.8): tmux 3.8 events (`SecondClick`,
+  `DoubleClick`, `MouseDragEnd`, status-line ranges, ...), default bindings and menus; select
+  panes and windows, drag borders, wheel into copy mode, drag selection with edge scrolling,
+  double/triple click, middle-click paste. See [COMPATIBILITY.md](COMPATIBILITY.md#mouse-set--g-mouse-on).
 - **Scripting**: hooks (`set-hook`, `after-*`, `client-attached`, `pane-exited`, ...),
-  `run-shell`, `if-shell`, `wait-for`, `set-environment`, `update-environment`, alerts.
+  hook monitors (`set-hook -B`), `run-shell`, `if-shell`, `wait-for` (including `-E` for
+  hook events), `set-environment`, `update-environment`, alerts.
 - **Terminal features** (`terminal-features`, `-T`): per-client RGB / 256 / 16-colour output,
   synchronized output, clipboard, title, cursor style, focus and mouse.
 - **Control mode** (`-C`, `-CC`): `%begin/%end/%error`, `%output`, notifications
@@ -112,12 +120,14 @@ PowerShell prompt hook described below.
 
 - Access restrictions, resource limits and security validation are described in
   [`SECURITY.md`](SECURITY.md).
-- Window sizes are capped at 1000x1000: the terminal emulator allocates every cell up front
-  (tmux allows 10000).
-- On Windows `suspend-client` does nothing (no job control) and `lock-*` needs `lock-command`.
-- Compatibility checks and platform differences are documented in
-  [`COMPATIBILITY.md`](COMPATIBILITY.md). These checks cover specific behaviours, not every
-  command, flag, format modifier or copy-mode command in tmux.
+- Window sizes are capped at 10000x10000, as in tmux; screen rows are allocated as they are
+  written.
+- On Windows `suspend-client` does nothing (no job control). `lock-*` needs `lock-command`,
+  which is empty by default.
+- Compatibility with tmux 3.8, the intentional platform differences and the known
+  remaining differences are documented in [`COMPATIBILITY.md`](COMPATIBILITY.md). These
+  checks cover specific behaviours, not every command, flag, format modifier or copy-mode
+  command in tmux.
 - Measured terminal UI comparisons and remaining Windows Unicode/ConPTY
   differences are documented in [`UI_COMPARISON.md`](UI_COMPARISON.md).
 
