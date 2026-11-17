@@ -482,7 +482,8 @@ impl Server {
         let mut first = first;
         let mut table = first.clone();
         loop {
-            if let Some(b) = self.bindings.get(&table).and_then(|t| t.get(&key)) {
+            // (no match: the table's Any key, KEYC_ANY)
+            if let Some(b) = self.bindings.get(&table).and_then(|t| t.get(&key).or_else(|| t.get("Any"))) {
                 let (cmd, repeat) = (b.cmd.clone(), b.repeat);
                 let ms = self.opt_session_num(Some(sid), "repeat-time").max(0) as u64;
                 let c = self.clients.get_mut(&cid).unwrap();

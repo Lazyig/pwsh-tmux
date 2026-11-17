@@ -801,6 +801,8 @@ impl Server {
                 first = table.clone();
                 continue;
             }
+            // no match: the Any key of the same table (KEYC_ANY, try_again)
+            let found = found.or_else(|| self.bindings.get(&table).and_then(|t| t.get("Any")).map(|b| (b.cmd.clone(), b.repeat)));
             match found {
                 Some((_, false)) if repeating => {
                     // a binding that does not repeat ends the repeat; the key is looked up

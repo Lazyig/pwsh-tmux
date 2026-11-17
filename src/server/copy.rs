@@ -106,7 +106,8 @@ impl Server {
         // character, a prompt in tmux, does not get them)
         let plain = self.key_plain && self.key_capture.is_some();
         let pending = !plain && matches!(self.panes.get(&pane).and_then(|p| p.mode.as_ref()), Some(PaneMode::Copy(cm)) if cm.waiting_for_key());
-        let binding = self.bindings.get(table).and_then(|t| t.get(name)).map(|b| b.cmd.clone());
+        // (an unbound key runs the table's Any binding, KEYC_ANY)
+        let binding = self.bindings.get(table).and_then(|t| t.get(name).or_else(|| t.get("Any"))).map(|b| b.cmd.clone());
         let default_raw = copymode::CopyMode::default_bindings(vi).iter().find(|(k, _)| keys::parse_key_name(k).map(|k| keys::key_name(&k)).as_deref().unwrap_or(k) == name).map(|(_, c)| *c);
         let default = default_raw.map(default_binding_command);
         // the repeat count bindings open the real numeric pane prompt ("(repeat) N"): it

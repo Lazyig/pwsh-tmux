@@ -905,3 +905,35 @@ fn readonly_copy_bindings_expand_command_aliases() {
     assert!(!f.binding_allowed_readonly("send-keys -X cancel ; select-pane -L"));
     assert!(!f.binding_allowed_readonly("sp -L"));
 }
+
+#[test]
+fn any_key_bindings_catch_keys_a_table_does_not_bind() {
+    // server_client_key_callback: a key not found in a table tries KEYC_ANY in that table
+    // before going back to the root table or to the pane
+    let mut f = fixture();
+    run(&mut f, &["bind-key", "-T", "prefix", "Any", "set-option -ga @h P"]);
+    run(&mut f, &["bind-key", "-T", "prefix", "z", "set-option -ga @h Z"]);
+    f.handle_input(1, b"\x02");
+    f.handle_input(1, b"\x1b[23~"); // F11, unbound in the prefix table
+    f.handle_input(1, b"\x02");
+    f.handle_input(1, b"z");
+    assert_eq!(f.opts_session.get("@h"), Some("PZ"));
+    assert_eq!(f.clients[&1].key_table, "root");
+    // a root Any binding takes keys before the pane
+    run(&mut f, &["bind-key", "-n", "Any", "set-option -ga @h R"]);
+    f.pane_input.try_iter().for_each(drop);
+    f.cfg_finished = true;
+    f.handle_input(1, b"a");
+    f.handle_input(1, b"b");
+    assert_eq!(f.opts_session.get("@h"), Some("PZRR"));
+    assert!(f.pane_input.try_recv().is_err());
+    // the message log names the key typed, not Any
+    assert!(f.messages.iter().any(|(_, m)| m.ends_with("key b: set-option -ag @h R")));
+    // a table switch-client -T chose
+    run(&mut f, &["unbind-key", "-n", "Any"]);
+    run(&mut f, &["bind-key", "-T", "mytab", "Any", "set-option -ga @h T"]);
+    f.clients.get_mut(&1).unwrap().set_key_table("mytab");
+    f.handle_input(1, b"k");
+    assert_eq!(f.opts_session.get("@h"), Some("PZRRT"));
+    assert_eq!(f.clients[&1].key_table, "root");
+}
