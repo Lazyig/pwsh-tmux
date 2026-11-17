@@ -1709,27 +1709,22 @@ impl Node {
         Some(true)
     }
 
-    /// Spread the target's nearest sibling group that changes, climbing to its
-    /// ancestors only if that group already has tmux's even sizes.
+    /// layout_spread_out: even out the cells of the pane's parent, or of the nearest
+    /// ancestor whose cells change.
     pub fn spread(&mut self, target: PaneId, area: Rect) -> bool {
-        let h = match self {
-            Node::Leaf(_) | Node::Float(..) => return false,
-            Node::Split { horizontal, .. } => *horizontal,
-        };
-        let mut items = Vec::new();
-        self.group_items(h, area, &mut items);
-        let Some(idx) = items.iter().position(|(n, _)| n.contains(target)) else { return false };
-        let (item, r) = items.swap_remove(idx);
-        if item.spread(target, r) {
-            return true;
+        let (mut panes, mut seps) = (Vec::new(), Vec::new());
+        self.layout(area, &mut panes, &mut seps);
+        let mut sizes: HashMap<PaneId, (i32, i32)> = panes.iter().map(|(p, r)| (*p, (i32::from(r.w), i32::from(r.h)))).collect();
+        let Some(mut cell) = self.cell(&sizes) else { return false };
+        let Some(path) = cell.path(target) else { return false };
+        for depth in (0..path.len()).rev() {
+            if cell.at_mut(&path[..depth]).spread_cell() {
+                cell.store(&mut sizes);
+                self.set_ratios(&sizes);
+                return true;
+            }
         }
-        let mut items = Vec::new();
-        self.group_items(h, area, &mut items);
-        let sizes = even_sizes(along(h, area), items.len());
-        let changed = items.iter().zip(&sizes).any(|((_, r), size)| along(h, *r) != *size);
-        drop(items);
-        self.assign_group(h, &sizes);
-        changed
+        false
     }
 
     fn to_cell(&self, r: Rect) -> Cell {
@@ -1805,6 +1800,43 @@ fn resize_in_group(sizes: &mut [u16], i: usize, want: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn widths(n: &Node, r: Rect) -> Vec<(u16, u16)> {
+        let (mut panes, mut seps) = (vec![], vec![]);
+        n.layout(r, &mut panes, &mut seps);
+        panes.iter().map(|(_, r)| (r.w, r.h)).collect()
+    }
+
+    #[test]
+    fn resizes_follow_tmux_layout_arithmetic() {
+        // three panes side by side, 20|19|39 in 80 columns (one cell of tmux's tree)
+        let r = |w, h| Rect { x: 0, y: 0, w, h };
+        let mut n = Node::Leaf(0);
+        n.split(0, 1, true);
+        n.split(1, 2, true);
+        assert!(n.set_size(0, Some(20), None, r(80, 24)) && n.set_size(1, Some(19), None, r(80, 24)));
+        assert_eq!(widths(&n, r(80, 24)), [(20, 24), (19, 24), (39, 24)]);
+        // layout_resize_adjust: a cell at a time to each child in turn
+        n.tmux_resize(r(80, 24), r(100, 24), 1);
+        assert_eq!(widths(&n, r(100, 24)), [(27, 24), (26, 24), (45, 24)]);
+        n.tmux_resize(r(100, 24), r(75, 24), 1);
+        assert_eq!(widths(&n, r(75, 24)), [(18, 24), (18, 24), (37, 24)]);
+        // layout_resize_pane: growing takes from the cells after, then before
+        let mut n = Node::Leaf(0);
+        n.split(0, 1, true);
+        n.split(1, 2, true);
+        n.set_size(0, Some(20), None, r(80, 24));
+        n.set_size(1, Some(29), None, r(80, 24));
+        assert!(n.resize_pane(1, Dir::Right, 50, r(80, 24), true));
+        assert_eq!(widths(&n, r(80, 24)), [(1, 24), (76, 24), (1, 24)]);
+        // layout_spread_out: only panes count, so a column of panes is left alone
+        let mut n = Node::Leaf(0);
+        n.split(0, 1, true);
+        n.split(1, 2, false);
+        n.set_size(0, Some(78), None, r(80, 24));
+        assert!(!n.spread(0, r(80, 24)));
+        assert!(n.spread(1, r(80, 24)) || widths(&n, r(80, 24))[1].1 == 12);
+    }
 
     #[test]
     fn min_size_keeps_every_pane_a_cell() {
@@ -2462,6 +2494,36 @@ impl TCell {
         self.kids[idx + 1].adjust(horizontal, size, min_w);
         self.kids[j].adjust(horizontal, -size, min_w);
         size
+    }
+
+    /// layout_spread_cell: each child the same size, the remainder to the first ones.
+    /// As in tmux only panes count (layout_cell_is_tiled is false for a cell of cells).
+    fn spread_cell(&mut self) -> bool {
+        let number = self.kids.iter().filter(|k| k.pane.is_some()).count() as i32;
+        if self.pane.is_some() || number <= 1 {
+            return false;
+        }
+        let horizontal = self.horizontal;
+        let size = if horizontal { self.sx } else { self.sy };
+        if size < number - 1 {
+            return false;
+        }
+        let each = (size - (number - 1)) / number;
+        if each == 0 {
+            return false;
+        }
+        let mut remainder = size - number * (each + 1) + 1;
+        let mut changed = false;
+        for k in self.kids.iter_mut().filter(|k| k.pane.is_some()) {
+            let mut change = each - if horizontal { k.sx } else { k.sy };
+            if remainder > 0 {
+                change += 1;
+                remainder -= 1;
+            }
+            k.adjust(horizontal, change, 1);
+            changed |= change != 0;
+        }
+        changed
     }
 
     fn store(&self, sizes: &mut HashMap<PaneId, (i32, i32)>) {
