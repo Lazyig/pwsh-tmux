@@ -1226,11 +1226,10 @@ impl Server {
         // the window menu, above the panes (redraw_mark_menu)
         if let Some(m) = self.menus.get(&wid).filter(|_| c.overlay.is_none()) {
             let ost = |name: &str, base: Style| self.style_option(&self.opt_window(Some(wid), name), base, active_target, Some(cid)).unwrap_or(base);
-            let st = ost("popup-style", Style::default());
-            let bst = ost("popup-border-style", Style::default());
-            let st = ost("menu-style", st);
-            let bst = ost("menu-border-style", bst);
-            let selected = ost("menu-selected-style", Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() });
+            // menu_reapply_styles: each from the default cell (style_apply)
+            let st = ost("menu-style", Style::default());
+            let bst = ost("menu-border-style", Style::default());
+            let selected = ost("menu-selected-style", Style::default());
             // display-menu -s -S -H -b
             let given = |v: &Option<String>, base: Style| self.flag_style(v.as_deref(), base, active_target, cid);
             let (st, bst, selected) = (given(&m.look.style, st), given(&m.look.border_style, bst), given(&m.look.selected_style, selected));
