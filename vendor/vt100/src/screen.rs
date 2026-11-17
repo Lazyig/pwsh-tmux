@@ -1204,6 +1204,44 @@ impl Screen {
         Some(width)
     }
 
+    /// screen_write_combine for a character with a width: whether it joins the cell
+    /// before the cursor (after a zero width joiner; a skin tone modifier and an emoji
+    /// that takes one, in either order; two regional indicators) and whether that makes
+    /// the cell wide (utf8_should_combine).
+    fn combine_with_last(&self, c: char) -> Option<bool> {
+        let pos = self.grid().pos();
+        // a 7-bit character never combines
+        if pos.col == 0 || c.is_ascii() {
+            return None;
+        }
+        let mut col = pos.col - 1;
+        let cell = self.grid().drawing_cell(crate::grid::Pos { row: pos.row, col })?;
+        let cell = if cell.is_wide_continuation() && col > 0 {
+            col -= 1;
+            self.grid().drawing_cell(crate::grid::Pos { row: pos.row, col })?
+        } else {
+            cell
+        };
+        // the cell must be as wide as the distance to the cursor
+        if cell.is_wide_continuation() || cell.is_wide() != (pos.col - col == 2) {
+            return None;
+        }
+        let text = cell.contents();
+        let mut chars = text.chars();
+        let single = match (chars.next(), chars.next()) {
+            (Some(l), None) => Some(l),
+            _ => None,
+        };
+        let ri = |x: char| ('\u{1F1E6}'..='\u{1F1FF}').contains(&x);
+        let modifier = |x: char| ('\u{1F3FB}'..='\u{1F3FF}').contains(&x);
+        if let Some(l) = single {
+            if (ri(c) && ri(l)) || (modifier(c) && EMOJI_MODIFIER_BASE.contains(&(l as u32))) || (modifier(l) && EMOJI_MODIFIER_BASE.contains(&(c as u32))) {
+                return Some(true);
+            }
+        }
+        text.ends_with('\u{200D}').then_some(false)
+    }
+
     // if this is the initial codepoint in a new cell, we need to determine
     // whether wrapping that character to the next row should set the row's
     // wrapping flag
@@ -1399,6 +1437,8 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
         let Some(width) = screen.calculate_width(c) else {
             return;
         };
+        let combine = if width > 0 { screen.combine_with_last(c) } else { None };
+        let width = if combine.is_some() { 0 } else { width };
 
         // base_pos will always be set to a valid cell, so
         // .drawing_cell(base_pos).unwrap() will always be valid
@@ -1463,9 +1503,10 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                 .drawing_cell_mut(base_pos)
                 .unwrap()
                 .append(c);
-            // VS16 makes a narrow base wide only with variation-selector-always-wide on
-            if c == '\u{FE0F}' {
-                let wide = screen.variation_wide || cell_was_wide;
+            // VS16 makes a narrow base wide only with variation-selector-always-wide on;
+            // a modifier or a second regional indicator always does
+            if c == '\u{FE0F}' || combine == Some(true) {
+                let wide = screen.variation_wide || cell_was_wide || combine == Some(true);
                 screen.grid_mut().drawing_cell_mut(base_pos).unwrap().set_wide(wide);
             }
             let cell_is_wide =
@@ -2107,3 +2148,15 @@ fn stravis(src: &[u8]) -> String {
     }
     out
 }
+
+/// The emoji a skin tone modifier combines with (utf8_should_combine).
+const EMOJI_MODIFIER_BASE: [u32; 72] = [
+    0x1F44B, 0x1F44C, 0x1F44D, 0x1F44E, 0x1F44F, 0x1F450, 0x1F466, 0x1F467, 0x1F468, 0x1F469,
+    0x1F46E, 0x1F470, 0x1F471, 0x1F472, 0x1F473, 0x1F474, 0x1F475, 0x1F476, 0x1F477, 0x1F478,
+    0x1F47C, 0x1F481, 0x1F482, 0x1F483, 0x1F485, 0x1F486, 0x1F487, 0x1F4AA, 0x1F575, 0x1F57A,
+    0x1F590, 0x1F595, 0x1F596, 0x1F645, 0x1F646, 0x1F647, 0x1F64B, 0x1F64C, 0x1F64D, 0x1F64E,
+    0x1F64F, 0x1F6B4, 0x1F6B5, 0x1F6B6, 0x1F926, 0x1F937, 0x1F938, 0x1F939, 0x1F93D, 0x1F93E,
+    0x1F9B5, 0x1F9B6, 0x1F9B8, 0x1F9B9, 0x1F9CD, 0x1F9CE, 0x1F9CF, 0x1F9D1, 0x1F9D2, 0x1F9D3,
+    0x1F9D4, 0x1F9D5, 0x1F9D6, 0x1F9D7, 0x1F9D8, 0x1F9D9, 0x1F9DA, 0x1F9DB, 0x1F9DC, 0x1F9DD,
+    0x1F9DE, 0x1F9DF,
+];

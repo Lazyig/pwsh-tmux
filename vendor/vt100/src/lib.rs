@@ -298,4 +298,22 @@ mod metadata_tests {
         p.process(b"h1\r\nh2\r\nh3\r\nh4\r\nh5\x1bc");
         assert_eq!((p.screen().scrollback_len(), text(&p, 0), text(&p, 4)), (5, "h1".into(), "h5".into()));
     }
+
+    #[test]
+    fn emoji_modifiers_joiners_and_regional_indicators_combine() {
+        // screen_write_combine: one wide cell for each of these; 7-bit characters never join
+        for (input, cursor, cell) in [
+            ("👋🏽", 2, "👋🏽"), ("🏽👋", 2, "🏽👋"), ("👨\u{200D}👩", 2, "👨\u{200D}👩"), ("🇰🇷🇯", 3, "🇰🇷"),
+            ("a🏽", 3, "a"), ("x\u{200D}y", 2, "x\u{200D}"),
+        ] {
+            let mut p = Parser::new(NonZeroU16::new(5).unwrap(), NonZeroU16::new(20).unwrap(), 0);
+            p.process(input.as_bytes());
+            assert_eq!(p.screen().cursor_position().1, cursor, "{input}");
+            assert_eq!(p.screen().cell(0, 0).unwrap().contents(), cell, "{input}");
+        }
+        // as a pair of narrow regional indicators would not: the second makes the cell wide
+        let mut p = Parser::new(NonZeroU16::new(5).unwrap(), NonZeroU16::new(20).unwrap(), 0);
+        p.process("🇰🇷".as_bytes());
+        assert!(p.screen().cell(0, 0).unwrap().is_wide());
+    }
 }
