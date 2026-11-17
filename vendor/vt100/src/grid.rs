@@ -456,6 +456,23 @@ impl Grid {
         self.scrollback.as_ref().map_or(0, |s| s.rows.len())
     }
 
+    /// session_update_history: a new history-limit, with the history over it
+    /// collected at once (grid_collect_history(gd, 1)). Like tmux a full history
+    /// loses at least one line.
+    pub fn set_scrollback_capacity(&mut self, limit: usize) {
+        let Some(s) = self.scrollback.as_mut() else { return };
+        s.capacity = limit;
+        let len = s.rows.len();
+        if len == 0 || len < limit {
+            return;
+        }
+        let ny = (len - limit).max(1).min(len);
+        s.rows.drain(..ny);
+        self.history_counters.1 += ny as u64;
+        s.offset = s.offset.min(s.rows.len());
+        s.unbounded_len = s.unbounded_len.saturating_sub(ny);
+    }
+
     pub fn scrollback(&self) -> usize {
         self.scrollback.as_ref().map_or(0, |s| s.offset)
     }
@@ -984,10 +1001,19 @@ impl Grid {
             // Number of rows that will be pushed to the scrollback.
             let num_pushed = count.min(scrollback.capacity);
 
-            // Scrollback length is capped at `scrollback.capacity`. These rows
-            // will be lost, so just remove them now to avoid allocating.
-            let scrollback_overflow = (scrollback.rows.len() + num_pushed)
-                .saturating_sub(scrollback.capacity);
+            // grid_collect_history(gd, 0) before each line enters it: a full
+            // history loses a tenth of its limit (at least one line) at once.
+            let cap = scrollback.capacity;
+            let (mut len, mut scrollback_overflow) = (scrollback.rows.len(), 0);
+            for _ in 0..num_pushed {
+                if len > 0 && len >= cap {
+                    let ny = (cap / 10).max(1).min(len);
+                    len -= ny;
+                    scrollback_overflow += ny;
+                }
+                len += 1;
+            }
+            let scrollback_overflow = scrollback_overflow.min(scrollback.rows.len());
             for row in scrollback.rows.drain(0..scrollback_overflow) {
                 on_row(&row);
             }

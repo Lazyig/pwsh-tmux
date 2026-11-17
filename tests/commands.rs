@@ -3806,3 +3806,18 @@ fn theme_options_are_strings_and_empty_lines_have_no_cells() {
     let grid = ctx.ok(&["capture-pane", "-p", "-R", "-t", "s"]);
     assert!(grid.lines().any(|l| l == "\tL 3 (3) flags=NONE[0] 0/0"), "{grid}");
 }
+
+#[test]
+fn source_file_nesting_is_limited() {
+    // CMD_SOURCE_FILE_DEPTH_LIMIT: a file sourcing itself stops after 50 levels
+    let ctx = Ctx::new("srcdepth");
+    ctx.ok(&["new-session", "-d", "-s", "d"]);
+    let conf = std::env::temp_dir().join(format!("{}-loop.conf", ctx.socket));
+    let path = conf.to_string_lossy().replace('\\', "/");
+    std::fs::write(&conf, format!("set -ga @n x\nsource '{path}'\n")).unwrap();
+    let err = ctx.fails(&["source-file", &path]);
+    assert!(err.contains("too many nested files"), "{err}");
+    assert_eq!(ctx.ok(&["show", "-gv", "@n"]).trim().len(), 50);
+    ctx.ok(&["display", "-p", "ok"]);
+    let _ = std::fs::remove_file(&conf);
+}

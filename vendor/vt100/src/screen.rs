@@ -831,6 +831,11 @@ impl Screen {
         (self.grid.scrollback_len(), self.grid.scrollback_capacity())
     }
 
+    /// A new history-limit for the normal screen's history (session_update_history).
+    pub fn set_history_limit(&mut self, limit: usize) {
+        self.grid.set_scrollback_capacity(limit);
+    }
+
     /// Row `index` of [`Screen::base_history_len`].
     #[must_use]
     pub fn base_history_row(&self, index: usize) -> Option<crate::capture::RowContents<'_>> {

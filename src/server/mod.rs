@@ -1207,6 +1207,9 @@ pub struct Ctx {
     pub files: Vec<String>,
     /// The line of the command running in each of `files` (0 before the first).
     pub lines: Vec<usize>,
+    /// Which of `files` source-file opened (its nesting limit does not count the
+    /// startup configuration).
+    pub sourced: Vec<bool>,
     /// The startup configuration's queue (the global queue: errors never end it).
     pub cfg: bool,
     /// The exit status for the command-line client (c->retval: run-shell and new-pane -W
@@ -3787,11 +3790,13 @@ impl Server {
             if name == *FILE_PUSH {
                 q.ctx.files.push(cmd.get(1).cloned().unwrap_or_default());
                 q.ctx.lines.push(0);
+                q.ctx.sourced.push(cmd.get(2).is_some());
                 continue;
             }
             if name == *FILE_POP {
                 q.ctx.files.pop();
                 q.ctx.lines.pop();
+                q.ctx.sourced.pop();
                 continue;
             }
             if name == *LINE_MARK {
@@ -4274,6 +4279,9 @@ mod input_tests;
 
 #[cfg(test)]
 mod surface_tests;
+
+#[cfg(test)]
+mod audit_tests;
 
 #[cfg(test)]
 mod size_tests {

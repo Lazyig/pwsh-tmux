@@ -4393,6 +4393,10 @@ impl Server {
             "show-hooks" => self.cmd_show_hooks(&o, ctx),
             // ---------------------------------------------------------------- scripting
             "source-file" => {
+                // CMD_SOURCE_FILE_DEPTH_LIMIT: a file that sources itself stops here
+                if ctx.sourced.iter().filter(|s| **s).count() >= 50 {
+                    return err("too many nested files");
+                }
                 let mut injected = Vec::new();
                 // cmd_source_file_exec: an error with one path is reported and the others
                 // are still read; the command fails only if no file was found
@@ -4409,10 +4413,13 @@ impl Server {
                     found += files.len();
                     for f in files {
                         match self.load_file(&f, &f, o.has('n'), o.has('v'), ctx) {
-                            Ok((cmds, verbose)) => {
+                            Ok((mut cmds, verbose)) => {
                                 for v in verbose {
                                     ctx.out.push_str(&v);
                                     ctx.out.push('\n');
+                                }
+                                if let Some(push) = cmds.first_mut() {
+                                    push.push("s".into());
                                 }
                                 injected.extend(cmds);
                             }
@@ -5056,6 +5063,20 @@ impl Server {
                 let wids: Vec<WinId> = self.windows.keys().copied().collect();
                 for w in wids {
                     self.apply_layout(w);
+                }
+            }
+            // session_update_history: every pane of every session takes the new limit
+            "history-limit" => {
+                let mut sids: Vec<SessId> = self.sessions.keys().copied().collect();
+                sids.sort_by(|a, b| self.sessions[a].name.cmp(&self.sessions[b].name));
+                for sid in sids {
+                    let limit = self.opt_session_num(Some(sid), "history-limit").max(0) as usize;
+                    let panes: Vec<PaneId> = self.sessions[&sid].links.values().filter_map(|w| self.windows.get(w)).flat_map(|w| w.panes()).collect();
+                    for p in panes {
+                        if let Some(p) = self.panes.get_mut(&p) {
+                            p.parser.screen_mut().set_history_limit(limit);
+                        }
+                    }
                 }
             }
             "mode-keys" => {}
