@@ -3961,6 +3961,12 @@ fn option_targets_and_break_pane_names() {
     assert!(!ctx.cmd(&["show", "-v", "-t", "s:", "@o"]).1.contains('1'));
     // default_window_name: the pane's command as given
     ctx.ok(&["split-window", "-d", "-t", "s:0", sh("sleep 30", "Start-Sleep 30")]);
+    // (break-pane marks the pane changed, so its new window is named after what it runs
+    // at once: wait until the shell has run sleep, or the name may be the shell's, as in
+    // tmux; on Windows Start-Sleep runs in the shell itself)
+    if cfg!(unix) {
+        wait_for("sleep runs", || ctx.fmt("s:0.1", "#{pane_current_command}") == "sleep");
+    }
     ctx.ok(&["break-pane", "-d", "-s", "s:0.1", "-t", "s:"]);
     let name = ctx.ok(&["list-windows", "-t", "s", "-F", "#{window_name}"]);
     assert_eq!(name.lines().nth(1), Some(sh("sleep", "Start-Sleep")), "{name}");
