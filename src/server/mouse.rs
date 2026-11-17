@@ -460,7 +460,17 @@ impl Server {
 
     /// Look a mouse key up in the key tables and run it, or give the event to the pane
     /// (the mouse half of server_client_key_callback).
-    fn mouse_key(&mut self, cid: ClientId, key: String, mut ctx: MouseCtx) {
+    fn mouse_key(&mut self, cid: ClientId, key: String, ctx: MouseCtx) {
+        // server_client_handle_key: the key callback is an item of the client's queue
+        // (behind a command that waits); with nothing in it, it runs at once
+        if self.client_busy(cid) {
+            self.client_append(cid, ClientItem::Mouse(key, ctx));
+        } else {
+            self.mouse_key_now(cid, key, ctx);
+        }
+    }
+
+    pub(super) fn mouse_key_now(&mut self, cid: ClientId, key: String, mut ctx: MouseCtx) {
         ctx.key = key.clone();
         let Some(sid) = self.client_session(cid) else { return };
         let fs_pane = self.mouse_pane(&ctx);

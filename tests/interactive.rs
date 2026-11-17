@@ -128,7 +128,10 @@ fn copy_mode_keys_and_paste() {
     t.prefix(b"[");
     wait_for("copy mode", || ctx.fmt("c", "#{pane_in_mode}") == "1");
     t.wait_screen("indicator", |s| s.contains("[0/"));
-    t.send(b"?alpha-beta\r");
+    // (tmux queues every key of one read before any of them runs, so the keys typed in
+    // the same read as the key opening a prompt wait behind it: they are typed apart)
+    t.send(b"?");
+    t.send(b"alpha-beta\r");
     t.send(b" ");
     t.send(b"e");
     t.send(b"\r");
@@ -163,10 +166,15 @@ fn copy_mode_count_then_rebound_or_unbound_key() {
     t.prefix(b"[");
     wait_for("copy mode", || ctx.fmt("n", "#{pane_in_mode}") == "1");
     ctx.ok(&["send-keys", "-X", "-t", "n", "history-top"]);
-    t.send(b"12J");
+    // (each key in a read of its own: a count's prompt does not get the keys read with
+    // the key that opened it)
+    for k in [b"1", b"2", b"J"] {
+        t.send(k);
+    }
     wait_for("rebound J moves the cursor", || ctx.fmt("n", "#{copy_cursor_y} #{scroll_position}").starts_with("12 "));
     let before = ctx.fmt("n", "#{copy_cursor_y} #{scroll_position}");
-    t.send(b"3K");
+    t.send(b"3");
+    t.send(b"K");
     t.send(b"j");
     wait_for("unbound K does nothing, j moves 3", || ctx.fmt("n", "#{copy_cursor_y}") == "15");
     assert!(before.ends_with(&ctx.fmt("n", "#{scroll_position}")));
@@ -558,8 +566,12 @@ fn prompt_types_keep_separate_histories() {
     assert_eq!(ctx.ok(&["show-prompt-history", "-T", "search"]), "History for search:\n\n1: needle\n2: other\n\n");
     assert_eq!(ctx.ok(&["show-prompt-history", "-T", "command"]), "History for command:\n\n1: typed\n\n");
     assert!(ctx.fails(&["command-prompt", "-t", &client, "-T", "window-target", "x"]).contains("unknown type: window-target"));
-    // commands run from the prompt are logged for its client
-    assert!(ctx.ok(&["show-messages"]).contains(&format!("{client} command: set-option -g @typed typed")));
+    // the answer of a prompt without -b goes after the command waiting for it, in that
+    // command-line client's queue (cmdq_insert_after), so it is logged for that client;
+    // with -b it is appended to the prompt's client's queue
+    let log = ctx.ok(&["show-messages"]);
+    assert!(log.contains(" command: set-option -g @typed typed") && !log.contains(&format!("{client} command: set-option -g @typed")), "{log}");
+    assert!(log.contains(&format!("{client} command: set-option -g @searched needle")), "{log}");
 }
 
 #[test]

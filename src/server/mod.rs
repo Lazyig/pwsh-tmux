@@ -1270,6 +1270,9 @@ pub struct Ctx {
     /// The next command is run-shell resumed after its -d delay: it is in the message
     /// log already.
     pub resumed: bool,
+    /// What a background job (run-shell -b, if-shell -b) runs when it is done: no
+    /// client's queue waits for it.
+    pub detached: bool,
 }
 
 /// Queue markers source-file puts around a file's commands. A parsed command can hold any
@@ -1313,6 +1316,16 @@ pub struct KeyEvent {
     pub key: keys::Key,
     /// A mouse key sent by name (MouseDown1Pane), in place of `key`.
     pub mouse: Option<String>,
+}
+
+/// An item of an attached client's command queue (c->queue) waiting behind a command
+/// that waits (a prompt, a popup, run-shell): a key it typed, which goes through the key
+/// tables when reached (server_client_key_callback), or commands appended for it
+/// (cmdq_append: a menu item, a mode's choice, a prompt without a waiting command).
+pub enum ClientItem {
+    Key(keys::Key, Vec<u8>),
+    Mouse(String, input::MouseCtx),
+    Queue(Queue),
 }
 
 /// The tmux release whose behaviour this server matches (`#{version}`).
@@ -1403,10 +1416,21 @@ pub struct Server {
     pub key_event_seq: u64,
     /// How many queues are running (run_queue nesting).
     pub queue_depth: usize,
-    /// Commands for a client's queue (cmdq_append) given while a queue was running: a
-    /// menu item or a prompt chosen by a key send-keys -K handed over at once. They run
-    /// when the running queue is done or waits.
-    pub client_queued: VecDeque<Queue>,
+    /// Each attached client's queue (c->queue) behind its running command: keys it typed
+    /// and commands appended for it. They run in order once no command of the client's
+    /// waits and no queue is running (a menu item chosen by a key send-keys -K hands over
+    /// runs when that queue is done or waits).
+    pub client_items: HashMap<ClientId, VecDeque<ClientItem>>,
+    /// The client whose terminal input is being read: its keys are all queued before any
+    /// of them is handled (tty_keys_next runs for the whole read before cmdq_next).
+    pub reading: Option<ClientId>,
+    /// resume_waits is running.
+    pub resuming: bool,
+    /// drain_clients is running.
+    pub draining: bool,
+    /// Commands a prompt's answer gives the command waiting for it (cmdq_insert_after the
+    /// waiting item), by prompt id, run before the rest of its queue.
+    pub prompt_inserts: HashMap<u64, Vec<Vec<String>>>,
     /// Events: hook bookkeeping, wait-for -E, monitors, change detection.
     pub ev: events::State,
     pub buffers: Vec<Buffer>,
@@ -1627,7 +1651,11 @@ impl Server {
             key_events: HashMap::new(),
             key_event_seq: 0,
             queue_depth: 0,
-            client_queued: VecDeque::new(),
+            client_items: HashMap::new(),
+            reading: None,
+            resuming: false,
+            draining: false,
+            prompt_inserts: HashMap::new(),
             ev: Default::default(),
             buffers: Vec::new(),
             buffer_seq: 0,
@@ -2782,6 +2810,10 @@ impl Server {
         for d in self.name_state.values().filter_map(|n| n.timer) {
             t = t.min(d.saturating_duration_since(now));
         }
+        // a closed prompt's or popup's queue goes on in the next turn, at once
+        if self.waits_resumable() {
+            t = Duration::ZERO;
+        }
         let now_us = now_us();
         for (_, deadline, _) in self.silence_timers() {
             t = t.min(Duration::from_micros(deadline.saturating_sub(now_us)));
@@ -2874,40 +2906,7 @@ impl Server {
             let windows = &self.windows;
             self.menus.retain(|w, _| windows.contains_key(w));
         }
-        let waiting = std::mem::take(&mut self.prompt_waits);
-        for (cid, epoch, argv, queue) in waiting {
-            if !self.prompt_open(epoch) {
-                let mut queue = queue;
-                self.after_command(&argv, &queue.ctx);
-                for c in std::mem::take(&mut self.ev.inject).into_iter().rev() {
-                    queue.cmds.push_front(c);
-                }
-                self.run_queue(queue);
-            } else {
-                self.prompt_waits.push((cid, epoch, argv, queue));
-            }
-        }
-        let waiting = std::mem::take(&mut self.overlay_waits);
-        for (cid, epoch, argv, queue) in waiting {
-            if self.clients.get(&cid).is_none_or(|c| c.overlay.is_none() || c.overlay_epoch != epoch) {
-                let mut queue = queue;
-                // popup_free_cb: a command-line client exits with the popup's status, 129
-                // (128 + SIGHUP) when it was closed before its command exited
-                if let Some(pane) = self.popup_panes.remove(&epoch) {
-                    let status = self.popup_status.remove(&pane).unwrap_or(129);
-                    if queue.ctx.reply.and_then(|r| self.clients.get(&r)).is_some_and(|c| c.session.is_none()) {
-                        queue.ctx.retval = status;
-                    }
-                }
-                self.after_command(&argv, &queue.ctx);
-                for c in std::mem::take(&mut self.ev.inject).into_iter().rev() {
-                    queue.cmds.push_front(c);
-                }
-                self.run_queue(queue);
-            } else {
-                self.overlay_waits.push((cid, epoch, argv, queue));
-            }
-        }
+        self.drain_clients();
         // Animation cycles request a one-shot status redraw every 100ms.
         self.animation_deadlines.borrow_mut().retain(|cid, deadline| {
             if *deadline > now { return self.clients.contains_key(cid); }
@@ -3956,10 +3955,137 @@ impl Server {
         self.drain_hooks();
         self.queue_depth -= 1;
         if self.queue_depth == 0 {
-            while let Some(q) = self.client_queued.pop_front() {
-                self.run_queue(q);
+            self.drain_clients();
+        }
+    }
+
+    /// The attached client whose queue (c->queue) a queue is: none for the global queue
+    /// (the configuration, event hooks) and background jobs.
+    pub(crate) fn queue_owner(&self, ctx: &Ctx) -> Option<ClientId> {
+        if ctx.cfg || ctx.detached || ctx.hook_depth > 1 {
+            return None;
+        }
+        self.queue_client(ctx)
+    }
+
+    /// A command of the client's queue waits (CMDQ_WAITING): a prompt, a popup, a job,
+    /// a delay, wait-for, a pane.
+    pub(crate) fn client_blocked(&self, cid: ClientId) -> bool {
+        let own = |q: &Queue| self.queue_owner(&q.ctx) == Some(cid);
+        self.prompt_waits.iter().any(|w| own(&w.3))
+            || self.overlay_waits.iter().any(|w| own(&w.3))
+            || self.jobs.values().any(|j| own(&j.queue))
+            || self.delayed.iter().any(|d| own(&d.1))
+            || self.waits.values().any(|c| c.waiters.iter().chain(&c.lockers).any(own))
+            || self.ev.waiters.iter().any(|w| own(&w.queue))
+            || self.pane_waits.values().flatten().any(|w| own(&w.1))
+    }
+
+    /// cmdq_append for an attached client: runs at once unless the client's queue has
+    /// items or waits, a queue is running or its input is being read.
+    pub(crate) fn client_append(&mut self, cid: ClientId, item: ClientItem) {
+        self.client_items.entry(cid).or_default().push_back(item);
+        self.drain_clients();
+    }
+
+    /// Whether a key for the client would wait behind items of its queue.
+    pub(crate) fn client_busy(&self, cid: ClientId) -> bool {
+        self.queue_depth > 0 || self.client_items.get(&cid).is_some_and(|q| !q.is_empty()) || self.client_blocked(cid)
+    }
+
+    /// server_loop's cmdq_next for each client: every client's items in order, each
+    /// until one of its commands waits. (Not while a queue runs or input is read: the
+    /// outermost caller does it, so the items are not handled recursively.)
+    pub(crate) fn drain_clients(&mut self) {
+        if self.queue_depth > 0 || self.reading.is_some() || self.draining {
+            return;
+        }
+        self.draining = true;
+        loop {
+            self.resume_waits();
+            let mut ran = false;
+            let cids: Vec<ClientId> = self.client_items.keys().copied().collect();
+            for cid in cids {
+                // (the items of a client that has gone go with it)
+                if !self.clients.contains_key(&cid) {
+                    self.client_items.remove(&cid);
+                    continue;
+                }
+                if self.client_blocked(cid) {
+                    continue;
+                }
+                let Some(item) = self.client_items.get_mut(&cid).and_then(|q| q.pop_front()) else { continue };
+                if self.client_items.get(&cid).is_some_and(|q| q.is_empty()) {
+                    self.client_items.remove(&cid);
+                }
+                ran = true;
+                match item {
+                    ClientItem::Key(k, raw) => {
+                        let name = keys::key_name(&k);
+                        self.handle_key_queued(cid, Some(k), &name, raw, false);
+                    }
+                    ClientItem::Mouse(key, ctx) => self.mouse_key_now(cid, key, ctx),
+                    ClientItem::Queue(q) => self.run_queue(q),
+                }
+            }
+            if !ran {
+                break;
             }
         }
+        self.draining = false;
+    }
+
+    /// The queues whose prompt or popup has closed go on (cmdq_continue), at once.
+    pub(crate) fn resume_waits(&mut self) {
+        if self.resuming || self.queue_depth > 0 {
+            return;
+        }
+        self.resuming = true;
+        let waiting = std::mem::take(&mut self.prompt_waits);
+        for (cid, epoch, argv, queue) in waiting {
+            if !self.prompt_open(epoch) {
+                let mut queue = queue;
+                self.after_command(&argv, &queue.ctx);
+                for c in std::mem::take(&mut self.ev.inject).into_iter().rev() {
+                    queue.cmds.push_front(c);
+                }
+                // the answer's commands come straight after the prompt, before its hook
+                for c in self.prompt_inserts.remove(&epoch).unwrap_or_default().into_iter().rev() {
+                    queue.cmds.push_front(c);
+                }
+                self.run_queue(queue);
+            } else {
+                self.prompt_waits.push((cid, epoch, argv, queue));
+            }
+        }
+        let waiting = std::mem::take(&mut self.overlay_waits);
+        for (cid, epoch, argv, queue) in waiting {
+            if self.clients.get(&cid).is_none_or(|c| c.overlay.is_none() || c.overlay_epoch != epoch) {
+                let mut queue = queue;
+                // popup_free_cb: a command-line client exits with the popup's status, 129
+                // (128 + SIGHUP) when it was closed before its command exited
+                if let Some(pane) = self.popup_panes.remove(&epoch) {
+                    let status = self.popup_status.remove(&pane).unwrap_or(129);
+                    if queue.ctx.reply.and_then(|r| self.clients.get(&r)).is_some_and(|c| c.session.is_none()) {
+                        queue.ctx.retval = status;
+                    }
+                }
+                self.after_command(&argv, &queue.ctx);
+                for c in std::mem::take(&mut self.ev.inject).into_iter().rev() {
+                    queue.cmds.push_front(c);
+                }
+                self.run_queue(queue);
+            } else {
+                self.overlay_waits.push((cid, epoch, argv, queue));
+            }
+        }
+        self.resuming = false;
+    }
+
+    /// Whether a waiting prompt or popup has closed (its queue goes on at once).
+    fn waits_resumable(&self) -> bool {
+        self.prompt_waits.iter().any(|w| !self.prompt_open(w.1))
+            || self.overlay_waits.iter().any(|(cid, epoch, ..)| self.clients.get(cid).is_none_or(|c| c.overlay.is_none() || c.overlay_epoch != *epoch))
     }
 
     /// A control client's reply for the item just run (cmdq_guard): each command,
@@ -4405,7 +4531,7 @@ impl Server {
                         "job-if" => {
                             let kind = JobKind::IfShell { then: get(3), otherwise: Some(get(4)).filter(|s| !s.is_empty()) };
                             if get(5) == "b" {
-                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: Default::default(), control_seq: None, ..q.ctx.clone() }, soft: 0 };
+                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: Default::default(), control_seq: None, detached: true, ..q.ctx.clone() }, soft: 0 };
                                 self.spawn_job(&get(2), None, kind, sub);
                                 self.control_item_done(&mut q, None);
                                 continue;
@@ -4424,7 +4550,7 @@ impl Server {
                             let cwd = Some(get(3)).filter(|s| !s.is_empty());
                             let kind = JobKind::RunShell { pane, background, stderr: get(4).contains('E') };
                             if background {
-                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: Default::default(), control_seq: None, ..q.ctx.clone() }, soft: 0 };
+                                let sub = Queue { cmds: VecDeque::new(), ctx: Ctx { reply: None, out: Default::default(), control_seq: None, detached: true, ..q.ctx.clone() }, soft: 0 };
                                 self.spawn_job(&get(2), cwd, kind, sub);
                                 self.control_item_done(&mut q, None);
                                 continue;

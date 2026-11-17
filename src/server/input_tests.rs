@@ -970,3 +970,50 @@ fn window_names_follow_mode_changes_at_most_every_name_interval() {
     f.automatic_rename();
     assert!(f.name_state[&wid].timer.is_none());
 }
+
+#[test]
+fn keys_of_one_read_wait_behind_the_prompt_one_of_them_opens() {
+    // server_client_handle_key0 takes every key of a read before the client's queue runs
+    // any: C-b : opens a prompt that waits (CMD_RETURN_WAIT), and the keys read with it
+    // are items behind it in the client's queue, not keys for the prompt
+    let mut f = fixture();
+    f.handle_input(1, b"\x02:abc\r");
+    assert_eq!(f.clients[&1].prompt.as_ref().map(|p| p.input.len()), Some(0));
+    assert_eq!(f.client_items.get(&1).map(|q| q.len()), Some(4));
+    // a later read goes to the prompt (handled at once, the queue may be blocked)
+    f.handle_input(1, b"x");
+    assert_eq!(f.clients[&1].prompt.as_ref().map(|p| p.input.iter().collect::<String>()), Some("x".into()));
+    // the prompt closes: its queue goes on, then the keys waiting behind it
+    f.pane_input.try_iter().for_each(drop);
+    f.handle_input(1, b"\x03");
+    assert!(f.clients[&1].prompt.is_none());
+    assert!(f.client_items.is_empty());
+    let typed: Vec<u8> = f.pane_input.try_iter().flatten().collect();
+    assert_eq!(typed, b"abc\r");
+}
+
+#[test]
+fn commands_for_a_client_wait_behind_its_waiting_prompt() {
+    // a menu item or a mode's choice is appended to the client's queue (cmdq_append):
+    // behind a prompt a binding opened, which first runs its answer (cmdq_insert_after,
+    // with the binding's key in the message log) and the rest of the binding
+    let mut f = fixture();
+    f.cfg_finished = true;
+    run(&mut f, &["bind-key", "-n", "F5", "command-prompt -p y 'set -ga @h %%' ; set -ga @h T"]);
+    f.handle_input(1, b"\x1b[15~");
+    assert!(f.clients[&1].prompt.is_some());
+    f.run_string(1, "set -ga @h M", None);
+    assert_eq!(f.opts_session.get("@h"), None);
+    f.handle_input(1, b"q");
+    f.handle_input(1, b"\r");
+    assert_eq!(f.opts_session.get("@h"), Some("qTM"));
+    assert!(f.messages.iter().any(|(_, m)| m.ends_with("key F5: set-option -ag @h q")), "{:?}", f.messages);
+    assert!(f.messages.iter().any(|(_, m)| m.ends_with(" command: set-option -ag @h M")), "{:?}", f.messages);
+    // a prompt closed without the client's input being read (detach, a command)
+    // resumes its queue in the next turn at once
+    f.handle_input(1, b"\x1b[15~");
+    f.clients.get_mut(&1).unwrap().prompt = None;
+    assert!(f.next_timeout() <= Duration::from_millis(5));
+    f.drain_clients();
+    assert_eq!(f.opts_session.get("@h"), Some("qTMT"));
+}

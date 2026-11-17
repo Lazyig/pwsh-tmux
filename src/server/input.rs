@@ -352,9 +352,15 @@ impl Server {
         } else {
             None
         };
+        // tty_keys_next takes every key of the read (server_client_handle_key0) before
+        // the client's queue runs them, so a prompt a key's binding opens does not get
+        // the keys after it in the same read: they wait behind the prompt in the queue
+        let reading = self.reading.replace(cid);
         for i in inputs {
             self.dispatch_input(cid, i);
         }
+        self.reading = reading;
+        self.drain_clients();
     }
 
     pub fn dispatch_input(&mut self, cid: ClientId, input: Input) {
@@ -588,10 +594,11 @@ impl Server {
         })
     }
 
+    /// server_client_handle_key: what cannot wait is done now, the rest of the key goes
+    /// in the client's queue (cmdq_append), after any commands of earlier keys.
     pub(super) fn handle_key(&mut self, cid: ClientId, k: Key, raw: Vec<u8>) {
         if let Some((k, raw)) = self.handle_key_now(cid, k, raw, false) {
-            let name = keys::key_name(&k);
-            self.handle_key_queued(cid, Some(k), &name, raw, false);
+            self.client_append(cid, ClientItem::Key(k, raw));
         }
     }
 
@@ -728,7 +735,7 @@ impl Server {
     /// and the prefix, then the pane or its mode. A key send-keys -K `sent` (KEYC_SENT) is
     /// never taken for a paste. `k` is None for a mouse key sent by name, whose event
     /// has no position.
-    fn handle_key_queued(&mut self, cid: ClientId, k: Option<Key>, name: &str, raw: Vec<u8>, sent: bool) {
+    pub(super) fn handle_key_queued(&mut self, cid: ClientId, k: Option<Key>, name: &str, raw: Vec<u8>, sent: bool) {
         let name = name.to_string();
         let mouse = k.is_none();
         if !self.clients.contains_key(&cid) { return; }
@@ -914,20 +921,39 @@ impl Server {
     }
 
     /// Runs a command string for a client (prompts, menus, modes): cmdq_append to the
-    /// client's queue, so while a queue is running (send-keys -K handing a menu or a
-    /// prompt its key) the commands wait until that queue is done or waits.
+    /// client's queue, so the commands wait behind a command of the client that waits
+    /// (a prompt a key opened), and while a queue is running (send-keys -K handing a menu
+    /// or a prompt its key) until that queue is done or waits.
     pub fn run_string(&mut self, cid: ClientId, cmd: &str, pane: Option<PaneId>) {
         // cmd_parse_from_string: the whole list is checked before any of it runs
         match self.parse_string(cmd) {
             Ok(cmds) => {
                 let ctx = Ctx { client: Some(cid), pane, from_key: true, ..Ctx::default() };
-                let q = Queue { cmds: cmds.into(), ctx , soft: 0 };
-                if self.queue_depth > 0 {
-                    self.client_queued.push_back(q);
-                } else {
-                    self.run_queue(q);
-                }
+                self.client_append(cid, ClientItem::Queue(Queue { cmds: cmds.into(), ctx , soft: 0 }));
             }
+            Err(e) => self.set_error(cid, &e),
+        }
+    }
+
+    /// A prompt's answer (cmd_command_prompt_callback, cmd_confirm_before_callback):
+    /// with a command waiting for the prompt, its commands go straight after it, with
+    /// its state (client, key) and as a group of their own (cmdq_insert_after with
+    /// cmdq_get_state); else they are appended to the client's queue with none.
+    fn run_prompt_answer(&mut self, cid: ClientId, pr: &Prompt, cmd: &str) {
+        let Some(ctx) = self.prompt_waits.iter().find(|w| w.1 == pr.id).map(|w| w.3.ctx.clone()) else {
+            self.run_string(cid, cmd, pr.pane);
+            return;
+        };
+        match self.parse_string(cmd) {
+            Ok(cmds) => {
+                let pane = pr.pane.or(ctx.pane).map(|p| p.to_string()).unwrap_or_default();
+                let client = ctx.client.map(|c| c.to_string()).unwrap_or_default();
+                let mut group = vec![vec![KEY_GROUP.clone(), "1".into(), client, pane, ctx.key.clone().unwrap_or_default()]];
+                group.extend(cmds);
+                group.push(vec![KEY_GROUP.clone(), "0".into()]);
+                self.prompt_inserts.entry(pr.id).or_default().extend(group);
+            }
+            // cmdq_get_error: an item of its own after the prompt
             Err(e) => self.set_error(cid, &e),
         }
     }
@@ -1293,7 +1319,7 @@ impl Server {
             PromptKind::Key => {
                 if let Some(s) = s {
                     let cmd = fill_template(&pr.template, &[s.to_string()]);
-                    self.run_string(cid, &cmd, pr.pane);
+                    self.run_prompt_answer(cid, pr, &cmd);
                 }
                 true
             }
@@ -1301,7 +1327,7 @@ impl Server {
                 let first = s.and_then(|s| s.chars().next());
                 if first == Some(pr.confirm.0) || (first == Some('\r') && pr.confirm.1) {
                     let template = pr.template.clone();
-                    self.run_string(cid, &template, pr.pane);
+                    self.run_prompt_answer(cid, pr, &template);
                 }
                 true
             }
@@ -1327,7 +1353,7 @@ impl Server {
                         }
                     }
                     let cmd = fill_template(&pr.template, &argv);
-                    self.run_string(cid, &cmd, pr.pane);
+                    self.run_prompt_answer(cid, pr, &cmd);
                     // an incremental prompt stays open for more typing
                     !pr.incremental
                 }

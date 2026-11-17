@@ -122,9 +122,10 @@ impl Server {
                 return;
             }
         }
-        // under send-keys -K the default prompts (jumps, searches, goto line) are the real
-        // command-prompt, which waits and holds up the keys after it
-        let queued_prompt = self.key_capture.is_some() && default_raw.is_some_and(|c| c.starts_with("command-prompt"));
+        // the default prompts (jumps, searches, goto line) are the real command-prompt,
+        // which waits and holds up the keys after it in the client's queue (typed in the
+        // same read, or sent by send-keys -K)
+        let queued_prompt = (self.key_capture.is_some() || cid.is_some()) && default_raw.is_some_and(|c| c.starts_with("command-prompt"));
         // the default mouse bindings (select-pane, scrolling, selecting) are commands too,
         // and send-keys without -K queues every binding as its commands
         let queued = queued_prompt || keys::parse_mouse_key_name(name).is_some() || plain;
