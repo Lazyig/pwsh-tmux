@@ -1260,6 +1260,11 @@ pub struct Ctx {
     pub skip_after: bool,
     /// How many key bindings' command groups (KEY_GROUP) the queue is in.
     pub key_depth: usize,
+    /// What each open KEY_GROUP replaced: the client, pane, key and logged client.
+    pub key_saved: Vec<(Option<ClientId>, Option<PaneId>, Option<String>, Option<ClientId>)>,
+    /// The next command is run-shell resumed after its -d delay: it is in the message
+    /// log already.
+    pub resumed: bool,
 }
 
 /// Queue markers source-file puts around a file's commands. A parsed command can hold any
@@ -1286,9 +1291,11 @@ pub static CFG_DONE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| i
 /// Server::key_events]. It is handled when the queue reaches it, so keys and the commands
 /// their bindings run happen in order, after any earlier command waits (a prompt).
 pub static KEY_EVENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("key"));
-/// [KEY_GROUP, "1"] and [KEY_GROUP, "0"] are put around the commands a KEY_EVENT's
-/// binding runs: they are a group of their own (key_bindings_dispatch makes a new
-/// cmdq item), so an error ends only the rest of that binding.
+/// [KEY_GROUP, "1", client, pane, key] and [KEY_GROUP, "0"] are put around the commands a
+/// KEY_EVENT's binding runs: they are a group of their own (key_bindings_dispatch makes a
+/// new cmdq item), so an error ends only the rest of that binding, and they run with the
+/// state of the key (its client, that client's pane and the key, for formats and the
+/// message log), while the queue's own client stays the one the log names.
 pub static KEY_GROUP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("key-group"));
 
 /// A key waiting in a queue as a KEY_EVENT item.
@@ -1299,6 +1306,8 @@ pub struct KeyEvent {
     /// The client that ran send-keys (key_origin while the key is handled).
     pub origin: ClientId,
     pub key: keys::Key,
+    /// A mouse key sent by name (MouseDown1Pane), in place of `key`.
+    pub mouse: Option<String>,
 }
 
 /// The tmux release whose behaviour this server matches (`#{version}`).
@@ -1366,9 +1375,18 @@ pub struct Server {
     /// send-keys -K: the bound commands of the keys it handles, which go in its own
     /// queue after it (server_client_handle_key_after) instead of a queue of their own.
     pub key_capture: Option<Vec<Vec<String>>>,
+    /// send-keys without -K to a pane in copy mode: the bindings of its keys go in its
+    /// queue (key_capture) for the queue's own client, without a key event.
+    pub key_plain: bool,
     /// send-keys -K keys waiting in a queue (KEY_EVENT items), by token.
     pub key_events: HashMap<u64, KeyEvent>,
     pub key_event_seq: u64,
+    /// How many queues are running (run_queue nesting).
+    pub queue_depth: usize,
+    /// Commands for a client's queue (cmdq_append) given while a queue was running: a
+    /// menu item or a prompt chosen by a key send-keys -K handed over at once. They run
+    /// when the running queue is done or waits.
+    pub client_queued: VecDeque<Queue>,
     /// Events: hook bookkeeping, wait-for -E, monitors, change detection.
     pub ev: events::State,
     pub buffers: Vec<Buffer>,
@@ -1384,6 +1402,10 @@ pub struct Server {
     pub waits: HashMap<String, events::Channel>,
     /// Queues waiting for an overlay to close, with the command's argv (its after hook).
     pub overlay_waits: Vec<(ClientId, u64, Vec<String>, Queue)>,
+    /// The pane of each popup a queue waits for (by overlay epoch), and how the popup's
+    /// command exited, for the command-line client's exit status.
+    pub popup_panes: HashMap<u64, PaneId>,
+    pub popup_status: HashMap<PaneId, i32>,
     /// Queues waiting for a prompt to close: (client, prompt id, the command's argv, queue).
     pub prompt_waits: Vec<(ClientId, u64, Vec<String>, Queue)>,
     /// The last prompt id given out (Server::next_prompt_id).
@@ -1572,8 +1594,11 @@ impl Server {
             cfg_finished: false,
             key_origin: None,
             key_capture: None,
+            key_plain: false,
             key_events: HashMap::new(),
             key_event_seq: 0,
+            queue_depth: 0,
+            client_queued: VecDeque::new(),
             ev: Default::default(),
             buffers: Vec::new(),
             buffer_seq: 0,
@@ -1584,6 +1609,8 @@ impl Server {
             jobs: HashMap::new(),
             waits: HashMap::new(),
             overlay_waits: Vec::new(),
+            popup_panes: HashMap::new(),
+            popup_status: HashMap::new(),
             prompt_waits: Vec::new(),
             prompt_ids: 0,
             menus: HashMap::new(),
@@ -2486,6 +2513,9 @@ impl Server {
         // popup?
         let popup_owner = self.clients.values().find(|c| matches!(&c.overlay, Some(Overlay::Popup(p)) if p.pane == id)).map(|c| c.id);
         if let Some(cid) = popup_owner {
+            if self.popup_panes.values().any(|p| *p == id) {
+                self.popup_status.insert(id, status.unwrap_or(129));
+            }
             // popup_job_complete_cb: -E closes it, -EE only for status 0
             let close = matches!(&self.clients[&cid].overlay, Some(Overlay::Popup(p)) if p.close_on_exit || (p.close_exit_zero && status == Some(0)));
             if let Some(p) = self.panes.get_mut(&id) {
@@ -2768,11 +2798,13 @@ impl Server {
             if self.clients.get(&cid).is_some_and(|c| c.click.deadline.is_some_and(|d| d <= now)) {
                 self.mouse_click_timer(cid);
             }
+            // server_client_repeat_timer: back to the default table (the session's key-table)
+            let default_table = self.clients.get(&cid).and_then(|c| c.session).map(|s| self.default_key_table(s)).unwrap_or_else(|| "root".into());
             let Some(c) = self.clients.get_mut(&cid) else { continue };
             if c.repeat_until.is_some_and(|d| d <= now) {
                 c.repeat_until = None;
-                if c.key_table != "root" {
-                    c.set_key_table("root");
+                if c.key_table != default_table {
+                    c.set_key_table(&default_table);
                     c.dirty = true;
                 }
             }
@@ -2817,6 +2849,14 @@ impl Server {
         for (cid, epoch, argv, queue) in waiting {
             if self.clients.get(&cid).is_none_or(|c| c.overlay.is_none() || c.overlay_epoch != epoch) {
                 let mut queue = queue;
+                // popup_free_cb: a command-line client exits with the popup's status, 129
+                // (128 + SIGHUP) when it was closed before its command exited
+                if let Some(pane) = self.popup_panes.remove(&epoch) {
+                    let status = self.popup_status.remove(&pane).unwrap_or(129);
+                    if queue.ctx.reply.and_then(|r| self.clients.get(&r)).is_some_and(|c| c.session.is_none()) {
+                        queue.ctx.retval = status;
+                    }
+                }
                 self.after_command(&argv, &queue.ctx);
                 for c in std::mem::take(&mut self.ev.inject).into_iter().rev() {
                     queue.cmds.push_front(c);
@@ -3421,6 +3461,8 @@ impl Server {
     /// update-environment.
     pub fn attach_client_env(&mut self, cid: ClientId, sid: SessId, update_env: bool) {
         let clear = options::is_on(&self.opt_server("clear-on-attach"));
+        // server_client_set_key_table(c, NULL): the session's key-table
+        let default_table = self.default_key_table(sid);
         let Some(c) = self.clients.get_mut(&cid) else { return };
         let was_attached = c.attached;
         c.focused = true;
@@ -3432,7 +3474,7 @@ impl Server {
         c.attached = true;
         c.prev = None;
         c.dirty = true;
-        c.set_key_table("root");
+        c.set_key_table(&default_table);
         if !was_attached {
             c.send(S_ATTACHED, if clear { b"" } else { b"no-clear" });
             self.start_terminal_queries(cid);
@@ -3833,15 +3875,23 @@ impl Server {
                 c.ctl.command_waiting = true;
             }
         }
+        self.queue_depth += 1;
         self.run_queue_inner(q);
         self.drain_hooks();
+        self.queue_depth -= 1;
+        if self.queue_depth == 0 {
+            while let Some(q) = self.client_queued.pop_front() {
+                self.run_queue(q);
+            }
+        }
     }
 
     /// A control client's reply for the item just run (cmdq_guard): each command,
     /// including those of hooks, gets its own %begin/%end (or %error) block, and the
     /// notifications it caused are written before the next one.
     fn control_item_done(&mut self, q: &mut Queue, err: Option<&str>) {
-        let (Some(seq), Some(cid)) = (q.ctx.control_seq, q.ctx.client) else { return };
+        // (a key group's commands still answer the control client whose queue it is)
+        let (Some(seq), Some(cid)) = (q.ctx.control_seq, self.queue_client(&q.ctx)) else { return };
         q.ctx.control_open = false;
         let out = std::mem::take(&mut q.ctx.out);
         // hook and key binding commands run with a new state, without CMDQ_STATE_CONTROL
@@ -3902,12 +3952,67 @@ impl Server {
             match mark {
                 Some(true) => depth += 1,
                 Some(false) if depth == 0 => {
-                    q.ctx.key_depth = q.ctx.key_depth.saturating_sub(1);
+                    Self::close_key_group(&mut q.ctx);
                     return;
                 }
                 Some(false) => depth -= 1,
                 None => q.soft = q.soft.saturating_sub(1),
             }
+        }
+    }
+
+    /// The client whose queue this is (cmdq item->client): the command-line client, the
+    /// attached client a binding runs for, or the one a key group's queue belongs to.
+    pub(crate) fn queue_client(&self, ctx: &Ctx) -> Option<ClientId> {
+        ctx.log_client.or(ctx.reply).or(ctx.client)
+    }
+
+    /// cmdq_error for a command that goes on (or whose group alone ends): shown at once,
+    /// on a command-line client's stderr (exit status 1) or an attached client's status
+    /// line. False when neither applies and the caller reports it.
+    pub(crate) fn report_error_now(&mut self, ctx: &mut Ctx, e: &str) -> bool {
+        if ctx.control_seq.is_some() {
+            return false;
+        }
+        let Some(owner) = self.queue_client(ctx) else { return false };
+        let Some(c) = self.clients.get(&owner) else { return false };
+        if c.control != 0 {
+            return false;
+        }
+        if !c.attached || c.session.is_none() {
+            self.log_error(Some(owner), e);
+            ctx.soft_err.push_str(e);
+            ctx.soft_err.push('\n');
+        } else {
+            self.set_error(owner, e);
+        }
+        true
+    }
+
+    /// A KEY_GROUP start: its commands run for the key's client, pane and key.
+    fn open_key_group(&self, ctx: &mut Ctx, mark: &[String]) {
+        ctx.key_depth += 1;
+        ctx.key_saved.push((ctx.client, ctx.pane, ctx.key.clone(), ctx.log_client));
+        // the queue's client (item->client) is the one the message log names
+        ctx.log_client = ctx.log_client.or(ctx.client);
+        // (no client: send-keys without -K, whose bindings keep the queue's client)
+        if mark.get(2).is_some_and(|c| c.is_empty()) {
+            ctx.pane = mark.get(3).and_then(|p| p.parse().ok()).or(ctx.pane);
+        } else if let Some(c) = mark.get(2).and_then(|c| c.parse().ok()).filter(|c| self.clients.contains_key(c)) {
+            ctx.client = Some(c);
+            ctx.pane = mark.get(3).and_then(|p| p.parse().ok());
+        }
+        ctx.key = mark.get(4).filter(|k| !k.is_empty()).cloned();
+    }
+
+    /// A KEY_GROUP end: back to what its start replaced.
+    fn close_key_group(ctx: &mut Ctx) {
+        ctx.key_depth = ctx.key_depth.saturating_sub(1);
+        if let Some((client, pane, key, log)) = ctx.key_saved.pop() {
+            ctx.client = client;
+            ctx.pane = pane;
+            ctx.key = key;
+            ctx.log_client = log;
         }
     }
 
@@ -3965,9 +4070,9 @@ impl Server {
             }
             if name == *KEY_GROUP {
                 if cmd.get(1).map(String::as_str) == Some("1") {
-                    q.ctx.key_depth += 1;
+                    self.open_key_group(&mut q.ctx, &cmd);
                 } else {
-                    q.ctx.key_depth = q.ctx.key_depth.saturating_sub(1);
+                    Self::close_key_group(&mut q.ctx);
                 }
                 continue;
             }
@@ -4002,14 +4107,20 @@ impl Server {
                 let ev = cmd.get(1).and_then(|t| t.parse().ok()).and_then(|t| self.key_events.remove(&t));
                 let gone = q.ctx.reply.or(q.ctx.client).is_some_and(|c| !self.clients.contains_key(&c));
                 let bound = ev.filter(|_| !gone).map(|ev| self.key_event(ev)).unwrap_or_default();
-                if !bound.is_empty() {
-                    q.cmds.push_front(vec![KEY_GROUP.clone(), "0".into()]);
-                    for c in bound.into_iter().rev() {
-                        q.cmds.push_front(c);
-                    }
-                    q.cmds.push_front(vec![KEY_GROUP.clone(), "1".into()]);
+                // (each binding in its KEY_GROUP marks)
+                for c in bound.into_iter().rev() {
+                    q.cmds.push_front(c);
                 }
                 continue;
+            }
+            // cmdq_fire_command: the items of a client that has gone (CLIENT_DEAD) fail
+            if q.ctx.reply.is_some_and(|r| !self.clients.contains_key(&r)) {
+                continue;
+            }
+            // a key group's client that has gone or detached: its commands find their
+            // client from the queue's (cmd_find_client), as with no key
+            if q.ctx.key_depth > 0 && q.ctx.client.is_some_and(|c| !self.clients.get(&c).is_some_and(|c| c.attached)) {
+                q.ctx.client = q.ctx.log_client;
             }
             let delay_cmd = (cmds::canonical(&name) == Some("run-shell")).then(|| cmd.clone());
             // the command's arguments for its hooks: an alias's command under its own name
@@ -4041,10 +4152,12 @@ impl Server {
                     self.control_item_done(&mut q, Some(if quiet { "" } else { e }));
                 } else if quiet {
                 } else if cli {
-                    self.log_error(q.ctx.client.or(q.ctx.reply), e);
+                    self.log_error(q.ctx.reply, e);
                     q.ctx.soft_err.push_str(e);
                     q.ctx.soft_err.push('\n');
-                } else if hook_failed.is_none() {
+                } else if !self.report_error_now(&mut q.ctx, e) && hook_failed.is_none() {
+                    // (an attached client's queue: its status line at once, which a later
+                    // message replaces)
                     hook_failed = Some(e.clone());
                 }
                 self.command_hook("command-error", &argv, &q.ctx);
@@ -4089,7 +4202,7 @@ impl Server {
                 self.ev.in_hook = saved_hook;
                 if q.ctx.control_seq.is_some() {
                     self.control_item_done(&mut q, Some(e));
-                } else if hook_failed.is_none() {
+                } else if !self.report_error_now(&mut q.ctx, e) && hook_failed.is_none() {
                     hook_failed = Some(e.clone());
                 }
                 Self::skip_hook_list(&mut q, &mut hook_saved);
@@ -4154,20 +4267,26 @@ impl Server {
                 }
                 Err(e) if soft && !e.starts_with('\0') => {
                     log(&format!("{e}"));
-                    if q.ctx.client.or(q.ctx.reply).is_some() {
-                        self.log_error(q.ctx.client.or(q.ctx.reply), &e);
-                    } else {
-                        self.no_client_error(&q.ctx, &e);
-                    }
                     // cmdq_remove_group: the rest of the failed command's line is dropped
                     Self::skip_group(&mut q);
                     let cli = q.ctx.control_seq.is_none() && q.ctx.reply.and_then(|r| self.clients.get(&r)).is_some_and(|c| !c.attached);
-                    if cli {
-                        q.ctx.soft_err.push_str(&e);
-                        q.ctx.soft_err.push('\n');
+                    let owner = self.queue_client(&q.ctx).filter(|_| q.ctx.control_seq.is_none() && !q.ctx.cfg);
+                    if !cli && owner.is_some_and(|c| self.clients.get(&c).is_some_and(|c| c.attached && c.session.is_some() && c.control == 0)) {
+                        // cmdq_error for an attached client: its status line
+                        self.set_error(owner.unwrap(), &e);
                     } else {
-                        q.ctx.out.push_str(&e);
-                        q.ctx.out.push('\n');
+                        if q.ctx.client.or(q.ctx.reply).is_some() {
+                            self.log_error(q.ctx.log_client.or(q.ctx.reply).or(q.ctx.client), &e);
+                        } else {
+                            self.no_client_error(&q.ctx, &e);
+                        }
+                        if cli {
+                            q.ctx.soft_err.push_str(&e);
+                            q.ctx.soft_err.push('\n');
+                        } else {
+                            q.ctx.out.push_str(&e);
+                            q.ctx.out.push('\n');
+                        }
                     }
                     self.control_item_done(&mut q, None);
                 }
@@ -4284,6 +4403,7 @@ impl Server {
                             let ms: u64 = get(2).parse().unwrap_or(0);
                             if let Some(c) = delay_cmd.as_ref().map(|c| strip_delay(c)) {
                                 q.cmds.push_front(c);
+                                q.ctx.resumed = true;
                             }
                             self.delayed.push((Instant::now() + Duration::from_millis(ms), q));
                             return;

@@ -3497,6 +3497,23 @@ fn startup_config_causes_go_to_the_first_attach() {
     let _ = std::fs::remove_file(&conf);
 }
 
+#[test]
+fn run_shell_c_parse_error_in_the_config_is_a_cause_and_the_file_goes_on() {
+    // cmd_run_shell_timer: a parse error of -C's commands is cmdq_error'ed (a config cause,
+    // with the file and line both in the parse error and in the cause) and does not
+    // fail run-shell, so the next line of the file still runs
+    let ctx = Ctx::new("cfgrunc");
+    let conf = std::env::temp_dir().join(format!("{}.conf", ctx.socket));
+    std::fs::write(&conf, "run-shell -C 'set -g @a {'\nset -g @b 1\n").unwrap();
+    let conf_s = conf.to_string_lossy().into_owned();
+    ctx.ok(&["-f", &conf_s, "new-session", "-d", "-s", "s"]);
+    assert_eq!(ctx.ok(&["show", "-gv", "@b"]).trim_end(), "1");
+    let f = conf_s.as_str();
+    let causes = control_attach_causes(&ctx, "s");
+    assert_eq!(causes.get(1).map(String::as_str), Some(format!("%config-error {f}:1: {f}:1: syntax error").as_str()), "{causes:?}");
+    let _ = std::fs::remove_file(&conf);
+}
+
 /// A control client attaching to `target`: its %session-changed and %config-error lines.
 fn control_attach_causes(ctx: &Ctx, target: &str) -> Vec<String> {
     control_causes(ctx, &["-C", "attach", "-t", target])
