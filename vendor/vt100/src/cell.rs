@@ -1,7 +1,8 @@
 use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
-// chosen to make the size of the cell struct 32 bytes
-const CONTENT_BYTES: usize = 22;
+// chosen to fill the cell struct to 38 bytes (the attributes hold tmux's underline
+// colour and styles, overline, blink, hidden, strikethrough and the DEC charset)
+const CONTENT_BYTES: usize = 23;
 
 const IS_WIDE: u8 = 0b1000_0000;
 const IS_WIDE_CONTINUATION: u8 = 0b0100_0000;
@@ -14,7 +15,7 @@ pub struct Cell {
     len: u8,
     attrs: crate::attrs::Attrs,
 }
-const _: () = assert!(core::mem::size_of::<Cell>() == 32);
+const _: () = assert!(core::mem::size_of::<Cell>() == 38);
 
 // Immutable, default-style ASCII cells can be shared by all history rows.
 // Index zero denotes an empty cell, distinct from a cell containing a space.
@@ -219,5 +220,47 @@ impl Cell {
     #[must_use]
     pub fn inverse(&self) -> bool {
         self.attrs.inverse()
+    }
+
+    /// The underline style: 0 none, 1 single, 2 double, 3 curly, 4 dotted, 5 dashed.
+    #[must_use]
+    pub fn underline_style(&self) -> u8 {
+        self.attrs.underline_style()
+    }
+
+    /// The underline colour (SGR 58).
+    #[must_use]
+    pub fn underline_color(&self) -> crate::Color {
+        self.attrs.ulcolor
+    }
+
+    /// Returns whether the cell blinks (SGR 5).
+    #[must_use]
+    pub fn blink(&self) -> bool {
+        self.attrs.blink()
+    }
+
+    /// Returns whether the cell is hidden (SGR 8).
+    #[must_use]
+    pub fn hidden(&self) -> bool {
+        self.attrs.hidden()
+    }
+
+    /// Returns whether the cell is struck through (SGR 9).
+    #[must_use]
+    pub fn strikethrough(&self) -> bool {
+        self.attrs.strikethrough()
+    }
+
+    /// Returns whether the cell has an overline (SGR 53).
+    #[must_use]
+    pub fn overline(&self) -> bool {
+        self.attrs.overline()
+    }
+
+    /// Whether the cell is drawn from the DEC special graphics set (GRID_ATTR_CHARSET).
+    #[must_use]
+    pub fn charset(&self) -> bool {
+        self.attrs.charset()
     }
 }

@@ -11,6 +11,9 @@ const MODE_BRACKETED_PASTE: u8 = 0b0001_0000;
 // Modes kept only so they can be reported (tmux's pane_private_modes and the
 // *_flag format variables); the parser does not change behaviour for them.
 const XMODE_INSERT: u16 = 1 << 0;
+const CHARSET_G0: u8 = 1;
+const CHARSET_G1: u8 = 2;
+const CHARSET_SHIFT: u8 = 4;
 const XMODE_WRAP: u16 = 1 << 1;
 const XMODE_CURSOR_BLINKING: u16 = 1 << 2;
 const XMODE_CURSOR_BLINKING_SET: u16 = 1 << 3;
@@ -98,6 +101,10 @@ pub struct Screen {
 
     attrs: crate::attrs::Attrs,
     saved_attrs: crate::attrs::Attrs,
+    /// Character sets (tmux cell.g0set, g1set and set): CHARSET_G0 and CHARSET_G1 when
+    /// that set is DEC special graphics (ESC ( 0, ESC ) 0), CHARSET_SHIFT after SO.
+    charset: u8,
+    saved_charset: u8,
 
     modes: u8,
     xmodes: u16,
@@ -151,6 +158,8 @@ impl Screen {
 
             attrs: crate::attrs::Attrs::default(),
             saved_attrs: crate::attrs::Attrs::default(),
+            charset: 0,
+            saved_charset: 0,
 
             modes: 0,
             xmodes: XMODE_WRAP,
@@ -1103,12 +1112,31 @@ impl Screen {
     fn save_cursor(&mut self) {
         self.grid_mut().save_cursor();
         self.saved_attrs = self.attrs;
+        self.saved_charset = self.charset;
         self.saved_hyperlink = self.hyperlink.clone();
+    }
+
+    /// SCS (ESC ( and ESC )): G0 or G1 is DEC special graphics ('0') or ASCII ('B').
+    pub fn designate_charset(&mut self, g1: bool, graphics: bool) {
+        let bit = if g1 { CHARSET_G1 } else { CHARSET_G0 };
+        if graphics { self.charset |= bit } else { self.charset &= !bit }
+    }
+
+    /// SO (true) and SI (false): G1 or G0 is the set in use.
+    pub fn shift_charset(&mut self, g1: bool) {
+        if g1 { self.charset |= CHARSET_SHIFT } else { self.charset &= !CHARSET_SHIFT }
+    }
+
+    /// input_print: a 7-bit character is drawn from the set in use.
+    fn graphics_charset(&self) -> bool {
+        let bit = if self.charset & CHARSET_SHIFT != 0 { CHARSET_G1 } else { CHARSET_G0 };
+        self.charset & bit != 0
     }
 
     fn restore_cursor(&mut self) {
         self.grid_mut().restore_cursor();
         self.attrs = self.saved_attrs;
+        self.charset = self.saved_charset;
         // input_restore_state: the saved cell has its link
         self.hyperlink = self.saved_hyperlink.clone();
     }
@@ -1432,7 +1460,8 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
     pub fn text(&mut self, c: char) {
         let screen = &mut self.screen;
         let pos = screen.grid().pos();
-        let attrs = screen.attrs;
+        let mut attrs = screen.attrs;
+        attrs.set_charset(c.is_ascii() && screen.graphics_charset());
 
         let Some(width) = screen.calculate_width(c) else {
             return;
@@ -1987,116 +2016,98 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
             return;
         }
 
-        let mut iter = params.iter();
-
-        macro_rules! next_param {
-            () => {
-                match iter.next() {
-                    Some(n) => n,
-                    _ => return,
-                }
-            };
-        }
-
-        macro_rules! to_u8 {
-            ($n:expr) => {
-                if let Some(n) = u16_to_u8($n) {
-                    n
-                } else {
-                    return;
-                }
-            };
-        }
-
-        macro_rules! next_param_u8 {
-            () => {
-                if let &[n] = next_param!() {
-                    to_u8!(n)
-                } else {
-                    return;
-                }
-            };
-        }
-
-        loop {
-            let screen = &mut self.screen;
-            match next_param!() {
-                [0] => screen.attrs = crate::attrs::Attrs::default(),
-                [1] => screen.attrs.set_bold(),
-                [2] => screen.attrs.set_dim(),
-                [3] => screen.attrs.set_italic(true),
-                [4] => screen.attrs.set_underline(true),
-                [7] => screen.attrs.set_inverse(true),
-                [22] => screen.attrs.set_normal_intensity(),
-                [23] => screen.attrs.set_italic(false),
-                [24] => screen.attrs.set_underline(false),
-                [27] => screen.attrs.set_inverse(false),
-                [n] if (30..=37).contains(n) => {
-                    screen.attrs.fgcolor = crate::Color::Idx(to_u8!(*n) - 30);
-                }
-                [38, 2, r, g, b] => {
-                    screen.attrs.fgcolor =
-                        crate::Color::Rgb(to_u8!(*r), to_u8!(*g), to_u8!(*b));
-                }
-                [38, 5, i] => {
-                    screen.attrs.fgcolor = crate::Color::palette(to_u8!(*i));
-                }
-                [38] => match next_param!() {
-                    [2] => {
-                        let r = next_param_u8!();
-                        let g = next_param_u8!();
-                        let b = next_param_u8!();
-                        screen.attrs.fgcolor = crate::Color::Rgb(r, g, b);
+        // input_csi_dispatch_sgr: each parameter in turn; 38, 48 and 58 take a colour
+        // from the ones after them, a parameter with colons (input_csi_dispatch_sgr_colon)
+        // is one colour or underline style, and anything unknown is skipped
+        let _ = &mut unhandled;
+        let list: alloc::vec::Vec<&[u16]> = params.iter().collect();
+        let get = |i: usize| -> Option<u16> { list.get(i).and_then(|p| p.first().copied()) };
+        let attrs = &mut self.screen.attrs;
+        let set = |attrs: &mut crate::attrs::Attrs, which: u16, c: crate::Color| match which {
+            38 => attrs.fgcolor = c,
+            48 => attrs.bgcolor = c,
+            _ => attrs.ulcolor = c,
+        };
+        let mut i = 0;
+        while i < list.len() {
+            let p = list[i];
+            if p.len() > 1 {
+                // a colon list: up to seven parts
+                if p.len() < 8 {
+                    let n = p.len();
+                    match (p[0], p[1]) {
+                        (4, style) if n == 2 && style <= 5 => attrs.set_underline_style(style as u8),
+                        (38 | 48 | 58, 2) if n >= 3 => {
+                            let at = if n == 5 { 2 } else { 3 };
+                            if n >= at + 3 && p[at..at + 3].iter().all(|v| *v <= 255) {
+                                set(attrs, p[0], crate::Color::Rgb(p[at] as u8, p[at + 1] as u8, p[at + 2] as u8));
+                            }
+                        }
+                        (38 | 48 | 58, 5) if n >= 3 => match p[2] {
+                            c @ 0..=255 => set(attrs, p[0], crate::Color::palette(c as u8)),
+                            _ if p[0] != 58 => set(attrs, p[0], crate::Color::Default),
+                            _ => {}
+                        },
+                        _ => {}
                     }
-                    [5] => {
-                        screen.attrs.fgcolor =
-                            crate::Color::palette(next_param_u8!());
-                    }
-                    _ => {
-                        unhandled(self);
-                        return;
-                    }
-                },
-                [39] => {
-                    screen.attrs.fgcolor = crate::Color::Default;
                 }
-                [n] if (40..=47).contains(n) => {
-                    screen.attrs.bgcolor = crate::Color::Idx(to_u8!(*n) - 40);
-                }
-                [48, 2, r, g, b] => {
-                    screen.attrs.bgcolor =
-                        crate::Color::Rgb(to_u8!(*r), to_u8!(*g), to_u8!(*b));
-                }
-                [48, 5, i] => {
-                    screen.attrs.bgcolor = crate::Color::palette(to_u8!(*i));
-                }
-                [48] => match next_param!() {
-                    [2] => {
-                        let r = next_param_u8!();
-                        let g = next_param_u8!();
-                        let b = next_param_u8!();
-                        screen.attrs.bgcolor = crate::Color::Rgb(r, g, b);
-                    }
-                    [5] => {
-                        screen.attrs.bgcolor =
-                            crate::Color::palette(next_param_u8!());
-                    }
-                    _ => {
-                        unhandled(self);
-                        return;
-                    }
-                },
-                [49] => {
-                    screen.attrs.bgcolor = crate::Color::Default;
-                }
-                [n] if (90..=97).contains(n) => {
-                    screen.attrs.fgcolor = crate::Color::Idx(to_u8!(*n) - 82);
-                }
-                [n] if (100..=107).contains(n) => {
-                    screen.attrs.bgcolor = crate::Color::Idx(to_u8!(*n) - 92);
-                }
-                _ => unhandled(self),
+                i += 1;
+                continue;
             }
+            let n = p[0];
+            if matches!(n, 38 | 48 | 58) {
+                i += 1;
+                match get(i) {
+                    Some(2) => {
+                        let rgb = (get(i + 1), get(i + 2), get(i + 3));
+                        if let (Some(r @ 0..=255), Some(g @ 0..=255), Some(b @ 0..=255)) = rgb {
+                            set(attrs, n, crate::Color::Rgb(r as u8, g as u8, b as u8));
+                            i += 3;
+                        }
+                    }
+                    Some(5) => {
+                        match get(i + 1) {
+                            Some(c @ 0..=255) => set(attrs, n, crate::Color::palette(c as u8)),
+                            _ if n != 58 => set(attrs, n, crate::Color::Default),
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    _ => {}
+                }
+                i += 1;
+                continue;
+            }
+            match n {
+                0 => *attrs = crate::attrs::Attrs::default(),
+                1 => attrs.set_bold(),
+                2 => attrs.set_dim(),
+                3 => attrs.set_italic(true),
+                4 => attrs.set_underline_style(1),
+                5 | 6 => attrs.set_blink(true),
+                7 => attrs.set_inverse(true),
+                8 => attrs.set_hidden(true),
+                9 => attrs.set_strikethrough(true),
+                21 => attrs.set_underline_style(2),
+                22 => attrs.set_normal_intensity(),
+                23 => attrs.set_italic(false),
+                24 => attrs.set_underline_style(0),
+                25 => attrs.set_blink(false),
+                27 => attrs.set_inverse(false),
+                28 => attrs.set_hidden(false),
+                29 => attrs.set_strikethrough(false),
+                30..=37 => attrs.fgcolor = crate::Color::Idx((n - 30) as u8),
+                39 => attrs.fgcolor = crate::Color::Default,
+                40..=47 => attrs.bgcolor = crate::Color::Idx((n - 40) as u8),
+                49 => attrs.bgcolor = crate::Color::Default,
+                53 => attrs.set_overline(true),
+                55 => attrs.set_overline(false),
+                59 => attrs.ulcolor = crate::Color::Default,
+                90..=97 => attrs.fgcolor = crate::Color::Idx((n - 82) as u8),
+                100..=107 => attrs.bgcolor = crate::Color::Idx((n - 92) as u8),
+                _ => {}
+            }
+            i += 1;
         }
     }
 
@@ -2105,15 +2116,6 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
         self.screen
             .grid_mut()
             .set_scroll_region(top - 1, bottom - 1);
-    }
-}
-
-fn u16_to_u8(i: u16) -> Option<u8> {
-    if i > u16::from(u8::MAX) {
-        None
-    } else {
-        // safe because we just ensured that the value fits in a u8
-        Some(i.try_into().unwrap())
     }
 }
 

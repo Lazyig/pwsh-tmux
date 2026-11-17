@@ -3349,7 +3349,7 @@ impl Server {
                     // -H: the links of each line not listed on an earlier one, at most one
                     // per column in all (cmd_capture_pane_hyperlinks)
                     let mut links = std::collections::HashSet::new();
-                    let mut last_link = None;
+                    let mut last_link = render::EscState::default();
                     for i in a..=b {
                         // plain text does not need the cells
                         let cells = o.has('e') || o.has('N') || o.has('C') || o.has('a') || o.has('H') || mode_lines.is_some();
@@ -5902,7 +5902,7 @@ fn row_line(row: &vt100::capture::RowContents, cols: u16) -> crate::cells::Line 
 
 /// One captured line: -e adds attribute sequences, `keep` (-N) keeps trailing spaces (up to
 /// the last styled cell with -T), -C escapes backslashes and writes ESC as \033.
-fn capture_line(line: &crate::cells::Line, escapes: bool, keep: bool, trim_unused: bool, escape: bool, last_link: &mut Option<u64>, allocated: bool) -> String {
+fn capture_line(line: &crate::cells::Line, escapes: bool, keep: bool, trim_unused: bool, escape: bool, last_link: &mut render::EscState, allocated: bool) -> String {
     let mut line = line.clone();
     if escape {
         for c in &mut line.cells {
@@ -5923,7 +5923,7 @@ fn capture_line(line: &crate::cells::Line, escapes: bool, keep: bool, trim_unuse
     } else {
         (0..line.cells.len()).map(|x| line.cell_text(x)).collect()
     };
-    let text = if escape { text.replace("\x1b\\", "\\033\\\\").replace('\x1b', "\\033") } else { text };
+    let text = if escape { text.replace("\x1b\\", "\\033\\\\").replace('\x1b', "\\033").replace('\x0e', "\\016").replace('\x0f', "\\017") } else { text };
     if keep || escapes { text } else { text.trim_end_matches(' ').to_string() }
 }
 

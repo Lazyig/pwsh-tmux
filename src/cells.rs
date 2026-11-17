@@ -6,16 +6,41 @@ pub use vt100::Color;
 pub struct Style {
     pub fg: Color,
     pub bg: Color,
-    pub attrs: u8,
+    /// The underline colour (tmux `us`).
+    pub us: Color,
+    pub attrs: u16,
 }
 
-pub const BOLD: u8 = 1;
-pub const DIM: u8 = 2;
-pub const ITALIC: u8 = 4;
-pub const UNDERLINE: u8 = 8;
-pub const INVERSE: u8 = 16;
-pub const BLINK: u8 = 32;
-pub const STRIKE: u8 = 64;
+pub const BOLD: u16 = 1;
+pub const DIM: u16 = 2;
+pub const ITALIC: u16 = 4;
+pub const UNDERLINE: u16 = 8;
+pub const INVERSE: u16 = 16;
+pub const BLINK: u16 = 32;
+pub const STRIKE: u16 = 64;
+pub const HIDDEN: u16 = 128;
+pub const OVERLINE: u16 = 256;
+/// GRID_ATTR_CHARSET: the text is DEC special graphics (line drawing) characters.
+pub const ACS: u16 = 512;
+/// GRID_ATTR_UNDERSCORE_2 to _5.
+pub const DOUBLE_UNDERLINE: u16 = 1024;
+pub const CURLY_UNDERLINE: u16 = 2048;
+pub const DOTTED_UNDERLINE: u16 = 4096;
+pub const DASHED_UNDERLINE: u16 = 8192;
+/// Any underline.
+pub const ALL_UNDERLINE: u16 = UNDERLINE | DOUBLE_UNDERLINE | CURLY_UNDERLINE | DOTTED_UNDERLINE | DASHED_UNDERLINE;
+
+/// tty_acs_table: the Unicode character for a DEC special graphics character.
+pub fn acs_char(c: char) -> Option<&'static str> {
+    Some(match c {
+        '+' => "→", ',' => "←", '-' => "↑", '.' => "↓", '0' => "▮", '`' => "◆", 'a' => "▒", 'b' => "␉",
+        'c' => "␌", 'd' => "␍", 'e' => "␊", 'f' => "°", 'g' => "±", 'h' => "␤", 'i' => "␋", 'j' => "┘",
+        'k' => "┐", 'l' => "┌", 'm' => "└", 'n' => "┼", 'o' => "⎺", 'p' => "⎻", 'q' => "─", 'r' => "⎼",
+        's' => "⎽", 't' => "├", 'u' => "┤", 'v' => "┴", 'w' => "┬", 'x' => "│", 'y' => "≤", 'z' => "≥",
+        '{' => "π", '|' => "≠", '}' => "£", '~' => "·",
+        _ => return None,
+    })
+}
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Cell {
@@ -97,11 +122,22 @@ impl Line {
 
 pub fn cell_from_vt(c: &vt100::Cell) -> Cell {
     let mut attrs = 0;
-    for (on, bit) in [(c.bold(), BOLD), (c.dim(), DIM), (c.italic(), ITALIC), (c.underline(), UNDERLINE), (c.inverse(), INVERSE)] {
+    for (on, bit) in [
+        (c.bold(), BOLD), (c.dim(), DIM), (c.italic(), ITALIC), (c.inverse(), INVERSE), (c.blink(), BLINK), (c.hidden(), HIDDEN),
+        (c.strikethrough(), STRIKE), (c.overline(), OVERLINE), (c.charset(), ACS),
+    ] {
         if on {
             attrs |= bit;
         }
     }
+    attrs |= match c.underline_style() {
+        0 => 0,
+        1 => UNDERLINE,
+        2 => DOUBLE_UNDERLINE,
+        3 => CURLY_UNDERLINE,
+        4 => DOTTED_UNDERLINE,
+        _ => DASHED_UNDERLINE,
+    };
     let text = if c.is_wide_continuation() {
         String::new()
     } else if c.has_contents() {
@@ -109,7 +145,7 @@ pub fn cell_from_vt(c: &vt100::Cell) -> Cell {
     } else {
         " ".into()
     };
-    Cell { text, style: Style { fg: c.fgcolor(), bg: c.bgcolor(), attrs } }
+    Cell { text, style: Style { fg: c.fgcolor(), bg: c.bgcolor(), us: c.underline_color(), attrs } }
 }
 
 /// Every row of a screen including its scrollback, oldest first.

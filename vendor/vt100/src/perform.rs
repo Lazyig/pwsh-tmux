@@ -19,9 +19,9 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
             11 => self.vt(),
             12 => self.ff(),
             13 => self.cr(),
-            // we don't implement shift in/out alternate character sets, but
-            // it shouldn't count as an "error"
-            14 | 15 => {}
+            // SO and SI: G1 or G0 in use
+            14 => self.screen.shift_charset(true),
+            15 => self.screen.shift_charset(false),
             // vte passes a lone byte from 0x80 to 0x9f here; tmux has no C1 controls and
             // shows it as an invalid UTF-8 byte
             0x80..=0x9f => self.text('\u{fffd}'),
@@ -32,6 +32,9 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, b: u8) {
         if intermediates == b"#" && b == b'8' {
             self.decaln();
+        } else if matches!(intermediates, b"(" | b")") && matches!(b, b'0' | b'B') {
+            // INPUT_ESC_SCSG0_ON/OFF and SCSG1_ON/OFF
+            self.screen.designate_charset(intermediates == b")", b == b'0');
         } else if let Some(i) = intermediates.first() {
             self.callbacks.unhandled_escape(
                 &mut self.screen,

@@ -1841,23 +1841,22 @@ pub fn colour_byname(s: &str) -> Option<Color> {
     X11_COLOURS.iter().find(|(name, _)| name.eq_ignore_ascii_case(s)).map(|(_, c)| Color::Rgb((c >> 16) as u8, (c >> 8) as u8, *c as u8))
 }
 
-const ATTRS: [(&str, u8); 15] = [
+const ATTRS: [(&str, u16); 15] = [
     ("bright", cells::BOLD),
     ("bold", cells::BOLD),
     ("dim", cells::DIM),
     ("underscore", cells::UNDERLINE),
-    ("double-underscore", cells::UNDERLINE),
-    ("curly-underscore", cells::UNDERLINE),
-    ("dotted-underscore", cells::UNDERLINE),
-    ("dashed-underscore", cells::UNDERLINE),
+    ("double-underscore", cells::DOUBLE_UNDERLINE),
+    ("curly-underscore", cells::CURLY_UNDERLINE),
+    ("dotted-underscore", cells::DOTTED_UNDERLINE),
+    ("dashed-underscore", cells::DASHED_UNDERLINE),
     ("blink", cells::BLINK),
     ("reverse", cells::INVERSE),
     ("italics", cells::ITALIC),
     ("strikethrough", cells::STRIKE),
-    // Accepted but not representable in Style.
-    ("hidden", 0),
-    ("overline", 0),
-    ("acs", 0),
+    ("hidden", cells::HIDDEN),
+    ("overline", cells::OVERLINE),
+    ("acs", cells::ACS),
 ];
 
 /// Apply one style word. Returns Err for unknown words or bad values. Theme colours are
@@ -1873,7 +1872,9 @@ fn apply_word(word: &str, st: &mut Style, align: &mut Align, base: Style, vars: 
             // fg=default and bg=default are the base colours.
             "fg" => st.fg = if val == "default" { base.fg } else { color()? },
             "bg" => st.bg = if val == "default" { base.bg } else { color()? },
-            "us" | "fill" => {
+            "us" => st.us = if val == "default" { base.us } else { color()? },
+            // kept by spans and parse_style_with (format_draw fills with it)
+            "fill" => {
                 color()?;
             }
             "align" => {
@@ -3306,7 +3307,7 @@ mod tests {
 
     // ----- spans -----
 
-    fn st(fg: Color, attrs: u8) -> Style {
+    fn st(fg: Color, attrs: u16) -> Style {
         Style { fg, bg: Color::Default, attrs }
     }
 

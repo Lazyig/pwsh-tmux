@@ -304,6 +304,19 @@ fn fit_style(mut st: Style, f: &super::features::Features) -> Style {
     if !f.has("strikethrough") {
         st.attrs &= !STRIKE;
     }
+    // tty_attributes: underline styles and colour need Smulx and Setulc (usstyle), else a
+    // plain underline; overline needs Smol
+    if !f.has("usstyle") {
+        if st.attrs & crate::cells::ALL_UNDERLINE != 0 {
+            st.attrs = (st.attrs & !crate::cells::ALL_UNDERLINE) | UNDERLINE;
+        }
+        st.us = Color::Default;
+    } else if st.us != Color::Default {
+        st.us = super::features::fit_color(st.us, f);
+    }
+    if !f.has("overline") {
+        st.attrs &= !crate::cells::OVERLINE;
+    }
     st
 }
 
@@ -320,46 +333,122 @@ fn dim_default(colour: Color, foreground: bool, terminal: &super::theme::Termina
 }
 
 pub fn push_sgr(out: &mut String, st: &Style) {
+    use crate::cells::{CURLY_UNDERLINE, DASHED_UNDERLINE, DOTTED_UNDERLINE, DOUBLE_UNDERLINE, HIDDEN, OVERLINE};
     out.push_str("\x1b[0");
-    for (bit, code) in [(BOLD, ";1"), (DIM, ";2"), (ITALIC, ";3"), (UNDERLINE, ";4"), (BLINK, ";5"), (INVERSE, ";7"), (STRIKE, ";9")] {
+    for (bit, code) in [(BOLD, ";1"), (DIM, ";2"), (ITALIC, ";3"), (BLINK, ";5"), (INVERSE, ";7"), (HIDDEN, ";8"), (STRIKE, ";9"), (OVERLINE, ";53")] {
         if st.attrs & bit != 0 {
             out.push_str(code);
         }
     }
+    // one underline: Smulx with its style (the styles fit_style keeps), else smul
+    let underline = [(DOUBLE_UNDERLINE, ";4:2"), (CURLY_UNDERLINE, ";4:3"), (DOTTED_UNDERLINE, ";4:4"), (DASHED_UNDERLINE, ";4:5"), (UNDERLINE, ";4")];
+    if let Some((_, code)) = underline.iter().find(|(bit, _)| st.attrs & bit != 0) {
+        out.push_str(code);
+    }
     push_color(out, st.fg, 30);
     push_color(out, st.bg, 40);
     out.push('m');
+    // Setulc and Setulc1 (the usstyle feature)
+    match st.us {
+        Color::Default => {}
+        Color::Rgb(r, g, b) => {
+            let _ = write!(out, "\x1b[58::2::{r}::{g}::{b}m");
+        }
+        Color::Idx(i) | Color::Palette(i) => {
+            let _ = write!(out, "\x1b[58::5::{i}m");
+        }
+    }
 }
 
 /// capture-pane -e: text with SGR escapes.
 pub fn line_with_escapes(line: &Line) -> String {
-    line_with_escapes_from(line, &mut None, false)
+    line_with_escapes_from(line, &mut EscState::default(), false)
 }
 
-/// [`line_with_escapes`] after lines that ended in link `last` (grid_string_cells keeps
-/// lastgc from line to line: a line that goes on with the link the line before ended in
-/// does not open it again, though each line closes what it opened); `last` becomes the
-/// link of the last cell read: the last used one, or with `allocated`
-/// (GRID_STRING_EMPTY_CELLS) the last the line has room for, which grid_expand_line
-/// grows to a quarter, half or all of the width (more than the text written at once).
-pub fn line_with_escapes_from(line: &Line, last: &mut Option<u64>, allocated: bool) -> String {
+/// What grid_string_cells carries from one line to the next: the last cell read (its
+/// attributes and colours, lastgc) and its link.
+#[derive(Default)]
+pub struct EscState {
+    pub style: Style,
+    pub link: Option<u64>,
+}
+
+/// grid_string_cells_fg/bg/us: the SGR parameters of a colour.
+fn sgr_colour(c: Color, which: u8) -> Vec<u16> {
+    let (base, default) = match which {
+        b'f' => (30, Some(39)),
+        b'b' => (40, Some(49)),
+        _ => (58, None),
+    };
+    match c {
+        Color::Default => default.into_iter().collect(),
+        Color::Idx(i) if i < 8 && which != b'u' => vec![base + u16::from(i)],
+        Color::Idx(i) if i < 16 && which != b'u' => vec![base + 60 + u16::from(i) - 8],
+        Color::Idx(i) | Color::Palette(i) => vec![if which == b'u' { 58 } else { base + 8 }, 5, u16::from(i)],
+        Color::Rgb(r, g, b) => vec![if which == b'u' { 58 } else { base + 8 }, 2, u16::from(r), u16::from(g), u16::from(b)],
+    }
+}
+
+/// grid_string_cells_code: the sequences that change `last` into `cur`. A removed
+/// attribute (or underline colour) starts with 0; each newly set attribute follows (a
+/// code over 9 is written with a colon, so overline is 5:3 as in tmux); then the
+/// colours that changed (one that is default after a reset is left out) and SO or SI.
+pub fn sgr_diff(last: &Style, cur: &Style) -> String {
+    use crate::cells::{ACS, CURLY_UNDERLINE, DASHED_UNDERLINE, DOTTED_UNDERLINE, DOUBLE_UNDERLINE, HIDDEN, OVERLINE};
+    const CODES: [(u16, u16); 13] = [
+        (BOLD, 1), (DIM, 2), (ITALIC, 3), (UNDERLINE, 4), (BLINK, 5), (INVERSE, 7), (HIDDEN, 8), (STRIKE, 9),
+        (DOUBLE_UNDERLINE, 42), (CURLY_UNDERLINE, 43), (DOTTED_UNDERLINE, 44), (DASHED_UNDERLINE, 45), (OVERLINE, 53),
+    ];
+    let (attr, mut lastattr) = (cur.attrs, last.attrs);
+    let mut s: Vec<u16> = Vec::new();
+    if CODES.iter().any(|(m, _)| attr & m == 0 && lastattr & m != 0) || (last.us != Color::Default && cur.us == Color::Default) {
+        s.push(0);
+        lastattr &= ACS;
+    }
+    s.extend(CODES.iter().filter(|(m, _)| attr & m != 0 && lastattr & m == 0).map(|(_, c)| *c));
     let mut out = String::new();
-    let mut cur = Style::default();
-    let mut link = *last;
+    if !s.is_empty() {
+        let codes: Vec<String> = s.iter().map(|c| if *c < 10 { c.to_string() } else { format!("{}:{}", c / 10, c % 10) }).collect();
+        let _ = write!(out, "\x1b[{}m", codes.join(";"));
+    }
+    let reset = s.first() == Some(&0);
+    for (n, o) in [(cur.fg, last.fg), (cur.bg, last.bg), (cur.us, last.us)].into_iter().zip([b'f', b'b', b'u']).map(|((n, o), w)| (sgr_colour(n, w), sgr_colour(o, w))) {
+        if n.is_empty() || (!reset && n == o) || (reset && matches!(n[0], 39 | 49)) {
+            continue;
+        }
+        let v: Vec<String> = n.iter().map(u16::to_string).collect();
+        let _ = write!(out, "\x1b[{}m", v.join(";"));
+    }
+    if attr & ACS != 0 && lastattr & ACS == 0 {
+        out.push('\x0e');
+    }
+    if attr & ACS == 0 && lastattr & ACS != 0 {
+        out.push('\x0f');
+    }
+    out
+}
+
+/// [`line_with_escapes`] after the lines before it (grid_string_cells keeps lastgc from
+/// line to line: a line goes on with the attributes and link the line before ended in,
+/// though each line closes the link it opened). With `allocated`
+/// (GRID_STRING_EMPTY_CELLS) the cells read go on to what the line has room for, which
+/// grid_expand_line grows to a quarter, half or all of the width; otherwise they end
+/// with the last used one.
+pub fn line_with_escapes_from(line: &Line, st: &mut EscState, allocated: bool) -> String {
+    let mut out = String::new();
     let mut open = false;
     let used = (0..line.cells.len()).rposition(|x| line.cells[x].text != " " || line.cells[x].style != Style::default() || line.metadata.contains_key(&(x as u16))).map_or(0, |x| x + 1);
-    for (x, c) in line.cells.iter().enumerate() {
+    let end = if allocated { super::vars::line_cellsize(line.cells.len(), used) } else { used };
+    for (x, c) in line.cells.iter().enumerate().take(end) {
         if line.is_padding(x) {
             continue;
         }
-        if c.style != cur {
-            push_sgr(&mut out, &c.style);
-            cur = c.style;
-        }
+        out.push_str(&sgr_diff(&st.style, &c.style));
+        st.style = c.style;
         // grid_string_cells_code: an OSC 8 link (with its own id) follows the attributes;
         // a cell without one closes the link only if this line opened it
         let next = line.metadata.get(&(x as u16)).and_then(|m| m.hyperlink.as_ref());
-        if next.map(|l| l.inner) != link {
+        if next.map(|l| l.inner) != st.link {
             if let Some(l) = next {
                 let _ = write!(out, "\x1b]8;{}{};{}\x1b\\", if l.id.is_empty() { "" } else { "id=" }, l.id, l.uri);
                 open = true;
@@ -367,22 +456,14 @@ pub fn line_with_escapes_from(line: &Line, last: &mut Option<u64>, allocated: bo
                 out.push_str("\x1b]8;;\x1b\\");
                 open = false;
             }
-            link = next.map(|l| l.inner);
-        }
-        if x < used {
-            *last = link;
+            st.link = next.map(|l| l.inner);
         }
         out.push_str(line.cell_text(x));
-    }
-    let w = line.cells.len();
-    if allocated && used > 0 && used < [w / 4, w / 2, w].into_iter().find(|&n| used < n).unwrap_or(w) {
-        *last = None;
     }
     if open {
         out.push_str("\x1b]8;;\x1b\\");
     }
-    let trimmed = out.trim_end_matches(' ').to_string();
-    if cur != Style::default() { trimmed + "\x1b[0m" } else { trimmed }
+    out.trim_end_matches(' ').to_string()
 }
 
 fn overlay_style(cell: &mut Style, over: Style) {
@@ -1146,6 +1227,7 @@ impl Server {
             let over = |s: Style| Style {
                 fg: if s.fg == Color::Default { inactive_border.fg } else { s.fg },
                 bg: if s.bg == Color::Default { inactive_border.bg } else { s.bg },
+                us: if s.us == Color::Default { inactive_border.us } else { s.us },
                 attrs: inactive_border.attrs | s.attrs,
             };
             let cell = spans.iter().find(|s| !s.text.is_empty()).and_then(|s| s.text.chars().next().map(|ch| {
@@ -1583,8 +1665,11 @@ impl Server {
                         link = next_link.map(|l| l.inner);
                     }
                 }
-                if c.utf8() || cell.text.is_ascii() { out.push_str(&terminal_text(&cell.text)); }
-                else { out.push_str(&non_utf8_text(&cell.text, row.get(x + 1).is_some_and(|n| n.text.is_empty()))); }
+                // tty_acs_get: a DEC graphics character is drawn as its Unicode form
+                let acs = (cell.style.attrs & crate::cells::ACS != 0).then(|| cell.text.chars().next().and_then(crate::cells::acs_char)).flatten();
+                let text = acs.unwrap_or(&cell.text);
+                if c.utf8() || text.is_ascii() { out.push_str(&terminal_text(text)); }
+                else { out.push_str(&non_utf8_text(text, row.get(x + 1).is_some_and(|n| n.text.is_empty()))); }
                 if cfg!(windows) && cell.text.chars().any(|c| char_width(c) == Some(0)) {
                     let width = cell.text.chars().filter_map(|c| char_width(c)).sum::<usize>();
                     if x + width < next.frame.w as usize { let _ = write!(out, "\x1b[{};{}H", y + 1, x + width + 1); }
