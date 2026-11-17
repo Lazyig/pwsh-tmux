@@ -4063,3 +4063,18 @@ fn source_file_reads_the_command_line_clients_stdin_and_aliases_log_their_blocks
     assert!(log.contains(" command: if-shell -F 1 { set-option -g @al 1 }\n"), "{log}");
     assert_eq!(ctx.ok(&["show-options", "-gv", "@al"]).trim(), "1");
 }
+
+// C-c stops a pane's program. On Windows the server is started in a new process group, which
+// turns Ctrl+C off, and panes would inherit that unless the server turns it back on.
+#[test]
+fn c_c_stops_a_panes_program() {
+    let ctx = Ctx::new("ctrl-c");
+    let mut args = vec!["new-session", "-d", "-s", "c"];
+    args.extend(sleep_argv("100"));
+    ctx.ok(&args);
+    ctx.ok(&["set", "-p", "-t", "c", "remain-on-exit", "on"]);
+    // let the program start before the key reaches it
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    ctx.ok(&["send-keys", "-t", "c", "C-c"]);
+    wait_for("pane dead after C-c", || ctx.fmt("c", "#{pane_dead}") == "1");
+}

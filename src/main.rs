@@ -78,6 +78,13 @@ fn main() {
         let mut rest = args[1..].to_vec();
         let cwd = if rest.first().map(String::as_str) == Some("-c") && rest.len() > 1 { Some(rest.drain(..2).nth(1).unwrap_or_default()) } else { None };
         let config = rest.first().cloned();
+        // The client starts the server with CREATE_NEW_PROCESS_GROUP, which turns Ctrl+C off
+        // for it, and panes would inherit that: a C-c sent to a pane's console would then
+        // never stop its program. Turn it back on before any pane starts.
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 0);
+        }
         let code = match server::run(config, cwd) {
             Ok(()) => 0,
             Err(e) => {
