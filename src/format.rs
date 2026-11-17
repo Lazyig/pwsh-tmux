@@ -2322,9 +2322,10 @@ pub fn width(s: &str) -> usize {
 
 /// Cells for a group of spans (wide characters occupy a lead cell plus an empty
 /// continuation) and the mouse range of every cell.
-fn group_cells_ranged<'a>(spans: impl Iterator<Item = &'a Span>) -> (Vec<Cell>, Vec<Option<Range>>) {
+fn group_cells_ranged<'a>(spans: impl Iterator<Item = &'a Span>) -> (Vec<Cell>, Vec<Option<Range>>, Vec<Option<String>>) {
     let mut cells: Vec<Cell> = Vec::new();
     let mut tags: Vec<Option<Range>> = Vec::new();
+    let mut links: Vec<Option<String>> = Vec::new();
     for sp in spans {
         let tag = sp.range.clone();
         for c in sp.text.chars() {
@@ -2340,27 +2341,31 @@ fn group_cells_ranged<'a>(spans: impl Iterator<Item = &'a Span>) -> (Vec<Cell>, 
                 Some(w) => {
                     cells.push(Cell { text: c.to_string(), style: sp.style });
                     tags.push(tag.clone());
+                    links.push(sp.link.clone());
                     for _ in 1..w {
                         cells.push(Cell { text: String::new(), style: sp.style });
                         tags.push(tag.clone());
+                        links.push(sp.link.clone());
                     }
                 }
             }
         }
     }
-    (cells, tags)
+    (cells, tags, links)
 }
 
 /// One of format_draw's screens: its cells and the mouse range under each.
 struct Screen {
     cells: Vec<Cell>,
     tags: Vec<Option<Range>>,
+    /// The link= of each cell.
+    links: Vec<Option<String>>,
 }
 
 impl Screen {
     fn of<'a>(spans: impl Iterator<Item = &'a Span>) -> Screen {
-        let (cells, tags) = group_cells_ranged(spans);
-        Screen { cells, tags }
+        let (cells, tags, links) = group_cells_ranged(spans);
+        Screen { cells, tags, links }
     }
 
     fn len(&self) -> usize {
@@ -2371,6 +2376,7 @@ impl Screen {
     fn append(&mut self, other: &Screen, n: usize) {
         self.cells.extend_from_slice(&other.cells[..n]);
         self.tags.extend_from_slice(&other.tags[..n]);
+        self.links.extend_from_slice(&other.links[..n]);
     }
 }
 
@@ -2378,6 +2384,7 @@ impl Screen {
 struct Out {
     cells: Vec<Option<Cell>>,
     tags: Vec<Option<Range>>,
+    links: Vec<Option<String>>,
     fill: Style,
 }
 
@@ -2392,6 +2399,7 @@ impl Out {
             let cut_end = k == n - 1 && s.cells.get(from + k + 1).is_some_and(Cell::is_continuation);
             self.cells[at + k] = Some(if cut_start || cut_end { Cell { text: " ".into(), style: self.fill } } else { src.clone() });
             self.tags[at + k] = s.tags[from + k].clone();
+            self.links[at + k] = s.links[from + k].clone();
         }
     }
 
@@ -2458,7 +2466,18 @@ pub fn layout_line_ranged(spans: &[Span], width: usize, fill: Style) -> (Vec<Cel
 /// focus and given its markers when it does not fit. Cells nothing is drawn on are None
 /// (tmux leaves what was there, such as the border line under a pane status line).
 pub fn draw_line(spans: &[Span], width: usize, fill: Style) -> (Vec<Option<Cell>>, Vec<Option<Range>>) {
-    let mut out = Out { cells: vec![None; width], tags: vec![None; width], fill };
+    let out = draw_out(spans, width, fill);
+    (out.cells, out.tags)
+}
+
+/// [`layout_line_ranged`] with the link= of each cell (tty_hyperlink for style links).
+pub fn layout_line_links(spans: &[Span], width: usize, fill: Style) -> (Vec<Cell>, Vec<Option<Range>>, Vec<Option<String>>) {
+    let out = draw_out(spans, width, fill);
+    (out.cells.into_iter().map(|c| c.unwrap_or_else(|| Cell { text: " ".into(), style: fill })).collect(), out.tags, out.links)
+}
+
+fn draw_out(spans: &[Span], width: usize, fill: Style) -> Out {
+    let mut out = Out { cells: vec![None; width], tags: vec![None; width], links: vec![None; width], fill };
     // a fill colour clears the available area first (the default cell with that background)
     if let Some(bg) = spans.iter().rev().find_map(|s| s.fill) {
         out.cells = vec![Some(Cell { text: " ".into(), style: Style { bg, ..Style::default() } }); width];
@@ -2468,7 +2487,7 @@ pub fn draw_line(spans: &[Span], width: usize, fill: Style) -> (Vec<Option<Cell>
     let (mut left, mut centre, mut right, abs) = (normal(Align::Left), normal(Align::Centre), normal(Align::Right), normal(Align::AbsoluteCentre));
     let Some(list_align) = spans.iter().find(|s| !matches!(s.part, Part::Normal | Part::Hidden)).map(|s| s.align) else {
         out.none(&left, &centre, &right, &abs);
-        return (out.cells, out.tags);
+        return out;
     };
     let (list, ll, lr, after) = (part(Part::List), part(Part::ListLeft), part(Part::ListRight), part(Part::After));
     // the focus as cell offsets in the list
@@ -2512,7 +2531,7 @@ pub fn draw_line(spans: &[Span], width: usize, fill: Style) -> (Vec<Option<Cell>
         out.put_list(at, listw, &list, &ll, &lr, focus);
         at += listw;
         out.put(at, &after, 0, afterw);
-        return (out.cells, out.tags);
+        return out;
     }
     // format_draw_left/centre/right: trim the centre first (the list first in the centre)
     while lw + cw + rw + listw + afterw > width {
@@ -2548,7 +2567,7 @@ pub fn draw_line(spans: &[Span], width: usize, fill: Style) -> (Vec<Option<Cell>
             _ => right.append(&after, afterw),
         }
         out.none(&left, &centre, &right, &abs);
-        return (out.cells, out.tags);
+        return out;
     }
     out.put(0, &left, 0, lw);
     match list_align {
@@ -2577,7 +2596,7 @@ pub fn draw_line(spans: &[Span], width: usize, fill: Style) -> (Vec<Option<Cell>
     }
     let aw = aw0.min(width);
     out.put((width - aw) / 2, &abs, 0, aw);
-    (out.cells, out.tags)
+    out
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -476,6 +476,15 @@ fn overlay_style(cell: &mut Style, over: Style) {
 }
 
 /// A blank that EL (erase to end of line, default background) reproduces exactly.
+/// A link= of a style as a hyperlink: one for each URI, apart from the panes' links.
+fn style_link(uri: &str) -> std::sync::Arc<vt100::Hyperlink> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    uri.hash(&mut h);
+    let inner = h.finish() | (1 << 63);
+    std::sync::Arc::new(vt100::Hyperlink { inner, id: String::new(), external_id: format!("tmux{:X}", inner & 0xffff_ffff), uri: uri.to_string() })
+}
+
 /// tty-features.c's Hls (the hyperlinks feature).
 const HLS: &str = "\x1b]8;%?%p1%l%tid=%p1%s%;;%p2%s\x1b\\";
 
@@ -1257,15 +1266,21 @@ impl Server {
                 let custom = &formats[i as usize];
                 // The built-in first line has a dedicated renderer for list clipping.
                 // the default first line too: its window list is a list= of format_draw
-                let (line, tags) = if !custom.is_empty() {
+                let (line, tags, links) = if !custom.is_empty() {
                     let base = self.status_style(sid, cid);
                     let cur = Target { sid: Some(sid), idx: Some(s.active), wid: Some(wid), pane: Some(win.active) };
                     let text = self.expand_status_time(cur, cid, custom, "");
-                    format::layout_line_ranged(&self.styled_spans(&text, base, cur, cid), cw as usize, base)
+                    format::layout_line_links(&self.styled_spans(&text, base, cur, cid), cw as usize, base)
                 } else {
-                    (vec![Cell { text: " ".into(), style: self.status_style(sid, cid) }; cw as usize], vec![None; cw as usize])
+                    (vec![Cell { text: " ".into(), style: self.status_style(sid, cid) }; cw as usize], vec![None; cw as usize], vec![None; cw as usize])
                 };
                 f.put_cells(0, y, &line);
+                // style link= (the status screen's own hyperlinks)
+                for (x, uri) in links.iter().enumerate() {
+                    if let Some(uri) = uri {
+                        f.set_link(x as u16, y, Some(&style_link(uri)));
+                    }
+                }
                 status_ranges.push(tags);
             }
         }
