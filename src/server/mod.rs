@@ -1328,6 +1328,9 @@ pub struct Server {
     /// While send-keys -K types keys: the client that ran it (key_bindings_dispatch
     /// queues the bound commands for that client).
     pub key_origin: Option<ClientId>,
+    /// send-keys -K: the bound commands of the keys it handles, which go in its own
+    /// queue after it (server_client_handle_key_after) instead of a queue of their own.
+    pub key_capture: Option<Vec<Vec<String>>>,
     /// Events: hook bookkeeping, wait-for -E, monitors, change detection.
     pub ev: events::State,
     pub buffers: Vec<Buffer>,
@@ -1519,6 +1522,7 @@ impl Server {
             env_hidden: std::collections::HashSet::new(),
             cfg_finished: false,
             key_origin: None,
+            key_capture: None,
             ev: Default::default(),
             buffers: Vec::new(),
             buffer_seq: 0,

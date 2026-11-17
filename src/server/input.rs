@@ -763,6 +763,7 @@ impl Server {
     /// for send-keys -K, the client that sent it).
     pub fn run_key_string(&mut self, cid: ClientId, cmd: &str, pane: Option<PaneId>, key: &str) {
         match self.parse_string(cmd) {
+            Ok(cmds) if self.key_capture.is_some() => self.key_capture.as_mut().unwrap().extend(cmds),
             Ok(cmds) => {
                 let ctx = Ctx { client: Some(cid), pane, from_key: true, key: Some(key.to_string()), log_client: self.key_origin, ..Ctx::default() };
                 self.run_queue(Queue { cmds: cmds.into(), ctx , soft: 0 });

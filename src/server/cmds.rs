@@ -4276,15 +4276,19 @@ impl Server {
                             None => list.extend(text.chars().filter_map(|c| keys::parse_key_name(&c.to_string()))),
                         }
                     }
-                    // the bound commands are the sending client's (cmdq_insert_after)
+                    // the bound commands are the sending client's: they go in this queue
+                    // after send-keys (server_client_handle_key_after), so their output is
+                    // its output
                     let saved = self.key_origin.replace(ctx.client.or(ctx.reply).unwrap_or(cid));
+                    let saved_capture = self.key_capture.replace(Vec::new());
                     for _ in 0..n {
                         for key in &list {
                             self.handle_key(cid, key.clone(), keys::encode_key(key, app));
                         }
                     }
                     self.key_origin = saved;
-                    return Ok(Flow::Next);
+                    let bound = std::mem::replace(&mut self.key_capture, saved_capture).unwrap_or_default();
+                    return Ok(Flow::Inject(bound, false));
                 }
                 if o.has('R') {
                     if let Some(p) = self.panes.get_mut(&pane) {
