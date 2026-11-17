@@ -580,11 +580,13 @@ impl Server {
         }
         if let Some(target) = self.client_active_pane(cid) {
             // the paste-start key reaches the pane's mode first: it ends clock mode
-            // like any key; in another mode the pasted text is dropped
-            match self.panes.get(&target).map(|p| &p.mode) {
-                Some(Some(PaneMode::Clock)) => self.exit_mode(target),
-                Some(Some(_)) => return,
-                _ => {}
+            // like any key; in another mode the pasted text is dropped, also in the
+            // mode clock mode was stacked on, which ending it brings back
+            if matches!(self.panes.get(&target).map(|p| &p.mode), Some(Some(PaneMode::Clock))) {
+                self.exit_mode(target);
+            }
+            if self.panes.get(&target).is_some_and(|p| p.mode.is_some()) {
+                return;
             }
             if self.panes.get(&target).is_some_and(|p| p.options.get("@input-disabled") == Some("on")) { return; }
             self.paste(target, &data, true, true, None);

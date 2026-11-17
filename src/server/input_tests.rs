@@ -817,6 +817,15 @@ fn pasted_input_never_reaches_a_pane_in_a_mode() {
     f.handle_input(1, b"\x1b[200~hi\x1b[201~");
     assert!(f.panes[&pane].mode.is_none());
     assert_eq!(f.pane_input.try_iter().flatten().collect::<Vec<u8>>(), b"hi");
+    // clock mode stacked on copy mode: ending it brings copy mode back, which drops
+    // the text (tmux 3.8, pod)
+    run(&mut f, &["copy-mode"]);
+    run(&mut f, &["clock-mode"]);
+    f.pane_input.try_iter().for_each(drop);
+    f.handle_input(1, b"\x1b[200~b1\r\x1b[201~");
+    assert!(matches!(f.panes[&pane].mode, Some(PaneMode::Copy(_))));
+    assert!(f.pane_input.try_recv().is_err());
+    run(&mut f, &["send-keys", "-X", "cancel"]);
     // a dead pane kept by remain-on-exit key closes on typed (or guessed pasted) input
     // too: server_client_handle_key checks it before the paste guess (tmux 3.8, pod)
     f.panes.get_mut(&pane).unwrap().options.set("remain-on-exit", "key".into());
