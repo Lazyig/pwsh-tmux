@@ -3048,9 +3048,9 @@ mod tests {
 
     #[test]
     fn styles() {
-        let base = Style { fg: Color::Idx(2), bg: Color::Idx(0), attrs: 0 };
+        let base = Style { fg: Color::Idx(2), bg: Color::Idx(0), attrs: 0, ..Style::default() };
         let s = parse_style("fg=red,bg=colour235,bold,noitalics", base).unwrap();
-        assert_eq!(s, Style { fg: Color::Idx(1), bg: Color::Idx(235), attrs: BOLD });
+        assert_eq!(s, Style { fg: Color::Idx(1), bg: Color::Idx(235), attrs: BOLD, ..Style::default() });
         let s = parse_style("bold dim italics underscore blink reverse strikethrough", base).unwrap();
         assert_eq!(s.attrs, BOLD | DIM | ITALIC | UNDERLINE | BLINK | INVERSE | STRIKE);
         let s2 = parse_style("nobold,nodim,noitalics,nounderscore,noblink,noreverse,nostrikethrough", s).unwrap();
@@ -3060,7 +3060,9 @@ mod tests {
         assert_eq!(parse_style("fg=red,default", base).unwrap(), base);
         assert_eq!(parse_style("fg=default", base).unwrap().fg, base.fg);
         assert_eq!(parse_style("", base).unwrap(), base);
-        assert_eq!(parse_style("bright,hidden,double-underscore", base).unwrap().attrs, BOLD | UNDERLINE);
+        // tmux keeps hidden, the underline styles, overline and acs, and us= is the underline colour
+        assert_eq!(parse_style("bright,hidden,double-underscore,overline,acs", base).unwrap().attrs, BOLD | crate::cells::HIDDEN | crate::cells::DOUBLE_UNDERLINE | crate::cells::OVERLINE | crate::cells::ACS);
+        assert_eq!(parse_style("us=red,curly-underscore", base).unwrap().us, Color::Idx(1));
         assert_eq!(parse_style("align=right,fill=blue,list=on,FG=Blue", base).unwrap().fg, Color::Idx(4));
         assert!(parse_style("fg=mauve", base).is_err());
         assert!(parse_style("sparkly", base).is_err());
@@ -3308,7 +3310,7 @@ mod tests {
     // ----- spans -----
 
     fn st(fg: Color, attrs: u16) -> Style {
-        Style { fg, bg: Color::Default, attrs }
+        Style { fg, bg: Color::Default, attrs, ..Style::default() }
     }
 
     #[test]

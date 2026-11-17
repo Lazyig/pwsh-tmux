@@ -4203,7 +4203,7 @@ mod tests {
         l.cells[0].style = Style { fg: Color::Idx(1), bg: Color::Default, attrs: crate::cells::BOLD, ..Style::default() };
         let mut cm = CopyMode::new(vec![l], 20, 1, (0, 0), true);
         cm.run("begin-selection", &[]);
-        let st = RenderStyle { selection: Style { fg: Color::Default, bg: CYAN, attrs: 0 }, selection_noattr: false, position_text: Some(String::new()), ..RenderStyle::default() };
+        let st = RenderStyle { selection: Style { fg: Color::Default, bg: CYAN, attrs: 0, ..Style::default() }, selection_noattr: false, position_text: Some(String::new()), ..RenderStyle::default() };
         assert_eq!(cm.render_with(&st).0[0].cells[0].style, Style { fg: Color::Idx(1), bg: CYAN, attrs: crate::cells::BOLD, ..Style::default() });
         let st = RenderStyle { selection_noattr: true, ..st };
         assert_eq!(cm.render_with(&st).0[0].cells[0].style, Style { fg: Color::Idx(1), bg: CYAN, attrs: 0, ..Style::default() });

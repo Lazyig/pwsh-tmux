@@ -1474,10 +1474,19 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
         let mut base_pos;
         let cell_was_wide;
 
+        let nowrap = !screen.wrap_mode();
         if width > 0 {
-            let wrap = screen.new_character_should_wrap(width);
-            let on_row = Self::on_row(screen, &mut self.callbacks);
-            screen.grid_mut().col_wrap(width, wrap, on_row);
+            if nowrap {
+                // screen_write_cell without MODE_WRAP: a character that does not fit is
+                // dropped, the last column is written over
+                if pos.col + width > screen.grid().size().cols() {
+                    return;
+                }
+            } else {
+                let wrap = screen.new_character_should_wrap(width);
+                let on_row = Self::on_row(screen, &mut self.callbacks);
+                screen.grid_mut().col_wrap(width, wrap, on_row);
+            }
             // col_wrap always sets self.grid().pos() to a valid cell
             base_pos = screen.grid().pos();
             // IRM (screen_write_cell): the character makes room for itself
@@ -1498,6 +1507,10 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
             screen.grid_mut().drawing_cell_mut(base_pos).unwrap().set_wide(width == 2);
             screen.last_char = Some(c);
             screen.grid_mut().col_inc(width);
+            if nowrap && screen.grid().pos().col >= screen.grid().size().cols() {
+                let last = screen.grid().size().cols() - 1;
+                screen.grid_mut().col_set(last);
+            }
         } else {
             // pos.row is valid, since it comes directly from
             // self.grid().pos() which we assume to always have a
@@ -1766,12 +1779,52 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
 
     // CSI A
     pub fn cuu(&mut self, offset: u16) {
+        // screen_write_cursorup: the cursor leaves a pending wrap for the last column
+        self.leave_pending_wrap();
         self.screen.grid_mut().row_dec_clamp(offset);
     }
 
     // CSI B
     pub fn cud(&mut self, offset: u16) {
+        self.leave_pending_wrap();
         self.screen.grid_mut().row_inc_clamp(offset);
+    }
+
+    fn leave_pending_wrap(&mut self) {
+        let cols = self.screen.grid().size().cols();
+        if self.screen.grid().pos().col >= cols {
+            self.screen.grid_mut().col_set(cols - 1);
+        }
+    }
+
+    // ESC D (IND): a line feed without a carriage return
+    pub fn ind(&mut self) {
+        let on_row = Self::on_row(&self.screen, &mut self.callbacks);
+        self.screen.grid_mut().row_inc_scroll(1, on_row);
+    }
+
+    // ESC E (NEL)
+    pub fn nel(&mut self) {
+        self.cr();
+        self.ind();
+    }
+
+    // CSI Z (CBT): back to the previous tab stop, `count` times
+    pub fn cbt(&mut self, count: u16) {
+        let cols = self.screen.grid().size().cols();
+        let mut cx = self.screen.grid().pos().col.min(cols - 1);
+        let stop = |s: &Screen, x: u16| s.tabs.as_ref().map_or(x % 8 == 0, |t| t.get(usize::from(x)).copied().unwrap_or(false));
+        let mut n = count;
+        while cx > 0 && n > 0 {
+            n -= 1;
+            loop {
+                cx -= 1;
+                if cx == 0 || stop(&self.screen, cx) {
+                    break;
+                }
+            }
+        }
+        self.screen.grid_mut().col_set(cx);
     }
 
     // CSI C

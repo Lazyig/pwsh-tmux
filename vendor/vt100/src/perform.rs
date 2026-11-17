@@ -48,6 +48,8 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
                 b'8' => self.decrc(),
                 b'=' => self.deckpam(),
                 b'>' => self.deckpnm(),
+                b'D' => self.ind(),
+                b'E' => self.nel(),
                 b'H' => self.hts(),
                 b'M' => self.ri(),
                 b'c' => {
@@ -104,6 +106,10 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
                 'S' => self.su(canonicalize_params_1(params, 1)),
                 'T' => self.sd(canonicalize_params_1(params, 1)),
                 'X' => self.ech(canonicalize_params_1(params, 1)),
+                'Z' => self.cbt(canonicalize_params_1(params, 1)),
+                // SCOSC and SCORC (INPUT_CSI_SCP/RCP): as DECSC and DECRC
+                's' => self.decsc(),
+                'u' => self.decrc(),
                 '`' => self.hpa(canonicalize_params_1(params, 1)),
                 'b' => self.rep(canonicalize_params_1(params, 1)),
                 'd' => self.vpa(canonicalize_params_1(params, 1)),

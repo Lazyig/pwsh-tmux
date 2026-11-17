@@ -348,14 +348,14 @@ pub fn push_sgr(out: &mut String, st: &Style) {
     push_color(out, st.fg, 30);
     push_color(out, st.bg, 40);
     out.push('m');
-    // Setulc and Setulc1 (the usstyle feature)
+    // Setulc and Setulc1 of the usstyle feature (its "::" is an escaped ':')
     match st.us {
         Color::Default => {}
         Color::Rgb(r, g, b) => {
-            let _ = write!(out, "\x1b[58::2::{r}::{g}::{b}m");
+            let _ = write!(out, "\x1b[58:2:{r}:{g}:{b}m");
         }
         Color::Idx(i) | Color::Palette(i) => {
-            let _ = write!(out, "\x1b[58::5::{i}m");
+            let _ = write!(out, "\x1b[58:5:{i}m");
         }
     }
 }
