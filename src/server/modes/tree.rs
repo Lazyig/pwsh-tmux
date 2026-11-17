@@ -941,6 +941,8 @@ impl Tree {
                     } else {
                         self.tagged.remove(&b.nodes[item].tag);
                     }
+                    // mode_tree_key: then on to the next line
+                    self.down(n, height, false);
                 }
             }
             "T" => {

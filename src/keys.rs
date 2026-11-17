@@ -898,12 +898,10 @@ pub fn normalize(k: Key) -> Key {
         && mods.ctrl
         && !mods.shift
     {
+        // tmux 3.8 keeps C-i, C-m, C-? and C-@ apart from Tab, Enter, BSpace and C-Space
+        // (only extended keys tell them apart); C-[ arriving as input is Escape
         let (new, keep_ctrl) = match c {
-            'i' | 'I' => (KeyCode::Tab, false),
-            'm' | 'M' => (KeyCode::Enter, false),
             '[' => (KeyCode::Escape, false),
-            '?' => (KeyCode::BSpace, false),
-            '@' => (KeyCode::Space, true),
             _ => (code.clone(), true),
         };
         code = new;
@@ -951,6 +949,16 @@ const NAMES: &[(&str, KeyCode)] = &[
 /// Parse a tmux key name ("C-b", "^B", "M-Left", "S-Up", "C-M-x", "F12", "PPage", ...) into a
 /// normalised Key. Mouse key names and "Any" return None (handled by the binding layer).
 pub fn parse_key_name(s: &str) -> Option<Key> {
+    // key_string_lookup_string: "0x" and hex digits is that character (a C0 code is
+    // its control key)
+    if let Some(hex) = s.strip_prefix("0x") {
+        let digits = hex.bytes().take_while(u8::is_ascii_hexdigit).count();
+        let u = u32::from_str_radix(hex.get(..digits).filter(|d| !d.is_empty())?, 16).ok()?;
+        if u < 0x20 || u == 0x7f {
+            return Some(control_key(u as u8));
+        }
+        return char::from_u32(u).map(|c| normalize(Key::plain(KeyCode::Char(c))));
+    }
     let mut mods = Mods::NONE;
     let mut rest = s;
     loop {
@@ -1657,7 +1665,7 @@ mod tests {
             assert_eq!(v[0], meta(KeyCode::Char('[')), "{raw:?}");
             assert_eq!(v.len(), raw.len() - 1, "{raw:?}");
         }
-        assert_eq!(key1(b"\x1b[105;5u"), k(KeyCode::Tab)); // C-i == Tab
+        assert_eq!(key1(b"\x1b[105;5u"), ctrl('i')); // C-i is not Tab
         assert_eq!(key1(b"\x1b[27;5;97~"), ctrl('a'));
         assert_eq!(key1(b"\x1b[27;5;49~"), ctrl('1'));
         assert_eq!(key1(b"\x1b[27;3;44~"), meta(KeyCode::Char(',')));
@@ -2135,12 +2143,21 @@ mod tests {
         assert_eq!(p("가"), ch('가'));
         assert_eq!(p("M-가"), meta(KeyCode::Char('가')));
         assert_eq!(p("C-Space"), km(KeyCode::Space, true, false, false));
-        assert_eq!(p("C-@"), km(KeyCode::Space, true, false, false));
-        assert_eq!(p("C-i"), k(KeyCode::Tab));
-        assert_eq!(p("C-m"), k(KeyCode::Enter));
+        // tmux 3.8 keeps these apart from C-Space, Tab and Enter
+        assert_eq!(p("C-@"), ctrl('@'));
+        assert_eq!(p("C-i"), ctrl('i'));
+        assert_eq!(p("C-m"), ctrl('m'));
+        assert_eq!(p("C-?"), ctrl('?'));
+        assert_eq!(key_name(&p("C-m")), "C-m");
+        // key_string_lookup_string: hexadecimal is that character
+        assert_eq!(p("0x41"), ch('A'));
+        assert_eq!(p("0x263a"), ch('☺'));
+        assert_eq!(p("0x0d"), k(KeyCode::Enter));
+        assert_eq!(p("0x01"), ctrl('a'));
+        assert_eq!(parse_key_name("0x"), None);
         assert_eq!(p("C-["), Key::new(KeyCode::Char('['), Mods::CTRL));
         assert_eq!(key_name(&p("C-[")), "C-[");
-        assert_eq!(p("^?"), k(KeyCode::BSpace));
+        assert_eq!(p("^?"), ctrl('?'));
         assert_eq!(p("KP0"), k(KeyCode::KP('0')));
         assert_eq!(p("KPEnter"), k(KeyCode::KP('\r')));
         assert_eq!(p("KP/"), k(KeyCode::KP('/')));

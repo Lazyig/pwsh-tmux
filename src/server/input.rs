@@ -525,7 +525,7 @@ impl Server {
                 // an unmodified BSpace writes one byte, and only for a plain or Ctrl key
                 return Some(backspace_byte(&option).map(|b| vec![b]).unwrap_or_default());
             }
-            if let Some(mut backspace) = keys::parse_key_name(&option) {
+            if let Some(mut backspace) = backspace_key(&option) {
                 // key = newkey | modifiers: BSpace itself has no sequence, a character goes
                 // through the usual modes, and a special key found only without the Meta
                 // (no implied Meta) gets ESC before its unmodified form
@@ -1902,8 +1902,17 @@ mod tests {
 
 /// The byte tmux writes for an unmodified BSpace: the backspace key's code truncated to a byte
 /// when it has no modifiers, or its C0 control code when it has only Ctrl.
+/// The backspace option's key. Its default (tmux's '\177', shown as C-?) is the
+/// backspace key itself, which this server cannot tell apart from C-? set by name.
+fn backspace_key(option: &str) -> Option<Key> {
+    if option == "C-?" {
+        return Some(Key::plain(KeyCode::BSpace));
+    }
+    keys::parse_key_name(option)
+}
+
 fn backspace_byte(option: &str) -> Option<u8> {
-    let key = keys::parse_key_name(option)?;
+    let key = backspace_key(option)?;
     // tmux function key codes start at KEYC_NONE; their low byte is the enum position
     let code: u32 = match &key.code {
         KeyCode::BSpace if option.eq_ignore_ascii_case("BSpace") => 7,

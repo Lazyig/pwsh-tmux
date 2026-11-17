@@ -3790,9 +3790,10 @@ impl Server {
                     None if o.rest.is_empty() => (vec![":".into()], false),
                     None => (vec![format!("({})", template.split_whitespace().next().unwrap_or(""))], true),
                 };
+                // prompt_create: format_expand_time, so strftime applies too
                 let inits: Vec<String> = match o.get('I') {
-                    Some(i) if o.has('l') => vec![self.expand(tt, Some(cid), i)],
-                    Some(i) => i.split(',').map(|s| self.expand(tt, Some(cid), s)).collect(),
+                    Some(i) if o.has('l') => vec![self.expand_time(tt, Some(cid), i)],
+                    Some(i) => i.split(',').map(|s| self.expand_time(tt, Some(cid), s)).collect(),
                     None => Vec::new(),
                 };
                 let prompts: Vec<(String, String)> = labels.into_iter().enumerate()
