@@ -1325,7 +1325,12 @@ pub struct KeyEvent {
 pub enum ClientItem {
     Key(keys::Key, Vec<u8>),
     Mouse(String, input::MouseCtx),
+    /// A bracketed paste, and bytes the key parser did not know (both for the pane).
+    Paste(Vec<u8>),
+    Raw(Vec<u8>),
     Queue(Queue),
+    /// A parse error (cmdq_get_error): reported when the queue reaches it.
+    Error(String),
 }
 
 /// The tmux release whose behaviour this server matches (`#{version}`).
@@ -2983,7 +2988,8 @@ impl Server {
             let mut changed = self.name_known.insert((r.id, r.generation));
             if let Some(c) = r.cmd.filter(|c| *c != p.current_cmd) {
                 p.current_cmd = c;
-                changed = true;
+                // (on Unix the name check reads the program itself, as tmux does)
+                changed |= !cfg!(unix);
             }
             // a directory the pane reported meanwhile is newer than this lookup
             if let Some(path) = r.path.filter(|path| p.cwd_seq == r.cwd_seq && *path != p.current_path) {
@@ -2993,6 +2999,25 @@ impl Server {
             if changed {
                 self.name_changed.insert(r.id);
             }
+        }
+    }
+
+    /// osdep_get_name for a pane's name check: on Unix its foreground program, read now
+    /// (quick). False where it could not be read (Windows uses the background lookup).
+    fn read_program_now(&mut self, pane: PaneId) -> bool {
+        #[cfg(unix)]
+        {
+            let Some(p) = self.panes.get(&pane).filter(|p| p.dead.is_none()) else { return false };
+            let Some(cmd) = procinfo::pane_programs(&[(p.pid, p.fg_pgrp())]).pop().and_then(|r| r.0) else { return false };
+            let generation = p.generation;
+            self.panes.get_mut(&pane).unwrap().current_cmd = cmd;
+            self.name_known.insert((pane, generation));
+            true
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pane;
+            false
         }
     }
 
@@ -3016,11 +3041,11 @@ impl Server {
                 self.name_changed.insert(active);
             }
             st.auto = auto;
-            if !auto || !self.name_changed.contains(&active) {
-                continue;
+            // (a timer that has fired is gone: it is a one-shot evtimer)
+            if st.timer.is_some_and(|t| t <= now) {
+                st.timer = None;
             }
-            // what the pane runs is not known yet (the lookup takes up to a second)
-            if self.panes.get(&active).is_some_and(|p| p.dead.is_none() && !self.name_known.contains(&(active, p.generation))) {
+            if !auto || !self.name_changed.contains(&active) {
                 continue;
             }
             // name_time_expired: checked less than NAME_INTERVAL ago, the timer does it
@@ -3028,6 +3053,14 @@ impl Server {
                 st.timer.get_or_insert(t + NAME_INTERVAL);
                 continue;
             }
+            // tmux reads what the pane runs as it checks the name (osdep_get_name); where
+            // that is slow (Windows) the name waits for the background lookup to find it
+            let known = self.read_program_now(active)
+                || self.panes.get(&active).is_none_or(|p| p.dead.is_some() || self.name_known.contains(&(active, p.generation)));
+            if !known {
+                continue;
+            }
+            let st = self.name_state.entry(wid).or_default();
             st.time = Some(now);
             st.timer = None;
             self.name_changed.remove(&active);
@@ -4025,6 +4058,9 @@ impl Server {
                         self.handle_key_queued(cid, Some(k), &name, raw, false);
                     }
                     ClientItem::Mouse(key, ctx) => self.mouse_key_now(cid, key, ctx),
+                    ClientItem::Paste(data) => self.paste_now(cid, data),
+                    ClientItem::Raw(raw) => self.raw_input_now(cid, raw),
+                    ClientItem::Error(e) => self.set_error(cid, &e),
                     ClientItem::Queue(q) => self.run_queue(q),
                 }
             }
@@ -4602,6 +4638,20 @@ impl Server {
                                 _ => self.finish_queue(q, None),
                             }
                             return;
+                        }
+                        "delay" if get(3) == "b" => {
+                            // run-shell -b -d: only the command waits for its timer, in a
+                            // queue of no client's (JOB_NOWAIT); the rest goes on now
+                            if let Some(c) = delay_cmd.as_ref().map(|c| strip_delay(c)) {
+                                let ms: u64 = get(2).parse().unwrap_or(0);
+                                // (a command-line client that has gone by then is not the
+                                // queue's client: cdata->client is the target client)
+                                let client = q.ctx.client.filter(|c| self.clients.get(c).is_some_and(|c| c.attached));
+                                let ctx = Ctx { client, reply: None, out: Default::default(), control_seq: None, detached: true, resumed: true, ..q.ctx.clone() };
+                                self.delayed.push((Instant::now() + Duration::from_millis(ms), Queue { cmds: VecDeque::from([c]), ctx, soft: 0 }));
+                            }
+                            self.control_item_done(&mut q, None);
+                            continue;
                         }
                         "delay" => {
                             // run-shell -d: the rest of the queue (and the command) runs later

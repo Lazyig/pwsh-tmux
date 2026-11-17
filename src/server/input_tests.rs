@@ -946,9 +946,8 @@ fn window_names_follow_mode_changes_at_most_every_name_interval() {
     let mut f = fixture();
     let pane = f.pane;
     let wid = f.window_of(pane).unwrap();
-    // (the pane's program is known once a lookup has found it)
-    f.automatic_rename();
-    assert!(f.name_changed.contains(&pane));
+    // (the pane's program is read as the name is checked on Unix, else known once a
+    // lookup has found it)
     let g = f.panes[&pane].generation;
     f.name_known.insert((pane, g));
     f.automatic_rename();
@@ -1016,4 +1015,107 @@ fn commands_for_a_client_wait_behind_its_waiting_prompt() {
     assert!(f.next_timeout() <= Duration::from_millis(5));
     f.drain_clients();
     assert_eq!(f.opts_session.get("@h"), Some("qTMT"));
+}
+
+#[test]
+fn pasted_text_keeps_its_place_in_the_clients_queue() {
+    // server_client_key_callback's paste_key: pasted keys are items of the client's
+    // queue, after the keys read before them and behind a command that waits
+    let mut f = fixture();
+    f.pane_input.try_iter().for_each(drop);
+    f.handle_input(1, b"ab\x1b[200~XY\x1b[201~cd");
+    let typed: Vec<u8> = f.pane_input.try_iter().flatten().collect();
+    assert_eq!(String::from_utf8_lossy(&typed).replace("\x1b[200~", "").replace("\x1b[201~", ""), "abXYcd");
+    // a typed key's run-shell -d waits: a later paste (and a parse error a menu or a
+    // prompt gives, cmdq_get_error) waits behind it
+    run(&mut f, &["bind-key", "-n", "F5", "run-shell -d 5 ; set -ga @h D"]);
+    f.handle_input(1, b"\x1b[15~");
+    f.handle_input(1, b"\x1b[200~PQ\x1b[201~");
+    assert!(f.parse_string("set -g @x { a").is_err());
+    f.run_string(1, "set -g @x { a", None);
+    assert!(f.pane_input.try_recv().is_err());
+    assert!(f.clients[&1].message.is_none());
+    for d in &mut f.delayed {
+        d.0 = Instant::now();
+    }
+    f.timers();
+    assert_eq!(f.opts_session.get("@h"), Some("D"));
+    let typed: Vec<u8> = f.pane_input.try_iter().flatten().collect();
+    assert!(String::from_utf8_lossy(&typed).contains("PQ"));
+    assert!(f.clients[&1].message.is_some());
+    // run-shell -b -d does not wait (JOB_NOWAIT): the keys after it go on at once
+    run(&mut f, &["bind-key", "-n", "F6", "run-shell -b -d 5 true ; set -ga @h B"]);
+    f.handle_input(1, b"\x1b[17~z");
+    assert_eq!(f.opts_session.get("@h"), Some("DB"));
+    let typed: Vec<u8> = f.pane_input.try_iter().flatten().collect();
+    assert_eq!(typed, b"z");
+    assert!(!f.client_blocked(1));
+}
+
+#[test]
+fn any_with_repeat_compares_the_bindings_key_and_bare_send_keys_sends_the_key() {
+    // server_client_repeat_time compares bd->key (KEYC_ANY) with c->last_key: a second
+    // key matched by Any is a repeat, with repeat-time, not initial-repeat-time
+    let mut f = fixture();
+    run(&mut f, &["bind-key", "-r", "-T", "prefix", "Any", "set-option -ga @h A"]);
+    run(&mut f, &["set-option", "-g", "initial-repeat-time", "3000"]);
+    run(&mut f, &["set-option", "-g", "repeat-time", "500"]);
+    f.handle_input(1, b"\x02");
+    f.handle_input(1, b"\x1b[23~");
+    let first = f.clients[&1].repeat_until.unwrap().saturating_duration_since(Instant::now());
+    assert!(first > Duration::from_millis(2000), "{first:?}");
+    f.handle_input(1, b"\x1b[24~");
+    let second = f.clients[&1].repeat_until.unwrap().saturating_duration_since(Instant::now());
+    assert!(second <= Duration::from_millis(500), "{second:?}");
+    assert_eq!(f.opts_session.get("@h"), Some("AA"));
+    run(&mut f, &["unbind-key", "-T", "prefix", "Any"]);
+    f.clients.get_mut(&1).unwrap().repeat_until = None;
+    f.clients.get_mut(&1).unwrap().set_key_table("root");
+    // cmd-send-keys.c with no keys: the event's key (for bind -n Any send-keys)
+    run(&mut f, &["bind-key", "-n", "Any", "send-keys"]);
+    run(&mut f, &["bind-key", "-n", "F5", "send-keys -N 2"]);
+    f.pane_input.try_iter().for_each(drop);
+    f.handle_input(1, b"q");
+    f.handle_input(1, b"\x1b[15~");
+    let typed: Vec<u8> = f.pane_input.try_iter().flatten().collect();
+    assert_eq!(typed, b"q");
+    // from the command line there is no key
+    run(&mut f, &["send-keys"]);
+    assert!(f.pane_input.try_recv().is_err());
+}
+
+#[test]
+fn a_window_name_timer_that_has_fired_is_dropped() {
+    // name_time_callback is a one-shot timer: with automatic-rename off (or nothing to
+    // check) a timer that has fired does not keep the loop waking
+    let mut f = fixture();
+    let pane = f.pane;
+    let wid = f.window_of(pane).unwrap();
+    f.automatic_rename();
+    run(&mut f, &["rename-window", "foo"]);
+    f.name_changed.insert(pane);
+    f.name_state.entry(wid).or_default().timer = Some(Instant::now() - Duration::from_millis(1));
+    f.automatic_rename();
+    assert!(f.name_state[&wid].timer.is_none());
+    assert!(f.next_timeout() > Duration::from_millis(5));
+}
+
+#[test]
+fn run_shell_c_waits_for_its_delay_and_with_b_goes_in_the_clients_queue() {
+    // cmd_run_shell_exec: -d also delays -C; with -b the commands are appended to the
+    // target client's queue (no state, so they log as the client's commands)
+    let mut f = fixture();
+    f.cfg_finished = true;
+    run(&mut f, &["bind-key", "-n", "F7", "run-shell -C -d 5 'set -ga @h C' ; set -ga @h E"]);
+    run(&mut f, &["bind-key", "-n", "F8", "run-shell -b -C 'set -ga @h X' ; set -ga @h Y"]);
+    f.handle_input(1, b"\x1b[18~");
+    assert_eq!(f.opts_session.get("@h"), None);
+    for d in &mut f.delayed {
+        d.0 = Instant::now();
+    }
+    f.timers();
+    assert_eq!(f.opts_session.get("@h"), Some("CE"));
+    f.handle_input(1, b"\x1b[19~");
+    assert_eq!(f.opts_session.get("@h"), Some("CEYX"));
+    assert!(f.messages.iter().any(|(_, m)| m.ends_with(" command: set-option -ag @h X") && !m.contains(" key ")), "{:?}", f.messages);
 }

@@ -484,7 +484,12 @@ impl Vars for VarCtx<'_> {
             "pane_id" => t.pane.map(|p| format!("%{p}")),
             "pane_title" => pane.map(|p| p.title.clone()),
             "pane_current_path" => pane.map(|p| p.current_path.clone()),
-            "pane_current_command" => pane.map(|p| p.current_cmd.clone()),
+            // format_cb_current_command: osdep_get_name as the format is expanded (read now
+            // on Unix, where it is quick; else what the background lookup last found)
+            "pane_current_command" => pane.map(|p| {
+                let now = if cfg!(unix) && p.dead.is_none() { procinfo::pane_programs(&[(p.pid, p.fg_pgrp())]).pop().and_then(|r| r.0) } else { None };
+                now.filter(|c| !c.is_empty()).unwrap_or_else(|| p.current_cmd.clone())
+            }),
             // cmd_stringify_argv: each argument escaped as args_print does
             "pane_start_command" => pane.map(|p| p.track.argv.iter().map(|a| options::escape_arg(a)).collect::<Vec<_>>().join(" ")),
             "pane_start_path" => pane.map(|p| p.start_path.clone()),

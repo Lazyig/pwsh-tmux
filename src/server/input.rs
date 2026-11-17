@@ -60,7 +60,8 @@ impl Client {
 pub struct InputState {
     /// When the key table was last set (keytable->activity_time), for prefix-timeout.
     pub(super) table_at: Option<Instant>,
-    last_key: String,
+    /// The key of the last binding run (c->last_key: Any for the Any binding).
+    pub(super) last_key: String,
     key_at: Option<Instant>,
     assume_paste: bool,
     guess_at: Option<Instant>,
@@ -412,24 +413,9 @@ impl Server {
                 if c.is_readonly() {
                     return;
                 }
-                // the first pasted key closes a pane waiting for one (tmux only skips the
-                // paste start and end markers)
-                if let Some(pane) = self.client_active_pane(cid).filter(|_| !data.is_empty()) {
-                    if self.dead_key(pane) {
-                        return;
-                    }
-                }
-                if let Some(target) = self.input_target(cid) {
-                    // the paste-start key reaches the pane's mode first: it ends clock mode
-                    // like any key; in another mode the pasted text is dropped
-                    match self.panes.get(&target).map(|p| &p.mode) {
-                        Some(Some(PaneMode::Clock)) => self.exit_mode(target),
-                        Some(Some(_)) => return,
-                        _ => {}
-                    }
-                    if self.panes.get(&target).is_some_and(|p| p.options.get("@input-disabled") == Some("on")) { return; }
-                    self.paste(target, &data, true, true, None);
-                }
+                // the pasted keys are items of the client's queue like typed keys
+                // (server_client_key_callback's paste_key), after the keys before them
+                self.client_append(cid, ClientItem::Paste(data));
             }
             Input::Unknown(raw) => {
                 // focus reports reach panes through pane-focus-in/out (only those that asked)
@@ -437,11 +423,46 @@ impl Server {
                     self.client_focus(cid, raw == b"\x1b[I");
                     return;
                 }
-                if let Some(t) = self.input_target(cid) {
-                    if self.panes.get(&t).is_some_and(|p| p.mode.is_none()) {
-                        self.panes[&t].send(raw);
-                    }
-                }
+                // (keys too, in the client's queue)
+                self.client_append(cid, ClientItem::Raw(raw));
+            }
+        }
+    }
+
+    /// A bracketed paste the client's queue reached (paste_key): to the pane, as it is.
+    pub(super) fn paste_now(&mut self, cid: ClientId, data: Vec<u8>) {
+        if self.client_is_readonly(Some(cid)) || self.client_session(cid).is_none() {
+            return;
+        }
+        // the first pasted key closes a pane waiting for one (tmux only skips the
+        // paste start and end markers)
+        if let Some(pane) = self.client_active_pane(cid).filter(|_| !data.is_empty()) {
+            if self.dead_key(pane) {
+                return;
+            }
+        }
+        if let Some(target) = self.input_target(cid) {
+            // the paste-start key reaches the pane's mode first: it ends clock mode
+            // like any key; in another mode the pasted text is dropped
+            match self.panes.get(&target).map(|p| &p.mode) {
+                Some(Some(PaneMode::Clock)) => self.exit_mode(target),
+                Some(Some(_)) => return,
+                _ => {}
+            }
+            if self.panes.get(&target).is_some_and(|p| p.options.get("@input-disabled") == Some("on")) { return; }
+            self.paste(target, &data, true, true, None);
+        }
+    }
+
+    /// Bytes the key parser did not know, reached in the client's queue: to the pane
+    /// when it is not in a mode.
+    pub(super) fn raw_input_now(&mut self, cid: ClientId, raw: Vec<u8>) {
+        if self.client_is_readonly(Some(cid)) {
+            return;
+        }
+        if let Some(t) = self.input_target(cid) {
+            if self.panes.get(&t).is_some_and(|p| p.mode.is_none()) {
+                self.panes[&t].send(raw);
             }
         }
     }
@@ -799,7 +820,7 @@ impl Server {
                 }
             }
             let was_repeating = repeating;
-            let found = self.bindings.get(&table).and_then(|t| t.get(&name)).map(|b| (b.cmd.clone(), b.repeat));
+            let found = self.bindings.get(&table).and_then(|t| t.get(&name)).map(|b| (b.cmd.clone(), b.repeat, name.clone()));
             // prefix-timeout counts from when the table was set, also by switch-client -T
             if table == "prefix" && prefix_ms > 0 && !(repeating && found.as_ref().is_some_and(|b| b.1))
                 && self.clients[&cid].input_state.table_at.is_some_and(|t| now.duration_since(t) > Duration::from_millis(prefix_ms)) {
@@ -809,9 +830,10 @@ impl Server {
                 continue;
             }
             // no match: the Any key of the same table (KEYC_ANY, try_again)
-            let found = found.or_else(|| self.bindings.get(&table).and_then(|t| t.get("Any")).map(|b| (b.cmd.clone(), b.repeat)));
+            // (the binding's key, KEYC_ANY, is what repeat compares with c->last_key)
+            let found = found.or_else(|| self.bindings.get(&table).and_then(|t| t.get("Any")).map(|b| (b.cmd.clone(), b.repeat, "Any".to_string())));
             match found {
-                Some((_, false)) if repeating => {
+                Some((_, false, _)) if repeating => {
                     // a binding that does not repeat ends the repeat; the key is looked up
                     // again from the default table, where it may be the prefix
                     reset(self, &default_table);
@@ -819,12 +841,12 @@ impl Server {
                     table = default_table.clone();
                     first = table.clone();
                 }
-                Some((cmd, repeat)) => {
+                Some((cmd, repeat, bkey)) => {
                     let mut ms = self.opt_session_num(Some(sid), "repeat-time").max(0) as u64;
                     let initial = self.opt_session_num(Some(sid), "initial-repeat-time").max(0) as u64;
-                    if ms > 0 && initial > 0 && (!repeating || self.clients[&cid].input_state.last_key != name) { ms = initial; }
+                    if ms > 0 && initial > 0 && (!repeating || self.clients[&cid].input_state.last_key != bkey) { ms = initial; }
                     let c = self.clients.get_mut(&cid).unwrap();
-                    c.input_state.last_key = name.clone();
+                    c.input_state.last_key = bkey;
                     if repeat && ms > 0 && table != default_table {
                         c.repeat_until = Some(Instant::now() + Duration::from_millis(ms));
                     } else {
@@ -931,7 +953,8 @@ impl Server {
                 let ctx = Ctx { client: Some(cid), pane, from_key: true, ..Ctx::default() };
                 self.client_append(cid, ClientItem::Queue(Queue { cmds: cmds.into(), ctx , soft: 0 }));
             }
-            Err(e) => self.set_error(cid, &e),
+            // cmdq_get_error: an item of the client's queue
+            Err(e) => self.client_append(cid, ClientItem::Error(e)),
         }
     }
 
@@ -953,8 +976,8 @@ impl Server {
                 group.push(vec![KEY_GROUP.clone(), "0".into()]);
                 self.prompt_inserts.entry(pr.id).or_default().extend(group);
             }
-            // cmdq_get_error: an item of its own after the prompt
-            Err(e) => self.set_error(cid, &e),
+            // cmdq_get_error: appended to the client's queue
+            Err(e) => self.client_append(cid, ClientItem::Error(e)),
         }
     }
 

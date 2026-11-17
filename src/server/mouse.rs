@@ -493,10 +493,16 @@ impl Server {
         let mut table = first.clone();
         loop {
             // (no match: the table's Any key, KEYC_ANY)
-            if let Some(b) = self.bindings.get(&table).and_then(|t| t.get(&key).or_else(|| t.get("Any"))) {
+            let found = self.bindings.get(&table).and_then(|t| t.get(&key).map(|b| (b, key.clone())).or_else(|| t.get("Any").map(|b| (b, "Any".to_string()))));
+            if let Some((b, bkey)) = found {
                 let (cmd, repeat) = (b.cmd.clone(), b.repeat);
-                let ms = self.opt_session_num(Some(sid), "repeat-time").max(0) as u64;
+                // server_client_repeat_time: initial-repeat-time unless this binding's key
+                // is repeating
+                let mut ms = self.opt_session_num(Some(sid), "repeat-time").max(0) as u64;
+                let initial = self.opt_session_num(Some(sid), "initial-repeat-time").max(0) as u64;
+                if ms > 0 && initial > 0 && (!repeating || self.clients[&cid].input_state.last_key != bkey) { ms = initial; }
                 let c = self.clients.get_mut(&cid).unwrap();
+                c.input_state.last_key = bkey;
                 if repeat && ms > 0 {
                     c.repeat_until = Some(Instant::now() + Duration::from_millis(ms));
                 } else {

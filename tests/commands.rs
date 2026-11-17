@@ -4037,3 +4037,29 @@ fn control_client_errors_set_its_exit_status_and_run_shell_c_reports_after_the_b
     assert_eq!(run("nosuchcmd\n").0, Some(0));
     assert_eq!(run("display-message -p hi\n").0, Some(0));
 }
+
+#[test]
+fn source_file_reads_the_command_line_clients_stdin_and_aliases_log_their_blocks() {
+    // file_read asks the command-line client for "-" (and /dev/stdin): its stdin
+    let ctx = Ctx::new("src-stdin");
+    ctx.ok(&["new-session", "-d", "-s", "s"]);
+    let mut child = ctx.command().args(["source-file", "-"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"if -F 1 { set -g @sf 1 }\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(ctx.ok(&["show-options", "-gv", "@sf"]).trim(), "1");
+    // (a parse error names the file "-", cfg_print_causes)
+    let mut child = ctx.command().args(["source-file", "-"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"set -g @x {\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(text.starts_with("-:2: "), "{text}");
+    assert_eq!(out.status.code(), Some(1));
+    // a command alias run from the command line: its { } blocks are logged as blocks
+    ctx.ok(&["set", "-s", "command-alias[100]", "zz=if -F 1 { set -g @al 1 }"]);
+    ctx.ok(&["zz"]);
+    let log = ctx.ok(&["show-messages"]);
+    assert!(log.contains(" command: source-file -\n"), "{log}");
+    assert!(log.contains(" command: if-shell -F 1 { set-option -g @al 1 }\n"), "{log}");
+    assert_eq!(ctx.ok(&["show-options", "-gv", "@al"]).trim(), "1");
+}
