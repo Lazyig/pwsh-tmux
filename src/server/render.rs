@@ -1530,8 +1530,11 @@ impl Server {
         c.status_ranges = next.status_ranges.clone();
         let prev = c.prev.as_ref().filter(|p| p.frame.w == next.frame.w && p.frame.h == next.frame.h);
         let mut out = String::new();
+        // a full redraw writes every row (EL ends each one), so nothing is cleared first:
+        // with clear-on-attach off an ED 2 would push the first screen into a terminal's
+        // scrollback a second time (tmux draws the lines, tty_draw_line)
         if prev.is_none() {
-            out.push_str("\x1b[0m\x1b[H\x1b[2J");
+            out.push_str("\x1b[0m\x1b[H");
         }
         let mut changed = false;
         let hyperlinks = feats.has("hyperlinks") || c.term_caps.contains_key("Hls");

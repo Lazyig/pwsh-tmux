@@ -405,8 +405,9 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                     // the server sends the theme and colour queries (VT100-like terminals only)
                     if alternate { let _ = out.write_all(b"\x1b[?1049h\x1b[H\x1b[2J"); }
                     else {
-                        // Scroll the previous terminal contents into scrollback.
-                        let _ = out.write_all(format!("\x1b[{};1H{}\x1b[H", rows, "\r\n".repeat(rows as usize + 1)).as_bytes());
+                        // Scroll the previous terminal contents into scrollback (tmux scrolls
+                        // sy + 1 lines with indn, which the terminal caps at its height).
+                        let _ = out.write_all(format!("\x1b[{};1H{}\x1b[H", rows, "\r\n".repeat(rows as usize)).as_bytes());
                     }
                     let _ = out.flush();
                     // tmux's client answers MSG_READY with MSG_RESIZE (client-resized)
