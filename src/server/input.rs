@@ -345,9 +345,10 @@ impl Server {
         let reply = c.keyp.partial_paste_end() || c.keyp.theme_reply_pending();
         c.esc_deadline = if c.keyp.has_pending() || c.keyp.partial_paste_end() {
             let mut ms = self.opts_server.get("escape-time").and_then(|v| v.parse().ok()).unwrap_or(10u64).max(1);
-            // tty_keys_next: also while a clipboard request (TTY_OSC52QUERY) is outstanding
+            // tty_keys_next: also while a clipboard request (TTY_OSC52QUERY) or a reply to
+            // the terminal requests (device attributes, DECRPM, colours) is outstanding
             let clipboard = !c.input_state.clipboard.is_empty() || c.clipboard_query.is_some_and(|d| Instant::now() < d);
-            if reply || clipboard { ms = ms.max(500); }
+            if reply || clipboard || c.terminal.replies_pending() { ms = ms.max(500); }
             if reply { Some(Instant::now() + Duration::from_millis(ms)) }
             else { c.esc_deadline.or_else(|| Some(Instant::now() + Duration::from_millis(ms))) }
         } else {

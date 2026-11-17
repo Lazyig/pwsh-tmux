@@ -203,7 +203,12 @@ impl Term {
         w.write_all(b).unwrap();
         w.flush().unwrap();
         drop(w);
-        std::thread::sleep(Duration::from_millis(120));
+        // an Escape at the end is a key only once the server's escape delay passes:
+        // at least 500ms while the terminal's replies to the attach requests are awaited
+        // (tmux 3.8 tty_keys_next; this terminal does not answer them), so the next key
+        // is not read as that key with Meta
+        let pause = if b.ends_with(b"\x1b") { 650 } else { 120 };
+        std::thread::sleep(Duration::from_millis(pause));
     }
 
     /// Prefix (C-b) then keys.

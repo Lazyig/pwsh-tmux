@@ -26,7 +26,13 @@ pub struct Terminal {
     have: u8,
     /// When the requests were sent (tty_start_start_timer).
     started: Option<Instant>,
+    /// TTY_WAITFG, TTY_WAITBG: the colour replies still awaited.
+    wait_colours: u8,
 }
+
+/// Terminal::wait_colours: the OSC 10 and OSC 11 replies.
+const WAIT_FG: u8 = 1;
+const WAIT_BG: u8 = 2;
 
 /// The request flags of Terminal::have (TTY_ALL_REQUEST_FLAGS is all of them).
 pub const HAVE_DA: u8 = 1;
@@ -65,20 +71,40 @@ impl Terminal {
     /// A reply of this kind is still taken: not received yet, and the start timer has
     /// not fired (tty_start_timer_callback stops waiting for all of them).
     pub fn waiting(&mut self, bit: u8) -> bool {
-        if self.started.is_some_and(|t| t.elapsed() > QUERY_TIMEOUT) {
-            self.have = HAVE_ALL;
-        }
+        self.start_timer();
         self.have & bit == 0
     }
     pub fn received(&mut self, bit: u8) {
         self.have |= bit;
     }
-    /// tty_repeat_requests: ask for the colours again, unless asked within REQUEST_LIMIT.
+    /// tty_start_timer_callback, QUERY_TIMEOUT after the requests were last sent: no reply
+    /// is waited for any more.
+    fn start_timer(&mut self) {
+        if self.started.is_some_and(|t| t.elapsed() > QUERY_TIMEOUT) {
+            self.have = HAVE_ALL;
+            self.wait_colours = 0;
+        }
+    }
+    /// A colour reply that parsed (tty_keys_colours clears TTY_WAITFG or TTY_WAITBG).
+    pub fn colour_received(&mut self, fg: bool) {
+        self.wait_colours &= if fg { !WAIT_FG } else { !WAIT_BG };
+    }
+    /// tty_keys_next: while replies to the requests are awaited (not all of TTY_ALL_REQUEST_FLAGS,
+    /// or TTY_WAITFG or TTY_WAITBG) a key that may be the start of one waits at least 500ms.
+    pub fn replies_pending(&mut self) -> bool {
+        self.start_timer();
+        self.started.is_some() && (self.have & HAVE_ALL != HAVE_ALL || self.wait_colours != 0)
+    }
+    /// tty_repeat_requests: ask for the colours again, unless asked within REQUEST_LIMIT
+    /// (tty_start_start_timer starts the timer again).
     pub fn requests(&mut self, force: bool) -> Option<&'static [u8]> {
         if !self.vt100 || (!force && self.last_requests.is_some_and(|t| t.elapsed() <= REQUEST_LIMIT)) {
             return None;
         }
+        self.start_timer();
         self.last_requests = Some(Instant::now());
+        self.wait_colours = WAIT_FG | WAIT_BG;
+        if self.started.is_some() { self.started = self.last_requests; }
         Some(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\")
     }
 }
@@ -413,6 +439,7 @@ impl Server {
         }
         if let Some((fg, colour)) = colour {
             if fg { c.terminal.fg = Some(colour) } else { c.terminal.bg = Some(colour); }
+            c.terminal.colour_received(fg);
         }
         c.prev = None;
         c.dirty = true;

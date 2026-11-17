@@ -24,7 +24,11 @@ decodes to Escape and `bind C-[` binds Escape), which gives tmux 3.8's "C-[ has 
 bindings of Escape" everywhere; unlike tmux, `list-keys` shows such a binding as Escape.
 Bracketed-paste terminals do not
 use paste guessing. Unterminated pastes recover after five seconds, and partial
-paste end markers receive at least 500ms before their escape timer expires.
+paste end markers receive at least 500ms before their escape timer expires. As in
+tmux 3.8 (tty_keys_next), so does a lone Escape while the terminal's replies to the
+attach requests (device attributes, DECRPM 2026, the OSC 10/11 colours) are awaited:
+until all have come or five seconds have passed, an Escape followed within 500ms by
+another key is that key with Meta.
 `xterm-keys` is retained as an intentional no-op: tmux 3.8's options-table.c
 marks this option "no longer used"; modified function keys remain enabled.
 

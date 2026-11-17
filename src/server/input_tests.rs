@@ -1129,3 +1129,34 @@ fn run_shell_c_waits_for_its_delay_and_with_b_goes_in_the_clients_queue() {
     assert_eq!(f.opts_session.get("@h"), Some("CEYX"));
     assert!(f.messages.iter().any(|(_, m)| m.ends_with(" command: set-option -ag @h X") && !m.contains(" key ")), "{:?}", f.messages);
 }
+
+#[test]
+fn escape_waits_at_least_500ms_while_terminal_replies_are_awaited() {
+    // tty_keys_next: until the terminal has answered the device attribute, DECRPM and
+    // colour requests (or the start timer fires) a lone Escape waits 500ms, so an Escape
+    // and the key typed straight after it are one Meta key, as in tmux
+    let mut f = fixture(); let sid = f.sid;
+    f.clients.get_mut(&1).unwrap().ident = Some(Identity { cols: 80, rows: 24, tty: true, cwd: String::new(), term: "xterm-256color".into(), pid: 0, ctx_pane: None, utf8: true, env: Vec::new() });
+    f.clients.get_mut(&1).unwrap().attached = false;
+    f.clients.get_mut(&1).unwrap().terminal.vt100 = true;
+    f.attach_client(1, sid);
+    f.handle_input(1, b"\x1b");
+    assert!(f.clients[&1].esc_deadline.unwrap().duration_since(Instant::now()) > Duration::from_millis(400));
+    f.clients.get_mut(&1).unwrap().keyp.flush_pending();
+    f.clients.get_mut(&1).unwrap().esc_deadline = None;
+    for reply in [&b"\x1b[?62;22c"[..], b"\x1b[>0;10;1c", b"\x1bP>|xterm(1)\x1b\\", b"\x1b[?2026;2$y", b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\"] {
+        f.handle_input(1, reply);
+    }
+    // (the background colour is still awaited)
+    f.handle_input(1, b"\x1b");
+    assert!(f.clients[&1].esc_deadline.unwrap().duration_since(Instant::now()) > Duration::from_millis(400));
+    f.clients.get_mut(&1).unwrap().keyp.flush_pending();
+    f.clients.get_mut(&1).unwrap().esc_deadline = None;
+    f.handle_input(1, b"\x1b]11;rgb:0000/0000/0000\x1b\\");
+    f.handle_input(1, b"\x1b");
+    assert!(f.clients[&1].esc_deadline.unwrap().duration_since(Instant::now()) <= Duration::from_millis(100));
+    // a terminal that is not VT100-like is asked nothing
+    let mut f = fixture();
+    f.handle_input(1, b"\x1b");
+    assert!(f.clients[&1].esc_deadline.unwrap().duration_since(Instant::now()) <= Duration::from_millis(100));
+}
