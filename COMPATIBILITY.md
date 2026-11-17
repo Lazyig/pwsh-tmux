@@ -113,7 +113,14 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   decides by its outstanding-request flags instead, so here a prompt's Escape timing does
   not depend on whether theme detection is still waiting.
 - **No signal information on Windows:** `pane_dead_signal` and other signal values are
-  never set there.
+  never set there. A popup whose command was ended (TerminateProcess) gives its waiting
+  command-line client that process's exit code, where on Unix it is the signal number
+  (WTERMSIG), as in tmux.
+- **Automatic rename and the pane's program.** tmux reads `pane_current_command` as it
+  checks a window's name; here what a pane runs is looked up in the background about once
+  a second, so a new pane's window is first checked once that lookup has found its
+  program. Otherwise names are checked as tmux does: when the active pane changes (output,
+  a mode, another active pane), at most every 500 ms.
 - **History line times** record the real time a line entered the history; tmux uses
   a time cached at the start of its event loop, which can be older.
 - **Terminal descriptions.** pwsh-tmux draws without terminfo, so a client terminal the
