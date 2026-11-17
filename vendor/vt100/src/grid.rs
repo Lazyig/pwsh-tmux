@@ -413,10 +413,6 @@ impl Grid {
     }
 
     /// Number of rows from the oldest history row through the bottom of the screen.
-    pub fn absolute_len(&self) -> usize {
-        self.scrollback_len() + self.rows.len()
-    }
-
     /// Row `index` counted from the oldest history row (0), ignoring the
     /// current scrollback view offset.
     pub fn absolute_row(&self, index: usize) -> Option<&crate::row::Row> {
@@ -454,6 +450,23 @@ impl Grid {
 
     pub fn scrollback_len(&self) -> usize {
         self.scrollback.as_ref().map_or(0, |s| s.rows.len())
+    }
+
+    /// session_update_history: a new history-limit, with the history over it
+    /// collected at once (grid_collect_history(gd, 1)). Like tmux a full history
+    /// loses at least one line.
+    pub fn set_scrollback_capacity(&mut self, limit: usize) {
+        let Some(s) = self.scrollback.as_mut() else { return };
+        s.capacity = limit;
+        let len = s.rows.len();
+        if len == 0 || len < limit {
+            return;
+        }
+        let ny = (len - limit).max(1).min(len);
+        s.rows.drain(..ny);
+        self.history_counters.1 += ny as u64;
+        s.offset = s.offset.min(s.rows.len());
+        s.unbounded_len = s.unbounded_len.saturating_sub(ny);
     }
 
     pub fn scrollback(&self) -> usize {
@@ -984,10 +997,19 @@ impl Grid {
             // Number of rows that will be pushed to the scrollback.
             let num_pushed = count.min(scrollback.capacity);
 
-            // Scrollback length is capped at `scrollback.capacity`. These rows
-            // will be lost, so just remove them now to avoid allocating.
-            let scrollback_overflow = (scrollback.rows.len() + num_pushed)
-                .saturating_sub(scrollback.capacity);
+            // grid_collect_history(gd, 0) before each line enters it: a full
+            // history loses a tenth of its limit (at least one line) at once.
+            let cap = scrollback.capacity;
+            let (mut len, mut scrollback_overflow) = (scrollback.rows.len(), 0);
+            for _ in 0..num_pushed {
+                if len > 0 && len >= cap {
+                    let ny = (cap / 10).max(1).min(len);
+                    len -= ny;
+                    scrollback_overflow += ny;
+                }
+                len += 1;
+            }
+            let scrollback_overflow = scrollback_overflow.min(scrollback.rows.len());
             for row in scrollback.rows.drain(0..scrollback_overflow) {
                 on_row(&row);
             }

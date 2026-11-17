@@ -11,6 +11,7 @@ mod events;
 mod float;
 /// The JSON subset tmux parses (layouts, display-message -j).
 pub use cmds::json::{parse as json_parse, Node as Json};
+pub use cmds::strerror;
 pub mod features;
 mod termcap;
 mod terminfo;
@@ -132,6 +133,8 @@ pub struct PaneCb {
     pub ext_keys: u8,
     /// extended-keys as the parser last saw it (0 off, 1 on, 2 always).
     pub ext_option: u8,
+    /// The pane's cursor-style option (DECSCUSR number), for DECRQM 12 and DECRQSS.
+    pub cursor_style_opt: u16,
     pub clipboard_queries: Vec<(Vec<u8>, bool)>,
     /// OSC 52 selections set by the application (selector, base64 data).
     pub clipboard_sets: Vec<(Vec<u8>, Vec<u8>)>,
@@ -166,7 +169,15 @@ impl OscState {
         // tmux sees the text after "N;" with its separators
         let arg = rest.iter().map(|p| String::from_utf8_lossy(p)).collect::<Vec<_>>().join(";");
         match *first {
-            b"7" => self.path = arg.chars().filter(|c| !c.is_control()).collect(),
+            // screen_set_path(untrusted): clean_name keeps the old path for one that is not
+            // valid and turns "#(" into "_(" (on Windows a backslash stays, as in titles)
+            b"7" => {
+                let raw = rest.join(&b';');
+                let clean = |p: &str| if cfg!(windows) { cmds::check_name(p).then(|| p.to_string()) } else { cmds::clean_title(p) };
+                if let Some(p) = std::str::from_utf8(&raw).ok().and_then(clean) {
+                    self.path = p.replace("#(", "_(");
+                }
+            }
             b"9" => self.progress(&arg),
             b"12" if arg != "?" => {
                 if let Some(c) = parse_x11_colour(&arg) {
@@ -340,7 +351,27 @@ impl vt100::Callbacks for PaneCb {
             self.events.push(events::OutputEvent::Clipboard);
         }
     }
-    fn dcs(&mut self, _: &mut vt100::Screen, payload: &[u8]) {
+    fn dcs(&mut self, screen: &mut vt100::Screen, payload: &[u8]) {
+        // DECRQSS (DCS $ q Pt ST, input_handle_decrqss): only the cursor style (SP q) is
+        // known; anything else is answered as not recognized
+        let data = payload.iter().position(|b| !(0x30..=0x3f).contains(b)).map_or(&payload[payload.len()..], |i| &payload[i..]);
+        if let Some(pt) = data.strip_prefix(b"$q") {
+            if pt.starts_with(b" q") {
+                use vt100::CursorStyle as C;
+                let blink = screen.cursor_blinking().0;
+                let ps = match screen.cursor_style() {
+                    C::BlinkBlock | C::SteadyBlock => if blink { 1 } else { 2 },
+                    C::BlinkUnderline | C::SteadyUnderline => if blink { 3 } else { 4 },
+                    C::BlinkVerticalBar | C::SteadyVerticalBar => if blink { 5 } else { 6 },
+                    // no style set: the cursor-style option
+                    C::Default => self.cursor_style_opt.min(6),
+                };
+                self.replies.extend(format!("\x1bP1$r q{ps} q\x1b\\").bytes());
+            } else {
+                self.replies.extend(b"\x1bP0$r\x1b\\");
+            }
+            return;
+        }
         // the parser already turned the doubled ESC bytes back into one
         if let Some(payload) = payload.strip_prefix(b"tmux;") {
             self.passthrough.push(payload.to_vec());
@@ -394,23 +425,102 @@ impl vt100::Callbacks for PaneCb {
     fn unhandled_csi(&mut self, screen: &mut vt100::Screen, i1: Option<u8>, _i2: Option<u8>, params: &[&[u16]], c: char) {
         let first = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
         match (i1, c, first) {
-            (Some(b'?'), 'p', 2031) if _i2 == Some(b'$') => {
-                self.replies.extend(format!("\x1b[?2031;{}$y", if screen.theme_updates() { 1 } else { 2 }).bytes());
+            // DECRQM for DEC private modes (INPUT_CSI_QUERY_PRIVATE): 1 set, 2 reset,
+            // 4 permanently reset, 0 unknown
+            (Some(b'?'), 'p', m) if _i2 == Some(b'$') && m > 0 => {
+                use vt100::MouseProtocolMode as M;
+                let on = |v: bool| if v { 1 } else { 2 };
+                let mouse = screen.mouse_protocol_mode();
+                let n = match m {
+                    1 => on(screen.application_cursor()),
+                    3 => 4,
+                    6 => on(screen.origin_mode()),
+                    7 => on(screen.wrap_mode()),
+                    12 => {
+                        let (blink, set) = screen.cursor_blinking();
+                        if screen.cursor_style() != vt100::CursorStyle::Default || set {
+                            on(blink)
+                        } else {
+                            // blinking for the odd cursor-style values
+                            on(self.cursor_style_opt % 2 == 1)
+                        }
+                    }
+                    25 => on(!screen.hide_cursor()),
+                    47 | 1047 | 1049 => on(screen.alternate_screen()),
+                    1000 => on(matches!(mouse, M::PressRelease | M::Press)),
+                    1002 => on(mouse == M::ButtonMotion),
+                    1003 => on(mouse == M::AnyMotion),
+                    1004 => on(screen.focus_events()),
+                    1005 => on(screen.mouse_encodings().0),
+                    1006 => on(screen.mouse_encodings().1),
+                    2004 => on(screen.bracketed_paste()),
+                    2026 => on(screen.synchronized_output()),
+                    2031 => on(screen.theme_updates()),
+                    _ => 0,
+                };
+                self.replies.extend(format!("\x1b[?{m};{n}$y").bytes());
             }
+            // DECRQM for ANSI modes (INPUT_CSI_QUERY): only IRM is known
+            (Some(b'$'), 'p', m) if _i2.is_none() && m > 0 => {
+                let n = if m == 4 { if screen.insert_mode() { 1 } else { 2 } } else { 0 };
+                self.replies.extend(format!("\x1b[{m};{n}$y").bytes());
+            }
+            // XTVERSION
+            (Some(b'>'), 'q', 0) => self.replies.extend(format!("\x1bP>|tmux {}\x1b\\", TMUX_VERSION).bytes()),
             (Some(b'?'), 'n', 996) => self.colours.report(&mut self.replies),
-            (None, 't', 22) if params.get(1).and_then(|p| p.first()).is_some_and(|p| matches!(p, 0 | 2)) => {
-                if self.title_stack.len() == 10 {
-                    self.title_stack.pop_front();
+            // window operations (input_csi_dispatch_winops), each with its arguments;
+            // vt100 itself handles 8 (resize)
+            (None, 't', _) => {
+                let arg = |i: usize| params.get(i).and_then(|p| p.first()).copied();
+                let (rows, cols) = screen.size();
+                let (y, x) = (u32::from(rows.get()), u32::from(cols.get()));
+                // tmux's default cell size when the terminal does not report pixels
+                let (xpixel, ypixel) = (16, 32);
+                let mut m = 0;
+                while let Some(n) = arg(m) {
+                    match n {
+                        3 | 4 | 8 => {
+                            m += 2;
+                            if arg(m - 1).is_none() || arg(m).is_none() {
+                                return;
+                            }
+                        }
+                        9 | 10 => {
+                            m += 1;
+                            if arg(m).is_none() {
+                                return;
+                            }
+                        }
+                        14 => self.replies.extend(format!("\x1b[4;{};{}t", y * ypixel, x * xpixel).bytes()),
+                        15 => self.replies.extend(format!("\x1b[5;{};{}t", y * ypixel, x * xpixel).bytes()),
+                        16 => self.replies.extend(format!("\x1b[6;{ypixel};{xpixel}t").bytes()),
+                        18 => self.replies.extend(format!("\x1b[8;{y};{x}t").bytes()),
+                        19 => self.replies.extend(format!("\x1b[9;{y};{x}t").bytes()),
+                        22 | 23 => {
+                            m += 1;
+                            match arg(m) {
+                                None => return,
+                                Some(0 | 2) if n == 22 => {
+                                    if self.title_stack.len() == 10 {
+                                        self.title_stack.pop_front();
+                                    }
+                                    self.title_stack.push_back(self.current_title.clone());
+                                }
+                                Some(0 | 2) => {
+                                    if let Some(title) = self.title_stack.pop_back() {
+                                        self.current_title = title;
+                                    }
+                                    let title = self.current_title.clone();
+                                    self.title = Some(title.clone());
+                                    self.events.push(events::OutputEvent::Title(title));
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                    m += 1;
                 }
-                self.title_stack.push_back(self.current_title.clone());
-            }
-            (None, 't', 23) if params.get(1).and_then(|p| p.first()).is_some_and(|p| matches!(p, 0 | 2)) => {
-                if let Some(title) = self.title_stack.pop_back() {
-                    self.current_title = title;
-                }
-                let title = self.current_title.clone();
-                self.title = Some(title.clone());
-                self.events.push(events::OutputEvent::Title(title));
             }
             (None, 'n', 6) => {
                 let (r, c) = screen.cursor_position();
@@ -640,8 +750,11 @@ pub struct Window {
     /// The cell a pane had when it last floated (tmux `layout_cell.fg`), for break-pane -W.
     pub float_saved: HashMap<PaneId, crate::layout::FGeom>,
     pub options: Options,
-    #[allow(dead_code)]
+    /// tmux w->flags: bell, activity and silence seen but not yet checked
+    /// (alerts_check_session finds them later if monitoring is turned on).
     pub alerts: u8,
+    /// When the silence timer (alerts_timer) was last reset, in microseconds.
+    pub silence_reset_us: u64,
     pub layout_cycle: Option<usize>,
     pub old_layout: Option<String>,
     pub created: u64,
@@ -780,6 +893,16 @@ pub struct Identity {
     pub env: Vec<(String, String)>,
 }
 
+impl Identity {
+    /// server_client_check_nested: $TMUX is set and the client runs in one of this
+    /// server's panes (here: its pane and the server pid in $PWSH_TMUX), so a client in
+    /// another server's pane is not nested.
+    pub fn nested(&self) -> bool {
+        let ours = self.env.iter().find(|(k, _)| k == "PWSH_TMUX").and_then(|(_, v)| v.rsplit(',').nth(1)?.parse::<u32>().ok()) == Some(std::process::id());
+        ours && self.ctx_pane.is_some()
+    }
+}
+
 pub enum PromptKind {
     Command,
     Confirm,
@@ -895,6 +1018,11 @@ pub struct Client {
     pub keyp: keys::Parser,
     pub input_state: input::InputState,
     pub term_caps: BTreeMap<String, String>,
+    /// terminal-overrides as they were when the terminal description was made
+    /// (tty_term_create) or its features last changed (tty_update_features).
+    pub term_overrides: Option<Vec<String>>,
+    /// What the terminal called itself in its XTVERSION reply (c->term_type).
+    pub term_type: String,
     pub esc_deadline: Option<Instant>,
     pub prompt: Option<Prompt>,
     pub overlay: Option<Overlay>,
@@ -1101,6 +1229,9 @@ pub struct Ctx {
     pub files: Vec<String>,
     /// The line of the command running in each of `files` (0 before the first).
     pub lines: Vec<usize>,
+    /// Which of `files` source-file opened (its nesting limit does not count the
+    /// startup configuration).
+    pub sourced: Vec<bool>,
     /// The startup configuration's queue (the global queue: errors never end it).
     pub cfg: bool,
     /// The exit status for the command-line client (c->retval: run-shell and new-pane -W
@@ -1146,6 +1277,8 @@ pub static FILE_POP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| i
 /// Before each command of a file: its line (cmd_get_source), which also makes its group.
 pub static LINE_MARK: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("line"));
 /// The end of the startup configuration (cfg_done).
+/// An error without a message (cmdq_error not called): it ends the command's group only.
+pub const QUIET_ERROR: &str = "\0quiet-error";
 pub static CFG_DONE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| internal_mark("cfg-done"));
 
 /// The tmux release whose behaviour this server matches (`#{version}`).
@@ -1210,11 +1343,17 @@ pub struct Server {
     /// While send-keys -K types keys: the client that ran it (key_bindings_dispatch
     /// queues the bound commands for that client).
     pub key_origin: Option<ClientId>,
+    /// send-keys -K: the bound commands of the keys it handles, which go in its own
+    /// queue after it (server_client_handle_key_after) instead of a queue of their own.
+    pub key_capture: Option<Vec<Vec<String>>>,
     /// Events: hook bookkeeping, wait-for -E, monitors, change detection.
     pub ev: events::State,
     pub buffers: Vec<Buffer>,
     pub buffer_seq: u32,
     pub bindings: BTreeMap<String, BTreeMap<String, Binding>>,
+    /// The key tables that still have their default_key_bindings (a table removed and
+    /// made again has none).
+    pub default_tables: std::collections::BTreeSet<String>,
     pub messages: VecDeque<(u64, String)>,
     /// Prompt history per type (command, search).
     pub prompt_history: [Vec<String>; 2],
@@ -1354,16 +1493,17 @@ pub fn run(config: Option<String>, cwd: Option<String>) -> io::Result<()> {
         srv.ev.activity.clear();
         srv.control_notify();
         srv.render_all();
-        let exit_empty = options::is_on(srv.opts_server.get("exit-empty").unwrap_or("on"));
-        let idle = srv.sessions.is_empty() && exit_empty && (srv.had_session || started.elapsed() > Duration::from_secs(30));
-        let unattached = options::is_on(srv.opts_server.get("exit-unattached").unwrap_or("off"))
-            && srv.had_session
-            && !srv.clients.values().any(|c| c.attached);
-        if srv.quit || idle || unattached {
-            break;
+        // server_loop: the server goes only once every client has gone (here: has its
+        // reply), so a command that connected as the last session went is still served
+        if srv.quit || srv.would_exit(None, started.elapsed() > Duration::from_secs(30)) {
+            match rx.try_recv() {
+                Ok(ev) if !srv.quit => srv.handle(ev),
+                _ => break,
+            }
         }
     }
-    // no client reaches a server that is shutting down (kill-server has done this already)
+    // no new clients from here (kill-server has stopped listening already): one started
+    // now finds no server and starts its own
     ipc::cleanup();
     srv.shutdown();
     srv.save_prompt_history();
@@ -1372,6 +1512,17 @@ pub fn run(config: Option<String>, cwd: Option<String>) -> io::Result<()> {
 }
 
 impl Server {
+    /// server_loop's exit test: no sessions (exit-empty) or no attached client
+    /// (exit-unattached), and no client other than `except` still waiting for its reply.
+    pub fn would_exit(&self, except: Option<ClientId>, timed_out: bool) -> bool {
+        let exit_empty = options::is_on(self.opts_server.get("exit-empty").unwrap_or("on"));
+        let idle = self.sessions.is_empty() && exit_empty && (self.had_session || timed_out);
+        let unattached = options::is_on(self.opts_server.get("exit-unattached").unwrap_or("off"))
+            && self.had_session
+            && !self.clients.values().any(|c| c.attached);
+        (idle || unattached) && self.clients.iter().all(|(id, c)| Some(*id) == except || c.io.exit_sent.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
     fn new(tx: mpsc::SyncSender<Event>) -> Self {
         let mut env = BTreeMap::new();
         for (k, v) in std::env::vars() {
@@ -1397,10 +1548,12 @@ impl Server {
             env_hidden: std::collections::HashSet::new(),
             cfg_finished: false,
             key_origin: None,
+            key_capture: None,
             ev: Default::default(),
             buffers: Vec::new(),
             buffer_seq: 0,
             bindings: input::default_bindings(),
+            default_tables: input::default_bindings().into_keys().collect(),
             messages: VecDeque::new(),
             prompt_history: Default::default(),
             jobs: HashMap::new(),
@@ -1615,6 +1768,14 @@ impl Server {
         v
     }
 
+    /// links_of in w->winlinks order: the order the links were made.
+    pub fn winlinks_of(&self, wid: WinId) -> Vec<(SessId, u32)> {
+        let mut v = self.links_of(wid);
+        let seq = &self.ev.seen.link_seq;
+        v.sort_by_key(|k| seq.get(k).filter(|(w, _)| *w == wid).map_or(u64::MAX, |(_, n)| *n));
+        v
+    }
+
     pub fn session_of_pane(&self, pane: PaneId) -> Option<(SessId, u32)> {
         let wid = self.window_of(pane)?;
         let links = self.links_of(wid);
@@ -1821,6 +1982,8 @@ impl Server {
                 keyp: keys::Parser::new(),
                 input_state: Default::default(),
                 term_caps: Default::default(),
+                term_overrides: None,
+                term_type: String::new(),
                 esc_deadline: None,
                 prompt: None,
                 overlay: None,
@@ -1907,9 +2070,10 @@ impl Server {
         if c.attached {
             if let Some(sid) = c.session {
                 self.update_session_size(sid);
-                self.check_destroy_unattached(sid);
             }
         }
+        // any client lost, a command client too (server_client_lost)
+        self.check_destroy_unattached();
     }
 
     /// server-access: let the owner, root/SYSTEM and allowed users in.
@@ -1955,6 +2119,7 @@ impl Server {
             C_IDENTIFY => {
                 let a = decode_args(&payload);
                 let get = |i: usize| a.get(i).cloned().unwrap_or_default();
+                let env: Vec<(String, String)> = a.iter().skip(10).filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect();
                 let ident = Identity {
                     cols: get(0).parse::<u16>().unwrap_or(80).min(MAX_SIZE),
                     rows: get(1).parse::<u16>().unwrap_or(24).min(MAX_SIZE),
@@ -1962,9 +2127,10 @@ impl Server {
                     cwd: get(3),
                     term: get(4),
                     pid: get(5).parse().unwrap_or(0),
+                    // cmd_find_inside_pane falls back to $TMUX_PANE whichever server set it
                     ctx_pane: get(6).strip_prefix('%').and_then(|s| s.parse().ok()),
                     utf8: get(9) != "0",
-                    env: a.iter().skip(10).filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect(),
+                    env,
                 };
                 let control = get(7).parse().unwrap_or(0);
                 let colorterm = ident.env.iter().find(|(k, _)| k == "COLORTERM").map(|(_, v)| v.as_str()).unwrap_or("");
@@ -1976,6 +2142,7 @@ impl Server {
                 let vt100 = theme::vt100_like(&ident.term, &overrides);
                 let terminal = control > 0 || ident.tty;
                 if let Some(c) = self.clients.get_mut(&cid) {
+                    c.term_overrides = Some(overrides.clone());
                     c.term_caps = caps;
                     c.control = control;
                     c.features = features;
@@ -2094,8 +2261,12 @@ impl Server {
         let ext_option = ext_keys_option(&self.opt_server("extended-keys"));
         let colours = self.pane_colours(id);
         let allow_title = options::is_on(&self.opt_pane(id, "allow-set-title"));
+        // the DECSCUSR number of the cursor-style choice
+        let cursor_style = ["default", "blinking-block", "block", "blinking-underline", "underline", "blinking-bar", "bar"]
+            .iter().position(|v| *v == self.opt_pane(id, "cursor-style")).unwrap_or(0) as u16;
         let p = self.panes.get_mut(&id).unwrap();
         p.parser.callbacks_mut().ext_option = ext_option;
+        p.parser.callbacks_mut().cursor_style_opt = cursor_style;
         p.parser.set_input_buffer_size(input_limit);
         p.parser.screen_mut().set_alternate_screen_allowed(alternate);
         p.parser.screen_mut().set_codepoint_widths(widths, variation_wide);
@@ -2147,6 +2318,7 @@ impl Server {
         // automatic-rename's inherited value, or to an empty name when that is off
         if let Some(n) = rename.filter(|_| options::is_on(&self.opt_pane(id, "allow-rename"))) {
             if let Some(wid) = self.window_of(id) {
+                *self.ev.renamed.entry(wid).or_default() += 1;
                 if n.is_empty() {
                     if let Some(w) = self.windows.get_mut(&wid) { w.options.unset("automatic-rename"); }
                     if !self.opt_window_on(Some(wid), "automatic-rename") {
@@ -2173,62 +2345,102 @@ impl Server {
         if let Some(w) = self.windows.get_mut(&wid) {
             w.activity = now_secs();
             w.activity_us = now_us();
+            // alerts_queue sets the window flags even when nothing monitors them, and
+            // alerts_reset restarts the silence timer
+            w.alerts |= ALERT_ACTIVITY | if bell { ALERT_BELL } else { 0 };
+            w.alerts &= !ALERT_SILENCE;
+            w.silence_reset_us = now_us();
         }
         self.pane_output_events(id, osc_events, clip_set);
-        if bell && self.opt_window_on(Some(wid), "monitor-bell") {
-            self.alert(wid, ALERT_BELL);
-        }
-        if self.opt_window_on(Some(wid), "monitor-activity") {
-            self.alert(wid, ALERT_ACTIVITY);
+        // alerts_enabled for the flags queued: then alerts_callback checks all of them
+        if (bell && self.opt_window_on(Some(wid), "monitor-bell")) || self.opt_window_on(Some(wid), "monitor-activity") {
+            self.alerts_callback(wid);
         }
         self.mark_window_dirty(wid);
     }
 
-    /// Flags a window in every session where it is not the current window.
-    pub fn alert(&mut self, wid: WinId, flag: u8) {
-        let links = self.links_of(wid);
-        let mut hooks = Vec::new();
-        for (sid, idx) in links {
-            let s = self.sessions.get_mut(&sid).unwrap();
-            let attached_here = self.clients.values().any(|c| c.attached && c.session == Some(sid));
-            if s.active == idx && attached_here {
-                continue;
-            }
-            let e = s.alerts.entry(idx).or_insert(0);
-            if *e & flag == 0 {
-                *e |= flag;
-                let (opt, visual, hook) = match flag {
-                    ALERT_BELL => ("bell-action", "visual-bell", "alert-bell"),
-                    ALERT_ACTIVITY => ("activity-action", "visual-activity", "alert-activity"),
-                    _ => ("silence-action", "visual-silence", "alert-silence"),
-                };
-                hooks.push((sid, idx, opt, visual, hook));
-            }
+    /// alerts_check_all: each flag the window has whose monitor option is on.
+    pub fn alerts_check_all(&mut self, wid: WinId) {
+        let pending = self.windows.get(&wid).map_or(0, |w| w.alerts);
+        if pending & ALERT_BELL != 0 && self.opt_window_on(Some(wid), "monitor-bell") {
+            self.alert(wid, ALERT_BELL);
         }
-        for (sid, idx, opt, visual, hook) in hooks {
-            let action = self.opt_session(Some(sid), opt);
-            if action == "none" {
+        if pending & ALERT_ACTIVITY != 0 && self.opt_window_on(Some(wid), "monitor-activity") {
+            self.alert(wid, ALERT_ACTIVITY);
+        }
+        if pending & ALERT_SILENCE != 0 && self.windows.contains_key(&wid) && self.opt_window_num(Some(wid), "monitor-silence") != 0 {
+            self.alert(wid, ALERT_SILENCE);
+        }
+    }
+
+    /// alerts_callback: the window is checked, then its flags are cleared.
+    fn alerts_callback(&mut self, wid: WinId) {
+        self.alerts_check_all(wid);
+        if let Some(w) = self.windows.get_mut(&wid) {
+            w.alerts &= !(ALERT_BELL | ALERT_ACTIVITY | ALERT_SILENCE);
+        }
+    }
+
+    /// alerts_reset_all: monitor-silence changed, every silence timer starts again.
+    pub fn alerts_reset_all(&mut self) {
+        let now = now_us();
+        for w in self.windows.values_mut() {
+            w.alerts &= !ALERT_SILENCE;
+            w.silence_reset_us = now;
+        }
+    }
+
+    /// tmux alerts_check_{bell,activity,silence}: flags the window in every session where it is
+    /// not the current window of an attached session, then, when {bell,activity,silence}-action
+    /// applies (any, current or other), fires the hook and tells the session's clients once.
+    pub fn alert(&mut self, wid: WinId, flag: u8) {
+        let (opt, visual, hook, what) = match flag {
+            ALERT_BELL => ("bell-action", "visual-bell", "alert-bell", "Bell"),
+            ALERT_ACTIVITY => ("activity-action", "visual-activity", "alert-activity", "Activity"),
+            _ => ("silence-action", "visual-silence", "alert-silence", "Silence"),
+        };
+        let mut alerted: Vec<SessId> = Vec::new();
+        for (sid, idx) in self.winlinks_of(wid) {
+            let attached = self.clients.values().any(|c| c.attached && c.session == Some(sid));
+            let Some(s) = self.sessions.get_mut(&sid) else { continue };
+            // bells are allowed even with an existing bell; activity and silence are not
+            if flag != ALERT_BELL && s.alerts.get(&idx).is_some_and(|a| a & flag != 0) {
                 continue;
             }
-            let vis = self.opt_session(Some(sid), visual);
-            let what = match flag {
-                ALERT_BELL => "Bell",
-                ALERT_ACTIVITY => "Activity",
-                _ => "Silence",
+            let current = s.active == idx;
+            if !current || !attached {
+                *s.alerts.entry(idx).or_insert(0) |= flag;
+                self.mark_session_dirty(sid);
+            }
+            let applies = match self.opt_session(Some(sid), opt).as_str() {
+                "any" => true,
+                "current" => current,
+                "other" => !current,
+                _ => false,
             };
-            let cids: Vec<ClientId> = self.clients.values().filter(|c| c.attached && c.session == Some(sid)).map(|c| c.id).collect();
-            for cid in cids {
-                if vis == "on" || vis == "both" {
-                    self.set_message(cid, &format!("{what} in window {idx}"));
-                }
-                if flag == ALERT_BELL && vis != "on" {
-                    if let Some(c) = self.clients.get(&cid).filter(|c| c.control == 0) {
-                        c.send(S_OUTPUT, b"\x07");
-                    }
-                }
+            if !applies {
+                continue;
             }
             if let Some(w) = self.sessions.get(&sid).and_then(|s| s.links.get(&idx)).copied() {
                 self.fire_winlink(hook, sid, idx, w);
+            }
+            if alerted.contains(&sid) {
+                continue;
+            }
+            alerted.push(sid);
+            // alerts_set_message: off rings, on shows a message instead, both does both
+            let vis = self.opt_session(Some(sid), visual);
+            let msg = if current { format!("{what} in current window") } else { format!("{what} in window {idx}") };
+            let cids: Vec<ClientId> = self.clients.values().filter(|c| c.attached && c.session == Some(sid) && c.control == 0).map(|c| c.id).collect();
+            for cid in cids {
+                if vis == "off" || vis == "both" {
+                    if let Some(c) = self.clients.get(&cid) {
+                        c.send(S_OUTPUT, b"\x07");
+                    }
+                }
+                if vis != "off" {
+                    self.set_message(cid, &msg);
+                }
             }
             self.mark_session_dirty(sid);
         }
@@ -2280,7 +2492,7 @@ impl Server {
             if let Some(p) = self.panes.get_mut(&id) {
                 if !fmt.is_empty() {
                     let cells = crate::format::layout_line(&crate::format::spans(&msg, Default::default()), p.size.0 as usize, Default::default());
-                    let line = render::line_with_escapes(&Line { cells, wrapped: false, ..Default::default() });
+                    let line = render::line_for_parser(&Line { cells, wrapped: false, ..Default::default() });
                     // format_draw leaves the cursor where it started, at the line's start
                     p.parser.process(format!("\x1b[r\x1b[{};1H\r\n\x1b[0m{line}\x1b[0m\r", p.size.1).as_bytes());
                 }
@@ -2473,11 +2685,42 @@ impl Server {
         if let Some(d) = self.copy_refresh_deadline() {
             t = t.min(d.saturating_duration_since(now));
         }
+        let now_us = now_us();
+        for (_, deadline, _) in self.silence_timers() {
+            t = t.min(Duration::from_micros(deadline.saturating_sub(now_us)));
+        }
         t.max(Duration::from_millis(5))
+    }
+
+    /// The windows with a silence timer (monitor-silence) and when it expires, in
+    /// microseconds, in window order.
+    fn silence_timers(&self) -> Vec<(WinId, u64, u64)> {
+        let mut v: Vec<(WinId, u64, u64)> = self.windows.values().filter_map(|w| {
+            let secs = self.opt_window_num(Some(w.id), "monitor-silence");
+            let period = (secs > 0).then(|| secs as u64 * 1_000_000)?;
+            Some((w.id, w.silence_reset_us.saturating_add(period), period))
+        }).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// alerts_timer: monitor-silence seconds after the last reset (output or the timer
+    /// itself) the window is queued for silence and the timer starts again, so the
+    /// current window of an attached session (never flagged) alerts again.
+    fn silence_check(&mut self) {
+        let now = now_us();
+        for (wid, deadline, period) in self.silence_timers() {
+            // (alert hooks may have removed windows)
+            let Some(w) = self.windows.get_mut(&wid).filter(|_| now >= deadline) else { continue };
+            w.silence_reset_us = if now - deadline < period { deadline } else { now };
+            w.alerts |= ALERT_SILENCE;
+            self.alerts_callback(wid);
+        }
     }
 
     fn timers(&mut self) {
         self.input_timers();
+        self.silence_check();
         if self.cfg_jobs_until.is_some_and(|t| Instant::now() >= t) {
             self.cfg_release_jobs();
         }
@@ -2578,26 +2821,6 @@ impl Server {
         self.check_monitors();
         self.request_pane_info();
         self.automatic_rename();
-        let wids: Vec<WinId> = self.windows.keys().copied().collect();
-        for wid in wids {
-            // silence (alert hooks run below may have removed windows)
-            if !self.windows.contains_key(&wid) {
-                continue;
-            }
-            let secs = self.opt_window_num(Some(wid), "monitor-silence");
-            if secs > 0 {
-                let Some(w) = self.windows.get(&wid) else { continue };
-                let quiet = w
-                    .layout
-                    .panes()
-                    .iter()
-                    .filter_map(|p| self.panes.get(p))
-                    .all(|p| p.last_output.elapsed() >= Duration::from_secs(secs as u64));
-                if quiet {
-                    self.alert(wid, ALERT_SILENCE);
-                }
-            }
-        }
         // status-interval redraws (clock, status-right time)
         let now = now_secs();
         let sids: Vec<SessId> = self.sessions.keys().copied().collect();
@@ -3065,16 +3288,48 @@ impl Server {
         s.alerts = std::mem::take(&mut s.alerts).into_iter().filter_map(|(i, a)| map.get(&i).map(|n| (*n, a))).collect();
     }
 
+    /// server_destroy_session: where the clients of a destroyed session go by its
+    /// detach-on-destroy (off: the newest other session; no-detached: the newest one
+    /// with no clients; previous and next: by name), and where a client that must not
+    /// detach goes when that finds none (the newest other session, with on or no-detached).
+    fn destroy_session_targets(&self, sid: SessId) -> (Option<SessId>, Option<SessId>) {
+        let Some(s) = self.sessions.get(&sid) else { return (None, None) };
+        let mode = s.options.get("detach-on-destroy").map(String::from).unwrap_or_else(|| self.opt_session(None, "detach-on-destroy"));
+        let newer = |detached: bool| {
+            self.sessions
+                .values()
+                .filter(|o| o.id != sid && !(detached && self.clients.values().any(|c| c.attached && c.session == Some(o.id))))
+                .max_by_key(|o| o.activity_seq)
+                .map(|o| o.id)
+        };
+        let by_name = |step: isize| {
+            let mut names: Vec<&Session> = self.sessions.values().collect();
+            names.sort_by(|a, b| a.name.cmp(&b.name));
+            let i = names.iter().position(|o| o.id == sid)? as isize;
+            let n = names[(i + step).rem_euclid(names.len() as isize) as usize].id;
+            (n != sid).then_some(n)
+        };
+        let s_new = match mode.as_str() {
+            "off" => newer(false),
+            "no-detached" => newer(true),
+            "previous" => by_name(-1),
+            "next" => by_name(1),
+            _ => None,
+        };
+        let cs_new = if s_new.is_none() && matches!(mode.as_str(), "on" | "no-detached") { newer(false) } else { None };
+        (s_new, cs_new)
+    }
+
     pub fn kill_session(&mut self, sid: SessId, _empty: bool) {
         // session-closed fires with the session's unlinks once the change is seen
         // (session_destroy), after what the command did before
         let closed = self.sessions.contains_key(&sid).then(|| self.payload_session(sid));
+        let (s_new, cs_new) = self.destroy_session_targets(sid);
         let Some(s) = self.sessions.remove(&sid) else { return };
         if let Some(mut p) = closed {
             p.target = vars::Target::default();
             self.ev.closed.push((sid, p));
         }
-        let detach_mode = s.options.get("detach-on-destroy").map(String::from).unwrap_or_else(|| self.opt_session(None, "detach-on-destroy"));
         for (_, wid) in &s.links {
             if self.links_of(*wid).is_empty() {
                 if let Some(w) = self.windows.remove(wid) {
@@ -3086,17 +3341,8 @@ impl Server {
         }
         let cids: Vec<ClientId> = self.clients.values().filter(|c| c.session == Some(sid)).map(|c| c.id).collect();
         for cid in cids {
-            let next = match detach_mode.as_str() {
-                "off" | "no-detached" | "previous" | "next" => self
-                    .clients
-                    .get(&cid)
-                    .and_then(|c| c.last_session)
-                    .filter(|s| self.sessions.contains_key(s))
-                    .or_else(|| self.current_session()),
-                // a no-detach-on-destroy client goes to any other session
-                _ if self.clients.get(&cid).is_some_and(|c| c.ctl.no_detach_on_destroy) => self.current_session(),
-                _ => None,
-            };
+            // a no-detach-on-destroy client goes to any other session
+            let next = s_new.or(cs_new.filter(|_| self.clients.get(&cid).is_some_and(|c| c.ctl.no_detach_on_destroy))).filter(|n| self.sessions.contains_key(n));
             match next {
                 Some(n) => self.switch_client(cid, n),
                 None => {
@@ -3118,9 +3364,27 @@ impl Server {
         }
     }
 
-    fn check_destroy_unattached(&mut self, sid: SessId) {
-        if self.opt_session_on(Some(sid), "destroy-unattached") && !self.clients.values().any(|c| c.attached && c.session == Some(sid)) {
-            self.kill_session(sid, false);
+    /// server_check_unattached: every unattached session (in name order) whose
+    /// destroy-unattached says so goes. keep-last keeps the last session of a group and
+    /// sessions not in a group; keep-group keeps only the last session of a group.
+    fn check_destroy_unattached(&mut self) {
+        let mut order: Vec<(String, SessId)> = self.sessions.values().map(|s| (s.name.clone(), s.id)).collect();
+        order.sort();
+        for (_, sid) in order {
+            let Some(group) = self.sessions.get(&sid).map(|s| s.group) else { continue };
+            if self.clients.values().any(|c| c.attached && c.session == Some(sid)) {
+                continue;
+            }
+            let count = group.map(|g| self.sessions.values().filter(|s| s.group == Some(g)).count());
+            let destroy = match self.opt_session(Some(sid), "destroy-unattached").as_str() {
+                "on" => true,
+                "keep-last" => count.is_some_and(|n| n > 1),
+                "keep-group" => count != Some(1),
+                _ => false,
+            };
+            if destroy {
+                self.kill_session(sid, false);
+            }
         }
     }
 
@@ -3163,6 +3427,11 @@ impl Server {
             let active = s.active;
             if writable { s.alerts.remove(&active); }
         }
+        // alerts_check_session: flags left on the session's windows
+        let wids: Vec<WinId> = self.sessions.get(&sid).map(|s| s.links.values().copied().collect()).unwrap_or_default();
+        for wid in wids {
+            self.alerts_check_all(wid);
+        }
         // server_client_set_session: the client is focused (set above) and its window's
         // latest, then the sizes are recalculated
         if let Some((_, wid)) = self.session_window(sid) {
@@ -3184,6 +3453,9 @@ impl Server {
         self.fire("client-session-changed", p);
         if !was_attached {
             self.fire_client("client-attached", cid);
+            // server_client_set_session checks every session (switch_client_env does
+            // this after the old session's size is updated)
+            self.check_destroy_unattached();
         }
     }
 
@@ -3202,7 +3474,7 @@ impl Server {
         self.attach_client_env(cid, sid, update_env);
         if let Some(o) = old.filter(|o| *o != sid) {
             self.update_session_size(o);
-            self.check_destroy_unattached(o);
+            self.check_destroy_unattached();
         }
     }
 
@@ -3237,7 +3509,7 @@ impl Server {
             self.latest_lost(cid);
             self.update_session_size(sid);
             self.fire("client-detached", events::Payload { readonly, ..detached });
-            self.check_destroy_unattached(sid);
+            self.check_destroy_unattached();
         }
     }
 
@@ -3481,6 +3753,12 @@ impl Server {
         let (mw, mh) = w.layout.min_size();
         let (sx, sy) = (cols.max(1).max(mw), rows.max(1).max(mh));
         if (w.sx, w.sy) != (sx, sy) {
+            // layout_resize (the zoomed layout is the one pane)
+            if w.sx > 0 && w.sy > 0 && !w.zoomed {
+                let (old, new) = (Rect { x: 0, y: 0, w: w.sx, h: w.sy }, Rect { x: 0, y: 0, w: sx, h: sy });
+                w.layout.tmux_resize(old, new, 1);
+            }
+            let w = self.windows.get_mut(&wid).unwrap();
             w.sx = sx;
             w.sy = sy;
             self.clamp_floats(wid);
@@ -3610,11 +3888,13 @@ impl Server {
             if name == *FILE_PUSH {
                 q.ctx.files.push(cmd.get(1).cloned().unwrap_or_default());
                 q.ctx.lines.push(0);
+                q.ctx.sourced.push(cmd.get(2).is_some());
                 continue;
             }
             if name == *FILE_POP {
                 q.ctx.files.pop();
                 q.ctx.lines.pop();
+                q.ctx.sourced.pop();
                 continue;
             }
             if name == *LINE_MARK {
@@ -3643,6 +3923,32 @@ impl Server {
             let readonly = self.readonly_context.replace(q.ctx.readonly);
             self.detect_changes(cmds::canonical(&name));
             self.readonly_context.set(readonly);
+            if matches!(&result, Err(e) if e == QUIET_ERROR) {
+                // a command that failed without cmdq_error (unbind-key -q): command-error
+                // still runs and the rest of its group goes, but the exit status stays 0
+                self.cur_mouse = saved_mouse;
+                self.cur_file = saved_file;
+                self.ev.cur_formats = saved_formats;
+                self.ev.in_hook = saved_hook;
+                if !soft && !hook_saved.is_empty() {
+                    self.control_item_done(&mut q, Some(""));
+                    Self::skip_hook_list(&mut q, &mut hook_saved);
+                    continue;
+                }
+                self.command_hook("command-error", &argv, &q.ctx);
+                let hooks = std::mem::take(&mut self.ev.inject);
+                if soft {
+                    Self::skip_group(&mut q);
+                } else {
+                    q.cmds.retain(|c| c.first() == Some(&*CFG_DONE));
+                    q.soft = 0;
+                }
+                self.control_item_done(&mut q, Some(""));
+                for c in hooks.into_iter().rev() {
+                    q.cmds.push_front(c);
+                }
+                continue;
+            }
             if let Err(e) = &result && !e.starts_with('\0') && !soft && !hook_saved.is_empty() {
                 // a hook command: the error ends that hook's list, the rest goes on
                 self.cur_mouse = saved_mouse;
@@ -3929,6 +4235,18 @@ impl Server {
                 let msg = format!("{} message: {e}", c.name());
                 self.add_message(&msg);
             }
+            // the command client is lost next (server_client_lost): check now so the next
+            // command sees the result, and if the server goes with it, stop listening
+            // before the reply so that command starts a server of its own
+            self.check_destroy_unattached();
+            // (not while hooks, jobs or delayed commands could still make a session)
+            if self.would_exit(Some(rc), false) && self.ev.pending.is_empty() && self.jobs.is_empty() && self.delayed.is_empty() {
+                ipc::cleanup();
+                // a Windows pipe lasts until the process exits: the client waits (kill-server)
+                if cfg!(windows) && let Some(c) = self.clients.get(&rc) {
+                    c.send(S_SHUTDOWN, b"");
+                }
+            }
             let Some(c) = self.clients.get(&rc) else { return };
             // config file errors go to stderr too and make the exit status 1
             let err = match (err, ctx.soft_err.trim_end_matches('\n')) {
@@ -4091,6 +4409,12 @@ fn strip_delay(cmd: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod input_tests;
+
+#[cfg(test)]
+mod surface_tests;
+
+#[cfg(test)]
+mod audit_tests;
 
 #[cfg(test)]
 mod size_tests {

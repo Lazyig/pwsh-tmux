@@ -137,7 +137,8 @@ fn tab_cells_are_captured_and_copied_as_tabs() {
     assert!(grid.contains("\t\tC 0,1 data=(7,7,       ) flags=TAB[80] ") && grid.contains("\t\tC 0,2 data=(1,1,!) flags=PADDING[4] "), "{grid}");
     assert!(grid.contains("\tL 0 (0) flags=EXTENDED[2] "), "{grid}");
     // the tab keeps the style of the cells it is written over
-    assert!(cap(&ctx, &["-e"])[4].contains("a\x1b[0m\t\x1b[0;41mb"), "{:?}", cap(&ctx, &["-e"])[4]);
+    // (capture -e writes only what changes, as grid_string_cells_code)
+    assert!(cap(&ctx, &["-e"])[4].contains("\x1b[41ma\x1b[49m\t\x1b[41mb"), "{:?}", cap(&ctx, &["-e"])[4]);
     ctx.ok(&["copy-mode", "-t", "m"]);
     x(&ctx, &["top-line"]);
     x(&ctx, &["begin-selection"]);

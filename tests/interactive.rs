@@ -353,8 +353,9 @@ fn detach_attach_and_nesting() {
     b.wait_screen("second attached", |s| s.contains("[d]"));
     a.wait_exit();
     assert_eq!(ctx.ok(&["list-clients"]).lines().count(), 1);
-    // attaching from inside a pane is refused
-    let inner = ctx.command().args(["attach", "-t", "d"]).env("PWSH_TMUX", "x").env("PWSH_TMUX_PANE", "%0").output().unwrap();
+    // attaching from inside a pane of this server ($PWSH_TMUX names its pid) is refused
+    let label = format!("x,{},0", ctx.fmt("d", "#{pid}"));
+    let inner = ctx.command().args(["attach", "-t", "d"]).env("PWSH_TMUX", label).env("PWSH_TMUX_PANE", "%0").output().unwrap();
     assert!(!inner.status.success());
     assert!(String::from_utf8_lossy(&inner.stderr).contains("nested"));
     // kill-server ends the client

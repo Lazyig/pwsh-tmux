@@ -455,13 +455,13 @@ pub struct RenderStyle {
 
 impl Default for RenderStyle {
     fn default() -> Self {
-        let mode = Style { fg: BLACK, bg: YELLOW, attrs: 0 };
+        let mode = Style { fg: BLACK, bg: YELLOW, attrs: 0, ..Style::default() };
         RenderStyle {
             selection: mode,
             selection_noattr: true,
-            matched: Style { fg: BLACK, bg: CYAN, attrs: 0 },
-            current_match: Style { fg: BLACK, bg: MAGENTA, attrs: 0 },
-            mark: Style { fg: BLACK, bg: YELLOW, attrs: 0 },
+            matched: Style { fg: BLACK, bg: CYAN, attrs: 0, ..Style::default() },
+            current_match: Style { fg: BLACK, bg: MAGENTA, attrs: 0, ..Style::default() },
+            mark: Style { fg: BLACK, bg: YELLOW, attrs: 0, ..Style::default() },
             current_line: None,
             line_number: Style { fg: Color::Idx(7), attrs: crate::cells::DIM, ..Style::default() },
             current_line_number: Style { fg: YELLOW, ..Style::default() },
@@ -3643,6 +3643,7 @@ fn select_cell(st: &RenderStyle, cell: Style) -> Style {
     Style {
         fg: if sel.fg == Color::Default { cell.fg } else { sel.fg },
         bg: if sel.bg == Color::Default { cell.bg } else { sel.bg },
+        us: if sel.us == Color::Default { cell.us } else { sel.us },
         attrs: if st.selection_noattr { sel.attrs } else { sel.attrs | cell.attrs },
     }
 }
@@ -4199,13 +4200,13 @@ mod tests {
         assert_eq!((marked(&cm, 0), marked(&cm, 1)), ("abcdefghij          ".to_string(), String::new()));
         // screen_select_cell: default colours and attributes come from the cell
         let mut l = line("ab", false);
-        l.cells[0].style = Style { fg: Color::Idx(1), bg: Color::Default, attrs: crate::cells::BOLD };
+        l.cells[0].style = Style { fg: Color::Idx(1), bg: Color::Default, attrs: crate::cells::BOLD, ..Style::default() };
         let mut cm = CopyMode::new(vec![l], 20, 1, (0, 0), true);
         cm.run("begin-selection", &[]);
-        let st = RenderStyle { selection: Style { fg: Color::Default, bg: CYAN, attrs: 0 }, selection_noattr: false, position_text: Some(String::new()), ..RenderStyle::default() };
-        assert_eq!(cm.render_with(&st).0[0].cells[0].style, Style { fg: Color::Idx(1), bg: CYAN, attrs: crate::cells::BOLD });
+        let st = RenderStyle { selection: Style { fg: Color::Default, bg: CYAN, attrs: 0, ..Style::default() }, selection_noattr: false, position_text: Some(String::new()), ..RenderStyle::default() };
+        assert_eq!(cm.render_with(&st).0[0].cells[0].style, Style { fg: Color::Idx(1), bg: CYAN, attrs: crate::cells::BOLD, ..Style::default() });
         let st = RenderStyle { selection_noattr: true, ..st };
-        assert_eq!(cm.render_with(&st).0[0].cells[0].style, Style { fg: Color::Idx(1), bg: CYAN, attrs: 0 });
+        assert_eq!(cm.render_with(&st).0[0].cells[0].style, Style { fg: Color::Idx(1), bg: CYAN, attrs: 0, ..Style::default() });
     }
 
     #[test]
@@ -4540,7 +4541,7 @@ mod tests {
         assert!(!cm.search_marks);
         cm.run("begin-selection", &[]);
         cm.run("cursor-right", &[]);
-        let selected = Style { fg: BLACK, bg: CYAN, attrs: 0 };
+        let selected = Style { fg: BLACK, bg: CYAN, attrs: 0, ..Style::default() };
         let (view,_) = cm.render_with_style(selected);
         assert_eq!(view[0].cells[0].style, selected);
         assert_eq!(view[0].cells[2].style.bg, Color::Default);
@@ -4789,7 +4790,7 @@ mod tests {
     fn styles_for_current_line_mark_and_matches() {
         let mut cm = CopyMode::new(lines(&["ab ab", "xab", "zz"]), W, 3, (2, 0), false);
         let red = Style { bg: Color::Idx(1), ..Style::default() };
-        let mark = Style { fg: Color::Idx(2), bg: Color::Idx(3), attrs: 0 };
+        let mark = Style { fg: Color::Idx(2), bg: Color::Idx(3), attrs: 0, ..Style::default() };
         let st = RenderStyle { current_line: Some(red), mark, position_text: Some(String::new()), ..RenderStyle::default() };
         let (view, _) = cm.render_with(&st);
         assert!(view[2].cells.iter().all(|c| c.style.bg == red.bg), "current line");

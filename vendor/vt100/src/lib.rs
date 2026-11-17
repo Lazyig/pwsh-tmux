@@ -116,7 +116,7 @@ mod metadata_tests {
         assert_eq!(meta.len(), 4);
         assert_eq!(meta[0].1.hyperlink.as_ref().unwrap().uri, "https://example.org");
         assert_eq!(meta[0].1.hyperlink.as_ref().unwrap().inner, meta[3].1.hyperlink.as_ref().unwrap().inner);
-        assert_eq!(core::mem::size_of::<Cell>(), 32);
+        assert_eq!(core::mem::size_of::<Cell>(), 38);
     }
     #[test]
     fn metadata_edits_reflow_and_anonymous_identity() {
@@ -298,4 +298,63 @@ mod metadata_tests {
         p.process(b"h1\r\nh2\r\nh3\r\nh4\r\nh5\x1bc");
         assert_eq!((p.screen().scrollback_len(), text(&p, 0), text(&p, 4)), (5, "h1".into(), "h5".into()));
     }
+
+    #[test]
+    fn emoji_modifiers_joiners_and_regional_indicators_combine() {
+        // screen_write_combine: one wide cell for each of these; 7-bit characters never join
+        for (input, cursor, cell) in [
+            ("👋🏽", 2, "👋🏽"), ("🏽👋", 2, "🏽👋"), ("👨\u{200D}👩", 2, "👨\u{200D}👩"), ("🇰🇷🇯", 3, "🇰🇷"),
+            ("a🏽", 3, "a"), ("x\u{200D}y", 2, "x\u{200D}"),
+            // utf8_should_combine reads the cell's first character: a second modifier joins
+            ("👋🏽🏽", 2, "👋🏽🏽"),
+        ] {
+            let mut p = Parser::new(NonZeroU16::new(5).unwrap(), NonZeroU16::new(20).unwrap(), 0);
+            p.process(input.as_bytes());
+            assert_eq!(p.screen().cursor_position().1, cursor, "{input}");
+            assert_eq!(p.screen().cell(0, 0).unwrap().contents(), cell, "{input}");
+        }
+        // as a pair of narrow regional indicators would not: the second makes the cell wide
+        let mut p = Parser::new(NonZeroU16::new(5).unwrap(), NonZeroU16::new(20).unwrap(), 0);
+        p.process("🇰🇷".as_bytes());
+        assert!(p.screen().cell(0, 0).unwrap().is_wide());
+    }
+
+    fn p30(input: &str) -> Parser {
+        let mut p = Parser::new(NonZeroU16::new(8).unwrap(), NonZeroU16::new(30).unwrap(), 0);
+        p.process(input.as_bytes());
+        p
+    }
+
+    #[test]
+    fn sgr_attributes_underline_styles_and_colours() {
+        // input_csi_dispatch_sgr: 58 takes its colour from the parameters after it
+        let p = p30("\x1b[4;58;2;10;20;30mA\x1b[0;1;2;5;8;9;53mB\x1b[0;4:3;38:2::1:2:3mC\x1b[22;21mD\x1b[58:5:9;24mE");
+        let c = |x| p.screen().cell(0, x).unwrap().clone();
+        assert_eq!((c(0).underline_style(), c(0).underline_color(), c(0).fgcolor()), (1, Color::Rgb(10, 20, 30), Color::Default));
+        assert!(c(1).bold() && c(1).dim() && c(1).blink() && c(1).hidden() && c(1).strikethrough() && c(1).overline());
+        assert_eq!((c(2).underline_style(), c(2).fgcolor()), (3, Color::Rgb(1, 2, 3)));
+        assert_eq!((c(3).bold(), c(3).underline_style()), (false, 2));
+        assert_eq!((c(4).underline_style(), c(4).underline_color()), (0, Color::Palette(9)));
+    }
+
+    #[test]
+    fn dec_graphics_wrap_off_and_cursor_controls() {
+        // SCS and SO/SI: the characters are kept, with GRID_ATTR_CHARSET
+        let p = p30("\x1b(0lq\x1b(Bk\x1b)0\x0ex\x0fy");
+        let cs: alloc::vec::Vec<bool> = (0..5).map(|x| p.screen().cell(0, x).unwrap().charset()).collect();
+        assert_eq!((p.screen().contents(), cs), ("lqkxy".into(), alloc::vec![true, true, false, true, false]));
+        // DECAWM off: the last column is written over
+        let p = p30("\x1b[?7labcdefghijklmnopqrstuvwxyz0123456789");
+        assert_eq!((p.screen().contents(), p.screen().cursor_position()), ("abcdefghijklmnopqrstuvwxyz0129".into(), (0, 29)));
+        // a cursor movement up or down leaves the wrap pending at the last column
+        let p = p30(&("a".repeat(29) + "x\x1b[Bz"));
+        assert_eq!((p.screen().cell(1, 29).unwrap().contents(), p.screen().cursor_position()), ("z", (1, 30)));
+        // IND, NEL, CBT, SCOSC and SCORC
+        let p = p30("ab\x1bDcd\x1bEe\x1b[4;1Habcdefghijkl\x1b[Zx\x1b[5;1Ha\x1b[sbc\x1b[u|");
+        assert_eq!(p.screen().contents(), "ab\n  cd\ne\nabcdefghxjkl\na|c");
+        // DECRC keeps the cursor on the screen: a saved pending wrap is dropped
+        let p = p30(&("a".repeat(29) + "x\x1b7\x1b[1;1H\x1b8z"));
+        assert_eq!((p.screen().contents(), p.screen().cursor_position()), ("a".repeat(29) + "z", (0, 30)));
+    }
 }
+

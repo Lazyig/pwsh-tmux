@@ -304,6 +304,19 @@ fn fit_style(mut st: Style, f: &super::features::Features) -> Style {
     if !f.has("strikethrough") {
         st.attrs &= !STRIKE;
     }
+    // tty_attributes: underline styles and colour need Smulx and Setulc (usstyle), else a
+    // plain underline; overline needs Smol
+    if !f.has("usstyle") {
+        if st.attrs & crate::cells::ALL_UNDERLINE != 0 {
+            st.attrs = (st.attrs & !crate::cells::ALL_UNDERLINE) | UNDERLINE;
+        }
+        st.us = Color::Default;
+    } else if st.us != Color::Default {
+        st.us = super::features::fit_color(st.us, f);
+    }
+    if !f.has("overline") {
+        st.attrs &= !crate::cells::OVERLINE;
+    }
     st
 }
 
@@ -320,46 +333,147 @@ fn dim_default(colour: Color, foreground: bool, terminal: &super::theme::Termina
 }
 
 pub fn push_sgr(out: &mut String, st: &Style) {
+    use crate::cells::{CURLY_UNDERLINE, DASHED_UNDERLINE, DOTTED_UNDERLINE, DOUBLE_UNDERLINE, HIDDEN, OVERLINE};
     out.push_str("\x1b[0");
-    for (bit, code) in [(BOLD, ";1"), (DIM, ";2"), (ITALIC, ";3"), (UNDERLINE, ";4"), (BLINK, ";5"), (INVERSE, ";7"), (STRIKE, ";9")] {
+    for (bit, code) in [(BOLD, ";1"), (DIM, ";2"), (ITALIC, ";3"), (BLINK, ";5"), (INVERSE, ";7"), (HIDDEN, ";8"), (STRIKE, ";9"), (OVERLINE, ";53")] {
         if st.attrs & bit != 0 {
             out.push_str(code);
         }
     }
+    // one underline: Smulx with its style (the styles fit_style keeps), else smul
+    let underline = [(DOUBLE_UNDERLINE, ";4:2"), (CURLY_UNDERLINE, ";4:3"), (DOTTED_UNDERLINE, ";4:4"), (DASHED_UNDERLINE, ";4:5"), (UNDERLINE, ";4")];
+    if let Some((_, code)) = underline.iter().find(|(bit, _)| st.attrs & bit != 0) {
+        out.push_str(code);
+    }
     push_color(out, st.fg, 30);
     push_color(out, st.bg, 40);
     out.push('m');
+    // Setulc and Setulc1 of the usstyle feature (its "::" is an escaped ':')
+    match st.us {
+        Color::Default => {}
+        Color::Rgb(r, g, b) => {
+            let _ = write!(out, "\x1b[58:2:{r}:{g}:{b}m");
+        }
+        Color::Idx(i) | Color::Palette(i) => {
+            let _ = write!(out, "\x1b[58:5:{i}m");
+        }
+    }
 }
 
-/// capture-pane -e: text with SGR escapes.
-pub fn line_with_escapes(line: &Line) -> String {
-    line_with_escapes_from(line, &mut None, false)
-}
-
-/// [`line_with_escapes`] after lines that ended in link `last` (grid_string_cells keeps
-/// lastgc from line to line: a line that goes on with the link the line before ended in
-/// does not open it again, though each line closes what it opened); `last` becomes the
-/// link of the last cell read: the last used one, or with `allocated`
-/// (GRID_STRING_EMPTY_CELLS) the last the line has room for, which grid_expand_line
-/// grows to a quarter, half or all of the width (more than the text written at once).
-pub fn line_with_escapes_from(line: &Line, last: &mut Option<u64>, allocated: bool) -> String {
+/// A drawn line as sequences a pane's parser takes back (format_draw onto a pane, as
+/// remain-on-exit-format): the SGR of each style (overline as 53, the line drawing set
+/// as G0) and the text, up to the last used cell. A plain colour (no COLOUR_FLAG_256) as
+/// the underscore colour is left out, as grid_string_cells_us leaves it out.
+pub fn line_for_parser(line: &Line) -> String {
     let mut out = String::new();
-    let mut cur = Style::default();
-    let mut link = *last;
-    let mut open = false;
-    let used = (0..line.cells.len()).rposition(|x| line.cells[x].text != " " || line.cells[x].style != Style::default() || line.metadata.contains_key(&(x as u16))).map_or(0, |x| x + 1);
-    for (x, c) in line.cells.iter().enumerate() {
+    let used = (0..line.cells.len()).rposition(|x| line.cells[x].text != " " || line.cells[x].style != Style::default()).map_or(0, |x| x + 1);
+    let mut last: Option<Style> = None;
+    for (x, c) in line.cells.iter().enumerate().take(used) {
         if line.is_padding(x) {
             continue;
         }
-        if c.style != cur {
-            push_sgr(&mut out, &c.style);
-            cur = c.style;
+        let mut st = c.style;
+        if matches!(st.us, Color::Idx(0..=15)) {
+            st.us = Color::Default;
         }
+        if last != Some(st) {
+            push_sgr(&mut out, &st);
+            let acs = st.attrs & crate::cells::ACS != 0;
+            if last.is_none_or(|l| (l.attrs & crate::cells::ACS != 0) != acs) {
+                out.push_str(if acs { "\x1b(0" } else { "\x1b(B" });
+            }
+            last = Some(st);
+        }
+        out.push_str(line.cell_text(x));
+    }
+    out.push_str("\x1b(B");
+    out
+}
+
+/// What grid_string_cells carries from one line to the next: the last cell read (its
+/// attributes and colours, lastgc) and its link.
+#[derive(Default)]
+pub struct EscState {
+    pub style: Style,
+    pub link: Option<u64>,
+}
+
+/// grid_string_cells_fg/bg/us: the SGR parameters of a colour.
+fn sgr_colour(c: Color, which: u8) -> Vec<u16> {
+    let (base, default) = match which {
+        b'f' => (30, Some(39)),
+        b'b' => (40, Some(49)),
+        _ => (58, None),
+    };
+    match c {
+        Color::Default => default.into_iter().collect(),
+        Color::Idx(i) if i < 8 && which != b'u' => vec![base + u16::from(i)],
+        Color::Idx(i) if i < 16 && which != b'u' => vec![base + 60 + u16::from(i) - 8],
+        Color::Idx(i) | Color::Palette(i) => vec![if which == b'u' { 58 } else { base + 8 }, 5, u16::from(i)],
+        Color::Rgb(r, g, b) => vec![if which == b'u' { 58 } else { base + 8 }, 2, u16::from(r), u16::from(g), u16::from(b)],
+    }
+}
+
+/// grid_string_cells_code: the sequences that change `last` into `cur`. A removed
+/// attribute (or underline colour) starts with 0; each newly set attribute follows (a
+/// code over 9 is written with a colon, so overline is 5:3 as in tmux); then the
+/// colours that changed (one that is default after a reset is left out) and SO or SI.
+pub fn sgr_diff(last: &Style, cur: &Style) -> String {
+    use crate::cells::{ACS, CURLY_UNDERLINE, DASHED_UNDERLINE, DOTTED_UNDERLINE, DOUBLE_UNDERLINE, HIDDEN, OVERLINE};
+    const CODES: [(u16, u16); 13] = [
+        (BOLD, 1), (DIM, 2), (ITALIC, 3), (UNDERLINE, 4), (BLINK, 5), (INVERSE, 7), (HIDDEN, 8), (STRIKE, 9),
+        (DOUBLE_UNDERLINE, 42), (CURLY_UNDERLINE, 43), (DOTTED_UNDERLINE, 44), (DASHED_UNDERLINE, 45), (OVERLINE, 53),
+    ];
+    let (attr, mut lastattr) = (cur.attrs, last.attrs);
+    let mut s: Vec<u16> = Vec::new();
+    if CODES.iter().any(|(m, _)| attr & m == 0 && lastattr & m != 0) || (last.us != Color::Default && cur.us == Color::Default) {
+        s.push(0);
+        lastattr &= ACS;
+    }
+    s.extend(CODES.iter().filter(|(m, _)| attr & m != 0 && lastattr & m == 0).map(|(_, c)| *c));
+    let mut out = String::new();
+    if !s.is_empty() {
+        let codes: Vec<String> = s.iter().map(|c| if *c < 10 { c.to_string() } else { format!("{}:{}", c / 10, c % 10) }).collect();
+        let _ = write!(out, "\x1b[{}m", codes.join(";"));
+    }
+    let reset = s.first() == Some(&0);
+    for (n, o) in [(cur.fg, last.fg), (cur.bg, last.bg), (cur.us, last.us)].into_iter().zip([b'f', b'b', b'u']).map(|((n, o), w)| (sgr_colour(n, w), sgr_colour(o, w))) {
+        if n.is_empty() || (!reset && n == o) || (reset && matches!(n[0], 39 | 49)) {
+            continue;
+        }
+        let v: Vec<String> = n.iter().map(u16::to_string).collect();
+        let _ = write!(out, "\x1b[{}m", v.join(";"));
+    }
+    if attr & ACS != 0 && lastattr & ACS == 0 {
+        out.push('\x0e');
+    }
+    if attr & ACS == 0 && lastattr & ACS != 0 {
+        out.push('\x0f');
+    }
+    out
+}
+
+/// capture-pane -e: a line with SGR escapes, after the lines before it (grid_string_cells keeps lastgc from
+/// line to line: a line goes on with the attributes and link the line before ended in,
+/// though each line closes the link it opened). With `allocated`
+/// (GRID_STRING_EMPTY_CELLS) the cells read go on to what the line has room for, which
+/// grid_expand_line grows to a quarter, half or all of the width; otherwise they end
+/// with the last used one. Trailing spaces go unless `keep` (-N: no GRID_STRING_TRIM_SPACES).
+pub fn line_with_escapes_from(line: &Line, st: &mut EscState, allocated: bool, keep: bool) -> String {
+    let mut out = String::new();
+    let mut open = false;
+    let used = (0..line.cells.len()).rposition(|x| line.cells[x].text != " " || line.cells[x].style != Style::default() || line.metadata.contains_key(&(x as u16))).map_or(0, |x| x + 1);
+    let end = if allocated { super::vars::line_cellsize(line.cells.len(), used) } else { used };
+    for (x, c) in line.cells.iter().enumerate().take(end) {
+        if line.is_padding(x) {
+            continue;
+        }
+        out.push_str(&sgr_diff(&st.style, &c.style));
+        st.style = c.style;
         // grid_string_cells_code: an OSC 8 link (with its own id) follows the attributes;
         // a cell without one closes the link only if this line opened it
         let next = line.metadata.get(&(x as u16)).and_then(|m| m.hyperlink.as_ref());
-        if next.map(|l| l.inner) != link {
+        if next.map(|l| l.inner) != st.link {
             if let Some(l) = next {
                 let _ = write!(out, "\x1b]8;{}{};{}\x1b\\", if l.id.is_empty() { "" } else { "id=" }, l.id, l.uri);
                 open = true;
@@ -367,22 +481,14 @@ pub fn line_with_escapes_from(line: &Line, last: &mut Option<u64>, allocated: bo
                 out.push_str("\x1b]8;;\x1b\\");
                 open = false;
             }
-            link = next.map(|l| l.inner);
-        }
-        if x < used {
-            *last = link;
+            st.link = next.map(|l| l.inner);
         }
         out.push_str(line.cell_text(x));
-    }
-    let w = line.cells.len();
-    if allocated && used > 0 && used < [w / 4, w / 2, w].into_iter().find(|&n| used < n).unwrap_or(w) {
-        *last = None;
     }
     if open {
         out.push_str("\x1b]8;;\x1b\\");
     }
-    let trimmed = out.trim_end_matches(' ').to_string();
-    if cur != Style::default() { trimmed + "\x1b[0m" } else { trimmed }
+    if keep { out } else { out.trim_end_matches(' ').to_string() }
 }
 
 fn overlay_style(cell: &mut Style, over: Style) {
@@ -395,6 +501,15 @@ fn overlay_style(cell: &mut Style, over: Style) {
 }
 
 /// A blank that EL (erase to end of line, default background) reproduces exactly.
+/// A link= of a style as a hyperlink: one for each URI, apart from the panes' links.
+fn style_link(uri: &str) -> std::sync::Arc<vt100::Hyperlink> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    uri.hash(&mut h);
+    let inner = h.finish() | (1 << 63);
+    std::sync::Arc::new(vt100::Hyperlink { inner, id: String::new(), external_id: format!("tmux{:X}", inner & 0xffff_ffff), uri: uri.to_string() })
+}
+
 /// tty-features.c's Hls (the hyperlinks feature).
 const HLS: &str = "\x1b]8;%?%p1%l%tid=%p1%s%;;%p2%s\x1b\\";
 
@@ -684,118 +799,6 @@ impl Server {
             base.bg = c;
         }
         base
-    }
-
-    /// The default status line and the mouse range of each cell (status-left is `left`,
-    /// each window entry `window|N` and status-right `right`, as in tmux's status-format).
-    fn status_line(&self, cid: ClientId, sid: SessId, width: u16) -> (Vec<Cell>, Vec<Option<format::Range>>) {
-        let s = &self.sessions[&sid];
-        let width = width as usize;
-        let base = self.status_style(sid, cid);
-        let cur = Target { sid: Some(sid), idx: Some(s.active), wid: Some(s.active_window()), pane: Some(self.windows[&s.active_window()].active) };
-        let left_style = self.style_option(&self.opt_session(Some(sid), "status-left-style"), base, cur, Some(cid)).unwrap_or(base);
-        let right_style = self.style_option(&self.opt_session(Some(sid), "status-right-style"), base, cur, Some(cid)).unwrap_or(base);
-        let left = self.expand_status_time(cur, cid, &self.opt_session(Some(sid), "status-left"), "");
-        let right = self.expand_status_time(cur, cid, &self.opt_session(Some(sid), "status-right"), "");
-        let left_len = self.opt_session_num(Some(sid), "status-left-length").max(0) as usize;
-        let right_len = self.opt_session_num(Some(sid), "status-right-length").max(0) as usize;
-        let lcells = spans_cells(&self.styled_spans(&left, left_style, cur, cid), left_len.min(width), base);
-        let mut rcells = spans_cells(&self.styled_spans(&right, right_style, cur, cid), right_len, base);
-        let available = width.saturating_sub(lcells.len());
-        if rcells.len() > available { rcells.drain(..rcells.len() - available); }
-
-        // window list
-        let sep = self.opt_window(None, "window-status-separator");
-        let mut wcells: Vec<Cell> = Vec::new();
-        let mut wtags: Vec<Option<format::Range>> = Vec::new();
-        let mut cur_range = (0, 0);
-        let n = s.links.len();
-        for (k, (idx, wid)) in s.links.iter().enumerate() {
-            let wid = *wid;
-            let t = Target { sid: Some(sid), idx: Some(*idx), wid: Some(wid), pane: Some(self.windows[&wid].active) };
-            let is_cur = *idx == s.active;
-            let fmt = self.opt_window(Some(wid), if is_cur { "window-status-current-format" } else { "window-status-format" });
-            let wst = |name: &str, base: Style| self.style_option(&self.opt_window(Some(wid), name), base, t, Some(cid)).unwrap_or(base);
-            let mut st = wst("window-status-style", base);
-            if is_cur {
-                st = wst("window-status-current-style", st);
-            } else if s.last.first() == Some(idx) {
-                st = wst("window-status-last-style", st);
-            }
-            let alerts = s.alerts.get(idx).copied().unwrap_or(0);
-            if alerts & ALERT_BELL != 0 {
-                st = wst("window-status-bell-style", st);
-            } else if alerts & (ALERT_ACTIVITY | ALERT_SILENCE) != 0 {
-                st = wst("window-status-activity-style", st);
-            }
-            let text = self.expand_status_time(t, cid, &fmt, "W");
-            let start = wcells.len();
-            wcells.extend(spans_cells(&self.styled_spans(&text, st, t, cid), usize::MAX, st));
-            wtags.resize(wcells.len(), Some(format::Range::Window(*idx)));
-            if is_cur {
-                cur_range = (start, wcells.len());
-            }
-            if k + 1 < n {
-                wcells.extend(spans_cells(&self.styled_spans(&sep, base, t, cid), usize::MAX, base));
-                wtags.resize(wcells.len(), None);
-            }
-        }
-        let avail = width.saturating_sub(lcells.len() + rcells.len());
-        // keep the current window visible when the list is too long
-        let (wstart, wlen) = if wcells.len() <= avail {
-            (0, wcells.len())
-        } else {
-            let centre = cur_range.0 + (cur_range.1 - cur_range.0) / 2;
-            let start = centre.saturating_sub(avail / 2).min(wcells.len().saturating_sub(avail));
-            (start, avail)
-        };
-        let mut wslice: Vec<Cell> = wcells[wstart..wstart + wlen].to_vec();
-        if let Some(c) = wslice.first_mut() {
-            if c.text.is_empty() {
-                *c = Cell { text: " ".into(), style: c.style };
-            }
-        }
-        if wstart > 0 {
-            if let Some(c) = wslice.first_mut() {
-                *c = Cell { text: "<".into(), style: c.style };
-            }
-        }
-        if wstart + wlen < wcells.len() {
-            if let Some(c) = wslice.last_mut() {
-                *c = Cell { text: ">".into(), style: c.style };
-            }
-        }
-        let mut line = vec![Cell { text: " ".into(), style: base }; width];
-        let mut tags: Vec<Option<format::Range>> = vec![None; width];
-        let justify = self.opt_session(Some(sid), "status-justify");
-        let wpos = match justify.as_str() {
-            "centre" => lcells.len() + (avail - wslice.len()) / 2,
-            "absolute-centre" => (width.saturating_sub(wslice.len()) / 2).max(lcells.len()),
-            "right" => lcells.len() + avail - wslice.len(),
-            _ => lcells.len(),
-        };
-        for (i, c) in lcells.into_iter().enumerate() {
-            line[i] = c;
-            tags[i] = Some(format::Range::Left);
-        }
-        for (i, c) in wslice.into_iter().enumerate() {
-            if wpos + i < width {
-                line[wpos + i] = c;
-                tags[wpos + i] = wtags[wstart + i].clone();
-            }
-        }
-        let rstart = width - rcells.len();
-        for (i, c) in rcells.into_iter().enumerate() {
-            line[rstart + i] = c;
-            tags[rstart + i] = Some(format::Range::Right);
-        }
-        // a wide char cut by a region boundary
-        for i in 0..width {
-            if line[i].text.is_empty() && (i == 0 || line[i - 1].text.chars().next().and_then(|c| char_width(c)) != Some(2)) {
-                line[i].text = " ".into();
-            }
-        }
-        (line, tags)
     }
 
     /// Draw a pane's content (or its mode) with its top left at (x0, y0) of the window,
@@ -1146,6 +1149,7 @@ impl Server {
             let over = |s: Style| Style {
                 fg: if s.fg == Color::Default { inactive_border.fg } else { s.fg },
                 bg: if s.bg == Color::Default { inactive_border.bg } else { s.bg },
+                us: if s.us == Color::Default { inactive_border.us } else { s.us },
                 attrs: inactive_border.attrs | s.attrs,
             };
             let cell = spans.iter().find(|s| !s.text.is_empty()).and_then(|s| s.text.chars().next().map(|ch| {
@@ -1256,11 +1260,10 @@ impl Server {
         // the window menu, above the panes (redraw_mark_menu)
         if let Some(m) = self.menus.get(&wid).filter(|_| c.overlay.is_none()) {
             let ost = |name: &str, base: Style| self.style_option(&self.opt_window(Some(wid), name), base, active_target, Some(cid)).unwrap_or(base);
-            let st = ost("popup-style", Style::default());
-            let bst = ost("popup-border-style", Style::default());
-            let st = ost("menu-style", st);
-            let bst = ost("menu-border-style", bst);
-            let selected = ost("menu-selected-style", Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() });
+            // menu_reapply_styles: each from the default cell (style_apply)
+            let st = ost("menu-style", Style::default());
+            let bst = ost("menu-border-style", Style::default());
+            let selected = ost("menu-selected-style", Style::default());
             // display-menu -s -S -H -b
             let given = |v: &Option<String>, base: Style| self.flag_style(v.as_deref(), base, active_target, cid);
             let (st, bst, selected) = (given(&m.look.style, st), given(&m.look.border_style, bst), given(&m.look.selected_style, selected));
@@ -1287,17 +1290,22 @@ impl Server {
                 let y = sy0 + i;
                 let custom = &formats[i as usize];
                 // The built-in first line has a dedicated renderer for list clipping.
-                let (line, tags) = if !custom.is_empty() && !(i == 0 && custom == options::STATUS_FORMATS[0]) {
+                // the default first line too: its window list is a list= of format_draw
+                let (line, tags, links) = if !custom.is_empty() {
                     let base = self.status_style(sid, cid);
                     let cur = Target { sid: Some(sid), idx: Some(s.active), wid: Some(wid), pane: Some(win.active) };
                     let text = self.expand_status_time(cur, cid, custom, "");
-                    format::layout_line_ranged(&self.styled_spans(&text, base, cur, cid), cw as usize, base)
-                } else if i == 0 {
-                    self.status_line(cid, sid, cw)
+                    format::layout_line_links(&self.styled_spans(&text, base, cur, cid), cw as usize, base)
                 } else {
-                    (vec![Cell { text: " ".into(), style: self.status_style(sid, cid) }; cw as usize], vec![None; cw as usize])
+                    (vec![Cell { text: " ".into(), style: self.status_style(sid, cid) }; cw as usize], vec![None; cw as usize], vec![None; cw as usize])
                 };
                 f.put_cells(0, y, &line);
+                // style link= (the status screen's own hyperlinks)
+                for (x, uri) in links.iter().enumerate() {
+                    if let Some(uri) = uri {
+                        f.set_link(x as u16, y, Some(&style_link(uri)));
+                    }
+                }
                 status_ranges.push(tags);
             }
         }
@@ -1547,8 +1555,11 @@ impl Server {
         c.status_ranges = next.status_ranges.clone();
         let prev = c.prev.as_ref().filter(|p| p.frame.w == next.frame.w && p.frame.h == next.frame.h);
         let mut out = String::new();
+        // a full redraw writes every row (EL ends each one), so nothing is cleared first:
+        // with clear-on-attach off an ED 2 would push the first screen into a terminal's
+        // scrollback a second time (tmux draws the lines, tty_draw_line)
         if prev.is_none() {
-            out.push_str("\x1b[0m\x1b[H\x1b[2J");
+            out.push_str("\x1b[0m\x1b[H");
         }
         let mut changed = false;
         let hyperlinks = feats.has("hyperlinks") || c.term_caps.contains_key("Hls");
@@ -1583,8 +1594,11 @@ impl Server {
                         link = next_link.map(|l| l.inner);
                     }
                 }
-                if c.utf8() || cell.text.is_ascii() { out.push_str(&terminal_text(&cell.text)); }
-                else { out.push_str(&non_utf8_text(&cell.text, row.get(x + 1).is_some_and(|n| n.text.is_empty()))); }
+                // tty_acs_get: a DEC graphics character is drawn as its Unicode form
+                let acs = (cell.style.attrs & crate::cells::ACS != 0).then(|| cell.text.chars().next().and_then(crate::cells::acs_char)).flatten();
+                let text = acs.unwrap_or(&cell.text);
+                if c.utf8() || text.is_ascii() { out.push_str(&terminal_text(text)); }
+                else { out.push_str(&non_utf8_text(text, row.get(x + 1).is_some_and(|n| n.text.is_empty()))); }
                 if cfg!(windows) && cell.text.chars().any(|c| char_width(c) == Some(0)) {
                     let width = cell.text.chars().filter_map(|c| char_width(c)).sum::<usize>();
                     if x + width < next.frame.w as usize { let _ = write!(out, "\x1b[{};{}H", y + 1, x + width + 1); }

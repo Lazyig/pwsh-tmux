@@ -45,9 +45,10 @@ const GRID_EXTD: usize = 23;
 fn history_usage(screen: &vt100::Screen) -> (usize, usize, usize) {
     let width = screen.size().1.get() as usize;
     let (mut cells, mut ext) = (0, 0);
-    let lines = screen.history_rows_len();
+    // the base grid: the normal screen's history also while the alternate screen is on
+    let lines = screen.base_history_len();
     for i in 0..lines {
-        let Some(row) = screen.history_row(i) else { continue };
+        let Some(row) = screen.base_history_row(i) else { continue };
         let mut used = 0;
         for x in 0..width {
             let Some(c) = row.cell(x as u16) else { break };
@@ -59,11 +60,20 @@ fn history_usage(screen: &vt100::Screen) -> (usize, usize, usize) {
                 ext += 1;
             }
         }
-        if used > 0 {
-            cells += if used < width / 4 { width / 4 } else if used < width / 2 { width / 2 } else { width };
-        }
+        cells += line_cellsize(width, used);
     }
     (lines, cells, ext)
+}
+
+/// A grid line's allocated cells (gl->cellsize): none until written, then grid_expand_line
+/// rounds up to a quarter, half or all of the width.
+pub fn line_cellsize(width: usize, used: usize) -> usize {
+    match used {
+        0 => 0,
+        u if u < width / 4 => width / 4,
+        u if u < width / 2 => width / 2,
+        _ => width,
+    }
 }
 
 /// tmux's pane_private_modes: the DEC private modes the application has turned on.
@@ -200,8 +210,10 @@ impl Vars for VarCtx<'_> {
             }
             'P' => {
                 if let Some(w) = self.t.wid.and_then(|w| self.srv.windows.get(&w)) {
-                    let mut panes = w.panes();
-                    panes.sort_unstable();
+                    // format_loop_panes: creation order, or i (pane index) or z (z order);
+                    // r reverses whichever it is
+                    let order = if flags.contains('i') { super::cmds::sort::Order::Index } else if flags.contains('z') { super::cmds::sort::Order::Z } else { super::cmds::sort::Order::Creation };
+                    let panes = self.srv.sorted_panes(w.id, super::cmds::sort::Criteria { order: Some(order), reversed: flags.contains('r') });
                     for pane in panes {
                         targets.push((Target { pane: Some(pane), ..self.t }, pane == w.active));
                     }
@@ -214,7 +226,7 @@ impl Vars for VarCtx<'_> {
         } else if kind == 'W' && flags.contains('t') {
             targets.sort_by_key(|(t, _)| std::cmp::Reverse(self.srv.windows[&t.wid.unwrap()].activity));
         }
-        if flags.contains('r') { targets.reverse(); }
+        if flags.contains('r') && kind != 'P' { targets.reverse(); }
         // the loops' format_defaults pass the session, the winlink, or the pane
         let mut extra = self.extra.clone();
         extra.insert(FORMAT_TYPE.to_string(), match kind { 'S' => "S", 'W' => "W", _ => "P" }.to_string());
@@ -339,7 +351,8 @@ impl Vars for VarCtx<'_> {
             "session_many_attached" => sess.map(|s| b(srv.clients.values().filter(|c| c.attached && c.session == Some(s.id)).count() > 1)),
             "session_created" => sess.map(|s| s.created.to_string()),
             "session_activity" => sess.map(|s| s.activity.to_string()),
-            "session_last_attached" => sess.map(|s| s.last_attached.to_string()),
+            // a zero time is empty (format_cb_session_last_attached)
+            "session_last_attached" => sess.filter(|s| s.last_attached != 0).map(|s| s.last_attached.to_string()),
             "session_path" => sess.map(|s| s.cwd.clone()),
             "session_alerts" => sess.map(|s| {
                 s.alerts
@@ -428,7 +441,14 @@ impl Vars for VarCtx<'_> {
             "window_start_flag" => Some(b(sess.zip(t.idx).is_some_and(|(s, i)| s.links.keys().next() == Some(&i)))),
             "window_end_flag" => Some(b(sess.zip(t.idx).is_some_and(|(s, i)| s.links.keys().next_back() == Some(&i)))),
             "window_linked" => win.map(|w| b(srv.links_of(w.id).len() > 1)),
-            "window_linked_sessions" => win.map(|w| srv.links_of(w.id).len().to_string()),
+            // a session group counts once
+            "window_linked_sessions" => win.map(|w| {
+                let mut keys: Vec<(bool, u32)> = srv.links_of(w.id).into_iter()
+                    .map(|(s, _)| srv.sessions[&s].group.map_or((false, s), |g| (true, g))).collect();
+                keys.sort_unstable();
+                keys.dedup();
+                keys.len().to_string()
+            }),
             // the format client's view of its current window (tty_window_offset)
             "window_bigger" => client.map(|c| b(srv.view_offset(c.id).bigger)),
             "window_active_clients" | "window_active_clients_list" => win.map(|w| {
@@ -438,11 +458,11 @@ impl Vars for VarCtx<'_> {
                 if name == "window_active_clients" { names.len().to_string() } else { names.join(",") }
             }).filter(|v| !v.is_empty()),
             "window_active_sessions" | "window_active_sessions_list" => win.map(|w| {
-                let names: Vec<String> = srv.links_of(w.id).into_iter()
+                let names: Vec<String> = srv.winlinks_of(w.id).into_iter()
                     .filter(|(s, i)| srv.sessions[s].active == *i).map(|(s, _)| srv.sessions[&s].name.clone()).collect();
                 if name == "window_active_sessions" { names.len().to_string() } else { names.join(",") }
             }).filter(|v| !v.is_empty()),
-            "window_linked_sessions_list" => win.map(|w| srv.links_of(w.id).into_iter().map(|(s, _)| srv.sessions[&s].name.clone()).collect::<Vec<_>>().join(",")).filter(|v| !v.is_empty()),
+            "window_linked_sessions_list" => win.map(|w| srv.winlinks_of(w.id).into_iter().map(|(s, _)| srv.sessions[&s].name.clone()).collect::<Vec<_>>().join(",")).filter(|v| !v.is_empty()),
             "window_stack_index" => sess.zip(t.idx).map(|(s, i)| s.last.iter().position(|x| *x == i).map_or(0, |n| n + 1).to_string()),
             // tmux's default cell size when the terminal does not report pixels
             "window_cell_width" => win.map(|_| "16".into()),
@@ -598,8 +618,9 @@ impl Vars for VarCtx<'_> {
             "cursor_y" => pane.map(|p| p.screen().cursor_position().0.to_string()),
             "cursor_flag" => pane.map(|p| b(!p.screen().hide_cursor())),
             "alternate_on" => pane.map(|p| b(p.screen().alternate_screen())),
-            "history_size" => pane.map(|p| p.screen().scrollback_len().to_string()),
-            "history_limit" => pane.map(|p| p.screen().scrollback_capacity().to_string()),
+            // wp->base.grid: the normal screen's history, also on the alternate screen
+            "history_size" => pane.map(|p| p.screen().base_scrollback().0.to_string()),
+            "history_limit" => pane.map(|p| p.screen().base_scrollback().1.to_string()),
             // copy mode (window_copy_formats)
             _ if super::copy::is_copy_var(name) => t.pane.and_then(|p| self.srv.copy_var(p, name)),
             "mouse_x" | "mouse_y" | "mouse_word" | "mouse_line" | "mouse_hyperlink" | "mouse_status_line" | "mouse_status_range" | "mouse_pane" => {
@@ -681,7 +702,9 @@ impl Vars for VarCtx<'_> {
             "client_key_table" => client.map(|c| c.key_table.clone()),
             "client_prefix" => client.map(|c| b(c.key_table == "prefix")),
             "client_readonly" => client.map(|c| b(c.is_readonly())),
-            "client_termname" | "client_termtype" => client.and_then(|c| c.ident.as_ref()).map(|i| i.term.clone()),
+            "client_termname" => client.and_then(|c| c.ident.as_ref()).map(|i| i.term.clone()),
+            // the terminal's XTVERSION reply, empty without one
+            "client_termtype" => client.map(|c| c.term_type.clone()),
             "client_termfeatures" => client.map(|c| c.features.list()),
             "client_user" => client.and_then(|c| c.user.as_ref()).map(|u| ipc::user_name_for_id(u)),
             "client_created" => client.map(|c| c.created.to_string()),
@@ -768,9 +791,41 @@ impl Vars for VarCtx<'_> {
         let ident = c.ident.as_ref()?;
         Some(match kind {
             'e' => ident.env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()).unwrap_or_default(),
-            'f' => b(c.features.list().split(',').any(|f| f == name)),
-            // No terminfo database is kept, so no capability is known.
-            _ => "0".into(),
+            // tty_feature_present: utf8 is the client's UTF-8 flag; another feature not
+            // applied is present when the terminal has all its capabilities (and the
+            // colours or flags it needs)
+            'f' => {
+                use super::terminfo::{describe, feature_capabilities, Value, CODES};
+                if name == "utf8" {
+                    return Some(b(c.utf8()));
+                }
+                if c.features.list().split(',').any(|f| f == name) {
+                    return Some(b(true));
+                }
+                let caps = feature_capabilities(name);
+                let flags_ok = match name {
+                    "256" => c.features.render_256(),
+                    "RGB" | "cstyle" | "margins" | "rectfill" | "sixel" | "ignorefkeys" => false,
+                    _ => true,
+                };
+                if caps.is_empty() || !flags_ok {
+                    return Some(b(false));
+                }
+                let overrides: Vec<String> = c.term_overrides.clone().unwrap_or_else(|| self.srv.opts_server.array_items("terminal-overrides").into_iter().map(|(_, v)| v).collect());
+                let have = describe(&ident.term, &overrides, &c.features);
+                b(caps.iter().all(|cap| {
+                    let n = cap.split('=').next().unwrap_or(cap);
+                    CODES.iter().position(|c| c.0 == n).is_some_and(|i| have[i] != Value::Missing)
+                }))
+            }
+            // tty_term_has_name: the capability in the client's terminal description
+            // (show-messages -T), after terminal-overrides and the features
+            _ => {
+                use super::terminfo::{describe, Value, CODES};
+                let overrides: Vec<String> = c.term_overrides.clone().unwrap_or_else(|| self.srv.opts_server.array_items("terminal-overrides").into_iter().map(|(_, v)| v).collect());
+                b(CODES.iter().position(|c| c.0 == name)
+                    .is_some_and(|i| describe(&ident.term, &overrides, &c.features)[i] != Value::Missing))
+            }
         })
     }
 

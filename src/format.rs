@@ -1841,23 +1841,22 @@ pub fn colour_byname(s: &str) -> Option<Color> {
     X11_COLOURS.iter().find(|(name, _)| name.eq_ignore_ascii_case(s)).map(|(_, c)| Color::Rgb((c >> 16) as u8, (c >> 8) as u8, *c as u8))
 }
 
-const ATTRS: [(&str, u8); 15] = [
+const ATTRS: [(&str, u16); 15] = [
     ("bright", cells::BOLD),
     ("bold", cells::BOLD),
     ("dim", cells::DIM),
     ("underscore", cells::UNDERLINE),
-    ("double-underscore", cells::UNDERLINE),
-    ("curly-underscore", cells::UNDERLINE),
-    ("dotted-underscore", cells::UNDERLINE),
-    ("dashed-underscore", cells::UNDERLINE),
+    ("double-underscore", cells::DOUBLE_UNDERLINE),
+    ("curly-underscore", cells::CURLY_UNDERLINE),
+    ("dotted-underscore", cells::DOTTED_UNDERLINE),
+    ("dashed-underscore", cells::DASHED_UNDERLINE),
     ("blink", cells::BLINK),
     ("reverse", cells::INVERSE),
     ("italics", cells::ITALIC),
     ("strikethrough", cells::STRIKE),
-    // Accepted but not representable in Style.
-    ("hidden", 0),
-    ("overline", 0),
-    ("acs", 0),
+    ("hidden", cells::HIDDEN),
+    ("overline", cells::OVERLINE),
+    ("acs", cells::ACS),
 ];
 
 /// Apply one style word. Returns Err for unknown words or bad values. Theme colours are
@@ -1873,7 +1872,9 @@ fn apply_word(word: &str, st: &mut Style, align: &mut Align, base: Style, vars: 
             // fg=default and bg=default are the base colours.
             "fg" => st.fg = if val == "default" { base.fg } else { color()? },
             "bg" => st.bg = if val == "default" { base.bg } else { color()? },
-            "us" | "fill" => {
+            "us" => st.us = if val == "default" { base.us } else { color()? },
+            // kept by spans and parse_style_with (format_draw fills with it)
+            "fill" => {
                 color()?;
             }
             "align" => {
@@ -2068,6 +2069,9 @@ pub struct Span {
     pub part: Part,
     /// In the list's focus (`list=focus` up to the next `list=on`), kept visible when trimmed.
     pub focus: bool,
+    /// The fill colour of the styles so far (fill=, the last one that is not default):
+    /// format_draw first clears the whole width with it.
+    pub fill: Option<Color>,
 }
 
 /// The format_draw screen of a span outside its alignment group.
@@ -2096,8 +2100,8 @@ enum ListWord {
 
 /// Split already-expanded text into styled spans: `#[fg=red]a#[default]b`.
 /// `#[default]` resets to the current default (initially `base`), `#[push-default]` makes the
-/// current style the default, `#[pop-default]` restores the previous one. A directive with an
-/// invalid word is ignored.
+/// style before its directive the default, `#[pop-default]` goes back to the base default
+/// (which `#[set-default]` sets). A directive with an invalid word is ignored.
 pub fn spans(text: &str, base: Style) -> Vec<Span> {
     spans_with(text, base, None)
 }
@@ -2107,8 +2111,9 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
     let mut out: Vec<Span> = Vec::new();
     let mut cur = base;
     let mut link = None;
+    // format_draw's current_default and base_default
     let mut default = base;
-    let mut defaults: Vec<Style> = Vec::new();
+    let mut base_default = base;
     let mut align = Align::Left;
     let mut range: Option<Range> = None;
     let mut range_start = 0;
@@ -2123,9 +2128,10 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
     // focus: 0 not started, 1 open (from this span index), 2 ended
     let mut focus = (0, 0);
     let (mut have_left, mut have_right) = (false, false);
+    let mut fill: Option<Color> = None;
 
     #[allow(clippy::too_many_arguments)]
-    fn flush(out: &mut Vec<Span>, buf: &mut String, style: Style, align: Align, range: &Option<Range>, link: &Option<String>, part: Part, focus: bool) {
+    fn flush(out: &mut Vec<Span>, buf: &mut String, style: Style, align: Align, range: &Option<Range>, link: &Option<String>, part: Part, focus: bool, fill: Option<Color>) {
         if buf.is_empty() {
             return;
         }
@@ -2137,10 +2143,11 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
             && !last.range_end
             && last.part == part
             && last.focus == focus
+            && last.fill == fill
         {
             last.text.push_str(buf);
         } else {
-            out.push(Span { text: buf.clone(), link: link.clone(), style, align, range: range.clone(), range_end: false, part, focus });
+            out.push(Span { text: buf.clone(), link: link.clone(), style, align, range: range.clone(), range_end: false, part, focus, fill });
         }
         buf.clear();
     }
@@ -2160,7 +2167,7 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
                 i += e + 1;
                 continue;
             }
-            flush(&mut out, &mut buf, cur, if part == Part::Normal { align } else { list_align }, &range, &link, part, part == Part::List && focus.0 == 1);
+            flush(&mut out, &mut buf, cur, if part == Part::Normal { align } else { list_align }, &range, &link, part, part == Part::List && focus.0 == 1, fill);
             match out.last().map(|l| l.part) {
                 Some(Part::ListLeft) => have_left = true,
                 Some(Part::ListRight) => have_right = true,
@@ -2168,22 +2175,16 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
             }
             let before = range.clone();
             let saved = cur;
+            // style_parse keeps the last of push-default, pop-default and set-default;
+            // format_draw applies it after the whole directive
+            let mut default_type = None;
             for w in style_words(&rest[2..e]) {
                 let lower = w.to_ascii_lowercase();
                 match lower.as_str() {
                     // link= continues until nolink, default or an empty link=.
                     "nolink" => link = None,
                     _ if lower.starts_with("link=") => link = Some(w[5..].to_string()).filter(|l| !l.is_empty()),
-                    // The style before this directive becomes the default.
-                    "set-default" => {
-                        defaults.clear();
-                        default = saved;
-                    }
-                    "push-default" => {
-                        defaults.push(default);
-                        default = cur;
-                    }
-                    "pop-default" => default = defaults.pop().unwrap_or(base),
+                    "set-default" | "push-default" | "pop-default" => default_type = Some(lower.clone()),
                     "norange" => range = None,
                     "nolist" => list_word = ListWord::Off,
                     "noalign" => {
@@ -2203,6 +2204,11 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
                             range = r;
                         }
                     }
+                    _ if lower.starts_with("fill=") => {
+                        if let Some(c) = parse_color_with(&lower[5..], vars).filter(|c| *c != Color::Default) {
+                            fill = Some(c);
+                        }
+                    }
                     // as style_parse in 3.8, default keeps the range
                     "default" => {
                         link = None;
@@ -2212,6 +2218,17 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
                         let _ = apply_word(w, &mut cur, &mut align, default, vars);
                     }
                 }
+            }
+            // push-default: the style before this directive (saved_sy); pop-default: the
+            // base default; set-default: both become the style before the directive
+            match default_type.as_deref() {
+                Some("push-default") => default = saved,
+                Some("pop-default") => default = base_default,
+                Some(_) => {
+                    base_default = saved;
+                    default = saved;
+                }
+                None => {}
             }
             // The list state (format_draw): entering or leaving the list or a marker drops
             // a range still open, and the focus ends at the next list=on.
@@ -2294,7 +2311,7 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
             i += c.len_utf8();
         }
     }
-    flush(&mut out, &mut buf, cur, if part == Part::Normal { align } else { list_align }, &range, &link, part, part == Part::List && focus.0 == 1);
+    flush(&mut out, &mut buf, cur, if part == Part::Normal { align } else { list_align }, &range, &link, part, part == Part::List && focus.0 == 1, fill);
     // a range still open at the end is dropped, as tmux does
     if range.is_some() {
         for sp in &mut out[range_start..] {
@@ -2311,9 +2328,10 @@ pub fn width(s: &str) -> usize {
 
 /// Cells for a group of spans (wide characters occupy a lead cell plus an empty
 /// continuation) and the mouse range of every cell.
-fn group_cells_ranged<'a>(spans: impl Iterator<Item = &'a Span>) -> (Vec<Cell>, Vec<Option<Range>>) {
+fn group_cells_ranged<'a>(spans: impl Iterator<Item = &'a Span>) -> (Vec<Cell>, Vec<Option<Range>>, Vec<Option<String>>) {
     let mut cells: Vec<Cell> = Vec::new();
     let mut tags: Vec<Option<Range>> = Vec::new();
+    let mut links: Vec<Option<String>> = Vec::new();
     for sp in spans {
         let tag = sp.range.clone();
         for c in sp.text.chars() {
@@ -2329,27 +2347,31 @@ fn group_cells_ranged<'a>(spans: impl Iterator<Item = &'a Span>) -> (Vec<Cell>, 
                 Some(w) => {
                     cells.push(Cell { text: c.to_string(), style: sp.style });
                     tags.push(tag.clone());
+                    links.push(sp.link.clone());
                     for _ in 1..w {
                         cells.push(Cell { text: String::new(), style: sp.style });
                         tags.push(tag.clone());
+                        links.push(sp.link.clone());
                     }
                 }
             }
         }
     }
-    (cells, tags)
+    (cells, tags, links)
 }
 
 /// One of format_draw's screens: its cells and the mouse range under each.
 struct Screen {
     cells: Vec<Cell>,
     tags: Vec<Option<Range>>,
+    /// The link= of each cell.
+    links: Vec<Option<String>>,
 }
 
 impl Screen {
     fn of<'a>(spans: impl Iterator<Item = &'a Span>) -> Screen {
-        let (cells, tags) = group_cells_ranged(spans);
-        Screen { cells, tags }
+        let (cells, tags, links) = group_cells_ranged(spans);
+        Screen { cells, tags, links }
     }
 
     fn len(&self) -> usize {
@@ -2360,6 +2382,7 @@ impl Screen {
     fn append(&mut self, other: &Screen, n: usize) {
         self.cells.extend_from_slice(&other.cells[..n]);
         self.tags.extend_from_slice(&other.tags[..n]);
+        self.links.extend_from_slice(&other.links[..n]);
     }
 }
 
@@ -2367,6 +2390,7 @@ impl Screen {
 struct Out {
     cells: Vec<Option<Cell>>,
     tags: Vec<Option<Range>>,
+    links: Vec<Option<String>>,
     fill: Style,
 }
 
@@ -2381,6 +2405,7 @@ impl Out {
             let cut_end = k == n - 1 && s.cells.get(from + k + 1).is_some_and(Cell::is_continuation);
             self.cells[at + k] = Some(if cut_start || cut_end { Cell { text: " ".into(), style: self.fill } } else { src.clone() });
             self.tags[at + k] = s.tags[from + k].clone();
+            self.links[at + k] = s.links[from + k].clone();
         }
     }
 
@@ -2447,13 +2472,28 @@ pub fn layout_line_ranged(spans: &[Span], width: usize, fill: Style) -> (Vec<Cel
 /// focus and given its markers when it does not fit. Cells nothing is drawn on are None
 /// (tmux leaves what was there, such as the border line under a pane status line).
 pub fn draw_line(spans: &[Span], width: usize, fill: Style) -> (Vec<Option<Cell>>, Vec<Option<Range>>) {
-    let mut out = Out { cells: vec![None; width], tags: vec![None; width], fill };
+    let out = draw_out(spans, width, fill);
+    (out.cells, out.tags)
+}
+
+/// [`layout_line_ranged`] with the link= of each cell (tty_hyperlink for style links).
+pub fn layout_line_links(spans: &[Span], width: usize, fill: Style) -> (Vec<Cell>, Vec<Option<Range>>, Vec<Option<String>>) {
+    let out = draw_out(spans, width, fill);
+    (out.cells.into_iter().map(|c| c.unwrap_or_else(|| Cell { text: " ".into(), style: fill })).collect(), out.tags, out.links)
+}
+
+fn draw_out(spans: &[Span], width: usize, fill: Style) -> Out {
+    let mut out = Out { cells: vec![None; width], tags: vec![None; width], links: vec![None; width], fill };
+    // a fill colour clears the available area first (the default cell with that background)
+    if let Some(bg) = spans.iter().rev().find_map(|s| s.fill) {
+        out.cells = vec![Some(Cell { text: " ".into(), style: Style { bg, ..Style::default() } }); width];
+    }
     let normal = |a: Align| Screen::of(spans.iter().filter(move |s| s.part == Part::Normal && s.align == a));
     let part = |p: Part| Screen::of(spans.iter().filter(move |s| s.part == p));
     let (mut left, mut centre, mut right, abs) = (normal(Align::Left), normal(Align::Centre), normal(Align::Right), normal(Align::AbsoluteCentre));
     let Some(list_align) = spans.iter().find(|s| !matches!(s.part, Part::Normal | Part::Hidden)).map(|s| s.align) else {
         out.none(&left, &centre, &right, &abs);
-        return (out.cells, out.tags);
+        return out;
     };
     let (list, ll, lr, after) = (part(Part::List), part(Part::ListLeft), part(Part::ListRight), part(Part::After));
     // the focus as cell offsets in the list
@@ -2497,7 +2537,7 @@ pub fn draw_line(spans: &[Span], width: usize, fill: Style) -> (Vec<Option<Cell>
         out.put_list(at, listw, &list, &ll, &lr, focus);
         at += listw;
         out.put(at, &after, 0, afterw);
-        return (out.cells, out.tags);
+        return out;
     }
     // format_draw_left/centre/right: trim the centre first (the list first in the centre)
     while lw + cw + rw + listw + afterw > width {
@@ -2533,7 +2573,7 @@ pub fn draw_line(spans: &[Span], width: usize, fill: Style) -> (Vec<Option<Cell>
             _ => right.append(&after, afterw),
         }
         out.none(&left, &centre, &right, &abs);
-        return (out.cells, out.tags);
+        return out;
     }
     out.put(0, &left, 0, lw);
     match list_align {
@@ -2562,7 +2602,7 @@ pub fn draw_line(spans: &[Span], width: usize, fill: Style) -> (Vec<Option<Cell>
     }
     let aw = aw0.min(width);
     out.put((width - aw) / 2, &abs, 0, aw);
-    (out.cells, out.tags)
+    out
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3047,9 +3087,9 @@ mod tests {
 
     #[test]
     fn styles() {
-        let base = Style { fg: Color::Idx(2), bg: Color::Idx(0), attrs: 0 };
+        let base = Style { fg: Color::Idx(2), bg: Color::Idx(0), attrs: 0, ..Style::default() };
         let s = parse_style("fg=red,bg=colour235,bold,noitalics", base).unwrap();
-        assert_eq!(s, Style { fg: Color::Idx(1), bg: Color::Idx(235), attrs: BOLD });
+        assert_eq!(s, Style { fg: Color::Idx(1), bg: Color::Idx(235), attrs: BOLD, ..Style::default() });
         let s = parse_style("bold dim italics underscore blink reverse strikethrough", base).unwrap();
         assert_eq!(s.attrs, BOLD | DIM | ITALIC | UNDERLINE | BLINK | INVERSE | STRIKE);
         let s2 = parse_style("nobold,nodim,noitalics,nounderscore,noblink,noreverse,nostrikethrough", s).unwrap();
@@ -3059,7 +3099,9 @@ mod tests {
         assert_eq!(parse_style("fg=red,default", base).unwrap(), base);
         assert_eq!(parse_style("fg=default", base).unwrap().fg, base.fg);
         assert_eq!(parse_style("", base).unwrap(), base);
-        assert_eq!(parse_style("bright,hidden,double-underscore", base).unwrap().attrs, BOLD | UNDERLINE);
+        // tmux keeps hidden, the underline styles, overline and acs, and us= is the underline colour
+        assert_eq!(parse_style("bright,hidden,double-underscore,overline,acs", base).unwrap().attrs, BOLD | crate::cells::HIDDEN | crate::cells::DOUBLE_UNDERLINE | crate::cells::OVERLINE | crate::cells::ACS);
+        assert_eq!(parse_style("us=red,curly-underscore", base).unwrap().us, Color::Idx(1));
         assert_eq!(parse_style("align=right,fill=blue,list=on,FG=Blue", base).unwrap().fg, Color::Idx(4));
         assert!(parse_style("fg=mauve", base).is_err());
         assert!(parse_style("sparkly", base).is_err());
@@ -3306,8 +3348,8 @@ mod tests {
 
     // ----- spans -----
 
-    fn st(fg: Color, attrs: u8) -> Style {
-        Style { fg, bg: Color::Default, attrs }
+    fn st(fg: Color, attrs: u16) -> Style {
+        Style { fg, bg: Color::Default, attrs, ..Style::default() }
     }
 
     #[test]
@@ -3317,8 +3359,8 @@ mod tests {
         assert_eq!(
             sp,
             vec![
-                Span { text: "a".into(), link: None, style: st(Color::Idx(1), 0), align: Align::Left, range: None, range_end: false, part: Part::Normal, focus: false },
-                Span { text: "b".into(), link: None, style: base, align: Align::Left, range: None, range_end: false, part: Part::Normal, focus: false },
+                Span { text: "a".into(), link: None, style: st(Color::Idx(1), 0), align: Align::Left, range: None, range_end: false, part: Part::Normal, focus: false, fill: None },
+                Span { text: "b".into(), link: None, style: base, align: Align::Left, range: None, range_end: false, part: Part::Normal, focus: false, fill: None },
             ]
         );
         // Merging of identical styles, `##` → `#`, `##[` is literal.
@@ -3357,6 +3399,14 @@ mod tests {
         let sp = spans("#[fg=red]#[push-default]a#[fg=blue]b#[default]c#[pop-default]#[default]d", base);
         let fgs: Vec<_> = sp.iter().map(|s| (s.text.as_str(), s.style.fg)).collect();
         assert_eq!(fgs, vec![("a", Color::Idx(1)), ("b", Color::Idx(4)), ("c", Color::Idx(1)), ("d", Color::Idx(2))]);
+        // push-default takes the style before its directive; pop-default goes back to the
+        // base even from a nested push
+        let fgs = |t: &str| spans(t, base).iter().map(|s| (s.text.clone(), s.style.fg)).collect::<Vec<_>>();
+        let red = |t: &str| format!("#[fg=red]#[push-default]{t}#[pop-default]#[default]");
+        assert_eq!(fgs(&red("#[fg=green,push-default]a#[default]b#[pop-default]#[default]c")), vec![("a".into(), Color::Idx(2)), ("b".into(), Color::Idx(1)), ("c".into(), Color::Idx(2))]);
+        assert_eq!(fgs(&red("a#[push-default]#[fg=blue]b#[default]c#[pop-default]#[default]d")), vec![("a".into(), Color::Idx(1)), ("b".into(), Color::Idx(4)), ("c".into(), Color::Idx(1)), ("d".into(), Color::Idx(2))]);
+        // set-default moves the base pop-default returns to
+        assert_eq!(fgs("#[fg=red]#[set-default]a#[fg=blue,push-default]b#[pop-default]#[default]c"), vec![("a".into(), Color::Idx(1)), ("b".into(), Color::Idx(4)), ("c".into(), Color::Idx(1))]);
     }
 
     // ----- width / layout -----

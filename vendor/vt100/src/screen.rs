@@ -11,6 +11,9 @@ const MODE_BRACKETED_PASTE: u8 = 0b0001_0000;
 // Modes kept only so they can be reported (tmux's pane_private_modes and the
 // *_flag format variables); the parser does not change behaviour for them.
 const XMODE_INSERT: u16 = 1 << 0;
+const CHARSET_G0: u8 = 1;
+const CHARSET_G1: u8 = 2;
+const CHARSET_SHIFT: u8 = 4;
 const XMODE_WRAP: u16 = 1 << 1;
 const XMODE_CURSOR_BLINKING: u16 = 1 << 2;
 const XMODE_CURSOR_BLINKING_SET: u16 = 1 << 3;
@@ -98,6 +101,10 @@ pub struct Screen {
 
     attrs: crate::attrs::Attrs,
     saved_attrs: crate::attrs::Attrs,
+    /// Character sets (tmux cell.g0set, g1set and set): CHARSET_G0 and CHARSET_G1 when
+    /// that set is DEC special graphics (ESC ( 0, ESC ) 0), CHARSET_SHIFT after SO.
+    charset: u8,
+    saved_charset: u8,
 
     modes: u8,
     xmodes: u16,
@@ -151,6 +158,8 @@ impl Screen {
 
             attrs: crate::attrs::Attrs::default(),
             saved_attrs: crate::attrs::Attrs::default(),
+            charset: 0,
+            saved_charset: 0,
 
             modes: 0,
             xmodes: XMODE_WRAP,
@@ -197,14 +206,26 @@ impl Screen {
     /// whether it holds extended cells.
     #[must_use]
     pub fn history_row_flags(&self, index: usize) -> (u8, bool) {
-        self.grid().absolute_row(index).map_or((0, false), |r| (r.flags(), r.extended()))
+        self.base_row(index).map_or((0, false), |r| (r.flags(), r.extended()))
     }
 
     /// When row `index` (counted as for [`Screen::history_row`]) entered the
     /// history, 0 if it has not or no time was set.
     #[must_use]
     pub fn history_row_time(&self, index: usize) -> u64 {
-        self.grid().absolute_row(index).map_or(0, crate::row::Row::time)
+        self.base_row(index).map_or(0, crate::row::Row::time)
+    }
+
+    /// Row `index` of tmux's base grid: the normal screen's history, then the
+    /// active screen's rows (the alternate screen keeps the history above it).
+    fn base_row(&self, index: usize) -> Option<&crate::row::Row> {
+        let history = self.grid.scrollback_len();
+        if index < history {
+            self.grid.absolute_row(index)
+        } else {
+            let g = self.grid();
+            g.absolute_row(g.scrollback_len() + index - history)
+        }
     }
 
     /// Apply OSC 8 (input_osc_8, hyperlinks_put), retaining only links referenced by
@@ -281,10 +302,12 @@ impl Screen {
         (size.rows, size.cols)
     }
 
-    /// Returns the number of lines in the scrollback.
+    /// Returns the number of lines in the scrollback: the normal screen's,
+    /// also while the alternate screen is active (tmux keeps the history in
+    /// the grid the alternate screen is drawn in).
     #[must_use]
     pub fn scrollback_len(&self) -> usize {
-        self.grid().scrollback_len()
+        self.grid.scrollback_len()
     }
 
     /// Returns the maximum capacity of the scrollback.
@@ -315,7 +338,10 @@ impl Screen {
     /// clears both the visible display and scrollback history, process both
     /// `CSI 2 J` and `CSI 3 J`.
     pub fn clear_scrollback(&mut self) {
-        self.grid_mut().erase_all_scrollback(|_| {});
+        // grid_clear_history(wp->base.grid): the normal screen's history also
+        // while the alternate screen is active
+        self.grid.erase_all_scrollback(|_| {});
+        self.alternate_grid.erase_all_scrollback(|_| {});
     }
 
     /// Returns the current position in the scrollback.
@@ -804,7 +830,7 @@ impl Screen {
     /// followed by the visible screen. Index these with [`Screen::history_row`].
     #[must_use]
     pub fn history_rows_len(&self) -> usize {
-        self.grid().absolute_len()
+        self.base_history_len()
     }
 
     /// Row `index` of the active screen counted from the oldest scrollback row
@@ -813,7 +839,33 @@ impl Screen {
     /// can read history without cloning the screen.
     #[must_use]
     pub fn history_row(&self, index: usize) -> Option<crate::capture::RowContents<'_>> {
-        self.grid().absolute_row(index).map(crate::capture::RowContents)
+        self.base_row(index).map(crate::capture::RowContents)
+    }
+
+    /// tmux's base grid (wp->base.grid) as the history formats see it: the
+    /// normal screen's history, then the visible rows of the active screen
+    /// (tmux swaps the alternate screen into the base grid's visible area).
+    #[must_use]
+    pub fn base_history_len(&self) -> usize {
+        self.grid.scrollback_len() + usize::from(self.grid().size().rows.get())
+    }
+
+    /// Normal screen history limit and length, also while the alternate
+    /// screen is active.
+    #[must_use]
+    pub fn base_scrollback(&self) -> (usize, usize) {
+        (self.grid.scrollback_len(), self.grid.scrollback_capacity())
+    }
+
+    /// A new history-limit for the normal screen's history (session_update_history).
+    pub fn set_history_limit(&mut self, limit: usize) {
+        self.grid.set_scrollback_capacity(limit);
+    }
+
+    /// Row `index` of [`Screen::base_history_len`].
+    #[must_use]
+    pub fn base_history_row(&self, index: usize) -> Option<crate::capture::RowContents<'_>> {
+        self.history_row(index)
     }
 
     /// Visible row `row` of the normal screen while the alternate screen is
@@ -1070,12 +1122,31 @@ impl Screen {
     fn save_cursor(&mut self) {
         self.grid_mut().save_cursor();
         self.saved_attrs = self.attrs;
+        self.saved_charset = self.charset;
         self.saved_hyperlink = self.hyperlink.clone();
+    }
+
+    /// SCS (ESC ( and ESC )): G0 or G1 is DEC special graphics ('0') or ASCII ('B').
+    pub fn designate_charset(&mut self, g1: bool, graphics: bool) {
+        let bit = if g1 { CHARSET_G1 } else { CHARSET_G0 };
+        if graphics { self.charset |= bit } else { self.charset &= !bit }
+    }
+
+    /// SO (true) and SI (false): G1 or G0 is the set in use.
+    pub fn shift_charset(&mut self, g1: bool) {
+        if g1 { self.charset |= CHARSET_SHIFT } else { self.charset &= !CHARSET_SHIFT }
+    }
+
+    /// input_print: a 7-bit character is drawn from the set in use.
+    fn graphics_charset(&self) -> bool {
+        let bit = if self.charset & CHARSET_SHIFT != 0 { CHARSET_G1 } else { CHARSET_G0 };
+        self.charset & bit != 0
     }
 
     fn restore_cursor(&mut self) {
         self.grid_mut().restore_cursor();
         self.attrs = self.saved_attrs;
+        self.charset = self.saved_charset;
         // input_restore_state: the saved cell has its link
         self.hyperlink = self.saved_hyperlink.clone();
     }
@@ -1169,6 +1240,42 @@ impl Screen {
         }
 
         Some(width)
+    }
+
+    /// screen_write_combine for a character with a width: whether it joins the cell
+    /// before the cursor (after a zero width joiner; a skin tone modifier and an emoji
+    /// that takes one, in either order; two regional indicators) and whether that makes
+    /// the cell wide (utf8_should_combine).
+    fn combine_with_last(&self, c: char) -> Option<bool> {
+        let pos = self.grid().pos();
+        // a 7-bit character never combines
+        if pos.col == 0 || c.is_ascii() {
+            return None;
+        }
+        let mut col = pos.col - 1;
+        let cell = self.grid().drawing_cell(crate::grid::Pos { row: pos.row, col })?;
+        let cell = if cell.is_wide_continuation() && col > 0 {
+            col -= 1;
+            self.grid().drawing_cell(crate::grid::Pos { row: pos.row, col })?
+        } else {
+            cell
+        };
+        // the cell must be as wide as the distance to the cursor
+        if cell.is_wide_continuation() || cell.is_wide() != (pos.col - col == 2) {
+            return None;
+        }
+        let text = cell.contents();
+        let ri = |x: char| ('\u{1F1E6}'..='\u{1F1FF}').contains(&x);
+        let modifier = |x: char| ('\u{1F3FB}'..='\u{1F3FF}').contains(&x);
+        // utf8_towc reads the cell's first character; regional indicators pair only
+        // when the cell has one (utf8_regional_count)
+        if let Some(l) = text.chars().next() {
+            let pair = ri(c) && ri(l) && text.chars().filter(|x| ri(*x)).count() == 1;
+            if pair || (modifier(c) && EMOJI_MODIFIER_BASE.contains(&(l as u32))) || (modifier(l) && EMOJI_MODIFIER_BASE.contains(&(c as u32))) {
+                return Some(true);
+            }
+        }
+        text.ends_with('\u{200D}').then_some(false)
     }
 
     // if this is the initial codepoint in a new cell, we need to determine
@@ -1361,21 +1468,33 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
     pub fn text(&mut self, c: char) {
         let screen = &mut self.screen;
         let pos = screen.grid().pos();
-        let attrs = screen.attrs;
+        let mut attrs = screen.attrs;
+        attrs.set_charset(c.is_ascii() && screen.graphics_charset());
 
         let Some(width) = screen.calculate_width(c) else {
             return;
         };
+        let combine = if width > 0 { screen.combine_with_last(c) } else { None };
+        let width = if combine.is_some() { 0 } else { width };
 
         // base_pos will always be set to a valid cell, so
         // .drawing_cell(base_pos).unwrap() will always be valid
         let mut base_pos;
         let cell_was_wide;
 
+        let nowrap = !screen.wrap_mode();
         if width > 0 {
-            let wrap = screen.new_character_should_wrap(width);
-            let on_row = Self::on_row(screen, &mut self.callbacks);
-            screen.grid_mut().col_wrap(width, wrap, on_row);
+            if nowrap {
+                // screen_write_cell without MODE_WRAP: a character that does not fit is
+                // dropped, the last column is written over
+                if pos.col + width > screen.grid().size().cols() {
+                    return;
+                }
+            } else {
+                let wrap = screen.new_character_should_wrap(width);
+                let on_row = Self::on_row(screen, &mut self.callbacks);
+                screen.grid_mut().col_wrap(width, wrap, on_row);
+            }
             // col_wrap always sets self.grid().pos() to a valid cell
             base_pos = screen.grid().pos();
             // IRM (screen_write_cell): the character makes room for itself
@@ -1396,6 +1515,10 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
             screen.grid_mut().drawing_cell_mut(base_pos).unwrap().set_wide(width == 2);
             screen.last_char = Some(c);
             screen.grid_mut().col_inc(width);
+            if nowrap && screen.grid().pos().col >= screen.grid().size().cols() {
+                let last = screen.grid().size().cols() - 1;
+                screen.grid_mut().col_set(last);
+            }
         } else {
             // pos.row is valid, since it comes directly from
             // self.grid().pos() which we assume to always have a
@@ -1430,9 +1553,10 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                 .drawing_cell_mut(base_pos)
                 .unwrap()
                 .append(c);
-            // VS16 makes a narrow base wide only with variation-selector-always-wide on
-            if c == '\u{FE0F}' {
-                let wide = screen.variation_wide || cell_was_wide;
+            // VS16 makes a narrow base wide only with variation-selector-always-wide on;
+            // a modifier or a second regional indicator always does
+            if c == '\u{FE0F}' || combine == Some(true) {
+                let wide = screen.variation_wide || cell_was_wide || combine == Some(true);
                 screen.grid_mut().drawing_cell_mut(base_pos).unwrap().set_wide(wide);
             }
             let cell_is_wide =
@@ -1576,6 +1700,9 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
     // ESC 8
     pub fn decrc(&mut self) {
         self.screen.restore_cursor();
+        // input_restore_state moves with screen_write_cursormove, which keeps the cursor
+        // on the screen: a saved pending wrap is gone
+        self.leave_pending_wrap();
     }
 
     // ESC =
@@ -1663,12 +1790,52 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
 
     // CSI A
     pub fn cuu(&mut self, offset: u16) {
+        // screen_write_cursorup: the cursor leaves a pending wrap for the last column
+        self.leave_pending_wrap();
         self.screen.grid_mut().row_dec_clamp(offset);
     }
 
     // CSI B
     pub fn cud(&mut self, offset: u16) {
+        self.leave_pending_wrap();
         self.screen.grid_mut().row_inc_clamp(offset);
+    }
+
+    fn leave_pending_wrap(&mut self) {
+        let cols = self.screen.grid().size().cols();
+        if self.screen.grid().pos().col >= cols {
+            self.screen.grid_mut().col_set(cols - 1);
+        }
+    }
+
+    // ESC D (IND): a line feed without a carriage return
+    pub fn ind(&mut self) {
+        let on_row = Self::on_row(&self.screen, &mut self.callbacks);
+        self.screen.grid_mut().row_inc_scroll(1, on_row);
+    }
+
+    // ESC E (NEL)
+    pub fn nel(&mut self) {
+        self.cr();
+        self.ind();
+    }
+
+    // CSI Z (CBT): back to the previous tab stop, `count` times
+    pub fn cbt(&mut self, count: u16) {
+        let cols = self.screen.grid().size().cols();
+        let mut cx = self.screen.grid().pos().col.min(cols - 1);
+        let stop = |s: &Screen, x: u16| s.tabs.as_ref().map_or(x % 8 == 0, |t| t.get(usize::from(x)).copied().unwrap_or(false));
+        let mut n = count;
+        while cx > 0 && n > 0 {
+            n -= 1;
+            loop {
+                cx -= 1;
+                if cx == 0 || stop(&self.screen, cx) {
+                    break;
+                }
+            }
+        }
+        self.screen.grid_mut().col_set(cx);
     }
 
     // CSI C
@@ -1913,116 +2080,98 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
             return;
         }
 
-        let mut iter = params.iter();
-
-        macro_rules! next_param {
-            () => {
-                match iter.next() {
-                    Some(n) => n,
-                    _ => return,
-                }
-            };
-        }
-
-        macro_rules! to_u8 {
-            ($n:expr) => {
-                if let Some(n) = u16_to_u8($n) {
-                    n
-                } else {
-                    return;
-                }
-            };
-        }
-
-        macro_rules! next_param_u8 {
-            () => {
-                if let &[n] = next_param!() {
-                    to_u8!(n)
-                } else {
-                    return;
-                }
-            };
-        }
-
-        loop {
-            let screen = &mut self.screen;
-            match next_param!() {
-                [0] => screen.attrs = crate::attrs::Attrs::default(),
-                [1] => screen.attrs.set_bold(),
-                [2] => screen.attrs.set_dim(),
-                [3] => screen.attrs.set_italic(true),
-                [4] => screen.attrs.set_underline(true),
-                [7] => screen.attrs.set_inverse(true),
-                [22] => screen.attrs.set_normal_intensity(),
-                [23] => screen.attrs.set_italic(false),
-                [24] => screen.attrs.set_underline(false),
-                [27] => screen.attrs.set_inverse(false),
-                [n] if (30..=37).contains(n) => {
-                    screen.attrs.fgcolor = crate::Color::Idx(to_u8!(*n) - 30);
-                }
-                [38, 2, r, g, b] => {
-                    screen.attrs.fgcolor =
-                        crate::Color::Rgb(to_u8!(*r), to_u8!(*g), to_u8!(*b));
-                }
-                [38, 5, i] => {
-                    screen.attrs.fgcolor = crate::Color::palette(to_u8!(*i));
-                }
-                [38] => match next_param!() {
-                    [2] => {
-                        let r = next_param_u8!();
-                        let g = next_param_u8!();
-                        let b = next_param_u8!();
-                        screen.attrs.fgcolor = crate::Color::Rgb(r, g, b);
+        // input_csi_dispatch_sgr: each parameter in turn; 38, 48 and 58 take a colour
+        // from the ones after them, a parameter with colons (input_csi_dispatch_sgr_colon)
+        // is one colour or underline style, and anything unknown is skipped
+        let _ = &mut unhandled;
+        let list: alloc::vec::Vec<&[u16]> = params.iter().collect();
+        let get = |i: usize| -> Option<u16> { list.get(i).and_then(|p| p.first().copied()) };
+        let attrs = &mut self.screen.attrs;
+        let set = |attrs: &mut crate::attrs::Attrs, which: u16, c: crate::Color| match which {
+            38 => attrs.fgcolor = c,
+            48 => attrs.bgcolor = c,
+            _ => attrs.ulcolor = c,
+        };
+        let mut i = 0;
+        while i < list.len() {
+            let p = list[i];
+            if p.len() > 1 {
+                // a colon list: up to seven parts
+                if p.len() < 8 {
+                    let n = p.len();
+                    match (p[0], p[1]) {
+                        (4, style) if n == 2 && style <= 5 => attrs.set_underline_style(style as u8),
+                        (38 | 48 | 58, 2) if n >= 3 => {
+                            let at = if n == 5 { 2 } else { 3 };
+                            if n >= at + 3 && p[at..at + 3].iter().all(|v| *v <= 255) {
+                                set(attrs, p[0], crate::Color::Rgb(p[at] as u8, p[at + 1] as u8, p[at + 2] as u8));
+                            }
+                        }
+                        (38 | 48 | 58, 5) if n >= 3 => match p[2] {
+                            c @ 0..=255 => set(attrs, p[0], crate::Color::palette(c as u8)),
+                            _ if p[0] != 58 => set(attrs, p[0], crate::Color::Default),
+                            _ => {}
+                        },
+                        _ => {}
                     }
-                    [5] => {
-                        screen.attrs.fgcolor =
-                            crate::Color::palette(next_param_u8!());
-                    }
-                    _ => {
-                        unhandled(self);
-                        return;
-                    }
-                },
-                [39] => {
-                    screen.attrs.fgcolor = crate::Color::Default;
                 }
-                [n] if (40..=47).contains(n) => {
-                    screen.attrs.bgcolor = crate::Color::Idx(to_u8!(*n) - 40);
-                }
-                [48, 2, r, g, b] => {
-                    screen.attrs.bgcolor =
-                        crate::Color::Rgb(to_u8!(*r), to_u8!(*g), to_u8!(*b));
-                }
-                [48, 5, i] => {
-                    screen.attrs.bgcolor = crate::Color::palette(to_u8!(*i));
-                }
-                [48] => match next_param!() {
-                    [2] => {
-                        let r = next_param_u8!();
-                        let g = next_param_u8!();
-                        let b = next_param_u8!();
-                        screen.attrs.bgcolor = crate::Color::Rgb(r, g, b);
-                    }
-                    [5] => {
-                        screen.attrs.bgcolor =
-                            crate::Color::palette(next_param_u8!());
-                    }
-                    _ => {
-                        unhandled(self);
-                        return;
-                    }
-                },
-                [49] => {
-                    screen.attrs.bgcolor = crate::Color::Default;
-                }
-                [n] if (90..=97).contains(n) => {
-                    screen.attrs.fgcolor = crate::Color::Idx(to_u8!(*n) - 82);
-                }
-                [n] if (100..=107).contains(n) => {
-                    screen.attrs.bgcolor = crate::Color::Idx(to_u8!(*n) - 92);
-                }
-                _ => unhandled(self),
+                i += 1;
+                continue;
             }
+            let n = p[0];
+            if matches!(n, 38 | 48 | 58) {
+                i += 1;
+                match get(i) {
+                    Some(2) => {
+                        let rgb = (get(i + 1), get(i + 2), get(i + 3));
+                        if let (Some(r @ 0..=255), Some(g @ 0..=255), Some(b @ 0..=255)) = rgb {
+                            set(attrs, n, crate::Color::Rgb(r as u8, g as u8, b as u8));
+                            i += 3;
+                        }
+                    }
+                    Some(5) => {
+                        match get(i + 1) {
+                            Some(c @ 0..=255) => set(attrs, n, crate::Color::palette(c as u8)),
+                            _ if n != 58 => set(attrs, n, crate::Color::Default),
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    _ => {}
+                }
+                i += 1;
+                continue;
+            }
+            match n {
+                0 => *attrs = crate::attrs::Attrs::default(),
+                1 => attrs.set_bold(),
+                2 => attrs.set_dim(),
+                3 => attrs.set_italic(true),
+                4 => attrs.set_underline_style(1),
+                5 | 6 => attrs.set_blink(true),
+                7 => attrs.set_inverse(true),
+                8 => attrs.set_hidden(true),
+                9 => attrs.set_strikethrough(true),
+                21 => attrs.set_underline_style(2),
+                22 => attrs.set_normal_intensity(),
+                23 => attrs.set_italic(false),
+                24 => attrs.set_underline_style(0),
+                25 => attrs.set_blink(false),
+                27 => attrs.set_inverse(false),
+                28 => attrs.set_hidden(false),
+                29 => attrs.set_strikethrough(false),
+                30..=37 => attrs.fgcolor = crate::Color::Idx((n - 30) as u8),
+                39 => attrs.fgcolor = crate::Color::Default,
+                40..=47 => attrs.bgcolor = crate::Color::Idx((n - 40) as u8),
+                49 => attrs.bgcolor = crate::Color::Default,
+                53 => attrs.set_overline(true),
+                55 => attrs.set_overline(false),
+                59 => attrs.ulcolor = crate::Color::Default,
+                90..=97 => attrs.fgcolor = crate::Color::Idx((n - 82) as u8),
+                100..=107 => attrs.bgcolor = crate::Color::Idx((n - 92) as u8),
+                _ => {}
+            }
+            i += 1;
         }
     }
 
@@ -2031,15 +2180,6 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
         self.screen
             .grid_mut()
             .set_scroll_region(top - 1, bottom - 1);
-    }
-}
-
-fn u16_to_u8(i: u16) -> Option<u8> {
-    if i > u16::from(u8::MAX) {
-        None
-    } else {
-        // safe because we just ensured that the value fits in a u8
-        Some(i.try_into().unwrap())
     }
 }
 
@@ -2074,3 +2214,15 @@ fn stravis(src: &[u8]) -> String {
     }
     out
 }
+
+/// The emoji a skin tone modifier combines with (utf8_should_combine).
+const EMOJI_MODIFIER_BASE: [u32; 72] = [
+    0x1F44B, 0x1F44C, 0x1F44D, 0x1F44E, 0x1F44F, 0x1F450, 0x1F466, 0x1F467, 0x1F468, 0x1F469,
+    0x1F46E, 0x1F470, 0x1F471, 0x1F472, 0x1F473, 0x1F474, 0x1F475, 0x1F476, 0x1F477, 0x1F478,
+    0x1F47C, 0x1F481, 0x1F482, 0x1F483, 0x1F485, 0x1F486, 0x1F487, 0x1F4AA, 0x1F575, 0x1F57A,
+    0x1F590, 0x1F595, 0x1F596, 0x1F645, 0x1F646, 0x1F647, 0x1F64B, 0x1F64C, 0x1F64D, 0x1F64E,
+    0x1F64F, 0x1F6B4, 0x1F6B5, 0x1F6B6, 0x1F926, 0x1F937, 0x1F938, 0x1F939, 0x1F93D, 0x1F93E,
+    0x1F9B5, 0x1F9B6, 0x1F9B8, 0x1F9B9, 0x1F9CD, 0x1F9CE, 0x1F9CF, 0x1F9D1, 0x1F9D2, 0x1F9D3,
+    0x1F9D4, 0x1F9D5, 0x1F9D6, 0x1F9D7, 0x1F9D8, 0x1F9D9, 0x1F9DA, 0x1F9DB, 0x1F9DC, 0x1F9DD,
+    0x1F9DE, 0x1F9DF,
+];

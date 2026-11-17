@@ -808,8 +808,8 @@ impl Server {
             for (k, v) in set {
                 p.options.set(k, v);
             }
-            if let Some(t) = &title {
-                p.title = t.clone();
+            if let Some(t) = title.as_deref().and_then(super::cmds::clean_title) {
+                p.title = t;
             }
         }
         if let Some(t) = title {

@@ -159,7 +159,12 @@ fn win_spawn_detached(exe: &std::path::Path, config: Option<&str>, cwd: &str) ->
 fn connect(autostart: bool, config: Option<&str>) -> Result<Stream, String> {
     match ipc::connect() {
         Ok(s) => return Ok(s),
-        Err(e) if !autostart => return Err(format!("no server running on {} ({e})", ipc::describe())),
+        // client_main: a refused connection is "no server running"; tmux leaves the socket
+        // when its server exits but this server removes it, so a missing one is the same
+        Err(e) if !autostart && matches!(e.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound) => {
+            return Err(format!("no server running on {}", ipc::describe()))
+        }
+        Err(e) if !autostart => return Err(format!("error connecting to {} ({})", ipc::describe(), crate::server::strerror(&e))),
         Err(_) => {}
     }
     spawn_server(config).map_err(|e| format!("failed to start server: {e}"))?;
@@ -419,8 +424,9 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                     // the server sends the theme and colour queries (VT100-like terminals only)
                     if alternate { let _ = out.write_all(b"\x1b[?1049h\x1b[H\x1b[2J"); }
                     else {
-                        // Scroll the previous terminal contents into scrollback.
-                        let _ = out.write_all(format!("\x1b[{};1H{}\x1b[H", rows, "\r\n".repeat(rows as usize + 1)).as_bytes());
+                        // Scroll the previous terminal contents into scrollback (tmux scrolls
+                        // sy + 1 lines with indn, which the terminal caps at its height).
+                        let _ = out.write_all(format!("\x1b[{};1H{}\x1b[H", rows, "\r\n".repeat(rows as usize)).as_bytes());
                     }
                     let _ = out.flush();
                     // tmux's client answers MSG_READY with MSG_RESIZE (client-resized)

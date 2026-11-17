@@ -348,11 +348,17 @@ impl PaneColours {
 
 impl Server {
     pub(super) fn terminal_report(&mut self, cid: ClientId, raw: &[u8]) -> bool {
+        // tty_update_features: new features apply terminal-overrides again
+        let overrides: Vec<String> = self.opts_server.array_items("terminal-overrides").into_iter().map(|(_, v)| v).collect();
         if let Some(c) = self.clients.get_mut(&cid) {
             // tty_keys_device_attributes2 and _extended: once per terminal
             let bit = if raw.starts_with(b"\x1bP>|") { HAVE_XDA } else if raw.starts_with(b"\x1b[>") { HAVE_DA2 } else { 0 };
             if bit != 0 && !c.denied && c.terminal.waiting(bit) && c.features.device_report(raw) {
                 c.terminal.received(bit);
+                if let Some(body) = raw.strip_prefix(b"\x1bP>|").and_then(|s| s.strip_suffix(b"\x1b\\")) {
+                    c.term_type = String::from_utf8_lossy(body).into_owned();
+                }
+                c.term_overrides = Some(overrides);
                 c.prev = None;
                 c.dirty = true;
                 return true;
@@ -369,6 +375,7 @@ impl Server {
                             }
                         }
                         c.terminal.received(HAVE_DA);
+                        c.term_overrides = Some(overrides);
                         c.prev = None;
                         c.dirty = true;
                         return true;
@@ -380,6 +387,7 @@ impl Server {
                 if c.terminal.waiting(HAVE_SYNC) {
                     if matches!(status[0], b'1'..=b'3') && !c.features.has("sync") {
                         c.features.parse("sync", &[',']);
+                        c.term_overrides = Some(overrides);
                         c.prev = None;
                         c.dirty = true;
                     }
@@ -541,6 +549,8 @@ mod tests {
             keyp: keys::Parser::new(),
             input_state: Default::default(),
             term_caps: Default::default(),
+            term_overrides: None,
+            term_type: String::new(),
             esc_deadline: None,
             prompt: None,
             overlay: None,

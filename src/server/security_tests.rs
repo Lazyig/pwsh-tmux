@@ -25,6 +25,8 @@ pub(super) fn fixture() -> (Server, mpsc::Receiver<Event>) {
             keyp: keys::Parser::new(),
             input_state: Default::default(),
             term_caps: Default::default(),
+            term_overrides: None,
+            term_type: String::new(),
             esc_deadline: None,
             prompt: None,
             overlay: None,
