@@ -11,6 +11,7 @@ mod events;
 mod float;
 /// The JSON subset tmux parses (layouts, display-message -j).
 pub use cmds::json::{parse as json_parse, Node as Json};
+pub use cmds::strerror;
 pub mod features;
 mod termcap;
 mod terminfo;
@@ -168,7 +169,15 @@ impl OscState {
         // tmux sees the text after "N;" with its separators
         let arg = rest.iter().map(|p| String::from_utf8_lossy(p)).collect::<Vec<_>>().join(";");
         match *first {
-            b"7" => self.path = arg.chars().filter(|c| !c.is_control()).collect(),
+            // screen_set_path(untrusted): clean_name keeps the old path for one that is not
+            // valid and turns "#(" into "_(" (on Windows a backslash stays, as in titles)
+            b"7" => {
+                let raw = rest.join(&b';');
+                let clean = |p: &str| if cfg!(windows) { cmds::check_name(p).then(|| p.to_string()) } else { cmds::clean_title(p) };
+                if let Some(p) = std::str::from_utf8(&raw).ok().and_then(clean) {
+                    self.path = p.replace("#(", "_(");
+                }
+            }
             b"9" => self.progress(&arg),
             b"12" if arg != "?" => {
                 if let Some(c) = parse_x11_colour(&arg) {

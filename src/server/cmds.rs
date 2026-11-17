@@ -1527,6 +1527,11 @@ impl Server {
         }
     }
 
+    /// paste_get_top: the newest automatic buffer (named buffers are skipped).
+    pub fn top_buffer(&self) -> Option<usize> {
+        self.buffers.iter().position(|b| b.automatic)
+    }
+
     /// paste_add: a new automatic buffer named `{prefix}N`, freeing the oldest automatic
     /// buffers over buffer-limit first; paste-buffer-changed fires with the final name.
     pub fn paste_add(&mut self, prefix: &str, data: Vec<u8>) {
@@ -2629,8 +2634,11 @@ impl Server {
                 }
                 if let Some(title) = o.get('T') {
                     let title = self.expand(tt, ctx.client, title);
+                    // screen_set_title: clean_name refuses a title with control characters
+                    // and the pane keeps its title
+                    let Some(clean) = clean_title(&title) else { return Ok(Flow::Next) };
                     let p = self.panes.get_mut(&pane).unwrap();
-                    p.title = title.clone();
+                    p.title = clean;
                     let mut ev = self.payload_pane(pane);
                     ev.str("new_title", title);
                     self.fire("pane-title-changed", ev);
@@ -4199,12 +4207,16 @@ impl Server {
                 if let Some(newname) = o.get('n') {
                     let pos = match &name {
                         Some(n) => self.buffers.iter().position(|b| &b.name == n).ok_or_else(|| format!("unknown buffer: {n}"))?,
-                        None if self.buffers.is_empty() => return err("no buffer"),
-                        None => 0,
+                        None => self.top_buffer().ok_or("no buffer")?,
                     };
                     if newname.is_empty() {
                         return err("new name is empty");
                     }
+                    // paste_rename: clean_name refuses control characters
+                    if !check_name(newname) {
+                        return err(format!("invalid buffer name: {newname}"));
+                    }
+                    let newname = &*clean_name(newname);
                     if self.buffers[pos].name == newname {
                         return Ok(Flow::Next);
                     }
@@ -4225,6 +4237,10 @@ impl Server {
                     return Ok(Flow::Next);
                 }
                 let data = o.rest.first().ok_or("no data specified")?.clone();
+                if data.is_empty() {
+                    return Ok(Flow::Next);
+                }
+                let name = name.map(|n| buffer_name(&n)).transpose()?;
                 // tty_set_selection on the target client (CMD_CLIENT_CANFAIL), clip ""
                 if o.has('w') {
                     if let Ok(cid) = self.resolve_client(ctx, o.get('t')) { self.set_selection(cid, "", data.as_bytes()); }
@@ -4239,11 +4255,9 @@ impl Server {
                         let old = self.buffers.remove(pos);
                         self.buffer_event(&old.name, true);
                     }
+                    // paste_get_top: the newest automatic buffer
                     None => {
-                        if self.buffers.is_empty() {
-                            return err("no buffer");
-                        }
-                        let old = self.buffers.remove(0);
+                        let old = self.buffers.remove(self.top_buffer().ok_or("no buffer")?);
                         self.buffer_event(&old.name, true);
                     }
                 }
@@ -4273,7 +4287,7 @@ impl Server {
             "show-buffer" => {
                 let b = match o.get('b') {
                     Some(n) => self.buffers.iter().find(|b| b.name == n).ok_or_else(|| format!("no buffer {n}"))?,
-                    None => self.buffers.first().ok_or("no buffers")?,
+                    None => self.top_buffer().map(|i| &self.buffers[i]).ok_or("no buffers")?,
                 };
                 ctx.out.push_str(&String::from_utf8_lossy(&b.data));
                 Ok(Flow::Next)
@@ -4281,7 +4295,7 @@ impl Server {
             "save-buffer" => {
                 let b = match o.get('b') {
                     Some(n) => self.buffers.iter().find(|b| b.name == n).ok_or_else(|| format!("no buffer {n}"))?,
-                    None => self.buffers.first().ok_or("no buffers")?,
+                    None => self.top_buffer().map(|i| &self.buffers[i]).ok_or("no buffers")?,
                 };
                 let path = o.rest.first().ok_or("save-buffer needs a path")?;
                 if path == "-" {
@@ -4289,8 +4303,9 @@ impl Server {
                     return Ok(Flow::Next);
                 }
                 let path = self.resolve_path(ctx, path);
-                let mut f = std::fs::OpenOptions::new().create(true).write(true).append(o.has('a')).truncate(!o.has('a')).open(&path).map_err(|e| format!("{path}: {e}"))?;
-                f.write_all(&b.data).map_err(|e| format!("{path}: {e}"))?;
+                // file_write_open: "<strerror>: <path>"
+                let mut f = std::fs::OpenOptions::new().create(true).write(true).append(o.has('a')).truncate(!o.has('a')).open(&path).map_err(|e| format!("{}: {path}", strerror(&e)))?;
+                f.write_all(&b.data).map_err(|e| format!("{}: {path}", strerror(&e)))?;
                 Ok(Flow::Next)
             }
             "load-buffer" => {
@@ -4301,12 +4316,17 @@ impl Server {
                     return err("unsafe legacy stdin buffer encoding; update the client");
                 } else {
                     let p = self.resolve_path(ctx, path);
-                    std::fs::read(&p).map_err(|e| format!("{p}: {e}"))?
+                    // file_read: "<strerror>: <path>"
+                    std::fs::read(&p).map_err(|e| format!("{}: {p}", strerror(&e)))?
                 };
+                let name = o.get('b').map(buffer_name).transpose()?;
                 if o.has('w') {
                     if let Ok(cid) = self.resolve_client(ctx, o.get('t')) { self.set_selection(cid, "", &data); }
                 }
-                self.add_buffer(o.get('b').map(String::from), data, false);
+                if data.is_empty() {
+                    return Ok(Flow::Next);
+                }
+                self.add_buffer(name, data, false);
                 Ok(Flow::Next)
             }
             "paste-buffer" => {
@@ -4316,12 +4336,10 @@ impl Server {
                 }
                 let idx = match o.get('b') {
                     Some(n) => self.buffers.iter().position(|b| b.name == n).ok_or_else(|| format!("no buffer {n}"))?,
-                    None => {
-                        if self.buffers.is_empty() {
-                            return Ok(Flow::Next);
-                        }
-                        0
-                    }
+                    None => match self.top_buffer() {
+                        Some(i) => i,
+                        None => return Ok(Flow::Next),
+                    },
                 };
                 let data = self.buffers[idx].data.clone();
                 // tmux 3.8 passes the text through vis(3) so it can't carry control sequences
@@ -5645,10 +5663,26 @@ fn describe_capability(i: usize, v: &super::terminfo::Value) -> String {
 }
 
 /// tmux's check_name (utf8_isvalid): printable ASCII and complete UTF-8 characters.
-fn check_name(name: &str) -> bool {
+pub(crate) fn check_name(name: &str) -> bool {
     // utf8_isvalid: printable ASCII or UTF-8 characters (bytes that were not UTF-8 come
     // from the client as rawarg characters)
     name.chars().all(|c| (!c.is_ascii() && !crate::rawarg::is_raw(c)) || (' '..='~').contains(&c))
+}
+
+/// clean_name(title, 0) for a pane title: None when it is not valid.
+pub(crate) fn clean_title(title: &str) -> Option<String> {
+    check_name(title).then(|| clean_name(title))
+}
+
+/// paste_set: a buffer name that is not empty and passes clean_name.
+fn buffer_name(name: &str) -> Result<String, String> {
+    if name.is_empty() {
+        return err("empty buffer name");
+    }
+    if !check_name(name) {
+        return err(format!("invalid buffer name: {name}"));
+    }
+    Ok(clean_name(name))
 }
 
 /// tmux's clean_name for a session (or window) name: vis-escaped with
@@ -5659,7 +5693,7 @@ fn clean_name(name: &str) -> String {
 
 /// strerror(3) text for an I/O error (without Rust's " (os error N)"); a missing file
 /// is ENOENT's text on every platform.
-pub(crate) fn strerror(e: &std::io::Error) -> String {
+pub fn strerror(e: &std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::NotFound {
         return "No such file or directory".into();
     }
