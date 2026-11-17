@@ -4187,6 +4187,7 @@ impl Server {
             if let Some(first) = argv.first_mut() {
                 *first = name.clone();
             }
+            crate::cmdparse::unmark_blocks(&mut argv);
             let saved_mouse = std::mem::replace(&mut self.cur_mouse, q.ctx.mouse.clone());
             let saved_file = std::mem::replace(&mut self.cur_file, q.ctx.files.last().cloned());
             let saved_formats = std::mem::replace(&mut self.ev.cur_formats, q.ctx.formats.clone());

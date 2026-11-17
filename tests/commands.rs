@@ -1362,6 +1362,14 @@ fn message_log_jobs_and_prompt_history_types() {
     let lines: Vec<&str> = log.lines().collect();
     assert!(lines[0].ends_with(" command: show-messages"), "{log}");
     assert!(lines[1].ends_with(" command: display-message \"hello msg\""), "{log}");
+    // cmd_print: { } blocks are printed as blocks, not as strings
+    let conf = std::env::temp_dir().join(format!("pt-msg-blocks-{}.conf", std::process::id()));
+    std::fs::write(&conf, "if-shell -F 1 { set -g @a 1 } { set -g @a 2 }\n").unwrap();
+    ctx.ok(&["source-file", &conf.to_string_lossy()]);
+    let _ = std::fs::remove_file(&conf);
+    let log = ctx.ok(&["show-messages"]);
+    assert!(log.contains(" command: if-shell -F 1 { set-option -g @a 1 } { set-option -g @a 2 }\n"), "{log}");
+    assert!(log.contains(" command: set-option -g @a 1\n"), "{log}");
     // -J: running jobs
     ctx.ok(&["run-shell", "-b", "sleep 5"]);
     let jobs = ctx.ok(&["show-messages", "-J"]);

@@ -128,6 +128,25 @@ fn flatten(p: Parsed) -> Vec<Vec<String>> {
     }).collect()
 }
 
+/// [`parse_blocks`] with every block marked with [`BLOCK_MARK`], as the queue carries
+/// them (the message log prints them as blocks).
+pub fn parse_marked(input: &str) -> Result<Vec<Vec<String>>, String> {
+    Ok(parse_blocks(input)?.into_iter().map(|c| c.into_iter().map(|(w, b)| if b { format!("{BLOCK_MARK}{w}") } else { w }).collect()).collect())
+}
+
+/// A command's arguments with their block marks dropped (a block is its commands'
+/// text), except bind-key's, which keeps its blocks.
+pub fn unmark_blocks(argv: &mut [String]) {
+    if argv.first().is_some_and(|n| is_bind_key(n.strip_prefix("\0alias:").unwrap_or(n))) {
+        return;
+    }
+    for a in argv.iter_mut().skip(1) {
+        if let Some(b) = a.strip_prefix(BLOCK_MARK) {
+            *a = b.to_string();
+        }
+    }
+}
+
 /// Whether a command name is bind-key or an abbreviation of it.
 pub fn is_bind_key(name: &str) -> bool {
     name.len() >= 2 && "bind-key".starts_with(name)

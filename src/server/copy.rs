@@ -142,7 +142,7 @@ impl Server {
                 // the default binding's commands go in the message log as if they ran
                 if let (Some(cmd), Some(c), false) = (&binding, cid, pending) {
                     let owner = self.key_origin.unwrap_or(c);
-                    for argv in crate::cmdparse::parse(cmd).unwrap_or_default() {
+                    for argv in crate::cmdparse::parse_marked(cmd).unwrap_or_default() {
                         if let Some(full) = argv.first().and_then(|n| super::cmds::canonical(n)) {
                             self.log_command(Some(owner), Some(name), full, &argv[1..]);
                         }

@@ -1783,6 +1783,14 @@ impl Server {
         if ctx.readonly && !READ_ONLY_OK.contains(&full) {
             return err("client is read-only");
         }
+        // the queue's { } blocks are marked (cmd_print shows them as blocks); the command
+        // gets their text (bind-key keeps them)
+        let marked = (full != "bind-key" && args.iter().any(|a| a.starts_with(cmdparse::BLOCK_MARK))).then(|| args.clone());
+        if marked.is_some() {
+            for a in &mut args {
+                if let Some(b) = a.strip_prefix(cmdparse::BLOCK_MARK) { *a = b.to_string(); }
+            }
+        }
         let o = parse_args(full, &args)?;
         if ctx.readonly {
             self.check_readonly_command(full, &o, ctx)?;
@@ -1790,7 +1798,7 @@ impl Server {
         // cmdq_add_message: each command goes in the message log (show-messages) once
         // the configuration is loaded, by key for a bound command of an attached client
         if !std::mem::take(&mut ctx.resumed) {
-            self.log_command(ctx.log_client.or(ctx.client).or(ctx.reply), ctx.key.as_deref(), full, &args);
+            self.log_command(ctx.log_client.or(ctx.client).or(ctx.reply), ctx.key.as_deref(), full, marked.as_deref().unwrap_or(&args));
         }
         self.command(full, o, env, ctx)
     }
@@ -5274,14 +5282,14 @@ impl Server {
             let is_alias = st.aliases.iter().any(|a| a.split_once('=').is_some_and(|(n, _)| n == words[0].0));
             let argv = if is_alias {
                 // the alias's commands, already expanded (exec does not expand them again)
-                let mut cmds = cmdparse::parse(&printed.join(" ; ")).map_err(|e| st.error(e))?;
+                let mut cmds = cmdparse::parse_marked(&printed.join(" ; ")).map_err(|e| st.error(e))?;
                 for cmd in &mut cmds {
                     cmd[0] = format!("\0alias:{}", cmd[0]);
                 }
                 cmds
             } else {
-                let bind = cmdparse::is_bind_key(&words[0].0);
-                vec![words.into_iter().map(|(w, b)| if b && bind { format!("{}{w}", cmdparse::BLOCK_MARK) } else { w }).collect()]
+                // { } blocks stay marked as blocks (exec gives a command their text)
+                vec![words.into_iter().map(|(w, b)| if b { format!("{}{w}", cmdparse::BLOCK_MARK) } else { w }).collect()]
             };
             Ok(((argv, c.line), printed.join(" ; ")))
         })?;
