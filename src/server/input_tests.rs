@@ -1424,3 +1424,43 @@ fn an_unknown_csi_sequence_is_read_as_meta_bracket_and_a_key_per_byte() {
     assert!(input::unknown_csi_keys(b"\x1b[57441;2u").is_none());
     assert!(input::unknown_csi_keys(b"\x1b[27;5;9999~").is_none());
 }
+
+#[test]
+fn a_block_template_takes_the_answers_without_being_parsed_again() {
+    // args_make_commands with a { } block: cmd_list_copy puts the answer into the
+    // block's parsed values (args_copy_copy_value), nothing is parsed again; a string
+    // template is filled in and parsed (cmd_parse_from_string), as by tmux 3.8
+    let mut f = fixture();
+    let wid = f.window_of(f.pane).unwrap();
+    let rename = |f: &mut Fixture, typed: &str| -> String {
+        f.handle_input(1, b"\x02,");
+        f.handle_input(1, b"\x15");
+        f.handle_input(1, typed.as_bytes());
+        f.handle_input(1, b"\r");
+        assert!(f.clients[&1].prompt.is_none(), "{typed}");
+        f.windows[&wid].name.clone()
+    };
+    // the default binding: command-prompt -I'#W' { rename-window -- '%%' }
+    for (typed, name) in [("a\"b", "a\"b"), ("say \"hi\"", "say \"hi\""), ("a\\b", "a\\\\b"), ("a$HOME", "a$HOME"), ("~", "~"), ("~u", "~u"),
+        ("-foo", "-foo"), ("-t x", "-t x"), ("--", "--"), ("x;y", "x;y"), ("{b}", "{b}"), ("%%", "%%"), ("a  b", "a  b"),
+        // tmux 3.8 gives "it'\\''s" here (an intentional difference)
+        ("it's", "it's"), ("a'b\"c\\d", "a'b\"c\\\\d")] {
+        assert_eq!(rename(&mut f, typed), name, "{typed}");
+    }
+    // a flag's value takes the answer too, and %1 / %2 the answers of each prompt
+    run(&mut f, &["bind-key", "F2", "command-prompt -p a,b { set -g @pair '%1|%2' ; set -g -- @first '%%' }"]);
+    f.handle_input(1, b"\x02\x1bOQ");
+    f.handle_input(1, b"-x $y\r'q\"\r");
+    assert_eq!(f.opts_session.get("@pair"), Some("-x $y|'q\""));
+    assert_eq!(f.opts_session.get("@first"), Some("-x $y"));
+    // a block inside the block gets them as well
+    run(&mut f, &["bind-key", "F3", "command-prompt { if-shell -F 1 { set -g @inner '%%' } }"]);
+    f.handle_input(1, b"\x02\x1bOR");
+    f.handle_input(1, b"$x \"y\" ~z\r");
+    assert_eq!(f.opts_session.get("@inner"), Some("$x \"y\" ~z"));
+    // a string template is parsed again
+    run(&mut f, &["bind-key", ",", "command-prompt -I'#W' \"rename-window -- '%%'\""]);
+    for (typed, name) in [("it's", "it's"), ("a\"b", "a\"b"), ("a\\b", "a\\\\b"), ("a$HOME", "a$HOME")] {
+        assert_eq!(rename(&mut f, typed), name, "{typed}");
+    }
+}

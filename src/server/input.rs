@@ -105,6 +105,11 @@ pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
 /// first %% (or %%%) left. %% escapes single quotes, %%% and %N% escape
 /// characters special inside double quotes.
 fn template_replace(template: &str, s: &str, idx: usize) -> String {
+    template_replace_quoting(template, s, idx, true)
+}
+
+/// [`template_replace`], with `sq` false leaving single quotes in a %% answer alone.
+fn template_replace_quoting(template: &str, s: &str, idx: usize, sq: bool) -> String {
     if !template.contains('%') {
         return template.to_string();
     }
@@ -127,7 +132,7 @@ fn template_replace(template: &str, s: &str, idx: usize) -> String {
             };
             if let Some(quote) = quote {
                 for c in s.bytes() {
-                    if quote == '\'' && c == b'\'' {
+                    if sq && quote == '\'' && c == b'\'' {
                         out.extend_from_slice(b"'\\''");
                         continue;
                     }
@@ -149,6 +154,19 @@ pub fn fill_template(template: &str, answers: &[String]) -> String {
     let mut out = template.to_string();
     for (i, a) in answers.iter().enumerate() {
         out = template_replace(&out, a, i + 1);
+    }
+    out
+}
+
+/// args_copy_copy_value: the answers put into one string value of a { } block's
+/// command, which is not parsed again. tmux 3.8 still escapes a single quote of a %%
+/// answer for single quotes here (cmd_template_replace's SQ mode), so the name typed
+/// as "it's" became "it'\''s"; pwsh-tmux leaves it as it is (COMPATIBILITY.md,
+/// Intentional differences). %%% and %N% keep tmux's escapes.
+pub fn fill_block_value(value: &str, answers: &[String]) -> String {
+    let mut out = value.to_string();
+    for (i, a) in answers.iter().enumerate() {
+        out = template_replace_quoting(&out, a, i + 1, false);
     }
     out
 }
@@ -1117,7 +1135,13 @@ impl Server {
     /// or a prompt its key) until that queue is done or waits.
     pub fn run_string(&mut self, cid: ClientId, cmd: &str, pane: Option<PaneId>) {
         // cmd_parse_from_string: the whole list is checked before any of it runs
-        match self.parse_string(cmd) {
+        let parsed = self.parse_string(cmd);
+        self.run_parsed(cid, parsed, pane);
+    }
+
+    /// [`Server::run_string`] for commands already parsed (or the parse's error).
+    fn run_parsed(&mut self, cid: ClientId, parsed: Result<Vec<Vec<String>>, String>, pane: Option<PaneId>) {
+        match parsed {
             Ok(cmds) => {
                 let ctx = Ctx { client: Some(cid), pane, from_key: true, ..Ctx::default() };
                 self.client_append(cid, ClientItem::Queue(Queue { cmds: cmds.into(), ctx , soft: 0 }));
@@ -1132,11 +1156,27 @@ impl Server {
     /// its state (client, key) and as a group of their own (cmdq_insert_after with
     /// cmdq_get_state); else they are appended to the client's queue with none.
     fn run_prompt_answer(&mut self, cid: ClientId, pr: &Prompt, cmd: &str) {
+        let parsed = self.parse_string(cmd);
+        self.run_prompt_commands(cid, pr, parsed);
+    }
+
+    /// The commands of a prompt's answer: a string template filled in and parsed, or
+    /// a { } block's commands with the answers in their values (args_make_commands).
+    fn run_prompt_template(&mut self, cid: ClientId, pr: &Prompt, answers: &[String]) {
+        if pr.block {
+            let cmds = super::cmds::copy_block(&pr.template, &|v| fill_block_value(v, answers));
+            self.run_prompt_commands(cid, pr, cmds);
+        } else {
+            self.run_prompt_answer(cid, pr, &fill_template(&pr.template, answers));
+        }
+    }
+
+    fn run_prompt_commands(&mut self, cid: ClientId, pr: &Prompt, parsed: Result<Vec<Vec<String>>, String>) {
         let Some(ctx) = self.prompt_waits.iter().find(|w| w.1 == pr.id).map(|w| w.3.ctx.clone()) else {
-            self.run_string(cid, cmd, pr.pane);
+            self.run_parsed(cid, parsed, pr.pane);
             return;
         };
-        match self.parse_string(cmd) {
+        match parsed {
             Ok(cmds) => {
                 let pane = pr.pane.or(ctx.pane).map(|p| p.to_string()).unwrap_or_default();
                 let client = ctx.client.map(|c| c.to_string()).unwrap_or_default();
@@ -1510,8 +1550,7 @@ impl Server {
         let close = match pr.kind {
             PromptKind::Key => {
                 if let Some(s) = s {
-                    let cmd = fill_template(&pr.template, &[s.to_string()]);
-                    self.run_prompt_answer(cid, pr, &cmd);
+                    self.run_prompt_template(cid, pr, &[s.to_string()]);
                 }
                 true
             }
@@ -1544,8 +1583,7 @@ impl Server {
                             return false;
                         }
                     }
-                    let cmd = fill_template(&pr.template, &argv);
-                    self.run_prompt_answer(cid, pr, &cmd);
+                    self.run_prompt_template(cid, pr, &argv);
                     // an incremental prompt stays open for more typing
                     !pr.incremental
                 }

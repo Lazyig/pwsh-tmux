@@ -921,6 +921,9 @@ pub struct Prompt {
     pub input: Vec<char>,
     pub cursor: usize,
     pub template: String,
+    /// The template was a { } block (ARGS_COMMANDS): the answers go into its parsed
+    /// values, which are not parsed again (args_make_commands, cmd_list_copy).
+    pub block: bool,
     pub history_pos: Option<usize>,
     /// The history this prompt reads and adds to (command-prompt -T, an index of
     /// input::PROMPT_TYPES).
@@ -955,7 +958,7 @@ impl Prompt {
         let input: Vec<char> = init.chars().collect();
         Prompt {
             vi_command: false, quote_next: false, copied: Vec::new(), kind, prompts, answers: Vec::new(), label, cursor: input.len(), input,
-            template, history_pos: None, history_type: 0, id: 0, pane, numeric: false, single_key: false, incremental: false, last: String::new(),
+            template, block: false, history_pos: None, history_type: 0, id: 0, pane, numeric: false, single_key: false, incremental: false, last: String::new(),
             complete: Vec::new(), closed: false, host: None, copy_incremental: None, bspace_exit: false, confirm: ('y', false),
         }
     }

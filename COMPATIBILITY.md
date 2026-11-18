@@ -145,6 +145,16 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   the bytes sent, and multiplexers such as GNU screen and Zellij answer DA1 themselves
   before the colours they ask the outer terminal for.) A partial theme or colour reply
   also waits 500 ms after the start timer, where tmux decides by its request flags alone.
+- **Single quotes in an answer put into a `{ }` block (a tmux 3.8 bug).** A prompt's
+  answer goes into the already parsed values of a block template (`command-prompt
+  { rename-window -- '%%' }`, the default `prefix ,`) without being parsed again
+  (args_make_commands and cmd_list_copy, arguments.c:784-790 and 349-372), as in tmux
+  3.8, so `"`, `\`, `$`, `~` and a leading `-` stay as typed. tmux 3.8 changed `%%` to
+  escape single quotes for a single-quoted string (cmd_template_replace, cmd.c:849-906,
+  CHANGES "%% is escaped for single quotes") and applies that escape to block values too,
+  where nothing removes it, so a window renamed to `it's` is named `it'\''s`. Here a `%%`
+  answer keeps its single quotes in a block; string templates (which are parsed again)
+  still escape them as in 3.8, and `%%%` / `%1%` keep tmux's escapes in both.
 - **No signal information on Windows:** `pane_dead_signal` and other signal values are
   never set there. A popup whose command was ended (TerminateProcess) gives its waiting
   command-line client that process's exit code, where on Unix it is the signal number

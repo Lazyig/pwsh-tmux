@@ -165,6 +165,87 @@ pub fn check_command(argv: &[String]) -> Result<(), String> {
     parse_args(full, &args).map(|_| ())
 }
 
+/// cmd_list_copy with answers (args_make_commands for a { } block): the block's
+/// commands (`text`, as the queue gives a block) with `fill` applied to every string
+/// value, flag values and arguments alike, and to the commands of blocks inside it.
+/// The values are not parsed again: each stays one word, flag values after their flag
+/// (or attached, for a flag whose value is optional) and the arguments after "--".
+pub(crate) fn copy_block(text: &str, fill: &dyn Fn(&str) -> String) -> Result<Vec<Vec<String>>, String> {
+    Ok(cmdparse::parse_marked(text)?.iter().map(|c| copy_block_command(c, fill)).collect())
+}
+
+fn copy_block_command(argv: &[String], fill: &dyn Fn(&str) -> String) -> Vec<String> {
+    let Some((name, args)) = argv.split_first() else { return Vec::new() };
+    let value = |a: &str| match a.strip_prefix(cmdparse::BLOCK_MARK) {
+        Some(b) => {
+            let inner = copy_block(b, fill).unwrap_or_default().iter()
+                .map(|c| c.iter().map(|w| match w.strip_prefix(cmdparse::BLOCK_MARK) {
+                    Some(b) => format!("{{ {b} }}"),
+                    None => cmdparse::quote(w),
+                }).collect::<Vec<_>>().join(" "))
+                .collect::<Vec<_>>().join(" ; ");
+            format!("{}{inner}", cmdparse::BLOCK_MARK)
+        }
+        None => fill(a),
+    };
+    let mut out = vec![name.clone()];
+    let spec = canonical(name).and_then(|full| COMMANDS.iter().find(|c| c.0 == full));
+    let mut i = 0;
+    if let Some(&(full, _, bools, vals)) = spec {
+        // the flags as args_parse read them (a word it would not take ends them, as is)
+        while let Some(a) = args.get(i) {
+            if a == "--" {
+                i += 1;
+                break;
+            }
+            if !a.starts_with('-') || a.len() < 2 || a.starts_with(cmdparse::BLOCK_MARK) {
+                break;
+            }
+            let chars: Vec<char> = a[1..].chars().collect();
+            for (j, &c) in chars.iter().enumerate() {
+                let inline: String = chars[j + 1..].iter().collect();
+                if optional_value_flag(full, c) {
+                    let v = if !inline.is_empty() { Some(inline) } else {
+                        match args.get(i + 1) {
+                            Some(n) if !(n.starts_with('-') && n[1..].starts_with(|c: char| c == '-' || c.is_ascii_alphabetic())) => {
+                                i += 1;
+                                Some(n.clone())
+                            }
+                            _ => None,
+                        }
+                    };
+                    match v.map(|v| fill(&v)) {
+                        Some(v) if !v.is_empty() => out.push(format!("-{c}{v}")),
+                        Some(v) => out.extend([format!("-{c}"), v]),
+                        None => out.push(format!("-{c}")),
+                    }
+                    break;
+                } else if bools.contains(c) {
+                    out.push(format!("-{c}"));
+                } else if vals.contains(c) {
+                    let v = if !inline.is_empty() { inline } else {
+                        i += 1;
+                        match args.get(i) {
+                            Some(v) => v.clone(),
+                            None => { out.push(format!("-{c}")); return out; }
+                        }
+                    };
+                    out.extend([format!("-{c}"), value(&v)]);
+                    break;
+                } else {
+                    // (an error when it runs, as it was)
+                    out.extend(args[i..].iter().cloned());
+                    return out;
+                }
+            }
+            i += 1;
+        }
+        out.push("--".into());
+    }
+    out.extend(args.get(i..).unwrap_or_default().iter().map(|a| value(a)));
+    out
+}
+
 /// The commands of a parse once built ([`Server::build_commands`]).
 #[derive(Default)]
 pub(crate) struct Built {
@@ -1791,7 +1872,12 @@ impl Server {
                 if let Some(b) = a.strip_prefix(cmdparse::BLOCK_MARK) { *a = b.to_string(); }
             }
         }
-        let o = parse_args(full, &args)?;
+        let mut o = parse_args(full, &args)?;
+        if let Some(m) = &marked {
+            // (the arguments are the last of the words getopt read)
+            let start = m.len() - o.rest.len();
+            o.rest_blocks = m[start..].iter().map(|a| a.starts_with(cmdparse::BLOCK_MARK)).collect();
+        }
         if ctx.readonly {
             self.check_readonly_command(full, &o, ctx)?;
         }
@@ -3846,8 +3932,10 @@ impl Server {
                     return Ok(Flow::Next);
                 }
                 let template = o.rest.first().cloned().unwrap_or_else(|| "%1".into());
-                // -F: the template is a format, expanded now
-                let template = if o.has('F') { self.expand(tt, Some(cid), &template) } else { template };
+                // -F: a string template is a format, expanded now (a { } block is kept
+                // as it is: args_make_commands_prepare)
+                let block = o.is_block(0);
+                let template = if o.has('F') && !block { self.expand(tt, Some(cid), &template) } else { template };
                 // -l: one prompt and input taken literally, not split at commas; others
                 // get a space after the prompt, except the default ':' (prompts are
                 // formats expanded when drawn, inputs are expanded now)
@@ -3869,6 +3957,7 @@ impl Server {
                 let kind = if o.has('k') && !o.has('1') && !o.has('N') && !o.has('i') { PromptKind::Key } else { PromptKind::Command };
                 // -1, -N, -i, -k and -e exclude each other in this order
                 let mut pr = Prompt::new(kind, prompts, template, ctx.pane);
+                pr.block = block;
                 pr.single_key = o.has('1');
                 pr.numeric = o.has('N') && !o.has('1');
                 pr.history_type = history_type;
@@ -4335,7 +4424,7 @@ impl Server {
                     Some(k) if o.rest.is_empty() && !o.has('N') && !o.has('R') => {
                         // (a key, not text: -l, -H and -F do not apply to it)
                         let flags = o.flags.iter().filter(|(c, _)| !matches!(c, 'l' | 'H' | 'F')).map(|(c, v)| (*c, v.clone())).collect();
-                        Opts { flags, rest: vec![k] }
+                        Opts { flags, rest: vec![k], rest_blocks: Vec::new() }
                     }
                     _ => o,
                 };
