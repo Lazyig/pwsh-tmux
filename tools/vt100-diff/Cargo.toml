@@ -1,0 +1,25 @@
+# Differential checker for the bundled vt100: runs the same input through the
+# vt100 of a base commit and the working tree's vendor/vt100 and compares
+# everything the application can observe. Development tool only: it is its own
+# workspace, so it is not part of the pwsh-tmux build or `cargo test`.
+# Use run.sh, which extracts the base copy to target/vt100-base first.
+[package]
+name = "vt100-diff"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "vt100-diff"
+path = "src/main.rs"
+
+[dependencies]
+# the working tree's copy (the candidate)
+vt100 = { path = "../../vendor/vt100" }
+# the base commit's copy, written by run.sh with git archive
+vt100_base = { package = "vt100-base", path = "target/vt100-base" }
+
+[profile.release]
+debug = 1
