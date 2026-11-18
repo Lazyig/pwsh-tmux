@@ -1533,3 +1533,24 @@ fn only_enter_confirms_a_prompt_not_c_j_or_c_m() {
         f.opts_session.unset("@cj");
     }
 }
+
+#[test]
+fn without_a_status_line_the_prompt_takes_the_row_status_position_names() {
+    // screen_redraw_screen: a prompt or message with no status line is drawn on one line
+    // at the top with status-position top (REDRAW_STATUS_TOP), else at the bottom
+    let mut f = fixture();
+    f.opts_session.set("status", "off".into());
+    let h = f.clients[&1].size.1;
+    let row = |f: &Fixture, y: u16| f.compose(1).unwrap().frame.row(y).iter().map(|c| c.text.as_str()).collect::<String>();
+    for (pos, y) in [("top", 0), ("bottom", h - 1)] {
+        f.opts_session.set("status-position", pos.into());
+        run(&mut f, &["command-prompt", "-p", "PROMPT", "set -g @x '%%'"]);
+        assert!(row(&f, y).starts_with("PROMPT "), "{pos}");
+        assert_eq!(f.compose(1).unwrap().cursor.map(|c| c.1), Some(y), "{pos}");
+        assert_eq!(f.message_row(1), Some(y), "{pos}");
+        f.dispatch_input(1, keys::Input::Key(Key::plain(KeyCode::Escape), vec![27]));
+        f.set_message(1, "MESSAGE");
+        assert!(row(&f, y).starts_with("MESSAGE"), "{pos}");
+        f.clients.get_mut(&1).unwrap().message = None;
+    }
+}

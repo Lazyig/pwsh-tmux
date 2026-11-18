@@ -1322,9 +1322,10 @@ impl Server {
                 status_ranges.push(tags);
             }
         }
-        // message / prompt replace the first status line (or the last row without a status line)
+        // message / prompt replace the first status line (or, without a status line, the
+        // first or last row by status-position: screen_redraw_screen)
         let message_line = self.opt_session_num(Some(sid), "message-line").max(0) as u16;
-        let my = if nstatus > 0 { (if top { 0 } else { ch - nstatus }) + message_line.min(nstatus - 1) } else { ch - 1 };
+        let my = if nstatus > 0 { (if top { 0 } else { ch - nstatus }) + message_line.min(nstatus - 1) } else if top { 0 } else { ch - 1 };
         if let Some(pr) = &c.prompt {
             let style_text = self.expand_time(active_target, Some(cid), &self.opt_session(Some(sid), "message-style"));
             let (ax, aw) = message_area(cw, &style_text);
@@ -1436,7 +1437,7 @@ impl Server {
         let nstatus = self.status_lines(Some(sid)).min(ch.saturating_sub(1));
         let top = self.opt_session(Some(sid), "status-position") == "top";
         let line = self.opt_session_num(Some(sid), "message-line").max(0) as u16;
-        Some(if nstatus > 0 { (if top { 0 } else { ch - nstatus }) + line.min(nstatus - 1) } else { ch - 1 })
+        Some(if nstatus > 0 { (if top { 0 } else { ch - nstatus }) + line.min(nstatus - 1) } else if top { 0 } else { ch - 1 })
     }
 
     /// tmux 3.8 prompt_layout: message-format is expanded with #{message} set
