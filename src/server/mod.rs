@@ -913,7 +913,8 @@ pub struct Prompt {
     pub vi_command: bool,
     /// C-v: the next key is inserted as it is
     pub quote_next: bool,
-    pub copied: Vec<char>,
+    /// What C-w deleted last (pr->copied), even nothing: C-y then pastes it, not a buffer.
+    pub copied: Option<Vec<char>>,
     pub kind: PromptKind,
     pub prompts: Vec<(String, String)>,
     pub answers: Vec<String>,
@@ -960,7 +961,7 @@ impl Prompt {
         let (label, init) = prompts.first().cloned().unwrap_or_default();
         let input: Vec<char> = init.chars().collect();
         Prompt {
-            vi_command: false, quote_next: false, copied: Vec::new(), kind, prompts, answers: Vec::new(), label, cursor: input.len(), input,
+            vi_command: false, quote_next: false, copied: None, kind, prompts, answers: Vec::new(), label, cursor: input.len(), input,
             template, freeze: true, block: false, history_pos: None, history_type: 0, id: 0, pane, numeric: false, single_key: false, incremental: false, last: String::new(),
             complete: Vec::new(), closed: false, host: None, copy_incremental: None, bspace_exit: false, confirm: ('y', false),
         }

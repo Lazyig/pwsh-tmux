@@ -1690,7 +1690,7 @@ impl Server {
             }
             PromptOp::DeleteWord => {
                 let i = prompt_backward_word(&pr.input, pr.cursor, &seps);
-                pr.copied = pr.input.drain(i..pr.cursor).collect();
+                pr.copied = Some(pr.input.drain(i..pr.cursor).collect());
                 pr.cursor = i;
                 true
             }
@@ -1741,20 +1741,21 @@ impl Server {
                 true
             }
             PromptOp::Yank => {
-                // prompt_paste: the C-w text, else the top buffer up to a control character
-                let value: Option<Vec<char>> = if !pr.copied.is_empty() {
-                    Some(pr.copied.clone())
+                // prompt_paste: the C-w text (once there is any, even an empty one), else
+                // the top buffer up to a control character
+                let value: Option<Vec<char>> = if let Some(copied) = &pr.copied {
+                    Some(copied.clone())
                 } else {
                     self.buffers.iter().find(|b| b.automatic).map(|b| prompt_paste_text(&b.data))
                 };
                 match value {
-                    Some(value) => {
+                    Some(value) if !value.is_empty() => {
                         let len = value.len();
                         pr.input.splice(pr.cursor..pr.cursor, value);
                         pr.cursor += len;
                         true
                     }
-                    None => false,
+                    _ => false,
                 }
             }
             PromptOp::Transpose => {

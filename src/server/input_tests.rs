@@ -1610,3 +1610,19 @@ fn the_status_line_under_a_prompt_or_message_stays_as_it_opened() {
     f.opts_session.set("@clock", "3".into());
     assert!(last(&f).contains("R=2"));
 }
+
+#[test]
+fn c_y_after_a_c_w_that_deleted_nothing_pastes_nothing() {
+    // prompt.c: C-w always sets pr->copied, even to nothing, and prompt_paste uses
+    // pr->copied once it is set rather than the top buffer
+    let mut f = fixture();
+    let input = |f: &Fixture| f.clients[&1].prompt.as_ref().map(|p| p.input.iter().collect::<String>()).unwrap_or_default();
+    f.add_buffer(None, b"ZZBUF".to_vec(), false);
+    run(&mut f, &["command-prompt", "set -g @x '%%'"]);
+    f.handle_input(1, b"\x19");
+    assert_eq!(input(&f), "ZZBUF");
+    f.handle_input(1, b"\x15\x17\x19");
+    assert_eq!(input(&f), "");
+    f.handle_input(1, b"one two\x17\x19\x19");
+    assert_eq!(input(&f), "one twotwo");
+}
