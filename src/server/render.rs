@@ -39,6 +39,11 @@ fn terminal_text(text: &str) -> std::borrow::Cow<'_, str> {
     text.into()
 }
 
+// Tests compose a frame both ways: Frame::new and Frame::set (true), or a reused frame and
+// Frame::set_parts.
+#[cfg(test)]
+thread_local! { static OLD_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
 pub struct Frame {
     pub w: u16,
     pub h: u16,
@@ -49,6 +54,50 @@ pub struct Frame {
 impl Frame {
     pub fn new(w: u16, h: u16) -> Frame {
         Frame { w, h, cells: vec![Cell::default(); w as usize * h as usize], links: Default::default() }
+    }
+    /// [`Frame::new`], reusing `spare` (a frame that is no longer needed) when it is the
+    /// same size: its cells are blanked in place, so their text buffers are kept.
+    pub fn reuse(spare: Option<Frame>, w: u16, h: u16) -> Frame {
+        #[cfg(test)]
+        if OLD_PATH.get() {
+            return Frame::new(w, h);
+        }
+        match spare {
+            Some(mut f) if f.w == w && f.h == h => {
+                for c in &mut f.cells {
+                    c.text.clear();
+                    c.text.push(' ');
+                    c.style = Style::default();
+                }
+                f.links.clear();
+                f
+            }
+            _ => Frame::new(w, h),
+        }
+    }
+    /// [`Frame::set`] with a cell's text and style, written into the cell's own buffer.
+    pub fn set_parts(&mut self, x: u16, y: u16, text: &str, style: Style) {
+        #[cfg(test)]
+        if OLD_PATH.get() {
+            return self.set(x, y, Cell { text: text.into(), style });
+        }
+        if x < self.w && y < self.h {
+            let i = y as usize * self.w as usize + x as usize;
+            self.links.remove(&i);
+            // Overwriting half of a wide char: blank the other half.
+            if self.cells[i].text.is_empty() && x > 0 {
+                self.links.remove(&(i - 1));
+                self.cells[i - 1] = Cell { text: " ".into(), style: self.cells[i - 1].style };
+            }
+            if !text.is_empty() && x + 1 < self.w && self.cells[i + 1].text.is_empty() && self.cells[i].text.chars().next().and_then(|c| char_width(c)) == Some(2) {
+                self.links.remove(&(i + 1));
+                self.cells[i + 1] = Cell { text: " ".into(), style: self.cells[i + 1].style };
+            }
+            let cell = &mut self.cells[i];
+            cell.text.clear();
+            cell.text.push_str(text);
+            cell.style = style;
+        }
     }
     pub fn set(&mut self, x: u16, y: u16, cell: Cell) {
         if x < self.w && y < self.h {
@@ -99,9 +148,9 @@ impl Frame {
             if x + cw > limit.min(self.w) {
                 break;
             }
-            self.set(x, y, Cell { text: ch.to_string(), style });
+            self.set_parts(x, y, ch.encode_utf8(&mut [0; 4]), style);
             if cw == 2 {
-                self.set(x + 1, y, Cell { text: String::new(), style });
+                self.set_parts(x + 1, y, "", style);
             }
             x += cw;
         }
@@ -109,7 +158,7 @@ impl Frame {
     }
     pub fn put_cells(&mut self, x: u16, y: u16, cells: &[Cell]) {
         for (i, c) in cells.iter().enumerate() {
-            self.set(x + i as u16, y, c.clone());
+            self.set_parts(x + i as u16, y, &c.text, c.style);
         }
     }
 }
@@ -866,9 +915,9 @@ impl Server {
                 for y in span(y0, h, clip.1) {
                     for x in span(x0, w, clip.0) {
                         let Some((ax, ay)) = vis(x, y) else { continue };
-                        let mut cell = lines.get(y as usize).and_then(|l| l.cells.get(x as usize)).cloned().unwrap_or_default();
-                        overlay_style(&mut cell.style, wstyle);
-                        f.set(ax, oy + ay, cell);
+                        let (text, mut style) = lines.get(y as usize).and_then(|l| l.cells.get(x as usize)).map_or((" ", Style::default()), |c| (c.text.as_str(), c.style));
+                        overlay_style(&mut style, wstyle);
+                        f.set_parts(ax, oy + ay, text, style);
                         f.set_link(ax, oy + ay, lines.get(y as usize).and_then(|l| l.tab_at(x as usize).map_or(l.metadata.get(&x), |(at, _)| l.metadata.get(&(at as u16)))?.hyperlink.as_ref()));
                     }
                 }
@@ -880,15 +929,15 @@ impl Server {
                     for x in span(x0, w, clip.0) {
                         let Some((ax, ay)) = vis(x, y) else { continue };
                         let Some(vc) = scr.cell(y, x) else {
-                            f.set(ax, oy + ay, Cell { text: " ".into(), style: wstyle });
+                            f.set_parts(ax, oy + ay, " ", wstyle);
                             continue;
                         };
-                        let mut cell = crate::cells::cell_from_vt(vc);
+                        let (mut text, mut style) = crate::cells::cell_parts_from_vt(vc);
                         if vc.is_wide() && (x + 1 >= w || ax + 1 >= cw) {
-                            cell.text = " ".into();
+                            text = " ";
                         }
-                        overlay_style(&mut cell.style, wstyle);
-                        f.set(ax, oy + ay, cell);
+                        overlay_style(&mut style, wstyle);
+                        f.set_parts(ax, oy + ay, text, style);
                         f.set_link(ax, oy + ay, row.as_ref().and_then(|r| r.hyperlink_at(x)));
                     }
                 }
@@ -1093,13 +1142,19 @@ impl Server {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn compose(&self, cid: ClientId) -> Option<RenderState> {
+        self.compose_into(cid, None)
+    }
+
+    /// [`Server::compose`] into `spare` (see [`Frame::reuse`]).
+    fn compose_into(&self, cid: ClientId, spare: Option<Frame>) -> Option<RenderState> {
         let _widths = self.width_context();
         let c = self.clients.get(&cid)?;
         let sid = c.session?;
         let s = self.sessions.get(&sid)?;
         let (cw, ch) = (c.size.0.max(1), c.size.1.max(1));
-        let mut f = Frame::new(cw, ch);
+        let mut f = Frame::reuse(spare, cw, ch);
         let wid = s.active_window();
         let win = &self.windows[&wid];
         let nstatus = self.status_lines(Some(sid)).min(ch.saturating_sub(1));
@@ -1159,7 +1214,7 @@ impl Server {
                 if char_width(ch) == Some(1) { Cell { text: ch.to_string(), style: over(s.style) } } else { Cell { text: " ".into(), style: inactive_border } }
             })).unwrap_or(Cell { text: " ".into(), style: inactive_border });
             for y in 0..area_h { for x in 0..cw {
-                if ((x as u32 + px as u32) < win.sx as u32 && (y as u32 + py as u32) < win.sy as u32) == inside { f.set(x, oy + y, cell.clone()); }
+                if ((x as u32 + px as u32) < win.sx as u32 && (y as u32 + py as u32) < win.sy as u32) == inside { f.set_parts(x, oy + y, &cell.text, cell.style); }
             } }
         }
 
@@ -1389,7 +1444,7 @@ impl Server {
         modes.appesc = c.features.has("appesc");
         modes.app_cursor = true;
         modes.bracketed_paste = c.features.has("bpaste");
-        Some(RenderState { frame: f, cursor, park, modes, status_ranges })
+        Some(RenderState { frame: f, cursor, park, modes, status_ranges, spare: None })
     }
 
     /// prompt_draw: while a prompt has the cursor it takes prompt-cursor-style and
@@ -1524,7 +1579,9 @@ impl Server {
     pub fn render(&mut self, cid: ClientId) {
         let _widths = self.width_context();
         self.update_view(cid);
-        let Some(next) = self.compose(cid) else { return };
+        // the frame before the previous one is drawn over (the previous one is diffed with)
+        let spare = self.clients.get_mut(&cid).and_then(|c| c.prev.as_mut()).and_then(|p| p.spare.take());
+        let Some(next) = self.compose_into(cid, spare) else { return };
         // window title
         let mut title_update = None;
         if let Some(sid) = self.client_session(cid) {
@@ -1625,7 +1682,7 @@ impl Server {
             changed = true;
         }
         if !changed && !modes_changed && !cursor_changed {
-            c.prev = Some(next);
+            c.keep_frame(next);
             return;
         }
         out.insert_str(0, "\x1b[?25l");
@@ -1679,7 +1736,16 @@ impl Server {
             out.push_str("\x1b[?2026l");
         }
         c.send(S_OUTPUT, out.as_bytes());
-        c.prev = Some(next);
+        c.keep_frame(next);
+    }
+}
+
+impl Client {
+    /// Keeps `next` as the state the next render is diffed with; the frame it replaces is
+    /// kept beside it for that render to draw over.
+    fn keep_frame(&mut self, mut next: RenderState) {
+        next.spare = self.prev.take().map(|p| p.frame);
+        self.prev = Some(next);
     }
 }
 
@@ -1903,5 +1969,241 @@ mod huge_float_tests {
         let row: String = f.row(3).iter().map(|c| c.text.as_str()).collect();
         assert!(row.contains("(0)") && row.contains("s:"), "{row}");
         kill(&mut srv);
+    }
+}
+
+#[cfg(test)]
+mod frame_reuse_tests {
+    use super::*;
+    use super::super::pan::tests::{clients, kill, run};
+
+    /// xorshift: the same pseudo-random sequence on every run.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn link(inner: u64) -> std::sync::Arc<vt100::Hyperlink> {
+        std::sync::Arc::new(vt100::Hyperlink { inner, id: String::new(), external_id: format!("x{inner}"), uri: format!("https://e/{inner}") })
+    }
+
+    /// A frame of that size with wide characters, styles and links everywhere, as a frame
+    /// drawn before can leave it.
+    fn dirty(w: u16, h: u16, seed: u64) -> Frame {
+        let mut r = Rng(seed | 1);
+        let mut f = Frame::new(w, h);
+        for i in 0..f.cells.len() {
+            let style = Style { fg: Color::Idx(r.below(256) as u8), bg: Color::Rgb(1, 2, r.below(256) as u8), us: Color::Idx(3), attrs: r.below(1 << 14) as u16 };
+            f.cells[i] = match r.below(4) {
+                0 => Cell { text: "あ".into(), style },
+                1 => Cell { text: String::new(), style },
+                2 => Cell { text: "e\u{301}\u{302}".into(), style },
+                _ => Cell { text: "z".into(), style },
+            };
+            if r.below(3) == 0 {
+                f.links.insert(i, link(r.below(5)));
+            }
+        }
+        f
+    }
+
+    fn same(a: &RenderState, b: &RenderState) -> bool {
+        a.frame.w == b.frame.w && a.frame.h == b.frame.h && a.frame.cells == b.frame.cells && a.frame.links == b.frame.links
+            && a.cursor == b.cursor && a.park == b.park && a.modes == b.modes && a.status_ranges == b.status_ranges
+    }
+
+    /// Composes client 1 with Frame::new and Frame::set, then into a used frame (`spare`)
+    /// and into a dirty one with Frame::set_parts: all three must be the same. Returns the
+    /// frame to reuse next.
+    fn check(srv: &Server, spare: Option<Frame>, what: &str, seed: u64) -> Frame {
+        OLD_PATH.set(true);
+        let old = srv.compose(1).unwrap();
+        OLD_PATH.set(false);
+        let new = srv.compose_into(1, spare).unwrap();
+        assert!(same(&old, &new), "{what}: a reused frame differs");
+        let new = srv.compose_into(1, Some(dirty(old.frame.w, old.frame.h, seed))).unwrap();
+        assert!(same(&old, &new), "{what}: a dirty frame differs");
+        let text: String = old.frame.cells.iter().map(|c| c.text.as_str()).collect();
+        assert!(!text.trim().is_empty(), "{what}: nothing drawn");
+        new.frame
+    }
+
+    fn feed(srv: &mut Server, pane: PaneId, data: &[u8]) {
+        let g = srv.panes[&pane].generation;
+        srv.pane_data(pane, g, data);
+    }
+
+    const MIXED: &[u8] = b"\x1b[2J\x1b[Hplain \x1b[1;31mbold red\x1b[0m \x1b[38;5;200;48;2;10;20;30mrgb\x1b[0m \
+\x1b[4:3;58;5;4mcurly\x1b[0m \x1b[2;3;5;7;8;9;53mattrs\x1b[0m\r\n\xed\x95\x9c\xea\xb8\x80 wide e\xcc\x81 \xf0\x9f\x87\xb0\xf0\x9f\x87\xb7 \
+\x1b(0lqqk\x1b(B \x1b]8;id=a;https://example.com/\x1b\\link\x1b]8;;\x1b\\ tab\tend\r\n\x1b[4:5mdash\x1b[4:4mdot\x1b[21mdouble\x1b[0m";
+
+    #[test]
+    fn frames_drawn_in_place_match_frames_drawn_new() {
+        let (mut srv, _ev) = clients((60, 20), None);
+        run(&mut srv, 1, &["new-session", "-d", "-s", "s", "-x", "60", "-y", "19"]).unwrap();
+        let sid = *srv.sessions.keys().next().unwrap();
+        srv.attach_client(1, sid);
+        let first = srv.client_active_pane(1).unwrap();
+        feed(&mut srv, first, MIXED);
+        let mut f = check(&srv, None, "mixed", 1);
+        // a wide character cut off by the pane's right edge
+        feed(&mut srv, first, "\x1b[3;59H\u{d55c}x".as_bytes());
+        f = check(&srv, Some(f), "wide at the edge", 2);
+        // colours and text all over the pane
+        let mut r = Rng(7);
+        let mut colour = String::new();
+        for _ in 0..600 {
+            let _ = write!(colour, "\x1b[3{};4{}m{}", r.below(8), r.below(8), ["a", "\u{d55c}", "e\u{301}", " ", "\u{1f600}"][r.below(5) as usize]);
+        }
+        feed(&mut srv, first, colour.as_bytes());
+        f = check(&srv, Some(f), "colour", 3);
+        // split panes with borders, pane status lines and a fill character
+        run(&mut srv, 1, &["split-window", "-h", "-d"]).unwrap();
+        run(&mut srv, 1, &["split-window", "-v", "-d"]).unwrap();
+        let panes = srv.windows[&srv.client_window(1).unwrap()].panes();
+        for (i, p) in panes.iter().enumerate() {
+            feed(&mut srv, *p, format!("\x1b[3{i}mpane {i} \u{d55c}\u{ae00}\x1b[0m").as_bytes());
+        }
+        f = check(&srv, Some(f), "split", 4);
+        run(&mut srv, 1, &["set", "-g", "pane-border-status", "top"]).unwrap();
+        run(&mut srv, 1, &["set", "-g", "pane-border-lines", "double"]).unwrap();
+        f = check(&srv, Some(f), "border status", 5);
+        run(&mut srv, 1, &["set", "-g", "window-size", "manual"]).unwrap();
+        run(&mut srv, 1, &["resize-window", "-x", "40", "-y", "12"]).unwrap();
+        for fill in ["", "x", "#[fg=red,bg=blue]~", "#[acs]q", "\u{d55c}", "#{?is_inside,i,o}"] {
+            run(&mut srv, 1, &["set", "-g", "fill-character", fill]).unwrap();
+            f = check(&srv, Some(f), &format!("fill {fill}"), 6);
+        }
+        run(&mut srv, 1, &["set", "-g", "window-size", "latest"]).unwrap();
+        run(&mut srv, 1, &["resize-window", "-A"]).unwrap();
+        f = check(&srv, Some(f), "window back to the client size", 7);
+        // a floating pane over the others
+        run(&mut srv, 1, &["new-pane", "-d", "-x", "30", "-y", "8", "-X", "5", "-Y", "3"]).unwrap();
+        let float = srv.float_rects(srv.client_window(1).unwrap())[0].0;
+        feed(&mut srv, float, MIXED);
+        f = check(&srv, Some(f), "floating pane", 8);
+        // copy mode with a selection, in a pane with history
+        let mut lines = String::new();
+        for i in 0..80 {
+            let _ = write!(lines, "\r\nline {i} \x1b[3{}m\u{d55c}\x1b[0m e\u{301} \x1b]8;;https://x/{i}\x1b\\url\x1b]8;;\x1b\\", i % 8);
+        }
+        feed(&mut srv, first, lines.as_bytes());
+        let t = format!("%{first}");
+        run(&mut srv, 1, &["copy-mode", "-t", &t]).unwrap();
+        for keys in [&["cursor-up"][..], &["cursor-up"], &["begin-selection"], &["cursor-up"], &["cursor-up"], &["cursor-left"], &["cursor-left"]] {
+            let mut args = vec!["send-keys", "-t", &t, "-X"];
+            args.extend_from_slice(keys);
+            run(&mut srv, 1, &args).unwrap();
+        }
+        f = check(&srv, Some(f), "copy-mode selection", 9);
+        run(&mut srv, 1, &["send-keys", "-t", &t, "-X", "cancel"]).unwrap();
+        run(&mut srv, 1, &["clock-mode", "-t", &t]).unwrap();
+        f = check(&srv, Some(f), "clock", 10);
+        srv.exit_mode(first);
+        run(&mut srv, 1, &["choose-tree", "-t", &t]).unwrap();
+        f = check(&srv, Some(f), "choose-tree", 11);
+        srv.exit_mode(first);
+        // a menu, a message and a status line with styles and ranges
+        run(&mut srv, 1, &["set", "-g", "status-format[0]", "#[fg=red]#[range=window|0]\u{d55c}win#[norange] #[align=right,bg=blue]e\u{301}right"]).unwrap();
+        run(&mut srv, 1, &["set", "-g", "status", "2"]).unwrap();
+        f = check(&srv, Some(f), "status", 12);
+        run(&mut srv, 1, &["display-menu", "-x", "2", "-y", "2", "-T", "menu", "First", "a", "", "Second \u{d55c}", "b", "", "", "Third", "c", ""]).unwrap();
+        f = check(&srv, Some(f), "menu", 13);
+        srv.clients.get_mut(&1).unwrap().overlay = None;
+        srv.menus.clear();
+        run(&mut srv, 1, &["display-message", "-d", "0", "message \u{d55c}"]).unwrap();
+        f = check(&srv, Some(f), "message", 14);
+        // a popup with a pane
+        run(&mut srv, 1, &["display-popup", "-w", "30", "-h", "8", "cat"]).unwrap();
+        let Some(Overlay::Popup(p)) = &srv.clients[&1].overlay else { panic!("no popup") };
+        let popup = p.pane;
+        feed(&mut srv, popup, MIXED);
+        f = check(&srv, Some(f), "popup", 15);
+        // another client size: a spare of the old size is not used
+        srv.clients.get_mut(&1).unwrap().size = (50, 15);
+        check(&srv, Some(f), "resized client", 16);
+        kill(&mut srv);
+    }
+
+    #[test]
+    fn set_parts_writes_what_set_writes() {
+        let mut r = Rng(11);
+        for round in 0..200 {
+            let (w, h) = (1 + r.below(12) as u16, 1 + r.below(4) as u16);
+            let mut a = dirty(w, h, round + 1);
+            let mut b = dirty(w, h, round + 1);
+            for _ in 0..60 {
+                let (x, y) = (r.below(w as u64 + 2) as u16, r.below(h as u64 + 1) as u16);
+                let text = ["", " ", "a", "\u{d55c}", "e\u{301}", "\u{1f1f0}\u{1f1f7}"][r.below(6) as usize];
+                let style = Style { fg: Color::Idx(r.below(8) as u8), attrs: r.below(4) as u16, ..Style::default() };
+                a.set(x, y, Cell { text: text.into(), style });
+                b.set_parts(x, y, text, style);
+                if r.below(4) == 0 {
+                    let l = link(r.below(3));
+                    a.set_link(x, y, Some(&l));
+                    b.set_link(x, y, Some(&l));
+                }
+                assert!(a.cells == b.cells && a.links == b.links, "round {round}");
+            }
+            let t = ["a\u{d55c}b", "\u{d55c}\u{d55c}e\u{301}", "\u{301}x"][r.below(3) as usize];
+            let (x, limit) = (r.below(w as u64) as u16, r.below(w as u64 + 1) as u16);
+            let mut c = dirty(w, h, round + 1);
+            let mut d = dirty(w, h, round + 1);
+            c.cells.clone_from(&a.cells);
+            d.cells.clone_from(&a.cells);
+            assert_eq!(c.text(x, 0, t, Style::default(), limit), {
+                // Frame::text as it was, with Frame::set
+                let (mut x, start) = (x, x);
+                for ch in t.chars() {
+                    let cw = char_width(ch).unwrap_or(0) as u16;
+                    if cw == 0 {
+                        if x > start {
+                            let mut previous = x - 1;
+                            if d.get(previous, 0).is_some_and(|c| c.text.is_empty()) && previous > start { previous -= 1; }
+                            if previous < d.w { d.cells[previous as usize].text.push(ch); }
+                        }
+                        continue;
+                    }
+                    if x + cw > limit.min(d.w) { break; }
+                    d.set(x, 0, Cell { text: ch.to_string(), style: Style::default() });
+                    if cw == 2 { d.set(x + 1, 0, Cell { text: String::new(), style: Style::default() }); }
+                    x += cw;
+                }
+                x
+            });
+            assert!(c.cells == d.cells && c.links == d.links, "text round {round}");
+        }
+    }
+
+    #[test]
+    fn cell_parts_match_cell_from_vt() {
+        let mut r = Rng(5);
+        let pieces: &[&[u8]] = &[b"a", b" ", b"\xed\x95\x9c", b"e\xcc\x81", b"\xf0\x9f\x87\xb0", b"\x1b[1;4:3;53m", b"\x1b[0m", b"\x1b[38;5;9;48;2;1;2;3m", b"\x1b[58;5;4m",
+            b"\x1b(0q\x1b(B", b"\r\n", b"\x1b[K", b"\x1b[3C", b"\t", b"\x1b[2;7;8;9;5m", b"\x1b[4:2m", b"\x1b[4:4m", b"\x1b[4:5m", b"\x1b[24m", b"\x1b[H", b"\x1b[5@"];
+        for seed in 0..50 {
+            let nz = |n: u16| std::num::NonZeroU16::new(n).unwrap();
+            let mut p = vt100::Parser::new(nz(6), nz(9 + seed as u16 % 5), 0);
+            for _ in 0..200 {
+                p.process(pieces[r.below(pieces.len() as u64) as usize]);
+            }
+            let s = p.screen();
+            let (rows, cols) = (s.size().0.get(), s.size().1.get());
+            for y in 0..rows {
+                for x in 0..cols {
+                    let vc = s.cell(y, x).unwrap();
+                    let cell = crate::cells::cell_from_vt(vc);
+                    let (text, style) = crate::cells::cell_parts_from_vt(vc);
+                    assert_eq!((cell.text.as_str(), cell.style), (text, style), "seed {seed} {y},{x}");
+                }
+            }
+        }
     }
 }

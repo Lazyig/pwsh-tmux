@@ -120,6 +120,35 @@ impl Line {
     }
 }
 
+/// The text and style [`cell_from_vt`] gives, without allocating.
+pub fn cell_parts_from_vt(c: &vt100::Cell) -> (&str, Style) {
+    let mut attrs = 0;
+    for (on, bit) in [
+        (c.bold(), BOLD), (c.dim(), DIM), (c.italic(), ITALIC), (c.inverse(), INVERSE), (c.blink(), BLINK), (c.hidden(), HIDDEN),
+        (c.strikethrough(), STRIKE), (c.overline(), OVERLINE), (c.charset(), ACS),
+    ] {
+        if on {
+            attrs |= bit;
+        }
+    }
+    attrs |= match c.underline_style() {
+        0 => 0,
+        1 => UNDERLINE,
+        2 => DOUBLE_UNDERLINE,
+        3 => CURLY_UNDERLINE,
+        4 => DOTTED_UNDERLINE,
+        _ => DASHED_UNDERLINE,
+    };
+    let text = if c.is_wide_continuation() {
+        ""
+    } else if c.has_contents() {
+        c.contents()
+    } else {
+        " "
+    };
+    (text, Style { fg: c.fgcolor(), bg: c.bgcolor(), us: c.underline_color(), attrs })
+}
+
 pub fn cell_from_vt(c: &vt100::Cell) -> Cell {
     let mut attrs = 0;
     for (on, bit) in [
