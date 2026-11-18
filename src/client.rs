@@ -557,6 +557,11 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                 let (c, r) = term::size();
                 post(C_RESIZE, &encode_size(c, r));
                 paused.set(false);
+                // SIGWINCH went to the shell while we were stopped: the resize thread looks
+                // again, so it knows the size sent above
+                if let Some(watch) = size_watch {
+                    watch.nudge();
+                }
                 post(C_RESUMED, b"");
             }
             Ok((S_SHELL, p)) => {
