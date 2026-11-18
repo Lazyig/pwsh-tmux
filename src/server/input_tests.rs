@@ -1626,3 +1626,21 @@ fn c_y_after_a_c_w_that_deleted_nothing_pastes_nothing() {
     f.handle_input(1, b"one two\x17\x19\x19");
     assert_eq!(input(&f), "one twotwo");
 }
+
+#[test]
+fn a_string_templates_prompt_is_its_text_up_to_a_space_or_comma() {
+    // args_make_commands_get_command: strcspn(" ,") for a string, the first command's
+    // name for a block
+    let mut f = fixture();
+    let label = |f: &mut Fixture, tpl: &str| -> String {
+        run(f, &["bind-key", "F4", &format!("command-prompt {tpl}")]);
+        f.handle_input(1, b"\x02\x1b[14~");
+        let l = f.clients[&1].prompt.as_ref().map(|p| p.label.clone()).unwrap_or_default();
+        f.dispatch_input(1, keys::Input::Key(Key::plain(KeyCode::Escape), vec![27]));
+        l
+    };
+    assert_eq!(label(&mut f, "\"renamew,x '%%'\""), "(renamew) ");
+    assert_eq!(label(&mut f, "\"renamew\tx '%%'\""), "(renamew\tx) ");
+    assert_eq!(label(&mut f, "\"new-window -n '%%'\""), "(new-window) ");
+    assert_eq!(label(&mut f, "{ renamew -- '%%' }"), "(rename-window) ");
+}

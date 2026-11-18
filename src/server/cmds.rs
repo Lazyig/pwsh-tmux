@@ -3943,7 +3943,10 @@ impl Server {
                     Some(p) if o.has('l') => (vec![p.to_string()], false),
                     Some(p) => (p.split(',').map(String::from).collect(), true),
                     None if o.rest.is_empty() => (vec![":".into()], false),
-                    None => (vec![format!("({})", template.split_whitespace().next().unwrap_or(""))], true),
+                    // args_make_commands_get_command: a block's first command, or a
+                    // string template up to a space or a comma
+                    None if block => (vec![format!("({})", template.split_whitespace().next().unwrap_or(""))], true),
+                    None => (vec![format!("({})", template.split([' ', ',']).next().unwrap_or(""))], true),
                 };
                 // prompt_create: format_expand_time, so strftime applies too
                 let inits: Vec<String> = match o.get('I') {
