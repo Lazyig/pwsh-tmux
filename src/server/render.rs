@@ -1435,7 +1435,12 @@ impl Server {
         // window (CLIENT_REDRAWWINDOW, server_client_check_redraw) still draws it, and
         // closing the prompt redraws everything (status_prompt_clear)
         let freeze = c.prompt.as_ref().filter(|p| p.freeze && !p.incremental && p.copy_incremental.is_none() && p.host.is_none()).map(|_| {
-            let panes: Vec<_> = rects.iter().map(|(p, r)| (*p, *r, self.panes.get(p).and_then(|p| p.mode.as_ref()).map(std::mem::discriminant))).collect();
+            // (a pane prompt redraws its pane, PANE_REDRAW, so it is drawn as it changes)
+            let panes: Vec<_> = rects.iter().map(|(p, r)| {
+                let pane = self.panes.get(p);
+                let prompt = pane.and_then(|p| p.prompt.as_ref()).map(|pr| (pr.label.clone(), pr.input.clone(), pr.cursor, pr.vi_command, pr.complete.clone()));
+                (*p, *r, pane.and_then(|p| p.mode.as_ref()).map(std::mem::discriminant), prompt)
+            }).collect();
             format!("{wid:?} {:?} {panes:?} {px} {py} {:?} {}", win.active, c.overlay.is_some(), self.menus.contains_key(&wid))
         });
         if let Some(key) = &freeze && let Some(prev) = c.prev.as_ref().filter(|p| p.freeze.as_ref() == Some(key) && p.frame.w == f.w && p.frame.h == f.h) {
