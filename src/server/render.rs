@@ -72,6 +72,19 @@ impl Frame {
             self.links.insert(y as usize * self.w as usize + x as usize, link.clone());
         }
     }
+    /// Row `y` (its cells and links) as it is in `other`, a frame of the same size.
+    fn copy_row(&mut self, other: &Frame, y: u16) {
+        let w = self.w as usize;
+        let start = y as usize * w;
+        self.cells[start..start + w].clone_from_slice(other.row(y));
+        let gone: Vec<usize> = self.links.range(start..start + w).map(|(i, _)| *i).collect();
+        for i in gone {
+            self.links.remove(&i);
+        }
+        for (i, l) in other.row_links(y) {
+            self.links.insert(*i, l.clone());
+        }
+    }
     fn row_links(&self, y: u16) -> impl Iterator<Item = (&usize, &std::sync::Arc<vt100::Hyperlink>)> {
         let start = y as usize * self.w as usize;
         self.links.range(start..start + self.w as usize)
@@ -1389,7 +1402,21 @@ impl Server {
         modes.appesc = c.features.has("appesc");
         modes.app_cursor = true;
         modes.bracketed_paste = c.features.has("bpaste");
-        Some(RenderState { frame: f, cursor, park, modes, status_ranges })
+        // TTY_FREEZE (status_prompt_set): while a prompt is open nothing a pane writes is
+        // drawn, only the status lines and the prompt row are; what redraws the whole
+        // window (CLIENT_REDRAWWINDOW, server_client_check_redraw) still draws it, and
+        // closing the prompt redraws everything (status_prompt_clear)
+        let freeze = c.prompt.as_ref().filter(|p| p.freeze && !p.incremental && p.copy_incremental.is_none() && p.host.is_none()).map(|_| {
+            let panes: Vec<_> = rects.iter().map(|(p, r)| (*p, *r, self.panes.get(p).and_then(|p| p.mode.as_ref()).map(std::mem::discriminant))).collect();
+            format!("{wid:?} {:?} {panes:?} {px} {py} {:?} {}", win.active, c.overlay.is_some(), self.menus.contains_key(&wid))
+        });
+        if let Some(key) = &freeze && let Some(prev) = c.prev.as_ref().filter(|p| p.freeze.as_ref() == Some(key) && p.frame.w == f.w && p.frame.h == f.h) {
+            let status = if top { 0..nstatus } else { ch - nstatus..ch };
+            for y in (0..ch).filter(|y| !status.contains(y) && *y != my) {
+                f.copy_row(&prev.frame, y);
+            }
+        }
+        Some(RenderState { frame: f, cursor, park, modes, status_ranges, freeze })
     }
 
     /// prompt_draw: while a prompt has the cursor it takes prompt-cursor-style and

@@ -3958,6 +3958,8 @@ impl Server {
                 // -1, -N, -i, -k and -e exclude each other in this order
                 let mut pr = Prompt::new(kind, prompts, template, ctx.pane);
                 pr.block = block;
+                // -C: the panes keep being drawn (PROMPT_NOFREEZE)
+                pr.freeze = !o.has('C');
                 pr.single_key = o.has('1');
                 pr.numeric = o.has('N') && !o.has('1');
                 pr.history_type = history_type;
@@ -3983,8 +3985,7 @@ impl Server {
                     }
                 }
                 self.prompt_incremental_start(cid, host);
-                // -C (keep updating panes) is how prompts behave here anyway; without -b
-                // (or -i) the command waits until the prompt is done
+                // without -b (or -i) the command waits until the prompt is done
                 self.prompt_wait(cid, id, o.has('b') || o.has('i'))
             }
             "confirm-before" => {

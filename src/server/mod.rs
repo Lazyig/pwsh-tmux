@@ -921,6 +921,9 @@ pub struct Prompt {
     pub input: Vec<char>,
     pub cursor: usize,
     pub template: String,
+    /// While the prompt is open the panes are not drawn (TTY_FREEZE): every client
+    /// prompt but command-prompt -C or -i (PROMPT_NOFREEZE, PROMPT_INCREMENTAL).
+    pub freeze: bool,
     /// The template was a { } block (ARGS_COMMANDS): the answers go into its parsed
     /// values, which are not parsed again (args_make_commands, cmd_list_copy).
     pub block: bool,
@@ -958,7 +961,7 @@ impl Prompt {
         let input: Vec<char> = init.chars().collect();
         Prompt {
             vi_command: false, quote_next: false, copied: Vec::new(), kind, prompts, answers: Vec::new(), label, cursor: input.len(), input,
-            template, block: false, history_pos: None, history_type: 0, id: 0, pane, numeric: false, single_key: false, incremental: false, last: String::new(),
+            template, freeze: true, block: false, history_pos: None, history_type: 0, id: 0, pane, numeric: false, single_key: false, incremental: false, last: String::new(),
             complete: Vec::new(), closed: false, host: None, copy_incremental: None, bspace_exit: false, confirm: ('y', false),
         }
     }
@@ -977,6 +980,9 @@ pub struct RenderState {
     pub modes: render::Modes,
     /// Mouse range of every cell of each status line (tmux status entry ranges).
     pub status_ranges: Vec<Vec<Option<crate::format::Range>>>,
+    /// While the client is frozen (TTY_FREEZE): what a change of would redraw the window
+    /// (the window shown, its layout, its panes' modes, the part shown).
+    pub freeze: Option<String>,
 }
 
 /// What a mouse drag in progress updates (tmux's mouse_drag_update callback).

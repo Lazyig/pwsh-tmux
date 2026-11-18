@@ -1464,3 +1464,48 @@ fn a_block_template_takes_the_answers_without_being_parsed_again() {
         assert_eq!(rename(&mut f, typed), name, "{typed}");
     }
 }
+
+#[test]
+fn a_status_prompt_freezes_the_panes_until_it_closes() {
+    // status_prompt_set: TTY_FREEZE without -C or -i, so what panes write is not drawn
+    // (tty_client_ready) until status_prompt_clear redraws everything
+    let mut f = fixture();
+    let pane = f.pane;
+    let row0 = |f: &Fixture| f.compose(1).unwrap().frame.row(0).iter().map(|c| c.text.as_str()).collect::<String>();
+    let write = |f: &mut Fixture, text: &str| {
+        let g = f.panes[&pane].generation;
+        f.pane_data(pane, g, format!("\x1b[H\x1b[2K{text}").as_bytes());
+    };
+    write(&mut f, "before");
+    f.render(1);
+    run(&mut f, &["command-prompt", "-I", "x", "set -g @x '%%'"]);
+    f.render(1);
+    write(&mut f, "during");
+    assert!(row0(&f).starts_with("before"));
+    f.render(1);
+    assert!(row0(&f).starts_with("before"));
+    // the window changing is drawn (CLIENT_REDRAWWINDOW)
+    run(&mut f, &["split-window", "-d"]);
+    assert!(row0(&f).starts_with("during"));
+    f.render(1);
+    write(&mut f, "later");
+    assert!(row0(&f).starts_with("during"));
+    f.dispatch_input(1, keys::Input::Key(Key::plain(KeyCode::Escape), vec![27]));
+    assert!(f.clients[&1].prompt.is_none());
+    assert!(row0(&f).starts_with("later"));
+    // -C and -i keep drawing the panes
+    for flag in ["-C", "-i"] {
+        f.render(1);
+        run(&mut f, &["command-prompt", flag, "set -g @x '%%'"]);
+        f.render(1);
+        write(&mut f, flag);
+        assert!(row0(&f).starts_with(flag), "{flag}");
+        f.dispatch_input(1, keys::Input::Key(Key::plain(KeyCode::Escape), vec![27]));
+    }
+    // confirm-before freezes too
+    f.render(1);
+    run(&mut f, &["confirm-before", "set -g @x y"]);
+    f.render(1);
+    write(&mut f, "confirm");
+    assert!(row0(&f).starts_with("-i"));
+}
