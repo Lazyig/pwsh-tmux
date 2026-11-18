@@ -3238,8 +3238,9 @@ impl CopyMode {
     /// Matches beginning on this physical row; end columns may extend onto wrapped rows.
     fn row_matches(&self, y: usize, needle: &str) -> Vec<(usize, usize)> {
         if y >= self.lines.len() { return Vec::new(); }
-        let mut s = String::new();
-        let mut starts = Vec::new(); // (byte offset, cell offset)
+        // sized for one row, the usual case
+        let mut s = String::with_capacity(self.width);
+        let mut starts = Vec::with_capacity(self.width); // (byte offset, cell offset)
         let mut row = y;
         let regex = self.search_regex && needle.contains(['^', '$', '*', '+', '(', ')', '?', '[', ']', '.', '\\']);
         let limit = if regex { 2000 } else { self.width + needle.len() };

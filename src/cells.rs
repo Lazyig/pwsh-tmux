@@ -213,15 +213,14 @@ pub fn snapshot_text_len(screen: &vt100::Screen, index: usize) -> usize {
 /// What columns `0..width` of [`snapshot_line`] give to a search: [`Line::cell_text`] of
 /// each of its cells, a blank past them. Read from the screen unless the row has a tab.
 pub fn snapshot_texts(screen: &vt100::Screen, index: usize, width: usize, mut f: impl FnMut(&str)) {
-    let n = snapshot_cells_len(screen, index);
-    match screen.history_row(index) {
-        Some(row) if row.metadata().any(|(_, m)| m.tab_width != 0) => {
-            let line = snapshot_line(screen, index);
-            (0..width).for_each(|x| f(if x < line.cells.len() { line.cell_text(x) } else { " " }));
-        }
-        Some(row) => (0..width).for_each(|x| f(if x < n { vt_cell_text(row.cell(x as u16)) } else { " " })),
-        None => (0..width).for_each(|_| f(" ")),
+    let Some(row) = screen.history_row(index) else { return (0..width).for_each(|_| f(" ")) };
+    if row.metadata().any(|(_, m)| m.tab_width != 0) {
+        let line = snapshot_line(screen, index);
+        return (0..width).for_each(|x| f(if x < line.cells.len() { line.cell_text(x) } else { " " }));
     }
+    let n = snapshot_cells_len(screen, index).min(width);
+    (0..n).for_each(|x| f(vt_cell_text(row.cell(x as u16))));
+    (n..width).for_each(|_| f(" "));
 }
 
 /// Row `index` of the screen counting its history (oldest history row = 0).
