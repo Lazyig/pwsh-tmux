@@ -33,7 +33,11 @@ pub fn expand(cap: &str, args: &[&str]) -> Option<String> {
                 loop { let c = chars.next()?; if c == '}' { break; } value.push(c); }
                 if active { stack.push(value.parse::<i64>().ok()?.to_string()); }
             }
-            '\'' => { let c = chars.next()?; if chars.next()? != '\'' { return None; } if active { stack.push((c as u32).to_string()); } }
+            '\'' => {
+                let c = chars.next()?;
+                if chars.next()? != '\'' { return None; }
+                if active { stack.push((c as u32).to_string()); }
+            }
             'i' if active => { for p in params.iter_mut().take(2) { *p = number(p.clone()).saturating_add(1).to_string(); } }
             'r' if active => params.swap(0, 1),
             'l' if active => { let n = stack.pop()?.len(); stack.push(n.to_string()); }

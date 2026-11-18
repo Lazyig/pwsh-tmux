@@ -1239,21 +1239,23 @@ fn display_menu_popup_positions_and_pane_prompt_like_tmux_3_8() {
     ctx.ok(&["set", "-g", "status-position", "bottom"]);
     // popup -x/-y take letters and formats; y is the bottom row
     let hi = print_then_sleep("hi", 10);
-    let _p1 = popup(&["-x", "#{e|+:2,3}", "-y", "6", "-w", "12", "-h", "4", &hi]);
+    let mut p1 = popup(&["-x", "#{e|+:2,3}", "-y", "6", "-w", "12", "-h", "4", &hi]);
     wait_for("popup", || row_of("hi").is_some());
     assert_eq!(row_of("┌"), Some(2));
     assert_eq!(rows()[2].find('┌'), Some(5));
     // Escape closes a popup without -E even while its command runs
     t.send(b"\x1b");
     wait_for("popup closed", || row_of("┌").is_none());
+    wait_for("popup client exits", || p1.try_wait().unwrap().is_some());
     // popups are drawn over the status line
-    let _p2 = popup(&["-x", "R", "-y", "100%", "-w", "12", "-h", "4", &hi]);
+    let mut p2 = popup(&["-x", "R", "-y", "100%", "-w", "12", "-h", "4", &hi]);
     wait_for("popup over status", || t.row(29).contains('└'));
     assert_eq!(t.row(29).find('└'), Some(88));
     t.send(b"\x03");
     wait_for("popup closed", || row_of("┌").is_none());
+    wait_for("popup client exits", || p2.try_wait().unwrap().is_some());
     // after its command exits, a key that is not Escape leaves it open
-    let _p3 = popup(&["-x", "0", "-y", "0", "-w", "12", "-h", "4", sh("printf noE", "[Console]::Write('noE')")]);
+    let mut p3 = popup(&["-x", "0", "-y", "0", "-w", "12", "-h", "4", sh("printf noE", "[Console]::Write('noE')")]);
     wait_for("popup", || row_of("noE").is_some());
     std::thread::sleep(Duration::from_millis(300));
     t.send(b"q");
@@ -1261,6 +1263,7 @@ fn display_menu_popup_positions_and_pane_prompt_like_tmux_3_8() {
     assert!(row_of("noE").is_some());
     t.send(b"\x1b");
     wait_for("popup closed", || row_of("noE").is_none());
+    wait_for("popup client exits", || p3.try_wait().unwrap().is_some());
     // command-prompt -P prompts on the pane's last line, the status line stays
     ctx.ok(&["command-prompt", "-b", "-P", "-t", &client, "-p", "pane:", "set -g @pp '%%'"]);
     wait_for("pane prompt", || t.row(28).starts_with("pane: "));
