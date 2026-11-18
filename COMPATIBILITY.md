@@ -157,6 +157,10 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   where nothing removes it, so a window renamed to `it's` is named `it'\''s`. Here a `%%`
   answer keeps its single quotes in a block; string templates (which are parsed again)
   still escape them as in 3.8, and `%%%` / `%1%` keep tmux's escapes in both.
+- **Configuration files with CRLF line endings** (as Windows editors and `core.autocrlf`
+  checkouts write them) are read with each `\r\n` as a newline. tmux 3.8 keeps the `\r`,
+  so a directive line such as `%endif\r` or `%else\r` is a syntax error there
+  (cmd-parse.y's lexer ends a line at `\n` only).
 - **No signal information on Windows:** `pane_dead_signal` and other signal values are
   never set there. A popup whose command was ended (TerminateProcess) gives its waiting
   command-line client that process's exit code, where on Unix it is the signal number
