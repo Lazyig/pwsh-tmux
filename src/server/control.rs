@@ -96,7 +96,7 @@ impl Server {
         if c.ctl.command_waiting {
             c.ctl.command_bytes = c.ctl.command_bytes.saturating_add(line.len() + 1);
             if c.ctl.command_bytes > output::MAX_REPLY {
-                c.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+                c.closed.close();
                 return;
             }
             c.ctl.command_lines.push_back(line.to_string());
@@ -329,12 +329,12 @@ impl Server {
                         let previous = last.map_or(0, |v| key.len() + v.len());
                         cached_bytes = cached_bytes.saturating_sub(previous).saturating_add(key.len() + value.len());
                         if cached_bytes > MAX_SUBS_BYTES {
-                            self.clients[&cid].closed.store(true, std::sync::atomic::Ordering::SeqCst);
+                            self.clients[&cid].closed.close();
                             continue 'clients;
                         }
                         out.push_str(&format!("%subscription-changed {name} {prefix} : {value}\n"));
                         if out.overflowed() {
-                            self.clients[&cid].closed.store(true, std::sync::atomic::Ordering::SeqCst);
+                            self.clients[&cid].closed.close();
                             continue 'clients;
                         }
                         updates.push((name.clone(), key, value));
@@ -487,7 +487,7 @@ impl Server {
         if let Some(text) = self.ev.ctl_queue.remove(&cid) {
             if text.overflowed() {
                 if let Some(c) = self.clients.get(&cid) {
-                    c.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    c.closed.close();
                 }
                 return;
             }
@@ -503,7 +503,7 @@ impl Server {
         // Continue input queued behind wait-for, run-shell and other async commands.
         loop {
             let next = self.clients.values_mut().find_map(|c| {
-                if c.ctl.command_waiting || c.ctl.exiting.get() || c.ctl.deferred_exit.borrow().is_some() || c.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                if c.ctl.command_waiting || c.ctl.exiting.get() || c.ctl.deferred_exit.borrow().is_some() || c.closed.is_closed() {
                     return None;
                 }
                 let line = c.ctl.command_lines.pop_front()?;

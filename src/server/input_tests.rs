@@ -10,7 +10,7 @@ fn fixture() -> Fixture {
     let (mut srv, events) = super::security_tests::fixture();
     let (tx, output) = mpsc::channel();
     let c = srv.clients.get_mut(&1).unwrap();
-    c.readonly = false; c.acl_readonly = false; c.tx = tx; c.closed.store(false, std::sync::atomic::Ordering::SeqCst);
+    c.readonly = false; c.acl_readonly = false; c.tx = tx; c.closed = Default::default();
     let mut ctx = Ctx::default();
     srv.exec(vec!["new-session".into(), "-d".into(), "-s".into(), "input".into()], &mut ctx).unwrap();
     let sid = *srv.sessions.keys().next().unwrap();
@@ -880,7 +880,7 @@ fn clipboard_request_goes_to_the_most_recent_usable_client() {
     // a second attached client, more recently active than client 1
     let (tx, out2) = mpsc::channel();
     let mut c2 = super::security_tests::fixture().0.clients.remove(&1).unwrap();
-    c2.id = 2; c2.tx = tx; c2.readonly = false; c2.acl_readonly = false; c2.closed.store(false, std::sync::atomic::Ordering::SeqCst);
+    c2.id = 2; c2.tx = tx; c2.readonly = false; c2.acl_readonly = false; c2.closed = Default::default();
     c2.features = features::compute("xterm-256color", "", &[], "clipboard");
     f.clients.insert(2, c2);
     f.attach_client(2, sid);

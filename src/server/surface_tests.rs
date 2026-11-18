@@ -13,7 +13,7 @@ fn fixture() -> Fixture {
     let (mut srv, events) = super::security_tests::fixture();
     let (tx, output) = mpsc::channel();
     let c = srv.clients.get_mut(&1).unwrap();
-    c.readonly = false; c.acl_readonly = false; c.tx = tx; c.closed.store(false, std::sync::atomic::Ordering::SeqCst);
+    c.readonly = false; c.acl_readonly = false; c.tx = tx; c.closed = Default::default();
     run(&mut srv, &["new-session", "-d", "-s", "al"]);
     run(&mut srv, &["new-window", "-d"]);
     let sid = *srv.sessions.keys().next().unwrap();

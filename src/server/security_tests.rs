@@ -298,7 +298,7 @@ fn slow_client_output_backlog_is_bounded_and_cancelled() {
     let payload = vec![b'x'; transport::MAX_OUTPUT_BACKLOG / 2];
     client.send(S_OUTPUT, &payload);
     client.send(S_OUTPUT, &payload);
-    assert!(client.closed.load(Ordering::SeqCst));
+    assert!(client.closed.is_closed());
     assert!(client.queued_bytes.load(Ordering::SeqCst) <= transport::MAX_OUTPUT_BACKLOG);
     assert_eq!(output.try_iter().count(), 1);
 }
