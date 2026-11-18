@@ -108,6 +108,10 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
 - **Windows transport.** Windows uses ConPTY and named pipes and identifies users by SID;
   Unix uses ptys, Unix sockets and uids. A Windows pipe's ACL is set when the pipe is
   created, so `server-access` changes on Windows belong in the config file.
+  The server's pipe connections are nonblocking (`PIPE_NOWAIT`) and cannot be waited on,
+  so each client connection checks for input every 5 ms: on Windows a key reaches the
+  server up to 5 ms (2.5 ms on average) later than on Unix, where the server waits on the
+  socket, and every attached client costs the server about 200 wakeups a second.
 - **Escape timing after attach (a tmux 3.8 bug).** tmux 3.8 asks a VT100-like terminal, in
   this order, for DA1 (`CSI c`), DA2 (`CSI > c`), XTVERSION (`CSI > q`), DECRQM 2026 and
   the OSC 10 and 11 colours (tty_send_requests, tty.c:406-425), and while any of those
