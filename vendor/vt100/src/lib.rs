@@ -319,6 +319,73 @@ mod metadata_tests {
         assert!(p.screen().cell(0, 0).unwrap().is_wide());
     }
 
+    #[test]
+    fn a_cell_widened_in_the_last_column_stays_there_like_tmux() {
+        // screen_write_combine widens the cell where it is: in the last column its second
+        // half is off the screen and the cursor stays; what follows wraps, writes over it
+        // or moves it like any cell (each expected screen is tmux 3.8's in a 25x5 pane)
+        let flag = "\u{1F1F0}\u{1F1F7}";
+        let x = |n: usize| "x".repeat(n);
+        let screen = |p: &Parser| -> alloc::vec::Vec<alloc::string::String> {
+            let s = p.screen();
+            (0..5).map(|y| (0..25).filter_map(|c| s.cell(y, c)).filter(|c| !c.is_wide_continuation())
+                .map(|c| if c.has_contents() { c.contents() } else { " " }).collect::<alloc::string::String>().trim_end().into()).collect()
+        };
+        let nl = "\r\n".repeat(4);
+        for (input, rows, cursor) in [
+            (x(24) + flag + "c", [&*(x(24) + flag), "c", "", "", ""], (1, 1)),
+            (x(24) + flag + "\x1bDc", [&*(x(24) + flag), "", "c", "", ""], (2, 1)),
+            (nl.clone() + &x(24) + flag + "\x1bD\x1b[rabc", ["abc", "", "", &*(x(24) + flag), ""], (0, 3)),
+            (x(24) + flag + "\r\x1b[24Cc", [&*(x(24) + "c"), "", "", "", ""], (0, 25)),
+            (nl + &x(24) + flag + "\r\x1b[24Cc", ["", "", "", "", &*(x(24) + "c")], (4, 25)),
+            (x(24) + flag + "\x1b[2Dc", [&*(x(23) + "c" + flag), "", "", "", ""], (0, 24)),
+            (x(24) + flag + "\r\x1b[P", [&*(x(23) + flag), "", "", "", ""], (0, 0)),
+            (x(24) + flag + "\r\x1b[@", [&*(" ".to_owned() + &x(24)), "", "", "", ""], (0, 0)),
+            (x(24) + flag + "\r\x1b[24C\x1b[X", [&*x(24), "", "", "", ""], (0, 24)),
+            (x(24) + flag + "\r\x1b[23C\u{4e2d}", [&*(x(23) + "\u{4e2d}"), "", "", "", ""], (0, 25)),
+            ("\x1b[2;4r\x1b[4;1H".to_owned() + &x(24) + flag + "c", ["", "", &*(x(24) + flag), "c", ""], (3, 1)),
+            ("\x1b[?7l".to_owned() + &x(24) + flag + "c", [&*(x(24) + "c"), "", "", "", ""], (0, 24)),
+            // nothing joins it: a modifier is a character of its own, a zero width
+            // character is dropped
+            (x(24) + flag + "\u{1F3FD}", [&*(x(24) + flag), "\u{1F3FD}", "", "", ""], (1, 2)),
+            (x(24) + flag + "\u{200D}c", [&*(x(24) + flag), "c", "", "", ""], (1, 1)),
+            (x(24) + flag + "\u{301}Q", [&*(x(24) + flag), "Q", "", "", ""], (1, 1)),
+        ] {
+            let mut p = Parser::new(NonZeroU16::new(5).unwrap(), NonZeroU16::new(25).unwrap(), 0);
+            p.process(input.as_bytes());
+            assert_eq!(screen(&p), rows, "{input:?}");
+            assert_eq!(p.screen().cursor_position(), cursor, "{input:?}");
+        }
+        let mut p = Parser::new(NonZeroU16::new(5).unwrap(), NonZeroU16::new(25).unwrap(), 0);
+        p.process((x(24) + flag).as_bytes());
+        let cell = p.screen().cell(0, 24).unwrap();
+        assert!(cell.is_wide() && cell.contents() == flag);
+        // nor does anything join a wide cell from its second half (a combining mark after
+        // CUB, or after a wide character in the last two columns without DECAWM)
+        for (input, at, cursor) in [("\u{4e2d}\x1b[D\u{301}".to_owned(), 0, (0, 1)), ("\x1b[?7l".to_owned() + &x(23) + "\u{4e2d}\u{301}", 23, (0, 24))] {
+            let mut p = Parser::new(NonZeroU16::new(5).unwrap(), NonZeroU16::new(25).unwrap(), 0);
+            p.process(input.as_bytes());
+            assert_eq!((p.screen().cell(0, at).unwrap().contents(), p.screen().cursor_position()), ("\u{4e2d}", cursor), "{input:?}");
+        }
+        // a wider or narrower pane shows all of it, the cursor after it on its second
+        // half (grid_reflow keeps tmux's padding cell; the alternate screen is not reflowed)
+        for (alternate, cols, row, at, cursor) in [(false, 30, 0, 24, (0, 25)), (false, 20, 0, 4, (0, 5)), (true, 30, 0, 24, (0, 25))] {
+            let mut p = Parser::new(NonZeroU16::new(3).unwrap(), NonZeroU16::new(25).unwrap(), 10);
+            p.process(format!("{}{}{flag}", if alternate { "\x1b[?1049h" } else { "" }, x(24)).as_bytes());
+            p.set_size(NonZeroU16::new(3).unwrap(), NonZeroU16::new(cols).unwrap());
+            let s = p.screen();
+            let y = s.history_rows_len() - 3;
+            let line = s.history_row(y + row).unwrap();
+            assert!(line.cell(at).unwrap().is_wide() && line.cell(at + 1).unwrap().is_wide_continuation(), "{cols}");
+            assert_eq!((line.cell(at).unwrap().contents(), s.cursor_position()), (flag, cursor), "{cols}");
+        }
+        // one column: the pair is a wide cell in it
+        let mut p = Parser::new(NonZeroU16::new(3).unwrap(), NonZeroU16::new(1).unwrap(), 0);
+        p.process(flag.as_bytes());
+        assert_eq!((p.screen().cell(0, 0).unwrap().contents(), p.screen().cursor_position()), (flag, (0, 1)));
+        p.process(format!("a\r{flag}\x1b[P\x1bDb\u{301}{flag}\x1b[@\u{1F1EF}\x1b[X").as_bytes());
+    }
+
     fn p30(input: &str) -> Parser {
         let mut p = Parser::new(NonZeroU16::new(8).unwrap(), NonZeroU16::new(30).unwrap(), 0);
         p.process(input.as_bytes());

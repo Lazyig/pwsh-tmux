@@ -4084,3 +4084,37 @@ fn c_c_stops_a_panes_program() {
     ctx.ok(&["send-keys", "-t", "c", "C-c"]);
     wait_for("pane dead after C-c", || ctx.fmt("c", "#{pane_dead}") == "1");
 }
+
+#[test]
+fn pane_output_that_widens_a_cell_in_the_last_column_leaves_the_server_running() {
+    // fuzzed output that panicked the parser and killed the server: a pair of regional
+    // indicators made the cell in the last column wide and the cell was written over
+    let ctx = Ctx::new("wide-last-column");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pane-output-crash");
+    let shown = |file: &std::path::Path, then: &str| -> String {
+        let path = file.display().to_string();
+        if cfg!(windows) {
+            format!("$b = [IO.File]::ReadAllBytes('{path}'); $o = [Console]::OpenStandardOutput(); $o.Write($b, 0, $b.Length); $o.Flush(); [Console]::Write('{then}'); Start-Sleep 100")
+        } else {
+            // the replies to its queries are not echoed over the screen
+            format!("stty -echo; cat '{path}'; printf '{then}'; sleep 100")
+        }
+    };
+    ctx.ok(&["new-session", "-d", "-s", "keep"]);
+    for (i, (name, cols, rows, history)) in [("crash-5x25.bin", 25, 5, 0), ("panic-11.bin", 1, 6, 7), ("panic-1712.bin", 18, 8, 7), ("panic-1861.bin", 25, 5, 14)].into_iter().enumerate() {
+        let (session, cols, rows, history) = (format!("w{i}"), cols.to_string(), rows.to_string(), history.to_string());
+        ctx.ok(&["set", "-g", "history-limit", &history]);
+        let script = shown(&dir.join(name), &format!("{}@done{i}@", if cfg!(windows) { "" } else { "\\033c" }));
+        ctx.ok(&["new-session", "-d", "-s", &session, "-x", &cols, "-y", &rows, &script]);
+        wait_for(&format!("{name} shown"), || ctx.ok(&["capture-pane", "-p", "-J", "-t", &session]).contains(&format!("@done{i}@")));
+    }
+    ctx.ok(&["has-session", "-t", "keep"]);
+    // the screen tmux 3.8 shows (ConPTY draws the output again on Windows)
+    if cfg!(unix) {
+        ctx.ok(&["set", "-g", "history-limit", "0"]);
+        ctx.ok(&["new-session", "-d", "-s", "screen", "-x", "25", "-y", "5", &shown(&dir.join("crash-5x25.bin"), "")]);
+        let want = "uwerosumvqueullhaujzjnzjs\nwsoceeamizajzukpwaxgvqunv\nnsffhfezwlonsluvvuicbublc\nffemsgmimjphtrvbrnypwffl\u{1F1F0}\u{1F1F7}\n\n";
+        wait_for("crash-5x25.bin shown", || ctx.capture("screen") == want);
+        assert_eq!(ctx.fmt("screen", "#{cursor_x},#{cursor_y}"), "25,2");
+    }
+}

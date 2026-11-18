@@ -1,5 +1,5 @@
 use crate::term::BufWrite as _;
-use alloc::{string::String, string::ToString as _, vec::Vec};
+use alloc::{string::String, vec::Vec};
 use unicode_width::UnicodeWidthChar as _;
 
 const MODE_APPLICATION_KEYPAD: u8 = 0b0000_0001;
@@ -1315,36 +1315,6 @@ impl Screen {
         wrap
     }
 
-    // if we already have a character in a cell, but adding a continuation
-    // character widened the cell off the end of the row, we need to move the
-    // base character to the beginning of the next row
-    fn wrap_widened_cell(
-        &mut self,
-        old_pos: crate::grid::Pos,
-        new_pos: crate::grid::Pos,
-    ) {
-        if new_pos.col == 0 {
-            let attrs = self.attrs;
-            let contents = self
-                .grid()
-                .drawing_cell(old_pos)
-                .unwrap()
-                .contents()
-                .to_string();
-            self.grid_mut()
-                .drawing_cell_mut(new_pos)
-                .unwrap()
-                .set_contents(&contents, attrs);
-            self.grid_mut()
-                .drawing_cell_mut(old_pos)
-                .unwrap()
-                .clear(attrs);
-            self.grid_mut().col_inc(2);
-        } else {
-            self.grid_mut().col_inc(1);
-        }
-    }
-
     // once we have drawn a character, clean up the wide character state of
     // nearby cells that may have been disrupted.
     fn text_cleanup(
@@ -1371,51 +1341,33 @@ impl Screen {
             }
         }
 
+        // a wide cell in the last column has its second half off the screen
+        // (screen_write_combine), so the cell after a wide cell may be missing
+        let next = crate::grid::Pos { row: base_pos.row, col: base_pos.col + 1 };
         if cell_was_wide && !cell_is_wide {
-            let next_cell = self
-                .grid_mut()
-                .drawing_cell_mut(crate::grid::Pos {
-                    row: base_pos.row,
-                    col: base_pos.col + 1,
-                })
-                // base_pos.row is assumed valid, and this cell previously
-                // was wide, so there must have been a continuation cell
-                // after it.
-                .unwrap();
-            next_cell.set(' ', attrs);
+            if let Some(next_cell) = self.grid_mut().drawing_cell_mut(next) {
+                if next_cell.is_wide_continuation() {
+                    next_cell.set(' ', attrs);
+                }
+            }
         }
 
         if !cell_was_wide && cell_is_wide {
-            let next_cell = self
-                .grid_mut()
-                .drawing_cell_mut(crate::grid::Pos {
-                    row: base_pos.row,
-                    col: base_pos.col + 1,
-                })
-                // base_pos.row is assumed valid, and the cell at base_pos
-                // has become wide, so it must have a cell after it (if it
-                // didn't, we would have wrapped earlier when widening the
-                // cell).
-                .unwrap();
+            let Some(next_cell) = self.grid_mut().drawing_cell_mut(next) else {
+                return;
+            };
             let next_cell_was_wide = next_cell.is_wide();
             next_cell.clear(crate::attrs::Attrs::default());
             next_cell.set_wide_continuation(true);
             if next_cell_was_wide {
-                let next_next_cell = self
-                    .grid_mut()
-                    .drawing_cell_mut(crate::grid::Pos {
-                        row: base_pos.row,
-                        col: base_pos.col + 2,
-                    })
-                    // the cell at base_pos.col + 1 was previously wide, so
-                    // it must have had a continuation cell after it.
-                    .unwrap();
-                next_next_cell.clear(attrs);
-                if base_pos.col + 2 == size.cols() - 1 {
-                    self.grid_mut()
-                        .drawing_row_mut(base_pos.row)
-                        .unwrap()
-                        .wrap(false);
+                let next_next = crate::grid::Pos { row: base_pos.row, col: base_pos.col + 2 };
+                if let Some(next_next_cell) = self.grid_mut().drawing_cell_mut(next_next).filter(|c| c.is_wide_continuation()) {
+                    next_next_cell.clear(attrs);
+                    if base_pos.col + 2 == size.cols() - 1 {
+                        if let Some(row) = self.grid_mut().drawing_row_mut(base_pos.row) {
+                            row.wrap(false);
+                        }
+                    }
                 }
             }
         }
@@ -1534,16 +1486,19 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                 .unwrap()
                 .is_wide_continuation()
             {
-                // pos.row is valid, since it comes directly from
-                // self.grid().pos() which we assume to always have a
-                // valid row value. we know pos.col - 2 is valid
-                // because the cell at pos.col - 1 is a wide
-                // continuation character, which means there must be
-                // the first half of the wide character before it.
-                base_pos = crate::grid::Pos {
-                    row: pos.row,
-                    col: pos.col - 2,
+                // the first half of the wide character is before its
+                // continuation; a continuation in the first column has none
+                let Some(col) = pos.col.checked_sub(2) else {
+                    return;
                 };
+                base_pos = crate::grid::Pos { row: pos.row, col };
+            }
+            // screen_write_combine: the cell must be as wide as the distance to
+            // the cursor, so nothing joins a wide cell from its second half or
+            // from beyond a wide cell in the last column
+            let base = screen.grid().drawing_cell(base_pos).unwrap();
+            if base.is_wide_continuation() || base.is_wide() != (pos.col - base_pos.col == 2) {
+                return;
             }
             cell_was_wide =
                 screen.grid().drawing_cell(base_pos).unwrap().is_wide();
@@ -1561,16 +1516,11 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
             }
             let cell_is_wide =
                 screen.grid().drawing_cell(base_pos).unwrap().is_wide();
-            if !cell_was_wide && cell_is_wide {
-                let on_row = Self::on_row(screen, &mut self.callbacks);
-                screen.grid_mut().col_wrap(1, false, on_row);
-                // col_wrap always leaves self.grid().pos() on a valid cell,
-                // so .drawing_cell(new_pos).unwrap() will always be valid.
-                let new_pos = screen.grid().pos();
-                screen.wrap_widened_cell(base_pos, new_pos);
-                if new_pos.col == 0 {
-                    base_pos = new_pos;
-                }
+            // screen_write_combine widens the cell where it is and moves the cursor
+            // past its second half; in the last column that half is off the screen
+            // (the cell is drawn blank, tty_draw_line_get_empty) and the cursor stays
+            if !cell_was_wide && cell_is_wide && base_pos.col + 1 < screen.grid().size().cols() {
+                screen.grid_mut().col_inc(1);
             }
         }
 

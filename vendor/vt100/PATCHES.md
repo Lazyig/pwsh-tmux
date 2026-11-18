@@ -72,3 +72,21 @@ scroll region not at the top goes into the history (grid_scroll_history_region);
 RIS keeps the history and, with scroll-on-clear, moves the screen into it; IRM
 makes text and tabs insert. `Screen::reset_hyperlinks` is screen_reset_hyperlinks
 (clear-history -H). Tests: lib.rs::metadata_tests.
+
+Local change: a character that combines with the cell before the cursor and makes
+it wide (a second regional indicator, an emoji modifier, VS16 with
+variation-selector-always-wide) widens the cell where it is, as
+screen_write_combine does. In the last column the second half is off the screen:
+the cell stays there, wide, with no continuation cell after it, the cursor does
+not move and the client draws it blank. Upstream moved the character to the next
+row, which after a scroll read the wrong row and left such a cell behind; writing
+over it then panicked. Code that tidies the cells around a wide cell
+(`text_cleanup`) tolerates the missing continuation and clears only continuation
+cells. Reflow gives such a cell its continuation and keeps a cursor after it on
+the second half (the offset grid_unwrap_position keeps); a row of the fixed
+alternate screen that grows shows the second half too. A zero width character
+joins the cell before the cursor only when that cell is as wide as the distance
+to the cursor (tmux drops it with the cursor on a wide cell's second half or
+after a wide cell in the last column). Tests:
+lib.rs::metadata_tests, src/cells.rs and tests/commands.rs with the fuzzed
+outputs in tests/fixtures/pane-output-crash.

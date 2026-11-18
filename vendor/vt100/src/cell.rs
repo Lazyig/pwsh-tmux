@@ -94,6 +94,7 @@ impl Cell {
         self.append_char(self.len(), c);
     }
 
+    #[cfg(test)]
     pub(crate) fn set_contents(&mut self, s: &str, a: crate::attrs::Attrs) {
         let mut chars = s.chars();
         let Some(c) = chars.next() else {

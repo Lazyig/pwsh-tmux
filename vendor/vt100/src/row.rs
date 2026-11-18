@@ -264,7 +264,17 @@ impl Row {
 
     fn grow_unchecked(&mut self, len: u16, cell: crate::Cell) {
         debug_assert!(self.cells.len() < usize::from(len));
+        // a wide cell in the last column had its second half off the screen; a wider row
+        // shows it (tmux keeps that padding cell in the line)
+        let old = self.cells.len();
+        let hanging = old.checked_sub(1).and_then(|last| self.cells.get(last)).is_some_and(crate::Cell::is_wide);
         self.cells.resize(len.into(), cell);
+        if hanging {
+            if let Some(next) = self.cells.get_mut(old) {
+                next.clear(crate::attrs::Attrs::default());
+                next.set_wide_continuation(true);
+            }
+        }
         self.wrapped = false;
     }
 

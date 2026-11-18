@@ -355,4 +355,49 @@ mod tests {
         assert_eq!(p.screen().cell(4, 4).map(|c| c.contents().to_string()).as_deref(), Some("q"));
         assert_eq!(p.screen().cell(9999, 9999).map(vt100::Cell::has_contents), Some(false));
     }
+
+    #[test]
+    fn output_that_widened_a_cell_in_the_last_column_is_read_and_reflowed() {
+        // fuzzed pane output that killed the server: a pair of regional indicators made the
+        // cell in the last column wide, then the cell was written over (with the pane's
+        // rows, columns, history limit and the read sizes the fuzzer used)
+        let nz = |n| NonZeroU16::new(n).unwrap();
+        let fixture = |name: &str| std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pane-output-crash").join(name)).unwrap();
+        let cases: [(&str, u16, u16, usize, &[usize]); 4] = [
+            ("crash-5x25.bin", 5, 25, 0, &[]),
+            ("panic-11.bin", 6, 1, 7, &[8, 35, 46, 8, 61, 44, 53, 40, 57, 31, 19, 6, 58, 50]),
+            ("panic-1712.bin", 8, 18, 7, &[20, 43, 7, 21, 11, 5, 38, 6, 3, 24, 26, 28, 36, 50, 25, 11]),
+            ("panic-1861.bin", 5, 25, 14, &[]),
+        ];
+        for (name, rows, cols, history, reads) in cases {
+            let data = fixture(name);
+            for split in [reads.to_vec(), vec![1; data.len()]] {
+                let mut p = vt100::Parser::new(nz(rows), nz(cols), history);
+                let mut at = 0;
+                for n in split.iter().copied().chain([data.len()]) {
+                    let end = (at + n).min(data.len());
+                    p.process(&data[at..end]);
+                    at = end;
+                }
+                let lines = snapshot(p.screen());
+                for i in 0..lines.len() {
+                    let _ = (text_at(p.screen(), i), line_at(p.screen(), i).text());
+                }
+                for y in 0..rows {
+                    let _ = p.screen().contents_between(y, 0, y, cols);
+                }
+                for (r, c) in [(rows, 1), (rows, 2), (rows + 1, cols + 1), (1, cols.saturating_sub(1).max(1)), (rows, cols)] {
+                    p.screen_mut().set_size(nz(r), nz(c));
+                    p.process(b"\x1b[1;1H\x1b[@\x1b[P");
+                    let _ = snapshot(p.screen());
+                }
+            }
+        }
+        // the screen tmux 3.8 shows for the first one (cat in a 25x5 pane)
+        let mut p = vt100::Parser::new(nz(5), nz(25), 0);
+        p.process(&fixture("crash-5x25.bin"));
+        let texts: Vec<String> = snapshot(p.screen()).iter().map(Line::text).collect();
+        assert_eq!(texts, ["uwerosumvqueullhaujzjnzjs", "wsoceeamizajzukpwaxgvqunv", "nsffhfezwlonsluvvuicbublc", "ffemsgmimjphtrvbrnypwffl\u{1F1F0}\u{1F1F7}", ""]);
+        assert_eq!(p.screen().cursor_position(), (2, 25));
+    }
 }
