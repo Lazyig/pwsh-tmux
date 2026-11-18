@@ -1664,3 +1664,21 @@ fn an_event_hooks_commands_log_without_a_client() {
     assert!(logged(&format!("{name} key F6: set-option -g @after 1")), "{:?}", f.messages);
     assert!(logged(&format!("{name} key F6: rename-window hooked")), "{:?}", f.messages);
 }
+
+#[test]
+fn confirm_before_expands_and_parses_a_string_command_at_once() {
+    // cmd_confirm_before_exec: args_make_commands_now(self, item, 0, 1), so a string is a
+    // format expanded and parsed when the command runs; a { } block is used as it is
+    let mut f = fixture();
+    run(&mut f, &["confirm-before", "-y", "set -g @c '#{session_name}'"]);
+    f.handle_input(1, b"\r");
+    assert_eq!(f.opts_session.get("@c"), Some("input"));
+    run(&mut f, &["bind-key", "F8", "confirm-before -y { set -g @cb '#{session_name}' }"]);
+    f.handle_input(1, b"\x02\x1b[19~");
+    assert!(f.clients[&1].prompt.is_some());
+    f.handle_input(1, b"\r");
+    assert_eq!(f.opts_session.get("@cb"), Some("#{session_name}"));
+    let mut ctx = Ctx { client: Some(1), ..Ctx::default() };
+    assert!(f.exec(vec!["confirm-before".into(), "set -g @x { a".into()], &mut ctx).is_err());
+    assert!(f.clients[&1].prompt.is_none());
+}

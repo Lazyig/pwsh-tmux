@@ -3997,6 +3997,14 @@ impl Server {
             "confirm-before" => {
                 let cid = self.resolve_client(ctx, t)?;
                 let command = o.rest.first().ok_or("confirm-before needs a command")?.clone();
+                // args_make_commands_now(..., expand): a string is a format expanded now
+                // and parsed now (its error is this command's); a { } block is kept
+                let command = if o.is_block(0) { command } else {
+                    let tt = self.current(&Ctx { client: Some(cid), ..ctx.clone() });
+                    let expanded = self.expand(tt, Some(cid), &command);
+                    self.parse_string(&expanded)?;
+                    expanded
+                };
                 // -c: the confirming key (printable ASCII), -y: Enter confirms too
                 let key = match o.get('c') {
                     Some(c) => match c.as_bytes() {
