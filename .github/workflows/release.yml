@@ -1,0 +1,78 @@
+name: Release
+
+# Builds the release archives with tools/build_release.py on Windows (MSVC, static
+# runtime) and Linux (GNU) and publishes them on the GitHub release for the tag.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and publish (for example v0.2.0)
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: 1.97.1
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        # ubuntu-22.04 keeps the Linux binary's glibc requirement low (2.35)
+        include:
+          - os: windows-2022
+            python: python
+          - os: ubuntu-22.04
+            python: python3
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustc -vV
+      - name: Check the tag matches Cargo.toml
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "v$version" = "$TAG" || { echo "tag $TAG does not match Cargo.toml version $version"; exit 1; }
+      - name: Build release archive
+        shell: bash
+        run: ${{ matrix.python }} tools/build_release.py --output "$RUNNER_TEMP/dist"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.os }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ls -l dist
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "pwsh-tmux ${TAG#v}" --notes "Release archives built from $TAG by tools/build_release.py. Each archive has BUILDINFO.json and SHA256SUMS; the .sha256 files hold the archive checksums. See README.md and COMPATIBILITY.md."
+          fi
