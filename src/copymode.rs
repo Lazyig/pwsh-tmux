@@ -5686,13 +5686,21 @@ mod frozen_backing_tests {
     use super::*;
     use crate::cells::{random_chunk, random_parser, snapshot, TestRng};
 
-    /// Everything a copy-mode command can show or give the server.
-    fn state(cm: &CopyMode, action: Action) -> String {
+    /// Everything a copy-mode command can show or give the server. The match count is left
+    /// out with `count` false: counting stops on a clock (200 ms), which a loaded machine
+    /// can reach in one copy and not the other.
+    fn state(cm: &CopyMode, action: Action, count: bool) -> String {
         format!(
             "{action:?} {:?} {} {} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {}",
-            cm.cursor(), cm.view_top(), cm.line_count(), cm.position(), cm.selection_ends(), cm.search_count(),
+            cm.cursor(), cm.view_top(), cm.line_count(), cm.position(), cm.selection_ends(), cm.search_count().filter(|_| count),
             cm.search_match(), cm.cursor_word(), cm.cursor_line(), cm.render(), cm.top_line_time(),
         )
+    }
+
+    /// The states of two copies, which must be the same.
+    fn states(a: &CopyMode, ra: Action, b: &CopyMode, rb: Action) -> (String, String) {
+        let count = ![a, b].iter().any(|c| c.search_count_partial() || c.search_timed_out());
+        (state(a, ra, count), state(b, rb, count))
     }
 
     const COMMANDS: &[&str] = &[
@@ -5723,7 +5731,8 @@ mod frozen_backing_tests {
             let vi = rng.below(2) == 0;
             let mut a = CopyMode::clone_from(snapshot(p.screen()), (cols, rows), (cy, cx), size, vi, other);
             let mut b = CopyMode::clone_from(Backing::frozen(p.screen().clone()), (cols, rows), (cy, cx), size, vi, other);
-            assert_eq!(state(&a, Action::None), state(&b, Action::None), "seed {seed} entry");
+            let (sa, sb) = states(&a, Action::None, &b, Action::None);
+            assert_eq!(sa, sb, "seed {seed} entry");
             for step in 0..150 {
                 let (ra, rb) = match rng.below(20) {
                     0 => {
@@ -5766,7 +5775,8 @@ mod frozen_backing_tests {
                         (a.run(command, &args), b.run(command, &args))
                     }
                 };
-                assert_eq!(state(&a, ra), state(&b, rb), "seed {seed} step {step}");
+                let (sa, sb) = states(&a, ra, &b, rb);
+                assert_eq!(sa, sb, "seed {seed} step {step}");
             }
             assert_eq!(a.backing_screen().0.to_vec(), b.backing_screen().0.to_vec(), "seed {seed}");
             assert_eq!(a.backing_screen().1, b.backing_screen().1, "seed {seed}");
