@@ -2088,9 +2088,10 @@ impl CopyMode {
                 line.time = src.time;
                 line.metadata = src.metadata.iter().filter(|(x, _)| (**x as usize) < content).map(|(&x,m)| ((x as usize + text_x) as u16,m.clone())).collect();
                 line.cells.extend(src.cells.iter().take(content).cloned());
-                // A wide char cut at the right edge: blank its lead.
+                // A wide char cut at the right edge: blank its lead (also one in the last
+                // column, whose second half is off the screen).
                 if line.cells.len() == content
-                    && src.cells.get(content).is_some_and(Cell::is_continuation)
+                    && src.cells.get(content).map_or_else(|| line.cells.last().is_some_and(|c| crate::width::str_width(&c.text) > 1), Cell::is_continuation)
                     && let Some(last) = line.cells.last_mut()
                 {
                     last.text = " ".into();
@@ -4854,6 +4855,17 @@ mod tests {
         let rows: Vec<String> = view.iter().map(|l| l.cells.iter().map(|c| c.text.as_str()).collect()).collect();
         assert_eq!(rows[1], format!("1203{}", v[1202]));
         assert_eq!(cursor, (4, 4));
+    }
+
+    #[test]
+    fn a_wide_cell_in_the_last_column_is_drawn_blank() {
+        // its second half is off the screen (screen_write_combine): tmux draws it empty
+        let nz = |n| std::num::NonZeroU16::new(n).unwrap();
+        let mut p = vt100::Parser::new(nz(2), nz(25), 0);
+        p.process(format!("{}\u{1F1F0}\u{1F1F7}", "x".repeat(24)).as_bytes());
+        let cm = CopyMode::new(crate::cells::snapshot(p.screen()), 25, 2, (0, 0), true);
+        let view = cm.render_with(&RenderStyle { position_text: Some(String::new()), ..RenderStyle::default() }).0;
+        assert_eq!(view[0].cells.iter().map(|c| c.text.as_str()).collect::<String>(), "x".repeat(24) + " ");
     }
 
     #[test]
