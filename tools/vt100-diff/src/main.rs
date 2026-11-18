@@ -596,7 +596,7 @@ fn run_seeds(mode: &str, start: u64, n: u64, (k, of): (u64, u64), o: &Opts, gen_
         let seeds: Vec<String> = panics.iter().take(10).map(|x| x.0.to_string()).collect();
         println!("  panicking seeds: {}{}", seeds.join(" "), if panics.len() > 10 { " ..." } else { "" });
         if o.deny_panic {
-            eprintln!("--deny-panic: {} cases panicked", panics.len());
+            eprintln!("{} cases panicked (identically in both; --allow-panic accepts that)", panics.len());
             return 3;
         }
     }
@@ -642,9 +642,9 @@ const USAGE: &str = "usage (normally through run.sh, which prepares the base cop
 file options: --size ROWSxCOLS (39x120) --hist N (2000) --chunk N (4095) --onlcr (\\n -> \\r\\n)
               --time (stamp history time per chunk) --resize RxC,RxC,...
 common: -j N (2 processes) --log-cap BYTES (64 MiB) --out DIR (target/vt100-diff-out)
-        --deny-panic (fail if any case panics) --strict-panic (panic line numbers must match)
-        --quiet
-exit status: 0 same, 1 difference, 2 usage, 3 panic with --deny-panic";
+        --allow-panic (identical panics on both sides count as a match; by default any panic fails)
+        --strict-panic (with --allow-panic: panic line numbers must match too) --quiet
+exit status: 0 same, 1 difference, 2 usage, 3 a case panicked on both sides (not with --allow-panic)";
 
 fn parse_size(s: &str) -> Option<(u16, u16)> {
     let (r, c) = s.split_once('x')?;
@@ -655,7 +655,7 @@ fn main() {
     install_panic_hook();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut pos = Vec::new();
-    let mut o = Opts { jobs: 2, cap: 64 << 20, out: std::env::var_os("VT100_DIFF_OUT").map_or_else(|| "vt100-diff-out".into(), Into::into), deny_panic: false, strict_panic: false, quiet: false };
+    let mut o = Opts { jobs: 2, cap: 64 << 20, out: std::env::var_os("VT100_DIFF_OUT").map_or_else(|| "vt100-diff-out".into(), Into::into), deny_panic: true, strict_panic: false, quiet: false };
     let (mut start, mut steps, mut reps, mut shard) = (None, 60usize, 5usize, None);
     let (mut size, mut hist, mut chunk, mut onlcr, mut timed, mut resizes) = ((39u16, 120u16), 2000usize, 4095usize, false, false, Vec::new());
     let usage = |m: &str| -> ! {
@@ -670,7 +670,10 @@ fn main() {
             "-j" => o.jobs = num(val("-j")) as usize,
             "--log-cap" => o.cap = num(val("--log-cap")) as usize,
             "--out" => o.out = val("--out").into(),
+            // panics fail by default since the crash fix (ebc077c); --allow-panic
+            // accepts identical panics, for a base from before that fix
             "--deny-panic" => o.deny_panic = true,
+            "--allow-panic" => o.deny_panic = false,
             "--strict-panic" => o.strict_panic = true,
             "--quiet" => o.quiet = true,
             "--start" => start = Some(num(val("--start"))),

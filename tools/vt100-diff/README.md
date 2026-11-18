@@ -19,7 +19,9 @@ tools/vt100-diff/run.sh [--base REV] MODE [ARGS...]
 `target/vt100-base` and renames that copy's package to `vt100-base`. It then
 builds the checker in release mode (`CARGO_BUILD_JOBS` defaults to 2) and runs
 it. The base revision is `--base REV`, else `$VT100_DIFF_BASE_REV`, else
-`git merge-base HEAD main`, else `HEAD`. The working copy is always the
+`git merge-base HEAD main`, else `HEAD`. On a branch made from another
+branch than `main`, pass that branch (`--base BRANCH`) so the base is the
+code the change started from. The working copy is always the
 `vendor/vt100` of the checkout that contains this `run.sh`.
 
 | Command | What it does |
@@ -31,9 +33,9 @@ it. The base revision is `--base REV`, else `$VT100_DIFF_BASE_REV`, else
 | `run.sh selfcheck [FUZZ_N] [RESIZE_N]` | Checks the checker. It plants each mutation from `inject.py` into a copy of the base and requires the listed modes to report a mismatch. Each mutation changes one value in every 499th event: a wrapped flag, a row flag, a history time or one character. |
 
 Common options: `-j N` (worker processes, default 2), `--start S` (first seed),
-`--deny-panic`, `--strict-panic`, `--log-cap BYTES`, `--out DIR`, `--quiet`.
+`--allow-panic`, `--strict-panic`, `--log-cap BYTES`, `--out DIR`, `--quiet`.
 Exit status: 0 for no difference, 1 for a difference, 2 for a usage error, and
-3 when `--deny-panic` is given and a case panicked.
+3 when a case panicked identically on both sides (unless `--allow-panic`).
 
 Typical gate for a change under `vendor/vt100`:
 
@@ -85,13 +87,19 @@ from an earlier case in the same process.
 
 ## Panics
 
-The base vt100 can panic on some inputs. At 72e7957, about 1% of fuzz cases
-end in `Option::unwrap()` in `screen.rs` (`text_cleanup` and `text`). A case
-where both sides panic counts as a match when the panics come from the same
-operation, with the same message, in the same source file. Line
-numbers are ignored because edits move them; `--strict-panic` compares them
-too. The summary lists the panic sites and the first panicking seeds.
-`--deny-panic` makes any panic a failure; use it once the crash is fixed.
+Any panic is a failure. A case where only one side panics is a difference
+(exit 1); when both sides panic the same way, the run still ends with exit 3
+after the summary, which lists the panic sites and the first panicking seeds.
+
+vt100 up to 72e7957 panics on about 1% of fuzz cases (`Option::unwrap()` in
+`screen.rs`, `text_cleanup` and `text`); ebc077c fixed that. A base from
+before the fix also behaves differently from the fixed code on those inputs,
+so compare against a base that contains the fix. To compare two copies that
+both lack it, pass `--allow-panic`: a case where both sides panic then counts
+as a match when the panics come from the same operation, with the same
+message, in the same source file. Line numbers are ignored because edits move
+them; `--strict-panic` compares them too. `--deny-panic`, the default, is
+still accepted.
 
 ## When it reports a difference
 
