@@ -1884,7 +1884,10 @@ impl Server {
         // cmdq_add_message: each command goes in the message log (show-messages) once
         // the configuration is loaded, by key for a bound command of an attached client
         if !std::mem::take(&mut ctx.resumed) {
-            self.log_command(ctx.log_client.or(ctx.client).or(ctx.reply), ctx.key.as_deref(), full, marked.as_deref().unwrap_or(&args));
+            // an event hook's commands are items of the global queue, which have no
+            // client (hooks_insert_one: cmdq_append(NULL)), so they log as "command:"
+            let who = if ctx.hook_depth > 1 { None } else { ctx.log_client.or(ctx.client).or(ctx.reply) };
+            self.log_command(who, ctx.key.as_deref(), full, marked.as_deref().unwrap_or(&args));
         }
         self.command(full, o, env, ctx)
     }

@@ -1644,3 +1644,23 @@ fn a_string_templates_prompt_is_its_text_up_to_a_space_or_comma() {
     assert_eq!(label(&mut f, "\"new-window -n '%%'\""), "(new-window) ");
     assert_eq!(label(&mut f, "{ renamew -- '%%' }"), "(rename-window) ");
 }
+
+#[test]
+fn an_event_hooks_commands_log_without_a_client() {
+    // hooks_insert_one puts an event hook's commands on the global queue (no client), so
+    // cmdq_add_message logs them as "command: ..."; after-* hooks follow their command in
+    // the client's queue with its event (hooks_insert), so they log as the bound command
+    // does, with its key
+    let mut f = fixture();
+    f.cfg_finished = true;
+    run(&mut f, &["set-hook", "-g", "window-renamed", "set -g @rn 1"]);
+    run(&mut f, &["set-hook", "-g", "after-rename-window", "set -g @after 1"]);
+    run(&mut f, &["bind-key", "F6", "rename-window hooked"]);
+    f.handle_input(1, b"\x02\x1b[17~");
+    assert_eq!(f.opts_session.get("@rn"), Some("1"));
+    let name = f.clients[&1].name();
+    let logged = |m: &str| f.messages.iter().any(|(_, l)| l == m);
+    assert!(logged("command: set-option -g @rn 1"), "{:?}", f.messages);
+    assert!(logged(&format!("{name} key F6: set-option -g @after 1")), "{:?}", f.messages);
+    assert!(logged(&format!("{name} key F6: rename-window hooked")), "{:?}", f.messages);
+}
