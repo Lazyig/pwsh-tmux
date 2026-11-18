@@ -4017,8 +4017,10 @@ impl Server {
                 let label = match o.get('p') {
                     Some(p) => format!("{p} "),
                     None => {
-                        // tmux names the first command, not the whole command line
-                        let name = cmdparse::parse(&command).ok().and_then(|c| c.first().and_then(|c| c.first()).cloned()).map(|n| canonical(&n).map(String::from).unwrap_or(n));
+                        // tmux names the first command, not the whole command line, as
+                        // it was built (cmd_get_entry: a command-alias expanded)
+                        let built = command_list_string(&command, &self.command_aliases()).unwrap_or_else(|_| command.clone());
+                        let name = cmdparse::parse(&built).ok().and_then(|c| c.first().and_then(|c| c.first()).cloned()).map(|n| canonical(&n).map(String::from).unwrap_or(n));
                         format!("Confirm '{}'? ({key}/n) ", name.unwrap_or_else(|| command.clone()))
                     }
                 };
@@ -4085,8 +4087,8 @@ impl Server {
                     None if o.has('j') => "",
                     None => "[#{session_name}] #{window_index}:#{window_name}, current pane #{pane_index} - (%H:%M %d-%b-%y)",
                 };
-                // -l: literal, -j: JSON printed back in tmux's form; -C (keep updating the
-                // pane) is how messages behave here anyway; -N: keys don't clear it
+                // -l: literal, -j: JSON printed back in tmux's form; -C: the panes keep
+                // being drawn; -N: keys don't clear it
                 let msg = if o.has('l') { fmt.to_string() } else if o.has('v') {
                     // -v: the expansion steps are printed first
                     let (msg, log) = crate::format::expand_time_verbose(fmt, &super::vars::VarCtx { srv: self, t: tt, client: fc, extra });
@@ -4124,6 +4126,10 @@ impl Server {
                     }
                 } else if let Some(c) = attached_client {
                     self.set_message_for(c, &msg, delay.map(|d| d as u64), o.has('N'));
+                    // -C: the panes keep being drawn (status_message_set no_freeze)
+                    if let Some(c) = self.clients.get_mut(&c) {
+                        c.message_no_freeze = o.has('C');
+                    }
                 }
                 Ok(Flow::Next)
             }
@@ -5907,6 +5913,8 @@ impl Server {
         pr.id = self.next_prompt_id();
         let id = pr.id;
         if let Some(c) = self.clients.get_mut(&cid) {
+            // status_prompt_set: status_message_clear first
+            c.message = None;
             c.prompt = Some(pr);
             c.dirty = true;
         }

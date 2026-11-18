@@ -73,10 +73,6 @@ impl Frame {
             self.links.insert(y as usize * self.w as usize + x as usize, link.clone());
         }
     }
-    /// Row `y` (its cells and links) as it is in `other`, a frame of the same size.
-    fn copy_row(&mut self, other: &Frame, y: u16) {
-        self.copy_row_from(other, y, y);
-    }
     /// Row `y` as row `from` of `other`, a frame as wide.
     fn copy_row_from(&mut self, other: &Frame, from: u16, y: u16) {
         let w = self.w as usize;
@@ -89,6 +85,23 @@ impl Frame {
         let other_start = from as usize * w;
         for (i, l) in other.row_links(from) {
             self.links.insert(start + i - other_start, l.clone());
+        }
+    }
+    /// The cells (and links) of columns x..x+w of rows y..y+h as they are in `other`, a
+    /// frame of the same size.
+    fn copy_rect(&mut self, other: &Frame, x: u16, y: u16, w: u16, h: u16) {
+        let (x1, y1) = (x.saturating_add(w).min(self.w), y.saturating_add(h).min(self.h));
+        for row in y..y1 {
+            let start = row as usize * self.w as usize;
+            let (a, b) = (start + x as usize, start + x1.max(x) as usize);
+            self.cells[a..b].clone_from_slice(&other.cells[a..b]);
+            let gone: Vec<usize> = self.links.range(a..b).map(|(i, _)| *i).collect();
+            for i in gone {
+                self.links.remove(&i);
+            }
+            for (i, l) in other.links.range(a..b) {
+                self.links.insert(*i, l.clone());
+            }
         }
     }
     fn row_links(&self, y: u16) -> impl Iterator<Item = (&usize, &std::sync::Arc<vt100::Hyperlink>)> {
@@ -1187,6 +1200,7 @@ impl Server {
             let cr = self.content_rect(wid, *r);
             self.draw_pane_body(&mut f, cid, wid, *id, (cr.x as i32 - pxi, cr.y as i32 - pyi, cr.w, cr.h), (cw, area_h), oy, &mut modes, &mut cursor);
         }
+        let (freeze, frozen, held) = self.freeze_panes(c, &mut f, wid, &rects, (px, py), (cw, area_h), oy);
 
         for (id, r) in &rects {
             if let Some(sb) = self.pane_scrollbar(wid, *id, *r) { super::display::draw_scrollbar(&mut f, sb, (-pxi, -pyi), (cw, area_h), oy); }
@@ -1333,7 +1347,7 @@ impl Server {
         // are not drawn again (screen_redraw_screen), so they stay as when it opened
         let status_y0 = if top { 0 } else { ch - nstatus };
         let status_under = (nstatus > 0 && (c.prompt.is_some() || c.message.is_some())).then(|| {
-            match c.prev.as_ref().and_then(|p| p.status_under.as_ref()).filter(|u| u.w == cw && u.h == nstatus) {
+            match c.status_under.as_ref().filter(|u| u.w == cw && u.h == nstatus) {
                 Some(under) => {
                     for y in 0..nstatus {
                         f.copy_row_from(under, y, status_y0 + y);
@@ -1341,9 +1355,16 @@ impl Server {
                     under.clone()
                 }
                 None => {
+                    // the status lines last drawn, or these when there are none
+                    let drawn = c.prev.as_ref().map(|p| &p.frame).filter(|p| p.w == cw && p.h == ch && c.prev.as_ref().is_some_and(|p| p.status_ranges.len() == nstatus as usize));
                     let mut under = Frame::new(cw, nstatus);
                     for y in 0..nstatus {
-                        under.copy_row_from(&f, status_y0 + y, y);
+                        under.copy_row_from(drawn.unwrap_or(&f), status_y0 + y, y);
+                    }
+                    if let Some(drawn) = drawn {
+                        for y in 0..nstatus {
+                            f.copy_row_from(drawn, status_y0 + y, status_y0 + y);
+                        }
                     }
                     under
                 }
@@ -1353,7 +1374,8 @@ impl Server {
         // first or last row by status-position: screen_redraw_screen)
         let message_line = self.opt_session_num(Some(sid), "message-line").max(0) as u16;
         let my = if nstatus > 0 { (if top { 0 } else { ch - nstatus }) + message_line.min(nstatus - 1) } else if top { 0 } else { ch - 1 };
-        if let Some(pr) = &c.prompt {
+        // a message is drawn over a prompt (screen_redraw_screen)
+        if let Some(pr) = c.prompt.as_ref().filter(|_| c.message.is_none()) {
             let style_text = self.expand_time(active_target, Some(cid), &self.opt_session(Some(sid), "message-style"));
             let (ax, aw) = message_area(cw, &style_text);
             let x = self.draw_prompt(&mut f, cid, pr, ax, aw, my);
@@ -1395,7 +1417,13 @@ impl Server {
                     }
                     let (ix, iy, iw, ih) = pp.inner();
                     cursor = None;
-                    if let Some(p) = self.panes.get(&pp.pane) {
+                    // what the popup's command writes is not drawn while frozen either
+                    // (tty_client_ready); only the popup opening, moving or closing
+                    // redraws it (server_redraw_client)
+                    let prev = c.prev.as_ref().map(|p| &p.frame).filter(|p| held && p.w == f.w && p.h == f.h);
+                    if let Some(prev) = prev {
+                        f.copy_rect(prev, ix, iy, iw, ih);
+                    } else if let Some(p) = self.panes.get(&pp.pane) {
                         let scr = p.screen();
                         for y in 0..ih {
                             let row = scr.history_row(scr.scrollback_len() + y as usize);
@@ -1430,26 +1458,53 @@ impl Server {
         modes.appesc = c.features.has("appesc");
         modes.app_cursor = true;
         modes.bracketed_paste = c.features.has("bpaste");
-        // TTY_FREEZE (status_prompt_set): while a prompt is open nothing a pane writes is
-        // drawn, only the status lines and the prompt row are; what redraws the whole
-        // window (CLIENT_REDRAWWINDOW, server_client_check_redraw) still draws it, and
-        // closing the prompt redraws everything (status_prompt_clear)
-        let freeze = c.prompt.as_ref().filter(|p| p.freeze && !p.incremental && p.copy_incremental.is_none() && p.host.is_none()).map(|_| {
-            // (a pane prompt redraws its pane, PANE_REDRAW, so it is drawn as it changes)
-            let panes: Vec<_> = rects.iter().map(|(p, r)| {
-                let pane = self.panes.get(p);
-                let prompt = pane.and_then(|p| p.prompt.as_ref()).map(|pr| (pr.label.clone(), pr.input.clone(), pr.cursor, pr.vi_command, pr.complete.clone()));
-                (*p, *r, pane.and_then(|p| p.mode.as_ref()).map(std::mem::discriminant), prompt)
-            }).collect();
-            format!("{wid:?} {:?} {panes:?} {px} {py} {:?} {}", win.active, c.overlay.is_some(), self.menus.contains_key(&wid))
-        });
-        if let Some(key) = &freeze && let Some(prev) = c.prev.as_ref().filter(|p| p.freeze.as_ref() == Some(key) && p.frame.w == f.w && p.frame.h == f.h) {
-            let status = if top { 0..nstatus } else { ch - nstatus..ch };
-            for y in (0..ch).filter(|y| !status.contains(y) && *y != my) {
-                f.copy_row(&prev.frame, y);
+        Some(RenderState { frame: f, cursor, park, modes, status_ranges, freeze, frozen, message: c.message.clone(), status_under })
+    }
+
+    /// TTY_FREEZE: while a prompt (not -C or -i, status_prompt_set) or a message (not
+    /// display-message -C, status_message_set) is shown, what panes write is not drawn
+    /// (tty_client_ready). `f` has the panes as they are now; when the client is still
+    /// frozen as it was they are put back as they were held. What redraws the window
+    /// (CLIENT_REDRAWWINDOW: the window, its layout, its panes' modes and prompts, the
+    /// part shown), a new prompt, a menu or overlay opening or closing (server_redraw_client)
+    /// and a message cleared or replaced (status_message_clear) draw them as they are
+    /// now; so does a pane in clock or tree mode, whose mode redraws it (PANE_REDRAW).
+    /// What is drawn over the panes (borders, pane status lines and prompts, floating
+    /// panes, menus, the status lines) is drawn as it is; a popup's content is held with
+    /// the panes. Returns the freeze key, the panes held and whether they were held as
+    /// they were (not redrawn).
+    #[allow(clippy::too_many_arguments)]
+    fn freeze_panes(&self, c: &Client, f: &mut Frame, wid: WinId, rects: &[(PaneId, Rect)], (px, py): (u16, u16), (cw, area_h): (u16, u16), oy: u16) -> (Option<String>, Option<Frame>, bool) {
+        let prompt = c.prompt.as_ref().filter(|p| p.freeze && !p.incremental && p.copy_incremental.is_none() && p.host.is_none());
+        let message = c.message.is_some() && !c.message_no_freeze;
+        if prompt.is_none() && !message {
+            return (None, None, false);
+        }
+        let win = &self.windows[&wid];
+        let live = |p: &PaneId| matches!(self.panes.get(p).and_then(|p| p.mode.as_ref()), Some(PaneMode::Clock | PaneMode::Tree(_) | PaneMode::Switch(_)));
+        let panes: Vec<_> = rects.iter().map(|(p, r)| {
+            let pane = self.panes.get(p);
+            // (a pane prompt redraws its pane, PANE_REDRAW)
+            let pr = pane.and_then(|p| p.prompt.as_ref()).map(|pr| (pr.label.clone(), pr.input.clone(), pr.cursor, pr.vi_command, pr.complete.clone()));
+            (*p, *r, pane.and_then(|p| p.mode.as_ref()).map(std::mem::discriminant), pr)
+        }).collect();
+        let key = format!("{wid:?} {:?} {panes:?} {px} {py} {:?} {:?} {}", win.active, c.prompt.as_ref().map(|p| p.id), c.overlay.as_ref().map(|Overlay::Popup(p)| (p.pane, p.x, p.y, p.w, p.h)), self.menus.contains_key(&wid));
+        let held = c.prev.as_ref().filter(|p| {
+            p.freeze.as_ref() == Some(&key) && (p.message.is_none() || p.message == c.message)
+        }).and_then(|p| p.frozen.as_ref()).filter(|h| h.w == f.w && h.h == f.h);
+        let was_held = held.is_some();
+        if let Some(held) = held {
+            let now = std::mem::replace(f, held.clone());
+            for (_, r) in rects.iter().filter(|(p, _)| live(p)) {
+                let cr = self.content_rect(wid, *r);
+                let (x0, y0) = ((cr.x as i32 - px as i32).max(0), (cr.y as i32 - py as i32).max(0));
+                let (x1, y1) = ((cr.x as i32 + cr.w as i32 - px as i32).min(cw as i32), (cr.y as i32 + cr.h as i32 - py as i32).min(area_h as i32));
+                if x0 < x1 && y0 < y1 {
+                    f.copy_rect(&now, x0 as u16, y0 as u16 + oy, (x1 - x0) as u16, (y1 - y0) as u16);
+                }
             }
         }
-        Some(RenderState { frame: f, cursor, park, modes, status_ranges, freeze, status_under })
+        (Some(key), Some(f.clone()), was_held)
     }
 
     /// prompt_draw: while a prompt has the cursor it takes prompt-cursor-style and
@@ -1613,6 +1668,7 @@ impl Server {
         next.modes.extkeys = (feats.has("extkeys") && ext_keys != "off") as u8;
         c.dirty = false;
         c.status_ranges = next.status_ranges.clone();
+        c.status_under = next.status_under.take();
         let prev = c.prev.as_ref().filter(|p| p.frame.w == next.frame.w && p.frame.h == next.frame.h);
         let mut out = String::new();
         // a full redraw writes every row (EL ends each one), so nothing is cleared first:
@@ -1692,6 +1748,12 @@ impl Server {
         out.push_str("\x1b[0m");
         if modes_changed {
             let m = next.modes;
+            // tty_start_tty: smkx, so the terminal sends application keypad keys (KPEnter
+            // is ESC O M, not CR or LF). Not on Windows, where a pane's PowerShell would
+            // then get KPEnter as LF (Ctrl+Enter) instead of the CR it gets now
+            if prev.is_none() && cfg!(unix) {
+                out.push_str("\x1b=");
+            }
             out.push_str(if m.app_cursor { "\x1b[?1h" } else { "\x1b[?1l" });
             out.push_str(&features::string_capability(&c.term_caps, if m.bracketed_paste { "Enbp" } else { "Dsbp" }, if m.bracketed_paste { "\x1b[?2004h" } else { "\x1b[?2004l" }, &[]));
             out.push_str(match m.mouse {

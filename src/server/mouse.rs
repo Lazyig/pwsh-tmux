@@ -817,14 +817,11 @@ impl Server {
 
     /// Position of a menu of `w` x `h` (tmux 3.8 cmd_display_menu_get_menu_pos): menus
     /// belong to the window, so -x/-y are window coordinates kept inside the window;
-    /// the result is moved below a status line at the top. None when it does not fit
-    /// on the client.
+    /// the result is moved below a status line at the top. A menu bigger than the window
+    /// is put at its top or left edge (menu_display), not refused.
     #[allow(clippy::too_many_arguments)]
     pub fn menu_position(&self, cid: ClientId, t: vars::Target, m: Option<&MouseCtx>, xarg: Option<&str>, yarg: Option<&str>, w: u16, h: u16) -> Option<(u16, u16)> {
         let c = self.clients.get(&cid)?;
-        if w > c.size.0 || h > c.size.1 {
-            return None;
-        }
         // without a window (no session) the client is the area, as for popups
         let Some(win) = t.wid.and_then(|w| self.windows.get(&w)) else {
             return self.overlay_position(cid, t, m, xarg, yarg, w, h);

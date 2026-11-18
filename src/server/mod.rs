@@ -981,11 +981,17 @@ pub struct RenderState {
     pub modes: render::Modes,
     /// Mouse range of every cell of each status line (tmux status entry ranges).
     pub status_ranges: Vec<Vec<Option<crate::format::Range>>>,
-    /// While the client is frozen (TTY_FREEZE): what a change of would redraw the window
-    /// (the window shown, its layout, its panes' modes, the part shown).
+    /// While the client is frozen (TTY_FREEZE): what a change of redraws the panes (the
+    /// window shown, its layout, its panes' modes and prompts, the part shown, the
+    /// prompt, a menu or overlay opening or closing).
     pub freeze: Option<String>,
+    /// While frozen: the panes as they are held (what tty_write did not draw).
+    pub frozen: Option<render::Frame>,
+    /// The message shown with this frame: clearing or replacing it redraws the panes
+    /// (status_message_clear sets CLIENT_ALLREDRAWFLAGS).
+    pub message: Option<(String, Instant)>,
     /// While a prompt or message is shown: the status lines as drawn under it, which stay
-    /// as they were when it opened (sl->screen).
+    /// as they were when it opened (sl->screen); kept in Client::status_under.
     pub status_under: Option<render::Frame>,
 }
 
@@ -1045,7 +1051,12 @@ pub struct Client {
     pub message_ignore_keys: bool,
     /// The message is text: its # are not styles (all but display-message).
     pub message_ignore_styles: bool,
+    /// display-message -C: the message does not freeze the panes.
+    pub message_no_freeze: bool,
     pub prev: Option<RenderState>,
+    /// The status lines under a prompt or message (RenderState::status_under), which a
+    /// full redraw (prev reset) keeps.
+    pub status_under: Option<render::Frame>,
     pub dirty: bool,
     pub last_session: Option<SessId>,
     pub created: u64,
@@ -1969,6 +1980,7 @@ impl Server {
             let until = if ms == 0 { MESSAGE_FOREVER } else { Duration::from_millis(ms) };
             c.message = Some((msg.to_string(), Instant::now() + until));
             c.message_ignore_styles = false;
+            c.message_no_freeze = false;
             // as tmux, a message without a timer keeps the previous setting
             if ms != 0 {
                 c.message_ignore_keys = ignore_keys;
@@ -2121,7 +2133,9 @@ impl Server {
                 message: None,
                 message_ignore_keys: false,
                 message_ignore_styles: true,
+                message_no_freeze: false,
                 prev: None,
+                status_under: None,
                 dirty: false,
                 last_session: None,
                 created: now,

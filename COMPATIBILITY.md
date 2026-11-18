@@ -82,7 +82,11 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   on Windows (`/usr/bin/vi` elsewhere). `lock-command` is empty by default on every
   platform (tmux uses a default chosen when it is built: `vlock` if vlock was found,
   otherwise `lock -np`), since Windows has no lock program, so `lock-*` needs one to be set.
-  Windows has no job control, so `suspend-client` does nothing there.
+  Windows has no job control, so `suspend-client` does nothing there. On Unix the client
+  turns on application keypad mode as tmux does (tty_start_tty's smkx, so keypad Enter
+  arrives as `\eOM`); on Windows it does not, so keypad Enter arrives as CR and a pane's
+  PowerShell gets Enter, not the LF (Ctrl+Enter there) that tmux sends a pane for keypad
+  Enter outside keypad mode.
 - **`default-terminal` is `xterm-256color`**, not `tmux-256color`: Windows hosts usually
   have no tmux terminfo and ConPTY programs expect xterm. Panes therefore get
   `TERM=xterm-256color`, and Home and End are sent as xterm's `\e[H`/`\e[F` (`\eOH`/`\eOF`
@@ -147,16 +151,28 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   the bytes sent, and multiplexers such as GNU screen and Zellij answer DA1 themselves
   before the colours they ask the outer terminal for.) A partial theme or colour reply
   also waits 500 ms after the start timer, where tmux decides by its request flags alone.
-- **Single quotes in an answer put into a `{ }` block (a tmux 3.8 bug).** A prompt's
-  answer goes into the already parsed values of a block template (`command-prompt
-  { rename-window -- '%%' }`, the default `prefix ,`) without being parsed again
-  (args_make_commands and cmd_list_copy, arguments.c:784-790 and 349-372), as in tmux
-  3.8, so `"`, `\`, `$`, `~` and a leading `-` stay as typed. tmux 3.8 changed `%%` to
-  escape single quotes for a single-quoted string (cmd_template_replace, cmd.c:849-906,
-  CHANGES "%% is escaped for single quotes") and applies that escape to block values too,
-  where nothing removes it, so a window renamed to `it's` is named `it'\''s`. Here a `%%`
-  answer keeps its single quotes in a block; string templates (which are parsed again)
-  still escape them as in 3.8, and `%%%` / `%1%` keep tmux's escapes in both.
+- **Single quotes in a `{ }` block value that is `%%` alone (a tmux 3.8 bug).** A
+  prompt's answer goes into the already parsed values of a block template without being
+  parsed again (args_make_commands and cmd_list_copy, arguments.c:784-790 and 349-372), as
+  in tmux 3.8, so `"`, `\`, `$`, `~` and a leading `-` stay as typed. tmux 3.8 changed
+  `%%` to escape single quotes for a single-quoted string (cmd_template_replace,
+  cmd.c:849-906, CHANGES "%% is escaped for single quotes"), which keeps an answer from
+  ending the quotes of a value that is parsed again later (an `if-shell` or `run-shell`
+  command, a shell command such as `split-window "man '%%'"`), and pwsh-tmux keeps that
+  escape there. But tmux 3.8 also applies it to a value that is the whole answer, such as
+  `rename-window -- '%%'` of the default `prefix ,` binding, where nothing can remove it,
+  so a window renamed to `it's` is named `it'\''s`. Here a value that is exactly `%%`
+  keeps the answer's single quotes as typed; every other value, string templates (which
+  are parsed again) and `%%%` / `%1%` escape as in 3.8.
+- **The panes stay frozen for a whole prompt.** While a status prompt is open (not
+  `command-prompt -C`/`-i`) or a message is shown (not `display-message -C`), pane output
+  is not drawn, as in tmux 3.8 (TTY_FREEZE, status.c:386 and 605). tmux 3.8 lifts the
+  freeze in two places where it means to keep it or never set it: closing a popup over an
+  open prompt unfreezes the panes for the rest of that prompt (server_client_clear_overlay,
+  server-client.c:135, clears TTY_FREEZE without looking at the prompt), and a message
+  shown over a `-C` prompt leaves the panes frozen after it is cleared until the prompt
+  closes (status_message_clear, status.c:402, keeps the freeze whenever a prompt is open).
+  Here the panes are frozen exactly while a freezing prompt or message is shown.
 - **Configuration files with CRLF line endings** (as Windows editors and `core.autocrlf`
   checkouts write them) are read with each `\r\n` as a newline. tmux 3.8 keeps the `\r`,
   so a directive line such as `%endif\r` or `%else\r` is a syntax error there

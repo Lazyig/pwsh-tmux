@@ -159,14 +159,16 @@ pub fn fill_template(template: &str, answers: &[String]) -> String {
 }
 
 /// args_copy_copy_value: the answers put into one string value of a { } block's
-/// command, which is not parsed again. tmux 3.8 still escapes a single quote of a %%
-/// answer for single quotes here (cmd_template_replace's SQ mode), so the name typed
-/// as "it's" became "it'\''s"; pwsh-tmux leaves it as it is (COMPATIBILITY.md,
-/// Intentional differences). %%% and %N% keep tmux's escapes.
+/// command, which is not parsed again. %% escapes a single quote for single quotes
+/// (cmd_template_replace's SQ mode) as in tmux 3.8, since such a value may be a
+/// string parsed later (an if-shell or run-shell command, a shell command): only a
+/// value that is `%%` alone, so the whole answer (`rename-window -- '%%'`, the
+/// default `prefix ,`), keeps its single quotes, where tmux 3.8 leaves "it'\''s"
+/// (COMPATIBILITY.md, Intentional differences). %%% and %N% keep tmux's escapes.
 pub fn fill_block_value(value: &str, answers: &[String]) -> String {
     let mut out = value.to_string();
     for (i, a) in answers.iter().enumerate() {
-        out = template_replace_quoting(&out, a, i + 1, false);
+        out = template_replace_quoting(&out, a, i + 1, out != "%%");
     }
     out
 }

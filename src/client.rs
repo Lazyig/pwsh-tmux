@@ -370,7 +370,8 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
     // client writes and keeps some sequences (OSC 52 queries) from the terminal
     let mut output_copy = std::env::var_os(OUTPUT_COPY).and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
     let restore = |out: &mut std::io::Stdout, alternate: bool| {
-        let _ = out.write_all(b"\x1b[?2031l\x1b[0m\x1b[?25h\x1b[?1l\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1004l\x1b[>4m");
+        // (tty_stop_tty: rmkx)
+        let _ = out.write_all(b"\x1b[?2031l\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1004l\x1b[>4m");
         let _ = out.write_all(if alternate { b"\x1b[?1049l" } else { b"\x1b[H\x1b[2J" });
         let _ = out.flush();
     };

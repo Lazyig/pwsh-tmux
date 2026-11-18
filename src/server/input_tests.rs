@@ -1443,7 +1443,8 @@ fn a_block_template_takes_the_answers_without_being_parsed_again() {
     // the default binding: command-prompt -I'#W' { rename-window -- '%%' }
     for (typed, name) in [("a\"b", "a\"b"), ("say \"hi\"", "say \"hi\""), ("a\\b", "a\\\\b"), ("a$HOME", "a$HOME"), ("~", "~"), ("~u", "~u"),
         ("-foo", "-foo"), ("-t x", "-t x"), ("--", "--"), ("x;y", "x;y"), ("{b}", "{b}"), ("%%", "%%"), ("a  b", "a  b"),
-        // tmux 3.8 gives "it'\\''s" here (an intentional difference)
+        // tmux 3.8 gives "it'\\''s" here: a value that is %% alone keeps its single
+        // quotes (an intentional difference)
         ("it's", "it's"), ("a'b\"c\\d", "a'b\"c\\\\d")] {
         assert_eq!(rename(&mut f, typed), name, "{typed}");
     }
@@ -1458,6 +1459,19 @@ fn a_block_template_takes_the_answers_without_being_parsed_again() {
     f.handle_input(1, b"\x02\x1bOR");
     f.handle_input(1, b"$x \"y\" ~z\r");
     assert_eq!(f.opts_session.get("@inner"), Some("$x \"y\" ~z"));
+    // a value with more than %% (a command parsed again later) escapes single quotes
+    // as tmux 3.8 does, so an answer cannot end its quotes
+    run(&mut f, &["bind-key", "F4", "command-prompt { if-shell -F 1 \"set -g @c '%%'\" }"]);
+    for typed in ["it's", "x' ; set -g @pwned 1 ; set -g @e '"] {
+        f.handle_input(1, b"\x02\x1bOS");
+        f.handle_input(1, typed.as_bytes());
+        f.handle_input(1, b"\r");
+        assert_eq!(f.opts_session.get("@c"), Some(typed));
+    }
+    assert_eq!(f.opts_session.get("@pwned"), None);
+    assert_eq!(input::fill_block_value("test '%%' = x", &["x' = x -o 'y".into()]), "test 'x'\\'' = x -o '\\''y' = x");
+    assert_eq!(input::fill_block_value("%%", &["it's".into()]), "it's");
+    assert_eq!(input::fill_block_value("%1:%%", &["a'".into()]), "a':a'\\''");
     // a string template is parsed again
     run(&mut f, &["bind-key", ",", "command-prompt -I'#W' \"rename-window -- '%%'\""]);
     for (typed, name) in [("it's", "it's"), ("a\"b", "a\"b"), ("a\\b", "a\\\\b"), ("a$HOME", "a$HOME")] {
@@ -1681,4 +1695,138 @@ fn confirm_before_expands_and_parses_a_string_command_at_once() {
     let mut ctx = Ctx { client: Some(1), ..Ctx::default() };
     assert!(f.exec(vec!["confirm-before".into(), "set -g @x { a".into()], &mut ctx).is_err());
     assert!(f.clients[&1].prompt.is_none());
+}
+
+#[test]
+fn confirm_before_names_the_command_an_alias_stands_for() {
+    // cmd_confirm_before_exec: cmd_get_entry of the first command as it was built
+    let mut f = fixture();
+    run(&mut f, &["set", "-s", "command-alias[100]", "myren=rename-window"]);
+    run(&mut f, &["confirm-before", "myren 'x'"]);
+    assert_eq!(f.clients[&1].prompt.as_ref().map(|p| p.label.as_str()), Some("Confirm 'rename-window'? (y/n) "));
+    f.handle_input(1, b"y");
+    assert_eq!(f.windows[&f.window_of(f.pane).unwrap()].name, "x");
+}
+
+#[test]
+fn a_frozen_client_redraws_for_a_new_prompt_a_message_and_what_is_over_the_panes() {
+    let mut f = fixture();
+    let pane = f.pane;
+    let row0 = |f: &Fixture| f.compose(1).unwrap().frame.row(0).iter().map(|c| c.text.as_str()).collect::<String>();
+    let write = |f: &mut Fixture, text: &str| {
+        let g = f.panes[&pane].generation;
+        f.pane_data(pane, g, format!("\x1b[H\x1b[2K{text}").as_bytes());
+    };
+    // a prompt opened by a prompt's answer: status_prompt_clear redraws everything
+    // (CLIENT_ALLREDRAWFLAGS), then the new one freezes again
+    run(&mut f, &["bind-key", "F5", "command-prompt -p one { command-prompt -p two { set -g @two '%%' } }"]);
+    write(&mut f, "before");
+    f.render(1);
+    f.handle_input(1, b"\x02\x1b[15~");
+    f.render(1);
+    write(&mut f, "during");
+    f.render(1);
+    assert!(row0(&f).starts_with("before"));
+    f.handle_input(1, b"a\r");
+    assert!(f.clients[&1].prompt.is_some());
+    assert!(row0(&f).starts_with("during"));
+    f.render(1);
+    write(&mut f, "later");
+    f.render(1);
+    assert!(row0(&f).starts_with("during"));
+    f.handle_input(1, b"b\r");
+    // (the first answer went into the nested block too: args_copy_copy_value)
+    assert_eq!(f.opts_session.get("@two"), Some("a"));
+    assert!(f.clients[&1].prompt.is_none());
+    assert!(row0(&f).starts_with("later"));
+    f.render(1);
+
+    // a message freezes too (status_message_set), unless display-message -C
+    run(&mut f, &["display-message", "-d", "0", "msg"]);
+    f.render(1);
+    write(&mut f, "m1");
+    f.render(1);
+    assert!(row0(&f).starts_with("later"));
+    f.handle_input(1, b"x");
+    assert!(f.clients[&1].message.is_none());
+    assert!(row0(&f).starts_with("m1"));
+    f.render(1);
+    run(&mut f, &["display-message", "-C", "-d", "0", "msg"]);
+    f.render(1);
+    write(&mut f, "m2");
+    assert!(row0(&f).starts_with("m2"));
+    f.handle_input(1, b"x");
+    f.render(1);
+
+    // a message is drawn over a prompt, and clearing it redraws the panes
+    run(&mut f, &["command-prompt", "-p", "(pp)", "set -g @x '%%'"]);
+    f.render(1);
+    let last = |f: &Fixture| f.compose(1).unwrap().frame.row(23).iter().map(|c| c.text.as_str()).collect::<String>();
+    assert!(last(&f).starts_with("(pp)"), "{}", last(&f));
+    write(&mut f, "m3");
+    run(&mut f, &["display-message", "-d", "0", "over"]);
+    f.render(1);
+    assert!(last(&f).contains("over"), "{}", last(&f));
+    assert!(row0(&f).starts_with("m2"));
+    // the key clears the message and goes on to the prompt
+    f.handle_input(1, b"z");
+    assert!(last(&f).starts_with("(pp) z"), "{}", last(&f));
+    assert!(row0(&f).starts_with("m3"));
+    f.render(1);
+
+    // a menu over the frozen panes is drawn as it changes (CLIENT_REDRAWMENU)
+    run(&mut f, &["display-menu", "-x", "0", "-y", "10", "-T", "M", "one", "1", "set -g @m 1", "two", "2", "set -g @m 2"]);
+    f.render(1);
+    let before = f.compose(1).unwrap().frame;
+    f.handle_input(1, b"\x1b[B");
+    let after = f.compose(1).unwrap().frame;
+    assert!(before.cells != after.cells, "the menu's selection is drawn");
+    f.handle_input(1, b"\r");
+    assert!(f.menus.is_empty());
+    assert!(f.clients[&1].prompt.is_some());
+    // (the menu's command waits in the client's queue behind the command-prompt)
+    f.handle_input(1, b"\r");
+    assert_eq!(f.opts_session.get("@x"), Some("z"));
+    assert_eq!(f.opts_session.get("@m"), Some("2"));
+}
+
+#[test]
+fn the_status_line_under_a_prompt_survives_a_full_redraw() {
+    // status_prompt_redraw draws over sl->screen; a full redraw does not draw the status
+    let mut f = fixture();
+    run(&mut f, &["set", "-g", "status", "2"]);
+    run(&mut f, &["set", "-g", "status-format[1]", "BEFORE"]);
+    f.render(1);
+    run(&mut f, &["command-prompt", "-p", "(x)", "set -g @x '%%'"]);
+    f.render(1);
+    let last = |f: &Fixture| f.compose(1).unwrap().frame.row(23).iter().map(|c| c.text.as_str()).collect::<String>();
+    assert!(last(&f).starts_with("BEFORE"));
+    run(&mut f, &["set", "-g", "status-format[1]", "AFTER"]);
+    f.clients.get_mut(&1).unwrap().prev = None;
+    f.render(1);
+    assert!(last(&f).starts_with("BEFORE"), "{}", last(&f));
+    f.handle_input(1, b"\x03");
+    assert!(f.clients[&1].prompt.is_none());
+    assert!(last(&f).starts_with("AFTER"), "{}", last(&f));
+}
+
+#[test]
+fn a_menu_taller_than_the_client_opens_at_the_top() {
+    // cmd_display_menu_get_menu_pos never refuses a size; menu_display puts a menu as
+    // tall as the window or taller at py 0
+    let mut f = fixture();
+    let mut args: Vec<String> = ["display-menu", "-T", "M"].iter().map(|s| s.to_string()).collect();
+    for i in 0..30 {
+        args.extend([format!("item{i}"), String::new(), format!("set -g @tall {i}")]);
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    run(&mut f, &args);
+    let wid = f.window_of(f.pane).unwrap();
+    let m = f.menus.get(&wid).expect("the menu is open");
+    assert_eq!(m.y, 0);
+    f.render(1);
+    let row = |f: &Fixture, y: u16| f.compose(1).unwrap().frame.row(y).iter().map(|c| c.text.as_str()).collect::<String>();
+    assert!(row(&f, 1).contains("item0"), "{}", row(&f, 1));
+    f.handle_input(1, b"\x1b[B\r");
+    assert_eq!(f.opts_session.get("@tall"), Some("1"));
 }
