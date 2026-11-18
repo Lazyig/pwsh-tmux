@@ -1554,3 +1554,29 @@ fn without_a_status_line_the_prompt_takes_the_row_status_position_names() {
         f.clients.get_mut(&1).unwrap().message = None;
     }
 }
+
+#[test]
+fn fill_terminal_clears_the_message_area_and_fill_default_does_not() {
+    // colour_fromstring: "terminal" is 9, not "default" (8), so prompt_draw and
+    // format_draw clear the area with it (sy.fill != 8)
+    let mut f = fixture();
+    f.opts_session.set("status-right", "RIGHTMOD".into());
+    let h = f.clients[&1].size.1;
+    let last = |f: &Fixture| f.compose(1).unwrap().frame.row(h - 1).iter().map(|c| c.text.as_str()).collect::<String>();
+    for (style, kept) in [("fg=red,bg=default,fill=terminal", false), ("fg=red,bg=default,fill=default", true), ("fg=red,fill=blue,fill=terminal", false), ("bg=red", true)] {
+        f.opts_session.set("message-style", style.into());
+        run(&mut f, &["command-prompt", "-p", "P", "set -g @x '%%'"]);
+        assert_eq!(last(&f).contains("RIGHTMOD"), kept, "prompt {style}");
+        f.dispatch_input(1, keys::Input::Key(Key::plain(KeyCode::Escape), vec![27]));
+        f.set_message(1, "M");
+        assert_eq!(last(&f).contains("RIGHTMOD"), kept, "message {style}");
+        f.clients.get_mut(&1).unwrap().message = None;
+    }
+    let frame = |f: &Fixture| f.compose(1).unwrap().frame;
+    f.opts_session.set("message-style", "fill=terminal".into());
+    run(&mut f, &["command-prompt", "-p", "P", "set -g @x '%%'"]);
+    let fr = frame(&f);
+    assert_eq!(fr.get(70, h - 1).unwrap().style, crate::cells::Style::default());
+    assert_eq!(crate::format::parse_fill("terminal", None), Some(vt100::Color::Default));
+    assert_eq!(crate::format::parse_fill("Default", None), None);
+}

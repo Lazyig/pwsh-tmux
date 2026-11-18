@@ -193,7 +193,7 @@ pub fn draw_box_lines(f: &mut Frame, x: u16, y: u16, w: u16, h: u16, style: Styl
 fn style_fill_align(style: &str) -> (Option<Color>, String) {
     let (mut fill, mut align) = (None, "left".to_string());
     for word in style.split(',').map(str::trim) {
-        if let Some(v) = word.strip_prefix("fill=") { fill = format::parse_color(v).filter(|c| *c != Color::Default); }
+        if let Some(v) = word.strip_prefix("fill=") { fill = format::parse_fill(v, None); }
         if let Some(v) = word.strip_prefix("align=") { align = v.to_string(); }
     }
     (fill, align)
@@ -259,7 +259,7 @@ fn message_cells(f: &mut Frame, y: u16, text: &str, base: Style) {
         if rest.starts_with("#[") {
             if let Some(end) = rest.find(']') {
                 for word in rest[2..end].split(',') {
-                    if let Some(bg) = word.strip_prefix("fill=").and_then(format::parse_color) { fill = Some(Style { bg, ..base }); }
+                    if let Some(bg) = word.strip_prefix("fill=").and_then(|v| format::parse_fill(v, None)) { fill = Some(Style { bg, ..base }); }
                 }
                 rest = &rest[end + 1..];
                 continue;

@@ -269,7 +269,7 @@ fn fill_align(s: &str, vars: &VarCtx) -> (Option<Color>, String) {
     for word in s.split([',', ' ', '\n']).filter(|w| !w.is_empty()) {
         let lower = word.to_ascii_lowercase();
         if let Some(v) = lower.strip_prefix("fill=") {
-            fill = crate::format::parse_color_with(v, Some(vars)).filter(|c| *c != Color::Default);
+            fill = crate::format::parse_fill(v, Some(vars));
         } else if let Some(v) = lower.strip_prefix("align=") {
             align = v.to_string();
         } else if lower == "default" {
