@@ -168,15 +168,20 @@ fn connect(autostart: bool, config: Option<&str>) -> Result<Stream, String> {
         Err(_) => {}
     }
     spawn_server(config).map_err(|e| format!("failed to start server: {e}"))?;
-    // by time: a connect attempt can wait for a busy Windows pipe
+    // Try at once, then back off (1, 2, 4 ... 50 ms) while the server loads its config.
+    // By time: a connect attempt can wait for a busy Windows pipe.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(50));
+    let mut delay = Duration::from_millis(1);
+    loop {
         if let Ok(s) = ipc::connect() {
             return Ok(s);
         }
+        if std::time::Instant::now() >= deadline {
+            return Err("server did not start".into());
+        }
+        thread::sleep(delay);
+        delay = (delay * 2).min(Duration::from_millis(50));
     }
-    Err("server did not start".into())
 }
 
 /// After kill-server: waits (bounded) until the server has closed the connection, which
