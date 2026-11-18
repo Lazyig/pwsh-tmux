@@ -307,21 +307,50 @@ impl Row {
 
     /// Trims trailing blank cells from the row.
     pub fn trim(&mut self) {
-        let excess = self
-            .cells
-            .iter()
-            .rev()
-            .take_while(|c| **c == crate::cell::Cell::DEFAULT)
-            .count();
+        self.trim_cells();
+        self.cells.shrink_to_fit();
+    }
+
+    fn trim_cells(&mut self) {
+        let excess = self.cells.trailing_default();
         if excess > 0 {
             let len = self.cells.len() - excess;
             self.cells.truncate(len);
         }
-        self.cells.shrink_to_fit();
     }
 
     pub(crate) fn compact(&mut self) {
         self.cells.compact();
+    }
+
+    /// `trim` then `compact`, with the same row; a row that becomes compact hands back
+    /// the storage its cells were in.
+    pub(crate) fn trim_compact_take(&mut self) -> Option<alloc::vec::Vec<crate::Cell>> {
+        self.trim_cells();
+        let storage = self.cells.compact_take();
+        if storage.is_none() {
+            self.cells.shrink_to_fit();
+        }
+        storage
+    }
+
+    /// Lets a new row write its cells into `storage` (see `RowCells::give_storage`).
+    pub(crate) fn give_storage(&mut self, storage: alloc::vec::Vec<crate::Cell>) {
+        self.cells.give_storage(storage);
+    }
+
+    pub(crate) fn has_metadata(&self) -> bool {
+        self.metadata.is_some()
+    }
+
+    pub(crate) fn wide_pairs_ok(&self) -> bool {
+        self.cells.wide_pairs_ok()
+    }
+
+    /// Widens a row no wider than `cols` whose last cell is not wide to `cols` with
+    /// default cells, stored as a new row the same cells were written into.
+    pub(crate) fn widen_sparse(&mut self, cols: u16) {
+        self.cells.widen_sparse(usize::from(cols));
     }
 
     pub fn wrap(&mut self, wrap: bool) {
