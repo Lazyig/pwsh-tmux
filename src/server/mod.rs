@@ -983,6 +983,9 @@ pub struct RenderState {
     /// While the client is frozen (TTY_FREEZE): what a change of would redraw the window
     /// (the window shown, its layout, its panes' modes, the part shown).
     pub freeze: Option<String>,
+    /// While a prompt or message is shown: the status lines as drawn under it, which stay
+    /// as they were when it opened (sl->screen).
+    pub status_under: Option<render::Frame>,
 }
 
 /// What a mouse drag in progress updates (tmux's mouse_drag_update callback).

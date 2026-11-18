@@ -39,6 +39,7 @@ fn terminal_text(text: &str) -> std::borrow::Cow<'_, str> {
     text.into()
 }
 
+#[derive(Clone)]
 pub struct Frame {
     pub w: u16,
     pub h: u16,
@@ -74,15 +75,20 @@ impl Frame {
     }
     /// Row `y` (its cells and links) as it is in `other`, a frame of the same size.
     fn copy_row(&mut self, other: &Frame, y: u16) {
+        self.copy_row_from(other, y, y);
+    }
+    /// Row `y` as row `from` of `other`, a frame as wide.
+    fn copy_row_from(&mut self, other: &Frame, from: u16, y: u16) {
         let w = self.w as usize;
         let start = y as usize * w;
-        self.cells[start..start + w].clone_from_slice(other.row(y));
+        self.cells[start..start + w].clone_from_slice(other.row(from));
         let gone: Vec<usize> = self.links.range(start..start + w).map(|(i, _)| *i).collect();
         for i in gone {
             self.links.remove(&i);
         }
-        for (i, l) in other.row_links(y) {
-            self.links.insert(*i, l.clone());
+        let other_start = from as usize * w;
+        for (i, l) in other.row_links(from) {
+            self.links.insert(start + i - other_start, l.clone());
         }
     }
     fn row_links(&self, y: u16) -> impl Iterator<Item = (&usize, &std::sync::Arc<vt100::Hyperlink>)> {
@@ -1322,6 +1328,27 @@ impl Server {
                 status_ranges.push(tags);
             }
         }
+        // status_prompt_redraw and status_message_redraw draw over the status screen as it
+        // was last drawn (sl->screen): while a prompt or message is shown the status lines
+        // are not drawn again (screen_redraw_screen), so they stay as when it opened
+        let status_y0 = if top { 0 } else { ch - nstatus };
+        let status_under = (nstatus > 0 && (c.prompt.is_some() || c.message.is_some())).then(|| {
+            match c.prev.as_ref().and_then(|p| p.status_under.as_ref()).filter(|u| u.w == cw && u.h == nstatus) {
+                Some(under) => {
+                    for y in 0..nstatus {
+                        f.copy_row_from(under, y, status_y0 + y);
+                    }
+                    under.clone()
+                }
+                None => {
+                    let mut under = Frame::new(cw, nstatus);
+                    for y in 0..nstatus {
+                        under.copy_row_from(&f, status_y0 + y, y);
+                    }
+                    under
+                }
+            }
+        });
         // message / prompt replace the first status line (or, without a status line, the
         // first or last row by status-position: screen_redraw_screen)
         let message_line = self.opt_session_num(Some(sid), "message-line").max(0) as u16;
@@ -1417,7 +1444,7 @@ impl Server {
                 f.copy_row(&prev.frame, y);
             }
         }
-        Some(RenderState { frame: f, cursor, park, modes, status_ranges, freeze })
+        Some(RenderState { frame: f, cursor, park, modes, status_ranges, freeze, status_under })
     }
 
     /// prompt_draw: while a prompt has the cursor it takes prompt-cursor-style and

@@ -1580,3 +1580,33 @@ fn fill_terminal_clears_the_message_area_and_fill_default_does_not() {
     assert_eq!(crate::format::parse_fill("terminal", None), Some(vt100::Color::Default));
     assert_eq!(crate::format::parse_fill("Default", None), None);
 }
+
+#[test]
+fn the_status_line_under_a_prompt_or_message_stays_as_it_opened() {
+    // status_prompt_redraw / status_message_redraw draw over sl->screen, which is not
+    // drawn again (status_redraw) while either is shown
+    let mut f = fixture();
+    f.opts_session.set("message-style", "bg=red".into());
+    f.opts_session.set("status-right", "R=#{@clock}".into());
+    let h = f.clients[&1].size.1;
+    let last = |f: &Fixture| f.compose(1).unwrap().frame.row(h - 1).iter().map(|c| c.text.as_str()).collect::<String>();
+    f.opts_session.set("@clock", "1".into());
+    f.render(1);
+    run(&mut f, &["command-prompt", "-p", "P", "set -g @x '%%'"]);
+    f.render(1);
+    assert!(last(&f).contains("R=1"));
+    f.opts_session.set("@clock", "2".into());
+    assert!(last(&f).contains("R=1"));
+    f.render(1);
+    // a message after it keeps the same status screen
+    f.dispatch_input(1, keys::Input::Key(Key::plain(KeyCode::Escape), vec![27]));
+    f.set_message(1, "M");
+    assert!(last(&f).contains("R=1"));
+    f.clients.get_mut(&1).unwrap().message = None;
+    assert!(last(&f).contains("R=2"));
+    f.render(1);
+    f.set_message(1, "M");
+    f.render(1);
+    f.opts_session.set("@clock", "3".into());
+    assert!(last(&f).contains("R=2"));
+}
