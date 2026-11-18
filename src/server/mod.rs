@@ -3165,8 +3165,16 @@ impl Server {
         let host_pid = procinfo::win::children_named(std::process::id(), "conhost.exe").into_iter().find(|p| !hosts_before.contains(p));
         #[cfg(not(windows))]
         let host_pid = None;
-        let mut cb = CommandBuilder::new(&argv[0]);
-        cb.args(&argv[1..]);
+        // spawn_pane: with no command, the shell as a login shell (argv0 "-" and its
+        // name; Unix only, and not PowerShell, which is given -NoLogo)
+        #[cfg(unix)]
+        let login = cmd.is_empty() && default_cmd.is_empty() && !procinfo::is_powershell(&shell) && procinfo::is_executable(&shell);
+        #[cfg(not(unix))]
+        let login = false;
+        let mut cb = if login { CommandBuilder::new_default_prog() } else { CommandBuilder::new(&argv[0]) };
+        if !login {
+            cb.args(&argv[1..]);
+        }
         cb.env_clear();
         for (k, v) in self.session_env(sid) {
             if let Some(v) = v {
@@ -3193,6 +3201,10 @@ impl Server {
         cb.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
         for (k, v) in extra_env {
             cb.env(k, v);
+        }
+        // SHELL is the shell the pane was given (which a login shell is run as, too)
+        if cfg!(unix) {
+            cb.env("SHELL", &shell);
         }
         let child = if empty { None } else { Some(pair.slave.spawn_command(cb).map_err(|e| format!("create pane failed: {} ({e})", argv[0]))?) };
         drop(pair.slave);

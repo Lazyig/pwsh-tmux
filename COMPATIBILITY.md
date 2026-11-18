@@ -76,7 +76,9 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
 
 - **Shell and platform defaults.** `default-shell` is PowerShell, the project's purpose:
   `pwsh`, falling back to `powershell.exe` on Windows and to `$SHELL` (then `/bin/sh`)
-  on Unix. `editor` is `notepad.exe`
+  on Unix. On Unix a pane without a command runs its shell as a login shell (argv0 `-` and
+  the shell's name), as tmux does, except PowerShell, which is started with `-NoLogo`
+  instead (Windows panes start the shell as a plain process). `editor` is `notepad.exe`
   on Windows (`/usr/bin/vi` elsewhere). `lock-command` is empty by default on every
   platform (tmux uses a default chosen when it is built: `vlock` if vlock was found,
   otherwise `lock -np`), since Windows has no lock program, so `lock-*` needs one to be set.

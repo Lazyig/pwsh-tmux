@@ -4084,3 +4084,25 @@ fn c_c_stops_a_panes_program() {
     ctx.ok(&["send-keys", "-t", "c", "C-c"]);
     wait_for("pane dead after C-c", || ctx.fmt("c", "#{pane_dead}") == "1");
 }
+
+// Unix only: tmux's login shell is an argv0 of "-" and the shell's name, which only a
+// Unix exec has (Windows panes start the shell as they always have), read from /proc.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_pane_without_a_command_runs_a_login_shell() {
+    // spawn_pane: no command and no default-command execs the shell with argv0
+    // "-sh", and SHELL is the shell even over -e
+    let ctx = Ctx::new("login-shell");
+    ctx.ok(&["new-session", "-d", "-s", "l"]);
+    ctx.ok(&["set", "-g", "default-shell", "/bin/sh"]);
+    ctx.ok(&["new-window", "-d", "-t", "l:1", "-e", "SHELL=/nonexistent"]);
+    let pid = ctx.fmt("l:1", "#{pane_pid}");
+    wait_for("-sh", || std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default() == b"-sh\0");
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+    assert!(environ.split(|b| *b == 0).any(|v| v == b"SHELL=/bin/sh"), "{}", String::from_utf8_lossy(&environ));
+    wait_for("pane_current_command", || ctx.fmt("l:1", "#{pane_current_command}") == "sh");
+    // a command goes through the shell as before
+    ctx.ok(&["new-window", "-d", "-t", "l:2", "exec sleep 30"]);
+    let pid = ctx.fmt("l:2", "#{pane_pid}");
+    wait_for("sleep", || std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default() == b"sleep\x0030\0");
+}

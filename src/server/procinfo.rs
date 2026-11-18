@@ -50,6 +50,13 @@ pub fn default_shell() -> String {
     }
 }
 
+/// Whether `path` is a file that may be run (checkshell's access X_OK).
+#[cfg(unix)]
+pub fn is_executable(path: &str) -> bool {
+    let Ok(c) = std::ffi::CString::new(path) else { return false };
+    std::path::Path::new(path).is_file() && unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0
+}
+
 pub fn is_powershell(shell: &str) -> bool {
     let stem = std::path::Path::new(shell).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
     stem == "pwsh" || stem == "powershell"
