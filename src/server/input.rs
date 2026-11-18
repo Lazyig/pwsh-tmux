@@ -2025,7 +2025,8 @@ fn prompt_emacs_op(k: &Key) -> PromptOp {
             'n' => PromptOp::Down,
             'y' => PromptOp::Yank,
             't' => PromptOp::Transpose,
-            'm' | 'j' => PromptOp::Enter,
+            // only CR (Enter) confirms: a typed LF is C-j (tty_keys_next) and neither C-j
+            // nor an extended C-m has a case in prompt_key, so they go nowhere
             'c' | 'g' | '[' => PromptOp::Cancel,
             'v' => PromptOp::QuoteNext,
             'i' => PromptOp::Tab,
@@ -2064,7 +2065,7 @@ fn prompt_vi_op(pr: &mut Prompt, k: &Key) -> PromptOp {
     if !pr.vi_command {
         return match name.as_str() {
             "C-a" | "C-c" | "C-e" | "C-g" | "C-h" | "Tab" | "C-k" | "C-n" | "C-p" | "C-t" | "C-u" | "C-v" | "C-w" | "C-y" | "Enter" | "KPEnter"
-            | "C-m" | "C-j" | "C-Left" | "C-Right" | "BSpace" | "DC" | "Down" | "End" | "Home" | "Left" | "Right" | "Up" => prompt_emacs_op(k),
+            | "C-Left" | "C-Right" | "BSpace" | "DC" | "Down" | "End" | "Home" | "Left" | "Right" | "Up" => prompt_emacs_op(k),
             "Escape" | "C-[" => {
                 pr.vi_command = true;
                 pr.cursor = pr.cursor.saturating_sub(1);
@@ -2110,7 +2111,7 @@ fn prompt_vi_op(pr: &mut Prompt, k: &Key) -> PromptOp {
         "a" | "Right" | "l" => PromptOp::Right,
         "Up" | "k" => PromptOp::Up,
         "C-h" => PromptOp::BSpace,
-        "Enter" | "KPEnter" | "C-m" | "C-j" => PromptOp::Enter,
+        "Enter" | "KPEnter" => PromptOp::Enter,
         _ => PromptOp::None,
     }
 }

@@ -1509,3 +1509,27 @@ fn a_status_prompt_freezes_the_panes_until_it_closes() {
     write(&mut f, "confirm");
     assert!(row0(&f).starts_with("-i"));
 }
+
+#[test]
+fn only_enter_confirms_a_prompt_not_c_j_or_c_m() {
+    // tty_keys_next makes a typed LF C-j (CR stays Enter); prompt_key has a case for
+    // '\r' only, so C-j and an extended C-m (CSI 109;5u) are dropped in emacs and vi keys
+    let mut f = fixture();
+    let input = |f: &Fixture| f.clients[&1].prompt.as_ref().map(|p| p.input.iter().collect::<String>());
+    for (keys, vi_command) in [("emacs", false), ("vi", false), ("vi", true)] {
+        f.opts_session.set("status-keys", keys.into());
+        run(&mut f, &["command-prompt", "set -g @cj '%%'"]);
+        f.handle_input(1, b"cj");
+        if vi_command {
+            f.dispatch_input(1, keys::Input::Key(Key::plain(KeyCode::Escape), vec![27]));
+        }
+        f.handle_input(1, b"\n");
+        f.handle_input(1, b"\x1b[109;5u");
+        f.handle_input(1, b"\x1b[106;5u");
+        assert_eq!(input(&f).as_deref(), Some("cj"), "{keys} {vi_command}");
+        f.handle_input(1, b"\r");
+        assert_eq!(input(&f), None, "{keys} {vi_command}");
+        assert_eq!(f.opts_session.get("@cj"), Some("cj"));
+        f.opts_session.unset("@cj");
+    }
+}
