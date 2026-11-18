@@ -101,59 +101,220 @@ pub fn default_bindings() -> BTreeMap<String, BTreeMap<String, Binding>> {
     t
 }
 
-/// cmd_template_replace: in `template` replace %N (and %N%) with `s`, and the
-/// first %% (or %%%) left. %% escapes single quotes, %%% and %N% escape
-/// characters special inside double quotes.
-fn template_replace(template: &str, s: &str, idx: usize) -> String {
-    template_replace_quoting(template, s, idx, true)
+/// How a prompt's answer is escaped where a template puts it (cmd_template_replace).
+/// Unix always uses tmux 3.8's escapes, made for POSIX shells and for the command parser.
+/// On Windows the commands run under PowerShell, cmd.exe or another shell, so the
+/// escapes follow every shell that may run them ([`Server::answer_quoting`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quoting {
+    /// A shell that is PowerShell or not known: a single quote is doubled ('' as
+    /// PowerShell reads it, an empty '' pair for sh and the command parser).
+    pub powershell: bool,
+    /// cmd.exe, which has no single quotes: its special characters get a caret.
+    pub cmd: bool,
 }
 
-/// [`template_replace`], with `sq` false leaving single quotes in a %% answer alone.
-fn template_replace_quoting(template: &str, s: &str, idx: usize, sq: bool) -> String {
+impl Quoting {
+    /// tmux 3.8's escapes.
+    pub const TMUX: Quoting = Quoting { powershell: false, cmd: false };
+
+    /// The escapes safe under all of `shells` (see [`procinfo::ShellKind`]): tmux's for
+    /// POSIX shells only; a shell that is PowerShell or not known doubles single quotes;
+    /// cmd.exe adds carets.
+    pub fn for_shells<'a>(shells: impl IntoIterator<Item = &'a str>) -> Quoting {
+        let mut q = Quoting::TMUX;
+        for shell in shells {
+            match procinfo::shell_kind(shell) {
+                procinfo::ShellKind::Posix => {}
+                procinfo::ShellKind::Cmd => q.cmd = true,
+                procinfo::ShellKind::PowerShell | procinfo::ShellKind::Other => q.powershell = true,
+            }
+        }
+        q
+    }
+}
+
+/// The quote a replacement is escaped for (cmd_template_replace's NQ, SQ and DQ).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Quote {
+    None,
+    Single,
+    Double,
+}
+
+/// PowerShell's single quotes (CharExtensions.IsSingleQuote): ' ‘ ’ ‚ ‛.
+fn ps_single_quote(c: char) -> bool {
+    matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}')
+}
+
+/// PowerShell's double quotes (CharExtensions.IsDoubleQuote): " “ ” „.
+fn ps_double_quote(c: char) -> bool {
+    matches!(c, '"' | '\u{201c}' | '\u{201d}' | '\u{201e}')
+}
+
+/// The characters cmd.exe acts on (outside double quotes, after a caret they are plain;
+/// % takes the caret into a variable's name, which then does not exist).
+const CMD_SPECIAL: &[char] = &['^', '&', '|', '<', '>', '(', ')', '%', '!'];
+
+/// An answer escaped for `quote` (cmd_template_replace). With [`Quoting::TMUX`], tmux
+/// 3.8's: a single quote becomes '\'' for single quotes, and " \ $ ; ~ get a backslash
+/// for double quotes. Otherwise the escape is safe for each shell that may read it and
+/// for the command parser:
+/// - single quotes (`'%%'`): PowerShell's single quotes are doubled, which PowerShell
+///   reads as one quote and sh and the parser as an empty pair, so the answer never
+///   leaves the quotes (a ' then disappears for them);
+/// - double quotes (`"%%%"`): " (and PowerShell's “ ” „) is doubled, \ doubled for the
+///   parser, $ and ` get PowerShell's backtick (cmd.exe alone: $ ; ~ get tmux's
+///   backslash);
+/// - cmd.exe: each of ^ & | < > ( ) % ! gets a caret and " is doubled, so whether the
+///   answer is inside cmd.exe's double quotes or not, nothing in it is acted on (inside
+///   them the carets stay); a newline (which ends the command) becomes a space.
+fn escape_answer(out: &mut String, s: &str, quote: Quote, q: Quoting) {
+    for c in s.chars() {
+        match quote {
+            Quote::None => {
+                out.push(c);
+                continue;
+            }
+            _ if q.cmd && (c == '\n' || c == '\r') => {
+                out.push(' ');
+                continue;
+            }
+            Quote::Single if q.powershell && ps_single_quote(c) => {
+                out.push(c);
+                out.push(c);
+                continue;
+            }
+            Quote::Single if c == '\'' => {
+                out.push_str("'\\''");
+                continue;
+            }
+            Quote::Single if q.cmd && c == '"' => {
+                out.push_str("\"\"");
+                continue;
+            }
+            Quote::Single => {}
+            Quote::Double if q == Quoting::TMUX => {
+                if "\"\\$;~".contains(c) {
+                    out.push('\\');
+                }
+            }
+            Quote::Double if c == '"' || (q.powershell && ps_double_quote(c)) => {
+                out.push(c);
+                out.push(c);
+                continue;
+            }
+            Quote::Double if c == '\\' => {
+                out.push_str("\\\\");
+                continue;
+            }
+            Quote::Double if q.powershell && (c == '`' || c == '$') => out.push('`'),
+            Quote::Double if !q.powershell && "$;~".contains(c) => out.push('\\'),
+            Quote::Double => {}
+        }
+        if q.cmd && CMD_SPECIAL.contains(&c) {
+            out.push('^');
+        }
+        out.push(c);
+    }
+}
+
+/// `inner` (an answer escaped for the next shell) put inside the command parser's
+/// `quote`, so parsing gives `inner` back: " \ $ ~ and a newline get a backslash inside
+/// double quotes, a ' becomes '\'' inside single quotes.
+fn encode_for_parser(out: &mut String, inner: &str, quote: Quote) {
+    for c in inner.chars() {
+        match (quote, c) {
+            (Quote::Double, '"' | '\\' | '$' | '~') => out.extend(['\\', c]),
+            (Quote::Double, '\n') => out.push_str("\\n"),
+            (Quote::Double, '\r') => out.push_str("\\r"),
+            (Quote::Single, '\'') => out.push_str("'\\''"),
+            _ => out.push(c),
+        }
+    }
+}
+
+/// What reads a template once the answers are in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Reader {
+    /// The command parser: a string template, or a { } block value that is a command
+    /// string (if-shell's commands, run-shell -C and the like).
+    Parser,
+    /// Whatever the value is given to as it is: a shell command (run-shell, if-shell's
+    /// test, split-window, display-popup) or a plain value.
+    Direct,
+}
+
+/// cmd_template_replace: in `template` replace %N (and %N%) with `s`, and the first %%
+/// (or %%%) left. %% escapes single quotes, %%% and %N% escape characters special inside
+/// double quotes; `sq` false leaves a %% answer as it is.
+///
+/// With [`Quoting::TMUX`] (Unix) the escapes are tmux 3.8's wherever the replacement is.
+/// Otherwise, for the parser, the quotes the template has around the replacement say who
+/// it is escaped for: %% inside the parser's double quotes (`"echo '%%'"`) and %%%
+/// inside its single quotes (`'echo "%%%"'`) are in the quotes of the command a shell
+/// reads next, so the answer gets the shell's escape put inside the parser's quotes;
+/// anywhere else the parser's own quotes are escaped, with tmux's escapes.
+fn template_replace(template: &str, s: &str, idx: usize, sq: bool, reader: Reader, q: Quoting) -> String {
     if !template.contains('%') {
         return template.to_string();
     }
-    let b = template.as_bytes();
-    let mut out: Vec<u8> = Vec::new();
+    let chars: Vec<char> = template.chars().collect();
+    let mut out = String::with_capacity(template.len() + s.len());
     let (mut i, mut replaced) = (0, false);
-    while i < b.len() {
-        let ch = b[i];
+    // the parser's quotes at this point of the template (yylex_token's states)
+    let (mut state, mut escaped) = (Quote::None, false);
+    while i < chars.len() {
+        let ch = chars[i];
         i += 1;
-        if ch == b'%' {
-            let quote = if i < b.len() && (b'1'..=b'9').contains(&b[i]) && (b[i] - b'0') as usize == idx {
+        if ch == '%' {
+            let quote = if i < chars.len() && chars[i].to_digit(10).is_some_and(|d| d >= 1 && d as usize == idx) {
                 i += 1;
-                Some(if i < b.len() && b[i] == b'%' { i += 1; '"' } else { ' ' })
-            } else if i < b.len() && b[i] == b'%' && !replaced {
+                Some(if chars.get(i) == Some(&'%') { i += 1; Quote::Double } else { Quote::None })
+            } else if chars.get(i) == Some(&'%') && !replaced {
                 replaced = true;
                 i += 1;
-                Some(if i < b.len() && b[i] == b'%' { i += 1; '"' } else { '\'' })
+                Some(if chars.get(i) == Some(&'%') { i += 1; Quote::Double } else { Quote::Single })
             } else {
                 None
             };
             if let Some(quote) = quote {
-                for c in s.bytes() {
-                    if sq && quote == '\'' && c == b'\'' {
-                        out.extend_from_slice(b"'\\''");
-                        continue;
+                escaped = false;
+                let quote = if quote == Quote::Single && !sq { Quote::None } else { quote };
+                match (reader, quote, state) {
+                    (Reader::Parser, Quote::Single, Quote::Double) | (Reader::Parser, Quote::Double, Quote::Single) if q != Quoting::TMUX => {
+                        let mut inner = String::new();
+                        escape_answer(&mut inner, s, quote, q);
+                        encode_for_parser(&mut out, &inner, state);
                     }
-                    if quote == '"' && b"\"\\$;~".contains(&c) {
-                        out.push(b'\\');
-                    }
-                    out.push(c);
+                    (Reader::Parser, _, _) => escape_answer(&mut out, s, quote, Quoting::TMUX),
+                    (Reader::Direct, _, _) => escape_answer(&mut out, s, quote, q),
                 }
                 continue;
             }
         }
+        if escaped {
+            escaped = false;
+        } else {
+            match (state, ch) {
+                (Quote::None, '\'') => state = Quote::Single,
+                (Quote::None, '"') => state = Quote::Double,
+                (Quote::Single, '\'') | (Quote::Double, '"') => state = Quote::None,
+                (Quote::None | Quote::Double, '\\') => escaped = true,
+                _ => {}
+            }
+        }
         out.push(ch);
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
-/// args_make_commands: each answer replaces %N and the next %% of the template.
-pub fn fill_template(template: &str, answers: &[String]) -> String {
+/// args_make_commands for a string template: each answer replaces %N and the next %%,
+/// and the result is parsed.
+pub fn fill_template(template: &str, answers: &[String], q: Quoting) -> String {
     let mut out = template.to_string();
     for (i, a) in answers.iter().enumerate() {
-        out = template_replace(&out, a, i + 1);
+        out = template_replace(&out, a, i + 1, true, Reader::Parser, q);
     }
     out
 }
@@ -164,16 +325,32 @@ pub fn fill_template(template: &str, answers: &[String]) -> String {
 /// string parsed later (an if-shell or run-shell command, a shell command): only a
 /// value that is `%%` alone, so the whole answer (`rename-window -- '%%'`, the
 /// default `prefix ,`), keeps its single quotes, where tmux 3.8 leaves "it'\''s"
-/// (COMPATIBILITY.md, Intentional differences). %%% and %N% keep tmux's escapes.
-pub fn fill_block_value(value: &str, answers: &[String]) -> String {
+/// (COMPATIBILITY.md, Intentional differences). %%% and %N% keep tmux's escapes on
+/// Unix. `reader` is who reads the value ([`super::cmds::copy_block`]), which on
+/// Windows decides the escapes with `q` ([`template_replace`]).
+pub fn fill_block_value(value: &str, answers: &[String], reader: Reader, q: Quoting) -> String {
     let mut out = value.to_string();
     for (i, a) in answers.iter().enumerate() {
-        out = template_replace_quoting(&out, a, i + 1, out != "%%");
+        let sq = out != "%%";
+        out = template_replace(&out, a, i + 1, sq, reader, q);
     }
     out
 }
 
 impl Server {
+    /// The escapes for answers put into templates ([`Quoting`]): tmux's on Unix, where
+    /// jobs run under /bin/sh. On Windows, safe under every shell that may run them: the
+    /// shell of jobs (run-shell, if-shell, #()) and default-shell, globally and in each
+    /// session, which runs new panes, popups and detach-client -E.
+    pub(crate) fn answer_quoting(&self) -> Quoting {
+        if !cfg!(windows) {
+            return Quoting::TMUX;
+        }
+        let shell = |sid: Option<SessId>| Some(self.opt_session(sid, "default-shell")).filter(|s| !s.is_empty()).unwrap_or_else(procinfo::default_shell);
+        let shells: Vec<String> = [procinfo::default_shell(), shell(None)].into_iter().chain(self.sessions.keys().map(|s| shell(Some(*s)))).collect();
+        Quoting::for_shells(shells.iter().map(String::as_str))
+    }
+
     pub(crate) fn width_context(&self) -> crate::width::Guard {
         let entries = self.opts_server.array_items("codepoint-widths").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
         crate::width::enter(features::codepoint_widths(&entries), options::is_on(&self.opt_server("variation-selector-always-wide")))
@@ -1165,11 +1342,12 @@ impl Server {
     /// The commands of a prompt's answer: a string template filled in and parsed, or
     /// a { } block's commands with the answers in their values (args_make_commands).
     fn run_prompt_template(&mut self, cid: ClientId, pr: &Prompt, answers: &[String]) {
+        let q = self.answer_quoting();
         if pr.block {
-            let cmds = super::cmds::copy_block(&pr.template, &|v| fill_block_value(v, answers));
+            let cmds = super::cmds::copy_block(&pr.template, &|v, reader| fill_block_value(v, answers, reader, q));
             self.run_prompt_commands(cid, pr, cmds);
         } else {
-            self.run_prompt_answer(cid, pr, &fill_template(&pr.template, answers));
+            self.run_prompt_answer(cid, pr, &fill_template(&pr.template, answers, q));
         }
     }
 
@@ -1426,7 +1604,7 @@ impl Server {
             return;
         }
         strip(&mut data);
-        let cmd = fill_template(&ed.command, &[String::from_utf8_lossy(&data).into_owned()]);
+        let cmd = fill_template(&ed.command, &[String::from_utf8_lossy(&data).into_owned()], self.answer_quoting());
         self.run_string(cid, &cmd, None);
     }
 
@@ -2323,16 +2501,18 @@ mod tests {
 
     #[test]
     fn templates() {
-        assert_eq!(fill_template("rename-window -- '%%'", &["it's".into()]), "rename-window -- 'it'\\''s'");
-        assert_eq!(fill_template("a %1 b %2", &["x".into(), "y z".into()]), "a x b y z");
-        assert_eq!(fill_template("%%", &["new-window -n x".into()]), "new-window -n x");
+        // (tmux 3.8's escapes, which Unix always uses)
+        let q = Quoting::TMUX;
+        assert_eq!(fill_template("rename-window -- '%%'", &["it's".into()], q), "rename-window -- 'it'\\''s'");
+        assert_eq!(fill_template("a %1 b %2", &["x".into(), "y z".into()], q), "a x b y z");
+        assert_eq!(fill_template("%%", &["new-window -n x".into()], q), "new-window -n x");
         // cmd_template_replace: %%% and %N% escape for double quotes, each answer takes the next %%
-        assert_eq!(fill_template("display \"[%%%]\"", &["a\"b$c".into()]), "display \"[a\\\"b\\$c]\"");
-        assert_eq!(fill_template("x %1% %1", &["a;b".into()]), "x a\\;b a;b");
-        assert_eq!(fill_template("\"%%\"", &["it's".into()]), "\"it'\\''s\"");
-        assert_eq!(fill_template("%% %%", &["q".into()]), "q %%");
-        assert_eq!(fill_template("%% %%", &["q".into(), "r".into()]), "q r");
-        assert_eq!(fill_template("100%", &["q".into()]), "100%");
+        assert_eq!(fill_template("display \"[%%%]\"", &["a\"b$c".into()], q), "display \"[a\\\"b\\$c]\"");
+        assert_eq!(fill_template("x %1% %1", &["a;b".into()], q), "x a\\;b a;b");
+        assert_eq!(fill_template("\"%%\"", &["it's".into()], q), "\"it'\\''s\"");
+        assert_eq!(fill_template("%% %%", &["q".into()], q), "q %%");
+        assert_eq!(fill_template("%% %%", &["q".into(), "r".into()], q), "q r");
+        assert_eq!(fill_template("100%", &["q".into()], q), "100%");
         let b = default_bindings();
         assert!(b["prefix"].contains_key("%"));
         assert!(b["prefix"].contains_key("\""));

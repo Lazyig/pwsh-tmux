@@ -4972,6 +4972,8 @@ fn strip_delay(cmd: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod input_tests;
+#[cfg(test)]
+mod quoting_tests;
 
 #[cfg(test)]
 mod surface_tests;

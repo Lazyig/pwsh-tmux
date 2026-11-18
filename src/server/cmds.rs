@@ -170,13 +170,29 @@ pub fn check_command(argv: &[String]) -> Result<(), String> {
 /// value, flag values and arguments alike, and to the commands of blocks inside it.
 /// The values are not parsed again: each stays one word, flag values after their flag
 /// (or attached, for a flag whose value is optional) and the arguments after "--".
-pub(crate) fn copy_block(text: &str, fill: &dyn Fn(&str) -> String) -> Result<Vec<Vec<String>>, String> {
+/// `fill` is told who reads each value: the command parser for a command's arguments
+/// that are commands ([`parsed_argument`]), else whatever the command gives it to.
+pub(crate) fn copy_block(text: &str, fill: &dyn Fn(&str, input::Reader) -> String) -> Result<Vec<Vec<String>>, String> {
     Ok(cmdparse::parse_marked(text)?.iter().map(|c| copy_block_command(c, fill)).collect())
 }
 
-fn copy_block_command(argv: &[String], fill: &dyn Fn(&str) -> String) -> Vec<String> {
+/// Whether argument `pos` (after the flags) of command `full`, given flags `flags`, is
+/// a command string that is parsed later: if-shell's commands, run-shell -C's,
+/// confirm-before's, a template (command-prompt, choose-*, display-panes), a binding's
+/// or a hook's commands and display-menu's items. if-shell's test, run-shell's command
+/// and the commands of new panes are run by a shell; flag values are formats or names.
+fn parsed_argument(full: &str, flags: &str, pos: usize) -> bool {
+    match full {
+        "if-shell" | "bind-key" | "set-hook" => pos >= 1,
+        "run-shell" => flags.contains('C'),
+        "confirm-before" | "command-prompt" | "choose-tree" | "choose-buffer" | "choose-client" | "display-panes" | "display-menu" => true,
+        _ => false,
+    }
+}
+
+fn copy_block_command(argv: &[String], fill: &dyn Fn(&str, input::Reader) -> String) -> Vec<String> {
     let Some((name, args)) = argv.split_first() else { return Vec::new() };
-    let value = |a: &str| match a.strip_prefix(cmdparse::BLOCK_MARK) {
+    let value_for = |a: &str, reader: input::Reader| match a.strip_prefix(cmdparse::BLOCK_MARK) {
         Some(b) => {
             let inner = copy_block(b, fill).unwrap_or_default().iter()
                 .map(|c| c.iter().map(|w| match w.strip_prefix(cmdparse::BLOCK_MARK) {
@@ -186,8 +202,10 @@ fn copy_block_command(argv: &[String], fill: &dyn Fn(&str) -> String) -> Vec<Str
                 .collect::<Vec<_>>().join(" ; ");
             format!("{}{inner}", cmdparse::BLOCK_MARK)
         }
-        None => fill(a),
+        None => fill(a, reader),
     };
+    let value = |a: &str| value_for(a, input::Reader::Direct);
+    let mut flags = String::new();
     let mut out = vec![name.clone()];
     let spec = canonical(name).and_then(|full| COMMANDS.iter().find(|c| c.0 == full));
     let mut i = 0;
@@ -214,15 +232,18 @@ fn copy_block_command(argv: &[String], fill: &dyn Fn(&str) -> String) -> Vec<Str
                             _ => None,
                         }
                     };
-                    match v.map(|v| fill(&v)) {
+                    flags.push(c);
+                    match v.map(|v| fill(&v, input::Reader::Direct)) {
                         Some(v) if !v.is_empty() => out.push(format!("-{c}{v}")),
                         Some(v) => out.extend([format!("-{c}"), v]),
                         None => out.push(format!("-{c}")),
                     }
                     break;
                 } else if bools.contains(c) {
+                    flags.push(c);
                     out.push(format!("-{c}"));
                 } else if vals.contains(c) {
+                    flags.push(c);
                     let v = if !inline.is_empty() { inline } else {
                         i += 1;
                         match args.get(i) {
@@ -242,7 +263,10 @@ fn copy_block_command(argv: &[String], fill: &dyn Fn(&str) -> String) -> Vec<Str
         }
         out.push("--".into());
     }
-    out.extend(args.get(i..).unwrap_or_default().iter().map(|a| value(a)));
+    let full = spec.map(|c| c.0).unwrap_or_default();
+    out.extend(args.get(i..).unwrap_or_default().iter().enumerate().map(|(pos, a)| {
+        value_for(a, if parsed_argument(full, &flags, pos) { input::Reader::Parser } else { input::Reader::Direct })
+    }));
     out
 }
 
@@ -6385,6 +6409,22 @@ mod tests {
         }
         assert_eq!(clean_name("a\\b"), if cfg!(windows) { "a\\b" } else { "a\\\\b" });
         assert_eq!(clean_title("t\\x").as_deref(), Some(if cfg!(windows) { "t\\x" } else { "t\\\\x" }));
+    }
+
+    #[test]
+    fn command_strings_in_a_block_are_read_by_the_parser() {
+        let readers = |text: &str| -> Vec<(String, bool)> {
+            let seen = std::cell::RefCell::new(Vec::new());
+            copy_block(text, &|v, r| { seen.borrow_mut().push((v.to_string(), r == input::Reader::Parser)); v.to_string() }).unwrap();
+            seen.into_inner()
+        };
+        let p = |v: &str, parsed: bool| (v.to_string(), parsed);
+        assert_eq!(readers("if-shell -t x 'test %%' 'set @a %%' 'set @b %%'"), [p("x", false), p("test %%", false), p("set @a %%", true), p("set @b %%", true)]);
+        assert_eq!(readers("run-shell 'echo %%' ; run-shell -C 'display %%'"), [p("echo %%", false), p("display %%", true)]);
+        assert_eq!(readers("split-window -c d 'vi %%' ; display-popup -E 'x %%'"), [p("d", false), p("vi %%", false), p("x %%", false)]);
+        assert_eq!(readers("confirm-before -p q 'kill %%' ; bind-key x 'y %%'"), [p("q", false), p("kill %%", true), p("x", false), p("y %%", true)]);
+        // a block inside: its own commands decide
+        assert_eq!(readers("if-shell -F 1 { run-shell 'echo %%' }"), [p("1", false), p("echo %%", false)]);
     }
 
     #[test]

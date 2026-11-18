@@ -2146,3 +2146,41 @@ fn escape_is_not_delayed_once_later_replies_show_xtversion_will_not_come() {
     let pane = ctx.capture("wt");
     assert!(!pane.contains("Late") && !pane.contains("P>"), "{pane}");
 }
+
+/// A prompt's answer in the single quotes of a { } block's shell command reaches the shell
+/// that runs it (if-shell's: /bin/sh on Unix, PowerShell on Windows) exactly, with no way
+/// out of the quotes: an answer that would leave them makes the test exit 3.
+#[test]
+fn prompt_answers_stay_in_the_quotes_of_the_shell_that_runs_them() {
+    let ctx = Ctx::new("prompt-quotes");
+    let answers = ["x'; exit 3; '", "it's", "\u{2018}x\u{2019}; exit 3; \u{2018}", "a\\'b; exit 3 #", "$(exit 3)`exit 3`"];
+    // the server's environment (which jobs inherit) has the expected answers
+    let mut start = ctx.command();
+    for (i, a) in answers.iter().enumerate() {
+        start.env(format!("PT_Q{i}"), format!("A{a}"));
+    }
+    assert!(start.args(["new-session", "-d", "-s", "q", "-x", "100", "-y", "30"]).status().unwrap().success());
+    let check = if cfg!(windows) {
+        "if ('A%%' -ceq \\\"$env:PT_Q%2\\\") { exit 0 } else { exit 1 }"
+    } else {
+        "test 'A%%' = \\\"$PT_Q%2\\\""
+    };
+    let dir = std::env::temp_dir().join(format!("{}-quotes", ctx.socket));
+    std::fs::create_dir_all(&dir).unwrap();
+    let conf = dir.join("quotes.conf");
+    // (\$ keeps the parser from expanding the variable itself)
+    let check = check.replace('$', "\\$");
+    std::fs::write(&conf, format!("bind -n F2 command-prompt -p a,n {{ if-shell \"{check}\" {{ set -g @r yes }} {{ set -g @r no }} }}\n")).unwrap();
+    ctx.ok(&["source-file", &conf.to_string_lossy().replace('\\', "/")]);
+    let t = Term::attach(&ctx, &["attach-session", "-t", "q"], 100, 30);
+    t.wait_screen("status line", |s| s.contains("[q]"));
+    for (i, a) in answers.iter().enumerate() {
+        ctx.ok(&["set", "-g", "@r", "pending"]);
+        t.send(b"\x1bOQ");
+        wait_for("prompt", || t.row(29).starts_with("a "));
+        t.send(format!("{a}\r{i}\r").as_bytes());
+        wait_for(&format!("if-shell for {a:?}"), || ctx.ok(&["show", "-gv", "@r"]).trim() != "pending");
+        assert_eq!(ctx.ok(&["show", "-gv", "@r"]).trim(), "yes", "{a:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

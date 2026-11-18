@@ -1471,9 +1471,10 @@ fn a_block_template_takes_the_answers_without_being_parsed_again() {
         assert_eq!(f.opts_session.get("@c"), Some(typed));
     }
     assert_eq!(f.opts_session.get("@pwned"), None);
-    assert_eq!(input::fill_block_value("test '%%' = x", &["x' = x -o 'y".into()]), "test 'x'\\'' = x -o '\\''y' = x");
-    assert_eq!(input::fill_block_value("%%", &["it's".into()]), "it's");
-    assert_eq!(input::fill_block_value("%1:%%", &["a'".into()]), "a':a'\\''");
+    let fill = |v: &str, a: &str| input::fill_block_value(v, &[a.to_string()], input::Reader::Direct, input::Quoting::TMUX);
+    assert_eq!(fill("test '%%' = x", "x' = x -o 'y"), "test 'x'\\'' = x -o '\\''y' = x");
+    assert_eq!(fill("%%", "it's"), "it's");
+    assert_eq!(fill("%1:%%", "a'"), "a':a'\\''");
     // a string template is parsed again
     run(&mut f, &["bind-key", ",", "command-prompt -I'#W' \"rename-window -- '%%'\""]);
     for (typed, name) in [("it's", "it's"), ("a\"b", "a\"b"), ("a\\b", "a\\\\b"), ("a$HOME", "a$HOME")] {
@@ -1832,4 +1833,47 @@ fn a_menu_taller_than_the_client_opens_at_the_top() {
     assert!(row(&f, 1).contains("item0"), "{}", row(&f, 1));
     f.handle_input(1, b"\x1b[B\r");
     assert_eq!(f.opts_session.get("@tall"), Some("1"));
+}
+
+#[test]
+fn prompt_answers_are_escaped_for_the_shells_that_may_run_them() {
+    // Unix keeps tmux 3.8's escapes whatever default-shell is (jobs run under /bin/sh);
+    // Windows takes the jobs' shell and every default-shell into account
+    let mut f = fixture();
+    let job = procinfo::default_shell();
+    let expect = |shells: &[&str]| if cfg!(windows) { input::Quoting::for_shells(shells.iter().copied()) } else { input::Quoting::TMUX };
+    f.opts_session.set("default-shell", "/bin/sh".into());
+    assert_eq!(f.answer_quoting(), expect(&[&job, "/bin/sh"]));
+    f.opts_session.set("default-shell", "pwsh.exe".into());
+    assert_eq!(f.answer_quoting(), expect(&[&job, "pwsh.exe"]));
+    // a session's own default-shell counts too
+    let sid = f.sid;
+    f.sessions.get_mut(&sid).unwrap().options.set("default-shell", "C:\\Windows\\System32\\cmd.exe".into());
+    let q = f.answer_quoting();
+    assert_eq!(q, expect(&[&job, "pwsh.exe", "cmd.exe"]));
+    // the block value of a binding's prompt gets those escapes (`set` keeps it as given)
+    run(&mut f, &["bind-key", "F6", "command-prompt { set -g @v \"echo '%%' %%\" }"]);
+    f.handle_input(1, b"\x02\x1b[17~");
+    f.handle_input(1, b"it's & x\r");
+    let want = input::fill_block_value("echo '%%' %%", &["it's & x".into()], input::Reader::Direct, q);
+    assert_eq!(f.opts_session.get("@v"), Some(want.as_str()));
+    if cfg!(windows) {
+        assert_eq!(want, "echo 'it''s ^& x' %%");
+    } else {
+        assert_eq!(want, "echo 'it'\\''s & x' %%");
+    }
+}
+
+/// On Windows the default shell (PowerShell) runs a prompt's answer in a block as the
+/// answer, whatever quotes it has (Unix: the same through /bin/sh with tmux's escapes).
+#[cfg(windows)]
+#[test]
+fn windows_job_shell_gets_powershell_escapes() {
+    let mut f = fixture();
+    f.opts_session.set("default-shell", procinfo::default_shell().into());
+    let q = f.answer_quoting();
+    if procinfo::shell_kind(&procinfo::default_shell()) == procinfo::ShellKind::PowerShell {
+        assert!(q.powershell && !q.cmd, "{q:?}");
+        assert_eq!(input::fill_block_value("echo '%%'", &["x'y\u{2019}z".into()], input::Reader::Direct, q), "echo 'x''y\u{2019}\u{2019}z'");
+    }
 }

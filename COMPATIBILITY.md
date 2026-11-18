@@ -168,7 +168,35 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   `rename-window -- '%%'` of the default `prefix ,` binding, where nothing can remove it,
   so a window renamed to `it's` is named `it'\''s`. Here a value that is exactly `%%`
   keeps the answer's single quotes as typed; every other value, string templates (which
-  are parsed again) and `%%%` / `%1%` escape as in 3.8.
+  are parsed again) and `%%%` / `%1%` escape as in 3.8 (on Windows, as in the next item).
+- **Prompt answers are escaped for the shell on Windows.** tmux 3.8's escapes (`'\''` for
+  `%%`, a backslash before `" \ $ ; ~` for `%%%` and `%N%`) are POSIX shell quoting, and
+  Unix keeps them exactly (jobs there run under `/bin/sh`). On Windows the commands run
+  under PowerShell (jobs: `run-shell`, `if-shell`, `#()`, `pipe-pane`, `copy-pipe`) and
+  `default-shell` (new panes, `display-popup`, `detach-client -E`), where `'\''` does not
+  quote: `{ run-shell "echo '%%'" }` answered `x'; echo pwned; '` would run `echo pwned`.
+  There the escape is chosen when the answer is put in, to be safe under every shell that
+  may run it: the jobs' shell and `default-shell` (global and of each session). With only
+  POSIX shells (sh, bash, zsh, dash, ksh and the like, such as Git Bash) it is tmux's. With
+  PowerShell, or a shell whose quoting is not known (fish, nu, ...), `%%` doubles each of
+  PowerShell's single quotes (`'` and `‘ ’ ‚ ‛`), which PowerShell reads as one quote and
+  sh and the command parser as an empty pair (the quote is lost, nothing escapes the
+  quotes), and `%%%`/`%N%` double `"` (and `“ ” „`), put a backtick before `` ` `` and `$`,
+  and double `\`. cmd.exe has no single quotes and nothing escapes inside its double quotes,
+  so for cmd.exe each of `^ & | < > ( ) % !` also gets a caret, `"` is doubled (cmd.exe's
+  quotes stay as they were) and a newline becomes a space: nothing in the answer is acted
+  on, inside cmd.exe's double quotes or not, but inside them the carets stay in the text.
+  Which escape applies also depends on who reads the value: in a `{ }` block, the
+  arguments that are commands parsed again (`if-shell`'s commands, `run-shell -C`,
+  `confirm-before`, `bind-key`, `set-hook`, templates of `command-prompt`, `choose-*` and
+  `display-panes`, `display-menu` items) and every string template keep tmux's escapes for
+  the command parser's quotes, which are the same everywhere; but `%%` inside the parser's
+  double quotes (`command-prompt "run-shell \"echo '%%'\""`) and `%%%` inside its single
+  quotes are in the next shell's quotes, so they get the shell's escape, encoded for the
+  parser's quotes. (tmux 3.8, and Unix here, gives sh the answer's quotes unescaped in
+  those two cases, since the parser removes the backslash of `'\''`.) A value that is `%%`
+  alone and `%N` are put in as typed, as before. A template that puts `%%` outside any
+  quotes, or that is written for another shell's quoting, is not made safe.
 - **The panes stay frozen for a whole prompt.** While a status prompt is open (not
   `command-prompt -C`/`-i`) or a message is shown (not `display-message -C`), pane output
   is not drawn, as in tmux 3.8 (TTY_FREEZE, status.c:386 and 605). tmux 3.8 lifts the

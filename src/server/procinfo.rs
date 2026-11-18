@@ -66,6 +66,32 @@ fn is_cmd(shell: &str) -> bool {
     std::path::Path::new(shell).file_stem().is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case("cmd"))
 }
 
+/// The quoting a shell reads a command string with, for escaping a prompt's answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellKind {
+    /// sh and its kin: '\'' puts a single quote in a single-quoted string.
+    Posix,
+    /// PowerShell: '' (or a doubled ‘ ’ ‚ ‛) puts a single quote in one.
+    PowerShell,
+    /// cmd.exe: no single quotes; ^ escapes a special character outside double quotes.
+    Cmd,
+    /// Any other shell, whose quoting is not known.
+    Other,
+}
+
+/// The kind of a shell from its name or path (either separator, any case, with or
+/// without .exe), on any platform, so the Windows choices are tested everywhere.
+pub fn shell_kind(shell: &str) -> ShellKind {
+    let name = shell.rsplit(['/', '\\']).next().unwrap_or(shell).to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    match name {
+        "pwsh" | "pwsh-preview" | "powershell" => ShellKind::PowerShell,
+        "cmd" => ShellKind::Cmd,
+        "sh" | "bash" | "dash" | "ash" | "zsh" | "ksh" | "ksh93" | "mksh" | "lksh" | "oksh" | "pdksh" | "yash" | "posh" | "bosh" => ShellKind::Posix,
+        _ => ShellKind::Other,
+    }
+}
+
 /// Wraps the user's prompt so PowerShell reports its location with OSC 7; that is how
 /// #{pane_current_path} works on Windows, where another process's cwd can't be read.
 /// `%` and `;` are percent-encoded: the URL is decoded, and `;` would end the OSC field.
