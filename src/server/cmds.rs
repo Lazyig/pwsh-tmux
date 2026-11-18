@@ -6196,10 +6196,20 @@ fn buffer_name(name: &str) -> Result<String, String> {
     Ok(clean_name(name))
 }
 
-/// tmux's clean_name for a session (or window) name: vis-escaped with
-/// VIS_OCTAL|VIS_CSTYLE|VIS_TAB|VIS_NL, complete UTF-8 characters kept.
+/// tmux's clean_name for a name or title given by a command (window, session and
+/// buffer names, pane titles): vis-escaped with VIS_OCTAL|VIS_CSTYLE|VIS_TAB|VIS_NL,
+/// complete UTF-8 characters kept.
 fn clean_name(name: &str) -> String {
-    String::from_utf8_lossy(&vis::strvis(name.as_bytes(), vis::OCTAL | vis::CSTYLE | vis::TAB | vis::NL)).into_owned()
+    clean_name_for(name, cfg!(windows))
+}
+
+/// [`clean_name`] on Windows (`windows`) or Unix. On Windows a backslash is kept, as in
+/// names and titles from a pane (vendor/vt100 clean_name): it separates the parts of a
+/// path there, and tmux's escaped (doubled) backslash would double again on every rename
+/// from a prompt that shows the name (`prefix ,`, -I'#W'). Unix escapes it as tmux 3.8.
+fn clean_name_for(name: &str, windows: bool) -> String {
+    let flags = vis::OCTAL | vis::CSTYLE | vis::TAB | vis::NL | if windows { vis::NOSLASH } else { 0 };
+    String::from_utf8_lossy(&vis::strvis(name.as_bytes(), flags)).into_owned()
 }
 
 /// strerror(3) text for an I/O error (without Rust's " (os error N)"); a missing file
@@ -6357,6 +6367,25 @@ pub const VAR_NAMES: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_from_commands_keep_backslashes_on_windows_only() {
+        // tmux 3.8's clean_name on Unix: a backslash is escaped (vis -c)
+        assert_eq!(clean_name_for("C:\\Users\\x", false), "C:\\\\Users\\\\x");
+        // on Windows it stays, as in a pane's titles and names (COMPATIBILITY.md)
+        assert_eq!(clean_name_for("C:\\Users\\x", true), "C:\\Users\\x");
+        // renaming to the name shown (-I'#W') gives the same name again
+        let once = clean_name_for("C:\\a", true);
+        assert_eq!(clean_name_for(&once, true), once);
+        // the other escapes are the same on both (check_name refuses control characters
+        // before, so only a name taken without it would have them)
+        for windows in [false, true] {
+            assert_eq!(clean_name_for("a\tb\nc\u{1}", windows), "a\\tb\\nc\\001");
+            assert_eq!(clean_name_for("é\"x", windows), "é\"x");
+        }
+        assert_eq!(clean_name("a\\b"), if cfg!(windows) { "a\\b" } else { "a\\\\b" });
+        assert_eq!(clean_title("t\\x").as_deref(), Some(if cfg!(windows) { "t\\x" } else { "t\\\\x" }));
+    }
 
     #[test]
     fn helpers() {

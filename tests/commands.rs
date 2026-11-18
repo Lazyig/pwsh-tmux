@@ -3164,7 +3164,8 @@ fn session_names_follow_check_name_and_clean_name() {
     ctx.ok(&["rename-session", "-t", "n", "n"]);
     let mut names: Vec<String> = ctx.ok(&["list-sessions", "-F", "[#{session_name}]"]).lines().map(String::from).collect();
     names.sort();
-    assert_eq!(names, ["[a:b]", "[a\\\\b]", "[n]", "[x.y]"]);
+    // (on Windows a backslash is kept, COMPATIBILITY.md)
+    assert_eq!(names, ["[a:b]", if cfg!(windows) { "[a\\b]" } else { "[a\\\\b]" }, "[n]", "[x.y]"]);
     // and the target syntax still splits at ':' and '.', as cmd-find does
     assert_eq!(ctx.fails(&["rename-session", "-t", "x.y", ""]).trim_end(), "can't find pane: y");
     ctx.ok(&["rename-session", "-t", "n", ""]);

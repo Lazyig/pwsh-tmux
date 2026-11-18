@@ -96,10 +96,15 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   `input_key` does not strip the sent-key flag; here they are sent as typed keys are.
 - **Pane titles on Windows.** ConPTY sets the console title when the pane starts, so
   `pane_title` begins as the shell's executable path and changes with the console title.
-  On Windows, titles and names set by the program in the pane (OSC 0/2, APC, `ESC k`) and
-  OSC 7 paths keep their backslashes (they are paths); on Unix they are escaped as in 3.8.
-  Titles and names given by commands (`select-pane -T`, `rename-window`, session and
-  buffer names) are escaped as in 3.8 on every platform.
+  On Windows clean_name keeps backslashes (they separate the parts of a path) in every
+  title, name and path: those set by the program in the pane (OSC 0/2, APC, `ESC k`), OSC 7
+  paths, and those given by commands (`select-pane -T`, `rename-window`, `new-window -n`,
+  `break-pane -n`, `new-session -s`/`-n`, `rename-session`, and buffer names from
+  `set-buffer -b`/`-n` and `load-buffer -b`), so a name typed as `C:\Users\x` is kept as typed
+  and found by that name, and renaming from a prompt that shows the name (`prefix ,`) does
+  not double them each time. On Unix they are escaped as in 3.8 (`C:\\Users\\x`). The
+  other escapes (tab, newline and control characters as `\t`, `\n` and octal) are the same
+  on both, and the names given by commands are refused for them anyway (check_name).
 - **Names that coexist with tmux.** The server listens on `/tmp/pwsh-tmux-UID/NAME`
   (under `PWSH_TMUX_TMPDIR` or `TMUX_TMPDIR` if set) on Unix and on a named pipe on
   Windows. Panes get `PWSH_TMUX` and `PWSH_TMUX_PANE` in place of `TMUX` and `TMUX_PANE`,

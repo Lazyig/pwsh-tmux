@@ -1446,6 +1446,8 @@ fn a_block_template_takes_the_answers_without_being_parsed_again() {
         // tmux 3.8 gives "it'\\''s" here: a value that is %% alone keeps its single
         // quotes (an intentional difference)
         ("it's", "it's"), ("a'b\"c\\d", "a'b\"c\\\\d")] {
+        // (on Windows clean_name keeps a backslash, COMPATIBILITY.md)
+        let name = if cfg!(windows) { name.replace("\\\\", "\\") } else { name.to_string() };
         assert_eq!(rename(&mut f, typed), name, "{typed}");
     }
     // a flag's value takes the answer too, and %1 / %2 the answers of each prompt
@@ -1475,6 +1477,7 @@ fn a_block_template_takes_the_answers_without_being_parsed_again() {
     // a string template is parsed again
     run(&mut f, &["bind-key", ",", "command-prompt -I'#W' \"rename-window -- '%%'\""]);
     for (typed, name) in [("it's", "it's"), ("a\"b", "a\"b"), ("a\\b", "a\\\\b"), ("a$HOME", "a$HOME")] {
+        let name = if cfg!(windows) { name.replace("\\\\", "\\") } else { name.to_string() };
         assert_eq!(rename(&mut f, typed), name, "{typed}");
     }
 }
