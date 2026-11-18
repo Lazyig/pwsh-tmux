@@ -6,3 +6,5 @@
 *.toml text eol=lf
 *.md text eol=lf
 Cargo.lock text eol=lf
+# terminal output fixtures are byte exact
+*.bin binary

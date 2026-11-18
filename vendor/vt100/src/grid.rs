@@ -236,7 +236,12 @@ impl Grid {
                 let tab = metadata.as_ref().map_or(0, |m| m.tab_width);
                 // columns taken (a tab wider than the row is kept, clipped to it), the
                 // cells it has here and the padding counted after it
-                let (width, span, padding) = if tab > 0 { (tab, tab.min(end - x), tab - 1) } else if cell.is_wide() { (2, 2, 0) } else { (1, 1, 0) };
+                // a wide cell in the last column has no continuation cell (its second
+                // half was off the screen, screen_write_combine): it gets one here, and a
+                // cursor after it keeps its offset, on the second half (grid_unwrap_position)
+                let next = old.get(x + 1);
+                let half = next.is_some_and(crate::Cell::is_wide_continuation);
+                let (width, span, padding) = if tab > 0 { (tab, tab.min(end - x), tab - 1) } else if cell.is_wide() { (2, if next.is_some() && !half { 1 } else { 2 }, 0) } else { (1, 1, 0) };
                 if used > 0 && used + width > cols {
                     if index != line_row {
                         // the rest of a row a join stopped in keeps its line (flags, time)
@@ -252,7 +257,7 @@ impl Grid {
                     }
                 }
                 // a cursor inside a tab keeps its offset, on a wide character its first half
-                let within = |c: u16| if tab > 0 { (col + c - x).min(cols - 1) } else { col };
+                let within = |c: u16| if tab > 0 { (col + c - x).min(cols - 1) } else if next.is_none() && c > x { col + 1 } else { col };
                 let cover = if tab > 0 { span } else { width };
                 if index == cursor_row && self.pos.col >= x && self.pos.col < x + cover { cursor = (produced, within(self.pos.col)); }
                 if index == saved_row && self.saved_pos.col >= x && self.saved_pos.col < x + cover { saved = (produced, within(self.saved_pos.col)); }
@@ -260,7 +265,8 @@ impl Grid {
                 if tab > 0 || width <= cols {
                     for i in 0..width.min(cols - col) {
                         // a tab's cells cut off by an earlier, narrower row are its blanks again
-                        let c = if i < span { old.get(x + i).cloned() } else { None }.unwrap_or_else(|| cell.clone());
+                        let c = if i < span { old.get(x + i).cloned() } else { None }.filter(|c| tab > 0 || i == 0 || c.is_wide_continuation())
+                            .unwrap_or_else(|| if tab > 0 { cell.clone() } else { let mut c = crate::Cell::new(); c.set_wide_continuation(true); c });
                         *row.get_mut_untracked(col + i).unwrap() = c;
                     }
                     if let Some(m) = metadata { row.set_metadata(col, m); }
