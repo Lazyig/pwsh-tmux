@@ -90,3 +90,14 @@ to the cursor (tmux drops it with the cursor on a wide cell's second half or
 after a wide cell in the last column). Tests:
 lib.rs::metadata_tests, src/cells.rs and tests/commands.rs with the fuzzed
 outputs in tests/fixtures/pane-output-crash.
+
+Local change (speed only): outside control strings and not right after ESC or
+ESC [, `Parser::process` hands vte the bytes up to the next ESC or 0xC2 in one
+call instead of one byte at a time. A run never starts at 0xC2 or a UTF-8
+continuation byte, because vte 0.15 handles a character split over calls
+differently from one it decodes whole (it prints a UTF-8 C1 control it
+completes from a split but executes a whole one, and drops the bytes after a
+character completed from a split). Printable ASCII with wrapping on and insert
+mode off goes through `WrappedScreen::text_ascii`, the one-column case of
+`text` with a single row lookup. Neither changes the result. Tests:
+parser::tests, screen::tests.
