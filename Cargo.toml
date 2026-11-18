@@ -1,6 +1,6 @@
 [package]
 name = "pwsh-tmux"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "A tmux-compatible terminal multiplexer for Windows (ConPTY) and Unix, with PowerShell as the default shell"
 license = "MIT"
