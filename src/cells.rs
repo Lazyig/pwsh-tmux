@@ -304,6 +304,8 @@ impl TestRng {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::num::NonZeroU16;
 
     #[test]
     fn snapshot_rows_read_one_at_a_time_match_the_whole_snapshot() {
@@ -331,8 +333,6 @@ mod tests {
         }
         assert!(wrapped_early > 0, "a row that wraps early is covered");
     }
-    use super::*;
-    use std::num::NonZeroU16;
 
     #[test]
     fn row_access_matches_cell_snapshot() {
