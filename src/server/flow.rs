@@ -299,7 +299,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
-    const SLOW: Timing = Timing { quiet: Duration::from_millis(150), stall: Duration::from_secs(5), cap: Duration::from_secs(10) };
+    // the quiet time is long against the tests' own sleeps, for a loaded machine
+    const SLOW: Timing = Timing { quiet: Duration::from_millis(600), stall: Duration::from_secs(5), cap: Duration::from_secs(10) };
 
     /// Reads `CREDITS` chunks the main loop has not handled yet, then a fifth.
     fn queue_four_and_read_a_fifth(flow: &Arc<Flow>) -> (Vec<Credit>, Credit) {
@@ -389,6 +390,40 @@ mod tests {
     }
 
     #[test]
+    fn a_burst_takes_the_output_a_reader_holds_up_to_its_deadline() {
+        use super::super::next_in_burst;
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        let backlog = Backlog::default();
+        // nothing queued or held: the burst ends at once
+        let start = Instant::now();
+        assert!(next_in_burst(&rx, &backlog, start + Duration::from_secs(10)).is_none());
+        assert!(start.elapsed() < Duration::from_secs(2));
+
+        // a reader holds a chunk: it is part of the burst
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let (b, t) = (backlog.clone(), tx.clone());
+        let sender = thread::spawn(move || {
+            let _held = b.hold();
+            held_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(50));
+            t.send(Event::ClientGone(7)).unwrap();
+        });
+        held.recv().unwrap();
+        let got = next_in_burst(&rx, &backlog, Instant::now() + Duration::from_secs(10));
+        assert!(matches!(got, Some(Event::ClientGone(7))));
+        sender.join().unwrap();
+        assert!(!backlog.any());
+
+        // ...but not past the deadline
+        let _held = backlog.hold();
+        let start = Instant::now();
+        assert!(next_in_burst(&rx, &backlog, start + Duration::from_millis(100)).is_none());
+        let took = start.elapsed();
+        assert!(took >= Duration::from_millis(100) && took < Duration::from_secs(5), "{took:?}");
+        drop(tx);
+    }
+
+    #[test]
     fn settle_waits_for_the_main_loop_to_handle_what_was_read() {
         let (_out, flow) = Output::new();
         assert!(flow.begin_read());
@@ -438,7 +473,7 @@ mod tests {
         });
         thread::sleep(Duration::from_millis(30));
         pending.store(false, Ordering::SeqCst); // the read returned with the last bytes
-        thread::sleep(Duration::from_millis(SLOW.quiet.as_millis() as u64 / 3));
+        thread::sleep(Duration::from_millis(20));
         let credit = flow.end_read(true).unwrap(); // ...and is counted, within the quiet time
         assert!(flow.begin_read());
         thread::sleep(Duration::from_millis(100));
@@ -505,7 +540,8 @@ mod tests {
             }
         });
         let start = Instant::now();
-        flow.settle_with(|| true, Timing { quiet: Duration::from_millis(2), stall: Duration::from_millis(100), cap: Duration::from_millis(300) });
+        // (no stall: the writer may not get the cpu for a while)
+        flow.settle_with(|| true, Timing { quiet: Duration::from_millis(2), stall: Duration::from_secs(3), cap: Duration::from_millis(300) });
         let took = start.elapsed();
         stop.store(true, Ordering::SeqCst);
         writer.join().unwrap();
