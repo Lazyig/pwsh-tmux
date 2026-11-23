@@ -221,10 +221,11 @@ pub fn job_command(command: &str) -> std::process::Command {
 /// has a byte order mark, and the writer it gives a program it pipes to writes that mark
 /// before the text: `'x' | findstr x` finds nothing, as findstr reads `\u{feff}x`. The same
 /// encoding without the mark keeps what is piped as `$OutputEncoding` makes it (ASCII,
-/// unless the profile sets it) and changes nothing else: the console's code page stays
-/// 65001, and the job's input is read in UTF-8 as before. It is a line of its own, so
-/// the job's command is as typed from the start of the next one (an error in it says
-/// `At line:2`). PowerShell 7 gives its encoding no mark.
+/// unless the profile sets it): the console's code page stays 65001, and the job's input
+/// is read in UTF-8 as before. It is a line of its own, so the job's command is as typed
+/// from the start of the next one, its line numbers one more; a command that starts with
+/// `using` or `param(...)`, which must come first, does not run as one. PowerShell 7
+/// gives its encoding no mark.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const PS51_JOB_PRELUDE: &str = "try { [Console]::InputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}";
 

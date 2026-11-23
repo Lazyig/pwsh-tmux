@@ -111,8 +111,11 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   line is the job's as it is (an error points into the command as typed; for Windows
   PowerShell 5.1 the command follows a line of its own that sets `[Console]::InputEncoding`
   to UTF-8 without a byte order mark, because .NET Framework's 65001 encoding has one and
-  writes it before what PowerShell pipes to a program (without the line `'x' | findstr x`
-  finds nothing); an error in the command then says `At line:2`), and its
+  writes it when a program PowerShell pipes to starts (without the line `'x' | findstr x`
+  finds nothing); so the line numbers in an error are one more than the command's, a
+  command that starts with `using` or `param(...)`, which must come first, does not run
+  as one, and an encoding the profile sets there is replaced; not where a job has a
+  console of its own, below), and its
   standard input, output and error are the job's (input NUL unless the job is given
   text, errors NUL unless `run-shell -E`). PowerShell (5.1 and 7) therefore starts with
   `[Console]::InputEncoding` and `[Console]::OutputEncoding` UTF-8, so what it prints and
