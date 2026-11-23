@@ -108,7 +108,11 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   its input and output code pages to UTF-8 (65001), again before each job starts. Each
   job's shell is started in it by the server, as tmux starts a job: it is the job's
   process (its pid is the one in `show-messages -J` and `#{pane_pipe_pid}`), its command
-  line is the job's as it is (an error points into the command as typed), and its
+  line is the job's as it is (an error points into the command as typed; for Windows
+  PowerShell 5.1 the command follows a line of its own that sets `[Console]::InputEncoding`
+  to UTF-8 without a byte order mark, because .NET Framework's 65001 encoding has one and
+  writes it before what PowerShell pipes to a program (without the line `'x' | findstr x`
+  finds nothing); an error in the command then says `At line:2`), and its
   standard input, output and error are the job's (input NUL unless the job is given
   text, errors NUL unless `run-shell -E`). PowerShell (5.1 and 7) therefore starts with
   `[Console]::InputEncoding` and `[Console]::OutputEncoding` UTF-8, so what it prints and

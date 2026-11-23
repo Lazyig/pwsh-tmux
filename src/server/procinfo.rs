@@ -204,13 +204,46 @@ pub fn job_command(command: &str) -> std::process::Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        let mut c = via_shell(&default_shell(), command).command();
-        c.creation_flags(job_creation_flags(win::jobs_console()));
+        let shell = default_shell();
+        let in_jobs_console = win::jobs_console();
+        let mut c = via_shell(&shell, &job_script(&shell, command, in_jobs_console)).command();
+        c.creation_flags(job_creation_flags(in_jobs_console));
         c
     }
     #[cfg(unix)]
     {
         shell_command(command)
+    }
+}
+
+/// What Windows PowerShell 5.1 runs first in the jobs' UTF-8 console. Its
+/// `[Console]::InputEncoding` there is .NET Framework's code page 65001 encoding, which
+/// has a byte order mark, and the writer it gives a program it pipes to writes that mark
+/// before the text: `'x' | findstr x` finds nothing, as findstr reads `\u{feff}x`. The same
+/// encoding without the mark keeps what is piped as `$OutputEncoding` makes it (ASCII,
+/// unless the profile sets it) and changes nothing else: the console's code page stays
+/// 65001, and the job's input is read in UTF-8 as before. It is a line of its own, so
+/// the job's command is as typed from the start of the next one (an error in it says
+/// `At line:2`). PowerShell 7 gives its encoding no mark.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const PS51_JOB_PRELUDE: &str = "try { [Console]::InputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}";
+
+/// Whether `shell` is Windows PowerShell (powershell.exe, 5.1 and before), not
+/// PowerShell 7 (pwsh). (Either separator on any platform.)
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_windows_powershell(shell: &str) -> bool {
+    let name = shell.rsplit(['\\', '/']).next().unwrap_or(shell).to_lowercase();
+    name == "powershell" || name == "powershell.exe"
+}
+
+/// The command string a job's `shell` runs for `command`: [`PS51_JOB_PRELUDE`] and then
+/// `command` for Windows PowerShell in the jobs' console, else `command` as it is.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn job_script(shell: &str, command: &str, in_jobs_console: bool) -> String {
+    if in_jobs_console && is_windows_powershell(shell) {
+        format!("{PS51_JOB_PRELUDE}\n{command}")
+    } else {
+        command.to_string()
     }
 }
 
@@ -658,6 +691,17 @@ mod shell_tests {
         // PowerShell and the others take words, which CommandLineToArgvW gives back
         assert_eq!(via_shell_on("powershell.exe", "echo \"a\"", true), ShellCommand::words(vec!["powershell.exe".into(), "-NoLogo".into(), "-Command".into(), "echo \"a\"".into()]));
         assert_eq!(via_shell_on("C:\\Program Files\\Git\\bin\\bash.exe", "echo \"a\"", true).raw, None);
+    }
+
+    #[test]
+    fn windows_powershell_jobs_pipe_without_a_byte_order_mark() {
+        for ps in ["powershell.exe", "powershell", "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "POWERSHELL.EXE"] {
+            assert_eq!(job_script(ps, "echo x | findstr x", true), format!("{PS51_JOB_PRELUDE}\necho x | findstr x"), "{ps}");
+            assert_eq!(job_script(ps, "echo x", false), "echo x", "{ps}: not in the jobs' console");
+        }
+        for other in ["pwsh.exe", "C:\\Program Files\\PowerShell\\7\\pwsh.exe", "cmd.exe", "/bin/sh", "powershell-preview.exe"] {
+            assert_eq!(job_script(other, "echo x", true), "echo x", "{other}");
+        }
     }
 
     #[cfg(windows)]
