@@ -563,16 +563,18 @@ impl Server {
         terminal
     }
 
+    /// window_pane_send_theme_update: only panes with mode 2031 are told. The others are
+    /// skipped before their colours are worked out; their cached colours are only read while
+    /// parsing, and pane_data refreshes them before every parse.
     pub(super) fn notify_pane_themes(&mut self) {
-        let panes: Vec<_> = self.panes.keys().copied().collect();
+        let panes: Vec<_> = self.panes.iter().filter(|(_, p)| p.screen().theme_updates()).map(|(id, _)| *id).collect();
         for id in panes {
             let terminal = self.pane_colours(id);
             let p = self.panes.get_mut(&id).unwrap();
-            let enabled = p.screen().theme_updates();
             let cb = p.parser.callbacks_mut();
             cb.colours.update(terminal);
             let mut replies = Vec::new();
-            cb.colours.notify(enabled, &mut replies);
+            cb.colours.notify(true, &mut replies);
             p.send(replies);
         }
     }
@@ -1035,11 +1037,14 @@ mod tests {
         assert_eq!(srv.pane_colours(pane).reported, Some(Theme::Dark));
         srv.clients.get_mut(&1).unwrap().terminal.reported = None;
         srv.theme_control_report(&format!("%{pane}:\x1b]11;rgb:00/00/00\x07"));
-        let cb = srv.panes.get_mut(&pane).unwrap().parser.callbacks_mut();
-        assert_eq!(cb.colours.theme(), Some(Theme::Dark)); // control report wins over pane palette
-        let mut replies = Vec::new();
-        cb.colours.osc(&[b"11", b"?"], true, &mut replies);
-        assert_eq!(replies, b"\x1b]11;rgb:0000/0000/0000\x07");
+        // the pane has no mode 2031, so its colours are worked out when it next parses
+        let (tx, input) = mpsc::channel();
+        srv.panes.get_mut(&pane).unwrap().input = tx;
+        let generation = srv.panes[&pane].generation;
+        srv.pane_data(pane, generation, b"\x1b[?996n\x1b]11;?\x07");
+        // control report wins over pane palette
+        assert_eq!(srv.panes[&pane].parser.callbacks().colours.theme(), Some(Theme::Dark));
+        assert_eq!(input.try_iter().flatten().collect::<Vec<u8>>(), b"\x1b[?997;1n\x1b]11;rgb:0000/0000/0000\x07");
         srv.kill_session(sid, false);
     }
 
@@ -1067,5 +1072,176 @@ mod tests {
         colours.notify(true, &mut replies);
         colours.notify(true, &mut replies);
         assert_eq!(replies, b"\x1b[?997;1n");
+    }
+
+    /// notify_pane_themes as it was before panes without mode 2031 were skipped: every
+    /// pane's colours are worked out and cached, and notify leaves out the disabled panes.
+    fn notify_every_pane(srv: &mut Server) {
+        let panes: Vec<_> = srv.panes.keys().copied().collect();
+        for id in panes {
+            let terminal = srv.pane_colours(id);
+            let p = srv.panes.get_mut(&id).unwrap();
+            let enabled = p.screen().theme_updates();
+            let cb = p.parser.callbacks_mut();
+            cb.colours.update(terminal);
+            let mut replies = Vec::new();
+            cb.colours.notify(enabled, &mut replies);
+            p.send(replies);
+        }
+    }
+
+    /// Two panes in one window of the attached client, with what is written to each pane.
+    struct TwoPanes { srv: Server, panes: [PaneId; 2], input: [mpsc::Receiver<Vec<u8>>; 2], reference: bool }
+    impl TwoPanes {
+        fn new(reference: bool) -> Self {
+            let (mut srv, first) = with_pane();
+            command(&mut srv, &["split-window", "-d", "sleep 30"]);
+            let second = *srv.panes.keys().find(|id| **id != first).unwrap();
+            let mut capture = |pane| {
+                let (tx, rx) = mpsc::channel();
+                srv.panes.get_mut(&pane).unwrap().input = tx;
+                rx
+            };
+            let input = [capture(first), capture(second)];
+            srv.clients.get_mut(&1).unwrap().terminal.vt100 = true;
+            TwoPanes { srv, panes: [first, second], input, reference }
+        }
+        fn notify(&mut self) {
+            if self.reference { notify_every_pane(&mut self.srv) } else { self.srv.notify_pane_themes() }
+        }
+        fn output(&mut self, pane: usize, data: &[u8]) {
+            let id = self.panes[pane];
+            let generation = self.srv.panes[&id].generation;
+            self.srv.pane_data(id, generation, data);
+        }
+        /// What each pane was sent since the last call, and its last notified theme.
+        fn written(&self) -> Vec<String> {
+            self.input.iter().zip(self.panes).map(|(rx, id)| {
+                let bytes: Vec<u8> = rx.try_iter().flatten().collect();
+                format!("{:?} {:?}", String::from_utf8_lossy(&bytes), self.srv.panes[&id].parser.callbacks().colours.last)
+            }).collect()
+        }
+    }
+
+    fn theme_change_steps(reference: bool) -> Vec<Vec<String>> {
+        let mut t = TwoPanes::new(reference);
+        let mut steps = Vec::new();
+        t.output(0, b"\x1b[?2031h");
+        steps.push(t.written());
+        command(&mut t.srv, &["set", "-g", "window-style", "bg=white"]);
+        t.notify();
+        t.notify();
+        steps.push(t.written());
+        t.srv.clients.get_mut(&1).unwrap().terminal.reported = Some(Theme::Dark);
+        t.notify();
+        t.notify();
+        steps.push(t.written());
+        t.srv.clients.get_mut(&1).unwrap().terminal.reported = None;
+        t.srv.clients.get_mut(&1).unwrap().terminal.bg = Some(Color::Rgb(0, 0, 0));
+        command(&mut t.srv, &["set", "-gu", "window-style"]);
+        t.notify();
+        steps.push(t.written());
+        t.srv.shutdown();
+        steps
+    }
+
+    #[test]
+    fn theme_updates_reach_only_panes_with_mode_2031() {
+        let steps = theme_change_steps(false);
+        assert_eq!(steps, theme_change_steps(true));
+        let expected = [
+            ["\"\" None", "\"\" None"],
+            ["\"\\u{1b}[?997;2n\" Some(Light)", "\"\" None"],
+            ["\"\\u{1b}[?997;1n\" Some(Dark)", "\"\" None"],
+            ["\"\" Some(Dark)", "\"\" None"],
+        ];
+        assert_eq!(steps, expected.map(|s| s.map(String::from).to_vec()).to_vec());
+        // a theme reported by the client notifies the same way (tty_keys_colours)
+        let mut t = TwoPanes::new(false);
+        t.output(0, b"\x1b[?2031h");
+        t.written();
+        t.srv.terminal_report(1, b"\x1b[?997;2n");
+        t.srv.terminal_report(1, b"\x1b[?997;2n");
+        assert_eq!(t.written(), ["\"\\u{1b}[?997;2n\" Some(Light)", "\"\" None"]);
+        t.srv.shutdown();
+    }
+
+    fn subscribe_steps(reference: bool) -> Vec<Vec<String>> {
+        let mut t = TwoPanes::new(reference);
+        let mut steps = Vec::new();
+        command(&mut t.srv, &["set", "-g", "window-style", "bg=white"]);
+        t.notify();
+        steps.push(t.written());
+        t.srv.clients.get_mut(&1).unwrap().terminal.bg = Some(Color::Rgb(0, 0, 0));
+        t.notify();
+        t.output(1, b"\x1b[?2031h\x1b[?996n");
+        steps.push(t.written());
+        t.notify();
+        steps.push(t.written());
+        command(&mut t.srv, &["set", "-gu", "window-style"]);
+        t.notify();
+        t.notify();
+        steps.push(t.written());
+        command(&mut t.srv, &["set", "-g", "window-style", "bg=white"]);
+        t.output(0, b"\x1b[?2031h");
+        t.notify();
+        steps.push(t.written());
+        t.srv.shutdown();
+        steps
+    }
+
+    #[test]
+    fn subscribing_after_style_changes_starts_from_the_current_theme() {
+        let steps = subscribe_steps(false);
+        assert_eq!(steps, subscribe_steps(true));
+        let expected = [
+            ["\"\" None", "\"\" None"],
+            ["\"\" None", "\"\\u{1b}[?997;2n\" Some(Light)"],
+            ["\"\" None", "\"\" Some(Light)"],
+            ["\"\" None", "\"\\u{1b}[?997;1n\" Some(Dark)"],
+            ["\"\" Some(Light)", "\"\\u{1b}[?997;2n\" Some(Light)"],
+        ];
+        assert_eq!(steps, expected.map(|s| s.map(String::from).to_vec()).to_vec());
+    }
+
+    fn colour_query_steps(reference: bool) -> Vec<Vec<String>> {
+        let mut t = TwoPanes::new(reference);
+        let mut steps = Vec::new();
+        let query = |t: &mut TwoPanes| {
+            t.output(0, b"\x1b]11;?\x07");
+            t.output(1, b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
+        };
+        query(&mut t);
+        steps.push(t.written());
+        command(&mut t.srv, &["set", "-g", "window-style", "fg=#0a0b0c,bg=#102030"]);
+        query(&mut t);
+        steps.push(t.written());
+        t.notify();
+        command(&mut t.srv, &["set", "-g", "window-active-style", "bg=#405060"]);
+        t.notify();
+        query(&mut t);
+        steps.push(t.written());
+        command(&mut t.srv, &["set", "-gu", "window-style"]);
+        command(&mut t.srv, &["set", "-gu", "window-active-style"]);
+        t.srv.clients.get_mut(&1).unwrap().terminal.fg = Some(Color::Rgb(1, 2, 3));
+        t.srv.clients.get_mut(&1).unwrap().terminal.bg = Some(Color::Rgb(255, 255, 255));
+        t.notify();
+        query(&mut t);
+        steps.push(t.written());
+        t.srv.shutdown();
+        steps
+    }
+
+    #[test]
+    fn colour_queries_after_option_changes_see_the_new_colours() {
+        let steps = colour_query_steps(false);
+        assert_eq!(steps, colour_query_steps(true));
+        let expected = [
+            ["\"\" None", "\"\" None"],
+            ["\"\\u{1b}]11;rgb:1010/2020/3030\\u{7}\" None", "\"\\u{1b}]10;rgb:0a0a/0b0b/0c0c\\u{1b}\\\\\\u{1b}]11;rgb:1010/2020/3030\\u{1b}\\\\\" None"],
+            ["\"\\u{1b}]11;rgb:4040/5050/6060\\u{7}\" None", "\"\\u{1b}]10;rgb:0a0a/0b0b/0c0c\\u{1b}\\\\\\u{1b}]11;rgb:1010/2020/3030\\u{1b}\\\\\" None"],
+            ["\"\\u{1b}]11;rgb:ffff/ffff/ffff\\u{7}\" None", "\"\\u{1b}]10;rgb:0101/0202/0303\\u{1b}\\\\\\u{1b}]11;rgb:ffff/ffff/ffff\\u{1b}\\\\\" None"],
+        ];
+        assert_eq!(steps, expected.map(|s| s.map(String::from).to_vec()).to_vec());
     }
 }
