@@ -1069,7 +1069,7 @@ pub struct Client {
     /// (ms since the epoch): how far behind the client is (control mode pause-after).
     pub pending: Arc<std::sync::atomic::AtomicUsize>,
     pub queued_bytes: Arc<std::sync::atomic::AtomicUsize>,
-    pub closed: Arc<std::sync::atomic::AtomicBool>,
+    pub closed: Arc<transport::Closer>,
     pub backlog_since: Arc<std::sync::atomic::AtomicU64>,
     pub ctl: control::Flags,
     /// Connecting user (uid / SID) and whether server-access lets it in / makes it read-only.
@@ -1122,7 +1122,7 @@ impl Client {
             self.io.exit_sent.store(true, Ordering::SeqCst);
         }
         let len = payload.len().saturating_add(5);
-        if self.closed.load(Ordering::SeqCst) {
+        if self.closed.is_closed() {
             self.io.discarded.fetch_add(len as u64, Ordering::Relaxed);
             return;
         }
@@ -1131,7 +1131,7 @@ impl Client {
             |n| n.checked_add(len).filter(|n| *n <= transport::MAX_OUTPUT_BACKLOG));
         if reserved.is_err() {
             self.io.discarded.fetch_add(len as u64, Ordering::Relaxed);
-            self.closed.store(true, Ordering::SeqCst);
+            self.closed.close();
             return;
         }
         if self.pending.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -1140,7 +1140,7 @@ impl Client {
         if self.tx.send(frame(kind, payload)).is_err() {
             self.queued_bytes.fetch_sub(len, Ordering::SeqCst);
             self.pending.fetch_sub(1, Ordering::SeqCst);
-            self.closed.store(true, Ordering::SeqCst);
+            self.closed.close();
         }
     }
 
@@ -2013,20 +2013,16 @@ impl Server {
         let writer_since = backlog_since.clone();
         let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let writer_bytes = queued_bytes.clone();
-        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closed = Arc::new(transport::Closer::new());
         let writer_closed = closed.clone();
         let reader_closed = closed.clone();
         let io = Arc::new(ClientIo::default());
         let writer_io = io.clone();
         thread::spawn(move || {
             use std::sync::atomic::Ordering;
-            loop {
-                if writer_closed.load(Ordering::SeqCst) { break; }
-                let buf = match rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(buf) => buf,
-                    Err(RecvTimeoutError::Timeout) => continue,
-                    Err(RecvTimeoutError::Disconnected) => break,
-                };
+            // The Client holds the only sender: this ends when it goes, or when a write
+            // fails or is cancelled (a write after close fails at once).
+            while let Ok(buf) = rx.recv() {
                 let mut send = transport::Io { stream: &stream, closed: &writer_closed, deadline: Some(Instant::now() + transport::IO_TIMEOUT) };
                 if send.write_all(&buf).is_err() {
                     break;
@@ -2038,7 +2034,7 @@ impl Server {
                     writer_since.store(now_ms(), Ordering::SeqCst);
                 }
             }
-            writer_closed.store(true, Ordering::SeqCst);
+            writer_closed.close();
         });
         let etx = self.tx.clone();
         let owner = self.owner.clone();
@@ -2080,7 +2076,7 @@ impl Server {
                     return;
                 }
             }
-            reader_closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            reader_closed.close();
             let _ = etx.send(Event::ClientGone(cid));
         });
         let now = now_secs();
@@ -2162,7 +2158,7 @@ impl Server {
         let detached = ((c.attached && c.session.is_some()) || self.ev.lost_attached.remove(&cid)).then(|| self.payload_client(cid));
         let closed = (c.control > 0 || c.ident.as_ref().is_some_and(|i| i.tty)).then(|| self.payload_client(cid));
         let Some(c) = self.clients.remove(&cid) else { return };
-        c.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        c.closed.close();
         if self.cfg_client == Some(cid) {
             // server_client_lost clears cfg_client; its held commands go with it
             self.cfg_client = None;

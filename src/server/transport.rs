@@ -7,17 +7,58 @@ pub const MAX_CLIENTS: usize = 64;
 pub const MAX_CLIENT_FRAME: usize = crate::protocol::MAX_CLIENT_FRAME;
 pub const MAX_OUTPUT_BACKLOG: usize = 8 << 20;
 pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often a wait that nothing can wake looks at the cancel flag.
+const CANCEL_POLL: Duration = Duration::from_millis(5);
+
+/// A connection's cancel flag. On Unix, `close` also wakes a reader or writer waiting
+/// for the socket, which then sees the flag at once. Without a wake pipe (Windows, or
+/// one could not be made) waits look at the flag every 5 ms.
+#[derive(Default)]
+pub struct Closer {
+    closed: AtomicBool,
+    /// Readable once the connection is closed. The byte is never read.
+    #[cfg(unix)]
+    wake: Option<(std::io::PipeReader, std::io::PipeWriter)>,
+}
+
+impl Closer {
+    pub fn new() -> Self {
+        Self {
+            closed: AtomicBool::new(false),
+            #[cfg(unix)]
+            wake: std::io::pipe().ok(),
+        }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    pub fn close(&self) {
+        #[cfg(unix)]
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            if let Some((_, w)) = &self.wake {
+                // only the first close writes, so this never fills the pipe
+                let _ = (&*w).write(&[1]);
+            }
+        }
+        #[cfg(not(unix))]
+        self.closed.store(true, Ordering::SeqCst);
+    }
+}
 
 pub struct Io<'a> {
     pub stream: &'a Stream,
-    pub closed: &'a AtomicBool,
+    pub closed: &'a Closer,
     pub deadline: Option<Instant>,
 }
 
 impl Io<'_> {
-    fn retry<T>(&self, mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    /// Runs `operation` until it does not report WouldBlock, the connection is closed or
+    /// the deadline passes. `events` is what to wait for between tries (POLLIN, POLLOUT).
+    fn retry<T>(&self, events: i16, mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
         loop {
-            if self.closed.load(Ordering::SeqCst) {
+            if self.closed.is_closed() {
                 return Err(io::ErrorKind::BrokenPipe.into());
             }
             if self.deadline.is_some_and(|d| Instant::now() >= d) {
@@ -26,22 +67,59 @@ impl Io<'_> {
             match operation() {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(5))
+                    #[cfg(unix)]
+                    self.wait(events);
+                    #[cfg(not(unix))]
+                    {
+                        let _ = events;
+                        thread::sleep(CANCEL_POLL)
+                    }
                 }
                 result => return result,
             }
         }
     }
+
+    /// Waits until the socket may be ready for `events`, the connection is closed or the
+    /// deadline comes. A wake-up for any other reason only means one more try.
+    #[cfg(unix)]
+    fn wait(&self, events: i16) {
+        use std::os::fd::AsRawFd;
+        let Stream::UdSocket(socket) = self.stream;
+        let mut limit = self.deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        if self.closed.wake.is_none() {
+            limit = Some(limit.map_or(CANCEL_POLL, |l| l.min(CANCEL_POLL)));
+        }
+        // rounded up, so the deadline has passed when a timed-out poll returns
+        let timeout = limit.map_or(-1, |l| l.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32);
+        let mut fds = [libc::pollfd { fd: socket.inner().as_raw_fd(), events, revents: 0 }; 2];
+        let mut count = 1;
+        if let Some((r, _)) = &self.closed.wake {
+            fds[1] = libc::pollfd { fd: r.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            count = 2;
+        }
+        // An error (EINTR) is a wake-up like any other.
+        unsafe { libc::poll(fds.as_mut_ptr(), count, timeout) };
+    }
 }
+
+#[cfg(unix)]
+const READ: i16 = libc::POLLIN;
+#[cfg(unix)]
+const WRITE: i16 = libc::POLLOUT;
+#[cfg(not(unix))]
+const READ: i16 = 0;
+#[cfg(not(unix))]
+const WRITE: i16 = 0;
 
 impl Read for Io<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         #[cfg(unix)]
         {
-            self.retry(|| (&*self.stream).read(buf))
+            self.retry(READ, || (&*self.stream).read(buf))
         }
         #[cfg(windows)]
-        self.retry(|| {
+        self.retry(READ, || {
             use std::os::windows::io::{AsHandle, AsRawHandle};
             use windows_sys::Win32::Storage::FileSystem::ReadFile;
             let Stream::NamedPipe(pipe) = self.stream;
@@ -74,13 +152,13 @@ impl Write for Io<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
         {
-            self.retry(|| (&*self.stream).write(&buf[..buf.len().min(16384)]))
+            self.retry(WRITE, || (&*self.stream).write(&buf[..buf.len().min(16384)]))
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             use std::os::fd::AsRawFd;
             let Stream::UdSocket(socket) = self.stream;
-            self.retry(|| {
+            self.retry(WRITE, || {
                 // Some older kernels can block a large send despite O_NONBLOCK.
                 // Bound each syscall and request nonblocking operation explicitly.
                 let written = unsafe { libc::send(socket.inner().as_raw_fd(), buf.as_ptr().cast(),
@@ -89,7 +167,7 @@ impl Write for Io<'_> {
             })
         }
         #[cfg(windows)]
-        self.retry(|| {
+        self.retry(WRITE, || {
             use std::os::windows::io::{AsHandle, AsRawHandle};
             use windows_sys::Win32::Storage::FileSystem::WriteFile;
             let Stream::NamedPipe(pipe) = self.stream;
@@ -161,42 +239,108 @@ mod tests {
 
     #[test]
     fn silent_peer_times_out_and_cancelled_reads_exit() {
-        let (server, _peer) = pair();
-        let closed = AtomicBool::new(false);
-        let mut io = Io {
-            stream: &server,
-            closed: &closed,
-            deadline: Some(Instant::now() + Duration::from_millis(30)),
-        };
-        assert_eq!(
-            io.read(&mut [0]).unwrap_err().kind(),
-            io::ErrorKind::TimedOut
-        );
-        closed.store(true, Ordering::SeqCst);
-        io.deadline = None;
-        assert_eq!(
-            io.read(&mut [0]).unwrap_err().kind(),
-            io::ErrorKind::BrokenPipe
-        );
+        // with a wake pipe, and without one (5 ms checks of the flag)
+        for closed in [Closer::new(), Closer::default()] {
+            let (server, _peer) = pair();
+            let mut io = Io {
+                stream: &server,
+                closed: &closed,
+                deadline: Some(Instant::now() + Duration::from_millis(30)),
+            };
+            assert_eq!(
+                io.read(&mut [0]).unwrap_err().kind(),
+                io::ErrorKind::TimedOut
+            );
+            closed.close();
+            io.deadline = None;
+            assert_eq!(
+                io.read(&mut [0]).unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+        }
     }
 
     #[test]
     fn stalled_writer_times_out_instead_of_holding_connection() {
-        let (server, _peer) = pair();
-        let started = Instant::now();
-        let closed = AtomicBool::new(false);
-        let mut io = Io {
-            stream: &server,
-            closed: &closed,
-            deadline: Some(Instant::now() + Duration::from_millis(30)),
-        };
-        assert_eq!(
-            io.write_all(&vec![0; MAX_OUTPUT_BACKLOG])
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::TimedOut
-        );
-        assert!(started.elapsed() < Duration::from_secs(1), "write syscall bypassed the deadline");
+        for closed in [Closer::new(), Closer::default()] {
+            let (server, _peer) = pair();
+            let started = Instant::now();
+            let mut io = Io {
+                stream: &server,
+                closed: &closed,
+                deadline: Some(Instant::now() + Duration::from_millis(30)),
+            };
+            assert_eq!(
+                io.write_all(&vec![0; MAX_OUTPUT_BACKLOG])
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::TimedOut
+            );
+            assert!(started.elapsed() < Duration::from_secs(1), "write syscall bypassed the deadline");
+        }
+    }
+
+    /// Closing a connection that is waiting to read (no deadline) or to write (a peer that
+    /// reads nothing) ends the wait at once.
+    #[test]
+    fn close_ends_waiting_reads_and_writes_promptly() {
+        for write in [false, true] {
+            for closed in [Closer::new(), Closer::default()] {
+                let (server, _peer) = pair();
+                let closed = Arc::new(closed);
+                let (started_tx, started) = mpsc::channel();
+                let waiter = {
+                    let closed = closed.clone();
+                    thread::spawn(move || {
+                        let mut io = Io { stream: &server, closed: &closed, deadline: None };
+                        started_tx.send(()).unwrap();
+                        let result = if write {
+                            io.write_all(&vec![0; MAX_OUTPUT_BACKLOG])
+                        } else {
+                            io.read(&mut [0]).map(drop)
+                        };
+                        (result.unwrap_err().kind(), Instant::now())
+                    })
+                };
+                started.recv().unwrap();
+                // let it fill the socket and start waiting
+                thread::sleep(Duration::from_millis(30));
+                assert!(!waiter.is_finished());
+                let at = Instant::now();
+                closed.close();
+                let (kind, ended) = waiter.join().unwrap();
+                assert_eq!(kind, io::ErrorKind::BrokenPipe);
+                let took = ended.saturating_duration_since(at);
+                // generous so a loaded machine does not fail it; a lost wake-up never ends
+                assert!(took < Duration::from_millis(500), "write {write}: close took {took:?}");
+            }
+        }
+    }
+
+    /// A connection that sends nothing ends as soon as the server closes it.
+    #[test]
+    fn closing_an_idle_client_ends_its_reader_promptly() {
+        let (server, mut peer) = pair();
+        let (tx, events) = mpsc::sync_channel(64);
+        let mut srv = Server::new(tx);
+        srv.accept(server);
+        write_frame(&mut peer, C_IDENTIFY, b"").unwrap();
+        let cid = *srv.clients.keys().next().unwrap();
+        // the identify frame arrives; after that the reader waits with no deadline
+        loop {
+            let event = events.recv_timeout(Duration::from_secs(2)).expect("identify");
+            if matches!(event, Event::ClientMsg(..)) { break; }
+            assert!(!matches!(event, Event::ClientGone(_)), "refused");
+        }
+        thread::sleep(Duration::from_millis(30));
+        let at = Instant::now();
+        srv.clients[&cid].closed.close();
+        loop {
+            let event = events.recv_timeout(Duration::from_secs(2)).expect("reader end");
+            if matches!(event, Event::ClientGone(c) if c == cid) { break; }
+        }
+        let took = at.elapsed();
+        assert!(took < Duration::from_millis(500), "reader ended after {took:?}");
     }
 
     #[test]
