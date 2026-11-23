@@ -192,15 +192,25 @@ pub fn shell_command(command: &str) -> std::process::Command {
 /// the server reads or whose input it writes. On Windows the server has no console, so a
 /// job gets a console of its own (without a window), with the system's console code page
 /// (an OEM one such as 437 or 949, unless UTF-8 is set for the system): PowerShell and
-/// cmd.exe write to a pipe in that code page, which loses what it has no character for
-/// (`é` is `e` in 949). So the job's shell is first told to use UTF-8 ([`job_script`]),
-/// and what is not UTF-8 is read in the console code page ([`job_text`]).
+/// cmd.exe write to a pipe and read one in that code page, which loses what it has no
+/// character for (`é` is `e` in 949). PowerShell reads all of its standard input before
+/// it runs its command, so nothing the command does can change that. So the job is
+/// started by pwsh-tmux itself ([`JOB_HOST`]), which sets the console it gets to UTF-8
+/// and then runs the shell in it, as the shell would be run otherwise; and what is not
+/// UTF-8 is read in the console code page ([`job_text`]).
 pub fn job_command(command: &str) -> std::process::Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        let shell = default_shell();
-        let mut c = via_shell(&shell, &job_script(&shell, command)).command();
+        let run = via_shell(&default_shell(), command);
+        let mut c = match std::env::current_exe() {
+            Ok(exe) => {
+                let mut c = std::process::Command::new(exe);
+                c.arg(JOB_HOST).args(job_host_args(&run));
+                c
+            }
+            Err(_) => run.command(),
+        };
         c.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
         c
     }
@@ -210,41 +220,74 @@ pub fn job_command(command: &str) -> std::process::Command {
     }
 }
 
-/// `command` for the shell of jobs on Windows, with its console set to UTF-8 first, so
-/// what it prints reaches the server as printed. Nothing else changes for the command:
-/// - PowerShell (5.1 and 7): [Console]::OutputEncoding (what PowerShell writes to a pipe
-///   in, and the console code page the programs it runs get), [Console]::InputEncoding
-///   (how it reads copy-pipe's and pipe-pane's text) and $OutputEncoding (what it gives
-///   programs it pipes to) are UTF-8 without a BOM; an error doing so is ignored. Not for
-///   a command that starts with `using`, which must come first in a script.
-/// - cmd.exe: `chcp 65001`, its output and errors thrown away, then the command after
-///   `&` (which binds least, so the command is all of what follows).
-/// - Other shells are given the command as it is (Git Bash's programs write UTF-8).
+/// `pwsh-tmux __job N WORD... [RAW]` runs the job of [`job_command`]: the N words of a
+/// [`ShellCommand`] (N at least 1), then its raw rest when there is one ([`job_host_args`]).
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn job_script(shell: &str, command: &str) -> String {
-    match shell_kind(shell) {
-        ShellKind::PowerShell => {
-            let first = command.trim_start().split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("");
-            if first.eq_ignore_ascii_case("using") {
-                return command.to_string();
-            }
-            format!("{PWSH_UTF8}; {command}")
-        }
-        ShellKind::Cmd => format!("chcp 65001 >nul 2>nul & {command}"),
-        _ => command.to_string(),
+pub const JOB_HOST: &str = "__job";
+
+/// The arguments after [`JOB_HOST`] for running `run`. Each is a word of pwsh-tmux's own
+/// command line, quoted for CommandLineToArgvW, so it reads them back as they are.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn job_host_args(run: &ShellCommand) -> Vec<String> {
+    let mut v = Vec::with_capacity(run.argv.len() + 2);
+    v.push(run.argv.len().to_string());
+    v.extend(run.argv.iter().cloned());
+    v.extend(run.raw.iter().cloned());
+    v
+}
+
+/// The [`ShellCommand`] of [`job_host_args`], or None for anything else.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn parse_job_host_args(args: &[String]) -> Option<ShellCommand> {
+    let (n, rest) = args.split_first()?;
+    let n: usize = n.parse().ok().filter(|&n| n >= 1 && n <= rest.len())?;
+    match &rest[n..] {
+        [] => Some(ShellCommand { argv: rest[..n].to_vec(), raw: None }),
+        [raw] => Some(ShellCommand { argv: rest[..n].to_vec(), raw: Some(raw.clone()) }),
+        _ => None,
     }
 }
 
-/// Sets a PowerShell job's console and encodings to UTF-8 ([`job_script`]).
-#[cfg_attr(not(windows), allow(dead_code))]
-const PWSH_UTF8: &str = "try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; \
-$OutputEncoding = [Console]::OutputEncoding; [Console]::InputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }";
+/// pwsh-tmux as a job's host ([`JOB_HOST`]): its console's input and output code pages
+/// are set to UTF-8 (65001), then `run` is started in that console with this process's
+/// standard input, output and error, and its exit status is returned. The shell and
+/// what it runs therefore start with UTF-8 as their console code page: PowerShell's
+/// [Console]::InputEncoding and OutputEncoding are UTF-8 from the start, cmd.exe and
+/// the programs they run write UTF-8, and the command itself is run as it is. A shell
+/// that cannot be started is reported on standard output with status 127, as the server
+/// reported it before. The host and the job are in a job object that ends them all
+/// should the host be ended (its pid is the job's), and that lets what is still running
+/// when the shell exits go on.
+#[cfg(windows)]
+pub fn host_job(run: &ShellCommand) -> i32 {
+    use windows_sys::Win32::Globalization::CP_UTF8;
+    use windows_sys::Win32::System::Console::{SetConsoleCP, SetConsoleOutputCP};
+    unsafe {
+        SetConsoleCP(CP_UTF8);
+        SetConsoleOutputCP(CP_UTF8);
+    }
+    let job = win::JobObject::kill_on_close();
+    let status = run.command().status();
+    if let Some(job) = job {
+        job.let_go();
+    }
+    match status {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = writeln!(out, "{e}");
+            let _ = out.flush();
+            127
+        }
+    }
+}
 
 /// What a job printed, as text: on Unix the bytes as UTF-8, as tmux shows them. On
-/// Windows each line that is UTF-8 is read as it is, and any other in the console code
-/// page jobs get ([`job_command`]): a program that writes in that code page (as programs
-/// run by Git Bash do, or a shell that was not told to use UTF-8) is shown as it would be
-/// in a pane, whose console reads it in that code page too.
+/// Windows each line that is UTF-8 is read as it is (jobs' consoles are UTF-8, see
+/// [`job_command`]), and any other in the system's console code page (`GetOEMCP`): a
+/// program that writes in that code page whatever its console's is, is shown as a pane
+/// whose console has that code page shows it.
 pub fn job_text(bytes: &[u8]) -> String {
     #[cfg(windows)]
     {
@@ -384,6 +427,49 @@ pub mod win {
         let mut wide = vec![0u16; n as usize];
         let n = unsafe { MultiByteToWideChar(cp, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n) };
         (n > 0).then(|| String::from_utf16_lossy(&wide[..n as usize]))
+    }
+
+    /// A job object this process is in, which ends every process in it when its handle
+    /// is closed (when this process ends), until [`JobObject::let_go`]. Processes in it
+    /// may still start others outside it (CREATE_BREAKAWAY_FROM_JOB).
+    pub struct JobObject(windows_sys::Win32::Foundation::HANDLE);
+
+    impl JobObject {
+        /// None when it cannot be made or this process cannot be put in it.
+        pub fn kill_on_close() -> Option<JobObject> {
+            use windows_sys::Win32::System::JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            };
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            unsafe {
+                let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if h.is_null() {
+                    return None;
+                }
+                let job = JobObject(h);
+                (job.limit(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK) && AssignProcessToJobObject(h, GetCurrentProcess()) != 0).then_some(job)
+            }
+        }
+
+        fn limit(&self, flags: u32) -> bool {
+            use windows_sys::Win32::System::JobObjects::{JobObjectExtendedLimitInformation, SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION};
+            unsafe {
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = flags;
+                SetInformationJobObject(self.0, JobObjectExtendedLimitInformation, (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(), std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32) != 0
+            }
+        }
+
+        /// Lets the processes in it go on when this process ends.
+        pub fn let_go(self) {
+            self.limit(windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_BREAKAWAY_OK);
+        }
+    }
+
+    impl Drop for JobObject {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
     }
 
     /// Pids of direct children of `parent` with the given executable name.
@@ -581,20 +667,23 @@ mod shell_tests {
     }
 
     #[test]
-    fn jobs_shells_print_utf8() {
-        // PowerShell: the encodings first, unless the command must come first
-        for ps in ["powershell.exe", "pwsh", "C:\\Program Files\\PowerShell\\7\\pwsh.exe"] {
-            assert_eq!(job_script(ps, "echo '\u{d55c}\u{ae00}'"), format!("{PWSH_UTF8}; echo '\u{d55c}\u{ae00}'"));
-            assert_eq!(job_script(ps, "  Using namespace System.Text; [UTF8Encoding]"), "  Using namespace System.Text; [UTF8Encoding]");
-            assert_eq!(job_script(ps, "usingx"), format!("{PWSH_UTF8}; usingx"));
+    fn a_job_host_reads_back_the_command_it_is_given() {
+        let commands = [
+            via_shell_on("powershell.exe", "echo '\u{d55c}' \"a b\" \\\"", true),
+            via_shell_on("cmd.exe", "echo \"%%%\" & pause", true),
+            via_shell_on("C:\\Program Files\\Git\\bin\\bash.exe", "", true),
+            ShellCommand { argv: vec!["3".into()], raw: Some("1".into()) },
+            ShellCommand::words(vec!["x".into(), "".into(), "2".into()]),
+        ];
+        for run in commands {
+            let args = job_host_args(&run);
+            assert_eq!(args[0], run.argv.len().to_string());
+            assert_eq!(parse_job_host_args(&args), Some(run));
         }
-        assert!(PWSH_UTF8.starts_with("try {") && PWSH_UTF8.ends_with("} catch { }"));
-        assert!(PWSH_UTF8.contains("[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false"));
-        // cmd.exe: chcp, its output and errors thrown away
-        assert_eq!(job_script("cmd.exe", "echo \"%%%\" | more"), "chcp 65001 >nul 2>nul & echo \"%%%\" | more");
-        // others as they are
-        assert_eq!(job_script("bash", "echo 'x'; exit 3"), "echo 'x'; exit 3");
-        assert_eq!(job_script("/bin/sh", "a"), "a");
+        // anything else is refused
+        for bad in [&[][..], &["0".to_string()][..], &["2".into(), "a".into()][..], &["1".into(), "a".into(), "b".into(), "c".into()][..], &["x".into(), "a".into()][..]] {
+            assert_eq!(parse_job_host_args(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
@@ -610,54 +699,11 @@ mod shell_tests {
         assert_eq!(job_text(b"x\xe9\n"), "x\u{fffd}\n");
     }
 
-    /// Runs `command` as a job's `shell` (a console of its own without a window, as
-    /// the server's jobs have), with what it prints read as the server reads it.
-    #[cfg(windows)]
-    fn job_output(shell: &str, command: &str) -> String {
-        use std::os::windows::process::CommandExt;
-        let mut c = via_shell(shell, &job_script(shell, command)).command();
-        c.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-        c.stdin(std::process::Stdio::null());
-        let o = c.output().expect("run the job");
-        job_text(&o.stdout) + &job_text(&o.stderr)
-    }
-
     #[cfg(windows)]
     #[test]
     fn windows_code_pages_are_read() {
         assert_eq!(win::code_page_text(b"\xc7\xd1\xb1\xdb", 949).as_deref(), Some("\u{d55c}\u{ae00}"));
         assert_eq!(win::code_page_text(b"\x82", 437).as_deref(), Some("\u{e9}"));
         assert_eq!(win::code_page_text(b"", 949).as_deref(), Some(""));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_jobs_print_what_their_shell_prints() {
-        // Hangul, é and a curly quote: none of them are in every console code page (é and
-        // ‘ are not in 949, Hangul is not in 437); PowerShell's ‘ ’ are its quotes
-        let text = "\u{d55c}\u{ae00} \u{e9} \u{201c}q\u{201d}";
-        let mut shells = vec!["powershell.exe"];
-        if which("pwsh.exe").is_some() {
-            shells.push("pwsh.exe");
-        }
-        // (the user's profile runs first and may print something)
-        for ps in shells {
-            let out = job_output(ps, &format!("echo '{text}'"));
-            assert!(out.ends_with(&format!("\n{text}\r\n")) || out == format!("{text}\r\n"), "{ps}: {out:?}");
-            let out = job_output(ps, &format!("echo '{text}' | findstr q"));
-            assert!(out.trim_end().ends_with(text), "{ps}, a program it pipes to: {out:?}");
-            let out = job_output(ps, "using namespace System.Text; [UTF8Encoding]::new($false).GetType().Name");
-            assert!(out.trim_end().ends_with("UTF8Encoding"), "{ps}: {out:?}");
-        }
-        // cmd.exe: quotes as written, no backslashes added; its own output in UTF-8
-        assert_eq!(job_output("cmd.exe", "echo \"%%%\" & echo \"a b\"").replace(' ', ""), "\"%%%\"\r\n\"ab\"\r\n");
-        assert_eq!(job_output("cmd.exe", &format!("echo {text}")), format!("{text}\r\n"));
-        assert_eq!(job_output("cmd.exe", "\"cmd.exe\" /c echo \"x\""), "\"x\"\r\n");
-        // Git Bash, when it is installed
-        let bash = std::path::Path::new("C:\\Program Files\\Git\\bin\\bash.exe");
-        if bash.is_file() {
-            let bash = bash.to_string_lossy();
-            assert_eq!(job_output(&bash, &format!("echo '{text}' \"%%%\" \\\"")), format!("{text} %%% \"\n"));
-        }
     }
 }
