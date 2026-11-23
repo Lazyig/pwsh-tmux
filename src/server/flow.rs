@@ -3,8 +3,9 @@
 //! A pane's reader keeps at most [`CREDITS`] chunks queued but not yet handled by the main
 //! loop. Reading ahead without a limit fills the shared event queue, and client input
 //! then waits behind a queue of output. A reader waiting for a credit holds the chunk it
-//! has read, as a reader blocked on a full queue would, and the main loop sees that in
-//! the [`Backlog`]: a burst of output is still rendered once per burst.
+//! has read, as a reader blocked on a full queue would, and the main loop sees that (and
+//! output waiting in a Unix terminal for the reader) in the [`Backlog`]: a burst of
+//! output is still rendered once per burst.
 //!
 //! A pane's exit is reported after the output it wrote before exiting has been handled
 //! (tmux's window_pane_destroy_ready), so its last output is always on the screen.
@@ -43,7 +44,8 @@ const TIMING: Timing = Timing {
 struct State {
     /// Chunks read and not yet handled by the main loop, the one the reader holds included.
     in_flight: usize,
-    /// The reader is in a read, or about to start one.
+    /// The reader waits for output: in a poll with nothing to read (Unix), or in a read
+    /// or about to start one.
     reading: bool,
     /// Counts the reader's reads that returned.
     reads: u64,
@@ -51,6 +53,9 @@ struct State {
     eof: bool,
     /// The pane is gone: the reader discards what it reads.
     closed: bool,
+    /// Threads waiting for a change: a change wakes them (only then, as a wake-up is a
+    /// system call and there is one per chunk otherwise).
+    waiting: usize,
 }
 
 /// What a pane's reader, its child waiter and the main loop share.
@@ -66,8 +71,21 @@ impl Flow {
     }
 
     fn update(&self, f: impl FnOnce(&mut State)) {
-        f(&mut self.lock());
-        self.changed.notify_all();
+        let mut s = self.lock();
+        f(&mut s);
+        if s.waiting > 0 {
+            self.changed.notify_all();
+        }
+    }
+
+    fn wait<'a>(&self, mut s: MutexGuard<'a, State>, timeout: Option<Duration>) -> MutexGuard<'a, State> {
+        s.waiting += 1;
+        let mut s = match timeout {
+            None => self.changed.wait(s).unwrap_or_else(|e| e.into_inner()),
+            Some(t) => self.changed.wait_timeout(s, t).unwrap_or_else(|e| e.into_inner()).0,
+        };
+        s.waiting -= 1;
+        s
     }
 
     /// Marks the reader as reading. False once the pane is gone.
@@ -77,12 +95,17 @@ impl Flow {
         !s.closed
     }
 
+    #[cfg(unix)]
+    fn set_reading(&self, reading: bool) {
+        self.lock().reading = reading;
+    }
+
     /// Waits, holding a chunk just read, until [`CREDITS`] or fewer chunks are queued
     /// before it. False once the pane is gone.
     fn wait_credit(&self) -> bool {
         let mut s = self.lock();
         while s.in_flight > CREDITS && !s.closed {
-            s = self.changed.wait(s).unwrap_or_else(|e| e.into_inner());
+            s = self.wait(s, None);
         }
         !s.closed
     }
@@ -150,7 +173,7 @@ impl Flow {
             }
             // woken by the reader and the main loop; the kernel's bytes are polled
             let wait = idle.map_or(t.quiet, |(since, _)| t.quiet.saturating_sub(now.duration_since(since)));
-            s = self.changed.wait_timeout(s, wait.max(Duration::from_millis(1))).unwrap_or_else(|e| e.into_inner()).0;
+            s = self.wait(s, Some(wait.max(Duration::from_millis(1))));
         }
     }
 }
@@ -186,8 +209,9 @@ impl Drop for Output {
     }
 }
 
-/// Counts the panes' readers that hold output read but not yet queued. Output follows
-/// soon then: the main loop has handled (or is about to take) the chunks before it.
+/// Counts the panes' readers that hold output read but not yet queued, or (Unix) whose
+/// terminal has more for the next read. Output follows soon then: the main loop has
+/// handled (or is about to take) the chunks before it, which would otherwise be queued.
 #[derive(Clone, Default)]
 pub struct Backlog(Arc<AtomicUsize>);
 
@@ -211,9 +235,11 @@ impl Drop for Held<'_> {
 }
 
 /// The pane reader thread: reads the terminal and sends its output to the main loop.
-pub fn read_pane(mut reader: Box<dyn Read + Send>, flow: Arc<Flow>, backlog: Backlog, tx: SyncSender<Event>, id: PaneId, generation: u32) {
+pub fn read_pane(mut reader: Box<dyn Read + Send>, more: Pending, flow: Arc<Flow>, backlog: Backlog, tx: SyncSender<Event>, id: PaneId, generation: u32) {
     let mut buf = vec![0u8; 64 * 1024];
+    let mut held = None;
     while flow.begin_read() {
+        more.wait_output(&flow, &mut held);
         let n = match reader.read(&mut buf) {
             Ok(n) if n > 0 => n,
             _ => {
@@ -223,14 +249,17 @@ pub fn read_pane(mut reader: Box<dyn Read + Send>, flow: Arc<Flow>, backlog: Bac
         };
         let Some(credit) = flow.end_read(true) else { break };
         // until the chunk is queued (a full queue included)
-        let _held = backlog.hold();
+        let h = held.take().unwrap_or_else(|| backlog.hold());
         if !flow.wait_credit() {
             break;
         }
         if tx.send(Event::PaneData(id, generation, buf[..n].to_vec(), credit)).is_err() {
             return;
         }
+        // until the next chunk is read, unless the terminal has nothing (wait_output)
+        held = Some(h);
     }
+    drop(held);
     // The pane has gone. Keep reading to the end: a pseudoconsole being closed waits for
     // its output to be read (older Windows), and a Unix process is not left blocked.
     while matches!(reader.read(&mut buf), Ok(n) if n > 0) {}
@@ -269,14 +298,39 @@ impl Read for PtyReader {
     }
 }
 
-/// Whether bytes are waiting in a pane's terminal, for [`Flow::settle`].
+/// Whether bytes are waiting in a pane's terminal, for [`Flow::settle`] and the reader.
+#[derive(Clone)]
 pub struct Pending {
-    /// The reader's pty master, for FIONREAD.
+    /// The reader's pty master, for poll and FIONREAD.
     #[cfg(unix)]
     fd: Option<Arc<std::fs::File>>,
 }
 
 impl Pending {
+    /// Before a read: returns once the terminal has output (or has closed). The reader
+    /// counts as waiting for output, for [`Flow::settle`], only while it has none to
+    /// read: so a read that took the last bytes is never mistaken for an idle reader. A
+    /// `held` chunk is let go when the reader has to wait.
+    fn wait_output<'a>(&self, flow: &Flow, held: &mut Option<Held<'a>>) {
+        #[cfg(unix)]
+        if let Some(fd) = &self.fd {
+            let ready = match poll_in(fd, 0) {
+                Some(false) => {
+                    *held = None;
+                    poll_in(fd, -1)
+                }
+                ready => ready,
+            };
+            if ready.is_some() {
+                flow.set_reading(false);
+                return;
+            }
+        }
+        // the read waits, and counts as waiting for output
+        let _ = flow;
+        *held = None;
+    }
+
     fn any(&self) -> bool {
         #[cfg(unix)]
         {
@@ -289,6 +343,24 @@ impl Pending {
         #[cfg(windows)]
         {
             false
+        }
+    }
+}
+
+/// Whether the terminal has output to read (or has closed), waiting up to `timeout`
+/// milliseconds (-1: no limit). None if it cannot be polled: the read is left to wait
+/// (and to report any error).
+#[cfg(unix)]
+fn poll_in(fd: &std::fs::File, timeout: libc::c_int) -> Option<bool> {
+    use std::os::fd::AsRawFd;
+    let mut p = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    loop {
+        // SAFETY: one pollfd
+        match unsafe { libc::poll(&mut p, 1, timeout) } {
+            0 => return Some(false),
+            n if n > 0 => return (p.revents & libc::POLLNVAL == 0).then_some(true),
+            _ if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted => return None,
+            _ => {}
         }
     }
 }
@@ -365,7 +437,11 @@ mod tests {
         let src = Src(data, 0, read.clone());
         let backlog = Backlog::default();
         let b = backlog.clone();
-        let reader = thread::spawn(move || read_pane(Box::new(src), flow, b, tx, 1, 0));
+        let none = Pending {
+            #[cfg(unix)]
+            fd: None,
+        };
+        let reader = thread::spawn(move || read_pane(Box::new(src), none, flow, b, tx, 1, 0));
         // four chunks reach the queue, then the reader waits holding a fifth
         let mut got = Vec::new();
         for _ in 0..CREDITS {
@@ -421,6 +497,40 @@ mod tests {
         let took = start.elapsed();
         assert!(took >= Duration::from_millis(100) && took < Duration::from_secs(5), "{took:?}");
         drop(tx);
+    }
+
+    // A Unix reader polls first: it counts as waiting for output only while it has none.
+    #[cfg(unix)]
+    #[test]
+    fn a_reader_waits_for_output_in_a_poll_and_not_while_it_reads() {
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+        let mut fds = [0; 2];
+        // SAFETY: two descriptors
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: just opened, owned here
+        let (r, mut w) = unsafe { (std::fs::File::from_raw_fd(fds[0]), std::fs::File::from_raw_fd(fds[1])) };
+        let r = Arc::new(r);
+        let (out, flow) = Output::new();
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        let backlog = Backlog::default();
+        let (f, b, more) = (flow.clone(), backlog.clone(), Pending { fd: Some(r.clone()) });
+        let reader = thread::spawn(move || read_pane(Box::new(PtyReader(r)), more, f, b, tx, 1, 0));
+        let start = Instant::now();
+        while !flow.lock().reading {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!backlog.any(), "nothing held while the terminal has nothing");
+        w.write_all(b"abc").unwrap();
+        let Ok(Event::PaneData(_, _, data, credit)) = rx.recv_timeout(Duration::from_secs(5)) else { panic!("no output") };
+        assert_eq!(data, b"abc");
+        assert_eq!(flow.lock().in_flight, 1);
+        drop(credit);
+        drop(w);
+        reader.join().unwrap();
+        assert!(flow.lock().eof && !backlog.any());
+        drop(out);
     }
 
     #[test]

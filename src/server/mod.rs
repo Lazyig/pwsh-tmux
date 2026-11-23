@@ -1623,9 +1623,9 @@ pub fn run(config: Option<String>, cwd: Option<String>) -> io::Result<()> {
 }
 
 /// The next event of a burst being coalesced. A pane reader holding output it has read
-/// (waiting for its chunks before to be handled) is sending it next: that output would
-/// be queued already without the limit on queued output, so it is waited for, up to the
-/// burst's deadline.
+/// (waiting for its chunks before to be handled) or about to read it is sending it next:
+/// that output would be queued already without the limit on queued output, so it is
+/// waited for, up to the burst's deadline.
 fn next_in_burst(rx: &mpsc::Receiver<Event>, backlog: &flow::Backlog, deadline: Instant) -> Option<Event> {
     if let Ok(ev) = rx.try_recv() {
         return Some(ev);
@@ -3220,7 +3220,8 @@ impl Server {
         let (output, flow) = flow::Output::new();
         let tx = self.tx.clone();
         let (reader_flow, backlog) = (flow.clone(), self.backlog.clone());
-        thread::spawn(move || flow::read_pane(reader, reader_flow, backlog, tx, id, generation));
+        let more = pending.clone();
+        thread::spawn(move || flow::read_pane(reader, more, reader_flow, backlog, tx, id, generation));
         if let Some(mut child) = child {
             let tx = self.tx.clone();
             thread::spawn(move || {
