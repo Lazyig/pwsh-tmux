@@ -3092,9 +3092,13 @@ impl Server {
             st.timer = None;
             self.name_changed.remove(&active);
             let fmt = self.opt_window(Some(wid), "automatic-rename-format");
-            let name = self.expand_for_pane(active, &fmt);
-            if !name.is_empty() && self.windows.get(&wid).is_some_and(|w| w.name != name) {
-                self.windows.get_mut(&wid).unwrap().name = name;
+            // automatic_rename_update compares the expanded name with the window's, then
+            // window_set_name(w, name, 1) sets it cleaned (clean_name, untrusted: #( made
+            // _( ), firing window-renamed even when that gives the same name
+            let expanded = self.expand_for_pane(active, &fmt);
+            if !expanded.is_empty() && self.windows.get(&wid).is_some_and(|w| w.name != expanded) {
+                *self.ev.renamed.entry(wid).or_default() += 1;
+                self.windows.get_mut(&wid).unwrap().name = cmds::clean_untrusted_name(&expanded);
                 self.mark_window_dirty(wid);
             }
         }

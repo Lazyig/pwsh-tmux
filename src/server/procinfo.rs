@@ -153,7 +153,8 @@ pub fn program_name(argv0: &str) -> String {
 /// What each pane runs, for (shell pid, pty foreground process group) pairs: the
 /// foreground program's name and, where it can be read, its working directory.
 ///
-/// On Unix that is the pty's foreground process group. On Windows it is the deepest
+/// On Unix that is the pty's foreground process group, and the name is the first word
+/// of its command line (osdep_get_name), such as `-bash` or `/usr/bin/vim`. On Windows it is the deepest
 /// descendant of the pane's shell, found in one process snapshot shared by all panes.
 /// This can be slow on a busy system, so the server calls it off its main thread.
 pub fn pane_programs(panes: &[(Option<u32>, Option<i32>)]) -> Vec<(Option<String>, Option<String>)> {
@@ -166,9 +167,16 @@ pub fn pane_programs(panes: &[(Option<u32>, Option<i32>)]) -> Vec<(Option<String
                 if exec_pending(p) {
                     return (None, None);
                 }
-                let comm = std::fs::read_to_string(format!("/proc/{p}/comm")).ok().map(|c| c.trim().to_string());
+                // osdep_get_name: the first word of its command line as it is (the
+                // name of the program a pane runs is parse_window_name of it), else its
+                // name from the kernel
+                let argv0 = std::fs::read(format!("/proc/{p}/cmdline")).ok().and_then(|c| {
+                    let first = c.split(|&b| b == 0).next().unwrap_or_default();
+                    (!first.is_empty()).then(|| String::from_utf8_lossy(first).into_owned())
+                });
+                let name = argv0.or_else(|| std::fs::read_to_string(format!("/proc/{p}/comm")).ok().map(|c| c.trim().to_string()));
                 let cwd = std::fs::read_link(format!("/proc/{p}/cwd")).ok().map(|p| p.to_string_lossy().into_owned());
-                (comm, cwd)
+                (name, cwd)
             })
             .collect()
     }

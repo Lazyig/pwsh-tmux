@@ -98,13 +98,27 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   `pane_title` begins as the shell's executable path and changes with the console title.
   On Windows clean_name keeps backslashes (they separate the parts of a path) in every
   title, name and path: those set by the program in the pane (OSC 0/2, APC, `ESC k`), OSC 7
-  paths, and those given by commands (`select-pane -T`, `rename-window`, `new-window -n`,
-  `break-pane -n`, `new-session -s`/`-n`, `rename-session`, and buffer names from
-  `set-buffer -b`/`-n` and `load-buffer -b`), so a name typed as `C:\Users\x` is kept as typed
-  and found by that name, and renaming from a prompt that shows the name (`prefix ,`) does
-  not double them each time. On Unix they are escaped as in 3.8 (`C:\\Users\\x`). The
-  other escapes (tab, newline and control characters as `\t`, `\n` and octal) are the same
-  on both, and the names given by commands are refused for them anyway (check_name).
+  paths, those given by commands (`select-pane -T`, the title of a floating pane from
+  `new-pane -T`, `rename-window`, `new-window -n`, `break-pane -n`, `new-session -s`/`-n`,
+  `rename-session`, and buffer names from `set-buffer -b`/`-n` and `load-buffer -b`), and
+  window names that are not given (a new window's, from its command, and
+  `automatic-rename`'s, `pane_current_command`), so a name typed as `C:\Users\x` is kept
+  as typed and found by that name, and renaming from a prompt that shows the name
+  (`prefix ,`) does not double them each time. On Unix they are escaped as in 3.8
+  (`C:\\Users\\x`). There, as in 3.8, a new window is named by parse_window_name of its
+  command line as `pane_start_command` shows it (each argument escaped), and
+  `pane_current_command` is parse_window_name of the first word of the foreground
+  program's command line (`/proc/PID/cmdline`, so `/p/-l` is `-l` and a long name is not
+  cut to 15 bytes); `automatic-rename` compares the expanded
+  `automatic-rename-format` with the window's name and, when they differ, sets it
+  through clean_name again (window_set_name), so a program named `a\b` gives a window
+  named `a\\\\b`, and fires `window-renamed` even when that is the name it had. On both,
+  window_set_name makes a `#(` in an automatic name `_(`.
+  Popup titles (`display-popup -T`) and floating-pane titles (`new-pane -T`, as
+  `select-pane -T`) go through clean_name only where 3.8 has it: a popup title never, so it
+  keeps backslashes on both; a floating pane's title as above. The other escapes (tab,
+  newline and control characters as `\t`, `\n` and octal) are the same on both, and the
+  names given by commands are refused for them anyway (check_name).
 - **Names that coexist with tmux.** The server listens on `/tmp/pwsh-tmux-UID/NAME`
   (under `PWSH_TMUX_TMPDIR` or `TMUX_TMPDIR` if set) on Unix and on a named pipe on
   Windows. Panes get `PWSH_TMUX` and `PWSH_TMUX_PANE` in place of `TMUX` and `TMUX_PANE`,

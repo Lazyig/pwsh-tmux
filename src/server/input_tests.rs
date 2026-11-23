@@ -990,6 +990,48 @@ fn window_names_follow_mode_changes_at_most_every_name_interval() {
 }
 
 #[test]
+fn automatic_names_are_compared_as_expanded_and_set_cleaned() {
+    // automatic_rename_update: the expanded format is compared with the window's name and
+    // set through window_set_name(w, name, 1) when they differ, so a name that clean_name
+    // changes is set (and window-renamed fired) at each check, as in tmux 3.8
+    let mut f = fixture();
+    let pane = f.pane;
+    let wid = f.window_of(pane).unwrap();
+    let g = f.panes[&pane].generation;
+    f.name_known.insert((pane, g));
+    #[cfg(unix)]
+    {
+        let start = Instant::now();
+        let (pid, pgrp) = (f.panes[&pane].pid, f.panes[&pane].fg_pgrp());
+        while procinfo::pane_programs(&[(pid, pgrp)]).pop().and_then(|r| r.0).is_none() && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    run(&mut f, &["set-option", "-w", "automatic-rename-format", "a\\b ##(x) c"]);
+    let want = if cfg!(windows) { "a\\b _(x) c" } else { "a\\\\b _(x) c" };
+    f.ev.renamed.clear();
+    f.name_changed.insert(pane);
+    f.automatic_rename();
+    assert_eq!(f.windows[&wid].name, want);
+    assert_eq!(f.ev.renamed.get(&wid), Some(&1));
+    std::thread::sleep(NAME_INTERVAL + Duration::from_millis(20));
+    f.name_changed.insert(pane);
+    f.automatic_rename();
+    assert_eq!(f.windows[&wid].name, want);
+    assert_eq!(f.ev.renamed.get(&wid), Some(&2));
+    // a name that clean_name keeps is set once
+    run(&mut f, &["set-option", "-w", "automatic-rename-format", "plain"]);
+    f.ev.renamed.clear();
+    for _ in 0..2 {
+        std::thread::sleep(NAME_INTERVAL + Duration::from_millis(20));
+        f.name_changed.insert(pane);
+        f.automatic_rename();
+    }
+    assert_eq!(f.windows[&wid].name, "plain");
+    assert_eq!(f.ev.renamed.get(&wid), Some(&1));
+}
+
+#[test]
 fn keys_of_one_read_wait_behind_the_prompt_one_of_them_opens() {
     // server_client_handle_key0 takes every key of a read before the client's queue runs
     // any: C-b : opens a prompt that waits (CMD_RETURN_WAIT), and the keys read with it

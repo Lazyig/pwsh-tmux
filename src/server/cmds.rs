@@ -1450,7 +1450,21 @@ impl Server {
         self.mark_session_dirty(sid);
     }
 
+    /// The shell a new pane of session `sid` runs (wp->shell): default-shell, or the
+    /// platform's when it is empty, as [`Server::spawn_into`] chooses it.
+    fn shell_of(&self, sid: Option<SessId>) -> String {
+        let shell = self.opt_session(sid, "default-shell");
+        if shell.is_empty() { procinfo::default_shell() } else { shell }
+    }
+
+    /// default_window_name: the name of what a new pane runs, `cmd`, else
+    /// default-command, else default-shell. On Unix, as in 3.8, parse_window_name of the
+    /// command as cmd_stringify_argv gives it (or of the shell); on Windows the program's
+    /// name without its directory and extension.
     fn window_name_for(&self, cmd: &[String], sid: Option<SessId>) -> String {
+        if cfg!(unix) {
+            return default_window_name(cmd, &self.opt_session(sid, "default-command"), &self.shell_of(sid));
+        }
         match cmd.first() {
             Some(c) if cmd.len() == 1 => procinfo::program_name(c.split_whitespace().next().unwrap_or(c)),
             Some(c) => procinfo::program_name(c),
@@ -3274,6 +3288,7 @@ impl Server {
                 // default_window_name: the pane's command as given, else its shell
                 let wname = name.clone().unwrap_or_else(|| match self.panes.get(&pane).map(|p| &p.track.argv) {
                     Some(argv) if argv.iter().any(|a| !a.is_empty()) => self.window_name_for(argv, Some(ssid)),
+                    Some(_) if cfg!(unix) => parse_window_name(&self.shell_of(Some(ssid))),
                     Some(_) => procinfo::program_name(&self.opt_session(Some(ssid), "default-shell")),
                     None => String::new(),
                 });
@@ -6209,6 +6224,51 @@ pub(crate) fn clean_title(title: &str) -> Option<String> {
     check_name(title).then(|| clean_name(title))
 }
 
+/// clean_name(name, 1) for a name that does not come from a command (the automatic
+/// name of a window): a #( becomes _( so it is never run as a job, then [`clean_name`].
+pub(crate) fn clean_untrusted_name(name: &str) -> String {
+    clean_name(&name.replace("#(", "_("))
+}
+
+/// parse_window_name (names.c): the name of a program from its command line, as
+/// pane_current_command shows it: past a leading `"` and up to the next, without "exec ",
+/// leading spaces and dashes, up to a space, without trailing bytes that are neither
+/// letters, digits nor punctuation, the basename of a path from /, then clean_name.
+pub(crate) fn parse_window_name(cmd: &str) -> String {
+    let mut name = cmd.as_bytes();
+    if name.first() == Some(&b'"') {
+        name = &name[1..];
+    }
+    name = &name[..name.iter().position(|&b| b == b'"').unwrap_or(name.len())];
+    name = name.strip_prefix(b"exec ").unwrap_or(name);
+    while let [b' ' | b'-', rest @ ..] = name {
+        name = rest;
+    }
+    name = &name[..name.iter().position(|&b| b == b' ').unwrap_or(name.len())];
+    while name.len() > 1 && !name[name.len() - 1].is_ascii_alphanumeric() && !name[name.len() - 1].is_ascii_punctuation() {
+        name = &name[..name.len() - 1];
+    }
+    // basename(3)
+    if name.first() == Some(&b'/') {
+        let trimmed = &name[..name.iter().rposition(|&b| b != b'/').map_or(1, |i| i + 1)];
+        name = &trimmed[trimmed.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1).min(trimmed.len().saturating_sub(1))..];
+    }
+    // clean_name: nothing when it is not UTF-8 (a character cut above)
+    std::str::from_utf8(name).map(clean_name).unwrap_or_default()
+}
+
+/// default_window_name (names.c) for a pane that runs `cmd`, else `default_command`
+/// (spawn_pane gives it as the pane's command), else `shell`: parse_window_name of the
+/// command as cmd_stringify_argv gives it, or of the shell.
+pub(crate) fn default_window_name(cmd: &[String], default_command: &str, shell: &str) -> String {
+    let line = match cmd {
+        [] if default_command.is_empty() => String::new(),
+        [] => options::escape_arg(default_command),
+        _ => cmd.iter().map(|a| options::escape_arg(a)).collect::<Vec<_>>().join(" "),
+    };
+    parse_window_name(if line.is_empty() { shell } else { &line })
+}
+
 /// paste_set: a buffer name that is not empty and passes clean_name.
 fn buffer_name(name: &str) -> Result<String, String> {
     if name.is_empty() {
@@ -6409,6 +6469,47 @@ mod tests {
         }
         assert_eq!(clean_name("a\\b"), if cfg!(windows) { "a\\b" } else { "a\\\\b" });
         assert_eq!(clean_title("t\\x").as_deref(), Some(if cfg!(windows) { "t\\x" } else { "t\\\\x" }));
+    }
+
+    #[test]
+    fn window_names_from_commands_as_parse_window_name() {
+        for (cmd, name) in [
+            ("vim", "vim"),
+            ("-bash", "bash"),
+            ("exec  -zsh -l", "zsh"),
+            ("\"/usr/bin/my prog\" x", "my"),
+            ("/usr/local/bin/", "bin"),
+            ("/", "/"),
+            ("//", "/"),
+            ("/a//", "a"),
+            ("sleep\t\u{1}", "sleep"),
+            ("x\u{e9}", "x"),
+            ("", ""),
+        ] {
+            assert_eq!(parse_window_name(cmd), name, "{cmd:?}");
+        }
+        assert_eq!(parse_window_name("a\\b"), if cfg!(windows) { "a\\b" } else { "a\\\\b" });
+        // default_window_name: the command line as cmd_stringify_argv gives it (each
+        // argument escaped as args_print does) read by parse_window_name, as tmux 3.8
+        // names a new window (pwsh-tmux on Unix)
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let unix = |w: &str| if cfg!(windows) { w.replace("\\\\", "\\") } else { w.to_string() };
+        for (cmd, dc, name) in [
+            (v(&["vim foo"]), "", "vim".to_string()),
+            (v(&["/p/j k", "-c", "x"]), "", "j".to_string()),
+            (v(&["/p/m\"n", "x"]), "", "'/p/m".to_string()),
+            (v(&["/p/-l", "x"]), "", "-l".to_string()),
+            (v(&["/p/a\\b", "x"]), "", unix("a\\\\\\\\b")),
+            (v(&["/p/e#(f", "x"]), "", "e#(f".to_string()),
+            (v(&["/usr/bin/top"]), "", "top".to_string()),
+            (v(&[]), "htop -d 5", "htop".to_string()),
+            (v(&[]), "", "zsh".to_string()),
+        ] {
+            assert_eq!(default_window_name(&cmd, dc, "/bin/zsh"), name, "{cmd:?} {dc:?}");
+        }
+        // window_set_name(w, name, 1) for an automatic name
+        assert_eq!(clean_untrusted_name("#(x) ##(y)"), "_(x) #_(y)");
+        assert_eq!(clean_untrusted_name("a\\b\t"), if cfg!(windows) { "a\\b\\t" } else { "a\\\\b\\t" });
     }
 
     #[test]
