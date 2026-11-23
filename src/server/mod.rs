@@ -687,8 +687,9 @@ impl Pane {
         self.parser.screen()
     }
 
-    pub fn snapshot(&self) -> Vec<Line> {
-        crate::cells::snapshot(self.parser.screen())
+    /// The screen with its history for copy mode, frozen as it is now.
+    pub fn snapshot(&self) -> crate::copymode::Backing {
+        crate::copymode::Backing::frozen(self.parser.screen().clone())
     }
 
     pub fn kill(&mut self) {

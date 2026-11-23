@@ -3391,7 +3391,7 @@ impl Server {
                         if let Some((l, _)) = &mode_lines {
                             // the mode's screen is a clone with its own empty hyperlink set,
                             // so its cells' links do not resolve (-H and -e show none)
-                            let mut l = l.get(i).cloned().unwrap_or_default();
+                            let mut l = l.cloned(i).unwrap_or_default();
                             l.metadata.retain(|_, m| { m.hyperlink = None; m.tab_width != 0 });
                             return l;
                         }

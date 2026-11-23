@@ -110,6 +110,12 @@ impl Line {
         self.metadata.get(&u16::try_from(x).ok()?)?.hyperlink.as_ref()
     }
 
+    /// Columns up to the last cell that is not blank or the end of the last tab
+    /// (grid_line_length).
+    pub fn text_len(&self) -> usize {
+        self.cells.iter().rposition(|c| c.text != " ").map_or(0, |i| i + 1).max(self.tabs_end())
+    }
+
     /// Text of the row with trailing blanks removed ([`text_at`] is the fast path).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn text(&self) -> String {
@@ -177,7 +183,9 @@ pub fn cell_from_vt(c: &vt100::Cell) -> Cell {
     Cell { text, style: Style { fg: c.fgcolor(), bg: c.bgcolor(), us: c.underline_color(), attrs } }
 }
 
-/// Every row of a screen including its scrollback, oldest first.
+/// Every row of a screen including its scrollback, oldest first (copy mode reads them one
+/// at a time with [`snapshot_line`]; this is what that must give).
+#[cfg(test)]
 pub fn snapshot(screen: &vt100::Screen) -> Vec<Line> {
     (0..screen.history_rows_len()).map(|i| {
         let mut line = line_at(screen, i);
@@ -192,7 +200,114 @@ pub fn snapshot(screen: &vt100::Screen) -> Vec<Line> {
     }).collect()
 }
 
-/// Row `index` of [`snapshot`] (oldest history row = 0) without building the others.
+/// Row `index` of [`snapshot`]: [`line_at`], a row that wrapped early ending at its last
+/// used cell.
+pub fn snapshot_line(screen: &vt100::Screen, index: usize) -> Line {
+    let mut line = line_at(screen, index);
+    if line.wrapped {
+        if let Some(row) = screen.history_row(index) {
+            line.cells.truncate(usize::from(row.used_len()));
+        }
+    }
+    line
+}
+
+/// The text [`cell_from_vt`] gives a cell (a cell past the stored row is blank).
+fn vt_cell_text(c: Option<&vt100::Cell>) -> &str {
+    match c {
+        Some(c) if c.is_wide_continuation() => "",
+        Some(c) if c.has_contents() => c.contents(),
+        _ => " ",
+    }
+}
+
+/// The number of cells of [`snapshot_line`] for a row of the screen (None for a row past
+/// it, which is blank).
+fn row_cells_len(row: Option<&vt100::capture::RowContents<'_>>, cols: usize) -> usize {
+    match row {
+        Some(row) if row.wrapped() => cols.min(usize::from(row.used_len())),
+        _ => cols,
+    }
+}
+
+fn cols_of(screen: &vt100::Screen) -> usize {
+    usize::from(screen.size().1.get())
+}
+
+/// The number of cells of [`snapshot_line`], read from the screen.
+pub fn snapshot_cells_len(screen: &vt100::Screen, index: usize) -> usize {
+    row_cells_len(screen.history_row(index).as_ref(), cols_of(screen))
+}
+
+/// [`Line::text_len`] of [`snapshot_line`], read from the screen.
+pub fn snapshot_text_len(screen: &vt100::Screen, index: usize) -> usize {
+    let Some(row) = screen.history_row(index) else { return 0 };
+    let n = row_cells_len(Some(&row), cols_of(screen));
+    let used = (0..n).rposition(|x| vt_cell_text(row.cell(x as u16)) != " ").map_or(0, |x| x + 1);
+    let tabs = row.metadata().filter(|(_, m)| m.tab_width > 0).map(|(x, m)| usize::from(x) + usize::from(m.tab_width)).max().unwrap_or(0).min(n);
+    used.max(tabs)
+}
+
+/// [`Line::tab_at`] of [`snapshot_line`], read from the screen's row.
+fn row_tab_at(row: &vt100::capture::RowContents<'_>, x: usize) -> Option<(usize, usize)> {
+    let x16 = u16::try_from(x).ok()?;
+    let (at, m) = row.metadata().take_while(|&(at, _)| at <= x16).last()?;
+    let (at, w) = (usize::from(at), usize::from(m.tab_width));
+    (x < at + w).then_some((at, w))
+}
+
+/// The text of cell `x` of [`snapshot_line`] for a row (its [`Cell::text`], None past its
+/// cells).
+fn row_cell<'a>(row: Option<&'a vt100::capture::RowContents<'_>>, cols: usize, x: usize) -> Option<&'a str> {
+    if x >= row_cells_len(row, cols) {
+        return None;
+    }
+    Some(row.map_or(" ", |row| vt_cell_text(row.cell(x as u16))))
+}
+
+/// `f` of the text of cell `x` of [`snapshot_line`] (its [`Cell::text`], None past its
+/// cells), read from the screen.
+pub fn with_snapshot_cell<R>(screen: &vt100::Screen, index: usize, x: usize, f: impl FnOnce(Option<&str>) -> R) -> R {
+    let row = screen.history_row(index);
+    f(row_cell(row.as_ref(), cols_of(screen), x))
+}
+
+/// [`Line::is_padding`] of [`snapshot_line`], read from the screen.
+pub fn snapshot_is_padding(screen: &vt100::Screen, index: usize, x: usize) -> bool {
+    let row = screen.history_row(index);
+    row_cell(row.as_ref(), cols_of(screen), x) == Some("")
+        || row.is_some_and(|row| row_tab_at(&row, x).is_some_and(|(at, _)| at != x))
+}
+
+/// Appends [`Line::cell_text`] of each of columns `xs` of [`snapshot_line`] to `out`, read
+/// from the screen.
+pub fn push_snapshot_cell_texts(out: &mut String, screen: &vt100::Screen, index: usize, xs: std::ops::Range<usize>) {
+    let row = screen.history_row(index);
+    let cols = cols_of(screen);
+    let tabs = row.as_ref().is_some_and(|row| row.metadata().any(|(_, m)| m.tab_width != 0));
+    for x in xs {
+        match row.as_ref().filter(|_| tabs).and_then(|row| row_tab_at(row, x)) {
+            Some((at, _)) if at == x => out.push('\t'),
+            Some(_) => {}
+            None => out.push_str(row_cell(row.as_ref(), cols, x).unwrap_or("")),
+        }
+    }
+}
+
+/// What columns `0..width` of [`snapshot_line`] give to a search: [`Line::cell_text`] of
+/// each of its cells, a blank past them. Read from the screen unless the row has a tab.
+pub fn snapshot_texts(screen: &vt100::Screen, index: usize, width: usize, mut f: impl FnMut(&str)) {
+    let Some(row) = screen.history_row(index) else { return (0..width).for_each(|_| f(" ")) };
+    if row.metadata().any(|(_, m)| m.tab_width != 0) {
+        let line = snapshot_line(screen, index);
+        return (0..width).for_each(|x| f(if x < line.cells.len() { line.cell_text(x) } else { " " }));
+    }
+    let n = snapshot_cells_len(screen, index).min(width);
+    (0..n).for_each(|x| f(vt_cell_text(row.cell(x as u16))));
+    (n..width).for_each(|_| f(" "));
+}
+
+/// Row `index` of the screen counting its history (oldest history row = 0).
 pub fn line_at(screen: &vt100::Screen, index: usize) -> Line {
     let cols = screen.size().1.get();
     match screen.history_row(index) {
@@ -218,10 +333,103 @@ pub fn text_at(screen: &vt100::Screen, index: usize) -> (String, bool) {
     (s, row.wrapped())
 }
 
+/// A screen of random content for the tests that check copy mode's row-by-row reads
+/// against [`snapshot`]: wrapped rows (also ones that wrap early), wide and combining
+/// characters, links, tabs, prompt marks, the alternate screen, scroll regions, and a
+/// history from none to past its limit.
+#[cfg(test)]
+pub(crate) fn random_parser(seed: u64) -> vt100::Parser {
+    let mut rng = TestRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+    let nz = |n: usize| std::num::NonZeroU16::new(n as u16).unwrap();
+    let (rows, cols) = (2 + rng.below(7), 4 + rng.below(27));
+    let limit = [0, 1, 5, 40, 200][rng.below(5)];
+    let mut p = vt100::Parser::new(nz(rows), nz(cols), limit);
+    for _ in 0..rng.below(400) {
+        random_chunk(&mut rng, &mut p);
+    }
+    p
+}
+
+/// More random output for [`random_parser`]'s screen, or a resize (which rewraps it).
+#[cfg(test)]
+pub(crate) fn random_chunk(rng: &mut TestRng, p: &mut vt100::Parser) {
+    let cols = usize::from(p.screen().size().1.get());
+    const PARTS: &[&str] = &[
+        "abc", "word ", "foo(bar) ", "  ", "\r\n", "\r\n", "\r\n", "\n", "\r", "\t", "a\tb", "한", "글자", "e\u{301}",
+        "\u{1F469}\u{200d}\u{1F4BB}", "\u{1F1F0}\u{1F1F7}", "\x1b[31m", "\x1b[0m", "\x1b[1;4m", "\x1b[38;2;1;2;3m",
+        "\x1b[44m", "\x1b]8;;http://a\x07", "\x1b]8;id=2;http://b\x07", "\x1b]8;;\x07", "\x1b]133;A\x07",
+        "\x1b]133;C\x07", "\x1b[?1049h", "\x1b[?1049l", "\x1b[H", "\x1b[2J", "\x1b[K", "\x1b[5G", "\x1b[3D",
+        "\x1b[2;4r", "\x1b[r", "\x1bD", "\x1bM", "\x1b[?7l", "\x1b[?7h", "\x08", "[x] ", "$ ls -l",
+    ];
+    match rng.below(10) {
+        0 => p.process("x".repeat(rng.below(2 * cols + 2)).as_bytes()),
+        1 => p.process(format!("{}\u{4e2d}", "y".repeat(cols - 1)).as_bytes()),
+        2 if rng.below(4) == 0 => {
+            let rows = p.screen().size().0;
+            p.screen_mut().set_size(rows, std::num::NonZeroU16::new(2 + rng.below(30) as u16).unwrap());
+        }
+        3 => (0..rng.below(60)).for_each(|i| p.process(format!("{i} {}\r\n", "z ".repeat(i % 7)).as_bytes())),
+        _ => p.process(PARTS[rng.below(PARTS.len())].as_bytes()),
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestRng(pub u64);
+
+#[cfg(test)]
+impl TestRng {
+    pub(crate) fn below(&mut self, n: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 % n as u64) as usize
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::num::NonZeroU16;
+
+    #[test]
+    fn snapshot_rows_read_one_at_a_time_match_the_whole_snapshot() {
+        // copy mode builds its lines from a frozen screen with snapshot_line, and reads a
+        // row's length, cells and search text without building it
+        let mut wrapped_early = 0;
+        for seed in 0..600 {
+            let p = random_parser(seed);
+            let s = p.screen();
+            let all = snapshot(s);
+            assert_eq!(all.len(), s.history_rows_len());
+            let cols = usize::from(s.size().1.get());
+            for (i, line) in all.iter().enumerate() {
+                assert_eq!(&snapshot_line(s, i), line, "seed {seed} row {i}");
+                assert_eq!(snapshot_cells_len(s, i), line.cells.len(), "seed {seed} row {i}");
+                assert_eq!(snapshot_text_len(s, i), line.text_len(), "seed {seed} row {i}");
+                for width in [cols, cols + 3] {
+                    let mut texts = Vec::new();
+                    snapshot_texts(s, i, width, |t| texts.push(t.to_string()));
+                    let want: Vec<&str> = (0..width).map(|x| if x < line.cells.len() { line.cell_text(x) } else { " " }).collect();
+                    assert_eq!(texts, want, "seed {seed} row {i}");
+                }
+                for x in 0..cols + 3 {
+                    let cell = with_snapshot_cell(s, i, x, |c| c.map(str::to_string));
+                    assert_eq!(cell.as_deref(), line.cells.get(x).map(|c| c.text.as_str()), "seed {seed} row {i} col {x}");
+                    assert_eq!(snapshot_is_padding(s, i, x), line.is_padding(x), "seed {seed} row {i} col {x}");
+                    let mut text = String::new();
+                    push_snapshot_cell_texts(&mut text, s, i, x..x + 1);
+                    assert_eq!(text, line.cell_text(x), "seed {seed} row {i} col {x}");
+                }
+                for (a, b) in [(0, cols), (1, cols + 3), (cols / 2, cols), (2, 1)] {
+                    let mut text = String::new();
+                    push_snapshot_cell_texts(&mut text, s, i, a..b);
+                    assert_eq!(text, (a..b).map(|x| line.cell_text(x)).collect::<String>(), "seed {seed} row {i} cols {a}..{b}");
+                }
+                wrapped_early += usize::from(line.wrapped && line.cells.len() < cols);
+            }
+        }
+        assert!(wrapped_early > 0, "a row that wraps early is covered");
+    }
 
     #[test]
     fn row_access_matches_cell_snapshot() {

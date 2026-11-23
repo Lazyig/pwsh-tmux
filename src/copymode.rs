@@ -471,8 +471,218 @@ impl Default for RenderStyle {
     }
 }
 
-pub struct CopyMode {
+/// The lines copy mode works on: lines it was given (view mode, a rewrapped copy), or a
+/// frozen copy of a pane's screen whose rows become lines ([`crate::cells::snapshot_line`])
+/// when they are first read. Rows read with [`Backing::get`] stay lines until
+/// [`Backing::trim`]; the row helpers and [`Backing::peek`] read a row without keeping it,
+/// for scans over the whole history.
+#[derive(Default)]
+pub struct Backing {
+    frozen: Option<Frozen>,
+    /// The lines after the frozen rows (every line when there is no screen).
     lines: Vec<Line>,
+}
+
+struct Frozen {
+    screen: Box<vt100::Screen>,
+    /// How many of the screen's rows (history first) are lines of the backing.
+    rows: usize,
+    cache: Vec<std::cell::OnceCell<Box<Line>>>,
+    /// The rows with a line in `cache`.
+    cached: std::cell::RefCell<Vec<usize>>,
+}
+
+impl From<Vec<Line>> for Backing {
+    fn from(lines: Vec<Line>) -> Self {
+        Backing { frozen: None, lines }
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Index<usize> for Backing {
+    type Output = Line;
+    fn index(&self, i: usize) -> &Line {
+        self.get(i).expect("line index")
+    }
+}
+
+#[cfg(test)]
+impl Backing {
+    fn iter(&self) -> impl Iterator<Item = &Line> {
+        (0..self.len()).filter_map(|i| self.get(i))
+    }
+}
+
+impl Backing {
+    /// The rows of `screen` with its history, oldest first, as [`crate::cells::snapshot`]
+    /// gives them.
+    pub fn frozen(screen: vt100::Screen) -> Self {
+        let rows = screen.history_rows_len();
+        let cache = std::iter::repeat_with(std::cell::OnceCell::new).take(rows).collect();
+        Backing { frozen: Some(Frozen { screen: Box::new(screen), rows, cache, cached: Default::default() }), lines: Vec::new() }
+    }
+
+    fn frozen_rows(&self) -> usize {
+        self.frozen.as_ref().map_or(0, |f| f.rows)
+    }
+
+    /// The frozen screen and row `i` when that line comes from it and is not built yet.
+    fn unbuilt(&self, i: usize) -> Option<(&vt100::Screen, usize)> {
+        self.frozen.as_ref().filter(|f| i < f.rows && f.cache[i].get().is_none()).map(|f| (&*f.screen, i))
+    }
+
+    pub fn len(&self) -> usize {
+        self.frozen_rows() + self.lines.len()
+    }
+
+    /// Line `i`, built from the screen (and kept) the first time it is read.
+    pub fn get(&self, i: usize) -> Option<&Line> {
+        match &self.frozen {
+            Some(f) if i < f.rows => Some(f.cache[i].get_or_init(|| {
+                f.cached.borrow_mut().push(i);
+                Box::new(crate::cells::snapshot_line(&f.screen, i))
+            })),
+            _ => self.lines.get(i - self.frozen_rows()),
+        }
+    }
+
+    /// `f` of line `i`, which is not kept if it had to be built.
+    pub fn peek<R>(&self, i: usize, f: impl FnOnce(&Line) -> R) -> Option<R> {
+        match self.unbuilt(i) {
+            Some((screen, i)) => Some(f(&crate::cells::snapshot_line(screen, i))),
+            None => self.get(i).map(f),
+        }
+    }
+
+    /// Line `i` soft-wraps onto the next one.
+    pub fn wrapped(&self, i: usize) -> bool {
+        match self.unbuilt(i) {
+            Some((screen, i)) => screen.history_row(i).is_some_and(|r| r.wrapped()),
+            None => self.get(i).is_some_and(|l| l.wrapped),
+        }
+    }
+
+    /// The ROW_* flags of line `i`.
+    pub fn flags(&self, i: usize) -> u8 {
+        match self.unbuilt(i) {
+            Some((screen, i)) => screen.history_row(i).map_or(0, |r| r.flags()),
+            None => self.get(i).map_or(0, |l| l.flags),
+        }
+    }
+
+    /// [`Line::text_len`] of line `i` (0 past the end).
+    pub fn text_len(&self, i: usize) -> usize {
+        match self.unbuilt(i) {
+            Some((screen, i)) => crate::cells::snapshot_text_len(screen, i),
+            None => self.get(i).map_or(0, Line::text_len),
+        }
+    }
+
+    /// How many cells line `i` has (0 past the end).
+    pub fn cells_len(&self, i: usize) -> usize {
+        match self.unbuilt(i) {
+            Some((screen, i)) => crate::cells::snapshot_cells_len(screen, i),
+            None => self.get(i).map_or(0, |l| l.cells.len()),
+        }
+    }
+
+    /// Line `i` as an owned line (built and not kept when it is not built yet).
+    pub fn cloned(&self, i: usize) -> Option<Line> {
+        match self.unbuilt(i) {
+            Some((screen, i)) => Some(crate::cells::snapshot_line(screen, i)),
+            None => self.get(i).cloned(),
+        }
+    }
+
+    /// `f` of the [`Cell::text`] of cell `x` of line `i` (None past its cells or the end).
+    pub fn with_cell<R>(&self, i: usize, x: usize, f: impl FnOnce(Option<&str>) -> R) -> R {
+        match self.unbuilt(i) {
+            Some((screen, i)) => crate::cells::with_snapshot_cell(screen, i, x, f),
+            None => f(self.get(i).and_then(|l| l.cells.get(x)).map(|c| c.text.as_str())),
+        }
+    }
+
+    /// [`Line::is_padding`] of cell `x` of line `i` (false past the end).
+    pub fn is_padding(&self, i: usize, x: usize) -> bool {
+        match self.unbuilt(i) {
+            Some((screen, i)) => crate::cells::snapshot_is_padding(screen, i, x),
+            None => self.get(i).is_some_and(|l| l.is_padding(x)),
+        }
+    }
+
+    /// Appends [`Line::cell_text`] of each of cells `xs` of line `i` to `out` (nothing past
+    /// the end).
+    pub fn push_cell_texts(&self, out: &mut String, i: usize, xs: std::ops::Range<usize>) {
+        match self.unbuilt(i) {
+            Some((screen, i)) => crate::cells::push_snapshot_cell_texts(out, screen, i, xs),
+            None => {
+                if let Some(l) = self.get(i) {
+                    xs.for_each(|x| out.push_str(l.cell_text(x)));
+                }
+            }
+        }
+    }
+
+    /// `f` of the text a search reads in each of columns `0..width` of line `i`
+    /// ([`Line::cell_text`], a blank past the cells or the end).
+    pub fn texts(&self, i: usize, width: usize, mut f: impl FnMut(&str)) {
+        match self.unbuilt(i) {
+            Some((screen, i)) => crate::cells::snapshot_texts(screen, i, width, f),
+            None => {
+                let line = self.get(i);
+                for x in 0..width {
+                    f(match line {
+                        Some(l) if x < l.cells.len() => l.cell_text(x),
+                        _ => " ",
+                    });
+                }
+            }
+        }
+    }
+
+    pub fn push(&mut self, line: Line) {
+        self.lines.push(line);
+    }
+
+    pub fn pop(&mut self) {
+        if self.lines.pop().is_some() {
+            return;
+        }
+        if let Some(f) = self.frozen.as_mut().filter(|f| f.rows > 0) {
+            f.rows -= 1;
+            if f.cache[f.rows].take().is_some() {
+                let last = f.rows;
+                f.cached.get_mut().retain(|&i| i != last);
+            }
+        }
+    }
+
+    /// Every line.
+    pub fn to_vec(&self) -> Vec<Line> {
+        (0..self.len()).filter_map(|i| self.cloned(i)).collect()
+    }
+
+    /// Every line, built from the screen where not built yet.
+    pub fn into_vec(self) -> Vec<Line> {
+        let Some(f) = self.frozen else { return self.lines };
+        let mut out: Vec<Line> = f.cache.into_iter().take(f.rows).enumerate()
+            .map(|(i, c)| c.into_inner().map_or_else(|| crate::cells::snapshot_line(&f.screen, i), |l| *l)).collect();
+        out.extend(self.lines);
+        out
+    }
+
+    /// Lets the built lines outside `keep` go once more than `limit` are kept.
+    pub fn trim(&mut self, keep: std::ops::Range<usize>, limit: usize) {
+        let Some(Frozen { cache, cached, .. }) = self.frozen.as_mut() else { return };
+        let cached = cached.get_mut();
+        if cached.len() > limit {
+            cached.retain(|&i| keep.contains(&i) || cache[i].take().is_none());
+        }
+    }
+}
+
+pub struct CopyMode {
+    lines: Backing,
     width: usize,
     height: usize,
     /// Absolute index of the first displayed line.
@@ -561,9 +771,9 @@ pub struct CopyMode {
 impl CopyMode {
     /// `lines`: snapshot (history + screen). The view initially shows the bottom `height`
     /// lines; `cursor` is (row within that bottom view, col).
-    pub fn new(lines: Vec<Line>, width: u16, height: u16, cursor: (u16, u16), vi: bool) -> Self {
+    pub fn new(lines: impl Into<Backing>, width: u16, height: u16, cursor: (u16, u16), vi: bool) -> Self {
         let mut cm = CopyMode {
-            lines,
+            lines: lines.into(),
             width: (width as usize).max(1),
             height: (height as usize).max(1),
             top: 0,
@@ -630,7 +840,8 @@ impl CopyMode {
     /// size, `cursor` its cursor as (row, column)) shown in a pane of `size`. With `trim`
     /// (copy-mode -s) empty lines at the bottom are dropped first; a different width
     /// rewraps the lines (grid_reflow) and the cursor stays on its character.
-    pub fn clone_from(mut lines: Vec<Line>, src: (u16, u16), cursor: (u16, u16), size: (u16, u16), vi: bool, trim: bool) -> Self {
+    pub fn clone_from(lines: impl Into<Backing>, src: (u16, u16), cursor: (u16, u16), size: (u16, u16), vi: bool, trim: bool) -> Self {
+        let mut lines = lines.into();
         let (sw, sh) = ((src.0 as usize).max(1), (src.1 as usize).max(1));
         while lines.len() < sh {
             lines.push(Line::default());
@@ -638,7 +849,7 @@ impl CopyMode {
         let hsize = lines.len() - sh;
         if trim {
             let blank = |l: &Line| !l.wrapped && l.cells.iter().all(|c| *c == Cell::default());
-            while lines.len() > hsize + 1 && lines.last().is_some_and(blank) {
+            while lines.len() > hsize + 1 && lines.peek(lines.len() - 1, blank) == Some(true) {
                 lines.pop();
             }
         }
@@ -652,9 +863,11 @@ impl CopyMode {
             lines.push(Line::default());
         }
         if width != sw {
-            let (wx, wy) = wrap_position(&lines, cx, cy);
-            lines = reflow(&lines, width);
-            (cx, cy) = unwrap_position(&lines, wx, wy);
+            let old = lines.into_vec();
+            let (wx, wy) = wrap_position(&old, cx, cy);
+            let new = reflow(&old, width);
+            (cx, cy) = unwrap_position(&new, wx, wy);
+            lines = new.into();
         }
         let mut cm = CopyMode::new(lines, size.0, size.1, (0, 0), vi);
         cm.place_cursor(cx, cy);
@@ -831,11 +1044,11 @@ impl CopyMode {
 
     /// window_copy_do_refresh: new content from the pane; follow new output when the cursor
     /// was on the bottom line, otherwise keep the same lines (counted from the top) in view.
-    pub fn refresh(&mut self, lines: Vec<Line>) {
+    pub fn refresh(&mut self, lines: impl Into<Backing>) {
         let follow = self.scroll_offset() == 0 && self.cy - self.top == self.height - 1;
         let from_top = self.top;
         let row = self.cy - self.top;
-        self.lines = lines;
+        self.lines = lines.into();
         self.pad();
         let hsize = self.hsize();
         if follow {
@@ -889,7 +1102,7 @@ impl CopyMode {
 
     /// The copied pane (window_copy_get_screen): its lines and how many are history,
     /// whatever is in view.
-    pub fn backing_screen(&self) -> (&[Line], usize) {
+    pub fn backing_screen(&self) -> (&Backing, usize) {
         (&self.lines, self.hsize())
     }
 
@@ -967,12 +1180,14 @@ impl CopyMode {
 
     /// `copy-mode -d`: a page down; true when that should leave copy mode (with -e).
     pub fn page_down_exit(&mut self, exit: bool) -> bool {
+        self.trim_cache();
         self.page_down(false);
         exit && self.scroll_offset() == 0 && self.anchor.is_none()
     }
 
     /// `copy-mode -u`.
     pub fn page_up_once(&mut self) {
+        self.trim_cache();
         self.page_up(false);
     }
 
@@ -980,6 +1195,7 @@ impl CopyMode {
     /// keeps its row on the screen, sticking to the end of lines as tmux does. With vi keys
     /// the cursor first moves a row so it stays on the same text.
     pub fn scroll_line(&mut self, up: bool) {
+        self.trim_cache();
         let norect = self.anchor.is_none() || !self.rect;
         // window_copy_scroll_up/down update the selection only when the view moves: at the
         // top or bottom the cursor moves alone and the selection keeps its ends
@@ -1024,6 +1240,7 @@ impl CopyMode {
     /// window_copy_move_mouse: the cursor goes to a cell of the view (before a command from
     /// a mouse binding) without updating the selection.
     pub fn move_mouse(&mut self, row: u16, col: u16) {
+        self.trim_cache();
         let held = self.slots().filter(|_| self.frozen.is_none());
         let row = (row as usize).min(self.height - 1);
         let y = (self.top + row).min(self.lines.len().saturating_sub(1));
@@ -1062,6 +1279,7 @@ impl CopyMode {
     /// Moves the cursor to a cell of the current view (mouse clicks and drags); `col` is
     /// the screen column (line numbers are skipped).
     pub fn move_to_view(&mut self, row: u16, col: u16) {
+        self.trim_cache();
         let row = (row as usize).min(self.height - 1);
         let y = (self.top + row).min(self.lines.len().saturating_sub(1));
         self.update_cursor(y, self.cursor_unoffset(col as usize));
@@ -1260,20 +1478,23 @@ impl CopyMode {
         self.height = height;
         self.pad();
         if width != self.width {
-            let (wx, wy) = wrap_position(&self.lines, cx, cy);
-            self.lines = reflow(&self.lines, width);
-            (cx, cy) = unwrap_position(&self.lines, wx, wy);
+            let old = std::mem::take(&mut self.lines).into_vec();
+            let (wx, wy) = wrap_position(&old, cx, cy);
+            let new = reflow(&old, width);
+            (cx, cy) = unwrap_position(&new, wx, wy);
+            self.lines = new.into();
         }
         self.width = width;
         self.pad();
         self.place_cursor(cx, cy);
         self.size_changed();
+        self.trim_cache();
     }
 
     /// Replace the content keeping the position relative to the bottom.
-    pub fn set_lines(&mut self, lines: Vec<Line>) {
+    pub fn set_lines(&mut self, lines: impl Into<Backing>) {
         let old = self.lines.len();
-        self.lines = lines;
+        self.lines = lines.into();
         self.pad();
         let new = self.lines.len();
         let remap = |y: usize| (new + y).saturating_sub(old).min(new - 1);
@@ -1290,6 +1511,7 @@ impl CopyMode {
     /// so its top is at `my - sl_mpos` (rows from the pane top). True when copy mode should
     /// exit (with `exit`, back at the bottom and nothing selected).
     pub fn scroll_to_slider(&mut self, sl_mpos: usize, my: i64, exit: bool) -> bool {
+        self.trim_cache();
         let sb_height = self.height;
         let size = self.hsize();
         let total = size + sb_height;
@@ -1437,6 +1659,7 @@ impl CopyMode {
                 self.incremental_command_origin = None;
             }
         }
+        self.trim_cache();
         action
     }
 
@@ -1831,9 +2054,9 @@ impl CopyMode {
                 // -o) goes to the top of the view; the repeat count is not used
                 let flag = if args.iter().any(|s| s == "-o") { vt100::ROW_START_OUTPUT } else { vt100::ROW_START_PROMPT };
                 let found = if command == "next-prompt" {
-                    (self.cy + 1..self.lines.len()).find(|&y| self.lines[y].flags & flag != 0)
+                    (self.cy + 1..self.lines.len()).find(|&y| self.lines.flags(y) & flag != 0)
                 } else {
-                    (0..self.cy).rev().find(|&y| self.lines[y].flags & flag != 0)
+                    (0..self.cy).rev().find(|&y| self.lines.flags(y) & flag != 0)
                 };
                 if let Some(y) = found {
                     self.pinned = None;
@@ -2260,6 +2483,13 @@ impl CopyMode {
         }
     }
 
+    /// Keeps the lines built from a frozen screen to the view and a screen either side of
+    /// it, once more than a few screens of them are kept.
+    fn trim_cache(&mut self) {
+        let h = self.height;
+        self.lines.trim(self.top.saturating_sub(h)..self.top + 2 * h, 3 * h + 64);
+    }
+
     fn hsize(&self) -> usize {
         self.lines.len().saturating_sub(self.height)
     }
@@ -2268,33 +2498,34 @@ impl CopyMode {
         self.count.take().unwrap_or(1).max(1)
     }
 
-    fn cell(&self, y: usize, x: usize) -> Option<&Cell> {
-        self.lines.get(y).and_then(|l| l.cells.get(x))
+    /// `f` of the text of a cell (None past the line's cells), read without keeping the
+    /// line, so scans over many lines build none.
+    fn with_cell<R>(&self, y: usize, x: usize, f: impl FnOnce(Option<&str>) -> R) -> R {
+        self.lines.with_cell(y, x, f)
     }
 
     fn is_cont(&self, y: usize, x: usize) -> bool {
-        self.lines.get(y).is_some_and(|l| l.is_padding(x))
+        self.lines.is_padding(y, x)
     }
 
     fn wrapped(&self, y: usize) -> bool {
-        self.lines.get(y).is_some_and(|l| l.wrapped)
+        self.lines.wrapped(y)
     }
 
     /// Length of the line's text (trailing blanks excluded).
     fn len(&self, y: usize) -> usize {
-        let Some(l) = self.lines.get(y) else { return 0 };
-        l.cells.iter().rposition(|c| c.text != " ").map_or(0, |i| i + 1).max(l.tabs_end())
+        self.lines.text_len(y)
     }
 
     /// Number of cells copied from the line: the whole row when it soft-wraps.
     fn copy_len(&self, y: usize) -> usize {
-        if self.wrapped(y) { self.lines[y].cells.len().min(self.width) } else { self.len(y) }
+        if self.wrapped(y) { self.lines.cells_len(y).min(self.width) } else { self.len(y) }
     }
 
     /// Largest column the cursor may occupy on row `y` (tmux allows one past the text).
     fn max_x(&self, y: usize) -> usize {
         if self.wrapped(y) {
-            self.lines[y].cells.len().min(self.width).saturating_sub(1)
+            self.lines.cells_len(y).min(self.width).saturating_sub(1)
         } else {
             self.len(y)
         }
@@ -2340,7 +2571,7 @@ impl CopyMode {
         let mut y = self.logical_start(y);
         loop {
             let len = self.len(y);
-            if let Some(x) = (0..len).find(|&x| self.cell(y, x).is_some_and(|c| c.text != " " && c.text != "\t" && !c.is_continuation())) {
+            if let Some(x) = (0..len).find(|&x| self.with_cell(y, x, |c| c.is_some_and(|c| c != " " && c != "\t" && !c.is_empty()))) {
                 return Some((y, x));
             }
             if !self.wrapped(y) || y + 1 >= self.lines.len() {
@@ -2378,18 +2609,18 @@ impl CopyMode {
 
     fn class(&self, (y, x): Pos, seps: &str) -> Class {
         let x = self.snap(y, x);
-        match self.cell(y, x) {
+        self.with_cell(y, x, |c| match c {
             None => Class::Space,
             // any Unicode whitespace separates words
-            Some(c) if c.text.is_empty() || c.text.chars().any(char::is_whitespace) => Class::Space,
+            Some(c) if c.is_empty() || c.chars().any(char::is_whitespace) => Class::Space,
             Some(c) => {
-                let mut chars = c.text.chars();
+                let mut chars = c.chars();
                 match (chars.next(), chars.next()) {
                     (Some(ch), None) if seps.contains(ch) => Class::Sep,
                     _ => Class::Word,
                 }
             }
-        }
+        })
     }
 
     fn step_right(&self, (y, x): Pos) -> Option<Pos> {
@@ -2569,19 +2800,22 @@ impl CopyMode {
     /// A space in `set` matches any Unicode whitespace (tmux 3.8).
     fn in_set(&self, (y, x): Pos, set: &str) -> bool {
         let space = set.contains(' ');
-        match self.cell(y, x) {
+        self.with_cell(y, x, |c| match c {
             None => space,
             // the padding half of a wide character is whitespace when that character is
-            Some(c) if c.is_continuation() => {
-                (space || set.contains('\t')) && (0..x).rev().map(|i| self.cell(y, i)).find(|c| !c.is_some_and(Cell::is_continuation))
-                    .flatten().is_some_and(|c| space && c.text.chars().any(char::is_whitespace))
+            Some("") => {
+                (space || set.contains('\t')) && (0..x).rev().find_map(|i| self.with_cell(y, i, |c| match c {
+                    Some("") => None,
+                    None => Some(false),
+                    Some(c) => Some(space && c.chars().any(char::is_whitespace)),
+                })).unwrap_or(false)
             }
-            Some(c) if space && c.text.chars().any(char::is_whitespace) => true,
+            Some(c) if space && c.chars().any(char::is_whitespace) => true,
             Some(c) => {
-                let mut chars = c.text.chars();
+                let mut chars = c.chars();
                 matches!((chars.next(), chars.next()), (Some(ch), None) if set.contains(ch))
             }
-        }
+        })
     }
 
     /// grid_reader_cursor_previous_word.
@@ -2788,9 +3022,7 @@ impl CopyMode {
         let mut out = String::new();
         let mut p = s;
         while p < e {
-            if let Some(c) = self.cell(p.0, p.1) {
-                out.push_str(&c.text);
-            }
+            self.with_cell(p.0, p.1, |c| out.push_str(c.unwrap_or("")));
             match self.step_right(p) {
                 Some(q) => p = q,
                 None => break,
@@ -2827,12 +3059,13 @@ impl CopyMode {
 
     /// A single-byte character at a cell (brackets are ASCII).
     fn ascii_at(&self, y: usize, x: usize) -> Option<char> {
-        let c = self.cell(y, x)?;
-        let mut chars = c.text.chars();
-        match (chars.next(), chars.next()) {
-            (Some(ch), None) if ch.is_ascii() && !c.is_continuation() => Some(ch),
-            _ => None,
-        }
+        self.with_cell(y, x, |c| {
+            let mut chars = c?.chars();
+            match (chars.next(), chars.next()) {
+                (Some(ch), None) if ch.is_ascii() => Some(ch),
+                _ => None,
+            }
+        })
     }
 
     /// window_copy_cmd_next_matching_bracket, once: from the bracket under the cursor (emacs
@@ -2982,7 +3215,7 @@ impl CopyMode {
     /// grid_reader_cursor_jump: the character at or after a position, through wrapped lines.
     fn reader_jump(&self, (mut y, mut x): Pos, ch: &str) -> Option<Pos> {
         loop {
-            if let Some(x) = (x..self.len(y)).find(|&x| self.cell(y, x).is_some_and(|c| c.text == ch)) {
+            if let Some(x) = (x..self.len(y)).find(|&x| self.with_cell(y, x, |c| c == Some(ch))) {
                 return Some((y, x));
             }
             if y + 1 >= self.lines.len() || !self.wrapped(y) {
@@ -2998,7 +3231,7 @@ impl CopyMode {
     fn reader_jump_back(&self, (mut y, x): Pos, ch: &str) -> Option<Pos> {
         let mut xx = x + 1;
         loop {
-            if let Some(x) = (0..xx).rev().find(|&x| self.cell(y, x).is_some_and(|c| c.text == ch)) {
+            if let Some(x) = (0..xx).rev().find(|&x| self.with_cell(y, x, |c| c == Some(ch))) {
                 return Some((y, x));
             }
             if y == 0 || !self.wrapped(y - 1) {
@@ -3046,20 +3279,22 @@ impl CopyMode {
     /// Matches beginning on this physical row; end columns may extend onto wrapped rows.
     fn row_matches(&self, y: usize, needle: &str) -> Vec<(usize, usize)> {
         if y >= self.lines.len() { return Vec::new(); }
-        let mut s = String::new();
-        let mut starts = Vec::new(); // (byte offset, cell offset)
+        // sized for one row, the usual case
+        let mut s = String::with_capacity(self.width);
+        let mut starts = Vec::with_capacity(self.width); // (byte offset, cell offset)
         let mut row = y;
         let regex = self.search_regex && needle.contains(['^', '$', '*', '+', '(', ')', '?', '[', ']', '.', '\\']);
         let limit = if regex { 2000 } else { self.width + needle.len() };
         loop {
-            for x in 0..self.width {
-                // a tab matches a tab (window_copy_search_compare)
-                let text = match self.lines.get(row) { Some(l) if x < l.cells.len() => l.cell_text(x), _ => " " };
+            // a tab matches a tab (window_copy_search_compare)
+            let mut x = 0;
+            self.lines.texts(row, self.width, |text| {
                 if !text.is_empty() {
                     starts.push((s.len(), (row - y) * self.width + x));
                     s.push_str(text);
                 }
-            }
+                x += 1;
+            });
             // window-copy.c limits joined regex subjects to 2000 cells.
             if !self.wrapped(row) || row + 1 == self.lines.len() || (row - y + 1) * self.width >= limit {
                 break;
@@ -3313,9 +3548,7 @@ impl CopyMode {
         let xx = self.copy_len(y);
         let (sx, ex) = (sx.min(xx), ex.min(xx));
         // padding is skipped and a tab copied as a tab
-        for x in sx..ex {
-            out.push_str(self.lines[y].cell_text(x));
-        }
+        self.lines.push_cell_texts(out, y, sx..ex);
         if !wrapped || ex != xx {
             out.push('\n');
         }
@@ -4563,7 +4796,7 @@ mod tests {
         keys(&mut cm, &["k", "C-y"]);
         let (off, cy) = (cm.scroll_offset(), cm.cy);
         let mut more: Vec<Line> = (0..3).map(|i| line(&format!("new{i}"), false)).collect();
-        let mut v = cm.lines.clone();
+        let mut v = cm.lines.to_vec();
         v.append(&mut more);
         cm.set_lines(v);
         assert_eq!(cm.cy, cy + 3, "position kept relative to the bottom");
@@ -5262,7 +5495,7 @@ mod tests {
         assert_eq!(cm.search_match().as_deref(), Some("界ABCDE"));
         cm.run("search-backward", &[".*E".into()]);
         assert_eq!((cm.cy, cm.cx), (0, 0), "backward overlap returns the beginning of the mark");
-        let mut cm = CopyMode::new((0..102).map(|_| line("xxxxxxxxxxxxxxxxxxxx", true)).collect(), W, 2, (0, 0), true);
+        let mut cm = CopyMode::new((0..102).map(|_| line("xxxxxxxxxxxxxxxxxxxx", true)).collect::<Vec<_>>(), W, 2, (0, 0), true);
         assert!(cm.row_matches(0, "[x]{2001}").is_empty());
         assert_eq!(cm.row_matches(0, "[x]{2000}"), vec![(0, 2000)]);
         assert!(cm.row_matches(0, "^").is_empty());
@@ -5319,9 +5552,9 @@ mod tests {
         for (n, expected) in [(0, None), (10, Some(10)), (100, Some(100)), (1000, Some(1000))] {
             let mut cm = CopyMode::new(vec![line(&"x".repeat(n.min(20)), false)], W, 1, (0, 0), true);
             // Each row has 20 matches; retry counts are added to the interrupted pass.
-            cm.lines = (0..(n / 20 + 1)).map(|_| line("xxxxxxxxxxxxxxxxxxxx", false)).collect();
+            cm.lines = (0..(n / 20 + 1)).map(|_| line("xxxxxxxxxxxxxxxxxxxx", false)).collect::<Vec<_>>().into();
             cm.height = cm.lines.len();
-            if n == 0 { cm.lines = lines(&["none"]); cm.height = 1; }
+            if n == 0 { cm.lines = lines(&["none"]).into(); cm.height = 1; }
             let mut calls = 0;
             cm.count_search_matches("x", false, || { calls += 1; if calls == 1 { 201 } else { 202 } });
             assert_eq!(cm.search_count(), expected);
@@ -5475,7 +5708,7 @@ mod display_search_tests {
     use super::*;
     #[test]
     fn wrap_search_can_be_disabled() {
-        let lines = ["target", "middle", "target"].into_iter().map(|s| Line { cells: s.chars().map(|c| crate::cells::Cell { text: c.to_string(), style: Default::default() }).collect(), wrapped: false, ..Default::default() }).collect();
+        let lines: Vec<Line> = ["target", "middle", "target"].into_iter().map(|s| Line { cells: s.chars().map(|c| crate::cells::Cell { text: c.to_string(), style: Default::default() }).collect(), wrapped: false, ..Default::default() }).collect();
         let mut cm = CopyMode::new(lines, 10, 3, (2, 0), false);
         cm.wrap_search = false;
         cm.run("search-forward", &["target".into()]);
@@ -5486,5 +5719,168 @@ mod display_search_tests {
         cm.wrap_search = false;
         cm.run("search-backward", &["target".into()]);
         assert_eq!(cm.cy, 0);
+    }
+}
+
+#[cfg(test)]
+mod frozen_backing_tests {
+    use super::*;
+    use crate::cells::{random_chunk, random_parser, snapshot, TestRng};
+
+    /// Everything a copy-mode command can show or give the server. The match count is left
+    /// out with `count` false: counting stops on a clock (200 ms), which a loaded machine
+    /// can reach in one copy and not the other.
+    fn state(cm: &CopyMode, action: Action, count: bool) -> String {
+        format!(
+            "{action:?} {:?} {} {} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {}",
+            cm.cursor(), cm.view_top(), cm.line_count(), cm.position(), cm.selection_ends(), cm.search_count().filter(|_| count),
+            cm.search_match(), cm.cursor_word(), cm.cursor_line(), cm.render(), cm.top_line_time(),
+        )
+    }
+
+    /// The states of two copies, which must be the same.
+    fn states(a: &CopyMode, ra: Action, b: &CopyMode, rb: Action) -> (String, String) {
+        let count = ![a, b].iter().any(|c| c.search_count_partial() || c.search_timed_out());
+        (state(a, ra, count), state(b, rb, count))
+    }
+
+    const COMMANDS: &[&str] = &[
+        "cursor-up", "cursor-down", "cursor-left", "cursor-right", "start-of-line", "end-of-line", "back-to-indentation",
+        "next-word", "next-space", "next-word-end", "previous-word", "previous-space", "next-matching-bracket",
+        "previous-matching-bracket", "top-line", "middle-line", "bottom-line", "history-top", "history-bottom",
+        "page-up", "halfpage-up", "page-down", "halfpage-down", "scroll-up", "scroll-down", "scroll-top",
+        "scroll-middle", "begin-selection", "stop-selection", "select-line", "select-word", "rectangle-toggle",
+        "clear-selection", "other-end", "copy-selection-no-clear", "copy-line", "copy-end-of-line", "search-again",
+        "search-reverse", "jump-again", "next-prompt", "previous-prompt", "next-prompt -o", "previous-paragraph",
+        "next-paragraph", "set-mark", "jump-to-mark", "search-forward x", "search-backward ab", "search-forward-text a",
+        "search-backward 글", "search-forward [a-z]+\\(", "jump-forward x", "jump-backward a", "goto-line 3",
+        "line-numbers-toggle", "refresh-now",
+    ];
+
+    #[test]
+    fn lazy_lines_from_a_frozen_screen_act_like_a_snapshot() {
+        // the server used to give copy mode cells::snapshot of the pane; it now gives the
+        // screen itself, read a row at a time: every command must see the same lines
+        for seed in 0..300 {
+            let mut p = random_parser(seed);
+            let mut rng = TestRng(seed * 7919 + 13);
+            let (rows, cols) = p.screen().size();
+            let (rows, cols) = (rows.get(), cols.get());
+            let (cy, cx) = p.screen().cursor_position();
+            let other = rng.below(4) == 0;
+            let size = if other { (cols + rng.below(5) as u16, rows + 1) } else { (cols, rows) };
+            let vi = rng.below(2) == 0;
+            let mut a = CopyMode::clone_from(snapshot(p.screen()), (cols, rows), (cy, cx), size, vi, other);
+            let mut b = CopyMode::clone_from(Backing::frozen(p.screen().clone()), (cols, rows), (cy, cx), size, vi, other);
+            let (sa, sb) = states(&a, Action::None, &b, Action::None);
+            assert_eq!(sa, sb, "seed {seed} entry");
+            for step in 0..150 {
+                let (ra, rb) = match rng.below(20) {
+                    0 => {
+                        // more output, then window_copy_do_refresh
+                        for _ in 0..rng.below(30) {
+                            random_chunk(&mut rng, &mut p);
+                        }
+                        a.refresh(snapshot(p.screen()));
+                        b.refresh(Backing::frozen(p.screen().clone()));
+                        (Action::None, Action::None)
+                    }
+                    1 => {
+                        let (w, h) = (2 + rng.below(30) as u16, 1 + rng.below(8) as u16);
+                        let (w, h) = if rng.below(2) == 0 { (a.width as u16, h) } else { (w, h) };
+                        a.resize(w, h);
+                        b.resize(w, h);
+                        (Action::None, Action::None)
+                    }
+                    2 => {
+                        let (r, c) = (rng.below(10) as u16, rng.below(40) as u16);
+                        a.move_to_view(r, c);
+                        b.move_to_view(r, c);
+                        (Action::None, Action::None)
+                    }
+                    3 => {
+                        let up = rng.below(2) == 0;
+                        a.scroll_line(up);
+                        b.scroll_line(up);
+                        (Action::None, Action::None)
+                    }
+                    _ => {
+                        let mut words = COMMANDS[rng.below(COMMANDS.len())].splitn(2, ' ');
+                        let command = words.next().unwrap();
+                        let args: Vec<String> = words.next().map(String::from).into_iter().collect();
+                        if rng.below(4) == 0 {
+                            let n = 1 + rng.below(40);
+                            a.set_count(n);
+                            b.set_count(n);
+                        }
+                        (a.run(command, &args), b.run(command, &args))
+                    }
+                };
+                let (sa, sb) = states(&a, ra, &b, rb);
+                assert_eq!(sa, sb, "seed {seed} step {step}");
+            }
+            assert_eq!(a.backing_screen().0.to_vec(), b.backing_screen().0.to_vec(), "seed {seed}");
+            assert_eq!(a.backing_screen().1, b.backing_screen().1, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn a_frozen_screen_keeps_few_lines() {
+        // only the rows read are built, and the ones kept stay near the view
+        let mut p = vt100::Parser::new(std::num::NonZeroU16::new(10).unwrap(), std::num::NonZeroU16::new(20).unwrap(), 5000);
+        for i in 0..5000 {
+            p.process(format!("line {i}\r\n").as_bytes());
+        }
+        let mut cm = CopyMode::new(Backing::frozen(p.screen().clone()), 20, 10, (9, 0), true);
+        let built = |cm: &CopyMode| cm.lines.frozen.as_ref().map_or(0, |f| f.cache.iter().filter(|c| c.get().is_some()).count());
+        let _ = cm.render();
+        assert!(built(&cm) <= 10);
+        for _ in 0..400 {
+            cm.run("page-up", &[]);
+            let _ = cm.render();
+        }
+        assert!(built(&cm) <= 3 * 10 + 64 + 10, "{} lines kept", built(&cm));
+        cm.run("search-forward", &["line 7".into()]);
+        cm.run("search-backward", &["nothing".into()]);
+        assert!(built(&cm) <= 3 * 10 + 64 + 10, "{} lines kept", built(&cm));
+        let frozen = cm.lines.frozen.as_ref().unwrap();
+        assert_eq!(frozen.cached.borrow().len(), built(&cm), "the list of built rows is exact");
+    }
+
+    #[test]
+    fn commands_over_the_whole_history_build_no_lines() {
+        // motions and copies that cross the history read the frozen rows' cells and keep no
+        // lines while they run (the cache is only trimmed after the command)
+        let mut p = vt100::Parser::new(std::num::NonZeroU16::new(10).unwrap(), std::num::NonZeroU16::new(20).unwrap(), 9000);
+        p.process(b"first a\tb \xed\x95\x9c\r\n");
+        (0..6000).for_each(|_| p.process(b"\r\n"));
+        (0..1000).for_each(|i| p.process(format!("w{i} [x] y\r\n").as_bytes()));
+        p.process(b"last");
+        let mut cm = CopyMode::new(Backing::frozen(p.screen().clone()), 20, 10, (9, 4), true);
+        let built = |cm: &CopyMode| cm.lines.frozen.as_ref().map_or(0, |f| f.cache.iter().filter(|c| c.get().is_some()).count());
+        let mut steps: Vec<(&str, usize, &str)> = vec![
+            ("history-top", 1, ""), ("next-word", 6000, ""), ("history-top", 1, ""), ("next-space", 3000, ""),
+            ("history-top", 1, ""), ("next-word-end", 6000, ""), ("history-bottom", 1, ""), ("previous-word", 6000, ""),
+            ("history-bottom", 1, ""), ("previous-space", 3000, ""), ("history-top", 1, ""), ("next-paragraph", 3, ""),
+            ("history-bottom", 1, ""), ("previous-paragraph", 3, ""), ("history-top", 1, ""), ("jump-forward", 1, "b"),
+        ];
+        steps.extend([("history-top", 1, ""), ("begin-selection", 1, ""), ("history-bottom", 1, ""), ("end-of-line", 1, "")]);
+        for (command, n, arg) in steps {
+            let before = built(&cm);
+            cm.set_count(n);
+            let args: Vec<String> = if arg.is_empty() { vec![] } else { vec![arg.into()] };
+            let _ = cm.run_inner(command, &args);
+            assert!(built(&cm) <= before + 64, "{command}: {} lines kept", built(&cm));
+            cm.trim_cache();
+        }
+        let before = built(&cm);
+        let Action::Copy { text, .. } = cm.run_inner("copy-selection-no-clear", &[]) else { panic!("no copy") };
+        assert!(built(&cm) <= before + 64, "copy: {} lines kept", built(&cm));
+        assert!(text.starts_with("first a\tb \u{d55c}\n\n") && text.ends_with("w999 [x] y\nlast"), "{text:?}");
+        assert_eq!(text.lines().count(), 7002);
+        cm.run_inner("rectangle-toggle", &[]);
+        let Action::Copy { text, .. } = cm.run_inner("copy-selection-no-clear", &[]) else { panic!("no copy") };
+        assert!(built(&cm) <= before + 64, "rectangle copy: {} lines kept", built(&cm));
+        assert_eq!(text.lines().count(), 7002);
     }
 }
