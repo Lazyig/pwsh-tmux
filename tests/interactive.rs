@@ -2182,5 +2182,23 @@ fn prompt_answers_stay_in_the_quotes_of_the_shell_that_runs_them() {
         wait_for(&format!("if-shell for {a:?}"), || ctx.ok(&["show", "-gv", "@r"]).trim() != "pending");
         assert_eq!(ctx.ok(&["show", "-gv", "@r"]).trim(), "yes", "{a:?}");
     }
+    // the same if-shell bound to a key from the prompt (bind-key's words are if-shell's
+    // arguments, so its test is a shell's), run when the key is pressed
+    std::fs::write(&conf, format!("bind -n F2 command-prompt -p a,n {{ bind -n F4 if-shell \"{check}\" {{ set -g @r yes }} {{ set -g @r no }} }}\n")).unwrap();
+    ctx.ok(&["source-file", &conf.to_string_lossy().replace('\\', "/")]);
+    for (i, a) in answers.iter().enumerate() {
+        let _ = ctx.cmd(&["unbind", "-n", "F4"]);
+        ctx.ok(&["set", "-g", "@r", "pending"]);
+        t.send(b"\x1bOQ");
+        wait_for("prompt", || t.row(29).starts_with("a "));
+        t.send(format!("{a}\r{i}\r").as_bytes());
+        wait_for(&format!("F4 bound for {a:?}"), || {
+            let (ok, keys) = ctx.cmd(&["list-keys", "-T", "root", "F4"]);
+            ok && keys.contains("if-shell")
+        });
+        t.send(b"\x1bOS");
+        wait_for(&format!("bound if-shell for {a:?}"), || ctx.ok(&["show", "-gv", "@r"]).trim() != "pending");
+        assert_eq!(ctx.ok(&["show", "-gv", "@r"]).trim(), "yes", "bound {a:?}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

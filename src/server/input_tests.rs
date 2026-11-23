@@ -1513,7 +1513,7 @@ fn a_block_template_takes_the_answers_without_being_parsed_again() {
         assert_eq!(f.opts_session.get("@c"), Some(typed));
     }
     assert_eq!(f.opts_session.get("@pwned"), None);
-    let fill = |v: &str, a: &str| input::fill_block_value(v, &[a.to_string()], input::Reader::Direct, input::Quoting::TMUX);
+    let fill = |v: &str, a: &str| input::fill_block_value(v, &[a.to_string()], input::Reader::Direct, input::Quoting::TMUX).unwrap();
     assert_eq!(fill("test '%%' = x", "x' = x -o 'y"), "test 'x'\\'' = x -o '\\''y' = x");
     assert_eq!(fill("%%", "it's"), "it's");
     assert_eq!(fill("%1:%%", "a'"), "a':a'\\''");
@@ -1897,7 +1897,7 @@ fn prompt_answers_are_escaped_for_the_shells_that_may_run_them() {
     run(&mut f, &["bind-key", "F6", "command-prompt { set -g @v \"echo '%%' %%\" }"]);
     f.handle_input(1, b"\x02\x1b[17~");
     f.handle_input(1, b"it's & x\r");
-    let want = input::fill_block_value("echo '%%' %%", &["it's & x".into()], input::Reader::Direct, q);
+    let want = input::fill_block_value("echo '%%' %%", &["it's & x".into()], input::Reader::Direct, q).unwrap();
     assert_eq!(f.opts_session.get("@v"), Some(want.as_str()));
     if cfg!(windows) {
         assert_eq!(want, "echo 'it''s ^& x' %%");
@@ -1916,6 +1916,6 @@ fn windows_job_shell_gets_powershell_escapes() {
     let q = f.answer_quoting();
     if procinfo::shell_kind(&procinfo::default_shell()) == procinfo::ShellKind::PowerShell {
         assert!(q.powershell && !q.cmd, "{q:?}");
-        assert_eq!(input::fill_block_value("echo '%%'", &["x'y\u{2019}z".into()], input::Reader::Direct, q), "echo 'x''y\u{2019}\u{2019}z'");
+        assert_eq!(input::fill_block_value("echo '%%'", &["x'y\u{2019}z".into()], input::Reader::Direct, q).unwrap(), "echo 'x''y\u{2019}\u{2019}z'");
     }
 }

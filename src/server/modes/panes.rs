@@ -498,7 +498,10 @@ impl Panes {
     }
 
     fn run(&self, pane: PaneId, srv: &Server) -> ModeAction {
-        ModeAction::Run(crate::server::input::fill_template(&self.template, &[format!("%{pane}")], srv.answer_quoting()))
+        match crate::server::input::fill_template(&self.template, &[format!("%{pane}")], srv.answer_quoting()) {
+            Ok(cmd) => ModeAction::Run(cmd),
+            Err(e) => ModeAction::Error(e),
+        }
     }
 
     pub fn key(&mut self, name: &str, srv: &Server) -> ModeAction {
