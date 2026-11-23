@@ -4192,20 +4192,27 @@ fn pane_output_that_widens_a_cell_in_the_last_column_leaves_the_server_running()
     // indicators made the cell in the last column wide and the cell was written over
     let ctx = Ctx::new("wide-last-column");
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pane-output-crash");
-    let shown = |file: &std::path::Path, then: &str| -> String {
+    // Shows the file, then the marker (if any). The output can leave other character
+    // sets in use (DEC special graphics draws "@done1@" as "@␍⎺┼␊1@"), so the
+    // terminal goes back to ASCII before the marker.
+    let shown = |file: &std::path::Path, marker: &str| -> String {
         let path = file.display().to_string();
         if cfg!(windows) {
-            format!("$b = [IO.File]::ReadAllBytes('{path}'); $o = [Console]::OpenStandardOutput(); $o.Write($b, 0, $b.Length); $o.Flush(); [Console]::Write('{then}'); Start-Sleep 100")
+            // without RIS: designate ASCII into G0-G3 (so whichever set is shifted in
+            // is ASCII, in conhost and in the pane's parser) and shift in G0 (SI)
+            let marker = if marker.is_empty() { String::new() } else { format!("$e = [string][char]27; [Console]::Write($e + '(B' + $e + ')B' + $e + '*B' + $e + '+B' + [char]15 + '{marker}'); ") };
+            format!("$b = [IO.File]::ReadAllBytes('{path}'); $o = [Console]::OpenStandardOutput(); $o.Write($b, 0, $b.Length); $o.Flush(); {marker}Start-Sleep 100")
         } else {
+            let marker = if marker.is_empty() { String::new() } else { format!("\\033c{marker}") };
             // the replies to its queries are not echoed over the screen
-            format!("stty -echo; cat '{path}'; printf '{then}'; sleep 100")
+            format!("stty -echo; cat '{path}'; printf '{marker}'; sleep 100")
         }
     };
     ctx.ok(&["new-session", "-d", "-s", "keep"]);
     for (i, (name, cols, rows, history)) in [("crash-5x25.bin", 25, 5, 0), ("panic-11.bin", 1, 6, 7), ("panic-1712.bin", 18, 8, 7), ("panic-1861.bin", 25, 5, 14)].into_iter().enumerate() {
         let (session, cols, rows, history) = (format!("w{i}"), cols.to_string(), rows.to_string(), history.to_string());
         ctx.ok(&["set", "-g", "history-limit", &history]);
-        let script = shown(&dir.join(name), &format!("{}@done{i}@", if cfg!(windows) { "" } else { "\\033c" }));
+        let script = shown(&dir.join(name), &format!("@done{i}@"));
         ctx.ok(&["new-session", "-d", "-s", &session, "-x", &cols, "-y", &rows, &script]);
         wait_for(&format!("{name} shown"), || ctx.ok(&["capture-pane", "-p", "-J", "-t", &session]).contains(&format!("@done{i}@")));
     }
