@@ -514,14 +514,13 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                 let p = String::from_utf8_lossy(&p).into_owned();
                 let (cmd, shell) = p.split_once('\0').unwrap_or((p.as_str(), ""));
                 let shell = if shell.is_empty() { crate::server::procinfo::default_shell() } else { shell.to_string() };
-                let argv = crate::server::procinfo::via_shell(&shell, cmd);
-                let mut c = std::process::Command::new(&argv[0]);
-                c.args(&argv[1..]);
+                let run = crate::server::procinfo::via_shell(&shell, cmd);
+                let mut c = run.command();
                 #[cfg(unix)]
                 {
                     use std::os::unix::process::CommandExt;
                     let e = c.exec();
-                    eprintln!("{}: {e}", argv[0]);
+                    eprintln!("{}: {e}", run.argv[0]);
                     std::process::exit(1);
                 }
                 #[cfg(not(unix))]

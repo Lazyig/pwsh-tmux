@@ -87,6 +87,16 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   arrives as `\eOM`); on Windows it does not, so keypad Enter arrives as CR and a pane's
   PowerShell gets Enter, not the LF (Ctrl+Enter there) that tmux sends a pane for keypad
   Enter outside keypad mode.
+- **How a shell is given a command on Windows.** Where tmux runs `default-shell -c
+  command` (a pane's or popup's command, `default-command`, `detach-client -E`, jobs and
+  `-c`), a POSIX shell gets `-c command` and PowerShell `-NoLogo -Command command`, as
+  words of the command line quoted for CommandLineToArgvW (which both read). cmd.exe
+  reads its own command line and has no `\"` escape, so it gets `/s /c "command"` there
+  as it is: `/s` makes it take off just those two quotes, and the command runs exactly as
+  written (`split-window 'echo "%%%" & pause'` shows `"%%%"`, where the quoting for
+  CommandLineToArgvW gave cmd.exe `\"%%%\"`, and a command that starts with a quote
+  keeps it). A pane given several words runs them as a program with its
+  arguments, quoted for CommandLineToArgvW, as before.
 - **`default-terminal` is `xterm-256color`**, not `tmux-256color`: Windows hosts usually
   have no tmux terminfo and ConPTY programs expect xterm. Panes therefore get
   `TERM=xterm-256color`, and Home and End are sent as xterm's `\e[H`/`\e[F` (`\eOH`/`\eOF`
@@ -233,7 +243,9 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
     carets stay in the text, and so do the other shells' escapes, which cmd.exe does not
     remove: with PowerShell (jobs under `pwsh`, `default-shell` cmd.exe) the backtick
     before `$` and `` ` `` in `"%%%"`, so `\\srv\c$\x` reaches cmd.exe as
-    ``\\srv\c`$\x``; with a POSIX shell the backslash before `\ $` and `` ` ``. PowerShell
+    ``\\srv\c`$\x``, and PowerShell's doubled quotes: in `"%%%"` each of `“ ” „` is
+    doubled, so an answer `“q”` reaches cmd.exe, and is shown by its `echo`, as `““q””`,
+    and in `'%%'` each of `' ‘ ’ ‚ ‛` (`it’s` is `it’’s`); with a POSIX shell the backslash before `\ $` and `` ` ``. PowerShell
     and sh read cmd.exe's escapes as text the same way: the carets, and in `'%%'` the
     doubled `"` (`'a""b'` is `a""b` for them).
   - Not guaranteed: a shell whose quoting is not known (fish, nu, xonsh, `wsl`, ...) gets

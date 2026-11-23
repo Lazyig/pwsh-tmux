@@ -373,6 +373,9 @@ fn the_escapes_for_each_set_of_shells() {
     assert_eq!(fill("echo '%%'", "it's\nx", CMD).unwrap(), "echo 'it'\\''s x'");
     assert_eq!(fill("type \"%%%\"", "a;b~c$d", CMD).unwrap(), "type \"a;b~c$d\"");
     assert_eq!(fill("type \"%%%\"", "a\"b", PS_CMD).unwrap(), "type \"a\"\"b\"");
+    // (cmd.exe reads PowerShell's escapes as text: its doubled curly quotes stay doubled)
+    assert_eq!(fill("echo \"%%%\"", "\u{201c}q\u{201d}\u{201e}", PS_CMD).unwrap(), "echo \"\u{201c}\u{201c}q\u{201d}\u{201d}\u{201e}\u{201e}\"");
+    assert_eq!(fill("echo '%%'", "it\u{2019}s '\u{2018}", PS_CMD).unwrap(), "echo 'it\u{2019}\u{2019}s ''\u{2018}\u{2018}'");
     assert!(fill("type \"%%%\"", "a\"b", CMD_SH).unwrap_err().contains("cmd.exe and sh"));
 }
 

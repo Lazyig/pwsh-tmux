@@ -3163,12 +3163,13 @@ impl Server {
         let shell = self.opt_session(sid, "default-shell");
         let shell = if shell.is_empty() { procinfo::default_shell() } else { shell };
         let default_cmd = self.opt_session(sid, "default-command");
-        let argv: Vec<String> = match cmd {
-            [] if default_cmd.is_empty() => procinfo::interactive(&shell),
+        let run = match cmd {
+            [] if default_cmd.is_empty() => procinfo::ShellCommand::words(procinfo::interactive(&shell)),
             [] => procinfo::via_shell(&shell, &default_cmd),
             [one] => procinfo::via_shell(&shell, one),
-            many => many.to_vec(),
+            many => procinfo::ShellCommand::words(many.to_vec()),
         };
+        let argv = &run.argv;
         // tmux keeps the command given, else default-command; respawn without one keeps the old
         let start_argv = match cmd {
             [] if default_cmd.is_empty() => self.panes.get(&id).map(|p| p.track.argv.clone()).unwrap_or_default(),
@@ -3192,6 +3193,10 @@ impl Server {
         let mut cb = if login { CommandBuilder::new_default_prog() } else { CommandBuilder::new(&argv[0]) };
         if !login {
             cb.args(&argv[1..]);
+            // cmd.exe's command line as it is (procinfo::via_shell)
+            if let Some(raw) = &run.raw {
+                cb.raw_arg(raw);
+            }
         }
         cb.env_clear();
         for (k, v) in self.session_env(sid) {

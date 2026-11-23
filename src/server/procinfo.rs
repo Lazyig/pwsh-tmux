@@ -62,8 +62,9 @@ pub fn is_powershell(shell: &str) -> bool {
     stem == "pwsh" || stem == "powershell"
 }
 
+/// (Either separator on any platform, so the Windows choices are tested everywhere.)
 fn is_cmd(shell: &str) -> bool {
-    std::path::Path::new(shell).file_stem().is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case("cmd"))
+    shell_kind(shell) == ShellKind::Cmd
 }
 
 /// The quoting a shell reads a command string with, for escaping a prompt's answer.
@@ -112,26 +113,69 @@ pub fn interactive(shell: &str) -> Vec<String> {
     vec![shell.to_string()]
 }
 
-/// argv to run a command string through the shell (tmux's `default-shell -c command`).
-pub fn via_shell(shell: &str, command: &str) -> Vec<String> {
+/// What a shell is given to run a command string (tmux's `default-shell -c command`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellCommand {
+    /// The program and its words, which Windows puts on the command line quoted for
+    /// CommandLineToArgvW (a `"` in a word becomes `\"`).
+    pub argv: Vec<String>,
+    /// The rest of the command line, put there as it is: for cmd.exe on Windows, which
+    /// reads its command line itself and takes `\"` as a backslash and a quote.
+    pub raw: Option<String>,
+}
+
+impl ShellCommand {
+    /// A program and its words, none of them raw.
+    pub fn words(argv: Vec<String>) -> ShellCommand {
+        ShellCommand { argv, raw: None }
+    }
+
+    /// A process for it (the command line as said above).
+    pub fn command(&self) -> std::process::Command {
+        let mut c = std::process::Command::new(&self.argv[0]);
+        c.args(&self.argv[1..]);
+        if let Some(raw) = &self.raw {
+            #[cfg(windows)]
+            std::os::windows::process::CommandExt::raw_arg(&mut c, raw);
+            #[cfg(not(windows))]
+            c.arg(raw);
+        }
+        c
+    }
+}
+
+/// cmd.exe's command line after its name for running `command` as it is: `/s` makes
+/// `/c` take off just the first and the last quote of the line, which are these, so
+/// none of `command`'s own quotes are removed (without `/s`, a command that starts with
+/// a quote would lose that one and its last).
+pub fn cmd_line(command: &str) -> String {
+    format!("/s /c \"{command}\"")
+}
+
+/// How `shell` runs a command string (tmux's `default-shell -c command`).
+pub fn via_shell(shell: &str, command: &str) -> ShellCommand {
+    via_shell_on(shell, command, cfg!(windows))
+}
+
+/// [`via_shell`] on Windows or elsewhere.
+fn via_shell_on(shell: &str, command: &str, windows: bool) -> ShellCommand {
     if is_cmd(shell) {
-        return vec![shell.into(), "/c".into(), command.into()];
+        if windows {
+            return ShellCommand { argv: vec![shell.into()], raw: Some(cmd_line(command)) };
+        }
+        return ShellCommand::words(vec![shell.into(), "/c".into(), command.into()]);
     }
     if is_powershell(shell) {
-        return vec![shell.into(), "-NoLogo".into(), "-Command".into(), command.into()];
+        return ShellCommand::words(vec![shell.into(), "-NoLogo".into(), "-Command".into(), command.into()]);
     }
-    vec![shell.into(), "-c".into(), command.into()]
+    ShellCommand::words(vec![shell.into(), "-c".into(), command.into()])
 }
 
 /// Shell used for run-shell / if-shell / pipe-pane jobs.
 pub fn job_command(command: &str) -> std::process::Command {
     #[cfg(windows)]
     {
-        let shell = default_shell();
-        let argv = via_shell(&shell, command);
-        let mut c = std::process::Command::new(&argv[0]);
-        c.args(&argv[1..]);
-        c
+        via_shell(&default_shell(), command).command()
     }
     #[cfg(unix)]
     {
@@ -390,5 +434,45 @@ mod tests {
         let _ = sleep.wait();
         assert!(seen.iter().all(|n| n.is_none() || n.as_deref() == Some("sleep")), "{seen:?}");
         assert_eq!(seen.last(), Some(&Some("sleep".to_string())));
+    }
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::*;
+
+    /// What cmd.exe runs for its command line `line` after `/s /c `: it takes off the
+    /// first character when it is a quote, and the last quote.
+    fn cmd_runs(line: &str) -> String {
+        let rest = line.strip_prefix("/s /c ").expect("/s /c");
+        let rest = rest.strip_prefix('"').expect("a quote first");
+        let last = rest.rfind('"').expect("a last quote");
+        format!("{}{}", &rest[..last], &rest[last + 1..])
+    }
+
+    #[test]
+    fn cmd_gets_its_command_line_as_it_is() {
+        for command in ["echo \"%%%\" & pause", "\"C:\\Program Files\\x.exe\" \"a b\"", "echo \\\"x\\\" \"", "echo a", "", "echo \u{201c}q\u{201d} \u{2018}r\u{2019}"] {
+            let run = via_shell_on("cmd.exe", command, true);
+            assert_eq!(run.argv, vec!["cmd.exe".to_string()]);
+            let raw = run.raw.expect("cmd.exe gets a raw command line");
+            assert_eq!(raw, format!("/s /c \"{command}\""));
+            assert_eq!(cmd_runs(&raw), command, "{raw}");
+        }
+        // any spelling of cmd.exe; not on Unix, where there is no cmd.exe to read it
+        assert!(via_shell_on("C:\\Windows\\System32\\CMD.EXE", "x", true).raw.is_some());
+        assert_eq!(via_shell_on("cmd", "echo \"a\"", false), ShellCommand::words(vec!["cmd".into(), "/c".into(), "echo \"a\"".into()]));
+        // PowerShell and the others take words, which CommandLineToArgvW gives back
+        assert_eq!(via_shell_on("powershell.exe", "echo \"a\"", true), ShellCommand::words(vec!["powershell.exe".into(), "-NoLogo".into(), "-Command".into(), "echo \"a\"".into()]));
+        assert_eq!(via_shell_on("C:\\Program Files\\Git\\bin\\bash.exe", "echo \"a\"", true).raw, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cmd_runs_its_command_as_written() {
+        let out = via_shell("cmd.exe", "echo \"%%%\" & echo \"a b\"").command().stdin(std::process::Stdio::null()).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).replace(' ', ""), "\"%%%\"\r\n\"ab\"\r\n");
+        let out = via_shell("cmd.exe", "\"cmd.exe\" /c echo \"x\"").command().stdin(std::process::Stdio::null()).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "\"x\"\r\n");
     }
 }

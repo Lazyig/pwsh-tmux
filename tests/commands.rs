@@ -1079,6 +1079,20 @@ fn show_options_and_hooks_formats() {
     assert_eq!(ctx.ok(&["show-hooks", "-w", "-t", "o"]), "pane-focus-in[0] display-message w\n");
 }
 
+/// On Windows cmd.exe gets a pane's command as written.
+#[cfg(windows)]
+#[test]
+fn windows_cmd_gets_a_panes_command_as_written() {
+    let ctx = Ctx::new("wintext");
+    ctx.ok(&["new-session", "-d", "-s", "w"]);
+    ctx.wait_prompt("w");
+    ctx.ok(&["set", "-g", "default-shell", "cmd.exe"]);
+    let pane = ctx.ok(&["split-window", "-d", "-P", "-F", "#{pane_id}", "echo \"%%%\" & echo done & pause"]).trim().to_string();
+    wait_for("cmd.exe's output", || ctx.capture(&pane).contains("done"));
+    let shown = ctx.capture(&pane);
+    assert!(shown.contains("\"%%%\"") && !shown.contains("\\\""), "{shown}");
+}
+
 #[test]
 fn run_shell_paste_and_display_flags() {
     let ctx = Ctx::new("runflags");

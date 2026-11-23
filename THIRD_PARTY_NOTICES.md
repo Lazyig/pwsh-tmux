@@ -5,6 +5,10 @@ The bundled `vendor/vt100` is vt100 0.18.1 with local normal-screen reflow,
 opt-in scroll-on-clear and lossless compact history storage changes.
 See `vendor/vt100/PATCHES.md` and its MIT `LICENSE`.
 
+The bundled `vendor/portable-pty` is portable-pty 0.9.0 with a local
+`CommandBuilder::raw_arg` (an argument put on the Windows command line as it is).
+See `vendor/portable-pty/PATCHES.md` and its MIT `LICENSE.md`.
+
 ## tmux
 
 pwsh-tmux contains no tmux source code, but it reproduces tmux's interface: command and option names, default option values and formats, the default key bindings, and the default menus. tmux is distributed under the ISC license:
