@@ -150,7 +150,7 @@ fn main() {
         }
     }
     if let Some(cmd) = shell_cmd {
-        let status = server::procinfo::job_command(&cmd).status().map(|s| s.code().unwrap_or(1)).unwrap_or(127);
+        let status = server::procinfo::shell_command(&cmd).status().map(|s| s.code().unwrap_or(1)).unwrap_or(127);
         std::process::exit(status);
     }
     std::process::exit(client::main(args, g));

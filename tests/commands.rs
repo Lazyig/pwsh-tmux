@@ -1079,13 +1079,16 @@ fn show_options_and_hooks_formats() {
     assert_eq!(ctx.ok(&["show-hooks", "-w", "-t", "o"]), "pane-focus-in[0] display-message w\n");
 }
 
-/// On Windows cmd.exe gets a pane's command as written.
+/// On Windows a job prints what its shell prints (UTF-8 whatever the console code page),
+/// and cmd.exe gets a pane's command as written.
 #[cfg(windows)]
 #[test]
-fn windows_cmd_gets_a_panes_command_as_written() {
+fn windows_jobs_keep_text_and_cmd_gets_quotes() {
     let ctx = Ctx::new("wintext");
     ctx.ok(&["new-session", "-d", "-s", "w"]);
     ctx.wait_prompt("w");
+    let text = "\u{d55c}\u{ae00} \u{e9} \u{201c}q\u{201d}";
+    assert!(ctx.ok(&["run-shell", &format!("echo '{text}'")]).trim_end().ends_with(text));
     ctx.ok(&["set", "-g", "default-shell", "cmd.exe"]);
     let pane = ctx.ok(&["split-window", "-d", "-P", "-F", "#{pane_id}", "echo \"%%%\" & echo done & pause"]).trim().to_string();
     wait_for("cmd.exe's output", || ctx.capture(&pane).contains("done"));

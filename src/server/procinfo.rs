@@ -171,8 +171,9 @@ fn via_shell_on(shell: &str, command: &str, windows: bool) -> ShellCommand {
     ShellCommand::words(vec![shell.into(), "-c".into(), command.into()])
 }
 
-/// Shell used for run-shell / if-shell / pipe-pane jobs.
-pub fn job_command(command: &str) -> std::process::Command {
+/// A command string the shell of jobs runs in this process's console (`-c`, and
+/// commands the server gives the client to run, such as lock-command).
+pub fn shell_command(command: &str) -> std::process::Command {
     #[cfg(windows)]
     {
         via_shell(&default_shell(), command).command()
@@ -185,6 +186,93 @@ pub fn job_command(command: &str) -> std::process::Command {
         c.arg0("sh").args(["-c", command]);
         c
     }
+}
+
+/// Shell used for run-shell / if-shell / #() / pipe-pane / copy-pipe jobs, whose output
+/// the server reads or whose input it writes. On Windows the server has no console, so a
+/// job gets a console of its own (without a window), with the system's console code page
+/// (an OEM one such as 437 or 949, unless UTF-8 is set for the system): PowerShell and
+/// cmd.exe write to a pipe in that code page, which loses what it has no character for
+/// (`é` is `e` in 949). So the job's shell is first told to use UTF-8 ([`job_script`]),
+/// and what is not UTF-8 is read in the console code page ([`job_text`]).
+pub fn job_command(command: &str) -> std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let shell = default_shell();
+        let mut c = via_shell(&shell, &job_script(&shell, command)).command();
+        c.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+        c
+    }
+    #[cfg(unix)]
+    {
+        shell_command(command)
+    }
+}
+
+/// `command` for the shell of jobs on Windows, with its console set to UTF-8 first, so
+/// what it prints reaches the server as printed. Nothing else changes for the command:
+/// - PowerShell (5.1 and 7): [Console]::OutputEncoding (what PowerShell writes to a pipe
+///   in, and the console code page the programs it runs get), [Console]::InputEncoding
+///   (how it reads copy-pipe's and pipe-pane's text) and $OutputEncoding (what it gives
+///   programs it pipes to) are UTF-8 without a BOM; an error doing so is ignored. Not for
+///   a command that starts with `using`, which must come first in a script.
+/// - cmd.exe: `chcp 65001`, its output and errors thrown away, then the command after
+///   `&` (which binds least, so the command is all of what follows).
+/// - Other shells are given the command as it is (Git Bash's programs write UTF-8).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn job_script(shell: &str, command: &str) -> String {
+    match shell_kind(shell) {
+        ShellKind::PowerShell => {
+            let first = command.trim_start().split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("");
+            if first.eq_ignore_ascii_case("using") {
+                return command.to_string();
+            }
+            format!("{PWSH_UTF8}; {command}")
+        }
+        ShellKind::Cmd => format!("chcp 65001 >nul 2>nul & {command}"),
+        _ => command.to_string(),
+    }
+}
+
+/// Sets a PowerShell job's console and encodings to UTF-8 ([`job_script`]).
+#[cfg_attr(not(windows), allow(dead_code))]
+const PWSH_UTF8: &str = "try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; \
+$OutputEncoding = [Console]::OutputEncoding; [Console]::InputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }";
+
+/// What a job printed, as text: on Unix the bytes as UTF-8, as tmux shows them. On
+/// Windows each line that is UTF-8 is read as it is, and any other in the console code
+/// page jobs get ([`job_command`]): a program that writes in that code page (as programs
+/// run by Git Bash do, or a shell that was not told to use UTF-8) is shown as it would be
+/// in a pane, whose console reads it in that code page too.
+pub fn job_text(bytes: &[u8]) -> String {
+    #[cfg(windows)]
+    {
+        let cp = unsafe { windows_sys::Win32::Globalization::GetOEMCP() };
+        decode_lines(bytes, |line| win::code_page_text(line, cp))
+    }
+    #[cfg(not(windows))]
+    {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
+/// `bytes` line by line: a line that is UTF-8 as it is, any other by `other` (else with
+/// U+FFFD for what is not UTF-8). A line ends after `\n`, which no byte of a multibyte
+/// character in an OEM or ANSI code page is.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn decode_lines(bytes: &[u8], other: impl Fn(&[u8]) -> Option<String>) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for line in bytes.split_inclusive(|&b| b == b'\n') {
+        match std::str::from_utf8(line) {
+            Ok(s) => out.push_str(s),
+            Err(_) => match other(line) {
+                Some(s) => out.push_str(&s),
+                None => out.push_str(&String::from_utf8_lossy(line)),
+            },
+        }
+    }
+    out
 }
 
 pub fn program_name(argv0: &str) -> String {
@@ -280,6 +368,22 @@ pub mod win {
             CloseHandle(snap);
         }
         out
+    }
+
+    /// `bytes` in code page `cp` (MultiByteToWideChar), or None when it cannot be read.
+    pub fn code_page_text(bytes: &[u8], cp: u32) -> Option<String> {
+        use windows_sys::Win32::Globalization::MultiByteToWideChar;
+        if bytes.is_empty() {
+            return Some(String::new());
+        }
+        let len = i32::try_from(bytes.len()).ok()?;
+        let n = unsafe { MultiByteToWideChar(cp, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0) };
+        if n <= 0 {
+            return None;
+        }
+        let mut wide = vec![0u16; n as usize];
+        let n = unsafe { MultiByteToWideChar(cp, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n) };
+        (n > 0).then(|| String::from_utf16_lossy(&wide[..n as usize]))
     }
 
     /// Pids of direct children of `parent` with the given executable name.
@@ -474,5 +578,86 @@ mod shell_tests {
         assert_eq!(String::from_utf8_lossy(&out.stdout).replace(' ', ""), "\"%%%\"\r\n\"ab\"\r\n");
         let out = via_shell("cmd.exe", "\"cmd.exe\" /c echo \"x\"").command().stdin(std::process::Stdio::null()).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), "\"x\"\r\n");
+    }
+
+    #[test]
+    fn jobs_shells_print_utf8() {
+        // PowerShell: the encodings first, unless the command must come first
+        for ps in ["powershell.exe", "pwsh", "C:\\Program Files\\PowerShell\\7\\pwsh.exe"] {
+            assert_eq!(job_script(ps, "echo '\u{d55c}\u{ae00}'"), format!("{PWSH_UTF8}; echo '\u{d55c}\u{ae00}'"));
+            assert_eq!(job_script(ps, "  Using namespace System.Text; [UTF8Encoding]"), "  Using namespace System.Text; [UTF8Encoding]");
+            assert_eq!(job_script(ps, "usingx"), format!("{PWSH_UTF8}; usingx"));
+        }
+        assert!(PWSH_UTF8.starts_with("try {") && PWSH_UTF8.ends_with("} catch { }"));
+        assert!(PWSH_UTF8.contains("[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false"));
+        // cmd.exe: chcp, its output and errors thrown away
+        assert_eq!(job_script("cmd.exe", "echo \"%%%\" | more"), "chcp 65001 >nul 2>nul & echo \"%%%\" | more");
+        // others as they are
+        assert_eq!(job_script("bash", "echo 'x'; exit 3"), "echo 'x'; exit 3");
+        assert_eq!(job_script("/bin/sh", "a"), "a");
+    }
+
+    #[test]
+    fn job_output_lines_that_are_not_utf8_are_read_in_the_code_page() {
+        // a stand-in for the console code page: Latin-1
+        let latin1 = |b: &[u8]| Some(b.iter().map(|&c| c as char).collect::<String>());
+        let bytes = [b"utf-8 \xc3\xa9\r\n".as_slice(), b"latin-1 \xe9\r\n", b"\xed\x95\x9c\n", b"last \xe9"].concat();
+        assert_eq!(decode_lines(&bytes, latin1), "utf-8 \u{e9}\r\nlatin-1 \u{e9}\r\n\u{d55c}\nlast \u{e9}");
+        // what the code page cannot read either is U+FFFD
+        assert_eq!(decode_lines(b"a\xff\nb", |_| None), "a\u{fffd}\nb");
+        assert_eq!(decode_lines(b"", latin1), "");
+        #[cfg(not(windows))]
+        assert_eq!(job_text(b"x\xe9\n"), "x\u{fffd}\n");
+    }
+
+    /// Runs `command` as a job's `shell` (a console of its own without a window, as
+    /// the server's jobs have), with what it prints read as the server reads it.
+    #[cfg(windows)]
+    fn job_output(shell: &str, command: &str) -> String {
+        use std::os::windows::process::CommandExt;
+        let mut c = via_shell(shell, &job_script(shell, command)).command();
+        c.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+        c.stdin(std::process::Stdio::null());
+        let o = c.output().expect("run the job");
+        job_text(&o.stdout) + &job_text(&o.stderr)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_code_pages_are_read() {
+        assert_eq!(win::code_page_text(b"\xc7\xd1\xb1\xdb", 949).as_deref(), Some("\u{d55c}\u{ae00}"));
+        assert_eq!(win::code_page_text(b"\x82", 437).as_deref(), Some("\u{e9}"));
+        assert_eq!(win::code_page_text(b"", 949).as_deref(), Some(""));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_jobs_print_what_their_shell_prints() {
+        // Hangul, é and a curly quote: none of them are in every console code page (é and
+        // ‘ are not in 949, Hangul is not in 437); PowerShell's ‘ ’ are its quotes
+        let text = "\u{d55c}\u{ae00} \u{e9} \u{201c}q\u{201d}";
+        let mut shells = vec!["powershell.exe"];
+        if which("pwsh.exe").is_some() {
+            shells.push("pwsh.exe");
+        }
+        // (the user's profile runs first and may print something)
+        for ps in shells {
+            let out = job_output(ps, &format!("echo '{text}'"));
+            assert!(out.ends_with(&format!("\n{text}\r\n")) || out == format!("{text}\r\n"), "{ps}: {out:?}");
+            let out = job_output(ps, &format!("echo '{text}' | findstr q"));
+            assert!(out.trim_end().ends_with(text), "{ps}, a program it pipes to: {out:?}");
+            let out = job_output(ps, "using namespace System.Text; [UTF8Encoding]::new($false).GetType().Name");
+            assert!(out.trim_end().ends_with("UTF8Encoding"), "{ps}: {out:?}");
+        }
+        // cmd.exe: quotes as written, no backslashes added; its own output in UTF-8
+        assert_eq!(job_output("cmd.exe", "echo \"%%%\" & echo \"a b\"").replace(' ', ""), "\"%%%\"\r\n\"ab\"\r\n");
+        assert_eq!(job_output("cmd.exe", &format!("echo {text}")), format!("{text}\r\n"));
+        assert_eq!(job_output("cmd.exe", "\"cmd.exe\" /c echo \"x\""), "\"x\"\r\n");
+        // Git Bash, when it is installed
+        let bash = std::path::Path::new("C:\\Program Files\\Git\\bin\\bash.exe");
+        if bash.is_file() {
+            let bash = bash.to_string_lossy();
+            assert_eq!(job_output(&bash, &format!("echo '{text}' \"%%%\" \\\"")), format!("{text} %%% \"\n"));
+        }
     }
 }

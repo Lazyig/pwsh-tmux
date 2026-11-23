@@ -272,7 +272,7 @@ impl Vars for VarCtx<'_> {
                 if let Some(d) = cwd.filter(|d| std::path::Path::new(d).is_dir()) {
                     c.current_dir(d);
                 }
-                let out = c.output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+                let out = c.output().map(|o| procinfo::job_text(&o.stdout)).unwrap_or_default();
                 // tmux shows the last line of output
                 let line = out.trim_end().lines().last().unwrap_or("").to_string();
                 let _ = tx.send(Event::FormatShell(cmd, line));

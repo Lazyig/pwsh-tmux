@@ -4926,7 +4926,7 @@ impl Server {
         thread::spawn(move || {
             let (status, out) = match child.and_then(|c| c.wait_with_output()) {
                 // a signal is passed on as its negated number
-                Ok(o) => (o.status.code().or_else(|| process_exit_signal(&o.status).map(|s| -s)).unwrap_or(1), String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr)),
+                Ok(o) => (o.status.code().or_else(|| process_exit_signal(&o.status).map(|s| -s)).unwrap_or(1), procinfo::job_text(&o.stdout) + &procinfo::job_text(&o.stderr)),
                 Err(e) => (127, format!("{e}\n")),
             };
             let _ = tx.send(Event::Job(id, status, out));

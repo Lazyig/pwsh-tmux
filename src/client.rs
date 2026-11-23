@@ -556,7 +556,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                 drop(raw.take());
                 restore(&mut out, alternate);
                 let cmd = String::from_utf8_lossy(&p).into_owned();
-                let _ = crate::server::procinfo::job_command(&cmd).status();
+                let _ = crate::server::procinfo::shell_command(&cmd).status();
                 raw = term::RawMode::enter().ok();
                 if alternate { let _ = out.write_all(b"\x1b[?1049h"); }
                 let _ = out.flush();
