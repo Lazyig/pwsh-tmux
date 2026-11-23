@@ -144,6 +144,28 @@ on Windows in these ways:
   and uses a 50 ms quiet period with an upper bound.
 - **Shared code.** WP2, WP5, WP6, WP7 and WP8 are platform-independent.
 
+### Named pipe output rate
+
+A Windows client received about 55 KB/s from the server. interprocess 2.4.7
+creates the local socket pipe with 512-byte buffers. The server writes with
+`PIPE_NOWAIT`, so a write took at most 512 bytes (or what a waiting client read
+could take) and the next try came after the 5 ms wait: about 200 small writes
+per second.
+
+- The bundled `vendor/interprocess` creates the pipe with 64 KiB buffers in
+  each direction. `vendor/interprocess/PATCHES.md` gives the reasons for the
+  size. Even if every write still ended in the 5 ms wait, a client could
+  receive about 13 MB/s.
+- The client reads through a 64 KiB buffer instead of reading each frame
+  header and body separately. A Windows pipe hands a write straight to a
+  waiting read, so a large read also takes more of each write. The client
+  flushes the terminal once for a run of output frames that has already
+  arrived, not after each frame.
+- The 5 ms wait itself and the key latency it adds are unchanged.
+
+None of this was measured on Windows. The checks below (item 7) say how to
+measure it.
+
 ### Checks still needed on a Windows machine
 
 1. **Connections (WP1):**
@@ -186,3 +208,19 @@ on Windows in these ways:
    - search;
    - a width-changing resize in copy-mode;
    - `capture-pane -M`.
+7. **Named pipe output rate (win-pipe):** compare this build with the previous
+   one, in Windows Terminal at 120x32 with one pane running pwsh.
+   - Client catch-up: in a second console, poll the client counters every
+     100 ms with `tmux list-clients -F '#{client_written} #{client_discarded}'`.
+     In the pane, run `1..20000`. The catch-up time runs from Enter until
+     `client_written` stops growing; the rate is its growth per second. The
+     previous build is expected near 55 KB/s.
+   - A long flood: `1..300000` must scroll without stalls and the client must
+     not be detached; `client_discarded` should stay 0 or close to it.
+   - Repeat both with `PWSH_TMUX_OUTPUT_COPY` set for the client (it appends
+     every output frame to a file) and without it, and note the difference.
+   - Interactive feel: key echo while idle and during a flood is no worse than
+     before, and a large paste (`paste-buffer` of a 1 MB buffer) arrives whole.
+   - `tests/commands.rs`
+     `pane_output_that_widens_a_cell_in_the_last_column_leaves_the_server_running`
+     passes: the marker is drawn in ASCII after the fuzzed output.
