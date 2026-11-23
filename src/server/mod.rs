@@ -980,6 +980,8 @@ pub struct RenderState {
     pub modes: render::Modes,
     /// Mouse range of every cell of each status line (tmux status entry ranges).
     pub status_ranges: Vec<Vec<Option<crate::format::Range>>>,
+    /// A frame no longer shown, which the next render draws into (render::Frame::reuse).
+    pub spare: Option<render::Frame>,
 }
 
 /// What a mouse drag in progress updates (tmux's mouse_drag_update callback).
