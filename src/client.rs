@@ -6,7 +6,6 @@ use crate::protocol::*;
 use crate::term;
 use interprocess::local_socket::Stream;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -168,15 +167,20 @@ fn connect(autostart: bool, config: Option<&str>) -> Result<Stream, String> {
         Err(_) => {}
     }
     spawn_server(config).map_err(|e| format!("failed to start server: {e}"))?;
-    // by time: a connect attempt can wait for a busy Windows pipe
+    // Try at once, then back off (1, 2, 4 ... 50 ms) while the server loads its config.
+    // By time: a connect attempt can wait for a busy Windows pipe.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(50));
+    let mut delay = Duration::from_millis(1);
+    loop {
         if let Ok(s) = ipc::connect() {
             return Ok(s);
         }
+        if std::time::Instant::now() >= deadline {
+            return Err("server did not start".into());
+        }
+        thread::sleep(delay);
+        delay = (delay * 2).min(Duration::from_millis(50));
     }
-    Err("server did not start".into())
 }
 
 /// After kill-server: waits (bounded) until the server has closed the connection, which
@@ -364,7 +368,8 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
     let mut control_started = false;
     let mut alternate = true;
     // Set while a lock command or a suspended shell owns the terminal.
-    let paused = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(term::Pause::new());
+    let mut size_watch: Option<term::SizeWatch> = None;
     let mut out = std::io::stdout();
     // a copy of the terminal output for the tests: on Windows ConPTY re-renders what the
     // client writes and keeps some sequences (OSC 52 queries) from the terminal
@@ -456,19 +461,24 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                         let _ = out.write_all(format!("\x1b[{};1H{}\x1b[H", rows, "\r\n".repeat(rows as usize)).as_bytes());
                     }
                     let _ = out.flush();
+                    // before the size is read, so no later change goes unseen
+                    let watch = term::SizeWatch::install();
+                    size_watch = Some(watch);
                     // tmux's client answers MSG_READY with MSG_RESIZE (client-resized)
                     let (c, r) = term::size();
                     post(C_RESIZE, &encode_size(c, r));
                     let input_post = post.clone();
-                    let paused = paused.clone();
+                    let input_paused = paused.clone();
+                    let resize_paused = paused.clone();
                     thread::spawn(move || {
+                        let paused = input_paused;
                         let mut input = term::Input::default();
                         loop {
-                            if paused.load(Ordering::SeqCst) {
-                                thread::sleep(Duration::from_millis(50));
+                            if paused.is_set() {
+                                paused.wait();
                                 continue;
                             }
-                            match input.wait(100) {
+                            match input.wait(&paused) {
                                 Ok(false) => continue,
                                 Ok(true) => {}
                                 // terminal gone: exit like tmux on SIGHUP (the server detaches us)
@@ -485,7 +495,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                     thread::spawn(move || {
                         let mut last = (cols, rows);
                         loop {
-                            thread::sleep(Duration::from_millis(100));
+                            watch.wait(resize_paused.is_set());
                             let now = term::size();
                             if now != last {
                                 last = now;
@@ -534,7 +544,7 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                 std::process::exit(0);
             }
             Ok((S_SUSPEND, _)) => {
-                paused.store(true, Ordering::SeqCst);
+                paused.set(true);
                 drop(raw.take());
                 restore(&mut out, alternate);
                 #[cfg(unix)]
@@ -546,11 +556,21 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                 let _ = out.flush();
                 let (c, r) = term::size();
                 post(C_RESIZE, &encode_size(c, r));
-                paused.store(false, Ordering::SeqCst);
+                paused.set(false);
+                // SIGWINCH went to the shell while we were stopped: the resize thread looks
+                // again, so it knows the size sent above
+                if let Some(watch) = size_watch {
+                    watch.nudge();
+                }
                 post(C_RESUMED, b"");
             }
             Ok((S_SHELL, p)) => {
-                paused.store(true, Ordering::SeqCst);
+                paused.set(true);
+                // the command may take the terminal's foreground, which keeps SIGWINCH from
+                // us: the resize thread looks every 100 ms until it is done
+                if let Some(watch) = size_watch {
+                    watch.nudge();
+                }
                 // give the reader a moment to leave its wait
                 thread::sleep(Duration::from_millis(150));
                 drop(raw.take());
@@ -560,7 +580,10 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
                 raw = term::RawMode::enter().ok();
                 if alternate { let _ = out.write_all(b"\x1b[?1049h"); }
                 let _ = out.flush();
-                paused.store(false, Ordering::SeqCst);
+                paused.set(false);
+                if let Some(watch) = size_watch {
+                    watch.nudge();
+                }
                 post(C_RESUMED, b"");
             }
             Ok(_) => {}
