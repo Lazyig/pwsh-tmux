@@ -7,19 +7,23 @@ pub fn size() -> (u16, u16) {
     {
         // ioctl only: crossterm falls back to running `tput cols` and `tput lines`
         // when there is no terminal, which cost two process spawns per command.
-        for fd in [1, 0, 2] {
-            let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-            if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
-                return (ws.ws_col, ws.ws_row);
-            }
-        }
-        (80, 24)
+        SIZE_FDS.into_iter().find_map(tty_size).unwrap_or((80, 24))
     }
     #[cfg(windows)]
     match crossterm::terminal::size() {
         Ok((c, r)) if c > 0 && r > 0 => (c, r),
         _ => (80, 24),
     }
+}
+
+/// The descriptors `size` asks, in order.
+#[cfg(unix)]
+const SIZE_FDS: [libc::c_int; 3] = [1, 0, 2];
+
+#[cfg(unix)]
+fn tty_size(fd: libc::c_int) -> Option<(u16, u16)> {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    (unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 && ws.ws_row > 0).then_some((ws.ws_col, ws.ws_row))
 }
 
 /// Puts the controlling terminal into raw mode with VT input; restores on drop.
@@ -206,11 +210,11 @@ static WINCH_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::ne
 /// This thread's errno, which the signal handler keeps for the code it interrupted.
 #[cfg(unix)]
 fn errno_location() -> *mut libc::c_int {
-    #[cfg(any(target_os = "linux", target_os = "redox"))]
+    #[cfg(any(target_os = "linux", target_os = "redox", target_os = "dragonfly"))]
     return unsafe { libc::__errno_location() };
     #[cfg(any(target_os = "android", target_os = "netbsd", target_os = "openbsd"))]
     return unsafe { libc::__errno() };
-    #[cfg(any(target_vendor = "apple", target_os = "freebsd", target_os = "dragonfly"))]
+    #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
     return unsafe { libc::__error() };
     #[cfg(any(target_os = "solaris", target_os = "illumos"))]
     return unsafe { libc::___errno() };
@@ -232,12 +236,58 @@ extern "C" fn on_winch(_: libc::c_int) {
     }
 }
 
+/// Whether the kernel sends us SIGWINCH for the terminal `size` reads: it goes only to
+/// the foreground process group of a controlling terminal (not, say, under `setsid`).
+#[cfg(unix)]
+fn winch_reaches_us() -> bool {
+    SIZE_FDS
+        .into_iter()
+        .find(|&fd| tty_size(fd).is_some())
+        .is_some_and(|fd| unsafe { libc::tcgetpgrp(fd) == libc::getpgrp() })
+}
+
+/// Sets `on_winch` for SIGWINCH and SIGCONT (after a stop the size may have changed
+/// while another process group had the terminal). Not when either signal came ignored
+/// or blocked: changing that would show in the commands the client runs, so the thread
+/// keeps polling then.
+#[cfg(unix)]
+fn catch_winch() -> bool {
+    unsafe {
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        if libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask) != 0 {
+            return false;
+        }
+        let mut old: [libc::sigaction; 2] = std::mem::zeroed();
+        for (i, sig) in [libc::SIGWINCH, libc::SIGCONT].into_iter().enumerate() {
+            if libc::sigismember(&mask, sig) != 0
+                || libc::sigaction(sig, std::ptr::null(), &mut old[i]) != 0
+                || old[i].sa_sigaction == libc::SIG_IGN
+            {
+                return false;
+            }
+        }
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_winch as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        sa.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut sa.sa_mask);
+        if libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut()) != 0 {
+            return false;
+        }
+        if libc::sigaction(libc::SIGCONT, &sa, std::ptr::null_mut()) != 0 {
+            libc::sigaction(libc::SIGWINCH, &old[0], std::ptr::null_mut());
+            return false;
+        }
+        true
+    }
+}
+
 /// Wakes the resize thread when the terminal may have changed size. On Unix that is
-/// SIGWINCH, which a handler (SA_RESTART, so other threads' blocking calls carry on)
-/// passes on through a pipe; the handler is reset by exec and the signal mask is left
-/// alone, so commands the client runs get SIGWINCH as before. On Windows (or when the
-/// handler can't be set up), and while a command owns the terminal (one that takes its
-/// foreground keeps SIGWINCH from us), the thread looks every 100 ms.
+/// SIGWINCH (and SIGCONT), which a handler (SA_RESTART, so other threads' blocking calls
+/// carry on) passes on through a pipe; the handler is reset by exec and the signal mask
+/// is left alone, so commands the client runs get the signals as before. On Windows,
+/// when the handler can't be set up, while SIGWINCH doesn't reach us, and while a command
+/// owns the terminal (one that takes its foreground keeps SIGWINCH from us), the thread
+/// looks every 100 ms.
 #[derive(Clone, Copy)]
 pub struct SizeWatch {
     #[cfg(unix)]
@@ -254,11 +304,7 @@ impl SizeWatch {
                 .get_or_init(|| {
                     let pipe = Pipe::new()?;
                     WINCH_FD.store(pipe.w, std::sync::atomic::Ordering::Relaxed);
-                    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
-                    sa.sa_sigaction = on_winch as extern "C" fn(libc::c_int) as libc::sighandler_t;
-                    sa.sa_flags = libc::SA_RESTART;
-                    unsafe { libc::sigemptyset(&mut sa.sa_mask) };
-                    if unsafe { libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut()) } != 0 {
+                    if !catch_winch() {
                         WINCH_FD.store(-1, std::sync::atomic::Ordering::Relaxed);
                         return None;
                     }
@@ -287,7 +333,7 @@ impl SizeWatch {
     pub fn wait(&self, poll: bool) {
         #[cfg(unix)]
         if let Some(pipe) = self.pipe {
-            pipe.wait(if poll { 100 } else { -1 });
+            pipe.wait(if poll || !winch_reaches_us() { 100 } else { -1 });
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -463,11 +509,13 @@ mod tests {
     fn size_watch_wakes_on_sigwinch() {
         let watch = SizeWatch::install();
         assert!(watch.pipe.is_some());
-        // the first wait returns at once
-        watch.wait(false);
+        // the first wait returns at once; the pipe is waited on directly, as the tests
+        // may run without a controlling terminal (where `wait` polls)
+        let pipe = watch.pipe.unwrap();
+        pipe.wait(-1);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            watch.wait(false);
+            pipe.wait(-1);
             tx.send(()).unwrap();
         });
         std::thread::sleep(std::time::Duration::from_millis(20));
