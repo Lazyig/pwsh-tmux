@@ -61,8 +61,9 @@ fn buffer_names_are_checked_and_unnamed_commands_use_the_newest_automatic_buffer
     // paste_set and paste_rename: clean_name refuses control characters
     assert_eq!(run(&mut f, &["set-buffer", "-b", "n\u{1}m", "x"]), Err("invalid buffer name: n\u{1}m".into()));
     assert_eq!(run(&mut f, &["set-buffer", "-b", "", "x"]), Err("empty buffer name".into()));
+    // (on Windows a backslash is kept, COMPATIBILITY.md)
     run(&mut f, &["set-buffer", "-b", "a\\b", "x"]).unwrap();
-    assert!(f.buffers.iter().any(|b| b.name == "a\\\\b"));
+    assert!(f.buffers.iter().any(|b| b.name == if cfg!(windows) { "a\\b" } else { "a\\\\b" }));
     run(&mut f, &["set-buffer", "-b", "ok", "x"]).unwrap();
     assert_eq!(run(&mut f, &["set-buffer", "-b", "ok", "-n", "r\tq"]), Err("invalid buffer name: r\tq".into()));
     // paste_get_top skips named buffers

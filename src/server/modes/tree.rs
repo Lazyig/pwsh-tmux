@@ -15,6 +15,11 @@ use crate::server::vars::Target;
 use crate::server::*;
 use std::collections::HashSet;
 
+/// A filled template's command run (leaving the mode), or its error.
+fn run_filled(cmd: Result<String, String>) -> ModeAction {
+    cmd.map_or_else(ModeAction::Error, ModeAction::Run)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TreeKind {
     /// choose-tree: sessions, windows and panes.
@@ -1105,8 +1110,12 @@ impl Tree {
                 if s.is_empty() {
                     return ModeAction::None;
                 }
-                let cmds: Vec<String> = self.tagged_or_current(b).iter().filter_map(|i| Tree::target_name(srv, &b.nodes[*i].data)).map(|t| fill_template(&s, &[t])).collect();
-                if cmds.is_empty() { ModeAction::None } else { ModeAction::RunKeep(cmds.join(" ; ")) }
+                let cmds: Result<Vec<String>, String> = self.tagged_or_current(b).iter().filter_map(|i| Tree::target_name(srv, &b.nodes[*i].data)).map(|t| fill_template(&s, &[t], srv.answer_shells())).collect();
+                match cmds {
+                    Ok(cmds) if cmds.is_empty() => ModeAction::None,
+                    Ok(cmds) => ModeAction::RunKeep(cmds.join(" ; ")),
+                    Err(e) => ModeAction::Error(e),
+                }
             }
             TreePrompt::KillCurrent | TreePrompt::KillTagged => {
                 if !s.eq_ignore_ascii_case("y") {
@@ -1184,7 +1193,7 @@ impl Tree {
             }
             "Enter" => {
                 return match Tree::target_name(srv, &data) {
-                    Some(t) => ModeAction::Run(fill_template(&self.command, &[t])),
+                    Some(t) => run_filled(fill_template(&self.command, &[t], srv.answer_shells())),
                     None => ModeAction::Exit,
                 };
             }
@@ -1198,8 +1207,13 @@ impl Tree {
             return ModeAction::Exit;
         }
         let item = self.current_item(b);
-        let paste = |t: &Tree, items: &[usize]| -> Vec<String> {
-            items.iter().filter_map(|i| Tree::target_name(srv, &b.nodes[*i].data)).map(|n| fill_template(&t.command, &[n])).collect()
+        let paste = |t: &Tree, items: &[usize]| -> ModeAction {
+            let cmds: Result<Vec<String>, String> = items.iter().filter_map(|i| Tree::target_name(srv, &b.nodes[*i].data)).map(|n| fill_template(&t.command, &[n], srv.answer_shells())).collect();
+            match cmds {
+                Ok(cmds) if cmds.is_empty() => ModeAction::Exit,
+                Ok(cmds) => ModeAction::Run(cmds.join(" ; ")),
+                Err(e) => ModeAction::Error(e),
+            }
         };
         match name {
             "d" => {
@@ -1219,12 +1233,10 @@ impl Tree {
                 }
             }
             "P" => {
-                let cmds = paste(self, &self.tagged_items(b));
-                return if cmds.is_empty() { ModeAction::Exit } else { ModeAction::Run(cmds.join(" ; ")) };
+                return paste(self, &self.tagged_items(b));
             }
             "p" | "Enter" => {
-                let cmds = paste(self, &[item]);
-                return if cmds.is_empty() { ModeAction::Exit } else { ModeAction::Run(cmds.join(" ; ")) };
+                return paste(self, &[item]);
             }
             "e" => {
                 if let ItemData::Buffer(n) = &b.nodes[item].data {
@@ -1260,7 +1272,7 @@ impl Tree {
             "i" => self.info = !self.info,
             "Enter" => {
                 return match Tree::target_name(srv, &b.nodes[item].data) {
-                    Some(c) => ModeAction::Run(fill_template(&self.command, &[c])),
+                    Some(c) => run_filled(fill_template(&self.command, &[c], srv.answer_shells())),
                     None => ModeAction::Exit,
                 };
             }
@@ -1387,7 +1399,7 @@ impl Tree {
             _ => return ModeAction::None,
         };
         match Tree::target_name(srv, &d) {
-            Some(t) => ModeAction::Run(fill_template(&self.command, &[t])),
+            Some(t) => run_filled(fill_template(&self.command, &[t], srv.answer_shells())),
             None => ModeAction::None,
         }
     }

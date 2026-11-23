@@ -165,6 +165,224 @@ pub fn check_command(argv: &[String]) -> Result<(), String> {
     parse_args(full, &args).map(|_| ())
 }
 
+/// cmd_list_copy with answers (args_make_commands for a { } block): the block's
+/// commands (`text`, as the queue gives a block) with `fill` applied to every string
+/// value, flag values and arguments alike, and to the commands of blocks inside it.
+/// The values are not parsed again: each stays one word, flag values after their flag
+/// (or attached, for a flag whose value is optional) and the arguments after "--".
+/// `fill` is told who reads each value ([`argument_reader`]): the command parser for a
+/// command's arguments that are commands, the shell of jobs for those it runs, else
+/// whatever the command gives it to. An error when the text does not parse or when the
+/// filled words of a binding end its commands elsewhere than `fill` was told
+/// ([`fill_bound_words`]).
+pub(crate) fn copy_block(text: &str, fill: &dyn Fn(&str, input::Reader) -> String) -> Result<Vec<Vec<String>>, String> {
+    cmdparse::parse_marked(text)?.iter().map(|c| copy_block_command(c, fill)).collect()
+}
+
+/// Whether argument `pos` (after the flags) of command `full`, given flags `flags`, is
+/// a command string that is parsed later: if-shell's commands, run-shell -C's,
+/// confirm-before's, a template (command-prompt, choose-*, display-panes), a binding's
+/// (when it is one string: several words are the command's own arguments, see
+/// [`copy_block_command`]) or a hook's commands and display-menu's items. if-shell's
+/// test, run-shell's command and the commands of new panes are run by a shell; flag
+/// values are formats or names.
+fn parsed_argument(full: &str, flags: &str, pos: usize) -> bool {
+    match full {
+        "if-shell" | "bind-key" | "set-hook" => pos >= 1,
+        "run-shell" => flags.contains('C'),
+        "confirm-before" | "command-prompt" | "choose-tree" | "choose-buffer" | "choose-client" | "display-panes" | "display-menu" => true,
+        _ => false,
+    }
+}
+
+/// Who reads argument `pos` of command `full` ([`parsed_argument`]): the parser, the
+/// shell of jobs (run-shell's command, and the words after it, which it reads as #{1}
+/// and on; if-shell's test without -F; pipe-pane's command), or anything else.
+fn argument_reader(full: &str, flags: &str, pos: usize) -> input::Reader {
+    if parsed_argument(full, flags, pos) {
+        return input::Reader::Parser;
+    }
+    match full {
+        "run-shell" => input::Reader::Job,
+        "if-shell" if pos == 0 && !flags.contains('F') => input::Reader::Job,
+        "pipe-pane" if pos == 0 => input::Reader::Job,
+        _ => input::Reader::Direct,
+    }
+}
+
+fn copy_block_command(argv: &[String], fill: &dyn Fn(&str, input::Reader) -> String) -> Result<Vec<String>, String> {
+    copy_command(argv, fill, false)
+}
+
+/// One command of [`copy_block`] with `fill` applied to its values. With `raw`, its
+/// words as written with the values filled (the words of a bound command, which
+/// bind-key reads again as tmux 3.8 does, cmd_parse_from_arguments), else the flags,
+/// then "--", then the arguments.
+fn copy_command(argv: &[String], fill: &dyn Fn(&str, input::Reader) -> String, raw: bool) -> Result<Vec<String>, String> {
+    let Some((name, args)) = argv.split_first() else { return Ok(Vec::new()) };
+    let value_for = |a: &str, reader: input::Reader| -> Result<String, String> { Ok(match a.strip_prefix(cmdparse::BLOCK_MARK) {
+        Some(b) => {
+            let inner = copy_block(b, fill)?.iter()
+                .map(|c| c.iter().map(|w| match w.strip_prefix(cmdparse::BLOCK_MARK) {
+                    Some(b) => format!("{{ {b} }}"),
+                    None => cmdparse::quote(w),
+                }).collect::<Vec<_>>().join(" "))
+                .collect::<Vec<_>>().join(" ; ");
+            format!("{}{inner}", cmdparse::BLOCK_MARK)
+        }
+        None => fill(a, reader),
+    }) };
+    let value = |a: &str| value_for(a, input::Reader::Direct);
+    let mut flags = String::new();
+    let mut out = vec![name.clone()];
+    // (the words as written, argument i at i + 1, each value replaced when filled)
+    let mut words = argv.to_vec();
+    let done = |out: Vec<String>, words: Vec<String>| Ok(if raw { words } else { out });
+    let spec = canonical(name).and_then(|full| COMMANDS.iter().find(|c| c.0 == full));
+    let mut i = 0;
+    if let Some(&(full, _, bools, vals)) = spec {
+        // the flags as args_parse read them (a word it would not take ends them, as is)
+        while let Some(a) = args.get(i) {
+            if a == "--" {
+                i += 1;
+                break;
+            }
+            if !a.starts_with('-') || a.len() < 2 || a.starts_with(cmdparse::BLOCK_MARK) {
+                break;
+            }
+            let chars: Vec<char> = a[1..].chars().collect();
+            for (j, &c) in chars.iter().enumerate() {
+                let inline: String = chars[j + 1..].iter().collect();
+                // the word up to the flag, before a value attached to it
+                let attached = |v: &str| format!("-{}{v}", chars[..=j].iter().collect::<String>());
+                if optional_value_flag(full, c) {
+                    let at = i;
+                    let v = if !inline.is_empty() { Some(inline) } else {
+                        match args.get(i + 1) {
+                            Some(n) if !(n.starts_with('-') && n[1..].starts_with(|c: char| c == '-' || c.is_ascii_alphabetic())) => {
+                                i += 1;
+                                Some(n.clone())
+                            }
+                            _ => None,
+                        }
+                    };
+                    flags.push(c);
+                    let v = v.map(|v| fill(&v, input::Reader::Direct));
+                    match &v {
+                        Some(v) if at == i => words[at + 1] = attached(v),
+                        Some(v) => words[i + 1] = v.clone(),
+                        None => {}
+                    }
+                    match v {
+                        Some(v) if !v.is_empty() => out.push(format!("-{c}{v}")),
+                        Some(v) => out.extend([format!("-{c}"), v]),
+                        None => out.push(format!("-{c}")),
+                    }
+                    break;
+                } else if bools.contains(c) {
+                    flags.push(c);
+                    out.push(format!("-{c}"));
+                } else if vals.contains(c) {
+                    flags.push(c);
+                    let at = i;
+                    let v = if !inline.is_empty() { inline } else {
+                        i += 1;
+                        match args.get(i) {
+                            Some(v) => v.clone(),
+                            None => { out.push(format!("-{c}")); return done(out, words); }
+                        }
+                    };
+                    let v = value(&v)?;
+                    words[i + 1] = if at == i { attached(&v) } else { v.clone() };
+                    out.extend([format!("-{c}"), v]);
+                    break;
+                } else {
+                    // (an error when it runs, as it was)
+                    out.extend(args[i..].iter().cloned());
+                    return done(out, words);
+                }
+            }
+            i += 1;
+        }
+        out.push("--".into());
+    }
+    let full = spec.map(|c| c.0).unwrap_or_default();
+    let rest = args.get(i..).unwrap_or_default();
+    if full == "bind-key" && rest.len() > 2 {
+        // the words after the key are the bound commands' arguments, read again when the
+        // key is bound, so each command says who reads them (run-shell's command is a
+        // shell's, not the parser's) and the words stay as written
+        let key = value(&rest[0])?;
+        let bound = fill_bound_words(&rest[1..], fill)?;
+        words[i + 1] = key.clone();
+        words[i + 2..].clone_from_slice(&bound);
+        out.push(key);
+        out.extend(bound);
+        return done(out, words);
+    }
+    for (pos, a) in rest.iter().enumerate() {
+        let v = value_for(a, argument_reader(full, &flags, pos))?;
+        words[i + 1 + pos] = v.clone();
+        out.push(v);
+    }
+    done(out, words)
+}
+
+/// Where cmd_parse_from_arguments ends the bound commands in `words`: after each word
+/// that ends with ";" (not "\;").
+fn bound_ends(words: &[String]) -> Vec<bool> {
+    words.iter().map(|w| !w.starts_with(cmdparse::BLOCK_MARK) && w.ends_with(';') && !w.ends_with("\\;")).collect()
+}
+
+/// bind-key's words after the key with the answers in, as written, each command's
+/// values filled for who reads them, the commands ending where the filled words end
+/// them, as cmd_parse_from_arguments splits them when the key is bound: an answer may
+/// end a command (`x;`) or keep one going (`x\`, before a ";"). The commands are taken
+/// where the written words end them and then, while the answers move that, where the
+/// filled words do, until they stay; an error if they do not (who reads a word would
+/// not be known: the escapes for the parser and for a shell differ). The escapes are the
+/// same for every reader on Unix (tmux 3.8's), so there the words are as 3.8 fills them.
+fn fill_bound_words(words: &[String], fill: &dyn Fn(&str, input::Reader) -> String) -> Result<Vec<String>, String> {
+    let mut ends = bound_ends(words);
+    for _ in 0..4 {
+        let out = fill_bound_split(words, &ends, fill)?;
+        let filled = bound_ends(&out);
+        if filled == ends {
+            return Ok(out);
+        }
+        ends = filled;
+    }
+    Err("an answer cannot change where a bound command ends".into())
+}
+
+/// [`fill_bound_words`] with the commands ending after the words `ends` marks: such a
+/// word that ends with ";" as written gives its command the word without it.
+fn fill_bound_split(words: &[String], ends: &[bool], fill: &dyn Fn(&str, input::Reader) -> String) -> Result<Vec<String>, String> {
+    let mut out = words.to_vec();
+    let mut start = 0;
+    for end in 0..=words.len() {
+        let sep = ends.get(end).copied().unwrap_or(false);
+        if end < words.len() && !sep {
+            continue;
+        }
+        // the command's words, the last without its ";" (none when it was only ";")
+        let mut cmd = words[start..end].to_vec();
+        let written = sep && bound_ends(&words[end..=end])[0];
+        if sep {
+            let w = &words[end];
+            let head = if written { &w[..w.len() - 1] } else { w.as_str() };
+            if !head.is_empty() {
+                cmd.push(head.to_string());
+            }
+        }
+        for (k, w) in copy_command(&cmd, fill, true)?.into_iter().enumerate() {
+            out[start + k] = if start + k == end && written { format!("{w};") } else { w };
+        }
+        start = end + 1;
+    }
+    Ok(out)
+}
+
 /// The commands of a parse once built ([`Server::build_commands`]).
 #[derive(Default)]
 pub(crate) struct Built {
@@ -1345,7 +1563,21 @@ impl Server {
         self.mark_session_dirty(sid);
     }
 
+    /// The shell a new pane of session `sid` runs (wp->shell): default-shell, or the
+    /// platform's when it is empty, as [`Server::spawn_into`] chooses it.
+    fn shell_of(&self, sid: Option<SessId>) -> String {
+        let shell = self.opt_session(sid, "default-shell");
+        if shell.is_empty() { procinfo::default_shell() } else { shell }
+    }
+
+    /// default_window_name: the name of what a new pane runs, `cmd`, else
+    /// default-command, else default-shell. On Unix, as in 3.8, parse_window_name of the
+    /// command as cmd_stringify_argv gives it (or of the shell); on Windows the program's
+    /// name without its directory and extension.
     fn window_name_for(&self, cmd: &[String], sid: Option<SessId>) -> String {
+        if cfg!(unix) {
+            return default_window_name(cmd, &self.opt_session(sid, "default-command"), &self.shell_of(sid));
+        }
         match cmd.first() {
             Some(c) if cmd.len() == 1 => procinfo::program_name(c.split_whitespace().next().unwrap_or(c)),
             Some(c) => procinfo::program_name(c),
@@ -1791,14 +2023,22 @@ impl Server {
                 if let Some(b) = a.strip_prefix(cmdparse::BLOCK_MARK) { *a = b.to_string(); }
             }
         }
-        let o = parse_args(full, &args)?;
+        let mut o = parse_args(full, &args)?;
+        if let Some(m) = &marked {
+            // (the arguments are the last of the words getopt read)
+            let start = m.len() - o.rest.len();
+            o.rest_blocks = m[start..].iter().map(|a| a.starts_with(cmdparse::BLOCK_MARK)).collect();
+        }
         if ctx.readonly {
             self.check_readonly_command(full, &o, ctx)?;
         }
         // cmdq_add_message: each command goes in the message log (show-messages) once
         // the configuration is loaded, by key for a bound command of an attached client
         if !std::mem::take(&mut ctx.resumed) {
-            self.log_command(ctx.log_client.or(ctx.client).or(ctx.reply), ctx.key.as_deref(), full, marked.as_deref().unwrap_or(&args));
+            // an event hook's commands are items of the global queue, which have no
+            // client (hooks_insert_one: cmdq_append(NULL)), so they log as "command:"
+            let who = if ctx.hook_depth > 1 { None } else { ctx.log_client.or(ctx.client).or(ctx.reply) };
+            self.log_command(who, ctx.key.as_deref(), full, marked.as_deref().unwrap_or(&args));
         }
         self.command(full, o, env, ctx)
     }
@@ -3161,6 +3401,7 @@ impl Server {
                 // default_window_name: the pane's command as given, else its shell
                 let wname = name.clone().unwrap_or_else(|| match self.panes.get(&pane).map(|p| &p.track.argv) {
                     Some(argv) if argv.iter().any(|a| !a.is_empty()) => self.window_name_for(argv, Some(ssid)),
+                    Some(_) if cfg!(unix) => parse_window_name(&self.shell_of(Some(ssid))),
                     Some(_) => procinfo::program_name(&self.opt_session(Some(ssid), "default-shell")),
                     None => String::new(),
                 });
@@ -3846,8 +4087,10 @@ impl Server {
                     return Ok(Flow::Next);
                 }
                 let template = o.rest.first().cloned().unwrap_or_else(|| "%1".into());
-                // -F: the template is a format, expanded now
-                let template = if o.has('F') { self.expand(tt, Some(cid), &template) } else { template };
+                // -F: a string template is a format, expanded now (a { } block is kept
+                // as it is: args_make_commands_prepare)
+                let block = o.is_block(0);
+                let template = if o.has('F') && !block { self.expand(tt, Some(cid), &template) } else { template };
                 // -l: one prompt and input taken literally, not split at commas; others
                 // get a space after the prompt, except the default ':' (prompts are
                 // formats expanded when drawn, inputs are expanded now)
@@ -3855,7 +4098,10 @@ impl Server {
                     Some(p) if o.has('l') => (vec![p.to_string()], false),
                     Some(p) => (p.split(',').map(String::from).collect(), true),
                     None if o.rest.is_empty() => (vec![":".into()], false),
-                    None => (vec![format!("({})", template.split_whitespace().next().unwrap_or(""))], true),
+                    // args_make_commands_get_command: a block's first command, or a
+                    // string template up to a space or a comma
+                    None if block => (vec![format!("({})", template.split_whitespace().next().unwrap_or(""))], true),
+                    None => (vec![format!("({})", template.split([' ', ',']).next().unwrap_or(""))], true),
                 };
                 // prompt_create: format_expand_time, so strftime applies too
                 let inits: Vec<String> = match o.get('I') {
@@ -3869,6 +4115,9 @@ impl Server {
                 let kind = if o.has('k') && !o.has('1') && !o.has('N') && !o.has('i') { PromptKind::Key } else { PromptKind::Command };
                 // -1, -N, -i, -k and -e exclude each other in this order
                 let mut pr = Prompt::new(kind, prompts, template, ctx.pane);
+                pr.block = block;
+                // -C: the panes keep being drawn (PROMPT_NOFREEZE)
+                pr.freeze = !o.has('C');
                 pr.single_key = o.has('1');
                 pr.numeric = o.has('N') && !o.has('1');
                 pr.history_type = history_type;
@@ -3894,13 +4143,20 @@ impl Server {
                     }
                 }
                 self.prompt_incremental_start(cid, host);
-                // -C (keep updating panes) is how prompts behave here anyway; without -b
-                // (or -i) the command waits until the prompt is done
+                // without -b (or -i) the command waits until the prompt is done
                 self.prompt_wait(cid, id, o.has('b') || o.has('i'))
             }
             "confirm-before" => {
                 let cid = self.resolve_client(ctx, t)?;
                 let command = o.rest.first().ok_or("confirm-before needs a command")?.clone();
+                // args_make_commands_now(..., expand): a string is a format expanded now
+                // and parsed now (its error is this command's); a { } block is kept
+                let command = if o.is_block(0) { command } else {
+                    let tt = self.current(&Ctx { client: Some(cid), ..ctx.clone() });
+                    let expanded = self.expand(tt, Some(cid), &command);
+                    self.parse_string(&expanded)?;
+                    expanded
+                };
                 // -c: the confirming key (printable ASCII), -y: Enter confirms too
                 let key = match o.get('c') {
                     Some(c) => match c.as_bytes() {
@@ -3913,8 +4169,10 @@ impl Server {
                 let label = match o.get('p') {
                     Some(p) => format!("{p} "),
                     None => {
-                        // tmux names the first command, not the whole command line
-                        let name = cmdparse::parse(&command).ok().and_then(|c| c.first().and_then(|c| c.first()).cloned()).map(|n| canonical(&n).map(String::from).unwrap_or(n));
+                        // tmux names the first command, not the whole command line, as
+                        // it was built (cmd_get_entry: a command-alias expanded)
+                        let built = command_list_string(&command, &self.command_aliases()).unwrap_or_else(|_| command.clone());
+                        let name = cmdparse::parse(&built).ok().and_then(|c| c.first().and_then(|c| c.first()).cloned()).map(|n| canonical(&n).map(String::from).unwrap_or(n));
                         format!("Confirm '{}'? ({key}/n) ", name.unwrap_or_else(|| command.clone()))
                     }
                 };
@@ -3981,8 +4239,8 @@ impl Server {
                     None if o.has('j') => "",
                     None => "[#{session_name}] #{window_index}:#{window_name}, current pane #{pane_index} - (%H:%M %d-%b-%y)",
                 };
-                // -l: literal, -j: JSON printed back in tmux's form; -C (keep updating the
-                // pane) is how messages behave here anyway; -N: keys don't clear it
+                // -l: literal, -j: JSON printed back in tmux's form; -C: the panes keep
+                // being drawn; -N: keys don't clear it
                 let msg = if o.has('l') { fmt.to_string() } else if o.has('v') {
                     // -v: the expansion steps are printed first
                     let (msg, log) = crate::format::expand_time_verbose(fmt, &super::vars::VarCtx { srv: self, t: tt, client: fc, extra });
@@ -4020,6 +4278,10 @@ impl Server {
                     }
                 } else if let Some(c) = attached_client {
                     self.set_message_for(c, &msg, delay.map(|d| d as u64), o.has('N'));
+                    // -C: the panes keep being drawn (status_message_set no_freeze)
+                    if let Some(c) = self.clients.get_mut(&c) {
+                        c.message_no_freeze = o.has('C');
+                    }
                 }
                 Ok(Flow::Next)
             }
@@ -4335,7 +4597,7 @@ impl Server {
                     Some(k) if o.rest.is_empty() && !o.has('N') && !o.has('R') => {
                         // (a key, not text: -l, -H and -F do not apply to it)
                         let flags = o.flags.iter().filter(|(c, _)| !matches!(c, 'l' | 'H' | 'F')).map(|(c, v)| (*c, v.clone())).collect();
-                        Opts { flags, rest: vec![k] }
+                        Opts { flags, rest: vec![k], rest_blocks: Vec::new() }
                     }
                     _ => o,
                 };
@@ -5803,6 +6065,8 @@ impl Server {
         pr.id = self.next_prompt_id();
         let id = pr.id;
         if let Some(c) = self.clients.get_mut(&cid) {
+            // status_prompt_set: status_message_clear first
+            c.message = None;
             c.prompt = Some(pr);
             c.dirty = true;
         }
@@ -6073,6 +6337,51 @@ pub(crate) fn clean_title(title: &str) -> Option<String> {
     check_name(title).then(|| clean_name(title))
 }
 
+/// clean_name(name, 1) for a name that does not come from a command (the automatic
+/// name of a window): a #( becomes _( so it is never run as a job, then [`clean_name`].
+pub(crate) fn clean_untrusted_name(name: &str) -> String {
+    clean_name(&name.replace("#(", "_("))
+}
+
+/// parse_window_name (names.c): the name of a program from its command line, as
+/// pane_current_command shows it: past a leading `"` and up to the next, without "exec ",
+/// leading spaces and dashes, up to a space, without trailing bytes that are neither
+/// letters, digits nor punctuation, the basename of a path from /, then clean_name.
+pub(crate) fn parse_window_name(cmd: &str) -> String {
+    let mut name = cmd.as_bytes();
+    if name.first() == Some(&b'"') {
+        name = &name[1..];
+    }
+    name = &name[..name.iter().position(|&b| b == b'"').unwrap_or(name.len())];
+    name = name.strip_prefix(b"exec ").unwrap_or(name);
+    while let [b' ' | b'-', rest @ ..] = name {
+        name = rest;
+    }
+    name = &name[..name.iter().position(|&b| b == b' ').unwrap_or(name.len())];
+    while name.len() > 1 && !name[name.len() - 1].is_ascii_alphanumeric() && !name[name.len() - 1].is_ascii_punctuation() {
+        name = &name[..name.len() - 1];
+    }
+    // basename(3)
+    if name.first() == Some(&b'/') {
+        let trimmed = &name[..name.iter().rposition(|&b| b != b'/').map_or(1, |i| i + 1)];
+        name = &trimmed[trimmed.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1).min(trimmed.len().saturating_sub(1))..];
+    }
+    // clean_name: nothing when it is not UTF-8 (a character cut above)
+    std::str::from_utf8(name).map(clean_name).unwrap_or_default()
+}
+
+/// default_window_name (names.c) for a pane that runs `cmd`, else `default_command`
+/// (spawn_pane gives it as the pane's command), else `shell`: parse_window_name of the
+/// command as cmd_stringify_argv gives it, or of the shell.
+pub(crate) fn default_window_name(cmd: &[String], default_command: &str, shell: &str) -> String {
+    let line = match cmd {
+        [] if default_command.is_empty() => String::new(),
+        [] => options::escape_arg(default_command),
+        _ => cmd.iter().map(|a| options::escape_arg(a)).collect::<Vec<_>>().join(" "),
+    };
+    parse_window_name(if line.is_empty() { shell } else { &line })
+}
+
 /// paste_set: a buffer name that is not empty and passes clean_name.
 fn buffer_name(name: &str) -> Result<String, String> {
     if name.is_empty() {
@@ -6084,10 +6393,20 @@ fn buffer_name(name: &str) -> Result<String, String> {
     Ok(clean_name(name))
 }
 
-/// tmux's clean_name for a session (or window) name: vis-escaped with
-/// VIS_OCTAL|VIS_CSTYLE|VIS_TAB|VIS_NL, complete UTF-8 characters kept.
+/// tmux's clean_name for a name or title given by a command (window, session and
+/// buffer names, pane titles): vis-escaped with VIS_OCTAL|VIS_CSTYLE|VIS_TAB|VIS_NL,
+/// complete UTF-8 characters kept.
 fn clean_name(name: &str) -> String {
-    String::from_utf8_lossy(&vis::strvis(name.as_bytes(), vis::OCTAL | vis::CSTYLE | vis::TAB | vis::NL)).into_owned()
+    clean_name_for(name, cfg!(windows))
+}
+
+/// [`clean_name`] on Windows (`windows`) or Unix. On Windows a backslash is kept, as in
+/// names and titles from a pane (vendor/vt100 clean_name): it separates the parts of a
+/// path there, and tmux's escaped (doubled) backslash would double again on every rename
+/// from a prompt that shows the name (`prefix ,`, -I'#W'). Unix escapes it as tmux 3.8.
+fn clean_name_for(name: &str, windows: bool) -> String {
+    let flags = vis::OCTAL | vis::CSTYLE | vis::TAB | vis::NL | if windows { vis::NOSLASH } else { 0 };
+    String::from_utf8_lossy(&vis::strvis(name.as_bytes(), flags)).into_owned()
 }
 
 /// strerror(3) text for an I/O error (without Rust's " (os error N)"); a missing file
@@ -6245,6 +6564,149 @@ pub const VAR_NAMES: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_from_commands_keep_backslashes_on_windows_only() {
+        // tmux 3.8's clean_name on Unix: a backslash is escaped (vis -c)
+        assert_eq!(clean_name_for("C:\\Users\\x", false), "C:\\\\Users\\\\x");
+        // on Windows it stays, as in a pane's titles and names (COMPATIBILITY.md)
+        assert_eq!(clean_name_for("C:\\Users\\x", true), "C:\\Users\\x");
+        // renaming to the name shown (-I'#W') gives the same name again
+        let once = clean_name_for("C:\\a", true);
+        assert_eq!(clean_name_for(&once, true), once);
+        // the other escapes are the same on both (check_name refuses control characters
+        // before, so only a name taken without it would have them)
+        for windows in [false, true] {
+            assert_eq!(clean_name_for("a\tb\nc\u{1}", windows), "a\\tb\\nc\\001");
+            assert_eq!(clean_name_for("é\"x", windows), "é\"x");
+        }
+        assert_eq!(clean_name("a\\b"), if cfg!(windows) { "a\\b" } else { "a\\\\b" });
+        assert_eq!(clean_title("t\\x").as_deref(), Some(if cfg!(windows) { "t\\x" } else { "t\\\\x" }));
+    }
+
+    #[test]
+    fn window_names_from_commands_as_parse_window_name() {
+        for (cmd, name) in [
+            ("vim", "vim"),
+            ("-bash", "bash"),
+            ("exec  -zsh -l", "zsh"),
+            ("\"/usr/bin/my prog\" x", "my"),
+            ("/usr/local/bin/", "bin"),
+            ("/", "/"),
+            ("//", "/"),
+            ("/a//", "a"),
+            ("sleep\t\u{1}", "sleep"),
+            ("x\u{e9}", "x"),
+            ("", ""),
+        ] {
+            assert_eq!(parse_window_name(cmd), name, "{cmd:?}");
+        }
+        assert_eq!(parse_window_name("a\\b"), if cfg!(windows) { "a\\b" } else { "a\\\\b" });
+        // default_window_name: the command line as cmd_stringify_argv gives it (each
+        // argument escaped as args_print does) read by parse_window_name, as tmux 3.8
+        // names a new window (pwsh-tmux on Unix)
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let unix = |w: &str| if cfg!(windows) { w.replace("\\\\", "\\") } else { w.to_string() };
+        for (cmd, dc, name) in [
+            (v(&["vim foo"]), "", "vim".to_string()),
+            (v(&["/p/j k", "-c", "x"]), "", "j".to_string()),
+            (v(&["/p/m\"n", "x"]), "", "'/p/m".to_string()),
+            (v(&["/p/-l", "x"]), "", "-l".to_string()),
+            (v(&["/p/a\\b", "x"]), "", unix("a\\\\\\\\b")),
+            (v(&["/p/e#(f", "x"]), "", "e#(f".to_string()),
+            (v(&["/usr/bin/top"]), "", "top".to_string()),
+            (v(&[]), "htop -d 5", "htop".to_string()),
+            (v(&[]), "", "zsh".to_string()),
+        ] {
+            assert_eq!(default_window_name(&cmd, dc, "/bin/zsh"), name, "{cmd:?} {dc:?}");
+        }
+        // window_set_name(w, name, 1) for an automatic name
+        assert_eq!(clean_untrusted_name("#(x) ##(y)"), "_(x) #_(y)");
+        assert_eq!(clean_untrusted_name("a\\b\t"), if cfg!(windows) { "a\\b\\t" } else { "a\\\\b\\t" });
+    }
+
+    #[test]
+    fn command_strings_in_a_block_are_read_by_the_parser() {
+        // P: the parser, J: the shell of jobs, D: anything else
+        let readers = |text: &str| -> Vec<(String, char)> {
+            let seen = std::cell::RefCell::new(Vec::new());
+            copy_block(text, &|v, r| {
+                let r = match r { input::Reader::Parser => 'P', input::Reader::Job => 'J', input::Reader::Direct => 'D' };
+                seen.borrow_mut().push((v.to_string(), r));
+                v.to_string()
+            }).unwrap();
+            seen.into_inner()
+        };
+        let p = |v: &str, r: char| (v.to_string(), r);
+        assert_eq!(readers("if-shell -t x 'test %%' 'set @a %%' 'set @b %%'"), [p("x", 'D'), p("test %%", 'J'), p("set @a %%", 'P'), p("set @b %%", 'P')]);
+        assert_eq!(readers("if-shell -F '#{%%}' 'set @a %%'"), [p("#{%%}", 'D'), p("set @a %%", 'P')]);
+        assert_eq!(readers("run-shell 'echo %%' '%%' ; run-shell -C 'display %%'"), [p("echo %%", 'J'), p("%%", 'J'), p("display %%", 'P')]);
+        assert_eq!(readers("run-shell -c '%%' -d 1 'echo'"), [p("%%", 'D'), p("1", 'D'), p("echo", 'J')]);
+        assert_eq!(readers("pipe-pane -o 'cat > %%'"), [p("cat > %%", 'J')]);
+        assert_eq!(readers("split-window -c d 'vi %%' ; display-popup -E 'x %%'"), [p("d", 'D'), p("vi %%", 'D'), p("x %%", 'D')]);
+        assert_eq!(readers("confirm-before -p q 'kill %%' ; bind-key x 'y %%'"), [p("q", 'D'), p("kill %%", 'P'), p("x", 'D'), p("y %%", 'P')]);
+        assert_eq!(readers("set-hook -g after-new-window 'display %%'"), [p("after-new-window", 'D'), p("display %%", 'P')]);
+        // a block inside: its own commands decide
+        assert_eq!(readers("if-shell -F 1 { run-shell 'echo %%' }"), [p("1", 'D'), p("echo %%", 'J')]);
+        assert_eq!(readers("set-hook -g after-new-window { run-shell 'echo %%' }"), [p("after-new-window", 'D'), p("echo %%", 'J')]);
+        // a binding of several words is the command's arguments: each command decides
+        assert_eq!(readers("bind-key -n F3 run-shell \"echo '%%'\""), [p("F3", 'D'), p("echo '%%'", 'J')]);
+        assert_eq!(
+            readers("bind-key F3 if-shell 'test %%' 'set @a %%' \\; run-shell -C 'display %%'"),
+            [p("F3", 'D'), p("test %%", 'J'), p("set @a %%", 'P'), p("display %%", 'P')],
+        );
+        assert_eq!(readers("bind-key F3 bind-key F4 run-shell 'x %%'"), [p("F3", 'D'), p("F4", 'D'), p("x %%", 'J')]);
+        assert_eq!(readers("bind-key -T root F3 split-window 'vi %%'"), [p("root", 'D'), p("F3", 'D'), p("vi %%", 'D')]);
+        assert_eq!(readers("bind-key F3 if-shell -F 1 { run-shell '%%' }"), [p("F3", 'D'), p("1", 'D'), p("%%", 'J')]);
+        // a word that ends with ";" ends a bound command, "\;" does not
+        assert_eq!(readers("bind-key F3 display 'x;' run-shell '%%'"), [p("F3", 'D'), p("x", 'D'), p("%%", 'J')]);
+        assert_eq!(readers("bind-key F3 display 'x\\;' run-shell '%%'"), [p("F3", 'D'), p("x\\;", 'D'), p("run-shell", 'D'), p("%%", 'D')]);
+    }
+
+    #[test]
+    fn a_bound_command_ends_where_the_filled_words_end_it() {
+        // an answer `A;` ends display's command, so the words after it are run-shell's:
+        // its command is filled again for the shell of jobs
+        let last = std::cell::RefCell::new(Vec::new());
+        let block = copy_block("bind-key -n F3 display %% run-shell 'echo x'", &|v, r| {
+            if v == "echo x" {
+                last.borrow_mut().push(r);
+            }
+            v.replace("%%", "A;")
+        }).unwrap();
+        assert_eq!(block[0][4..], ["display", "A;", "run-shell", "echo x"]);
+        assert_eq!(last.into_inner(), [input::Reader::Direct, input::Reader::Job]);
+        // the escapes may move the end again: filled until it stays put
+        let fill = |v: &str, r: input::Reader| match (v, r) {
+            ("%%", input::Reader::Direct) => "a;".to_string(),
+            ("%%", _) => "a\\;".to_string(),
+            _ => v.to_string(),
+        };
+        assert_eq!(copy_block("bind-key F3 display %% if-shell true %%", &fill).unwrap()[0][3..], ["display", "a;", "if-shell", "true", "a\\;"]);
+    }
+
+    #[test]
+    fn a_binding_of_several_words_keeps_its_commands() {
+        let copy = |text: &str, a: &str| copy_block(text, &|v, _| v.replace("%%", a)).unwrap();
+        let bound = |text: &str, a: &str| binding_command(&copy(text, a)[0][4..]);
+        // the bound commands' words are as written, with the answers in (bind-key reads
+        // them as tmux 3.8 does: an answer that looks like a flag is one)
+        assert_eq!(bound("bind-key -n F3 run-shell 'echo %%'", "A"), "run-shell 'echo A'");
+        assert_eq!(bound("bind-key -n F3 display -p x \\; display -p '%%'", "A"), "display -p x ; display -p A");
+        assert_eq!(bound("bind-key -n F3 display -p %%", "-x"), "display -p -x");
+        assert_eq!(bound("bind-key -n F3 display -t%% -- x", "A"), "display -tA -- x");
+        assert_eq!(bound("bind-key -n F3 bind-key -n F4 run-shell %%", "A"), "bind-key -n F4 run-shell A");
+        // a word written with \; at the end keeps its ";", and a filled word that ends
+        // with ";" ends its command, as cmd_parse_from_arguments reads the filled words
+        assert_eq!(bound("bind-key -n F3 display -p 'x\\;' \\; display %%", "A"), "display -p 'x;' ; display A");
+        assert_eq!(bound("bind-key -n F3 display -p %% \\; display x", "A;"), "display -p A ; display x");
+        assert_eq!(bound("bind-key -n F3 display -p %% \\; display x", "A\\;"), "display -p 'A;' ; display x");
+        assert_eq!(bound("bind-key -n F3 display -p 'x;' display %%", "A"), "display -p x ; display A");
+        // a block keeps its commands
+        assert_eq!(bound("bind-key -n F3 if-shell -F 1 { display %% }", "A"), "if-shell -F 1 { display -- A }");
+        // one string is parsed when the key is pressed, as before
+        assert_eq!(bound("bind-key -n F3 'display %%'", "A"), "display A");
+    }
 
     #[test]
     fn helpers() {

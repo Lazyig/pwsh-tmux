@@ -13,7 +13,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 crossterm = "0.29.0"
 fancy-regex = { version = "0.19.2", features = ["leftmost_longest"] }
 interprocess = "2.4.7"
-portable-pty = "0.9.0"
+portable-pty = { version = "0.9.0", path = "vendor/portable-pty" }
 unicode-width = "0.2.3"
 vt100 = { version = "0.18.1", path = "vendor/vt100" }
 

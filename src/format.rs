@@ -1790,6 +1790,12 @@ pub fn parse_color_with(s: &str, vars: Option<&dyn Vars>) -> Option<Color> {
     parse_color(s)
 }
 
+/// A style's fill= colour: none for "default" (8, which never fills: format_draw,
+/// prompt_draw), the terminal's own colours for "terminal" (9, a colour of its own).
+pub fn parse_fill(s: &str, vars: Option<&dyn Vars>) -> Option<Color> {
+    if s.eq_ignore_ascii_case("default") { None } else { parse_color_with(s, vars) }
+}
+
 /// colour_fromstring: names, brightNAME, 0-7 and 90-97, colourN, #rrggbb, theme names,
 /// grayN/greyN (0-100) and the X11 colour names. As tmux, the string is not trimmed, but the
 /// numbers of colourN and greyN may have leading space (strtonum).
@@ -2205,7 +2211,7 @@ pub fn spans_with(text: &str, base: Style, vars: Option<&dyn Vars>) -> Vec<Span>
                         }
                     }
                     _ if lower.starts_with("fill=") => {
-                        if let Some(c) = parse_color_with(&lower[5..], vars).filter(|c| *c != Color::Default) {
+                        if let Some(c) = parse_fill(&lower[5..], vars) {
                             fill = Some(c);
                         }
                     }

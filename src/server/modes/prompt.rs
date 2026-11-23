@@ -101,6 +101,12 @@ impl PanePrompt {
     /// prompt_key with emacs status-keys: `history` is the history for the prompt's type,
     /// oldest first.
     pub fn key(&mut self, name: &str, history: &[String]) -> PromptKey {
+        // prompt_keypad_key: an unmodified keypad key is its character (KPEnter CR)
+        let name = match name.strip_prefix("KP") {
+            Some("Enter") => "Enter",
+            Some(k) if k.len() == 1 && "/*-+.0123456789".contains(k) => k,
+            _ => name,
+        };
         if self.numeric {
             if let Some(c) = key_char(name).filter(|c| c.is_ascii_digit()) {
                 self.insert(c);
@@ -112,7 +118,9 @@ impl PanePrompt {
             // the key itself is the answer; keys that are not characters (arrows, function
             // keys) are ignored, control keys answer with something that is not a character
             return match name {
-                "Enter" | "C-m" | "C-j" => PromptKey::Done("\r".into()),
+                // (key & 0x1f: an extended C-m is CR, C-j is LF)
+                "Enter" | "C-m" => PromptKey::Done("\r".into()),
+                "C-j" => PromptKey::Done("\n".into()),
                 "Escape" | "C-[" | "C-c" | "C-g" | "BSpace" | "Tab" => PromptKey::Cancel,
                 n => match key_char(n).or_else(|| n.strip_prefix("M-").and_then(key_char)) {
                     Some(c) => PromptKey::Done(c.to_string()),
@@ -225,7 +233,9 @@ impl PanePrompt {
                 self.cursor = idx;
                 return PromptKey::Changed;
             }
-            "Enter" | "C-m" | "C-j" => return PromptKey::Done(self.text()),
+            // only CR confirms: C-j (a typed LF) and an extended C-m have no case in
+            // prompt_key and append_key drops them
+            "Enter" => return PromptKey::Done(self.text()),
             "Escape" | "C-[" | "C-c" | "C-g" => return PromptKey::Cancel,
             n => {
                 // append_key: anything else that is a character is typed, the rest (function
@@ -269,7 +279,7 @@ fn fill_align(s: &str, vars: &VarCtx) -> (Option<Color>, String) {
     for word in s.split([',', ' ', '\n']).filter(|w| !w.is_empty()) {
         let lower = word.to_ascii_lowercase();
         if let Some(v) = lower.strip_prefix("fill=") {
-            fill = crate::format::parse_color_with(v, Some(vars)).filter(|c| *c != Color::Default);
+            fill = crate::format::parse_fill(v, Some(vars));
         } else if let Some(v) = lower.strip_prefix("align=") {
             align = v.to_string();
         } else if lower == "default" {
@@ -401,6 +411,21 @@ mod tests {
         assert_eq!(s.key("y", &[]), PromptKey::Done("y".into()));
         assert_eq!(s.key("F1", &[]), PromptKey::Handled);
         assert_eq!(s.key("BSpace", &[]), PromptKey::Cancel);
+        assert_eq!(s.key("C-j", &[]), PromptKey::Done("\n".into()));
+        assert_eq!(s.key("C-m", &[]), PromptKey::Done("\r".into()));
+        assert_eq!(s.key("KP5", &[]), PromptKey::Done("5".into()));
+    }
+
+    #[test]
+    fn only_enter_or_kpenter_confirms_a_pane_prompt() {
+        // prompt_key: '\r' confirms; C-j and an extended C-m are dropped, as in a status
+        // prompt; keypad keys are their characters (prompt_keypad_key)
+        let mut p = PanePrompt::new("(filter) ", "a");
+        assert_eq!(p.key("C-j", &[]), PromptKey::Handled);
+        assert_eq!(p.key("C-m", &[]), PromptKey::Handled);
+        assert_eq!(p.key("KP7", &[]), PromptKey::Changed);
+        assert_eq!(p.text(), "a7");
+        assert_eq!(p.key("KPEnter", &[]), PromptKey::Done("a7".into()));
     }
 
     #[test]

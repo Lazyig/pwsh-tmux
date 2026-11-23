@@ -990,6 +990,48 @@ fn window_names_follow_mode_changes_at_most_every_name_interval() {
 }
 
 #[test]
+fn automatic_names_are_compared_as_expanded_and_set_cleaned() {
+    // automatic_rename_update: the expanded format is compared with the window's name and
+    // set through window_set_name(w, name, 1) when they differ, so a name that clean_name
+    // changes is set (and window-renamed fired) at each check, as in tmux 3.8
+    let mut f = fixture();
+    let pane = f.pane;
+    let wid = f.window_of(pane).unwrap();
+    let g = f.panes[&pane].generation;
+    f.name_known.insert((pane, g));
+    #[cfg(unix)]
+    {
+        let start = Instant::now();
+        let (pid, pgrp) = (f.panes[&pane].pid, f.panes[&pane].fg_pgrp());
+        while procinfo::pane_programs(&[(pid, pgrp)]).pop().and_then(|r| r.0).is_none() && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    run(&mut f, &["set-option", "-w", "automatic-rename-format", "a\\b ##(x) c"]);
+    let want = if cfg!(windows) { "a\\b _(x) c" } else { "a\\\\b _(x) c" };
+    f.ev.renamed.clear();
+    f.name_changed.insert(pane);
+    f.automatic_rename();
+    assert_eq!(f.windows[&wid].name, want);
+    assert_eq!(f.ev.renamed.get(&wid), Some(&1));
+    std::thread::sleep(NAME_INTERVAL + Duration::from_millis(20));
+    f.name_changed.insert(pane);
+    f.automatic_rename();
+    assert_eq!(f.windows[&wid].name, want);
+    assert_eq!(f.ev.renamed.get(&wid), Some(&2));
+    // a name that clean_name keeps is set once
+    run(&mut f, &["set-option", "-w", "automatic-rename-format", "plain"]);
+    f.ev.renamed.clear();
+    for _ in 0..2 {
+        std::thread::sleep(NAME_INTERVAL + Duration::from_millis(20));
+        f.name_changed.insert(pane);
+        f.automatic_rename();
+    }
+    assert_eq!(f.windows[&wid].name, "plain");
+    assert_eq!(f.ev.renamed.get(&wid), Some(&1));
+}
+
+#[test]
 fn keys_of_one_read_wait_behind_the_prompt_one_of_them_opens() {
     // server_client_handle_key0 takes every key of a read before the client's queue runs
     // any: C-b : opens a prompt that waits (CMD_RETURN_WAIT), and the keys read with it
@@ -1423,4 +1465,478 @@ fn an_unknown_csi_sequence_is_read_as_meta_bracket_and_a_key_per_byte() {
     assert!(input::unknown_csi_keys(b"\x1b[<66;1;1M").is_none());
     assert!(input::unknown_csi_keys(b"\x1b[57441;2u").is_none());
     assert!(input::unknown_csi_keys(b"\x1b[27;5;9999~").is_none());
+}
+
+#[test]
+fn a_block_template_takes_the_answers_without_being_parsed_again() {
+    // args_make_commands with a { } block: cmd_list_copy puts the answer into the
+    // block's parsed values (args_copy_copy_value), nothing is parsed again; a string
+    // template is filled in and parsed (cmd_parse_from_string), as by tmux 3.8
+    let mut f = fixture();
+    let wid = f.window_of(f.pane).unwrap();
+    let rename = |f: &mut Fixture, typed: &str| -> String {
+        f.handle_input(1, b"\x02,");
+        f.handle_input(1, b"\x15");
+        f.handle_input(1, typed.as_bytes());
+        f.handle_input(1, b"\r");
+        assert!(f.clients[&1].prompt.is_none(), "{typed}");
+        f.windows[&wid].name.clone()
+    };
+    // the default binding: command-prompt -I'#W' { rename-window -- '%%' }
+    for (typed, name) in [("a\"b", "a\"b"), ("say \"hi\"", "say \"hi\""), ("a\\b", "a\\\\b"), ("a$HOME", "a$HOME"), ("~", "~"), ("~u", "~u"),
+        ("-foo", "-foo"), ("-t x", "-t x"), ("--", "--"), ("x;y", "x;y"), ("{b}", "{b}"), ("%%", "%%"), ("a  b", "a  b"),
+        // tmux 3.8 gives "it'\\''s" here: a value that is %% alone keeps its single
+        // quotes (an intentional difference)
+        ("it's", "it's"), ("a'b\"c\\d", "a'b\"c\\\\d")] {
+        // (on Windows clean_name keeps a backslash, COMPATIBILITY.md)
+        let name = if cfg!(windows) { name.replace("\\\\", "\\") } else { name.to_string() };
+        assert_eq!(rename(&mut f, typed), name, "{typed}");
+    }
+    // a flag's value takes the answer too, and %1 / %2 the answers of each prompt
+    run(&mut f, &["bind-key", "F2", "command-prompt -p a,b { set -g @pair '%1|%2' ; set -g -- @first '%%' }"]);
+    f.handle_input(1, b"\x02\x1bOQ");
+    f.handle_input(1, b"-x $y\r'q\"\r");
+    assert_eq!(f.opts_session.get("@pair"), Some("-x $y|'q\""));
+    assert_eq!(f.opts_session.get("@first"), Some("-x $y"));
+    // a block inside the block gets them as well
+    run(&mut f, &["bind-key", "F3", "command-prompt { if-shell -F 1 { set -g @inner '%%' } }"]);
+    f.handle_input(1, b"\x02\x1bOR");
+    f.handle_input(1, b"$x \"y\" ~z\r");
+    assert_eq!(f.opts_session.get("@inner"), Some("$x \"y\" ~z"));
+    // a value with more than %% (a command parsed again later) escapes single quotes
+    // as tmux 3.8 does, so an answer cannot end its quotes
+    run(&mut f, &["bind-key", "F4", "command-prompt { if-shell -F 1 \"set -g @c '%%'\" }"]);
+    for typed in ["it's", "x' ; set -g @pwned 1 ; set -g @e '"] {
+        f.handle_input(1, b"\x02\x1bOS");
+        f.handle_input(1, typed.as_bytes());
+        f.handle_input(1, b"\r");
+        assert_eq!(f.opts_session.get("@c"), Some(typed));
+    }
+    assert_eq!(f.opts_session.get("@pwned"), None);
+    let fill = |v: &str, a: &str| input::fill_block_value(v, &[a.to_string()], input::Reader::Direct, input::Quoting::TMUX).unwrap();
+    assert_eq!(fill("test '%%' = x", "x' = x -o 'y"), "test 'x'\\'' = x -o '\\''y' = x");
+    assert_eq!(fill("%%", "it's"), "it's");
+    assert_eq!(fill("%1:%%", "a'"), "a':a'\\''");
+    // a string template is parsed again
+    run(&mut f, &["bind-key", ",", "command-prompt -I'#W' \"rename-window -- '%%'\""]);
+    for (typed, name) in [("it's", "it's"), ("a\"b", "a\"b"), ("a\\b", "a\\\\b"), ("a$HOME", "a$HOME")] {
+        let name = if cfg!(windows) { name.replace("\\\\", "\\") } else { name.to_string() };
+        assert_eq!(rename(&mut f, typed), name, "{typed}");
+    }
+}
+
+#[test]
+fn a_status_prompt_freezes_the_panes_until_it_closes() {
+    // status_prompt_set: TTY_FREEZE without -C or -i, so what panes write is not drawn
+    // (tty_client_ready) until status_prompt_clear redraws everything
+    let mut f = fixture();
+    let pane = f.pane;
+    let row0 = |f: &Fixture| f.compose(1).unwrap().frame.row(0).iter().map(|c| c.text.as_str()).collect::<String>();
+    let write = |f: &mut Fixture, text: &str| {
+        let g = f.panes[&pane].generation;
+        f.pane_data(pane, g, format!("\x1b[H\x1b[2K{text}").as_bytes());
+    };
+    write(&mut f, "before");
+    f.render(1);
+    run(&mut f, &["command-prompt", "-I", "x", "set -g @x '%%'"]);
+    f.render(1);
+    write(&mut f, "during");
+    assert!(row0(&f).starts_with("before"));
+    f.render(1);
+    assert!(row0(&f).starts_with("before"));
+    // the window changing is drawn (CLIENT_REDRAWWINDOW)
+    run(&mut f, &["split-window", "-d"]);
+    assert!(row0(&f).starts_with("during"));
+    f.render(1);
+    write(&mut f, "later");
+    assert!(row0(&f).starts_with("during"));
+    f.dispatch_input(1, keys::Input::Key(Key::plain(KeyCode::Escape), vec![27]));
+    assert!(f.clients[&1].prompt.is_none());
+    assert!(row0(&f).starts_with("later"));
+    // -C and -i keep drawing the panes
+    for flag in ["-C", "-i"] {
+        f.render(1);
+        run(&mut f, &["command-prompt", flag, "set -g @x '%%'"]);
+        f.render(1);
+        write(&mut f, flag);
+        assert!(row0(&f).starts_with(flag), "{flag}");
+        f.dispatch_input(1, keys::Input::Key(Key::plain(KeyCode::Escape), vec![27]));
+    }
+    // confirm-before freezes too
+    f.render(1);
+    run(&mut f, &["confirm-before", "set -g @x y"]);
+    f.render(1);
+    write(&mut f, "confirm");
+    assert!(row0(&f).starts_with("-i"));
+}
+
+#[test]
+fn only_enter_confirms_a_prompt_not_c_j_or_c_m() {
+    // tty_keys_next makes a typed LF C-j (CR stays Enter); prompt_key has a case for
+    // '\r' only, so C-j and an extended C-m (CSI 109;5u) are dropped in emacs and vi keys
+    let mut f = fixture();
+    let input = |f: &Fixture| f.clients[&1].prompt.as_ref().map(|p| p.input.iter().collect::<String>());
+    for (keys, vi_command) in [("emacs", false), ("vi", false), ("vi", true)] {
+        f.opts_session.set("status-keys", keys.into());
+        run(&mut f, &["command-prompt", "set -g @cj '%%'"]);
+        f.handle_input(1, b"cj");
+        if vi_command {
+            f.dispatch_input(1, keys::Input::Key(Key::plain(KeyCode::Escape), vec![27]));
+        }
+        f.handle_input(1, b"\n");
+        f.handle_input(1, b"\x1b[109;5u");
+        f.handle_input(1, b"\x1b[106;5u");
+        assert_eq!(input(&f).as_deref(), Some("cj"), "{keys} {vi_command}");
+        f.handle_input(1, b"\r");
+        assert_eq!(input(&f), None, "{keys} {vi_command}");
+        assert_eq!(f.opts_session.get("@cj"), Some("cj"));
+        f.opts_session.unset("@cj");
+    }
+}
+
+#[test]
+fn without_a_status_line_the_prompt_takes_the_row_status_position_names() {
+    // screen_redraw_screen: a prompt or message with no status line is drawn on one line
+    // at the top with status-position top (REDRAW_STATUS_TOP), else at the bottom
+    let mut f = fixture();
+    f.opts_session.set("status", "off".into());
+    let h = f.clients[&1].size.1;
+    let row = |f: &Fixture, y: u16| f.compose(1).unwrap().frame.row(y).iter().map(|c| c.text.as_str()).collect::<String>();
+    for (pos, y) in [("top", 0), ("bottom", h - 1)] {
+        f.opts_session.set("status-position", pos.into());
+        run(&mut f, &["command-prompt", "-p", "PROMPT", "set -g @x '%%'"]);
+        assert!(row(&f, y).starts_with("PROMPT "), "{pos}");
+        assert_eq!(f.compose(1).unwrap().cursor.map(|c| c.1), Some(y), "{pos}");
+        assert_eq!(f.message_row(1), Some(y), "{pos}");
+        f.dispatch_input(1, keys::Input::Key(Key::plain(KeyCode::Escape), vec![27]));
+        f.set_message(1, "MESSAGE");
+        assert!(row(&f, y).starts_with("MESSAGE"), "{pos}");
+        f.clients.get_mut(&1).unwrap().message = None;
+    }
+}
+
+#[test]
+fn fill_terminal_clears_the_message_area_and_fill_default_does_not() {
+    // colour_fromstring: "terminal" is 9, not "default" (8), so prompt_draw and
+    // format_draw clear the area with it (sy.fill != 8)
+    let mut f = fixture();
+    f.opts_session.set("status-right", "RIGHTMOD".into());
+    let h = f.clients[&1].size.1;
+    let last = |f: &Fixture| f.compose(1).unwrap().frame.row(h - 1).iter().map(|c| c.text.as_str()).collect::<String>();
+    for (style, kept) in [("fg=red,bg=default,fill=terminal", false), ("fg=red,bg=default,fill=default", true), ("fg=red,fill=blue,fill=terminal", false), ("bg=red", true)] {
+        f.opts_session.set("message-style", style.into());
+        run(&mut f, &["command-prompt", "-p", "P", "set -g @x '%%'"]);
+        assert_eq!(last(&f).contains("RIGHTMOD"), kept, "prompt {style}");
+        f.dispatch_input(1, keys::Input::Key(Key::plain(KeyCode::Escape), vec![27]));
+        f.set_message(1, "M");
+        assert_eq!(last(&f).contains("RIGHTMOD"), kept, "message {style}");
+        f.clients.get_mut(&1).unwrap().message = None;
+    }
+    let frame = |f: &Fixture| f.compose(1).unwrap().frame;
+    f.opts_session.set("message-style", "fill=terminal".into());
+    run(&mut f, &["command-prompt", "-p", "P", "set -g @x '%%'"]);
+    let fr = frame(&f);
+    assert_eq!(fr.get(70, h - 1).unwrap().style, crate::cells::Style::default());
+    assert_eq!(crate::format::parse_fill("terminal", None), Some(vt100::Color::Default));
+    assert_eq!(crate::format::parse_fill("Default", None), None);
+}
+
+#[test]
+fn the_status_line_under_a_prompt_or_message_stays_as_it_opened() {
+    // status_prompt_redraw / status_message_redraw draw over sl->screen, which is not
+    // drawn again (status_redraw) while either is shown
+    let mut f = fixture();
+    f.opts_session.set("message-style", "bg=red".into());
+    f.opts_session.set("status-right", "R=#{@clock}".into());
+    let h = f.clients[&1].size.1;
+    let last = |f: &Fixture| f.compose(1).unwrap().frame.row(h - 1).iter().map(|c| c.text.as_str()).collect::<String>();
+    f.opts_session.set("@clock", "1".into());
+    f.render(1);
+    run(&mut f, &["command-prompt", "-p", "P", "set -g @x '%%'"]);
+    f.render(1);
+    assert!(last(&f).contains("R=1"));
+    f.opts_session.set("@clock", "2".into());
+    assert!(last(&f).contains("R=1"));
+    f.render(1);
+    // a message after it keeps the same status screen
+    f.dispatch_input(1, keys::Input::Key(Key::plain(KeyCode::Escape), vec![27]));
+    f.set_message(1, "M");
+    assert!(last(&f).contains("R=1"));
+    f.clients.get_mut(&1).unwrap().message = None;
+    assert!(last(&f).contains("R=2"));
+    f.render(1);
+    f.set_message(1, "M");
+    f.render(1);
+    f.opts_session.set("@clock", "3".into());
+    assert!(last(&f).contains("R=2"));
+}
+
+#[test]
+fn c_y_after_a_c_w_that_deleted_nothing_pastes_nothing() {
+    // prompt.c: C-w always sets pr->copied, even to nothing, and prompt_paste uses
+    // pr->copied once it is set rather than the top buffer
+    let mut f = fixture();
+    let input = |f: &Fixture| f.clients[&1].prompt.as_ref().map(|p| p.input.iter().collect::<String>()).unwrap_or_default();
+    f.add_buffer(None, b"ZZBUF".to_vec(), false);
+    run(&mut f, &["command-prompt", "set -g @x '%%'"]);
+    f.handle_input(1, b"\x19");
+    assert_eq!(input(&f), "ZZBUF");
+    f.handle_input(1, b"\x15\x17\x19");
+    assert_eq!(input(&f), "");
+    f.handle_input(1, b"one two\x17\x19\x19");
+    assert_eq!(input(&f), "one twotwo");
+}
+
+#[test]
+fn a_string_templates_prompt_is_its_text_up_to_a_space_or_comma() {
+    // args_make_commands_get_command: strcspn(" ,") for a string, the first command's
+    // name for a block
+    let mut f = fixture();
+    let label = |f: &mut Fixture, tpl: &str| -> String {
+        run(f, &["bind-key", "F4", &format!("command-prompt {tpl}")]);
+        f.handle_input(1, b"\x02\x1b[14~");
+        let l = f.clients[&1].prompt.as_ref().map(|p| p.label.clone()).unwrap_or_default();
+        f.dispatch_input(1, keys::Input::Key(Key::plain(KeyCode::Escape), vec![27]));
+        l
+    };
+    assert_eq!(label(&mut f, "\"renamew,x '%%'\""), "(renamew) ");
+    assert_eq!(label(&mut f, "\"renamew\tx '%%'\""), "(renamew\tx) ");
+    assert_eq!(label(&mut f, "\"new-window -n '%%'\""), "(new-window) ");
+    assert_eq!(label(&mut f, "{ renamew -- '%%' }"), "(rename-window) ");
+}
+
+#[test]
+fn an_event_hooks_commands_log_without_a_client() {
+    // hooks_insert_one puts an event hook's commands on the global queue (no client), so
+    // cmdq_add_message logs them as "command: ..."; after-* hooks follow their command in
+    // the client's queue with its event (hooks_insert), so they log as the bound command
+    // does, with its key
+    let mut f = fixture();
+    f.cfg_finished = true;
+    run(&mut f, &["set-hook", "-g", "window-renamed", "set -g @rn 1"]);
+    run(&mut f, &["set-hook", "-g", "after-rename-window", "set -g @after 1"]);
+    run(&mut f, &["bind-key", "F6", "rename-window hooked"]);
+    f.handle_input(1, b"\x02\x1b[17~");
+    assert_eq!(f.opts_session.get("@rn"), Some("1"));
+    let name = f.clients[&1].name();
+    let logged = |m: &str| f.messages.iter().any(|(_, l)| l == m);
+    assert!(logged("command: set-option -g @rn 1"), "{:?}", f.messages);
+    assert!(logged(&format!("{name} key F6: set-option -g @after 1")), "{:?}", f.messages);
+    assert!(logged(&format!("{name} key F6: rename-window hooked")), "{:?}", f.messages);
+}
+
+#[test]
+fn confirm_before_expands_and_parses_a_string_command_at_once() {
+    // cmd_confirm_before_exec: args_make_commands_now(self, item, 0, 1), so a string is a
+    // format expanded and parsed when the command runs; a { } block is used as it is
+    let mut f = fixture();
+    run(&mut f, &["confirm-before", "-y", "set -g @c '#{session_name}'"]);
+    f.handle_input(1, b"\r");
+    assert_eq!(f.opts_session.get("@c"), Some("input"));
+    run(&mut f, &["bind-key", "F8", "confirm-before -y { set -g @cb '#{session_name}' }"]);
+    f.handle_input(1, b"\x02\x1b[19~");
+    assert!(f.clients[&1].prompt.is_some());
+    f.handle_input(1, b"\r");
+    assert_eq!(f.opts_session.get("@cb"), Some("#{session_name}"));
+    let mut ctx = Ctx { client: Some(1), ..Ctx::default() };
+    assert!(f.exec(vec!["confirm-before".into(), "set -g @x { a".into()], &mut ctx).is_err());
+    assert!(f.clients[&1].prompt.is_none());
+}
+
+#[test]
+fn confirm_before_names_the_command_an_alias_stands_for() {
+    // cmd_confirm_before_exec: cmd_get_entry of the first command as it was built
+    let mut f = fixture();
+    run(&mut f, &["set", "-s", "command-alias[100]", "myren=rename-window"]);
+    run(&mut f, &["confirm-before", "myren 'x'"]);
+    assert_eq!(f.clients[&1].prompt.as_ref().map(|p| p.label.as_str()), Some("Confirm 'rename-window'? (y/n) "));
+    f.handle_input(1, b"y");
+    assert_eq!(f.windows[&f.window_of(f.pane).unwrap()].name, "x");
+}
+
+#[test]
+fn a_frozen_client_redraws_for_a_new_prompt_a_message_and_what_is_over_the_panes() {
+    let mut f = fixture();
+    let pane = f.pane;
+    let row0 = |f: &Fixture| f.compose(1).unwrap().frame.row(0).iter().map(|c| c.text.as_str()).collect::<String>();
+    let write = |f: &mut Fixture, text: &str| {
+        let g = f.panes[&pane].generation;
+        f.pane_data(pane, g, format!("\x1b[H\x1b[2K{text}").as_bytes());
+    };
+    // a prompt opened by a prompt's answer: status_prompt_clear redraws everything
+    // (CLIENT_ALLREDRAWFLAGS), then the new one freezes again
+    run(&mut f, &["bind-key", "F5", "command-prompt -p one { command-prompt -p two { set -g @two '%%' } }"]);
+    write(&mut f, "before");
+    f.render(1);
+    f.handle_input(1, b"\x02\x1b[15~");
+    f.render(1);
+    write(&mut f, "during");
+    f.render(1);
+    assert!(row0(&f).starts_with("before"));
+    f.handle_input(1, b"a\r");
+    assert!(f.clients[&1].prompt.is_some());
+    assert!(row0(&f).starts_with("during"));
+    f.render(1);
+    write(&mut f, "later");
+    f.render(1);
+    assert!(row0(&f).starts_with("during"));
+    f.handle_input(1, b"b\r");
+    // (the first answer went into the nested block too: args_copy_copy_value)
+    assert_eq!(f.opts_session.get("@two"), Some("a"));
+    assert!(f.clients[&1].prompt.is_none());
+    assert!(row0(&f).starts_with("later"));
+    f.render(1);
+
+    // a message freezes too (status_message_set), unless display-message -C
+    run(&mut f, &["display-message", "-d", "0", "msg"]);
+    f.render(1);
+    write(&mut f, "m1");
+    f.render(1);
+    assert!(row0(&f).starts_with("later"));
+    f.handle_input(1, b"x");
+    assert!(f.clients[&1].message.is_none());
+    assert!(row0(&f).starts_with("m1"));
+    f.render(1);
+    run(&mut f, &["display-message", "-C", "-d", "0", "msg"]);
+    f.render(1);
+    write(&mut f, "m2");
+    assert!(row0(&f).starts_with("m2"));
+    f.handle_input(1, b"x");
+    f.render(1);
+
+    // a message is drawn over a prompt, and clearing it redraws the panes
+    run(&mut f, &["command-prompt", "-p", "(pp)", "set -g @x '%%'"]);
+    f.render(1);
+    let last = |f: &Fixture| f.compose(1).unwrap().frame.row(23).iter().map(|c| c.text.as_str()).collect::<String>();
+    assert!(last(&f).starts_with("(pp)"), "{}", last(&f));
+    write(&mut f, "m3");
+    run(&mut f, &["display-message", "-d", "0", "over"]);
+    f.render(1);
+    assert!(last(&f).contains("over"), "{}", last(&f));
+    assert!(row0(&f).starts_with("m2"));
+    // the key clears the message and goes on to the prompt
+    f.handle_input(1, b"z");
+    assert!(last(&f).starts_with("(pp) z"), "{}", last(&f));
+    assert!(row0(&f).starts_with("m3"));
+    f.render(1);
+
+    // a menu over the frozen panes is drawn as it changes (CLIENT_REDRAWMENU)
+    run(&mut f, &["display-menu", "-x", "0", "-y", "10", "-T", "M", "one", "1", "set -g @m 1", "two", "2", "set -g @m 2"]);
+    f.render(1);
+    let before = f.compose(1).unwrap().frame;
+    f.handle_input(1, b"\x1b[B");
+    let after = f.compose(1).unwrap().frame;
+    assert!(before.cells != after.cells, "the menu's selection is drawn");
+    f.handle_input(1, b"\r");
+    assert!(f.menus.is_empty());
+    assert!(f.clients[&1].prompt.is_some());
+    // (the menu's command waits in the client's queue behind the command-prompt)
+    f.handle_input(1, b"\r");
+    assert_eq!(f.opts_session.get("@x"), Some("z"));
+    assert_eq!(f.opts_session.get("@m"), Some("2"));
+}
+
+#[test]
+fn the_status_line_under_a_prompt_survives_a_full_redraw() {
+    // status_prompt_redraw draws over sl->screen; a full redraw does not draw the status
+    let mut f = fixture();
+    run(&mut f, &["set", "-g", "status", "2"]);
+    run(&mut f, &["set", "-g", "status-format[1]", "BEFORE"]);
+    f.render(1);
+    run(&mut f, &["command-prompt", "-p", "(x)", "set -g @x '%%'"]);
+    f.render(1);
+    let last = |f: &Fixture| f.compose(1).unwrap().frame.row(23).iter().map(|c| c.text.as_str()).collect::<String>();
+    assert!(last(&f).starts_with("BEFORE"));
+    run(&mut f, &["set", "-g", "status-format[1]", "AFTER"]);
+    f.clients.get_mut(&1).unwrap().prev = None;
+    f.render(1);
+    assert!(last(&f).starts_with("BEFORE"), "{}", last(&f));
+    f.handle_input(1, b"\x03");
+    assert!(f.clients[&1].prompt.is_none());
+    assert!(last(&f).starts_with("AFTER"), "{}", last(&f));
+}
+
+#[test]
+fn a_menu_taller_than_the_client_opens_at_the_top() {
+    // cmd_display_menu_get_menu_pos never refuses a size; menu_display puts a menu as
+    // tall as the window or taller at py 0
+    let mut f = fixture();
+    let mut args: Vec<String> = ["display-menu", "-T", "M"].iter().map(|s| s.to_string()).collect();
+    for i in 0..30 {
+        args.extend([format!("item{i}"), String::new(), format!("set -g @tall {i}")]);
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    run(&mut f, &args);
+    let wid = f.window_of(f.pane).unwrap();
+    let m = f.menus.get(&wid).expect("the menu is open");
+    assert_eq!(m.y, 0);
+    f.render(1);
+    let row = |f: &Fixture, y: u16| f.compose(1).unwrap().frame.row(y).iter().map(|c| c.text.as_str()).collect::<String>();
+    assert!(row(&f, 1).contains("item0"), "{}", row(&f, 1));
+    f.handle_input(1, b"\x1b[B\r");
+    assert_eq!(f.opts_session.get("@tall"), Some("1"));
+}
+
+#[test]
+fn prompt_answers_are_escaped_for_the_shells_that_may_run_them() {
+    // Windows takes the jobs' shell and every default-shell into account; Unix keeps tmux
+    // 3.8's escapes (jobs run under /bin/sh) unless a default-shell is PowerShell or
+    // cmd.exe, whose quotes they do not keep
+    let mut f = fixture();
+    let job = procinfo::default_shell();
+    let expect = |shells: &[&str]| match cfg!(windows) {
+        true => input::Quoting::for_shells(std::iter::once(job.as_str()).chain(shells.iter().copied())),
+        false if shells.iter().all(|s| procinfo::shell_kind(s) == procinfo::ShellKind::Posix || procinfo::shell_kind(s) == procinfo::ShellKind::Other) => input::Quoting::TMUX,
+        false => input::Quoting::for_shells(std::iter::once("/bin/sh").chain(shells.iter().copied())),
+    };
+    f.opts_session.set("default-shell", "/bin/sh".into());
+    assert_eq!(f.answer_quoting(), expect(&["/bin/sh"]));
+    if !cfg!(windows) {
+        assert_eq!(f.answer_quoting(), input::Quoting::TMUX);
+        f.opts_session.set("default-shell", "/usr/bin/fish".into());
+        assert_eq!(f.answer_quoting(), input::Quoting::TMUX);
+    }
+    f.opts_session.set("default-shell", "pwsh.exe".into());
+    assert_eq!(f.answer_quoting(), expect(&["pwsh.exe"]));
+    assert!(f.answer_quoting().powershell && !f.answer_quoting().tmux);
+    // a session's own default-shell counts too
+    let sid = f.sid;
+    f.sessions.get_mut(&sid).unwrap().options.set("default-shell", "C:\\Windows\\System32\\cmd.exe".into());
+    let q = f.answer_quoting();
+    assert_eq!(q, expect(&["pwsh.exe", "cmd.exe"]));
+    // jobs: their shell's alone (Unix: /bin/sh, tmux's)
+    assert_eq!(f.job_answer_quoting(), if cfg!(windows) { input::Quoting::for_shells([job.as_str()]) } else { input::Quoting::TMUX });
+    if !cfg!(windows) {
+        // Unix with PowerShell for panes: a pane's command is escaped for it and sh
+        let e = input::fill_block_value("Get-Content '%%'", &["x'; echo pwned; '".into()], input::Reader::Direct, q).unwrap_err();
+        assert!(e.contains("PowerShell and sh"), "{e}");
+        f.sessions.get_mut(&sid).unwrap().options.set("default-shell", "/bin/sh".into());
+        f.opts_session.set("default-shell", "/bin/sh".into());
+    }
+    let q = f.answer_quoting();
+    // the block value of a binding's prompt gets those escapes (`set` keeps it as given)
+    run(&mut f, &["bind-key", "F6", "command-prompt { set -g @v \"echo '%%' %%\" }"]);
+    f.handle_input(1, b"\x02\x1b[17~");
+    f.handle_input(1, b"it's & x\r");
+    let want = input::fill_block_value("echo '%%' %%", &["it's & x".into()], input::Reader::Direct, q).unwrap();
+    assert_eq!(f.opts_session.get("@v"), Some(want.as_str()));
+    if cfg!(windows) {
+        assert_eq!(want, "echo 'it''s ^& x' %%");
+    } else {
+        assert_eq!(want, "echo 'it'\\''s & x' %%");
+    }
+}
+
+/// On Windows the default shell (PowerShell) runs a prompt's answer in a block as the
+/// answer, whatever quotes it has (Unix: the same through /bin/sh with tmux's escapes).
+#[cfg(windows)]
+#[test]
+fn windows_job_shell_gets_powershell_escapes() {
+    let mut f = fixture();
+    f.opts_session.set("default-shell", procinfo::default_shell().into());
+    let q = f.answer_quoting();
+    if procinfo::shell_kind(&procinfo::default_shell()) == procinfo::ShellKind::PowerShell {
+        assert!(q.powershell && !q.cmd, "{q:?}");
+        assert_eq!(input::fill_block_value("echo '%%'", &["x'y\u{2019}z".into()], input::Reader::Direct, q).unwrap(), "echo 'x''y\u{2019}\u{2019}z'");
+    }
 }

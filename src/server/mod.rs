@@ -920,7 +920,8 @@ pub struct Prompt {
     pub vi_command: bool,
     /// C-v: the next key is inserted as it is
     pub quote_next: bool,
-    pub copied: Vec<char>,
+    /// What C-w deleted last (pr->copied), even nothing: C-y then pastes it, not a buffer.
+    pub copied: Option<Vec<char>>,
     pub kind: PromptKind,
     pub prompts: Vec<(String, String)>,
     pub answers: Vec<String>,
@@ -928,6 +929,12 @@ pub struct Prompt {
     pub input: Vec<char>,
     pub cursor: usize,
     pub template: String,
+    /// While the prompt is open the panes are not drawn (TTY_FREEZE): every client
+    /// prompt but command-prompt -C or -i (PROMPT_NOFREEZE, PROMPT_INCREMENTAL).
+    pub freeze: bool,
+    /// The template was a { } block (ARGS_COMMANDS): the answers go into its parsed
+    /// values, which are not parsed again (args_make_commands, cmd_list_copy).
+    pub block: bool,
     pub history_pos: Option<usize>,
     /// The history this prompt reads and adds to (command-prompt -T, an index of
     /// input::PROMPT_TYPES).
@@ -961,8 +968,8 @@ impl Prompt {
         let (label, init) = prompts.first().cloned().unwrap_or_default();
         let input: Vec<char> = init.chars().collect();
         Prompt {
-            vi_command: false, quote_next: false, copied: Vec::new(), kind, prompts, answers: Vec::new(), label, cursor: input.len(), input,
-            template, history_pos: None, history_type: 0, id: 0, pane, numeric: false, single_key: false, incremental: false, last: String::new(),
+            vi_command: false, quote_next: false, copied: None, kind, prompts, answers: Vec::new(), label, cursor: input.len(), input,
+            template, freeze: true, block: false, history_pos: None, history_type: 0, id: 0, pane, numeric: false, single_key: false, incremental: false, last: String::new(),
             complete: Vec::new(), closed: false, host: None, copy_incremental: None, bspace_exit: false, confirm: ('y', false),
         }
     }
@@ -983,6 +990,18 @@ pub struct RenderState {
     pub status_ranges: Vec<Vec<Option<crate::format::Range>>>,
     /// A frame no longer shown, which the next render draws into (render::Frame::reuse).
     pub spare: Option<render::Frame>,
+    /// While the client is frozen (TTY_FREEZE): what a change of redraws the panes (the
+    /// window shown, its layout, its panes' modes and prompts, the part shown, the
+    /// prompt, a menu or overlay opening or closing).
+    pub freeze: Option<String>,
+    /// While frozen: the panes as they are held (what tty_write did not draw).
+    pub frozen: Option<render::Frame>,
+    /// The message shown with this frame: clearing or replacing it redraws the panes
+    /// (status_message_clear sets CLIENT_ALLREDRAWFLAGS).
+    pub message: Option<(String, Instant)>,
+    /// While a prompt or message is shown: the status lines as drawn under it, which stay
+    /// as they were when it opened (sl->screen); kept in Client::status_under.
+    pub status_under: Option<render::Frame>,
 }
 
 /// What a mouse drag in progress updates (tmux's mouse_drag_update callback).
@@ -1041,7 +1060,12 @@ pub struct Client {
     pub message_ignore_keys: bool,
     /// The message is text: its # are not styles (all but display-message).
     pub message_ignore_styles: bool,
+    /// display-message -C: the message does not freeze the panes.
+    pub message_no_freeze: bool,
     pub prev: Option<RenderState>,
+    /// The status lines under a prompt or message (RenderState::status_under), which a
+    /// full redraw (prev reset) keeps.
+    pub status_under: Option<render::Frame>,
     pub dirty: bool,
     pub last_session: Option<SessId>,
     pub created: u64,
@@ -1988,6 +2012,7 @@ impl Server {
             let until = if ms == 0 { MESSAGE_FOREVER } else { Duration::from_millis(ms) };
             c.message = Some((msg.to_string(), Instant::now() + until));
             c.message_ignore_styles = false;
+            c.message_no_freeze = false;
             // as tmux, a message without a timer keeps the previous setting
             if ms != 0 {
                 c.message_ignore_keys = ignore_keys;
@@ -2136,7 +2161,9 @@ impl Server {
                 message: None,
                 message_ignore_keys: false,
                 message_ignore_styles: true,
+                message_no_freeze: false,
                 prev: None,
+                status_under: None,
                 dirty: false,
                 last_session: None,
                 created: now,
@@ -3093,9 +3120,13 @@ impl Server {
             st.timer = None;
             self.name_changed.remove(&active);
             let fmt = self.opt_window(Some(wid), "automatic-rename-format");
-            let name = self.expand_for_pane(active, &fmt);
-            if !name.is_empty() && self.windows.get(&wid).is_some_and(|w| w.name != name) {
-                self.windows.get_mut(&wid).unwrap().name = name;
+            // automatic_rename_update compares the expanded name with the window's, then
+            // window_set_name(w, name, 1) sets it cleaned (clean_name, untrusted: #( made
+            // _( ), firing window-renamed even when that gives the same name
+            let expanded = self.expand_for_pane(active, &fmt);
+            if !expanded.is_empty() && self.windows.get(&wid).is_some_and(|w| w.name != expanded) {
+                *self.ev.renamed.entry(wid).or_default() += 1;
+                self.windows.get_mut(&wid).unwrap().name = cmds::clean_untrusted_name(&expanded);
                 self.mark_window_dirty(wid);
             }
         }
@@ -3160,12 +3191,13 @@ impl Server {
         let shell = self.opt_session(sid, "default-shell");
         let shell = if shell.is_empty() { procinfo::default_shell() } else { shell };
         let default_cmd = self.opt_session(sid, "default-command");
-        let argv: Vec<String> = match cmd {
-            [] if default_cmd.is_empty() => procinfo::interactive(&shell),
+        let run = match cmd {
+            [] if default_cmd.is_empty() => procinfo::ShellCommand::words(procinfo::interactive(&shell)),
             [] => procinfo::via_shell(&shell, &default_cmd),
             [one] => procinfo::via_shell(&shell, one),
-            many => many.to_vec(),
+            many => procinfo::ShellCommand::words(many.to_vec()),
         };
+        let argv = &run.argv;
         // tmux keeps the command given, else default-command; respawn without one keeps the old
         let start_argv = match cmd {
             [] if default_cmd.is_empty() => self.panes.get(&id).map(|p| p.track.argv.clone()).unwrap_or_default(),
@@ -3180,8 +3212,20 @@ impl Server {
         let host_pid = procinfo::win::children_named(std::process::id(), "conhost.exe").into_iter().find(|p| !hosts_before.contains(p));
         #[cfg(not(windows))]
         let host_pid = None;
-        let mut cb = CommandBuilder::new(&argv[0]);
-        cb.args(&argv[1..]);
+        // spawn_pane: with no command, the shell as a login shell (argv0 "-" and its
+        // name; Unix only, and not PowerShell, which is given -NoLogo)
+        #[cfg(unix)]
+        let login = cmd.is_empty() && default_cmd.is_empty() && !procinfo::is_powershell(&shell) && procinfo::is_executable(&shell);
+        #[cfg(not(unix))]
+        let login = false;
+        let mut cb = if login { CommandBuilder::new_default_prog() } else { CommandBuilder::new(&argv[0]) };
+        if !login {
+            cb.args(&argv[1..]);
+            // cmd.exe's command line as it is (procinfo::via_shell)
+            if let Some(raw) = &run.raw {
+                cb.raw_arg(raw);
+            }
+        }
         cb.env_clear();
         for (k, v) in self.session_env(sid) {
             if let Some(v) = v {
@@ -3208,6 +3252,10 @@ impl Server {
         cb.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
         for (k, v) in extra_env {
             cb.env(k, v);
+        }
+        // SHELL is the shell the pane was given (which a login shell is run as, too)
+        if cfg!(unix) {
+            cb.env("SHELL", &shell);
         }
         let child = if empty { None } else { Some(pair.slave.spawn_command(cb).map_err(|e| format!("create pane failed: {} ({e})", argv[0]))?) };
         drop(pair.slave);
@@ -4900,7 +4948,7 @@ impl Server {
         thread::spawn(move || {
             let (status, out) = match child.and_then(|c| c.wait_with_output()) {
                 // a signal is passed on as its negated number
-                Ok(o) => (o.status.code().or_else(|| process_exit_signal(&o.status).map(|s| -s)).unwrap_or(1), String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr)),
+                Ok(o) => (o.status.code().or_else(|| process_exit_signal(&o.status).map(|s| -s)).unwrap_or(1), procinfo::job_text(&o.stdout) + &procinfo::job_text(&o.stderr)),
                 Err(e) => (127, format!("{e}\n")),
             };
             let _ = tx.send(Event::Job(id, status, out));
@@ -4955,6 +5003,8 @@ fn strip_delay(cmd: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod input_tests;
+#[cfg(test)]
+mod quoting_tests;
 
 #[cfg(test)]
 mod surface_tests;

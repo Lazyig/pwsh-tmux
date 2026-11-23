@@ -497,8 +497,11 @@ impl Panes {
         index.checked_sub(base).and_then(|i| w.panes().get(i).copied())
     }
 
-    fn run(&self, pane: PaneId) -> ModeAction {
-        ModeAction::Run(crate::server::input::fill_template(&self.template, &[format!("%{pane}")]))
+    fn run(&self, pane: PaneId, srv: &Server) -> ModeAction {
+        match crate::server::input::fill_template(&self.template, &[format!("%{pane}")], srv.answer_shells()) {
+            Ok(cmd) => ModeAction::Run(cmd),
+            Err(e) => ModeAction::Error(e),
+        }
     }
 
     pub fn key(&mut self, name: &str, srv: &Server) -> ModeAction {
@@ -509,7 +512,7 @@ impl Panes {
             return ModeAction::None;
         }
         match self.key_pane(srv, name) {
-            Some(p) => self.run(p),
+            Some(p) => self.run(p, srv),
             None => ModeAction::Exit,
         }
     }
@@ -520,7 +523,7 @@ impl Panes {
         }
         let hit = self.areas(srv, w, h).into_iter().rev().find(|(_, ax, ay, aw, ah)| x >= *ax && x < ax + aw && y >= *ay && y < ay + ah);
         match hit {
-            Some((p, ..)) if srv.panes.contains_key(&p) => self.run(p),
+            Some((p, ..)) if srv.panes.contains_key(&p) => self.run(p, srv),
             _ => ModeAction::None,
         }
     }

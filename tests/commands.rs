@@ -1092,6 +1092,84 @@ fn show_options_and_hooks_formats() {
     assert_eq!(ctx.ok(&["show-hooks", "-w", "-t", "o"]), "pane-focus-in[0] display-message w\n");
 }
 
+/// On Windows a job prints what its shell prints (UTF-8 whatever the console code page),
+/// and cmd.exe gets a pane's command as written.
+#[cfg(windows)]
+#[test]
+fn windows_jobs_keep_text_and_cmd_gets_quotes() {
+    let ctx = Ctx::new("wintext");
+    ctx.ok(&["new-session", "-d", "-s", "w"]);
+    ctx.wait_prompt("w");
+    let text = "\u{d55c}\u{ae00} \u{e9} \u{201c}q\u{201d}";
+    assert!(ctx.ok(&["run-shell", &format!("echo '{text}'")]).trim_end().ends_with(text));
+    ctx.ok(&["set", "-g", "default-shell", "cmd.exe"]);
+    let pane = ctx.ok(&["split-window", "-d", "-P", "-F", "#{pane_id}", "echo \"%%%\" & echo done & pause"]).trim().to_string();
+    wait_for("cmd.exe's output", || ctx.capture(&pane).contains("done"));
+    let shown = ctx.capture(&pane);
+    assert!(shown.contains("\"%%%\"") && !shown.contains("\\\""), "{shown}");
+}
+
+/// Runs a CLI command that should end, or fails the test after 60 seconds (ending it).
+#[cfg(windows)]
+fn ends(ctx: &Ctx, args: &[&str], what: &str) -> (Option<i32>, String) {
+    let mut child = ctx.command().args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let start = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed() > Duration::from_secs(60) {
+            let _ = child.kill();
+            panic!("{what}: {args:?} did not end");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let o = child.wait_with_output().unwrap();
+    (o.status.code(), String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr))
+}
+
+/// On Windows the server's jobs run in its console, which it makes without a window and
+/// sets to UTF-8, so what the shell prints and reads is whole whatever the system's
+/// console code page; the job is the shell itself, and what it starts goes on by itself.
+#[cfg(windows)]
+#[test]
+fn windows_jobs_run_in_the_servers_utf8_console() {
+    let text = "\u{d55c}\u{ae00} \u{e9} \u{201c}q\u{201d}";
+    let mut shells = vec!["powershell.exe"];
+    if std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("pwsh.exe").is_file())) {
+        shells.push("pwsh.exe");
+    }
+    for ps in shells {
+        let ctx = Ctx::new("winjobs");
+        // the server this starts runs its jobs with PWSH_TMUX_SHELL
+        let out = ctx.command().env("PWSH_TMUX_SHELL", ps).args(["new-session", "-d", "-s", "w"]).output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let out = ctx.ok(&["run-shell", &format!("echo '{text}'")]);
+        assert!(out.trim_end().ends_with(text), "{ps}: {out:?}");
+        assert!(ctx.ok(&["run-shell", "chcp"]).contains("65001"), "{ps}");
+        // #() in a format, with its own job
+        wait_for("#() output", || ctx.fmt("w", &format!("#(echo '{text}')")) == text);
+        // run-shell -E shows PowerShell's error
+        let (code, shown) = ends(&ctx, &["run-shell", "-E", "Get-PwshTmuxNoSuchCommand"], ps);
+        assert_eq!(code, Some(1), "{ps}: {shown}");
+        assert!(shown.contains("Get-PwshTmuxNoSuchCommand") && shown.contains("returned 1"), "{ps}: {shown}");
+        // what Start-Process starts neither holds the job nor ends with it
+        let file = std::env::temp_dir().join(format!("pwsh-tmux-it-started-{}-{ps}", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let command = format!(
+            "Start-Process -WindowStyle Hidden -FilePath $env:ComSpec -ArgumentList '/d /c ping -n 3 127.0.0.1 >nul & echo done>\"{}\"'; 'started'",
+            file.display()
+        );
+        let (code, out) = ends(&ctx, &["run-shell", &command], "run-shell Start-Process");
+        assert!(code == Some(0) && out.contains("started"), "{ps}: {out}");
+        wait_for("what Start-Process started", || file.exists());
+        let _ = std::fs::remove_file(&file);
+        // a pipe-pane job is its shell (#{pane_pipe_pid})
+        ctx.ok(&["pipe-pane", "-t", "w", "-O", "$input | Out-Null"]);
+        let pid = ctx.fmt("w", "#{pane_pipe_pid}");
+        let name = ctx.ok(&["run-shell", &format!("(Get-Process -Id {pid}).ProcessName")]);
+        assert!(name.trim_end().eq_ignore_ascii_case(ps.trim_end_matches(".exe")), "{ps}: {pid} is {name:?}");
+        ctx.ok(&["pipe-pane", "-t", "w"]);
+    }
+}
+
 #[test]
 fn run_shell_paste_and_display_flags() {
     let ctx = Ctx::new("runflags");
@@ -3186,7 +3264,8 @@ fn session_names_follow_check_name_and_clean_name() {
     ctx.ok(&["rename-session", "-t", "n", "n"]);
     let mut names: Vec<String> = ctx.ok(&["list-sessions", "-F", "[#{session_name}]"]).lines().map(String::from).collect();
     names.sort();
-    assert_eq!(names, ["[a:b]", "[a\\\\b]", "[n]", "[x.y]"]);
+    // (on Windows a backslash is kept, COMPATIBILITY.md)
+    assert_eq!(names, ["[a:b]", if cfg!(windows) { "[a\\b]" } else { "[a\\\\b]" }, "[n]", "[x.y]"]);
     // and the target syntax still splits at ':' and '.', as cmd-find does
     assert_eq!(ctx.fails(&["rename-session", "-t", "x.y", ""]).trim_end(), "can't find pane: y");
     ctx.ok(&["rename-session", "-t", "n", ""]);
@@ -4139,4 +4218,26 @@ fn pane_output_that_widens_a_cell_in_the_last_column_leaves_the_server_running()
         wait_for("crash-5x25.bin shown", || ctx.capture("screen") == want);
         assert_eq!(ctx.fmt("screen", "#{cursor_x},#{cursor_y}"), "25,2");
     }
+}
+
+// Unix only: tmux's login shell is an argv0 of "-" and the shell's name, which only a
+// Unix exec has (Windows panes start the shell as they always have), read from /proc.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_pane_without_a_command_runs_a_login_shell() {
+    // spawn_pane: no command and no default-command execs the shell with argv0
+    // "-sh", and SHELL is the shell even over -e
+    let ctx = Ctx::new("login-shell");
+    ctx.ok(&["new-session", "-d", "-s", "l"]);
+    ctx.ok(&["set", "-g", "default-shell", "/bin/sh"]);
+    ctx.ok(&["new-window", "-d", "-t", "l:1", "-e", "SHELL=/nonexistent"]);
+    let pid = ctx.fmt("l:1", "#{pane_pid}");
+    wait_for("-sh", || std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default() == b"-sh\0");
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+    assert!(environ.split(|b| *b == 0).any(|v| v == b"SHELL=/bin/sh"), "{}", String::from_utf8_lossy(&environ));
+    wait_for("pane_current_command", || ctx.fmt("l:1", "#{pane_current_command}") == "sh");
+    // a command goes through the shell as before
+    ctx.ok(&["new-window", "-d", "-t", "l:2", "exec sleep 30"]);
+    let pid = ctx.fmt("l:2", "#{pane_pid}");
+    wait_for("sleep", || std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default() == b"sleep\x0030\0");
 }

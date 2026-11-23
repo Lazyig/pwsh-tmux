@@ -5,6 +5,16 @@ use std::collections::HashMap;
 pub struct Opts {
     pub flags: HashMap<char, String>,
     pub rest: Vec<String>,
+    /// Which of `rest` were { } blocks (ARGS_COMMANDS values), set by the server's
+    /// dispatcher; empty when none were.
+    pub rest_blocks: Vec<bool>,
+}
+
+impl Opts {
+    /// Whether argument `i` of `rest` was a { } block.
+    pub fn is_block(&self, i: usize) -> bool {
+        self.rest_blocks.get(i).copied().unwrap_or(false)
+    }
 }
 
 impl Opts {
@@ -100,7 +110,7 @@ pub fn getopt_optional(args: &[String], bools: &str, vals: &str, optional: &str)
         }
         i += 1;
     }
-    Ok(Opts { flags, rest: args[i.min(args.len())..].to_vec() })
+    Ok(Opts { flags, rest: args[i.min(args.len())..].to_vec(), rest_blocks: Vec::new() })
 }
 
 #[cfg(test)]

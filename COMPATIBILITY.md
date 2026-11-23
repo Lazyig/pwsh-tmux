@@ -76,11 +76,73 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
 
 - **Shell and platform defaults.** `default-shell` is PowerShell, the project's purpose:
   `pwsh`, falling back to `powershell.exe` on Windows and to `$SHELL` (then `/bin/sh`)
-  on Unix. `editor` is `notepad.exe`
+  on Unix. On Unix a pane without a command runs its shell as a login shell (argv0 `-` and
+  the shell's name), as tmux does, except PowerShell, which is started with `-NoLogo`
+  instead (Windows panes start the shell as a plain process). `editor` is `notepad.exe`
   on Windows (`/usr/bin/vi` elsewhere). `lock-command` is empty by default on every
   platform (tmux uses a default chosen when it is built: `vlock` if vlock was found,
   otherwise `lock -np`), since Windows has no lock program, so `lock-*` needs one to be set.
-  Windows has no job control, so `suspend-client` does nothing there.
+  Windows has no job control, so `suspend-client` does nothing there. On Unix the client
+  turns on application keypad mode as tmux does (tty_start_tty's smkx, so keypad Enter
+  arrives as `\eOM`); on Windows it does not, so keypad Enter arrives as CR and a pane's
+  PowerShell gets Enter, not the LF (Ctrl+Enter there) that tmux sends a pane for keypad
+  Enter outside keypad mode.
+- **How a shell is given a command on Windows.** Where tmux runs `default-shell -c
+  command` (a pane's or popup's command, `default-command`, `detach-client -E`, jobs and
+  `-c`), a POSIX shell gets `-c command` and PowerShell `-NoLogo -Command command`, as
+  words of the command line quoted for CommandLineToArgvW (which both read). cmd.exe
+  reads its own command line and has no `\"` escape, so it gets `/s /c "command"` there
+  as it is: `/s` makes it take off just those two quotes, and the command runs exactly as
+  written (`split-window 'echo "%%%" & pause'` shows `"%%%"`, where the quoting for
+  CommandLineToArgvW gave cmd.exe `\"%%%\"`, and a command that starts with a quote
+  keeps it). A pane given several words runs them as a program with its
+  arguments, quoted for CommandLineToArgvW, as before.
+- **Job output on Windows is what the job printed.** The server has no console, and a
+  console program it starts would get one in the system's console code page (an OEM one
+  such as 437 or 949, or 65001 when Windows is set to use UTF-8), in which PowerShell and
+  cmd.exe write to a pipe and read one, losing what it has no character for (`é` is `e`
+  in 949, Hangul is `?` in 437), where a pane's console shows the same text whole; and
+  PowerShell reads its standard input in the code page it starts with, so its command
+  cannot change how that is read. So the server makes one console for its jobs
+  (`run-shell`, `if-shell`, `#()`, `pipe-pane`, `copy-pipe`), without a window, and sets
+  its input and output code pages to UTF-8 (65001), again before each job starts. Each
+  job's shell is started in it by the server, as tmux starts a job: it is the job's
+  process (its pid is the one in `show-messages -J` and `#{pane_pipe_pid}`), its command
+  line is the job's as it is (an error points into the command as typed; for Windows
+  PowerShell 5.1 the command follows a line of its own that sets `[Console]::InputEncoding`
+  and `[Console]::OutputEncoding` to UTF-8 without a byte order mark, because .NET
+  Framework's 65001 encoding has one and writes it when a program PowerShell pipes to
+  starts (without the line `'x' | findstr x` finds nothing, and `'x' | more` prints the
+  mark); so the line numbers in an error are one more than the command's, and encodings
+  the profile sets there are replaced. A command whose first statement must come first
+  (`using`, `param(...)`, after blank space and comments) runs without that line, and a
+  program it pipes to gets the mark. Not where a job has a console of its own, below),
+  and its
+  standard input, output and error are the job's (input NUL unless the job is given
+  text, errors NUL unless `run-shell -E`). PowerShell (5.1 and 7) therefore starts with
+  `[Console]::InputEncoding` and `[Console]::OutputEncoding` UTF-8, so what it prints and
+  what it reads from `copy-pipe` and `pipe-pane` are UTF-8, and cmd.exe and the programs
+  a job runs get 65001 as their console code page (`chcp` says 65001). What PowerShell
+  gives a program it pipes to is in `$OutputEncoding`, as in a pane: UTF-8 in PowerShell
+  7, ASCII in Windows PowerShell 5.1 unless the profile sets it (`$OutputEncoding =
+  [Text.UTF8Encoding]::new($false)`); so in 5.1 `run-shell "echo 'x한글é' | findstr x"`
+  prints `x???`, and `findstr 한` finds nothing in it where the system's code page has
+  Hangul (949: `'...' returned 1`, as in a pane). A failed command's error goes to the
+  shell's standard error, which `run-shell -E` shows; without `-E` it may not show, as
+  tmux discards a job's standard error (`'Get-Foo' returned 1` alone). What a job starts goes on by itself and does not
+  keep the job from ending (`run-shell -b "Start-Process notepad"`). The jobs share that
+  console: a job that changes its code page (`chcp 949`) changes it for the jobs running
+  with it until the next one starts, and a Ctrl+C or Ctrl+Break a job sends to the whole
+  console reaches the others (the server goes on, as it does at a user's logoff). A server started with a console of its
+  own (by hand, in a terminal) leaves that console as it is and gives each job a console
+  of its own without a window, in the system's code page. Each line of the output that
+  is not UTF-8 is read in the system's console code page (`GetOEMCP`), as a pane's
+  console with that code page would read a program that writes in it whatever its
+  console's code page is (a program that writes in the ANSI code page is read wrongly
+  where that differs from the OEM one). `pipe-pane -I` gives the pane the job's bytes as
+  they are. PowerShell's `‘ ’ ‚ ‛` are quotes, as in a pane: `run-shell "echo '한글 ‘q’
+  é'"` prints `한글 ` and `q é` on two lines (`‘` ends the first quoted text and `’`
+  starts another).
 - **`default-terminal` is `xterm-256color`**, not `tmux-256color`: Windows hosts usually
   have no tmux terminfo and ConPTY programs expect xterm. Panes therefore get
   `TERM=xterm-256color`, and Home and End are sent as xterm's `\e[H`/`\e[F` (`\eOH`/`\eOF`
@@ -90,10 +152,29 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   `input_key` does not strip the sent-key flag; here they are sent as typed keys are.
 - **Pane titles on Windows.** ConPTY sets the console title when the pane starts, so
   `pane_title` begins as the shell's executable path and changes with the console title.
-  On Windows, titles and names set by the program in the pane (OSC 0/2, APC, `ESC k`) and
-  OSC 7 paths keep their backslashes (they are paths); on Unix they are escaped as in 3.8.
-  Titles and names given by commands (`select-pane -T`, `rename-window`, session and
-  buffer names) are escaped as in 3.8 on every platform.
+  On Windows clean_name keeps backslashes (they separate the parts of a path) in every
+  title, name and path: those set by the program in the pane (OSC 0/2, APC, `ESC k`), OSC 7
+  paths, those given by commands (`select-pane -T`, the title of a floating pane from
+  `new-pane -T`, `rename-window`, `new-window -n`, `break-pane -n`, `new-session -s`/`-n`,
+  `rename-session`, and buffer names from `set-buffer -b`/`-n` and `load-buffer -b`), and
+  window names that are not given (a new window's, from its command, and
+  `automatic-rename`'s, `pane_current_command`), so a name typed as `C:\Users\x` is kept
+  as typed and found by that name, and renaming from a prompt that shows the name
+  (`prefix ,`) does not double them each time. On Unix they are escaped as in 3.8
+  (`C:\\Users\\x`). There, as in 3.8, a new window is named by parse_window_name of its
+  command line as `pane_start_command` shows it (each argument escaped), and
+  `pane_current_command` is parse_window_name of the first word of the foreground
+  program's command line (`/proc/PID/cmdline`, so `/p/-l` is `-l` and a long name is not
+  cut to 15 bytes); `automatic-rename` compares the expanded
+  `automatic-rename-format` with the window's name and, when they differ, sets it
+  through clean_name again (window_set_name), so a program named `a\b` gives a window
+  named `a\\\\b`, and fires `window-renamed` even when that is the name it had. On both,
+  window_set_name makes a `#(` in an automatic name `_(`.
+  Popup titles (`display-popup -T`) and floating-pane titles (`new-pane -T`, as
+  `select-pane -T`) go through clean_name only where 3.8 has it: a popup title never, so it
+  keeps backslashes on both; a floating pane's title as above. The other escapes (tab,
+  newline and control characters as `\t`, `\n` and octal) are the same on both, and the
+  names given by commands are refused for them anyway (check_name).
 - **Names that coexist with tmux.** The server listens on `/tmp/pwsh-tmux-UID/NAME`
   (under `PWSH_TMUX_TMPDIR` or `TMUX_TMPDIR` if set) on Unix and on a named pipe on
   Windows. Panes get `PWSH_TMUX` and `PWSH_TMUX_PANE` in place of `TMUX` and `TMUX_PANE`,
@@ -149,6 +230,124 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   the bytes sent, and multiplexers such as GNU screen and Zellij answer DA1 themselves
   before the colours they ask the outer terminal for.) A partial theme or colour reply
   also waits 500 ms after the start timer, where tmux decides by its request flags alone.
+- **Single quotes in a `{ }` block value that is `%%` alone (a tmux 3.8 bug).** A
+  prompt's answer goes into the already parsed values of a block template without being
+  parsed again (args_make_commands and cmd_list_copy, arguments.c:784-790 and 349-372), as
+  in tmux 3.8, so `"`, `\`, `$`, `~` and a leading `-` stay as typed. tmux 3.8 changed
+  `%%` to escape single quotes for a single-quoted string (cmd_template_replace,
+  cmd.c:849-906, CHANGES "%% is escaped for single quotes"), which keeps an answer from
+  ending the quotes of a value that is parsed again later (an `if-shell` or `run-shell`
+  command, a shell command such as `split-window "man '%%'"`), and pwsh-tmux keeps that
+  escape there. But tmux 3.8 also applies it to a value that is the whole answer, such as
+  `rename-window -- '%%'` of the default `prefix ,` binding, where nothing can remove it,
+  so a window renamed to `it's` is named `it'\''s`. Here a value that is exactly `%%`
+  keeps the answer's single quotes as typed; every other value, string templates (which
+  are parsed again) and `%%%` / `%1%` escape as in 3.8 (on Windows, and on Unix with a
+  PowerShell or cmd.exe `default-shell`, as in the next item).
+- **Prompt answers are escaped for the shell on Windows** (and on Unix when a
+  `default-shell` is PowerShell or cmd.exe). tmux 3.8's escapes (`'\''` for `%%`, a
+  backslash before `" \ $ ; ~` for `%%%` and `%N%`) are made for the command parser and
+  POSIX shells, and Unix keeps them exactly, as 3.8 has them (jobs there run under
+  `/bin/sh`; in sh's double quotes tmux's `%%%` leaves a `` ` `` that runs a command and
+  gives `\;` and `\~` with their backslash). On Windows jobs (`run-shell`, `if-shell`,
+  `#()`, `pipe-pane`, `copy-pipe`) run under `PWSH_TMUX_SHELL` if it is set, else `pwsh`,
+  else `powershell` (`default-shell` does not change this), and new panes,
+  `display-popup` and `detach-client -E` run under `default-shell`. There `'\''` does not
+  quote: `{ run-shell "echo '%%'" }` answered `x'; echo pwned; '` would run `echo pwned`.
+  So on Windows the escape is chosen when the answer is put in, for the shells that may
+  read the value: a command the jobs' shell runs (`run-shell`'s and the words after it,
+  `if-shell`'s test without `-F`, `pipe-pane`'s) is for that shell alone; any other value
+  (a pane's or popup's command, a format, whose `#()` the jobs' shell runs) is for the
+  jobs' shell and every `default-shell` (global and of each session). On Unix the same
+  is done for those other values, with `/bin/sh` as the jobs' shell, when a
+  `default-shell` (global or of a session) is PowerShell or cmd.exe: `default-shell` is
+  `pwsh` when it is installed (see Shell and platform defaults), and there `{
+  split-window "Get-Content '%%'" }` would give PowerShell tmux's `'\''`. That is the
+  only case where Unix differs from 3.8 here (3.8 gives a PowerShell `default-shell` the
+  same `'\''`); jobs keep tmux's escapes, and with POSIX shells (or any other, such as
+  fish) everything is as in 3.8. Each shell of the set then reads the answer as typed:
+  - POSIX shells (sh, bash, zsh, dash, ksh and the like, such as Git Bash): `'\''` in
+    single quotes, and a backslash before `\ " $` and `` ` `` in double quotes.
+  - PowerShell (5.1 and 7): its single quotes (`'` and `‘ ’ ‚ ‛`) doubled in single quotes;
+    `"` and `“ ” „` doubled and a backtick before `$` and `` ` `` in double quotes. `\` is
+    kept as it is, so a Windows path stays one.
+  - PowerShell and a POSIX shell (say, Git Bash as `default-shell`, for a pane's command,
+    or PowerShell as `default-shell` on Unix): no form of PowerShell's quotes, nor in
+    double quotes of `$`, `` ` `` or a `\` before another `\`, a line end or the end of
+    the answer, is read as typed by both (a backtick is PowerShell's escape and starts a
+    command in sh, and quoting the pieces apart, `"a"'$'"b"`, makes PowerShell take them
+    as separate arguments). An answer with one of them is refused, with the error `an
+    answer with ' cannot be quoted for both PowerShell and sh` (a character that is not
+    ASCII is followed by its code point: `an answer with ‘ (U+2018) cannot be quoted for
+    both PowerShell and sh`), and none of the template's commands run. The rest of an answer is put in as typed. (Setting
+    `PWSH_TMUX_SHELL` and `default-shell` to the same kind of shell avoids this.)
+  - cmd.exe has no single quotes, nothing escapes inside its double quotes, and where its
+    double quotes are is not known when the answer is put in, so each of
+    `^ & | < > ( ) % !` gets a caret, `"` is doubled and a newline becomes a space:
+    cmd.exe acts on nothing in the answer (`cmd /c` has delayed expansion off unless the
+    `DelayedExpansion` value under `Software\Microsoft\Command Processor` turns it on,
+    which is not guaranteed: `!` is then special inside its double quotes too), and reads
+    it as typed outside its double quotes. With a POSIX shell as well, `"` in double
+    quotes is refused (`\"` ends cmd.exe's quotes, `""` sh's).
+  - What the shells of a set with cmd.exe read is safe but not always as typed: each
+    one's escapes are there for the others too. Inside cmd.exe's double quotes the
+    carets stay in the text, and so do the other shells' escapes, which cmd.exe does not
+    remove: with PowerShell (jobs under `pwsh`, `default-shell` cmd.exe) the backtick
+    before `$` and `` ` `` in `"%%%"`, so `\\srv\c$\x` reaches cmd.exe as
+    ``\\srv\c`$\x``, and PowerShell's doubled quotes: in `"%%%"` each of `“ ” „` is
+    doubled, so an answer `“q”` reaches cmd.exe, and is shown by its `echo`, as `““q””`,
+    and in `'%%'` each of `' ‘ ’ ‚ ‛` (`it’s` is `it’’s`); with a POSIX shell the backslash before `\ $` and `` ` ``. PowerShell
+    and sh read cmd.exe's escapes as text the same way: the carets, and in `'%%'` the
+    doubled `"` (`'a""b'` is `a""b` for them).
+  - Not guaranteed: a shell whose quoting is not known (fish, nu, xonsh, `wsl`, ...) gets
+    the escapes for PowerShell and a POSIX shell on Windows, but fish reads `\'` and `\\`
+    in single quotes and nu has no escape in them, so an answer may still leave a `'%%'`.
+    A native program that PowerShell runs gets the answer as PowerShell passes arguments
+    (Windows PowerShell 5.1 and pwsh before 7.3 pass an embedded `"` unescaped).
+
+  Which escape applies also depends on who reads the value. A `{ }` block's values are
+  read by whatever its command gives them to: the arguments that are commands parsed
+  again (`if-shell`'s commands, `run-shell -C`, `confirm-before`, `bind-key` and
+  `set-hook` given one command string, templates of `command-prompt`, `choose-*` and
+  `display-panes`, `display-menu` items) by the command parser, `run-shell`'s,
+  `if-shell`'s test and `pipe-pane`'s by the jobs' shell, the rest as said above. A
+  string template, and a value the parser reads, is read by the parser, and the quotes
+  of each reader the answer goes through decide: where the answer is outside the
+  parser's quotes, they get tmux's escape (the parser reads the answer's syntax); inside
+  them, the command the parser gives the answer to says who reads it next, as in a
+  block, and where the answer is inside that reader's quotes it gets that reader's
+  escape (another parser's, or the shells', or the refusal) encoded for the parser's
+  quotes. So `command-prompt "run-shell \"echo '%%'\""`, `command-prompt 'run-shell
+  "echo \"%%%\""'`, `run-shell "echo \"%%%\""` (the shell's double quotes written `\"`
+  in the parser's) and a command string in a command string, `if-shell true "run-shell
+  \"echo '%%'\""`, each give the shell the answer as typed (or refuse it), and an
+  answer that is outside the next reader's quotes, `rename-window "%%"`, reaches it as
+  typed. (tmux 3.8, and Unix here, escape for the first parser's quotes only: it gives
+  sh the answer's quotes unescaped in such cases, since the parser removes the backslash
+  of `'\''`.) A `bind-key` given several words binds those words as the command's own
+  arguments, so each is escaped for what that command does with it (`{ bind -n F3
+  run-shell "echo '%%'" }` gives the shell's escape); as in 3.8, a filled word that ends
+  with `;` (not `\;`) ends the bound command there, and who reads the words after it is
+  decided where the filled words end the commands (an answer `x;` makes the next word a
+  command's; an error if the commands would not stay put). A value that is `%%` alone
+  and `%N` are put in as typed, as before. On both platforms, as in 3.8, the parser
+  removes spaces and a comment after a newline inside its quotes, and a backslash before
+  a newline, so such an answer loses them; and a template that puts `%%` outside any
+  quotes, that is written for another shell's quoting, or that a command expands as a
+  format (`run-shell`, `if-shell`: an answer's `#()` runs), is not made safe.
+- **The panes stay frozen for a whole prompt.** While a status prompt is open (not
+  `command-prompt -C`/`-i`) or a message is shown (not `display-message -C`), pane output
+  is not drawn, as in tmux 3.8 (TTY_FREEZE, status.c:386 and 605). tmux 3.8 lifts the
+  freeze in two places where it means to keep it or never set it: closing a popup over an
+  open prompt unfreezes the panes for the rest of that prompt (server_client_clear_overlay,
+  server-client.c:135, clears TTY_FREEZE without looking at the prompt), and a message
+  shown over a `-C` prompt leaves the panes frozen after it is cleared until the prompt
+  closes (status_message_clear, status.c:402, keeps the freeze whenever a prompt is open).
+  Here the panes are frozen exactly while a freezing prompt or message is shown.
+- **Configuration files with CRLF line endings** (as Windows editors and `core.autocrlf`
+  checkouts write them) are read with each `\r\n` as a newline. tmux 3.8 keeps the `\r`,
+  so a directive line such as `%endif\r` or `%else\r` is a syntax error there
+  (cmd-parse.y's lexer ends a line at `\n` only).
 - **No signal information on Windows:** `pane_dead_signal` and other signal values are
   never set there. A popup whose command was ended (TerminateProcess) gives its waiting
   command-line client that process's exit code, where on Unix it is the signal number

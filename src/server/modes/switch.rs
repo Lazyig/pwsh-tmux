@@ -148,7 +148,10 @@ impl Switch {
     fn choose(&self, srv: &Server, w: usize) -> ModeAction {
         let items = self.items(srv, w);
         match items.get(self.current) {
-            Some(it) => ModeAction::Run(crate::server::input::fill_template(&self.command, std::slice::from_ref(&it.target))),
+            Some(it) => match crate::server::input::fill_template(&self.command, std::slice::from_ref(&it.target), srv.answer_shells()) {
+                Ok(cmd) => ModeAction::Run(cmd),
+                Err(e) => ModeAction::Error(e),
+            },
             None => ModeAction::None,
         }
     }

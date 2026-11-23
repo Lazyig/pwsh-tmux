@@ -43,6 +43,9 @@ pub enum ModeAction {
     Run(String),
     /// Run a command and stay in the mode.
     RunKeep(String),
+    /// A command that could not be made (a name that cannot be quoted for the shells,
+    /// [`crate::server::input::fill_template`]): shown as the command's error would be.
+    Error(String),
     /// Open `value` in the editor and run `command` (%% is the new text) when it closes,
     /// or replace the contents of paste buffer `buffer` with it.
     Edit { value: Vec<u8>, command: String, buffer: Option<String> },
