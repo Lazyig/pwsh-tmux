@@ -1,19 +1,22 @@
 //! Pane output flow control.
 //!
-//! A pane's reader keeps at most [`CREDITS`] chunks read but not yet handled by the main
+//! A pane's reader keeps at most [`CREDITS`] chunks queued but not yet handled by the main
 //! loop. Reading ahead without a limit fills the shared event queue, and client input
-//! then waits behind a queue of output.
+//! then waits behind a queue of output. A reader waiting for a credit holds the chunk it
+//! has read, as a reader blocked on a full queue would, and the main loop sees that in
+//! the [`Backlog`]: a burst of output is still rendered once per burst.
 //!
 //! A pane's exit is reported after the output it wrote before exiting has been handled
 //! (tmux's window_pane_destroy_ready), so its last output is always on the screen.
 
 use super::{Event, PaneId};
 use std::io::Read;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// Chunks (up to 64 KiB each) a pane may have in flight to the main loop.
+/// Chunks (up to 64 KiB each) a pane may have queued to the main loop.
 const CREDITS: usize = 4;
 
 /// How long [`Flow::settle`] waits for a pane's output once its process has exited.
@@ -38,7 +41,7 @@ const TIMING: Timing = Timing {
 
 #[derive(Default)]
 struct State {
-    /// Chunks read and not yet handled by the main loop.
+    /// Chunks read and not yet handled by the main loop, the one the reader holds included.
     in_flight: usize,
     /// The reader is in a read, or about to start one.
     reading: bool,
@@ -67,18 +70,25 @@ impl Flow {
         self.changed.notify_all();
     }
 
-    /// Waits for a credit and marks the reader as reading. False once the pane is gone.
+    /// Marks the reader as reading. False once the pane is gone.
     fn begin_read(&self) -> bool {
         let mut s = self.lock();
-        while s.in_flight >= CREDITS && !s.closed {
-            s = self.changed.wait(s).unwrap_or_else(|e| e.into_inner());
-        }
         s.reading = !s.closed;
         !s.closed
     }
 
-    /// Records the end of a read (`got`: it returned data). The credit for the chunk,
-    /// unless the read ended the output or the pane has gone.
+    /// Waits, holding a chunk just read, until [`CREDITS`] or fewer chunks are queued
+    /// before it. False once the pane is gone.
+    fn wait_credit(&self) -> bool {
+        let mut s = self.lock();
+        while s.in_flight > CREDITS && !s.closed {
+            s = self.changed.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+        !s.closed
+    }
+
+    /// Records the end of a read (`got`: it returned data). The chunk's credit, which
+    /// counts it in flight, unless the read ended the output or the pane has gone.
     fn end_read(self: &Arc<Self>, got: bool) -> Option<Credit> {
         let mut credit = None;
         self.update(|s| {
@@ -176,8 +186,32 @@ impl Drop for Output {
     }
 }
 
+/// Counts the panes' readers that hold output read but not yet queued. Output follows
+/// soon then: the main loop has handled (or is about to take) the chunks before it.
+#[derive(Clone, Default)]
+pub struct Backlog(Arc<AtomicUsize>);
+
+impl Backlog {
+    pub fn any(&self) -> bool {
+        self.0.load(Ordering::SeqCst) > 0
+    }
+
+    fn hold(&self) -> Held<'_> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Held(self)
+    }
+}
+
+struct Held<'a>(&'a Backlog);
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.0 .0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// The pane reader thread: reads the terminal and sends its output to the main loop.
-pub fn read_pane(mut reader: Box<dyn Read + Send>, flow: Arc<Flow>, tx: SyncSender<Event>, id: PaneId, generation: u32) {
+pub fn read_pane(mut reader: Box<dyn Read + Send>, flow: Arc<Flow>, backlog: Backlog, tx: SyncSender<Event>, id: PaneId, generation: u32) {
     let mut buf = vec![0u8; 64 * 1024];
     while flow.begin_read() {
         let n = match reader.read(&mut buf) {
@@ -187,7 +221,12 @@ pub fn read_pane(mut reader: Box<dyn Read + Send>, flow: Arc<Flow>, tx: SyncSend
                 return;
             }
         };
-        let Some(credit) = flow.end_read(true) else { continue };
+        let Some(credit) = flow.end_read(true) else { break };
+        // until the chunk is queued (a full queue included)
+        let _held = backlog.hold();
+        if !flow.wait_credit() {
+            break;
+        }
         if tx.send(Event::PaneData(id, generation, buf[..n].to_vec(), credit)).is_err() {
             return;
         }
@@ -197,32 +236,47 @@ pub fn read_pane(mut reader: Box<dyn Read + Send>, flow: Arc<Flow>, tx: SyncSend
     while matches!(reader.read(&mut buf), Ok(n) if n > 0) {}
 }
 
+/// Opens a pane's terminal for reading: the reader thread's end and the child waiter's
+/// [`Pending`]. On Unix both use one duplicate of the master, as many descriptors as a
+/// plain reader.
+pub fn open(master: &dyn portable_pty::MasterPty) -> Result<(Box<dyn Read + Send>, Pending), String> {
+    #[cfg(unix)]
+    if let Some(fd) = master.as_raw_fd() {
+        use std::os::fd::BorrowedFd;
+        // SAFETY: the master is open for the duration of this call; the message is
+        // portable-pty's (try_clone_reader)
+        let dup = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned().map_err(|_| format!("dup of fd {fd} failed"))?;
+        let file = Arc::new(std::fs::File::from(dup));
+        return Ok((Box::new(PtyReader(file.clone())), Pending { fd: Some(file) }));
+    }
+    let reader = master.try_clone_reader().map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    return Ok((reader, Pending { fd: None }));
+    // PeekNamedPipe on ConPTY's output pipe would wait for the reader's pending
+    // synchronous read (they share a file object), and portable-pty does not expose the
+    // handle: Flow::settle goes by the reader alone.
+    #[cfg(windows)]
+    Ok((reader, Pending {}))
+}
+
+#[cfg(unix)]
+struct PtyReader(Arc<std::fs::File>);
+
+#[cfg(unix)]
+impl Read for PtyReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&*self.0).read(buf)
+    }
+}
+
 /// Whether bytes are waiting in a pane's terminal, for [`Flow::settle`].
 pub struct Pending {
-    /// A duplicate of the pty master, for FIONREAD.
+    /// The reader's pty master, for FIONREAD.
     #[cfg(unix)]
-    fd: Option<std::os::fd::OwnedFd>,
+    fd: Option<Arc<std::fs::File>>,
 }
 
 impl Pending {
-    pub fn new(master: &dyn portable_pty::MasterPty) -> Self {
-        #[cfg(unix)]
-        {
-            use std::os::fd::BorrowedFd;
-            // SAFETY: the master is open for the duration of this call
-            let fd = master.as_raw_fd().and_then(|fd| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned().ok());
-            Pending { fd }
-        }
-        #[cfg(windows)]
-        {
-            // PeekNamedPipe on ConPTY's output pipe would wait for the reader's pending
-            // synchronous read (they share a file object), and portable-pty does not
-            // expose the handle: Flow::settle goes by the reader alone.
-            let _ = master;
-            Pending {}
-        }
-    }
-
     fn any(&self) -> bool {
         #[cfg(unix)]
         {
@@ -247,21 +301,29 @@ mod tests {
 
     const SLOW: Timing = Timing { quiet: Duration::from_millis(150), stall: Duration::from_secs(5), cap: Duration::from_secs(10) };
 
-    #[test]
-    fn a_reader_waits_for_a_credit_once_four_chunks_are_in_flight() {
-        let (out, flow) = Output::new();
-        let mut credits = Vec::new();
-        for _ in 0..CREDITS {
+    /// Reads `CREDITS` chunks the main loop has not handled yet, then a fifth.
+    fn queue_four_and_read_a_fifth(flow: &Arc<Flow>) -> (Vec<Credit>, Credit) {
+        let credits: Vec<_> = (0..CREDITS).map(|_| {
             assert!(flow.begin_read());
-            credits.push(flow.end_read(true).unwrap());
-        }
+            let c = flow.end_read(true).unwrap();
+            assert!(flow.wait_credit());
+            c
+        }).collect();
+        assert!(flow.begin_read(), "the reader reads on with four chunks queued");
+        (credits, flow.end_read(true).unwrap())
+    }
+
+    #[test]
+    fn a_reader_holds_a_fifth_chunk_until_one_is_handled() {
+        let (out, flow) = Output::new();
+        let (mut credits, fifth) = queue_four_and_read_a_fifth(&flow);
         let (done_tx, done) = std::sync::mpsc::channel();
         let f = flow.clone();
-        thread::spawn(move || done_tx.send(f.begin_read()).unwrap());
+        thread::spawn(move || done_tx.send(f.wait_credit()).unwrap());
         assert!(done.recv_timeout(Duration::from_millis(100)).is_err(), "a fifth chunk must wait");
         credits.pop(); // the main loop handled one
         assert!(done.recv_timeout(Duration::from_secs(5)).unwrap());
-        drop(credits);
+        drop((credits, fifth));
         assert_eq!(flow.lock().in_flight, 0);
         drop(out);
     }
@@ -269,19 +331,18 @@ mod tests {
     #[test]
     fn a_reader_stops_waiting_and_drains_once_the_pane_goes() {
         let (out, flow) = Output::new();
-        let credits: Vec<_> = (0..CREDITS).map(|_| {
-            assert!(flow.begin_read());
-            flow.end_read(true).unwrap()
-        }).collect();
+        let (credits, fifth) = queue_four_and_read_a_fifth(&flow);
         let (done_tx, done) = std::sync::mpsc::channel();
         let f = flow.clone();
-        thread::spawn(move || done_tx.send(f.begin_read()).unwrap());
+        thread::spawn(move || done_tx.send(f.wait_credit()).unwrap());
         assert!(done.recv_timeout(Duration::from_millis(50)).is_err());
         drop(out);
         assert!(!done.recv_timeout(Duration::from_secs(5)).unwrap(), "no credit once the pane is gone");
+        assert!(!flow.begin_read());
         // a read in progress when the pane goes is not sent
         assert!(flow.end_read(true).is_none());
-        drop(credits);
+        drop((credits, fifth));
+        assert_eq!(flow.lock().in_flight, 0);
     }
 
     #[test]
@@ -301,19 +362,29 @@ mod tests {
             }
         }
         let src = Src(data, 0, read.clone());
-        let reader = thread::spawn(move || read_pane(Box::new(src), flow, tx, 1, 0));
-        // four chunks reach the queue, then the reader waits
+        let backlog = Backlog::default();
+        let b = backlog.clone();
+        let reader = thread::spawn(move || read_pane(Box::new(src), flow, b, tx, 1, 0));
+        // four chunks reach the queue, then the reader waits holding a fifth
         let mut got = Vec::new();
         for _ in 0..CREDITS {
             got.push(rx.recv_timeout(Duration::from_secs(5)).unwrap());
         }
         thread::sleep(Duration::from_millis(50));
-        assert_eq!(read.load(Ordering::SeqCst), CREDITS * 64 * 1024);
+        assert_eq!(read.load(Ordering::SeqCst), (CREDITS + 1) * 64 * 1024);
         assert!(rx.try_recv().is_err());
+        assert!(backlog.any(), "the main loop sees the chunk held");
+        // handling one lets the held chunk through
+        got.pop();
+        got.push(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(read.load(Ordering::SeqCst), (CREDITS + 2) * 64 * 1024);
+        assert!(backlog.any());
         drop(out);
         reader.join().unwrap();
         assert_eq!(read.load(Ordering::SeqCst), 10 * 64 * 1024, "read to the end");
         assert!(rx.try_recv().is_err(), "nothing sent once the pane is gone");
+        assert!(!backlog.any());
         drop(got);
     }
 

@@ -1393,6 +1393,8 @@ pub struct Parked {
 
 pub struct Server {
     pub tx: mpsc::SyncSender<Event>,
+    /// Pane output read and waiting to be queued, for the main loop's coalescing.
+    pub backlog: flow::Backlog,
     pub pty: Box<dyn PtySystem + Send>,
     pub sessions: BTreeMap<SessId, Session>,
     pub windows: HashMap<WinId, Window>,
@@ -1578,7 +1580,7 @@ pub fn run(config: Option<String>, cwd: Option<String>) -> io::Result<()> {
                 srv.handle(ev);
                 // Coalesce bursts of output into one render.
                 let deadline = Instant::now() + Duration::from_millis(4);
-                while let Ok(ev) = rx.try_recv() {
+                while let Some(ev) = next_in_burst(&rx, &srv.backlog, deadline) {
                     output_only &= matches!(ev, Event::PaneData(..));
                     srv.handle(ev);
                     if Instant::now() > deadline {
@@ -1620,6 +1622,26 @@ pub fn run(config: Option<String>, cwd: Option<String>) -> io::Result<()> {
     Ok(())
 }
 
+/// The next event of a burst being coalesced. A pane reader holding output it has read
+/// (waiting for its chunks before to be handled) is sending it next: that output would
+/// be queued already without the limit on queued output, so it is waited for, up to the
+/// burst's deadline.
+fn next_in_burst(rx: &mpsc::Receiver<Event>, backlog: &flow::Backlog, deadline: Instant) -> Option<Event> {
+    if let Ok(ev) = rx.try_recv() {
+        return Some(ev);
+    }
+    while backlog.any() {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        // a reader that finds its pane gone holds nothing any more: look again soon
+        match rx.recv_timeout(left.min(Duration::from_millis(1))) {
+            Ok(ev) => return Some(ev),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+    rx.try_recv().ok()
+}
+
 impl Server {
     /// server_loop's exit test: no sessions (exit-empty) or no attached client
     /// (exit-unattached), and no client other than `except` still waiting for its reply.
@@ -1641,6 +1663,7 @@ impl Server {
         }
         let mut srv = Self {
             tx,
+            backlog: flow::Backlog::default(),
             pty: native_pty_system(),
             sessions: BTreeMap::new(),
             windows: HashMap::new(),
@@ -3190,17 +3213,16 @@ impl Server {
         let child = if empty { None } else { Some(pair.slave.spawn_command(cb).map_err(|e| format!("create pane failed: {} ({e})", argv[0]))?) };
         drop(pair.slave);
         let pid = child.as_ref().and_then(|c| c.process_id());
-        let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
+        let (reader, pending) = flow::open(&*pair.master)?;
         let mut writer = pair.master.take_writer().map_err(|e| e.to_string())?;
         let killer = child.as_ref().map(|c| c.clone_killer());
 
         let (output, flow) = flow::Output::new();
         let tx = self.tx.clone();
-        let reader_flow = flow.clone();
-        thread::spawn(move || flow::read_pane(reader, reader_flow, tx, id, generation));
+        let (reader_flow, backlog) = (flow.clone(), self.backlog.clone());
+        thread::spawn(move || flow::read_pane(reader, reader_flow, backlog, tx, id, generation));
         if let Some(mut child) = child {
             let tx = self.tx.clone();
-            let pending = flow::Pending::new(&*pair.master);
             thread::spawn(move || {
                 let status = child.wait().ok().map(|s| exit_status(&s));
                 // window_pane_destroy_ready: the output before the exit is shown first
