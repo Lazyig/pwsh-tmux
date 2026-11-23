@@ -610,13 +610,14 @@ impl Backing {
         }
     }
 
-    /// Appends [`Line::cell_text`] of cell `x` of line `i` to `out` (nothing past the end).
-    pub fn push_cell_text(&self, out: &mut String, i: usize, x: usize) {
+    /// Appends [`Line::cell_text`] of each of cells `xs` of line `i` to `out` (nothing past
+    /// the end).
+    pub fn push_cell_texts(&self, out: &mut String, i: usize, xs: std::ops::Range<usize>) {
         match self.unbuilt(i) {
-            Some((screen, i)) => crate::cells::push_snapshot_cell_text(out, screen, i, x),
+            Some((screen, i)) => crate::cells::push_snapshot_cell_texts(out, screen, i, xs),
             None => {
                 if let Some(l) = self.get(i) {
-                    out.push_str(l.cell_text(x));
+                    xs.for_each(|x| out.push_str(l.cell_text(x)));
                 }
             }
         }
@@ -3547,7 +3548,7 @@ impl CopyMode {
         let xx = self.copy_len(y);
         let (sx, ex) = (sx.min(xx), ex.min(xx));
         // padding is skipped and a tab copied as a tab
-        (sx..ex).for_each(|x| self.lines.push_cell_text(out, y, x));
+        self.lines.push_cell_texts(out, y, sx..ex);
         if !wrapped || ex != xx {
             out.push('\n');
         }

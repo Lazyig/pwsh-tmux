@@ -192,19 +192,28 @@ fn vt_cell_text(c: Option<&vt100::Cell>) -> &str {
     }
 }
 
-/// The number of cells of [`snapshot_line`], read from the screen.
-pub fn snapshot_cells_len(screen: &vt100::Screen, index: usize) -> usize {
-    let cols = usize::from(screen.size().1.get());
-    match screen.history_row(index) {
+/// The number of cells of [`snapshot_line`] for a row of the screen (None for a row past
+/// it, which is blank).
+fn row_cells_len(row: Option<&vt100::capture::RowContents<'_>>, cols: usize) -> usize {
+    match row {
         Some(row) if row.wrapped() => cols.min(usize::from(row.used_len())),
         _ => cols,
     }
 }
 
+fn cols_of(screen: &vt100::Screen) -> usize {
+    usize::from(screen.size().1.get())
+}
+
+/// The number of cells of [`snapshot_line`], read from the screen.
+pub fn snapshot_cells_len(screen: &vt100::Screen, index: usize) -> usize {
+    row_cells_len(screen.history_row(index).as_ref(), cols_of(screen))
+}
+
 /// [`Line::text_len`] of [`snapshot_line`], read from the screen.
 pub fn snapshot_text_len(screen: &vt100::Screen, index: usize) -> usize {
-    let n = snapshot_cells_len(screen, index);
     let Some(row) = screen.history_row(index) else { return 0 };
+    let n = row_cells_len(Some(&row), cols_of(screen));
     let used = (0..n).rposition(|x| vt_cell_text(row.cell(x as u16)) != " ").map_or(0, |x| x + 1);
     let tabs = row.metadata().filter(|(_, m)| m.tab_width > 0).map(|(x, m)| usize::from(x) + usize::from(m.tab_width)).max().unwrap_or(0).min(n);
     used.max(tabs)
@@ -218,30 +227,41 @@ fn row_tab_at(row: &vt100::capture::RowContents<'_>, x: usize) -> Option<(usize,
     (x < at + w).then_some((at, w))
 }
 
+/// The text of cell `x` of [`snapshot_line`] for a row (its [`Cell::text`], None past its
+/// cells).
+fn row_cell<'a>(row: Option<&'a vt100::capture::RowContents<'_>>, cols: usize, x: usize) -> Option<&'a str> {
+    if x >= row_cells_len(row, cols) {
+        return None;
+    }
+    Some(row.map_or(" ", |row| vt_cell_text(row.cell(x as u16))))
+}
+
 /// `f` of the text of cell `x` of [`snapshot_line`] (its [`Cell::text`], None past its
 /// cells), read from the screen.
 pub fn with_snapshot_cell<R>(screen: &vt100::Screen, index: usize, x: usize, f: impl FnOnce(Option<&str>) -> R) -> R {
-    if x >= snapshot_cells_len(screen, index) {
-        return f(None);
-    }
-    match screen.history_row(index) {
-        Some(row) => f(Some(vt_cell_text(row.cell(x as u16)))),
-        None => f(Some(" ")),
-    }
+    let row = screen.history_row(index);
+    f(row_cell(row.as_ref(), cols_of(screen), x))
 }
 
 /// [`Line::is_padding`] of [`snapshot_line`], read from the screen.
 pub fn snapshot_is_padding(screen: &vt100::Screen, index: usize, x: usize) -> bool {
-    with_snapshot_cell(screen, index, x, |c| c == Some(""))
-        || screen.history_row(index).is_some_and(|row| row_tab_at(&row, x).is_some_and(|(at, _)| at != x))
+    let row = screen.history_row(index);
+    row_cell(row.as_ref(), cols_of(screen), x) == Some("")
+        || row.is_some_and(|row| row_tab_at(&row, x).is_some_and(|(at, _)| at != x))
 }
 
-/// Appends [`Line::cell_text`] of [`snapshot_line`] at `x` to `out`, read from the screen.
-pub fn push_snapshot_cell_text(out: &mut String, screen: &vt100::Screen, index: usize, x: usize) {
-    match screen.history_row(index).and_then(|row| row_tab_at(&row, x)) {
-        Some((at, _)) if at == x => out.push('\t'),
-        Some(_) => {}
-        None => with_snapshot_cell(screen, index, x, |c| out.push_str(c.unwrap_or(""))),
+/// Appends [`Line::cell_text`] of each of columns `xs` of [`snapshot_line`] to `out`, read
+/// from the screen.
+pub fn push_snapshot_cell_texts(out: &mut String, screen: &vt100::Screen, index: usize, xs: std::ops::Range<usize>) {
+    let row = screen.history_row(index);
+    let cols = cols_of(screen);
+    let tabs = row.as_ref().is_some_and(|row| row.metadata().any(|(_, m)| m.tab_width != 0));
+    for x in xs {
+        match row.as_ref().filter(|_| tabs).and_then(|row| row_tab_at(row, x)) {
+            Some((at, _)) if at == x => out.push('\t'),
+            Some(_) => {}
+            None => out.push_str(row_cell(row.as_ref(), cols, x).unwrap_or("")),
+        }
     }
 }
 
@@ -368,8 +388,13 @@ mod tests {
                     assert_eq!(cell.as_deref(), line.cells.get(x).map(|c| c.text.as_str()), "seed {seed} row {i} col {x}");
                     assert_eq!(snapshot_is_padding(s, i, x), line.is_padding(x), "seed {seed} row {i} col {x}");
                     let mut text = String::new();
-                    push_snapshot_cell_text(&mut text, s, i, x);
+                    push_snapshot_cell_texts(&mut text, s, i, x..x + 1);
                     assert_eq!(text, line.cell_text(x), "seed {seed} row {i} col {x}");
+                }
+                for (a, b) in [(0, cols), (1, cols + 3), (cols / 2, cols), (2, 1)] {
+                    let mut text = String::new();
+                    push_snapshot_cell_texts(&mut text, s, i, a..b);
+                    assert_eq!(text, (a..b).map(|x| line.cell_text(x)).collect::<String>(), "seed {seed} row {i} cols {a}..{b}");
                 }
                 wrapped_early += usize::from(line.wrapped && line.cells.len() < cols);
             }
