@@ -172,9 +172,11 @@ pub fn check_command(argv: &[String]) -> Result<(), String> {
 /// (or attached, for a flag whose value is optional) and the arguments after "--".
 /// `fill` is told who reads each value ([`argument_reader`]): the command parser for a
 /// command's arguments that are commands, the shell of jobs for those it runs, else
-/// whatever the command gives it to.
+/// whatever the command gives it to. An error when the text does not parse or when the
+/// filled words of a binding end its commands elsewhere than `fill` was told
+/// ([`fill_bound_words`]).
 pub(crate) fn copy_block(text: &str, fill: &dyn Fn(&str, input::Reader) -> String) -> Result<Vec<Vec<String>>, String> {
-    Ok(cmdparse::parse_marked(text)?.iter().map(|c| copy_block_command(c, fill)).collect())
+    cmdparse::parse_marked(text)?.iter().map(|c| copy_block_command(c, fill)).collect()
 }
 
 /// Whether argument `pos` (after the flags) of command `full`, given flags `flags`, is
@@ -208,7 +210,7 @@ fn argument_reader(full: &str, flags: &str, pos: usize) -> input::Reader {
     }
 }
 
-fn copy_block_command(argv: &[String], fill: &dyn Fn(&str, input::Reader) -> String) -> Vec<String> {
+fn copy_block_command(argv: &[String], fill: &dyn Fn(&str, input::Reader) -> String) -> Result<Vec<String>, String> {
     copy_command(argv, fill, false)
 }
 
@@ -216,11 +218,11 @@ fn copy_block_command(argv: &[String], fill: &dyn Fn(&str, input::Reader) -> Str
 /// words as written with the values filled (the words of a bound command, which
 /// bind-key reads again as tmux 3.8 does, cmd_parse_from_arguments), else the flags,
 /// then "--", then the arguments.
-fn copy_command(argv: &[String], fill: &dyn Fn(&str, input::Reader) -> String, raw: bool) -> Vec<String> {
-    let Some((name, args)) = argv.split_first() else { return Vec::new() };
-    let value_for = |a: &str, reader: input::Reader| match a.strip_prefix(cmdparse::BLOCK_MARK) {
+fn copy_command(argv: &[String], fill: &dyn Fn(&str, input::Reader) -> String, raw: bool) -> Result<Vec<String>, String> {
+    let Some((name, args)) = argv.split_first() else { return Ok(Vec::new()) };
+    let value_for = |a: &str, reader: input::Reader| -> Result<String, String> { Ok(match a.strip_prefix(cmdparse::BLOCK_MARK) {
         Some(b) => {
-            let inner = copy_block(b, fill).unwrap_or_default().iter()
+            let inner = copy_block(b, fill)?.iter()
                 .map(|c| c.iter().map(|w| match w.strip_prefix(cmdparse::BLOCK_MARK) {
                     Some(b) => format!("{{ {b} }}"),
                     None => cmdparse::quote(w),
@@ -229,13 +231,13 @@ fn copy_command(argv: &[String], fill: &dyn Fn(&str, input::Reader) -> String, r
             format!("{}{inner}", cmdparse::BLOCK_MARK)
         }
         None => fill(a, reader),
-    };
+    }) };
     let value = |a: &str| value_for(a, input::Reader::Direct);
     let mut flags = String::new();
     let mut out = vec![name.clone()];
     // (the words as written, argument i at i + 1, each value replaced when filled)
     let mut words = argv.to_vec();
-    let done = |out: Vec<String>, words: Vec<String>| if raw { words } else { out };
+    let done = |out: Vec<String>, words: Vec<String>| Ok(if raw { words } else { out });
     let spec = canonical(name).and_then(|full| COMMANDS.iter().find(|c| c.0 == full));
     let mut i = 0;
     if let Some(&(full, _, bools, vals)) = spec {
@@ -290,7 +292,7 @@ fn copy_command(argv: &[String], fill: &dyn Fn(&str, input::Reader) -> String, r
                             None => { out.push(format!("-{c}")); return done(out, words); }
                         }
                     };
-                    let v = value(&v);
+                    let v = value(&v)?;
                     words[i + 1] = if at == i { attached(&v) } else { v.clone() };
                     out.extend([format!("-{c}"), v]);
                     break;
@@ -310,8 +312,8 @@ fn copy_command(argv: &[String], fill: &dyn Fn(&str, input::Reader) -> String, r
         // the words after the key are the bound commands' arguments, read again when the
         // key is bound, so each command says who reads them (run-shell's command is a
         // shell's, not the parser's) and the words stay as written
-        let key = value(&rest[0]);
-        let bound = fill_bound_words(&rest[1..], fill);
+        let key = value(&rest[0])?;
+        let bound = fill_bound_words(&rest[1..], fill)?;
         words[i + 1] = key.clone();
         words[i + 2..].clone_from_slice(&bound);
         out.push(key);
@@ -319,35 +321,66 @@ fn copy_command(argv: &[String], fill: &dyn Fn(&str, input::Reader) -> String, r
         return done(out, words);
     }
     for (pos, a) in rest.iter().enumerate() {
-        let v = value_for(a, argument_reader(full, &flags, pos));
+        let v = value_for(a, argument_reader(full, &flags, pos))?;
         words[i + 1 + pos] = v.clone();
         out.push(v);
     }
     done(out, words)
 }
 
-/// bind-key's words after the key with the answers in, as written: split into commands
-/// at a word that ends with ";" (not "\;"), as cmd_parse_from_arguments splits them
-/// when the key is bound, and each command's values filled for who reads them.
-fn fill_bound_words(words: &[String], fill: &dyn Fn(&str, input::Reader) -> String) -> Vec<String> {
+/// Where cmd_parse_from_arguments ends the bound commands in `words`: after each word
+/// that ends with ";" (not "\;").
+fn bound_ends(words: &[String]) -> Vec<bool> {
+    words.iter().map(|w| !w.starts_with(cmdparse::BLOCK_MARK) && w.ends_with(';') && !w.ends_with("\\;")).collect()
+}
+
+/// bind-key's words after the key with the answers in, as written, each command's
+/// values filled for who reads them, the commands ending where the filled words end
+/// them, as cmd_parse_from_arguments splits them when the key is bound: an answer may
+/// end a command (`x;`) or keep one going (`x\`, before a ";"). The commands are taken
+/// where the written words end them and then, while the answers move that, where the
+/// filled words do, until they stay; an error if they do not (who reads a word would
+/// not be known: the escapes for the parser and for a shell differ). The escapes are the
+/// same for every reader on Unix (tmux 3.8's), so there the words are as 3.8 fills them.
+fn fill_bound_words(words: &[String], fill: &dyn Fn(&str, input::Reader) -> String) -> Result<Vec<String>, String> {
+    let mut ends = bound_ends(words);
+    for _ in 0..4 {
+        let out = fill_bound_split(words, &ends, fill)?;
+        let filled = bound_ends(&out);
+        if filled == ends {
+            return Ok(out);
+        }
+        ends = filled;
+    }
+    Err("an answer cannot change where a bound command ends".into())
+}
+
+/// [`fill_bound_words`] with the commands ending after the words `ends` marks: such a
+/// word that ends with ";" as written gives its command the word without it.
+fn fill_bound_split(words: &[String], ends: &[bool], fill: &dyn Fn(&str, input::Reader) -> String) -> Result<Vec<String>, String> {
     let mut out = words.to_vec();
     let mut start = 0;
     for end in 0..=words.len() {
-        let sep = words.get(end).is_some_and(|w| !w.starts_with(cmdparse::BLOCK_MARK) && w.ends_with(';') && !w.ends_with("\\;"));
+        let sep = ends.get(end).copied().unwrap_or(false);
         if end < words.len() && !sep {
             continue;
         }
         // the command's words, the last without its ";" (none when it was only ";")
         let mut cmd = words[start..end].to_vec();
-        if let Some(head) = sep.then(|| &words[end][..words[end].len() - 1]).filter(|h| !h.is_empty()) {
-            cmd.push(head.to_string());
+        let written = sep && bound_ends(&words[end..=end])[0];
+        if sep {
+            let w = &words[end];
+            let head = if written { &w[..w.len() - 1] } else { w.as_str() };
+            if !head.is_empty() {
+                cmd.push(head.to_string());
+            }
         }
-        for (k, w) in copy_command(&cmd, fill, true).into_iter().enumerate() {
-            out[start + k] = if start + k == end { format!("{w};") } else { w };
+        for (k, w) in copy_command(&cmd, fill, true)?.into_iter().enumerate() {
+            out[start + k] = if start + k == end && written { format!("{w};") } else { w };
         }
         start = end + 1;
     }
-    out
+    Ok(out)
 }
 
 /// The commands of a parse once built ([`Server::build_commands`]).
@@ -6628,6 +6661,28 @@ mod tests {
         // a word that ends with ";" ends a bound command, "\;" does not
         assert_eq!(readers("bind-key F3 display 'x;' run-shell '%%'"), [p("F3", 'D'), p("x", 'D'), p("%%", 'J')]);
         assert_eq!(readers("bind-key F3 display 'x\\;' run-shell '%%'"), [p("F3", 'D'), p("x\\;", 'D'), p("run-shell", 'D'), p("%%", 'D')]);
+    }
+
+    #[test]
+    fn a_bound_command_ends_where_the_filled_words_end_it() {
+        // an answer `A;` ends display's command, so the words after it are run-shell's:
+        // its command is filled again for the shell of jobs
+        let last = std::cell::RefCell::new(Vec::new());
+        let block = copy_block("bind-key -n F3 display %% run-shell 'echo x'", &|v, r| {
+            if v == "echo x" {
+                last.borrow_mut().push(r);
+            }
+            v.replace("%%", "A;")
+        }).unwrap();
+        assert_eq!(block[0][4..], ["display", "A;", "run-shell", "echo x"]);
+        assert_eq!(last.into_inner(), [input::Reader::Direct, input::Reader::Job]);
+        // the escapes may move the end again: filled until it stays put
+        let fill = |v: &str, r: input::Reader| match (v, r) {
+            ("%%", input::Reader::Direct) => "a;".to_string(),
+            ("%%", _) => "a\\;".to_string(),
+            _ => v.to_string(),
+        };
+        assert_eq!(copy_block("bind-key F3 display %% if-shell true %%", &fill).unwrap()[0][3..], ["display", "a;", "if-shell", "true", "a\\;"]);
     }
 
     #[test]

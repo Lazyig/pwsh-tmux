@@ -555,3 +555,112 @@ fn real_shells_read_the_words_as_the_model_does() {
         }
     }
 }
+
+/// The answers of the review's cases (and the Windows checklist's).
+const LAYERED: &[&str] = &[
+    "$(echo pwned)",
+    "a\"b",
+    "x`y",
+    "it's",
+    "x'; echo pwned; '",
+    "x\" ; run-shell pwned ; \"",
+    "\u{2018}q\u{2019} \u{201c}d\u{201d}",
+    "$env:USERPROFILE",
+    "%PATH%",
+    "C:\\Users\\x",
+    "a & b | c",
+];
+
+/// `%%%` in the shell's double quotes written `\"` inside the parser's double quotes
+/// (`command-prompt "run-shell \"echo \\\"%%%\\\"\""`): the double quotes around the
+/// answer are the shell's, so it gets the shell's escape, or the refusal, as a block
+/// value does (review: it got the parser's, and PowerShell and sh ran `$(echo pwned)`).
+#[test]
+fn shell_double_quotes_inside_the_parsers_get_the_shells_escape() {
+    for q in WINDOWS {
+        for a in LAYERED {
+            let one = [a.to_string()];
+            let want = fill_block_value("echo \"%%%\"", &one, Reader::Job, q);
+            let got = fill_template("run-shell \"echo \\\"%%%\\\"\"", &one, q);
+            let block = fill_block("if-shell true \"run-shell \\\"echo \\\\\\\"%%%\\\\\\\"\\\"\"", &one, q, q);
+            let Ok(want) = want else {
+                assert!(got.is_err() && block.is_err(), "{q:?} {a:?}");
+                continue;
+            };
+            let got = cmdparse::parse(&got.unwrap()).unwrap();
+            assert_eq!(got, [vec!["run-shell".to_string(), want.clone()]], "{q:?} {a:?}");
+            let block = block.unwrap();
+            assert_eq!(cmdparse::parse(block[0].last().unwrap()).unwrap(), [vec!["run-shell".to_string(), want.clone()]], "{q:?} {a:?}");
+            if q.powershell && !q.cmd {
+                assert_eq!(ps_word(want.strip_prefix("echo ").unwrap()).as_deref(), Ok(*a), "{q:?}");
+            } else if q.posix && !q.cmd {
+                assert_eq!(sh_word(want.strip_prefix("echo ").unwrap()).as_deref(), Ok(*a), "{q:?}");
+            }
+        }
+    }
+    let one = ["$(echo pwned)".to_string()];
+    assert_eq!(fill_template("run-shell \"echo \\\"%%%\\\"\"", &one, PS).unwrap(), "run-shell \"echo \\\"`\\$(echo pwned)\\\"\"");
+    assert!(fill_template("run-shell \"echo \\\"%%%\\\"\"", &one, PS_SH).is_err());
+    // Unix: tmux 3.8's escape for the parser's double quotes
+    assert_eq!(fill_template("run-shell \"echo \\\"%%%\\\"\"", &one, TMUX).unwrap(), "run-shell \"echo \\\"\\$(echo pwned)\\\"\"");
+}
+
+/// A command string in a command string (`if-shell true "run-shell \"echo '%%'\""`): each
+/// parser the answer goes through gets its escape, down to the shell (review: only the
+/// first parser's quotes were kept, and if-shell's parse ran `run-shell pwned`).
+#[test]
+fn every_parser_an_answer_goes_through_is_escaped_for() {
+    for q in WINDOWS {
+        for a in LAYERED {
+            let one = [a.to_string()];
+            let want = fill_block_value("echo '%%'", &one, Reader::Job, q);
+            let string = fill_template("if-shell true \"run-shell \\\"echo '%%'\\\"\"", &one, q);
+            let block = fill_block("if-shell true \"if-shell true \\\"run-shell \\\\\\\"echo '%%'\\\\\\\"\\\"\"", &one, q, q);
+            let Ok(want) = want else {
+                assert!(string.is_err() && block.is_err(), "{q:?} {a:?}");
+                continue;
+            };
+            let outer = cmdparse::parse(&string.unwrap()).unwrap();
+            assert_eq!(outer.len(), 1, "{q:?} {a:?}: {outer:?}");
+            assert_eq!(cmdparse::parse(&outer[0][2]).unwrap(), [vec!["run-shell".to_string(), want.clone()]], "{q:?} {a:?}");
+            let block = block.unwrap();
+            let first = cmdparse::parse(block[0].last().unwrap()).unwrap();
+            assert_eq!(first.len(), 1, "{q:?} {a:?}: {first:?}");
+            assert_eq!(cmdparse::parse(&first[0][2]).unwrap(), [vec!["run-shell".to_string(), want.clone()]], "{q:?} {a:?}");
+            if q.powershell && !q.cmd {
+                assert_eq!(ps_word(want.strip_prefix("echo ").unwrap()).as_deref(), Ok(*a), "{q:?}");
+            }
+        }
+    }
+    // the answer outside the next reader's quotes reaches it as typed
+    assert_eq!(cmdparse::parse(&fill_template("rename-window \"%%\"", &["it's".into()], PS).unwrap()).unwrap(), [vec!["rename-window", "it's"]]);
+    assert_eq!(cmdparse::parse(&fill_template("display '[%%%]'", &["a\"b$c".into()], PS).unwrap()).unwrap(), [vec!["display", "[a\"b$c]"]]);
+    // Unix: tmux 3.8's escapes, for the first parser
+    assert_eq!(
+        fill_template("if-shell true \"run-shell \\\"echo '%%'\\\"\"", &["x\" ; run-shell pwned ; \"".into()], TMUX).unwrap(),
+        "if-shell true \"run-shell \\\"echo 'x\" ; run-shell pwned ; \"'\\\"\"",
+    );
+}
+
+/// An answer that ends a bound command (`x;`): who reads the words after it is decided
+/// where the filled words end the commands, as bind-key splits them (review: the
+/// if-shell string was escaped as send-keys' word, then parsed by if-shell).
+#[test]
+fn a_bound_command_an_answer_ends_is_escaped_for_who_reads_it() {
+    let a = ["x\" ; run-shell \"echo PWNED >> o\" ; display \"y;".to_string()];
+    let t = "bind -n F3 send-keys '%%' if-shell true \"run-shell \\\"echo '%%'\\\"\"";
+    for q in [PS, PS_SH, PS_CMD, SH, CMD] {
+        let block = fill_block(t, &a, q, q).unwrap_or_else(|e| panic!("{q:?}: {e}"));
+        let bound = cmdparse::parse(&super::cmds::binding_command(&block[0][4..])).unwrap();
+        assert_eq!(bound.len(), 2, "{q:?}: {bound:?}");
+        assert_eq!(bound[0], ["send-keys", a[0].strip_suffix(';').unwrap()]);
+        let inner = cmdparse::parse(&bound[1][2]).unwrap();
+        assert_eq!(inner, [vec!["run-shell".to_string(), fill_block_value("echo '%%'", &a, Reader::Job, q).unwrap()]], "{q:?}");
+        if q.powershell && !q.cmd {
+            assert_eq!(ps_word(inner[0][1].strip_prefix("echo ").unwrap()).as_deref(), Ok(a[0].as_str()));
+        }
+    }
+    // Unix: the words as tmux 3.8 fills them
+    let block = fill_block(t, &a, TMUX, TMUX).unwrap();
+    assert_eq!(block[0][4..], ["send-keys", &a[0], "if-shell", "true", &format!("run-shell \"echo '{}'\"", a[0])]);
+}

@@ -498,7 +498,7 @@ impl Panes {
     }
 
     fn run(&self, pane: PaneId, srv: &Server) -> ModeAction {
-        match crate::server::input::fill_template(&self.template, &[format!("%{pane}")], srv.answer_quoting()) {
+        match crate::server::input::fill_template(&self.template, &[format!("%{pane}")], srv.answer_shells()) {
             Ok(cmd) => ModeAction::Run(cmd),
             Err(e) => ModeAction::Error(e),
         }

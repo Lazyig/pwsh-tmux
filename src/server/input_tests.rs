@@ -1879,20 +1879,41 @@ fn a_menu_taller_than_the_client_opens_at_the_top() {
 
 #[test]
 fn prompt_answers_are_escaped_for_the_shells_that_may_run_them() {
-    // Unix keeps tmux 3.8's escapes whatever default-shell is (jobs run under /bin/sh);
-    // Windows takes the jobs' shell and every default-shell into account
+    // Windows takes the jobs' shell and every default-shell into account; Unix keeps tmux
+    // 3.8's escapes (jobs run under /bin/sh) unless a default-shell is PowerShell or
+    // cmd.exe, whose quotes they do not keep
     let mut f = fixture();
     let job = procinfo::default_shell();
-    let expect = |shells: &[&str]| if cfg!(windows) { input::Quoting::for_shells(shells.iter().copied()) } else { input::Quoting::TMUX };
+    let expect = |shells: &[&str]| match cfg!(windows) {
+        true => input::Quoting::for_shells(std::iter::once(job.as_str()).chain(shells.iter().copied())),
+        false if shells.iter().all(|s| procinfo::shell_kind(s) == procinfo::ShellKind::Posix || procinfo::shell_kind(s) == procinfo::ShellKind::Other) => input::Quoting::TMUX,
+        false => input::Quoting::for_shells(std::iter::once("/bin/sh").chain(shells.iter().copied())),
+    };
     f.opts_session.set("default-shell", "/bin/sh".into());
-    assert_eq!(f.answer_quoting(), expect(&[&job, "/bin/sh"]));
+    assert_eq!(f.answer_quoting(), expect(&["/bin/sh"]));
+    if !cfg!(windows) {
+        assert_eq!(f.answer_quoting(), input::Quoting::TMUX);
+        f.opts_session.set("default-shell", "/usr/bin/fish".into());
+        assert_eq!(f.answer_quoting(), input::Quoting::TMUX);
+    }
     f.opts_session.set("default-shell", "pwsh.exe".into());
-    assert_eq!(f.answer_quoting(), expect(&[&job, "pwsh.exe"]));
+    assert_eq!(f.answer_quoting(), expect(&["pwsh.exe"]));
+    assert!(f.answer_quoting().powershell && !f.answer_quoting().tmux);
     // a session's own default-shell counts too
     let sid = f.sid;
     f.sessions.get_mut(&sid).unwrap().options.set("default-shell", "C:\\Windows\\System32\\cmd.exe".into());
     let q = f.answer_quoting();
-    assert_eq!(q, expect(&[&job, "pwsh.exe", "cmd.exe"]));
+    assert_eq!(q, expect(&["pwsh.exe", "cmd.exe"]));
+    // jobs: their shell's alone (Unix: /bin/sh, tmux's)
+    assert_eq!(f.job_answer_quoting(), if cfg!(windows) { input::Quoting::for_shells([job.as_str()]) } else { input::Quoting::TMUX });
+    if !cfg!(windows) {
+        // Unix with PowerShell for panes: a pane's command is escaped for it and sh
+        let e = input::fill_block_value("Get-Content '%%'", &["x'; echo pwned; '".into()], input::Reader::Direct, q).unwrap_err();
+        assert!(e.contains("PowerShell and sh"), "{e}");
+        f.sessions.get_mut(&sid).unwrap().options.set("default-shell", "/bin/sh".into());
+        f.opts_session.set("default-shell", "/bin/sh".into());
+    }
+    let q = f.answer_quoting();
     // the block value of a binding's prompt gets those escapes (`set` keeps it as given)
     run(&mut f, &["bind-key", "F6", "command-prompt { set -g @v \"echo '%%' %%\" }"]);
     f.handle_input(1, b"\x02\x1b[17~");

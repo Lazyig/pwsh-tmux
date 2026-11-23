@@ -1110,7 +1110,7 @@ impl Tree {
                 if s.is_empty() {
                     return ModeAction::None;
                 }
-                let cmds: Result<Vec<String>, String> = self.tagged_or_current(b).iter().filter_map(|i| Tree::target_name(srv, &b.nodes[*i].data)).map(|t| fill_template(&s, &[t], srv.answer_quoting())).collect();
+                let cmds: Result<Vec<String>, String> = self.tagged_or_current(b).iter().filter_map(|i| Tree::target_name(srv, &b.nodes[*i].data)).map(|t| fill_template(&s, &[t], srv.answer_shells())).collect();
                 match cmds {
                     Ok(cmds) if cmds.is_empty() => ModeAction::None,
                     Ok(cmds) => ModeAction::RunKeep(cmds.join(" ; ")),
@@ -1193,7 +1193,7 @@ impl Tree {
             }
             "Enter" => {
                 return match Tree::target_name(srv, &data) {
-                    Some(t) => run_filled(fill_template(&self.command, &[t], srv.answer_quoting())),
+                    Some(t) => run_filled(fill_template(&self.command, &[t], srv.answer_shells())),
                     None => ModeAction::Exit,
                 };
             }
@@ -1208,7 +1208,7 @@ impl Tree {
         }
         let item = self.current_item(b);
         let paste = |t: &Tree, items: &[usize]| -> ModeAction {
-            let cmds: Result<Vec<String>, String> = items.iter().filter_map(|i| Tree::target_name(srv, &b.nodes[*i].data)).map(|n| fill_template(&t.command, &[n], srv.answer_quoting())).collect();
+            let cmds: Result<Vec<String>, String> = items.iter().filter_map(|i| Tree::target_name(srv, &b.nodes[*i].data)).map(|n| fill_template(&t.command, &[n], srv.answer_shells())).collect();
             match cmds {
                 Ok(cmds) if cmds.is_empty() => ModeAction::Exit,
                 Ok(cmds) => ModeAction::Run(cmds.join(" ; ")),
@@ -1272,7 +1272,7 @@ impl Tree {
             "i" => self.info = !self.info,
             "Enter" => {
                 return match Tree::target_name(srv, &b.nodes[item].data) {
-                    Some(c) => run_filled(fill_template(&self.command, &[c], srv.answer_quoting())),
+                    Some(c) => run_filled(fill_template(&self.command, &[c], srv.answer_shells())),
                     None => ModeAction::Exit,
                 };
             }
@@ -1399,7 +1399,7 @@ impl Tree {
             _ => return ModeAction::None,
         };
         match Tree::target_name(srv, &d) {
-            Some(t) => run_filled(fill_template(&self.command, &[t], srv.answer_quoting())),
+            Some(t) => run_filled(fill_template(&self.command, &[t], srv.answer_shells())),
             None => ModeAction::None,
         }
     }

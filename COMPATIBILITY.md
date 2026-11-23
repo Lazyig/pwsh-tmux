@@ -182,12 +182,14 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   `rename-window -- '%%'` of the default `prefix ,` binding, where nothing can remove it,
   so a window renamed to `it's` is named `it'\''s`. Here a value that is exactly `%%`
   keeps the answer's single quotes as typed; every other value, string templates (which
-  are parsed again) and `%%%` / `%1%` escape as in 3.8 (on Windows, as in the next item).
-- **Prompt answers are escaped for the shell on Windows.** tmux 3.8's escapes (`'\''` for
-  `%%`, a backslash before `" \ $ ; ~` for `%%%` and `%N%`) are made for the command
-  parser and POSIX shells, and Unix keeps them exactly, as 3.8 has them (jobs there run
-  under `/bin/sh`; in sh's double quotes tmux's `%%%` leaves a `` ` `` that runs a command
-  and gives `\;` and `\~` with their backslash). On Windows jobs (`run-shell`, `if-shell`,
+  are parsed again) and `%%%` / `%1%` escape as in 3.8 (on Windows, and on Unix with a
+  PowerShell or cmd.exe `default-shell`, as in the next item).
+- **Prompt answers are escaped for the shell on Windows** (and on Unix when a
+  `default-shell` is PowerShell or cmd.exe). tmux 3.8's escapes (`'\''` for `%%`, a
+  backslash before `" \ $ ; ~` for `%%%` and `%N%`) are made for the command parser and
+  POSIX shells, and Unix keeps them exactly, as 3.8 has them (jobs there run under
+  `/bin/sh`; in sh's double quotes tmux's `%%%` leaves a `` ` `` that runs a command and
+  gives `\;` and `\~` with their backslash). On Windows jobs (`run-shell`, `if-shell`,
   `#()`, `pipe-pane`, `copy-pipe`) run under `PWSH_TMUX_SHELL` if it is set, else `pwsh`,
   else `powershell` (`default-shell` does not change this), and new panes,
   `display-popup` and `detach-client -E` run under `default-shell`. There `'\''` does not
@@ -196,54 +198,80 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   read the value: a command the jobs' shell runs (`run-shell`'s and the words after it,
   `if-shell`'s test without `-F`, `pipe-pane`'s) is for that shell alone; any other value
   (a pane's or popup's command, a format, whose `#()` the jobs' shell runs) is for the
-  jobs' shell and every `default-shell` (global and of each session). Each of them then
-  reads the answer as typed:
+  jobs' shell and every `default-shell` (global and of each session). On Unix the same
+  is done for those other values, with `/bin/sh` as the jobs' shell, when a
+  `default-shell` (global or of a session) is PowerShell or cmd.exe: `default-shell` is
+  `pwsh` when it is installed (see Shell and platform defaults), and there `{
+  split-window "Get-Content '%%'" }` would give PowerShell tmux's `'\''`. That is the
+  only case where Unix differs from 3.8 here (3.8 gives a PowerShell `default-shell` the
+  same `'\''`); jobs keep tmux's escapes, and with POSIX shells (or any other, such as
+  fish) everything is as in 3.8. Each shell of the set then reads the answer as typed:
   - POSIX shells (sh, bash, zsh, dash, ksh and the like, such as Git Bash): `'\''` in
     single quotes, and a backslash before `\ " $` and `` ` `` in double quotes.
   - PowerShell (5.1 and 7): its single quotes (`'` and `‘ ’ ‚ ‛`) doubled in single quotes;
     `"` and `“ ” „` doubled and a backtick before `$` and `` ` `` in double quotes. `\` is
     kept as it is, so a Windows path stays one.
-  - PowerShell and a POSIX shell (say, Git Bash as `default-shell`, for a pane's command):
-    no form of PowerShell's quotes, nor in double quotes of `$`, `` ` `` or a `\` before
-    another `\`, a line end or the end of the answer, is read as typed by both (a
-    backtick is PowerShell's escape and starts a command in sh, and quoting the pieces
-    apart, `"a"'$'"b"`, makes PowerShell take them as separate arguments). An answer with
-    one of them is refused, with the error `an answer with ' cannot be quoted for both
-    PowerShell and sh`, and none of the template's commands run. The rest of an answer is
-    put in as typed. (Setting `PWSH_TMUX_SHELL` and `default-shell` to the same kind of
-    shell avoids this.)
+  - PowerShell and a POSIX shell (say, Git Bash as `default-shell`, for a pane's command,
+    or PowerShell as `default-shell` on Unix): no form of PowerShell's quotes, nor in
+    double quotes of `$`, `` ` `` or a `\` before another `\`, a line end or the end of
+    the answer, is read as typed by both (a backtick is PowerShell's escape and starts a
+    command in sh, and quoting the pieces apart, `"a"'$'"b"`, makes PowerShell take them
+    as separate arguments). An answer with one of them is refused, with the error `an
+    answer with ' cannot be quoted for both PowerShell and sh`, and none of the
+    template's commands run. The rest of an answer is put in as typed. (Setting
+    `PWSH_TMUX_SHELL` and `default-shell` to the same kind of shell avoids this.)
   - cmd.exe has no single quotes, nothing escapes inside its double quotes, and where its
     double quotes are is not known when the answer is put in, so each of
     `^ & | < > ( ) % !` gets a caret, `"` is doubled and a newline becomes a space:
-    cmd.exe acts on nothing in the answer (`cmd /c` has delayed expansion off), and reads
-    it as typed outside its double quotes, but inside them the carets stay in the text,
-    and the other shells of the set read them too. With a POSIX shell as well, `"` in
-    double quotes is refused (`\"` ends cmd.exe's quotes, `""` sh's).
+    cmd.exe acts on nothing in the answer (`cmd /c` has delayed expansion off unless the
+    `DelayedExpansion` value under `Software\Microsoft\Command Processor` turns it on,
+    which is not guaranteed: `!` is then special inside its double quotes too), and reads
+    it as typed outside its double quotes. With a POSIX shell as well, `"` in double
+    quotes is refused (`\"` ends cmd.exe's quotes, `""` sh's).
+  - What the shells of a set with cmd.exe read is safe but not always as typed: each
+    one's escapes are there for the others too. Inside cmd.exe's double quotes the
+    carets stay in the text, and so do the other shells' escapes, which cmd.exe does not
+    remove: with PowerShell (jobs under `pwsh`, `default-shell` cmd.exe) the backtick
+    before `$` and `` ` `` in `"%%%"`, so `\\srv\c$\x` reaches cmd.exe as
+    ``\\srv\c`$\x``; with a POSIX shell the backslash before `\ $` and `` ` ``. PowerShell
+    and sh read cmd.exe's escapes as text the same way: the carets, and in `'%%'` the
+    doubled `"` (`'a""b'` is `a""b` for them).
   - Not guaranteed: a shell whose quoting is not known (fish, nu, xonsh, `wsl`, ...) gets
-    the escapes for PowerShell and a POSIX shell, but fish reads `\'` and `\\` in single
-    quotes and nu has no escape in them, so an answer may still leave a `'%%'`. A native
-    program that PowerShell runs gets the answer as PowerShell passes arguments (Windows
-    PowerShell 5.1 and pwsh before 7.3 pass an embedded `"` unescaped).
+    the escapes for PowerShell and a POSIX shell on Windows, but fish reads `\'` and `\\`
+    in single quotes and nu has no escape in them, so an answer may still leave a `'%%'`.
+    A native program that PowerShell runs gets the answer as PowerShell passes arguments
+    (Windows PowerShell 5.1 and pwsh before 7.3 pass an embedded `"` unescaped).
 
-  Which escape applies also depends on who reads the value: in a `{ }` block, the
-  arguments that are commands parsed again (`if-shell`'s commands, `run-shell -C`,
-  `confirm-before`, `bind-key` and `set-hook` given one command string, templates of
-  `command-prompt`, `choose-*` and `display-panes`, `display-menu` items) and every string
-  template keep tmux's escapes for the command parser's quotes, which are the same
-  everywhere. A `bind-key` given several words binds those words as the command's own
+  Which escape applies also depends on who reads the value. A `{ }` block's values are
+  read by whatever its command gives them to: the arguments that are commands parsed
+  again (`if-shell`'s commands, `run-shell -C`, `confirm-before`, `bind-key` and
+  `set-hook` given one command string, templates of `command-prompt`, `choose-*` and
+  `display-panes`, `display-menu` items) by the command parser, `run-shell`'s,
+  `if-shell`'s test and `pipe-pane`'s by the jobs' shell, the rest as said above. A
+  string template, and a value the parser reads, is read by the parser, and the quotes
+  of each reader the answer goes through decide: where the answer is outside the
+  parser's quotes, they get tmux's escape (the parser reads the answer's syntax); inside
+  them, the command the parser gives the answer to says who reads it next, as in a
+  block, and where the answer is inside that reader's quotes it gets that reader's
+  escape (another parser's, or the shells', or the refusal) encoded for the parser's
+  quotes. So `command-prompt "run-shell \"echo '%%'\""`, `command-prompt 'run-shell
+  "echo \"%%%\""'`, `run-shell "echo \"%%%\""` (the shell's double quotes written `\"`
+  in the parser's) and a command string in a command string, `if-shell true "run-shell
+  \"echo '%%'\""`, each give the shell the answer as typed (or refuse it), and an
+  answer that is outside the next reader's quotes, `rename-window "%%"`, reaches it as
+  typed. (tmux 3.8, and Unix here, escape for the first parser's quotes only: it gives
+  sh the answer's quotes unescaped in such cases, since the parser removes the backslash
+  of `'\''`.) A `bind-key` given several words binds those words as the command's own
   arguments, so each is escaped for what that command does with it (`{ bind -n F3
   run-shell "echo '%%'" }` gives the shell's escape); as in 3.8, a filled word that ends
-  with `;` (not `\;`) ends the bound command there. `%%` inside the parser's double
-  quotes (`command-prompt "run-shell \"echo '%%'\""`) and `%%%` inside its single quotes
-  are in the next shell's quotes, so they get the shell's escape (or the refusal),
-  encoded for the parser's quotes. (tmux 3.8, and Unix here, gives sh the answer's quotes
-  unescaped in those two cases, since the parser removes the backslash of `'\''`.) A value
-  that is `%%` alone and `%N` are put in as typed, as before. On both platforms, as in
-  3.8, the parser removes spaces and a comment after a newline inside its quotes, and a
-  backslash before a newline, so such an answer loses them; and a template that puts
-  `%%` outside any quotes, that is written for another shell's quoting, or that a
-  command expands as a format (`run-shell`, `if-shell`: an answer's `#()` runs), is not
-  made safe.
+  with `;` (not `\;`) ends the bound command there, and who reads the words after it is
+  decided where the filled words end the commands (an answer `x;` makes the next word a
+  command's; an error if the commands would not stay put). A value that is `%%` alone
+  and `%N` are put in as typed, as before. On both platforms, as in 3.8, the parser
+  removes spaces and a comment after a newline inside its quotes, and a backslash before
+  a newline, so such an answer loses them; and a template that puts `%%` outside any
+  quotes, that is written for another shell's quoting, or that a command expands as a
+  format (`run-shell`, `if-shell`: an answer's `#()` runs), is not made safe.
 - **The panes stay frozen for a whole prompt.** While a status prompt is open (not
   `command-prompt -C`/`-i`) or a message is shown (not `display-message -C`), pane output
   is not drawn, as in tmux 3.8 (TTY_FREEZE, status.c:386 and 605). tmux 3.8 lifts the
