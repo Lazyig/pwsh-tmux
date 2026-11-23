@@ -97,33 +97,44 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   CommandLineToArgvW gave cmd.exe `\"%%%\"`, and a command that starts with a quote
   keeps it). A pane given several words runs them as a program with its
   arguments, quoted for CommandLineToArgvW, as before.
-- **Job output on Windows is what the job printed.** The server has no console, so each
-  job (`run-shell`, `if-shell`, `#()`, `pipe-pane`, `copy-pipe`) gets a console of its
-  own, without a window, in the system's console code page (an OEM one such as 437 or
-  949, or 65001 when Windows is set to use UTF-8). PowerShell and cmd.exe write to a pipe
-  and read one in that code page, which loses what it has no character for (`é` is `e`
+- **Job output on Windows is what the job printed.** The server has no console, and a
+  console program it starts would get one in the system's console code page (an OEM one
+  such as 437 or 949, or 65001 when Windows is set to use UTF-8), in which PowerShell and
+  cmd.exe write to a pipe and read one, losing what it has no character for (`é` is `e`
   in 949, Hangul is `?` in 437), where a pane's console shows the same text whole; and
-  PowerShell reads all of its standard input before its command runs, so the command
-  cannot change how that is read. So a job is started by pwsh-tmux itself (`pwsh-tmux
-  __job`, which is the job's pid in `show-messages -J` and `#{pane_pipe_pid}`): it sets
-  its console's input and output code pages to UTF-8 (65001), then runs the shell in that
-  console with the job's command line as it would be otherwise, and exits with the
-  shell's status. Nothing is added to the command, so it behaves as written (an error
-  points into it as typed): PowerShell (5.1 and 7) starts with `[Console]::InputEncoding`
-  and `[Console]::OutputEncoding` UTF-8, so what it prints and what it reads from
-  `copy-pipe` and `pipe-pane` are UTF-8, and cmd.exe and the programs a job runs get
-  65001 as their console code page (`chcp` says 65001). What PowerShell gives a program
-  it pipes to is in `$OutputEncoding`, as in a pane: UTF-8 in PowerShell 7, ASCII in
-  Windows PowerShell 5.1 unless the profile sets it (`$OutputEncoding =
-  [Text.UTF8Encoding]::new($false)`). Ending the host's process ends the job's
-  processes too; what the job leaves running when its shell exits goes on. Each line of
-  the output that is not UTF-8 is read in the system's console code page (`GetOEMCP`),
-  as a pane's console with that code page would read a program that writes in it
-  whatever its console's code page is (a program that writes in the ANSI code page is
-  read wrongly where that differs from the OEM one). `pipe-pane -I` gives the pane the
-  job's bytes as they are. PowerShell's `‘ ’ ‚ ‛` are quotes, as in a pane: `run-shell
-  "echo '한글 ‘q’ é'"` prints `한글 ` and `q é` on two lines (`‘` ends the first quoted
-  text and `’` starts another).
+  PowerShell reads its standard input in the code page it starts with, so its command
+  cannot change how that is read. So the server makes one console for its jobs
+  (`run-shell`, `if-shell`, `#()`, `pipe-pane`, `copy-pipe`), without a window, and sets
+  its input and output code pages to UTF-8 (65001), again before each job starts. Each
+  job's shell is started in it by the server, as tmux starts a job: it is the job's
+  process (its pid is the one in `show-messages -J` and `#{pane_pipe_pid}`), its command
+  line is the job's as it is (an error points into the command as typed), and its
+  standard input, output and error are the job's (input NUL unless the job is given
+  text, errors NUL unless `run-shell -E`). PowerShell (5.1 and 7) therefore starts with
+  `[Console]::InputEncoding` and `[Console]::OutputEncoding` UTF-8, so what it prints and
+  what it reads from `copy-pipe` and `pipe-pane` are UTF-8, and cmd.exe and the programs
+  a job runs get 65001 as their console code page (`chcp` says 65001). What PowerShell
+  gives a program it pipes to is in `$OutputEncoding`, as in a pane: UTF-8 in PowerShell
+  7, ASCII in Windows PowerShell 5.1 unless the profile sets it (`$OutputEncoding =
+  [Text.UTF8Encoding]::new($false)`); so in 5.1 `run-shell "echo 'x한글é' | findstr x"`
+  prints `x???`, and `findstr 한` finds nothing in it where the system's code page has
+  Hangul (949: `'...' returned 1`, as in a pane). PowerShell 7
+  writes a failed command's error to its standard error, which `run-shell -E` shows;
+  Windows PowerShell 5.1 writes it to its output while its standard error is NUL, so
+  `run-shell` shows it without `-E`. What a job starts goes on by itself and does not
+  keep the job from ending (`run-shell -b "Start-Process notepad"`). The jobs share that
+  console: a job that changes its code page (`chcp 949`) changes it for the jobs running
+  with it until the next one starts, and a Ctrl+C or Ctrl+Break a job sends to the whole
+  console reaches the others (the server goes on). A server started with a console of its
+  own (by hand, in a terminal) leaves that console as it is and gives each job a console
+  of its own without a window, in the system's code page. Each line of the output that
+  is not UTF-8 is read in the system's console code page (`GetOEMCP`), as a pane's
+  console with that code page would read a program that writes in it whatever its
+  console's code page is (a program that writes in the ANSI code page is read wrongly
+  where that differs from the OEM one). `pipe-pane -I` gives the pane the job's bytes as
+  they are. PowerShell's `‘ ’ ‚ ‛` are quotes, as in a pane: `run-shell "echo '한글 ‘q’
+  é'"` prints `한글 ` and `q é` on two lines (`‘` ends the first quoted text and `’`
+  starts another).
 - **`default-terminal` is `xterm-256color`**, not `tmux-256color`: Windows hosts usually
   have no tmux terminfo and ConPTY programs expect xterm. Panes therefore get
   `TERM=xterm-256color`, and Home and End are sent as xterm's `\e[H`/`\e[F` (`\eOH`/`\eOF`

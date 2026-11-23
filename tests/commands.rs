@@ -1096,73 +1096,64 @@ fn windows_jobs_keep_text_and_cmd_gets_quotes() {
     assert!(shown.contains("\"%%%\"") && !shown.contains("\\\""), "{shown}");
 }
 
-/// What a job prints, read as the server reads it (UTF-8 here), run as the server runs
-/// jobs: by `pwsh-tmux __job N WORD... [RAW]` in a console of its own without a window,
-/// with `input` on its standard input.
+/// Runs a CLI command that should end, or fails the test after 60 seconds (ending it).
 #[cfg(windows)]
-fn windows_job(words: &[&str], raw: Option<&str>, input: &str) -> (Option<i32>, String) {
-    use std::os::windows::process::CommandExt;
-    let mut c = std::process::Command::new(BIN);
-    c.arg("__job").arg(words.len().to_string()).args(words).args(raw);
-    c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = c.spawn().expect("run the job");
-    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+fn ends(ctx: &Ctx, args: &[&str], what: &str) -> (Option<i32>, String) {
+    let mut child = ctx.command().args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let start = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed() > Duration::from_secs(60) {
+            let _ = child.kill();
+            panic!("{what}: {args:?} did not end");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let o = child.wait_with_output().unwrap();
     (o.status.code(), String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr))
 }
 
-/// On Windows a job's console is UTF-8 before its shell starts, so what the shell
-/// prints and reads is whole whatever the system's console code page, and nothing is
-/// added to the command (PowerShell's errors point into it as written).
+/// On Windows the server's jobs run in its console, which it makes without a window and
+/// sets to UTF-8, so what the shell prints and reads is whole whatever the system's
+/// console code page; the job is the shell itself, and what it starts goes on by itself.
 #[cfg(windows)]
 #[test]
-fn windows_job_host_runs_shells_in_utf8() {
-    // Hangul, é and a curly quote: none of them are in every console code page (é and
-    // the quotes are not in 949, Hangul is not in 437); PowerShell's ‘ ’ are its quotes
+fn windows_jobs_run_in_the_servers_utf8_console() {
     let text = "\u{d55c}\u{ae00} \u{e9} \u{201c}q\u{201d}";
     let mut shells = vec!["powershell.exe"];
     if std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("pwsh.exe").is_file())) {
         shells.push("pwsh.exe");
     }
-    // (the user's profile runs first and may print something)
     for ps in shells {
-        let run = |command: &str, input: &str| windows_job(&[ps, "-NoLogo", "-Command", command], None, input);
-        let (code, out) = run(&format!("echo '{text}'"), "");
-        assert_eq!(code, Some(0));
-        assert!(out.ends_with(&format!("\n{text}\r\n")) || out == format!("{text}\r\n"), "{ps}: {out:?}");
-        // what it reads (copy-pipe, pipe-pane)
-        let (_, out) = run("$input | ForEach-Object { 'got ' + $_ }", &format!("{text}\n"));
-        assert!(out.contains(&format!("got {text}")), "{ps}, its input: {out:?}");
-        // the console code page its programs get
-        let (_, out) = run("chcp", "");
-        assert!(out.contains("65001"), "{ps}: {out:?}");
-        // a command that must come first still can
-        let (_, out) = run("using namespace System.Text; [UTF8Encoding]::new($false).GetType().Name", "");
-        assert!(out.trim_end().ends_with("UTF8Encoding"), "{ps}: {out:?}");
-        // an error shows the command as written, at its own line and column
-        let (code, out) = run("Get-PwshTmuxNoSuchCommand", "");
-        assert_eq!(code, Some(1), "{ps}: {out:?}");
-        assert!(out.contains("Get-PwshTmuxNoSuchCommand") && !out.contains("Encoding"), "{ps}: {out:?}");
-        // the exit status is the shell's
-        assert_eq!(run("exit 7", "").0, Some(7));
-    }
-    // cmd.exe: quotes as written, no backslashes added; its own output in UTF-8
-    let cmd = |command: &str| windows_job(&["cmd.exe"], Some(&format!("/s /c \"{command}\"")), "");
-    assert_eq!(cmd("echo \"%%%\" & echo \"a b\"").1.replace(' ', ""), "\"%%%\"\r\n\"ab\"\r\n");
-    assert_eq!(cmd(&format!("echo {text}")).1, format!("{text}\r\n"));
-    assert_eq!(cmd("\"cmd.exe\" /c echo \"x\"").1, "\"x\"\r\n");
-    assert_eq!(cmd("exit /b 3").0, Some(3));
-    // a shell that cannot be started is reported on its output with status 127
-    let (code, out) = windows_job(&["pwsh-tmux-no-such-shell.exe", "-c", "x"], None, "");
-    assert_eq!(code, Some(127));
-    assert!(!out.trim().is_empty(), "{out:?}");
-    // Git Bash, when it is installed
-    let bash = std::path::Path::new("C:\\Program Files\\Git\\bin\\bash.exe");
-    if bash.is_file() {
-        let bash = bash.to_string_lossy();
-        assert_eq!(windows_job(&[&bash, "-c", &format!("echo '{text}' \"%%%\" \\\"")], None, "").1, format!("{text} %%% \"\n"));
-        assert_eq!(windows_job(&[&bash, "-c", "cat"], None, &format!("{text}\n")).1, format!("{text}\n"));
+        let ctx = Ctx::new("winjobs");
+        // the server this starts runs its jobs with PWSH_TMUX_SHELL
+        let out = ctx.command().env("PWSH_TMUX_SHELL", ps).args(["new-session", "-d", "-s", "w"]).output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let out = ctx.ok(&["run-shell", &format!("echo '{text}'")]);
+        assert!(out.trim_end().ends_with(text), "{ps}: {out:?}");
+        assert!(ctx.ok(&["run-shell", "chcp"]).contains("65001"), "{ps}");
+        // #() in a format, with its own job
+        wait_for("#() output", || ctx.fmt("w", &format!("#(echo '{text}')")) == text);
+        // run-shell -E shows PowerShell's error
+        let (code, shown) = ends(&ctx, &["run-shell", "-E", "Get-PwshTmuxNoSuchCommand"], ps);
+        assert_eq!(code, Some(1), "{ps}: {shown}");
+        assert!(shown.contains("Get-PwshTmuxNoSuchCommand") && shown.contains("returned 1"), "{ps}: {shown}");
+        // what Start-Process starts neither holds the job nor ends with it
+        let file = std::env::temp_dir().join(format!("pwsh-tmux-it-started-{}-{ps}", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let command = format!(
+            "Start-Process -WindowStyle Hidden -FilePath $env:ComSpec -ArgumentList '/d /c ping -n 3 127.0.0.1 >nul & echo done>\"{}\"'; 'started'",
+            file.display()
+        );
+        let (code, out) = ends(&ctx, &["run-shell", &command], "run-shell Start-Process");
+        assert!(code == Some(0) && out.contains("started"), "{ps}: {out}");
+        wait_for("what Start-Process started", || file.exists());
+        let _ = std::fs::remove_file(&file);
+        // a pipe-pane job is its shell (#{pane_pipe_pid})
+        ctx.ok(&["pipe-pane", "-t", "w", "-O", "$input | Out-Null"]);
+        let pid = ctx.fmt("w", "#{pane_pipe_pid}");
+        let name = ctx.ok(&["run-shell", &format!("(Get-Process -Id {pid}).ProcessName")]);
+        assert!(name.trim_end().eq_ignore_ascii_case(ps.trim_end_matches(".exe")), "{ps}: {pid} is {name:?}");
+        ctx.ok(&["pipe-pane", "-t", "w"]);
     }
 }
 

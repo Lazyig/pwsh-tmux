@@ -189,29 +189,23 @@ pub fn shell_command(command: &str) -> std::process::Command {
 }
 
 /// Shell used for run-shell / if-shell / #() / pipe-pane / copy-pipe jobs, whose output
-/// the server reads or whose input it writes. On Windows the server has no console, so a
-/// job gets a console of its own (without a window), with the system's console code page
-/// (an OEM one such as 437 or 949, unless UTF-8 is set for the system): PowerShell and
-/// cmd.exe write to a pipe and read one in that code page, which loses what it has no
-/// character for (`é` is `e` in 949). PowerShell reads all of its standard input before
-/// it runs its command, so nothing the command does can change that. So the job is
-/// started by pwsh-tmux itself ([`JOB_HOST`]), which sets the console it gets to UTF-8
-/// and then runs the shell in it, as the shell would be run otherwise; and what is not
-/// UTF-8 is read in the console code page ([`job_text`]).
+/// the server reads or whose input it writes. On Windows the server has no console, and
+/// a console program it starts gets one in the system's console code page (an OEM one
+/// such as 437 or 949, unless UTF-8 is set for the system), in which PowerShell and
+/// cmd.exe write to a pipe and read one, losing what it has no character for (`é` is `e`
+/// in 949); PowerShell reads its standard input in the code page it starts with, so
+/// nothing its command does can change that. So the server makes one console without a
+/// window for its jobs, in UTF-8 ([`win::jobs_console`]), and each job's shell is started
+/// in it as the server's own child, with the standard input, output and error the caller
+/// gives it and its command as it is. Without that console a job gets one of its own,
+/// without a window, in the system's code page. What is not UTF-8 is read in the system's
+/// console code page ([`job_text`]).
 pub fn job_command(command: &str) -> std::process::Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        let run = via_shell(&default_shell(), command);
-        let mut c = match std::env::current_exe() {
-            Ok(exe) => {
-                let mut c = std::process::Command::new(exe);
-                c.arg(JOB_HOST).args(job_host_args(&run));
-                c
-            }
-            Err(_) => run.command(),
-        };
-        c.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+        let mut c = via_shell(&default_shell(), command).command();
+        c.creation_flags(job_creation_flags(win::jobs_console()));
         c
     }
     #[cfg(unix)]
@@ -220,67 +214,38 @@ pub fn job_command(command: &str) -> std::process::Command {
     }
 }
 
-/// `pwsh-tmux __job N WORD... [RAW]` runs the job of [`job_command`]: the N words of a
-/// [`ShellCommand`] (N at least 1), then its raw rest when there is one ([`job_host_args`]).
+/// Windows' CREATE_NO_WINDOW: a console program gets a console of its own, without a
+/// window.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub const JOB_HOST: &str = "__job";
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// The arguments after [`JOB_HOST`] for running `run`. Each is a word of pwsh-tmux's own
-/// command line, quoted for CommandLineToArgvW, so it reads them back as they are.
+/// The process creation flags of a job on Windows: none in the jobs' console, which the
+/// job then shares with the server, else CREATE_NO_WINDOW, so that no console window
+/// shows either way. (Not DETACHED_PROCESS, which would start the shell without a console
+/// and give each console program it runs one with a window; not CREATE_NEW_CONSOLE,
+/// whose console has a window.)
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn job_host_args(run: &ShellCommand) -> Vec<String> {
-    let mut v = Vec::with_capacity(run.argv.len() + 2);
-    v.push(run.argv.len().to_string());
-    v.extend(run.argv.iter().cloned());
-    v.extend(run.raw.iter().cloned());
-    v
+pub fn job_creation_flags(in_jobs_console: bool) -> u32 {
+    if in_jobs_console { 0 } else { CREATE_NO_WINDOW }
 }
 
-/// The [`ShellCommand`] of [`job_host_args`], or None for anything else.
+/// Makes up to `tries` attempts, `pause` apart, until one succeeds; stops early when
+/// `gone` says there is nothing left to wait for. Whether an attempt succeeded.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn parse_job_host_args(args: &[String]) -> Option<ShellCommand> {
-    let (n, rest) = args.split_first()?;
-    let n: usize = n.parse().ok().filter(|&n| n >= 1 && n <= rest.len())?;
-    match &rest[n..] {
-        [] => Some(ShellCommand { argv: rest[..n].to_vec(), raw: None }),
-        [raw] => Some(ShellCommand { argv: rest[..n].to_vec(), raw: Some(raw.clone()) }),
-        _ => None,
-    }
-}
-
-/// pwsh-tmux as a job's host ([`JOB_HOST`]): its console's input and output code pages
-/// are set to UTF-8 (65001), then `run` is started in that console with this process's
-/// standard input, output and error, and its exit status is returned. The shell and
-/// what it runs therefore start with UTF-8 as their console code page: PowerShell's
-/// [Console]::InputEncoding and OutputEncoding are UTF-8 from the start, cmd.exe and
-/// the programs they run write UTF-8, and the command itself is run as it is. A shell
-/// that cannot be started is reported on standard output with status 127, as the server
-/// reported it before. The host and the job are in a job object that ends them all
-/// should the host be ended (its pid is the job's), and that lets what is still running
-/// when the shell exits go on.
-#[cfg(windows)]
-pub fn host_job(run: &ShellCommand) -> i32 {
-    use windows_sys::Win32::Globalization::CP_UTF8;
-    use windows_sys::Win32::System::Console::{SetConsoleCP, SetConsoleOutputCP};
-    unsafe {
-        SetConsoleCP(CP_UTF8);
-        SetConsoleOutputCP(CP_UTF8);
-    }
-    let job = win::JobObject::kill_on_close();
-    let status = run.command().status();
-    if let Some(job) = job {
-        job.let_go();
-    }
-    match status {
-        Ok(s) => s.code().unwrap_or(1),
-        Err(e) => {
-            use std::io::Write;
-            let mut out = std::io::stdout();
-            let _ = writeln!(out, "{e}");
-            let _ = out.flush();
-            127
+pub fn retry(tries: u32, pause: std::time::Duration, mut attempt: impl FnMut() -> bool, mut gone: impl FnMut() -> bool) -> bool {
+    for n in 0..tries {
+        if attempt() {
+            return true;
+        }
+        if gone() {
+            // one more try: what was waited for may have come just before it went
+            return attempt();
+        }
+        if n + 1 < tries {
+            std::thread::sleep(pause);
         }
     }
+    false
 }
 
 /// What a job printed, as text: on Unix the bytes as UTF-8, as tmux shows them. On
@@ -393,7 +358,8 @@ pub mod win {
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
     };
 
-    fn processes() -> Vec<(u32, u32, String)> {
+    /// (pid, parent pid, executable name) of every process.
+    pub(crate) fn processes() -> Vec<(u32, u32, String)> {
         let mut out = Vec::new();
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -429,47 +395,65 @@ pub mod win {
         (n > 0).then(|| String::from_utf16_lossy(&wide[..n as usize]))
     }
 
-    /// A job object this process is in, which ends every process in it when its handle
-    /// is closed (when this process ends), until [`JobObject::let_go`]. Processes in it
-    /// may still start others outside it (CREATE_BREAKAWAY_FROM_JOB).
-    pub struct JobObject(windows_sys::Win32::Foundation::HANDLE);
-
-    impl JobObject {
-        /// None when it cannot be made or this process cannot be put in it.
-        pub fn kill_on_close() -> Option<JobObject> {
-            use windows_sys::Win32::System::JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            };
-            use windows_sys::Win32::System::Threading::GetCurrentProcess;
-            unsafe {
-                let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-                if h.is_null() {
-                    return None;
-                }
-                let job = JobObject(h);
-                (job.limit(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK) && AssignProcessToJobObject(h, GetCurrentProcess()) != 0).then_some(job)
-            }
-        }
-
-        fn limit(&self, flags: u32) -> bool {
-            use windows_sys::Win32::System::JobObjects::{JobObjectExtendedLimitInformation, SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION};
-            unsafe {
-                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-                info.BasicLimitInformation.LimitFlags = flags;
-                SetInformationJobObject(self.0, JobObjectExtendedLimitInformation, (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(), std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32) != 0
-            }
-        }
-
-        /// Lets the processes in it go on when this process ends.
-        pub fn let_go(self) {
-            self.limit(windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_BREAKAWAY_OK);
-        }
+    /// Whether this process is in the console it made for jobs ([`super::job_command`]),
+    /// making it the first time: a console without a window, whose input and output
+    /// code pages are set to UTF-8 (65001) each time this is asked, as a job may have
+    /// changed them (they are the console's, which the jobs share). Only a process that
+    /// has no console makes one: the server, which the client starts with
+    /// DETACHED_PROCESS. One that has a console (a test run in a terminal, a server
+    /// started by hand) leaves it as it is, and its jobs get consoles of their own.
+    /// False too when the console can no longer be used, so that jobs still get a
+    /// console without a window.
+    pub fn jobs_console() -> bool {
+        use windows_sys::Win32::Globalization::CP_UTF8;
+        use windows_sys::Win32::System::Console::{SetConsoleCP, SetConsoleOutputCP};
+        static MADE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *MADE.get_or_init(make_jobs_console) && unsafe { SetConsoleCP(CP_UTF8) != 0 && SetConsoleOutputCP(CP_UTF8) != 0 }
     }
 
-    impl Drop for JobObject {
-        fn drop(&mut self) {
-            unsafe { CloseHandle(self.0) };
+    /// A console without a window for this process, which has none. AllocConsole would
+    /// show a window (or open a terminal, where one is the default), so a console program
+    /// is started with CREATE_NO_WINDOW, which gives it a console without one, and this
+    /// process attaches to that console, which stays while a process is in it. The program
+    /// is cmd.exe's `pause`, which waits on its standard input (a pipe) and is ended once
+    /// this process is attached; its console is made as it starts, after it is created,
+    /// so attaching is retried (for up to five seconds).
+    fn make_jobs_console() -> bool {
+        use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+        use windows_sys::Win32::System::Console::{AttachConsole, GetConsoleCP, SetConsoleCtrlHandler};
+        if unsafe { GetConsoleCP() } != 0 {
+            return false;
         }
+        // the system's cmd.exe (ComSpec may name another shell)
+        let cmd = std::env::var_os("SystemRoot").map(|r| std::path::Path::new(&r).join("System32").join("cmd.exe")).filter(|p| p.is_file());
+        let mut c = std::process::Command::new(cmd.unwrap_or_else(|| "cmd.exe".into()));
+        c.args(["/d", "/c", "pause"]).creation_flags(super::CREATE_NO_WINDOW);
+        c.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+        let Ok(mut helper) = c.spawn() else { return false };
+        let pid = helper.id();
+        let stdin = helper.stdin.take();
+        let attached = super::retry(
+            500,
+            std::time::Duration::from_millis(10),
+            || unsafe { AttachConsole(pid) } != 0,
+            || helper.try_wait().map_or(true, |s| s.is_some()),
+        );
+        drop(stdin);
+        let _ = helper.kill();
+        let _ = helper.wait();
+        if attached {
+            unsafe { SetConsoleCtrlHandler(Some(goes_on), 1) };
+        }
+        attached
+    }
+
+    /// The jobs' console handler: Ctrl+C and Ctrl+Break that a job sends to all of its
+    /// console (GenerateConsoleCtrlEvent with group 0) reach this process too, which goes
+    /// on. (Not SetConsoleCtrlHandler(NULL, TRUE), which the panes would inherit.)
+    unsafe extern "system" fn goes_on(kind: u32) -> windows_sys::core::BOOL {
+        use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+        (kind == CTRL_C_EVENT || kind == CTRL_BREAK_EVENT) as windows_sys::core::BOOL
     }
 
     /// Pids of direct children of `parent` with the given executable name.
@@ -667,22 +651,263 @@ mod shell_tests {
     }
 
     #[test]
-    fn a_job_host_reads_back_the_command_it_is_given() {
-        let commands = [
-            via_shell_on("powershell.exe", "echo '\u{d55c}' \"a b\" \\\"", true),
-            via_shell_on("cmd.exe", "echo \"%%%\" & pause", true),
-            via_shell_on("C:\\Program Files\\Git\\bin\\bash.exe", "", true),
-            ShellCommand { argv: vec!["3".into()], raw: Some("1".into()) },
-            ShellCommand::words(vec!["x".into(), "".into(), "2".into()]),
-        ];
-        for run in commands {
-            let args = job_host_args(&run);
-            assert_eq!(args[0], run.argv.len().to_string());
-            assert_eq!(parse_job_host_args(&args), Some(run));
+    fn jobs_never_get_a_console_window() {
+        // in the jobs' console a job shares it; else it gets one of its own without a window
+        assert_eq!(job_creation_flags(true), 0);
+        assert_eq!(job_creation_flags(false), CREATE_NO_WINDOW);
+        assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
+        #[cfg(windows)]
+        assert_eq!(CREATE_NO_WINDOW, windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
+
+    #[test]
+    fn retry_stops_at_success_or_when_nothing_is_left_to_wait_for() {
+        let pause = std::time::Duration::from_millis(1);
+        // succeeds on the third attempt
+        let mut n = 0;
+        assert!(retry(5, pause, || { n += 1; n == 3 }, || false));
+        assert_eq!(n, 3);
+        // never: every attempt is made
+        let mut n = 0;
+        assert!(!retry(4, pause, || { n += 1; false }, || false));
+        assert_eq!(n, 4);
+        // gone after the second attempt: one more try, then no more
+        let (mut n, mut checks) = (0, 0);
+        assert!(!retry(100, pause, || { n += 1; false }, || { checks += 1; checks == 2 }));
+        assert_eq!(n, 3);
+        // what was waited for came just before it went
+        let mut n = 0;
+        assert!(retry(100, pause, || { n += 1; n == 2 }, || true));
+        assert_eq!(n, 2);
+        assert!(!retry(0, pause, || true, || false));
+    }
+
+    /// Runs `command` as the server runs a job: standard input NUL (or a pipe given
+    /// `input`), output a pipe, errors NUL (a pipe with `stderr`, as for run-shell -E). Its
+    /// exit status and output, read as the server reads it; None when it has not ended
+    /// within 30 seconds (it is then ended).
+    #[cfg(windows)]
+    fn job(command: &str, input: Option<&str>, stderr: bool) -> Option<(Option<i32>, String)> {
+        use std::io::{Read, Write};
+        use std::process::Stdio;
+        let mut c = job_command(command);
+        c.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() });
+        c.stdout(Stdio::piped()).stderr(if stderr { Stdio::piped() } else { Stdio::null() });
+        let mut child = c.spawn().expect("start the job");
+        if let (Some(text), Some(mut si)) = (input, child.stdin.take()) {
+            si.write_all(text.as_bytes()).unwrap();
         }
-        // anything else is refused
-        for bad in [&[][..], &["0".to_string()][..], &["2".into(), "a".into()][..], &["1".into(), "a".into(), "b".into(), "c".into()][..], &["x".into(), "a".into()][..]] {
-            assert_eq!(parse_job_host_args(bad), None, "{bad:?}");
+        let read = |r: Option<Box<dyn Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut v = Vec::new();
+                if let Some(mut r) = r {
+                    let _ = r.read_to_end(&mut v);
+                }
+                v
+            })
+        };
+        let out = read(child.stdout.take().map(|o| Box::new(o) as Box<dyn Read + Send>));
+        let err = read(child.stderr.take().map(|e| Box::new(e) as Box<dyn Read + Send>));
+        let start = std::time::Instant::now();
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            if start.elapsed() > std::time::Duration::from_secs(30) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let mut bytes = out.join().unwrap();
+        bytes.extend(err.join().unwrap());
+        Some((status.code(), job_text(&bytes)))
+    }
+
+    /// The executable name of a job's process while it runs: the shell's, not pwsh-tmux's.
+    #[cfg(windows)]
+    fn job_process_name() -> Option<String> {
+        use std::process::Stdio;
+        let mut c = job_command("Start-Sleep 10");
+        let mut child = c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("start the job");
+        let name = win::processes().into_iter().find(|p| p.0 == child.id()).map(|p| p.2);
+        let _ = child.kill();
+        let _ = child.wait();
+        name
+    }
+
+    /// Sets [`detached_job_checks`]'s case.
+    #[cfg(windows)]
+    const DETACHED_CASE: &str = "PWSH_TMUX_TEST_DETACHED_CASE";
+
+    /// Runs `case` of [`detached_job_checks`] with `shell` as the jobs' shell in a copy of
+    /// this test binary started as the client starts the server, with DETACHED_PROCESS,
+    /// so without a console: it makes the jobs' console, as the server does.
+    #[cfg(windows)]
+    fn detached(case: &str, shell: &str) {
+        use std::os::windows::process::CommandExt;
+        let path = module_path!().split_once("::").map_or(module_path!(), |(_, rest)| rest);
+        let name = format!("{path}::detached_job_checks");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+            .env(DETACHED_CASE, case)
+            .env("PWSH_TMUX_SHELL", shell)
+            .creation_flags(windows_sys::Win32::System::Threading::DETACHED_PROCESS)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run this test binary without a console");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success() && text.contains(" 1 passed"), "{case} with {shell}:\n{text}");
+    }
+
+    /// The PowerShells installed: Windows PowerShell, and PowerShell 7 when it is there.
+    #[cfg(windows)]
+    fn powershells() -> Vec<&'static str> {
+        let mut v = vec!["powershell.exe"];
+        if which("pwsh.exe").is_some() {
+            v.push("pwsh.exe");
+        }
+        v
+    }
+
+    /// The checks [`detached`] runs, each in a process without a console (run by itself,
+    /// without a case, it checks nothing).
+    #[cfg(windows)]
+    #[test]
+    fn detached_job_checks() {
+        use windows_sys::Win32::System::Console::{GetConsoleCP, GetConsoleOutputCP};
+        let Ok(case) = std::env::var(DETACHED_CASE) else { return };
+        assert_eq!(unsafe { GetConsoleCP() }, 0, "started without a console");
+        assert!(win::jobs_console(), "the jobs' console is made");
+        assert_eq!(unsafe { (GetConsoleCP(), GetConsoleOutputCP()) }, (65001, 65001));
+        let shell = default_shell();
+        let pwsh7 = program_name(&shell).eq_ignore_ascii_case("pwsh");
+        // Hangul, é and curly double quotes: none of them are in every console code page
+        // (é and the quotes are not in 949, Hangul is not in 437)
+        let text = "\u{d55c}\u{ae00} \u{e9} \u{201c}q\u{201d}";
+        let run = |command: &str| job(command, None, false).unwrap_or_else(|| panic!("{shell}: {command:?} did not end"));
+        match case.as_str() {
+            "utf8" => {
+                // (the user's profile runs first and may print something)
+                let (code, out) = run(&format!("echo '{text}'"));
+                assert_eq!(code, Some(0));
+                assert!(out.ends_with(&format!("{text}\r\n")), "{shell}: {out:?}");
+                // the console code page it and its programs start with
+                assert!(run("chcp").1.contains("65001"), "{shell}");
+                let out = run("[Console]::InputEncoding.CodePage; [Console]::OutputEncoding.CodePage").1;
+                assert!(out.ends_with("65001\r\n65001\r\n"), "{shell}: {out:?}");
+                // (PowerShell's “ ” are quotes: a program it runs is given Hangul and é)
+                let words = "\u{d55c}\u{ae00}\u{e9}";
+                assert!(run(&format!("cmd.exe /d /c echo {words}")).1.ends_with(&format!("{words}\r\n")), "{shell}: a program it runs");
+                // what it reads (copy-pipe, pipe-pane)
+                let (_, out) = job("$input | ForEach-Object { 'got ' + $_ }", Some(&format!("{text}\n")), false).expect("ends");
+                assert!(out.contains(&format!("got {text}")), "{shell}, its input: {out:?}");
+                // the command as written: a command that must come first still can
+                let out = run("using namespace System.Text; [UTF8Encoding]::new($false).GetType().Name").1;
+                assert!(out.trim_end().ends_with("UTF8Encoding"), "{shell}: {out:?}");
+                assert_eq!(run("exit 7").0, Some(7));
+            }
+            "cmd" => {
+                assert_eq!(run(&format!("echo {text}")).1, format!("{text}\r\n"));
+                assert_eq!(run("echo \"%%%\" & echo \"a b\"").1.replace(' ', ""), "\"%%%\"\r\n\"ab\"\r\n");
+                assert!(run("chcp").1.contains("65001"));
+                assert_eq!(run("exit /b 3").0, Some(3));
+            }
+            // a): the job's process is the shell, started by the server itself
+            "pid" => {
+                let name = job_process_name();
+                let want = std::path::Path::new(&shell).file_name().unwrap().to_string_lossy().into_owned();
+                assert!(name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&want)), "{name:?}, not {want}");
+                assert_eq!(run("echo SECURITY_PROOF").1.trim_end().lines().last(), Some("SECURITY_PROOF"));
+            }
+            // b): what a job starts neither keeps its shell from ending nor ends with it
+            "start" => {
+                let file = std::env::temp_dir().join(format!("pwsh-tmux-started-{}-{}", std::process::id(), program_name(&shell)));
+                let _ = std::fs::remove_file(&file);
+                let command = format!(
+                    "Start-Process -WindowStyle Hidden -FilePath $env:ComSpec -ArgumentList '/d /c ping -n 3 127.0.0.1 >nul & echo done>\"{}\"'; 'started'",
+                    file.display()
+                );
+                let (code, out) = job(&command, None, false).unwrap_or_else(|| panic!("{shell}: the shell did not end after Start-Process"));
+                assert_eq!(code, Some(0), "{shell}: {out:?}");
+                assert!(out.contains("started"), "{shell}: {out:?}");
+                let start = std::time::Instant::now();
+                while !file.exists() && start.elapsed() < std::time::Duration::from_secs(20) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                assert!(file.exists(), "{shell}: what Start-Process started went on after the shell ended");
+                let _ = std::fs::remove_file(&file);
+            }
+            // c): a failed command's error, with run-shell -E and (Windows PowerShell 5.1,
+            // which writes it to the output when its error output is NUL) without
+            "error" => {
+                let (code, shown) = job("Get-PwshTmuxNoSuchCommand", None, true).expect("ends");
+                assert_eq!(code, Some(1), "{shell}: {shown:?}");
+                assert!(shown.contains("Get-PwshTmuxNoSuchCommand"), "{shell}, -E: {shown:?}");
+                let (code, out) = run("Get-PwshTmuxNoSuchCommand");
+                assert_eq!(code, Some(1), "{shell}: {out:?}");
+                if !pwsh7 {
+                    assert!(out.contains("Get-PwshTmuxNoSuchCommand"), "{shell} without -E, as before 7b49b23: {out:?}");
+                }
+            }
+            // d): a program the shell pipes to gets $OutputEncoding (ASCII in Windows
+            // PowerShell 5.1, as in a pane; UTF-8 in 7), and reads NUL as the job's input
+            "findstr" => {
+                let (code, out) = run(&format!("echo 'x{text}' | findstr x"));
+                assert_eq!(code, Some(0), "{shell}: {out:?}");
+                let want = if pwsh7 { format!("x{text}") } else { "x??".to_string() };
+                assert!(out.contains(&want), "{shell}: {out:?}");
+                let (code, out) = run("findstr x");
+                assert_eq!(code, Some(1), "{shell}: findstr on the job's input (NUL): {out:?}");
+            }
+            other => panic!("no case {other}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_jobs_print_and_read_utf8_in_the_jobs_console() {
+        for ps in powershells() {
+            detached("utf8", ps);
+        }
+        detached("cmd", "cmd.exe");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_job_is_its_shell() {
+        // here, in a test run's console (left as it is), and as the server runs jobs
+        let shell = default_shell();
+        let want = std::path::Path::new(&shell).file_name().unwrap().to_string_lossy().into_owned();
+        let name = job_process_name();
+        assert!(name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&want)), "{name:?}, not {want}");
+        for ps in powershells() {
+            detached("pid", ps);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_what_a_job_starts_goes_on_without_holding_it() {
+        for ps in powershells() {
+            detached("start", ps);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_failed_powershell_command_shows_its_error() {
+        for ps in powershells() {
+            detached("error", ps);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_programs_a_job_pipes_to_get_its_output_encoding() {
+        for ps in powershells() {
+            detached("findstr", ps);
         }
     }
 

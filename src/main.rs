@@ -73,12 +73,6 @@ pub mod rawarg {
 
 fn main() {
     let mut args: Vec<String> = std::env::args_os().skip(1).map(rawarg::from_os).collect();
-    // a server job's host: its console set to UTF-8, then the job's shell in it
-    #[cfg(windows)]
-    if args.first().map(String::as_str) == Some(server::procinfo::JOB_HOST) {
-        let code = server::procinfo::parse_job_host_args(&args[1..]).map_or(127, |run| server::procinfo::host_job(&run));
-        std::process::exit(code);
-    }
     if args.first().map(String::as_str) == Some("__server") {
         // __server [-c CWD] [CONFIG]: CWD is the starting client's directory
         let mut rest = args[1..].to_vec();
