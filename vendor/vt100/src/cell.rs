@@ -71,6 +71,26 @@ impl Cell {
         usize::from(self.len & LEN_BITS)
     }
 
+    /// A hash of everything `eq` compares, for looking cells up in a row's palette.
+    pub(crate) fn palette_hash(&self) -> u32 {
+        const PRIME: u32 = 0x0100_0193;
+        let color = |c: crate::Color| match c {
+            crate::Color::Default => 0,
+            crate::Color::Idx(i) => 0x100 | u32::from(i),
+            crate::Color::Palette(i) => 0x200 | u32::from(i),
+            crate::Color::Rgb(r, g, b) => 0x0400_0000 | u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b),
+        };
+        let mut h = 0x811c_9dc5 ^ u32::from(self.len);
+        for &b in &self.contents[..self.len()] {
+            h = (h ^ u32::from(b)).wrapping_mul(PRIME);
+        }
+        let a = self.attrs;
+        for v in [color(a.fgcolor), color(a.bgcolor), color(a.ulcolor), u32::from(a.mode)] {
+            h = (h ^ v).wrapping_mul(PRIME);
+        }
+        h ^ (h >> 16) ^ (h >> 8)
+    }
+
     pub(crate) fn set(&mut self, c: char, a: crate::attrs::Attrs) {
         self.len = 0;
         self.append_char(0, c);

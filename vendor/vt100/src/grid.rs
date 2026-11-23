@@ -225,6 +225,14 @@ impl Grid {
         for (index, mut old) in source.enumerate() {
             let wrapped = old.wrapped();
             if !wrapped { old.trim(); }
+            // grid_reflow_move: a whole line that fits, with nothing the loop below would
+            // change (cursor, tabs, links, unpaired wide cells), is the row it would build
+            if !wrapped && col == 0 && used == 0 && old.cols() <= cols && index != cursor_row && index != saved_row
+                && !old.has_metadata() && old.wide_pairs_ok() && !slow_reflow() {
+                emit(old, &mut out, &mut produced);
+                (line_row, split) = (index + 1, false);
+                continue;
+            }
             let end = if wrapped { old.used_len() } else { old.cols() };
             // rewrapped rows keep the time their line entered the history
             if col == 0 && used == 0 { row.set_time(old.time()); row.set_flags(old.flags()); }
@@ -298,8 +306,11 @@ impl Grid {
         let discarded = produced - out.len();
         let new_history = out.len() - usize::from(size.rows());
         self.rows = out.drain(new_history..).collect();
+        // rows moved as they were are no wider than the screen, and are trimmed
+        for row in &mut self.rows { row.widen_sparse(cols); }
         history.rows = out;
-        for row in &mut history.rows { row.compact(); }
+        // like rows that scroll into the history; a wrapped row keeps its width
+        for row in &mut history.rows { if !row.wrapped() { row.trim(); } row.compact(); }
         history.unbounded_len = old_scrolled.min(new_history);
         history.offset = 0;
         self.pos.row = cursor.0.saturating_sub(discarded + new_history).min(usize::from(size.rows()-1)) as u16;
@@ -1033,10 +1044,12 @@ impl Grid {
 
             scrollback.rows.extend(
                 between[num_reset..num_removed].iter_mut().map(|row| {
-                    row.trim();
-                    row.compact();
+                    // trim and compact; the new row writes into the storage the cells left
+                    let storage = row.trim_compact_take();
                     if stamp { row.set_time(now); }
-                    core::mem::replace(row, new_row())
+                    let mut new = new_row();
+                    if let Some(storage) = storage { new.give_storage(storage); }
+                    core::mem::replace(row, new)
                 }),
             );
 
@@ -1265,4 +1278,131 @@ impl Size {
 pub struct Pos {
     pub row: u16,
     pub col: u16,
+}
+
+/// Whether reflow leaves out its fast path (for tests that compare the two paths).
+#[cfg(test)]
+fn slow_reflow() -> bool {
+    SLOW_REFLOW.with(core::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn slow_reflow() -> bool {
+    false
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static SLOW_REFLOW: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+mod reflow_tests {
+    use alloc::{format, string::String, vec::Vec};
+    use core::num::NonZeroU16;
+
+    type RowState = (Vec<Option<crate::Cell>>, bool, u8, u64, u16, Vec<(u16, u16, Option<String>)>);
+
+    fn state(p: &crate::Parser) -> (Vec<RowState>, (u16, u16), super::Pos, usize) {
+        let s = p.screen();
+        let cols = s.size().1.get();
+        let rows = (0..s.history_rows_len()).map(|i| {
+            let r = s.history_row(i).unwrap();
+            let cells = (0..=cols).map(|c| r.cell(c).cloned()).collect();
+            let meta = r.metadata().map(|(x, m)| (x, m.tab_width, m.hyperlink.as_ref().map(|h| h.uri.clone()))).collect();
+            (cells, r.wrapped(), r.flags(), r.time(), r.used_len(), meta)
+        });
+        (rows.collect(), s.cursor_position(), s.grid().saved_pos, s.history_rows_len())
+    }
+
+    fn set_size(p: &mut crate::Parser, rows: u16, cols: u16, slow: bool) {
+        super::SLOW_REFLOW.with(|s| s.set(slow));
+        p.set_size(NonZeroU16::new(rows).unwrap(), NonZeroU16::new(cols).unwrap());
+        super::SLOW_REFLOW.with(|s| s.set(false));
+    }
+
+    /// Lines moved whole by the reflow fast path come out as the general path builds
+    /// them: cells, wrap, flags, time, used length, links and tabs, cursor and history.
+    #[test]
+    fn reflow_fast_path_matches_the_general_path() {
+        let mut input = Vec::new();
+        for i in 0..400u32 {
+            match i % 10 {
+                0 => input.extend_from_slice(format!("{i}\r\n").as_bytes()),
+                1 => input.extend_from_slice(format!("\x1b[3{}m{}\x1b[0m\r\n", i % 8, "x".repeat((i % 150) as usize)).as_bytes()),
+                2 => input.extend_from_slice("한글 wide 中文字符 ".repeat((i % 13) as usize).as_bytes()),
+                3 => input.extend_from_slice(b"a\tb\tc\r\n"),
+                4 => input.extend_from_slice(b"\x1b]8;;http://x\x07link\x1b]8;;\x07 tail\r\n"),
+                5 => input.extend_from_slice(b"\x1b[41m  \x1b[0m\r\n"),
+                6 => input.extend_from_slice(format!("{}\r\n", "y".repeat(79 + (i % 3) as usize)).as_bytes()),
+                7 => input.extend_from_slice("e\u{301}\u{2764}\u{fe0f} \u{1f469}\u{200d}\u{1f4bb}\r\n".as_bytes()),
+                8 => input.extend_from_slice(format!("\x1b]133;A\x07{}\x1b[38;2;1;2;3m\u{4e2d}\x1b[m\r\n", "z".repeat((i % 7) as usize)).as_bytes()),
+                _ => input.extend_from_slice(b"\x1b[5;7Hmid\x1b[24;1H\r\n"),
+            }
+        }
+        input.extend_from_slice(b"\x1b7\x1b[3;5H\x1b8partial\x1b[20;1H\x1b7\x1b[22;1H");
+        let sizes = [(24u16, 80u16), (60, 200), (24, 80), (10, 33), (24, 120), (5, 1), (24, 80), (40, 79), (24, 81), (24, 2), (30, 80)];
+        for hist in [0usize, 100, 5000] {
+            let new = || crate::Parser::new(NonZeroU16::new(24).unwrap(), NonZeroU16::new(80).unwrap(), hist);
+            let (mut fast, mut slow) = (new(), new());
+            fast.screen_mut().set_time(7);
+            slow.screen_mut().set_time(7);
+            fast.process(&input);
+            slow.process(&input);
+            for (rows, cols) in sizes {
+                set_size(&mut fast, rows, cols, false);
+                set_size(&mut slow, rows, cols, true);
+                assert!(state(&fast) == state(&slow), "history {hist} size {rows}x{cols}");
+                let more = "more 中\r\n\x1b[2;3Hx\x1b[3;1H\x1b7\x1b[4;1H".as_bytes();
+                fast.process(more);
+                slow.process(more);
+                assert!(state(&fast) == state(&slow), "history {hist} size {rows}x{cols} after output");
+            }
+        }
+    }
+
+    /// The fast path leaves rows with links, tabs, the cursor or unpaired wide cells to
+    /// the general path.
+    #[test]
+    fn reflow_fast_path_skips_rows_it_cannot_move() {
+        let cases: [&[u8]; 6] = [
+            b"top\r\n\x1b]8;;http://x\x07ab\x1b]8;;\x07\r\nnext\r\n",
+            b"top\r\na\tb\r\nnext\r\n",
+            "top\r\n\u{4e2d}\u{6587}\x1b[2;2H\x1b[@x\r\nnext\r\n".as_bytes(),
+            "top\r\n\x1b[2;5H\u{4e2d}\x1b[2;5H\x1b[P\r\nnext\r\n".as_bytes(),
+            // a cell widened in the last column has no continuation cell
+            "top\r\nabcdefghijklmnopqrs\u{1f1f0}\u{1f1f7}\r\nnext\r\n".as_bytes(),
+            b"top\r\nsaved\x1b7\r\nnext\r\nlast",
+        ];
+        for input in cases {
+            for (rows, cols) in [(4u16, 20u16), (4, 3), (6, 40), (4, 20)] {
+                let new = || crate::Parser::new(NonZeroU16::new(4).unwrap(), NonZeroU16::new(20).unwrap(), 10);
+                let (mut fast, mut slow) = (new(), new());
+                fast.process(input);
+                slow.process(input);
+                set_size(&mut fast, rows, cols, false);
+                set_size(&mut slow, rows, cols, true);
+                assert!(state(&fast) == state(&slow), "{input:?} {rows}x{cols}");
+            }
+        }
+    }
+
+    /// A row that scrolls into the history compact hands its storage to the new row,
+    /// which then reads and writes as an empty row.
+    #[test]
+    fn scrolled_rows_hand_their_storage_to_the_new_row() {
+        let mut p = crate::Parser::new(NonZeroU16::new(2).unwrap(), NonZeroU16::new(10).unwrap(), 10);
+        p.process(b"abcdefghij\r\n\x1b[31mred\x1b[m\r\n");
+        let s = p.screen();
+        assert_eq!(s.history_rows_len(), 3);
+        assert_eq!(s.history_row(0).unwrap().cell(9).unwrap().contents(), "j");
+        assert!(s.history_row(0).unwrap().cell(10).is_none());
+        assert_eq!(s.history_row(1).unwrap().cell(2).unwrap().fgcolor(), crate::Color::Idx(1));
+        assert!((0..10).all(|c| !s.cell(1, c).unwrap().has_contents()));
+        assert!(s.cell(1, 10).is_none());
+        p.process(b"\x1b[2;4Hz");
+        let s = p.screen();
+        assert_eq!(s.contents(), "red\n   z");
+        assert!((0..3).all(|c| s.cell(1, c).unwrap() == s.cell(1, 9).unwrap()));
+    }
 }

@@ -23,6 +23,15 @@ Clearing with a colour or rewriting a whole row makes it dense; editing a compac
 row expands it on demand.
 Read-only cell access does not expand compact rows. Reflow compacts its history
 output as well. This does not lower the history limit or change cell capacity.
+Compacting builds the palette (in order of first appearance) straight from sparse
+or dense cells through a 256-slot hash; a row that scrolls into the history
+compact hands its emptied cell storage (up to 1024 cells) to the new row that
+replaces it. Trimming and truncating a compact row keep it compact. Reflow moves
+a line that fits the new width whole when nothing in it would change
+(grid_reflow_move: not wrapped, not the cursor's or saved cursor's row, no tabs or
+links, every wide cell paired with its continuation), and trims the unwrapped
+rows it puts in the history like rows that scroll there. Tests:
+grid::reflow_tests, row_cells::tests.
 
 Local addition: `Screen::history_rows_len` / `Screen::history_row` (backed by
 `Grid::absolute_len` / `Grid::absolute_row`) and `RowContents::cell`, `wrapped`
