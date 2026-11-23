@@ -6457,6 +6457,9 @@ fn capture_line(line: &crate::cells::Line, escapes: bool, keep: bool, trim_unuse
     }
     let text = if escapes {
         render::line_with_escapes_from(&line, last_link, allocated, keep)
+    } else if keep && allocated {
+        // -N: the trailing spaces kept go on to what the line has room for, not the width
+        (0..render::line_cells_end(&line, true)).map(|x| line.cell_text(x)).collect()
     } else {
         (0..line.cells.len()).map(|x| line.cell_text(x)).collect()
     };

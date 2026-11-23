@@ -1231,11 +1231,27 @@ fn capture_details(ctx: &Ctx) {
     assert!(ctx.fails(&["capture-pane", "-p", "-a", "-t", "c"]).contains("no alternate screen"));
     assert_eq!(ctx.ok(&["capture-pane", "-p", "-a", "-q", "-t", "c"]), "\n");
     assert!(ctx.ok(&["capture-pane", "-p", "-R", "-t", "c"]).starts_with("G 20x4 (0/"));
+    // -N keeps the trailing spaces a line has room for (gl->cellsize: a quarter, half or
+    // all of the width once written), not the whole width
+    let kept = "l1   \nlong line wrapping a\nround     \n\\z   \n";
+    assert_eq!(ctx.ok(&["capture-pane", "-p", "-N", "-t", "c"]), kept);
     ctx.ok(&["copy-mode", "-t", "c"]);
     assert!(ctx.ok(&["capture-pane", "-p", "-M", "-t", "c"]).contains("long line"));
+    assert_eq!(ctx.ok(&["capture-pane", "-p", "-M", "-N", "-t", "c"]), kept);
     // -M reads the mode's copy of the pane, not its scrolled view, nor the selection
     ctx.ok(&["send-keys", "-X", "-t", "c", "begin-selection"]);
     assert_eq!(ctx.ok(&["capture-pane", "-p", "-M", "-S", "1", "-E", "1", "-t", "c"]), "long line wrapping a\n");
+    // scrolled up, -M still gives the bottom of that copy (tmux 3.8 cmd-capture-pane.c:
+    // gd->hsize to hsize + sy - 1 of window_copy_get_screen's backing grid); the lines
+    // in view are reached with -S/-E counted back from the copy's history
+    ctx.ok(&["new-session", "-d", "-s", "h", "-x", "20", "-y", "4", "seq 1 50; sleep 100"]);
+    wait_for("seq", || ctx.capture("h").contains("50"));
+    ctx.ok(&["copy-mode", "-t", "h"]);
+    ctx.ok(&["send-keys", "-X", "-t", "h", "goto-line", "30"]);
+    assert_eq!(ctx.fmt("h", "#{pane_mode} #{scroll_position}"), "copy-mode 30");
+    assert_eq!(ctx.ok(&["capture-pane", "-p", "-M", "-t", "h"]), "48\n49\n50\n\n");
+    assert_eq!(ctx.ok(&["capture-pane", "-p", "-M", "-S", "-30", "-E", "-27", "-t", "h"]), "18\n19\n20\n21\n");
+    assert_eq!(ctx.ok(&["capture-pane", "-p", "-M", "-S", "-", "-E", "-", "-t", "h"]).lines().count(), 51);
 }
 
 fn empty_panes(ctx: &Ctx) {
