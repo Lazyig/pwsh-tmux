@@ -9,6 +9,7 @@ mod control;
 mod copy;
 mod events;
 mod float;
+mod flow;
 /// The JSON subset tmux parses (layouts, display-message -j).
 pub use cmds::json::{parse as json_parse, Node as Json};
 pub use cmds::strerror;
@@ -85,7 +86,8 @@ pub enum Event {
     Conn(Stream),
     ClientMsg(ClientId, u8, Vec<u8>),
     ClientGone(ClientId),
-    PaneData(PaneId, u32, Vec<u8>),
+    /// Pane output; the credit goes back to the pane's reader when the event is dropped.
+    PaneData(PaneId, u32, Vec<u8>, flow::Credit),
     /// The exit status: negative for a signal (pane_dead_signal), see [`exit_status`].
     PaneExit(PaneId, u32, Option<i32>),
     Job(u32, i32, String),
@@ -603,6 +605,9 @@ impl PaneMode {
 pub struct Pane {
     pub id: PaneId,
     pub generation: u32,
+    /// Lets the reader go on without credits once the pane is dropped. Before `master`:
+    /// fields drop in order, and closing a pseudoconsole may wait for the reader.
+    pub output: flow::Output,
     pub parser: vt100::Parser<PaneCb>,
     pub input: Sender<Vec<u8>>,
     pub master: Box<dyn MasterPty + Send>,
@@ -716,6 +721,7 @@ impl Pane {
 /// Drops a pane off the main loop: on older Windows (10, Server 2022) ClosePseudoConsole
 /// blocks until conhost exits, which would freeze every client.
 fn release(mut p: Pane) {
+    p.output.close();
     p.kill_host();
     thread::spawn(move || drop(p));
 }
@@ -1387,6 +1393,8 @@ pub struct Parked {
 
 pub struct Server {
     pub tx: mpsc::SyncSender<Event>,
+    /// Pane output read and waiting to be queued, for the main loop's coalescing.
+    pub backlog: flow::Backlog,
     pub pty: Box<dyn PtySystem + Send>,
     pub sessions: BTreeMap<SessId, Session>,
     pub windows: HashMap<WinId, Window>,
@@ -1572,7 +1580,7 @@ pub fn run(config: Option<String>, cwd: Option<String>) -> io::Result<()> {
                 srv.handle(ev);
                 // Coalesce bursts of output into one render.
                 let deadline = Instant::now() + Duration::from_millis(4);
-                while let Ok(ev) = rx.try_recv() {
+                while let Some(ev) = next_in_burst(&rx, &srv.backlog, deadline) {
                     output_only &= matches!(ev, Event::PaneData(..));
                     srv.handle(ev);
                     if Instant::now() > deadline {
@@ -1614,6 +1622,26 @@ pub fn run(config: Option<String>, cwd: Option<String>) -> io::Result<()> {
     Ok(())
 }
 
+/// The next event of a burst being coalesced. A pane reader holding output it has read
+/// (waiting for its chunks before to be handled) or about to read it is sending it next:
+/// that output would be queued already without the limit on queued output, so it is
+/// waited for, up to the burst's deadline.
+fn next_in_burst(rx: &mpsc::Receiver<Event>, backlog: &flow::Backlog, deadline: Instant) -> Option<Event> {
+    if let Ok(ev) = rx.try_recv() {
+        return Some(ev);
+    }
+    while backlog.any() {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        // a reader that finds its pane gone holds nothing any more: look again soon
+        match rx.recv_timeout(left.min(Duration::from_millis(1))) {
+            Ok(ev) => return Some(ev),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+    rx.try_recv().ok()
+}
+
 impl Server {
     /// server_loop's exit test: no sessions (exit-empty) or no attached client
     /// (exit-unattached), and no client other than `except` still waiting for its reply.
@@ -1635,6 +1663,7 @@ impl Server {
         }
         let mut srv = Self {
             tx,
+            backlog: flow::Backlog::default(),
             pty: native_pty_system(),
             sessions: BTreeMap::new(),
             windows: HashMap::new(),
@@ -1977,7 +2006,7 @@ impl Server {
                 }
             }
             Event::ClientGone(cid) => self.client_gone(cid),
-            Event::PaneData(id, generation, data) => self.pane_data(id, generation, &data),
+            Event::PaneData(id, generation, data, _credit) => self.pane_data(id, generation, &data),
             Event::PaneExit(id, generation, status) => {
                 if self.panes.get(&id).is_some_and(|p| p.generation == generation) {
                     self.pane_exited(id, status);
@@ -3180,28 +3209,21 @@ impl Server {
         let child = if empty { None } else { Some(pair.slave.spawn_command(cb).map_err(|e| format!("create pane failed: {} ({e})", argv[0]))?) };
         drop(pair.slave);
         let pid = child.as_ref().and_then(|c| c.process_id());
-        let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
+        let (reader, pending) = flow::open(&*pair.master)?;
         let mut writer = pair.master.take_writer().map_err(|e| e.to_string())?;
         let killer = child.as_ref().map(|c| c.clone_killer());
 
+        let (output, flow) = flow::Output::new();
         let tx = self.tx.clone();
-        thread::spawn(move || {
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if tx.send(Event::PaneData(id, generation, buf[..n].to_vec())).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
+        let (reader_flow, backlog) = (flow.clone(), self.backlog.clone());
+        let more = pending.clone();
+        thread::spawn(move || flow::read_pane(reader, more, reader_flow, backlog, tx, id, generation));
         if let Some(mut child) = child {
             let tx = self.tx.clone();
             thread::spawn(move || {
                 let status = child.wait().ok().map(|s| exit_status(&s));
+                // window_pane_destroy_ready: the output before the exit is shown first
+                flow.settle(&pending);
                 let _ = tx.send(Event::PaneExit(id, generation, status));
             });
         }
@@ -3223,6 +3245,7 @@ impl Server {
             Pane {
                 id,
                 generation,
+                output,
                 parser: vt100::Parser::new_with_callbacks(nz(rows), nz(cols), history, {
                     // screen_reinit: a new screen starts in mode 1 with extended-keys always
                     let ext_option = ext_keys_option(&self.opt_server("extended-keys"));

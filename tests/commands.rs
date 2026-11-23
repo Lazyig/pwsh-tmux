@@ -601,6 +601,19 @@ fn respawn_and_remain_on_exit() {
     assert_eq!(ids(&ctx, "r").len(), 1);
 }
 
+#[cfg(unix)]
+#[test]
+fn remain_on_exit_keeps_the_last_output_of_a_flood() {
+    let ctx = Ctx::new("roe-flood");
+    ctx.ok(&["new-session", "-d", "-s", "q", "-x", "80", "-y", "24"]);
+    ctx.ok(&["set", "-g", "remain-on-exit", "on"]);
+    ctx.ok(&["respawn-pane", "-k", "-t", "q", "seq 1 200000"]);
+    wait_for("pane dead", || ctx.fmt("q", "#{pane_dead}") == "1");
+    let text = ctx.capture("q");
+    let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+    assert!(lines.len() >= 2 && lines[lines.len() - 2] == "200000" && lines[lines.len() - 1].starts_with("Pane is dead"), "{text}");
+}
+
 #[test]
 fn split_window_options() {
     let ctx = Ctx::new("split");
@@ -3033,6 +3046,15 @@ fn floating_panes_from_the_cli() {
         assert_eq!(out.status.code(), Some(3));
         // it waits silently: no (empty) error line on stderr
         assert!(out.stderr.is_empty(), "{:?}", String::from_utf8_lossy(&out.stderr));
+        // the pane's last output is handled before its exit (window_pane_destroy_ready)
+        ctx.ok(&["set", "-w", "-t", "f", "remain-on-exit", "on"]);
+        let out = ctx.command().args(["new-pane", "-W", "-t", "f", "printf END; exit 3"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        let panes = ctx.ok(&["list-panes", "-t", "f", "-F", "#{pane_id} #{pane_dead} #{pane_dead_status}"]);
+        let dead = panes.lines().find_map(|l| l.strip_suffix(" 1 3")).unwrap_or_else(|| panic!("no dead pane: {panes}"));
+        // (the dead line scrolls the small pane: END is in the history)
+        let text = ctx.ok(&["capture-pane", "-p", "-S", "-", "-t", dead]);
+        assert!(text.starts_with("END\n") && text.contains("\nPane is dead (status 3,"), "{text:?}");
     }
 }
 
