@@ -1418,6 +1418,14 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
     }
 
     pub fn text(&mut self, c: char) {
+        if matches!(c, ' '..='~') && self.screen.wrap_mode() && !self.screen.insert_mode() {
+            self.text_ascii(c);
+        } else {
+            self.text_any(c);
+        }
+    }
+
+    fn text_any(&mut self, c: char) {
         let screen = &mut self.screen;
         let pos = screen.grid().pos();
         let mut attrs = screen.attrs;
@@ -1539,6 +1547,50 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
         }
         if hyperlink.is_some() {
             row.set_metadata(base_pos.col, crate::CellMetadata { hyperlink, tab_width: 0 });
+        }
+    }
+
+    /// `text` for a printable ASCII character with wrapping on and insert mode off,
+    /// looking the row up once. Such a character is one column wide, never combines and
+    /// never makes a cell wide, so this is the width-1 path of `text` with those cases
+    /// left out: the same cells are read and written in the same order (a written cell
+    /// loses its metadata, `Row::get_mut`), then `text_cleanup` and the line flags.
+    fn text_ascii(&mut self, c: char) {
+        let screen = &mut self.screen;
+        let mut attrs = screen.attrs;
+        attrs.set_charset(screen.graphics_charset());
+        let wrap = screen.new_character_should_wrap(1);
+        let on_row = Self::on_row(screen, &mut self.callbacks);
+        screen.grid_mut().col_wrap(1, wrap, on_row);
+        // col_wrap always leaves the cursor on a valid cell
+        let pos = screen.grid().pos();
+        screen.last_char = Some(c);
+        screen.grid_mut().col_inc(1);
+        let cleanup_attrs = screen.attrs;
+        let hyperlink = screen.hyperlink.clone();
+        let row = screen.grid_mut().drawing_row_mut(pos.row).unwrap();
+        let cell = row.get_mut(pos.col).unwrap();
+        let cell_was_wide = cell.is_wide();
+        // Cell::set clears the wide flags of a one column character
+        cell.set(c, attrs);
+        // text_cleanup with cell_is_wide false
+        if pos.col > 0 && row.get(pos.col - 1).is_some_and(crate::Cell::is_wide) {
+            let prev_cell = row.get_mut(pos.col - 1).unwrap();
+            prev_cell.clear(*prev_cell.attrs());
+        }
+        if cell_was_wide {
+            if let Some(next_cell) = row.get_mut(pos.col + 1) {
+                if next_cell.is_wide_continuation() {
+                    next_cell.set(' ', cleanup_attrs);
+                }
+            }
+        }
+        // grid_extended_cell: of the reasons in `text`, only an RGB colour applies
+        if matches!(attrs.fgcolor, crate::Color::Rgb(..)) || matches!(attrs.bgcolor, crate::Color::Rgb(..)) {
+            row.set_flags(row.flags() | crate::ROW_EXTENDED);
+        }
+        if hyperlink.is_some() {
+            row.set_metadata(pos.col, crate::CellMetadata { hyperlink, tab_width: 0 });
         }
     }
 
@@ -2176,3 +2228,66 @@ const EMOJI_MODIFIER_BASE: [u32; 72] = [
     0x1F9D4, 0x1F9D5, 0x1F9D6, 0x1F9D7, 0x1F9D8, 0x1F9D9, 0x1F9DA, 0x1F9DB, 0x1F9DC, 0x1F9DD,
     0x1F9DE, 0x1F9DF,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{Screen, WrappedScreen};
+
+    #[derive(Clone, Default)]
+    struct Scrolls(Vec<String>);
+    impl crate::Callbacks for Scrolls {
+        fn on_scroll(&mut self, row: crate::capture::RowContents<'_>, alt: bool) {
+            self.0.push(alloc::format!("{:?} {alt}", row.0));
+        }
+    }
+
+    /// `text_ascii` is the printable ASCII case of `text_any`: both give the same screen
+    /// (cells, wide state around the cell, links, line flags and wraps, the scroll it
+    /// causes) after random output with wide, combining and RGB cells, links, charsets,
+    /// scroll regions and the alternate screen.
+    #[test]
+    fn text_ascii_matches_text_any() {
+        const SETUP: [&str; 34] = [
+            "\u{3042}", "\u{1F600}", "e\u{301}", "\u{1F1F0}\u{1F1F7}", "\u{1F1F0}", "\u{200D}", "\u{FE0F}", "\u{1F44D}\u{1F3FD}",
+            "\x1b[38;2;1;2;3m", "\x1b[48;2;4;5;6m", "\x1b[0m", "\x1b[31;1m", "\x1b]8;;http://x\x07", "\x1b]8;;\x07",
+            "\r\n", "\n", "\r", "\x1bD", "\x1bM", "\x1b[2;4r", "\x1b[r", "\x1b(0", "\x1b(B", "\x0e", "\x0f",
+            "\x1b[?1049h", "\x1b[?1049l", "\t", "\x08", "\x1b[@", "\x1b[P", "\x1b[3X", "\x1b[K", "\x1b[2J",
+        ];
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let mut checked = 0;
+        for _ in 0..300 {
+            let rows = core::num::NonZeroU16::new(1 + next(6) as u16).unwrap();
+            let cols = core::num::NonZeroU16::new(1 + next(12) as u16).unwrap();
+            let mut ws = WrappedScreen { screen: Screen::new(crate::grid::Size { rows, cols }, next(3) as usize * 5), callbacks: Scrolls::default() };
+            ws.screen.variation_wide = next(2) == 0;
+            let mut vte = vte::Parser::new();
+            for _ in 0..200 {
+                match next(20) {
+                    0..=7 => {
+                        let c = char::from(b' ' + next(95) as u8);
+                        if !ws.screen.wrap_mode() || ws.screen.insert_mode() { continue; }
+                        let mut other = WrappedScreen { screen: ws.screen.clone(), callbacks: ws.callbacks.clone() };
+                        ws.text_ascii(c);
+                        other.text_any(c);
+                        assert_eq!(alloc::format!("{:?}", ws.screen), alloc::format!("{:?}", other.screen));
+                        assert_eq!(ws.callbacks.0, other.callbacks.0);
+                        checked += 1;
+                    }
+                    8 => {
+                        let (r, c) = (1 + next(7), 1 + next(13));
+                        vte.advance(&mut ws, alloc::format!("\x1b[{r};{c}H").as_bytes());
+                    }
+                    9 => vte.advance(&mut ws, [&b"\x1b[4h"[..], b"\x1b[4l", b"\x1b[?7l", b"\x1b[?7h"][next(4) as usize]),
+                    _ => vte.advance(&mut ws, SETUP[next(SETUP.len() as u64) as usize].as_bytes()),
+                }
+            }
+        }
+        assert!(checked > 5000, "{checked}");
+    }
+}

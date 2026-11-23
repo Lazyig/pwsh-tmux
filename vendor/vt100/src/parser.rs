@@ -78,7 +78,27 @@ impl<CB: crate::Callbacks> Parser<CB> {
         // only), CAN, SUB or any ESC, and are dispatched however they end; C0 bytes inside are
         // dropped. A DCS can be cancelled until its final byte; after that it ends only on
         // ESC \ and ESC x keeps just x, so DCS tmux; payloads double their ESC bytes.
-        for &b in bytes {
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            i += 1;
+            if self.string_kind.is_none() && !self.escape && !self.csi_start && starts_run(b) {
+                // Outside a string and not right after ESC or ESC [, this loop only hands
+                // each byte to vte, so a run up to the next ESC goes to vte in one call:
+                // vte makes the same calls in the same order. Two bytes keep going one at a
+                // time because vte's buffer for a character split over calls differs from
+                // its whole-string path:
+                // - 0xC2, the lead byte of U+0080..U+009F: vte prints such a C1 character
+                //   when it completes it in that buffer (as one byte at a time always does)
+                //   but executes it when it decodes it whole, so a run ends before 0xC2.
+                // - UTF-8 continuation bytes (starts_run): a character completed in that
+                //   buffer skips every byte copied into it after the character, so a run
+                //   never starts where an earlier call may have left part of a character.
+                let end = bytes[i..].iter().position(|&c| c == 0x1b || c == 0xc2).map_or(bytes.len(), |p| i + p);
+                self.parser.advance(&mut self.screen, &bytes[i - 1..end]);
+                i = end;
+                continue;
+            }
             if let Some(kind) = self.string_kind {
                 if kind == b'P' && self.dcs_handler {
                     if self.escape {
@@ -294,6 +314,12 @@ impl<CB: crate::Callbacks> Parser<CB> {
     }
 }
 
+/// Whether `Parser::process` may hand vte a run of bytes starting with `b` in one call
+/// (see there): not ESC, not 0xC2 and not a UTF-8 continuation byte.
+fn starts_run(b: u8) -> bool {
+    b != 0x1b && b != 0xc2 && !(0x80..=0xbf).contains(&b)
+}
+
 /// tmux's utf8_isvalid: printable ASCII and complete UTF-8 characters only.
 fn utf8_isvalid(s: &[u8]) -> bool {
     core::str::from_utf8(s).is_ok_and(|t| t.chars().all(|c| !c.is_ascii() || (' '..='~').contains(&c)))
@@ -358,5 +384,92 @@ impl embedded_io::Write for Parser {
 impl embedded_io::WriteReady for Parser {
     fn write_ready(&mut self) -> core::result::Result<bool, Self::Error> {
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Parser;
+    use core::num::NonZeroU16;
+
+    fn p30(input: &str) -> Parser {
+        let mut p = Parser::new(NonZeroU16::new(8).unwrap(), NonZeroU16::new(30).unwrap(), 0);
+        p.process(input.as_bytes());
+        p
+    }
+
+    /// Callbacks with the cursor at the time of each call.
+    #[derive(Default)]
+    struct Log(alloc::vec::Vec<alloc::string::String>);
+    impl crate::Callbacks for Log {
+        fn audible_bell(&mut self, s: &mut crate::Screen) { self.0.push(alloc::format!("bell {:?}", s.cursor_position())); }
+        fn set_window_title(&mut self, s: &mut crate::Screen, t: &[u8]) { self.0.push(alloc::format!("title {t:?} {:?}", s.cursor_position())); }
+        fn unhandled_control(&mut self, s: &mut crate::Screen, b: u8) { self.0.push(alloc::format!("control {b} {:?}", s.cursor_position())); }
+        fn unhandled_csi(&mut self, s: &mut crate::Screen, i1: Option<u8>, i2: Option<u8>, params: &[&[u16]], c: char) {
+            self.0.push(alloc::format!("csi {i1:?} {i2:?} {params:?} {c} {:?}", s.cursor_position()));
+        }
+        fn on_scroll(&mut self, row: crate::capture::RowContents<'_>, alt: bool) {
+            self.0.push(alloc::format!("scroll {:?} {alt}", row.0));
+        }
+    }
+
+    /// The whole state of a parser fed `chunks` one after the other.
+    fn fed(chunks: &[&[u8]]) -> alloc::string::String {
+        let mut p = Parser::new_with_callbacks(NonZeroU16::new(4).unwrap(), NonZeroU16::new(10).unwrap(), 20, Log::default());
+        for chunk in chunks { p.process(chunk); }
+        alloc::format!("{:?}\n{:?}\n{:?}", p.screen(), p.screen().contents_formatted(), p.callbacks().0)
+    }
+
+    #[test]
+    fn runs_given_to_vte_at_once_match_one_byte_at_a_time() {
+        // Parser::process passes runs of bytes to vte in one call; one byte per call is
+        // how it worked before, so every split of the input must give the same state
+        let inputs: [&[u8]; 14] = [
+            b"plain text that wraps over the edge of the row and scrolls\r\nmore\x07",
+            "wide \u{3042}\u{3044} and e\u{301} \u{1F1F0}\u{1F1F7} \u{1F44D}\u{1F3FD} done".as_bytes(),
+            // C1 controls sent as UTF-8 are printed; lone C1 bytes are executed
+            b"a\xc2\x9bb\xc2\x85c\x9bd\x85e\xc2\x80\xc2\x9f",
+            b"\xc2Z\xc2\xc2\x9b\xc2",
+            // invalid and cut off UTF-8
+            b"x\xe2\x82y\xf0\x9f\x98z\xff\xfe\x80\xbf\xe0\x80\xed\xa0\x80\xf4\x90\x80\x80w",
+            b"\xe2\x82\xac\xe2\x82\x1b[1m\xe2\x82\xac\xf0\x9f\x98\x80\xe2",
+            // an empty SGR is not SGR 0; CSI after a run
+            b"\x1b[1;4mbold\x1b[mplain\x1b[;mx\x1b[0my\x1b[38;2;1;2;3mrgb\x1b[48;5;9mbg",
+            b"\x1b[2;3r\x1b[3;1Hab\x1bDcd\x1bMef\x1b[?6h\x1b[Hgh\x1b[r",
+            b"\x1b(0lqk\x0exy\x0f\x1b(Bab\x1b[4hins\x1b[4l\x1b[?7lnowrap0123456789\x1b[?7h",
+            // strings: OSC with BEL and ST, APC, DCS, PM, ESC k, CAN and SUB inside
+            b"t\x1b]2;title\x07u\x1b]0;x\x1b\\v\x1b_apc\x1b\\w\x1bPq#0\x1b\\x\x1b^pm\x18y\x1bkname\x1b\\z\x1b]2;a\x1ab",
+            b"\x1b[?1049halt screen\r\n\r\n\r\n\r\nscrolls\x1b[?1049lback",
+            b"\x1b[1;5Hc\x1b[2Ja\x1b[3Jtab\tx\x08\x08y\x1b[5Xz\x1b[2@\x1b[P\x1b[b",
+            b"\x1b[5n\x1b[c\x1b[>c\x1b[=3h\x1b[?2004h\x1b[12;34;56t\x1b[999;1H\x1b[J\x1b#8",
+            "\u{3042}\u{3042}\u{3042}\u{3042}\u{3042}x\u{3042}\x1b[1;10Hab\x1b[1;9H\u{3042}y\x1b[1;2Hz".as_bytes(),
+        ];
+        for input in inputs {
+            let bytes: alloc::vec::Vec<&[u8]> = input.chunks(1).collect();
+            let want = fed(&bytes);
+            assert_eq!(fed(&[input]), want, "{input:?}");
+            for at in 0..=input.len() {
+                assert_eq!(fed(&[&input[..at], &input[at..]]), want, "{input:?} at {at}");
+            }
+        }
+    }
+
+    #[test]
+    fn c1_controls_sent_as_utf8_survive_runs_and_splits() {
+        // vte executes U+0080..U+009F it decodes whole but prints one completed from bytes
+        // split over calls; tmux keeps them as characters, as one byte at a time did
+        let p = p30("a\u{9b}b");
+        assert_eq!((p.screen().cell(0, 0).unwrap().contents(), p.screen().cell(0, 1).unwrap().contents()), ("a\u{9b}", "b"));
+        // a lone C1 byte is an invalid UTF-8 byte
+        let mut p = p30("");
+        p.process(b"a\x9bb");
+        assert_eq!(p.screen().contents(), "a\u{fffd}b");
+        // vte drops the bytes after a character completed from a split, so the byte after
+        // the split goes on its own
+        let mut p = p30("");
+        p.process(b"a\xc2");
+        p.process(b"\x9bZ\xe2");
+        p.process(b"\x82\xac!");
+        assert_eq!(p.screen().contents(), "a\u{9b}Z\u{20ac}!");
     }
 }
