@@ -586,6 +586,42 @@ impl Backing {
         }
     }
 
+    /// Line `i` as an owned line (built and not kept when it is not built yet).
+    pub fn cloned(&self, i: usize) -> Option<Line> {
+        match self.unbuilt(i) {
+            Some((screen, i)) => Some(crate::cells::snapshot_line(screen, i)),
+            None => self.get(i).cloned(),
+        }
+    }
+
+    /// `f` of the [`Cell::text`] of cell `x` of line `i` (None past its cells or the end).
+    pub fn with_cell<R>(&self, i: usize, x: usize, f: impl FnOnce(Option<&str>) -> R) -> R {
+        match self.unbuilt(i) {
+            Some((screen, i)) => crate::cells::with_snapshot_cell(screen, i, x, f),
+            None => f(self.get(i).and_then(|l| l.cells.get(x)).map(|c| c.text.as_str())),
+        }
+    }
+
+    /// [`Line::is_padding`] of cell `x` of line `i` (false past the end).
+    pub fn is_padding(&self, i: usize, x: usize) -> bool {
+        match self.unbuilt(i) {
+            Some((screen, i)) => crate::cells::snapshot_is_padding(screen, i, x),
+            None => self.get(i).is_some_and(|l| l.is_padding(x)),
+        }
+    }
+
+    /// Appends [`Line::cell_text`] of cell `x` of line `i` to `out` (nothing past the end).
+    pub fn push_cell_text(&self, out: &mut String, i: usize, x: usize) {
+        match self.unbuilt(i) {
+            Some((screen, i)) => crate::cells::push_snapshot_cell_text(out, screen, i, x),
+            None => {
+                if let Some(l) = self.get(i) {
+                    out.push_str(l.cell_text(x));
+                }
+            }
+        }
+    }
+
     /// `f` of the text a search reads in each of columns `0..width` of line `i`
     /// ([`Line::cell_text`], a blank past the cells or the end).
     pub fn texts(&self, i: usize, width: usize, mut f: impl FnMut(&str)) {
@@ -622,7 +658,7 @@ impl Backing {
 
     /// Every line.
     pub fn to_vec(&self) -> Vec<Line> {
-        (0..self.len()).filter_map(|i| self.peek(i, Line::clone)).collect()
+        (0..self.len()).filter_map(|i| self.cloned(i)).collect()
     }
 
     /// Every line, built from the screen where not built yet.
@@ -2461,12 +2497,14 @@ impl CopyMode {
         self.count.take().unwrap_or(1).max(1)
     }
 
-    fn cell(&self, y: usize, x: usize) -> Option<&Cell> {
-        self.lines.get(y).and_then(|l| l.cells.get(x))
+    /// `f` of the text of a cell (None past the line's cells), read without keeping the
+    /// line, so scans over many lines build none.
+    fn with_cell<R>(&self, y: usize, x: usize, f: impl FnOnce(Option<&str>) -> R) -> R {
+        self.lines.with_cell(y, x, f)
     }
 
     fn is_cont(&self, y: usize, x: usize) -> bool {
-        self.lines.get(y).is_some_and(|l| l.is_padding(x))
+        self.lines.is_padding(y, x)
     }
 
     fn wrapped(&self, y: usize) -> bool {
@@ -2532,7 +2570,7 @@ impl CopyMode {
         let mut y = self.logical_start(y);
         loop {
             let len = self.len(y);
-            if let Some(x) = (0..len).find(|&x| self.cell(y, x).is_some_and(|c| c.text != " " && c.text != "\t" && !c.is_continuation())) {
+            if let Some(x) = (0..len).find(|&x| self.with_cell(y, x, |c| c.is_some_and(|c| c != " " && c != "\t" && !c.is_empty()))) {
                 return Some((y, x));
             }
             if !self.wrapped(y) || y + 1 >= self.lines.len() {
@@ -2570,18 +2608,18 @@ impl CopyMode {
 
     fn class(&self, (y, x): Pos, seps: &str) -> Class {
         let x = self.snap(y, x);
-        match self.cell(y, x) {
+        self.with_cell(y, x, |c| match c {
             None => Class::Space,
             // any Unicode whitespace separates words
-            Some(c) if c.text.is_empty() || c.text.chars().any(char::is_whitespace) => Class::Space,
+            Some(c) if c.is_empty() || c.chars().any(char::is_whitespace) => Class::Space,
             Some(c) => {
-                let mut chars = c.text.chars();
+                let mut chars = c.chars();
                 match (chars.next(), chars.next()) {
                     (Some(ch), None) if seps.contains(ch) => Class::Sep,
                     _ => Class::Word,
                 }
             }
-        }
+        })
     }
 
     fn step_right(&self, (y, x): Pos) -> Option<Pos> {
@@ -2761,19 +2799,22 @@ impl CopyMode {
     /// A space in `set` matches any Unicode whitespace (tmux 3.8).
     fn in_set(&self, (y, x): Pos, set: &str) -> bool {
         let space = set.contains(' ');
-        match self.cell(y, x) {
+        self.with_cell(y, x, |c| match c {
             None => space,
             // the padding half of a wide character is whitespace when that character is
-            Some(c) if c.is_continuation() => {
-                (space || set.contains('\t')) && (0..x).rev().map(|i| self.cell(y, i)).find(|c| !c.is_some_and(Cell::is_continuation))
-                    .flatten().is_some_and(|c| space && c.text.chars().any(char::is_whitespace))
+            Some("") => {
+                (space || set.contains('\t')) && (0..x).rev().find_map(|i| self.with_cell(y, i, |c| match c {
+                    Some("") => None,
+                    None => Some(false),
+                    Some(c) => Some(space && c.chars().any(char::is_whitespace)),
+                })).unwrap_or(false)
             }
-            Some(c) if space && c.text.chars().any(char::is_whitespace) => true,
+            Some(c) if space && c.chars().any(char::is_whitespace) => true,
             Some(c) => {
-                let mut chars = c.text.chars();
+                let mut chars = c.chars();
                 matches!((chars.next(), chars.next()), (Some(ch), None) if set.contains(ch))
             }
-        }
+        })
     }
 
     /// grid_reader_cursor_previous_word.
@@ -2980,9 +3021,7 @@ impl CopyMode {
         let mut out = String::new();
         let mut p = s;
         while p < e {
-            if let Some(c) = self.cell(p.0, p.1) {
-                out.push_str(&c.text);
-            }
+            self.with_cell(p.0, p.1, |c| out.push_str(c.unwrap_or("")));
             match self.step_right(p) {
                 Some(q) => p = q,
                 None => break,
@@ -3019,12 +3058,13 @@ impl CopyMode {
 
     /// A single-byte character at a cell (brackets are ASCII).
     fn ascii_at(&self, y: usize, x: usize) -> Option<char> {
-        let c = self.cell(y, x)?;
-        let mut chars = c.text.chars();
-        match (chars.next(), chars.next()) {
-            (Some(ch), None) if ch.is_ascii() && !c.is_continuation() => Some(ch),
-            _ => None,
-        }
+        self.with_cell(y, x, |c| {
+            let mut chars = c?.chars();
+            match (chars.next(), chars.next()) {
+                (Some(ch), None) if ch.is_ascii() => Some(ch),
+                _ => None,
+            }
+        })
     }
 
     /// window_copy_cmd_next_matching_bracket, once: from the bracket under the cursor (emacs
@@ -3174,7 +3214,7 @@ impl CopyMode {
     /// grid_reader_cursor_jump: the character at or after a position, through wrapped lines.
     fn reader_jump(&self, (mut y, mut x): Pos, ch: &str) -> Option<Pos> {
         loop {
-            if let Some(x) = (x..self.len(y)).find(|&x| self.cell(y, x).is_some_and(|c| c.text == ch)) {
+            if let Some(x) = (x..self.len(y)).find(|&x| self.with_cell(y, x, |c| c == Some(ch))) {
                 return Some((y, x));
             }
             if y + 1 >= self.lines.len() || !self.wrapped(y) {
@@ -3190,7 +3230,7 @@ impl CopyMode {
     fn reader_jump_back(&self, (mut y, x): Pos, ch: &str) -> Option<Pos> {
         let mut xx = x + 1;
         loop {
-            if let Some(x) = (0..xx).rev().find(|&x| self.cell(y, x).is_some_and(|c| c.text == ch)) {
+            if let Some(x) = (0..xx).rev().find(|&x| self.with_cell(y, x, |c| c == Some(ch))) {
                 return Some((y, x));
             }
             if y == 0 || !self.wrapped(y - 1) {
@@ -3507,7 +3547,7 @@ impl CopyMode {
         let xx = self.copy_len(y);
         let (sx, ex) = (sx.min(xx), ex.min(xx));
         // padding is skipped and a tab copied as a tab
-        self.lines.peek(y, |l| (sx..ex).for_each(|x| out.push_str(l.cell_text(x))));
+        (sx..ex).for_each(|x| self.lines.push_cell_text(out, y, x));
         if !wrapped || ex != xx {
             out.push('\n');
         }
@@ -5804,5 +5844,42 @@ mod frozen_backing_tests {
         assert!(built(&cm) <= 3 * 10 + 64 + 10, "{} lines kept", built(&cm));
         let frozen = cm.lines.frozen.as_ref().unwrap();
         assert_eq!(frozen.cached.borrow().len(), built(&cm), "the list of built rows is exact");
+    }
+
+    #[test]
+    fn commands_over_the_whole_history_build_no_lines() {
+        // motions and copies that cross the history read the frozen rows' cells and keep no
+        // lines while they run (the cache is only trimmed after the command)
+        let mut p = vt100::Parser::new(std::num::NonZeroU16::new(10).unwrap(), std::num::NonZeroU16::new(20).unwrap(), 9000);
+        p.process(b"first a\tb \xed\x95\x9c\r\n");
+        (0..6000).for_each(|_| p.process(b"\r\n"));
+        (0..1000).for_each(|i| p.process(format!("w{i} [x] y\r\n").as_bytes()));
+        p.process(b"last");
+        let mut cm = CopyMode::new(Backing::frozen(p.screen().clone()), 20, 10, (9, 4), true);
+        let built = |cm: &CopyMode| cm.lines.frozen.as_ref().map_or(0, |f| f.cache.iter().filter(|c| c.get().is_some()).count());
+        let mut steps: Vec<(&str, usize, &str)> = vec![
+            ("history-top", 1, ""), ("next-word", 6000, ""), ("history-top", 1, ""), ("next-space", 3000, ""),
+            ("history-top", 1, ""), ("next-word-end", 6000, ""), ("history-bottom", 1, ""), ("previous-word", 6000, ""),
+            ("history-bottom", 1, ""), ("previous-space", 3000, ""), ("history-top", 1, ""), ("next-paragraph", 3, ""),
+            ("history-bottom", 1, ""), ("previous-paragraph", 3, ""), ("history-top", 1, ""), ("jump-forward", 1, "b"),
+        ];
+        steps.extend([("history-top", 1, ""), ("begin-selection", 1, ""), ("history-bottom", 1, ""), ("end-of-line", 1, "")]);
+        for (command, n, arg) in steps {
+            let before = built(&cm);
+            cm.set_count(n);
+            let args: Vec<String> = if arg.is_empty() { vec![] } else { vec![arg.into()] };
+            let _ = cm.run_inner(command, &args);
+            assert!(built(&cm) <= before + 64, "{command}: {} lines kept", built(&cm));
+            cm.trim_cache();
+        }
+        let before = built(&cm);
+        let Action::Copy { text, .. } = cm.run_inner("copy-selection-no-clear", &[]) else { panic!("no copy") };
+        assert!(built(&cm) <= before + 64, "copy: {} lines kept", built(&cm));
+        assert!(text.starts_with("first a\tb \u{d55c}\n\n") && text.ends_with("w999 [x] y\nlast"), "{text:?}");
+        assert_eq!(text.lines().count(), 7002);
+        cm.run_inner("rectangle-toggle", &[]);
+        let Action::Copy { text, .. } = cm.run_inner("copy-selection-no-clear", &[]) else { panic!("no copy") };
+        assert!(built(&cm) <= before + 64, "rectangle copy: {} lines kept", built(&cm));
+        assert_eq!(text.lines().count(), 7002);
     }
 }
