@@ -118,14 +118,13 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   7, ASCII in Windows PowerShell 5.1 unless the profile sets it (`$OutputEncoding =
   [Text.UTF8Encoding]::new($false)`); so in 5.1 `run-shell "echo 'x한글é' | findstr x"`
   prints `x???`, and `findstr 한` finds nothing in it where the system's code page has
-  Hangul (949: `'...' returned 1`, as in a pane). PowerShell 7
-  writes a failed command's error to its standard error, which `run-shell -E` shows;
-  Windows PowerShell 5.1 writes it to its output while its standard error is NUL, so
-  `run-shell` shows it without `-E`. What a job starts goes on by itself and does not
+  Hangul (949: `'...' returned 1`, as in a pane). A failed command's error goes to the
+  shell's standard error, which `run-shell -E` shows; without `-E` it may not show, as
+  tmux discards a job's standard error (`'Get-Foo' returned 1` alone). What a job starts goes on by itself and does not
   keep the job from ending (`run-shell -b "Start-Process notepad"`). The jobs share that
   console: a job that changes its code page (`chcp 949`) changes it for the jobs running
   with it until the next one starts, and a Ctrl+C or Ctrl+Break a job sends to the whole
-  console reaches the others (the server goes on). A server started with a console of its
+  console reaches the others (the server goes on, as it does at a user's logoff). A server started with a console of its
   own (by hand, in a terminal) leaves that console as it is and gives each job a console
   of its own without a window, in the system's code page. Each line of the output that
   is not UTF-8 is read in the system's console code page (`GetOEMCP`), as a pane's

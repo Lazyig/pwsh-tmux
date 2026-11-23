@@ -229,6 +229,24 @@ pub fn job_creation_flags(in_jobs_console: bool) -> u32 {
     if in_jobs_console { 0 } else { CREATE_NO_WINDOW }
 }
 
+/// Windows' console control events (wincon.h): Ctrl+C, Ctrl+Break, the console closing,
+/// the user logging off, the system shutting down.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const CTRL_EVENTS: [u32; 5] = [0, 1, 2, 5, 6];
+
+/// Whether the server goes on after console control event `kind`, which reaches it once
+/// it is in the jobs' console (it had none and got none before). Ctrl+C and Ctrl+Break a
+/// job sends to all of the console: yes. Logoff: yes, as Windows sends it to a console
+/// process that outlives a user's logoff (a server started over SSH, in session 0, when
+/// any user logs off), and one in the user's session is ended at logoff anyway. Shutdown:
+/// yes, the system ends it. The console closing: no, as Windows ends the process when
+/// its handler returns whatever it returns.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn survives_ctrl_event(kind: u32) -> bool {
+    let [c, brk, _close, logoff, shutdown] = CTRL_EVENTS;
+    [c, brk, logoff, shutdown].contains(&kind)
+}
+
 /// Makes up to `tries` attempts, `pause` apart, until one succeeds; stops early when
 /// `gone` says there is nothing left to wait for. Whether an attempt succeeded.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -448,12 +466,13 @@ pub mod win {
         attached
     }
 
-    /// The jobs' console handler: Ctrl+C and Ctrl+Break that a job sends to all of its
-    /// console (GenerateConsoleCtrlEvent with group 0) reach this process too, which goes
-    /// on. (Not SetConsoleCtrlHandler(NULL, TRUE), which the panes would inherit.)
+    /// The jobs' console handler: control events in that console, such as Ctrl+C and
+    /// Ctrl+Break a job sends to all of it (GenerateConsoleCtrlEvent with group 0), or a
+    /// logoff, reach this process too, which goes on ([`super::survives_ctrl_event`]).
+    /// (Not SetConsoleCtrlHandler(NULL, TRUE), which the panes would inherit, and which
+    /// covers only Ctrl+C.)
     unsafe extern "system" fn goes_on(kind: u32) -> windows_sys::core::BOOL {
-        use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
-        (kind == CTRL_C_EVENT || kind == CTRL_BREAK_EVENT) as windows_sys::core::BOOL
+        super::survives_ctrl_event(kind) as windows_sys::core::BOOL
     }
 
     /// Pids of direct children of `parent` with the given executable name.
@@ -661,6 +680,19 @@ mod shell_tests {
     }
 
     #[test]
+    fn the_server_survives_its_jobs_consoles_events_but_its_closing() {
+        let [c, brk, close, logoff, shutdown] = CTRL_EVENTS;
+        assert!(survives_ctrl_event(c) && survives_ctrl_event(brk));
+        assert!(survives_ctrl_event(logoff) && survives_ctrl_event(shutdown));
+        assert!(!survives_ctrl_event(close));
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Console as w;
+            assert_eq!(CTRL_EVENTS, [w::CTRL_C_EVENT, w::CTRL_BREAK_EVENT, w::CTRL_CLOSE_EVENT, w::CTRL_LOGOFF_EVENT, w::CTRL_SHUTDOWN_EVENT]);
+        }
+    }
+
+    #[test]
     fn retry_stops_at_success_or_when_nothing_is_left_to_wait_for() {
         let pause = std::time::Duration::from_millis(1);
         // succeeds on the third attempt
@@ -811,8 +843,17 @@ mod shell_tests {
             "cmd" => {
                 assert_eq!(run(&format!("echo {text}")).1, format!("{text}\r\n"));
                 assert_eq!(run("echo \"%%%\" & echo \"a b\"").1.replace(' ', ""), "\"%%%\"\r\n\"ab\"\r\n");
+                assert_eq!(run("\"cmd.exe\" /c echo \"x\"").1, "\"x\"\r\n");
                 assert!(run("chcp").1.contains("65001"));
                 assert_eq!(run("exit /b 3").0, Some(3));
+            }
+            // Git Bash: its output and input as they are, its command as written
+            "bash" => {
+                let (code, out) = run(&format!("echo '{text}' \"%%%\" \\\""));
+                assert_eq!((code, out.as_str()), (Some(0), format!("{text} %%% \"\n").as_str()));
+                let (_, out) = job("cat", Some(&format!("{text}\n")), false).expect("ends");
+                assert_eq!(out, format!("{text}\n"));
+                assert_eq!(run("exit 5").0, Some(5));
             }
             // a): the job's process is the shell, started by the server itself
             "pid" => {
@@ -839,17 +880,15 @@ mod shell_tests {
                 assert!(file.exists(), "{shell}: what Start-Process started went on after the shell ended");
                 let _ = std::fs::remove_file(&file);
             }
-            // c): a failed command's error, with run-shell -E and (Windows PowerShell 5.1,
-            // which writes it to the output when its error output is NUL) without
+            // c): a failed command's error shows with run-shell -E; without it the error
+            // output is NUL, as tmux discards a job's, and whether the error shows then is
+            // up to the shell (not checked), but the status is the same
             "error" => {
                 let (code, shown) = job("Get-PwshTmuxNoSuchCommand", None, true).expect("ends");
                 assert_eq!(code, Some(1), "{shell}: {shown:?}");
                 assert!(shown.contains("Get-PwshTmuxNoSuchCommand"), "{shell}, -E: {shown:?}");
                 let (code, out) = run("Get-PwshTmuxNoSuchCommand");
                 assert_eq!(code, Some(1), "{shell}: {out:?}");
-                if !pwsh7 {
-                    assert!(out.contains("Get-PwshTmuxNoSuchCommand"), "{shell} without -E, as before 7b49b23: {out:?}");
-                }
             }
             // d): a program the shell pipes to gets $OutputEncoding (ASCII in Windows
             // PowerShell 5.1, as in a pane; UTF-8 in 7), and reads NUL as the job's input
@@ -872,6 +911,10 @@ mod shell_tests {
             detached("utf8", ps);
         }
         detached("cmd", "cmd.exe");
+        let bash = std::path::Path::new("C:\\Program Files\\Git\\bin\\bash.exe");
+        if bash.is_file() {
+            detached("bash", &bash.to_string_lossy());
+        }
     }
 
     #[cfg(windows)]
