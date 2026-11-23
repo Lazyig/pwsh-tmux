@@ -217,17 +217,49 @@ pub fn job_command(command: &str) -> std::process::Command {
 }
 
 /// What Windows PowerShell 5.1 runs first in the jobs' UTF-8 console. Its
-/// `[Console]::InputEncoding` there is .NET Framework's code page 65001 encoding, which
-/// has a byte order mark, and the writer it gives a program it pipes to writes that mark
-/// before the text: `'x' | findstr x` finds nothing, as findstr reads `\u{feff}x`. The same
-/// encoding without the mark keeps what is piped as `$OutputEncoding` makes it (ASCII,
-/// unless the profile sets it): the console's code page stays 65001, and the job's input
-/// is read in UTF-8 as before. It is a line of its own, so the job's command is as typed
-/// from the start of the next one, its line numbers one more; a command that starts with
-/// `using` or `param(...)`, which must come first, does not run as one. PowerShell 7
-/// gives its encoding no mark.
+/// `[Console]::InputEncoding` and `[Console]::OutputEncoding` there are .NET Framework's
+/// code page 65001 encoding, which has a byte order mark: the writer it gives a program
+/// it pipes to writes that mark before the text (`'x' | findstr x` finds nothing, as
+/// findstr reads `\u{feff}x`), and one shows in what such a program prints (`'x' | more`).
+/// The same encoding without the mark keeps what is piped as `$OutputEncoding` makes it
+/// (ASCII, unless the profile sets it): the console's code pages stay 65001, and the
+/// job's input is read in UTF-8 as before. It is a line of its own, so the job's command
+/// is as typed from the start of the next one, its line numbers one more. A command whose
+/// first statement must come first (`using`, `param(...)`) is run without it
+/// ([`must_come_first`]). PowerShell 7 gives its encodings no mark.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub const PS51_JOB_PRELUDE: &str = "try { [Console]::InputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}";
+pub const PS51_JOB_PRELUDE: &str = "try { [Console]::InputEncoding = New-Object System.Text.UTF8Encoding $false; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch {};";
+
+/// Whether the first statement of PowerShell `command`, after blank space and comments
+/// (`# ...` to the line's end, `<# ... #>`, which `#requires` is one of), is one that
+/// must be the script's first: `using` or a `param` block.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn must_come_first(command: &str) -> bool {
+    let mut rest = command;
+    loop {
+        rest = rest.trim_start();
+        if let Some(after) = rest.strip_prefix("<#") {
+            match after.find("#>") {
+                Some(end) => rest = &after[end + 2..],
+                None => return false,
+            }
+        } else if rest.starts_with('#') {
+            match rest.find('\n') {
+                Some(end) => rest = &rest[end + 1..],
+                None => return false,
+            }
+        } else {
+            break;
+        }
+    }
+    let word: String = rest.chars().take_while(|c| c.is_ascii_alphabetic()).collect::<String>().to_ascii_lowercase();
+    let next = rest[word.len()..].chars().next();
+    match word.as_str() {
+        "using" => next.is_some_and(char::is_whitespace),
+        "param" => next.is_some_and(|c| c == '(' || c.is_whitespace()),
+        _ => false,
+    }
+}
 
 /// Whether `shell` is Windows PowerShell (powershell.exe, 5.1 and before), not
 /// PowerShell 7 (pwsh). (Either separator on any platform.)
@@ -238,10 +270,11 @@ fn is_windows_powershell(shell: &str) -> bool {
 }
 
 /// The command string a job's `shell` runs for `command`: [`PS51_JOB_PRELUDE`] and then
-/// `command` for Windows PowerShell in the jobs' console, else `command` as it is.
+/// `command` for Windows PowerShell in the jobs' console (unless its first statement
+/// must come first), else `command` as it is.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn job_script(shell: &str, command: &str, in_jobs_console: bool) -> String {
-    if in_jobs_console && is_windows_powershell(shell) {
+    if in_jobs_console && is_windows_powershell(shell) && !must_come_first(command) {
         format!("{PS51_JOB_PRELUDE}\n{command}")
     } else {
         command.to_string()
@@ -702,6 +735,20 @@ mod shell_tests {
         }
         for other in ["pwsh.exe", "C:\\Program Files\\PowerShell\\7\\pwsh.exe", "cmd.exe", "/bin/sh", "powershell-preview.exe"] {
             assert_eq!(job_script(other, "echo x", true), "echo x", "{other}");
+        }
+        // a first statement that must come first keeps its place
+        for first in [
+            "using namespace System.Text; [UTF8Encoding]::new($false)",
+            "  USING module x",
+            "# a\n<# b\n #>\n#requires -Version 5\nusing namespace X",
+            "param($a) $a",
+            "Param ($a)",
+            "param\n($a)",
+        ] {
+            assert_eq!(job_script("powershell.exe", first, true), first, "{first:?}");
+        }
+        for not_first in ["usingx", "Using-Thing", "parameters", "param", "echo using namespace X", "<# open", "'using x'"] {
+            assert_eq!(job_script("powershell.exe", not_first, true), format!("{PS51_JOB_PRELUDE}\n{not_first}"), "{not_first:?}");
         }
     }
 

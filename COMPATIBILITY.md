@@ -110,12 +110,14 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   process (its pid is the one in `show-messages -J` and `#{pane_pipe_pid}`), its command
   line is the job's as it is (an error points into the command as typed; for Windows
   PowerShell 5.1 the command follows a line of its own that sets `[Console]::InputEncoding`
-  to UTF-8 without a byte order mark, because .NET Framework's 65001 encoding has one and
-  writes it when a program PowerShell pipes to starts (without the line `'x' | findstr x`
-  finds nothing); so the line numbers in an error are one more than the command's, a
-  command that starts with `using` or `param(...)`, which must come first, does not run
-  as one, and an encoding the profile sets there is replaced; not where a job has a
-  console of its own, below), and its
+  and `[Console]::OutputEncoding` to UTF-8 without a byte order mark, because .NET
+  Framework's 65001 encoding has one and writes it when a program PowerShell pipes to
+  starts (without the line `'x' | findstr x` finds nothing, and `'x' | more` prints the
+  mark); so the line numbers in an error are one more than the command's, and encodings
+  the profile sets there are replaced. A command whose first statement must come first
+  (`using`, `param(...)`, after blank space and comments) runs without that line, and a
+  program it pipes to gets the mark. Not where a job has a console of its own, below),
+  and its
   standard input, output and error are the job's (input NUL unless the job is given
   text, errors NUL unless `run-shell -E`). PowerShell (5.1 and 7) therefore starts with
   `[Console]::InputEncoding` and `[Console]::OutputEncoding` UTF-8, so what it prints and
