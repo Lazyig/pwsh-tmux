@@ -233,7 +233,7 @@ fn escape_answer(out: &mut String, s: &str, quote: Quote, q: Quoting) -> Result<
             out.push(c);
             continue;
         }
-        let both = |what: &str| format!("an answer with {c} cannot be quoted for both {what}");
+        let both = |what: &str| format!("an answer with {} cannot be quoted for both {what}", shown_char(c));
         if q.powershell && q.posix && no_common_form(c, chars.peek().copied(), quote) {
             return Err(both("PowerShell and sh"));
         }
@@ -278,6 +278,12 @@ fn escape_answer(out: &mut String, s: &str, quote: Quote, q: Quoting) -> Result<
         out.push(c);
     }
     Ok(())
+}
+
+/// A character of an answer as an error shows it: itself, and its code point when it is
+/// not ASCII, so a curly quote (`‘ (U+2018)`) is not taken for `'`.
+fn shown_char(c: char) -> String {
+    if c.is_ascii() { c.to_string() } else { format!("{c} (U+{:04X})", c as u32) }
 }
 
 /// `inner` (an answer escaped for the next shell) put inside the command parser's

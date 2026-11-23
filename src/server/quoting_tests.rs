@@ -368,6 +368,10 @@ fn the_escapes_for_each_set_of_shells() {
         let e = fill(t, a, PS_SH).unwrap_err();
         assert!(e.contains("cannot be quoted for both PowerShell and sh"), "{e}");
     }
+    // the refused character as typed, with its code point when it is not ASCII
+    assert_eq!(fill("echo '%%'", "a\u{2018}b", PS_SH).unwrap_err(), "an answer with \u{2018} (U+2018) cannot be quoted for both PowerShell and sh");
+    assert_eq!(fill("echo \"%%%\"", "x\u{201e}", PS_SH).unwrap_err(), "an answer with \u{201e} (U+201E) cannot be quoted for both PowerShell and sh");
+    assert_eq!(fill("echo '%%'", "it's", PS_SH).unwrap_err(), "an answer with ' cannot be quoted for both PowerShell and sh");
     // cmd.exe: carets and doubled quotes, nothing for sh's or tmux's quotes
     assert_eq!(fill("echo %%", "a&b|c%PATH%!x\"y", CMD).unwrap(), "echo a^&b^|c^%PATH^%^!x\"\"y");
     assert_eq!(fill("echo '%%'", "it's\nx", CMD).unwrap(), "echo 'it'\\''s x'");

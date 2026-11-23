@@ -247,8 +247,9 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
     the answer, is read as typed by both (a backtick is PowerShell's escape and starts a
     command in sh, and quoting the pieces apart, `"a"'$'"b"`, makes PowerShell take them
     as separate arguments). An answer with one of them is refused, with the error `an
-    answer with ' cannot be quoted for both PowerShell and sh`, and none of the
-    template's commands run. The rest of an answer is put in as typed. (Setting
+    answer with ' cannot be quoted for both PowerShell and sh` (a character that is not
+    ASCII is followed by its code point: `an answer with ‘ (U+2018) cannot be quoted for
+    both PowerShell and sh`), and none of the template's commands run. The rest of an answer is put in as typed. (Setting
     `PWSH_TMUX_SHELL` and `default-shell` to the same kind of shell avoids this.)
   - cmd.exe has no single quotes, nothing escapes inside its double quotes, and where its
     double quotes are is not known when the answer is put in, so each of
