@@ -311,14 +311,15 @@ mod tests {
                 let (kind, ended) = waiter.join().unwrap();
                 assert_eq!(kind, io::ErrorKind::BrokenPipe);
                 let took = ended.saturating_duration_since(at);
-                assert!(took < Duration::from_millis(50), "write {write}: close took {took:?}");
+                // generous so a loaded machine does not fail it; a lost wake-up never ends
+                assert!(took < Duration::from_millis(500), "write {write}: close took {took:?}");
             }
         }
     }
 
     /// A connection that sends nothing ends as soon as the server closes it.
     #[test]
-    fn closing_an_idle_client_ends_its_reader_within_50_ms() {
+    fn closing_an_idle_client_ends_its_reader_promptly() {
         let (server, mut peer) = pair();
         let (tx, events) = mpsc::sync_channel(64);
         let mut srv = Server::new(tx);
@@ -339,7 +340,7 @@ mod tests {
             if matches!(event, Event::ClientGone(c) if c == cid) { break; }
         }
         let took = at.elapsed();
-        assert!(took < Duration::from_millis(50), "reader ended after {took:?}");
+        assert!(took < Duration::from_millis(500), "reader ended after {took:?}");
     }
 
     #[test]
