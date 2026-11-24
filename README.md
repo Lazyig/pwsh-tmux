@@ -45,6 +45,12 @@ runtime on Windows, remaps local build paths, and records source and file hashes
 It supports native x86_64 Windows MSVC and Linux GNU builds. `--offline` reuses an
 existing Cargo cache. See [`VALIDATION.md`](VALIDATION.md) for release checks.
 
+Version 0.3.1 keeps the screen current on slow terminals: the client acknowledges
+output, the server waits for it before the next frame and scrolls pane regions instead
+of redrawing them. It also fixes terminal differences from tmux 3.8 (erase and
+scroll-region details, character widths), two copy-mode panics, and tells a client
+over the 64-connection limit why it was refused. 0.3.1 adds one client message, so
+upgrade both and restart existing servers (`kill-server`).
 Version 0.3.0 cuts key latency, CPU and memory use (see
 [`PERFORMANCE.md`](PERFORMANCE.md)), keeps a client that cannot keep up attached
 as tmux does, and widens the Windows named pipe buffers. The client and server
