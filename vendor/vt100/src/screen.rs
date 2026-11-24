@@ -1793,7 +1793,7 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
     // ESC M
     pub fn ri(&mut self) {
         let blank = self.screen.attrs.blank();
-        self.screen.grid_mut().row_dec_scroll(1, blank);
+        self.screen.grid_mut().reverse_index(blank);
     }
 
     // ESC # 8

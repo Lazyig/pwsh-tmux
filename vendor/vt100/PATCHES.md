@@ -156,3 +156,14 @@ codepoint-widths and before the Unicode width, so U+261D, U+26F9, U+270C,
 U+270D, U+1F3CB, U+1F3CC, U+1F574, U+1F575 and U+1F590 are two columns as in
 tmux 3.8 (the regional indicators, one column, already agree). Tests:
 lib.rs::tmux_screen_tests, tmux_width::tests.
+
+Local change: a cell that holds nothing but a background colour, as a clear, an
+insert or a scrolled-in row leaves it, is not used (`Cell::is_blank`,
+`Row::used_len`): tmux's grid_empty_line and grid_clear_cell do not raise
+gl->cellused. scroll-on-clear (grid_view_clear_history) moves the lines up to
+the last used one into the history, so `CSI 44m CSI S` then a clear adds no
+blank lines. RI is screen_write_reverseindex: the region scrolls down only with
+the cursor on its top row, so RI on row 0 above the region does nothing
+(upstream scrolled the region). ICH of more than half of the rest of the line
+blanks all `n` cells where tmux's grid_move_cells leaves some old cells behind
+(see COMPATIBILITY.md). Tests: lib.rs::tmux_screen_tests.

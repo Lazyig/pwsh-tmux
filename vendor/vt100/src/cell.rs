@@ -162,6 +162,13 @@ impl Cell {
         self.len() > 0
     }
 
+    /// Whether the cell is only what clearing or scrolling in leaves (`grid_clear_cell`,
+    /// `grid_empty_line`: no text, nothing but a background colour). tmux never counts
+    /// such cells in a line's `gl->cellused`; written cells, spaces included, it does.
+    pub(crate) fn is_blank(&self) -> bool {
+        !self.has_contents() && !self.is_wide_continuation() && self.attrs == self.attrs.blank()
+    }
+
     /// Returns whether the text data in the cell represents a wide character.
     #[must_use]
     pub fn is_wide(&self) -> bool {

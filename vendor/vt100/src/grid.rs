@@ -824,8 +824,9 @@ impl Grid {
     pub fn erase_all_into_history<F>(&mut self, attrs: crate::attrs::Attrs, on_row: F)
     where F: FnMut(&crate::row::Row) {
         if self.scrollback.is_some() {
-            let last = self.rows.iter().rposition(|r| (0..self.size.cols()).any(|x|
-                r.get(x).is_some_and(|c| *c != crate::cell::Cell::DEFAULT))).map_or(0, |i| i+1);
+            // grid_view_clear_history: up to the last line with a used cell (cellused),
+            // so lines only cleared or scrolled in with a background colour stay out
+            let last = self.rows.iter().rposition(|r| r.used_len() != 0).map_or(0, |i| i+1);
             let region = (self.scroll_top,self.scroll_bottom);
             self.scroll_top = 0;
             self.scroll_bottom = self.size.rows()-1;
@@ -1240,14 +1241,15 @@ impl Grid {
         self.row_clamp_top(in_scroll_region);
     }
 
-    pub fn row_dec_scroll(&mut self, count: u16, blank: crate::attrs::Attrs) {
-        let in_scroll_region = self.in_scroll_region();
-        // need to account for clamping by both row_clamp_top and by
-        // saturating_sub
-        let extra_lines = count.saturating_sub(self.pos.row);
-        self.pos.row = self.pos.row.saturating_sub(count);
-        let lines = self.row_clamp_top(in_scroll_region);
-        self.scroll_down(lines + extra_lines, blank);
+    /// `screen_write_reverseindex`: at the top of the scroll region the region scrolls
+    /// down, anywhere else the cursor goes up a row unless it is on the first row
+    /// (above the region too: the region is not scrolled from there).
+    pub fn reverse_index(&mut self, blank: crate::attrs::Attrs) {
+        if self.pos.row == self.scroll_top {
+            self.scroll_down(1, blank);
+        } else if self.pos.row > 0 {
+            self.pos.row -= 1;
+        }
     }
 
     pub fn row_set(&mut self, i: u16) {

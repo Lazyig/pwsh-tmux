@@ -675,4 +675,52 @@ mod tmux_screen_tests {
         p.process("a\u{261d}b".as_bytes());
         assert_eq!(p.screen().cursor_position().1, 3);
     }
+
+    #[test]
+    fn scroll_on_clear_skips_lines_with_only_a_background() {
+        // grid_view_clear_history: the last line with gl->cellused != 0 decides; a line
+        // only cleared or scrolled in with a background colour (grid_empty_line) has
+        // none, a written space has one (results checked against tmux 3.4)
+        for (input, hist) in [
+            ("1\r\n2\r\n3\x1b[44m\x1b[S\x1b[0m\x1b[H\x1b[2J", 3),
+            ("1\r\n2\r\n3\x1b[44m\x1b[6;1H\n\n\x1b[0m\x1b[H\x1b[2J", 3),
+            ("1\r\n2\r\n3\x1b[44m\x1b[2;1H\x1b[L\x1b[0m\x1b[H\x1b[2J", 4),
+            ("\x1b[44m\x1b[2J\x1b[0m\x1b[H\x1b[2J", 0),
+            ("\x1b[44m\x1b[3;1H\x1b[K\x1b[0m\x1b[H\x1b[2J", 0),
+            ("\x1b[44m \x1b[0m\r\n\r\n\x1b[H\x1b[2J", 1),
+            ("\x1b[44m\x1b[2J\x1b[3;1Hx\x1b[0m\x1b[2J", 3),
+            ("\ta\x1b[D\x1b[X\x1b[H\x1b[2J", 1),
+        ] {
+            let mut p = Parser::new(NonZeroU16::new(6).unwrap(), NonZeroU16::new(8).unwrap(), 100);
+            p.screen_mut().set_scroll_on_clear(true);
+            p.process(input.as_bytes());
+            assert_eq!(p.screen().scrollback_len(), hist, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn insert_characters_blanks_every_inserted_cell() {
+        // deliberately not tmux: grid_move_cells wipes only the cells not moved over, so
+        // tmux's grid keeps "cdef" behind two blanks here and ignores ICH 8 entirely,
+        // while the terminal it draws to shows blanks (COMPATIBILITY.md)
+        let p = run(2, 8, "abcdefgh\r\x1b[44m\x1b[6@");
+        assert!((0..6).all(|x| style(&p, 0, x) == blank(Color::Idx(4))));
+        assert_eq!(rows(&p)[0], "      ab");
+        let p = run(2, 8, "abcdefgh\r\x1b[8@");
+        assert_eq!(rows(&p)[0], "");
+    }
+
+    #[test]
+    fn reverse_index_scrolls_only_at_the_top_of_the_region() {
+        // screen_write_reverseindex: above the region on the first row nothing moves
+        let p = run(6, 8, "a\r\nb\r\nc\x1b[2;5r\x1b[H\x1bM");
+        assert_eq!((rows(&p)[..3].to_vec(), p.screen().cursor_position()), (alloc::vec!["a".into(), "b".into(), "c".into()], (0, 0)));
+        // at the region's top it scrolls the region; elsewhere the cursor goes up
+        let p = run(6, 8, "a\r\nb\r\nc\x1b[2;5r\x1b[2;1H\x1bM");
+        assert_eq!((rows(&p)[..4].to_vec(), p.screen().cursor_position()), (alloc::vec!["a".into(), String::new(), "b".into(), "c".into()], (1, 0)));
+        let p = run(6, 8, "a\r\nb\r\nc\x1b[2;3r\x1b[5;1H\x1bM\x1bM");
+        assert_eq!((rows(&p)[..3].to_vec(), p.screen().cursor_position()), (alloc::vec!["a".into(), "b".into(), "c".into()], (2, 0)));
+        let p = run(6, 8, "a\r\nb\x1b[H\x1bM");
+        assert_eq!((rows(&p)[..3].to_vec(), p.screen().cursor_position()), (alloc::vec![String::new(), "a".into(), "b".into()], (0, 0)));
+    }
 }
