@@ -45,6 +45,16 @@ pub fn expanded_cellsize(sx: u16, cols: u16) -> u16 {
     }
 }
 
+/// The size of a line of size `cellsize` once cells `from..to` are written one at a time
+/// (grid_set_cell expands the line for each cell, so a line written up to a quarter or
+/// half of the width stays there, where one grid_expand_line to it takes the next size).
+pub fn grown_cellsize(mut cellsize: u16, from: u16, to: u16, cols: u16) -> u16 {
+    while from < to && cellsize < to {
+        cellsize = expanded_cellsize((cellsize + 1).max(from + 1), cols);
+    }
+    cellsize
+}
+
 impl Row {
     pub fn new(cols: u16) -> Self {
         Self {
@@ -72,6 +82,11 @@ impl Row {
         if sx > self.cellsize {
             self.cellsize = expanded_cellsize(sx, self.cols());
         }
+    }
+
+    /// grid_set_cell for each of cells `from..to` in turn (see `grown_cellsize`).
+    pub fn expand_cells(&mut self, from: u16, to: u16) {
+        self.cellsize = grown_cellsize(self.cellsize, from, to, self.cols());
     }
 
     pub fn flags(&self) -> u8 {
@@ -279,12 +294,20 @@ impl Row {
         }
     }
 
-    pub fn erase(&mut self, i: u16, attrs: crate::attrs::Attrs) {
-        // grid_clear: with the default background only the cells the line has are
-        // cleared, with another the line grows to the cleared cells
-        if attrs.bgcolor != crate::Color::Default {
-            self.expand(i + 1);
+    /// grid_clear of cells `range`: with the default background only the cells the
+    /// line has are cleared, with another the line grows to the cells cleared, in one
+    /// grid_expand_line.
+    pub fn erase_range(&mut self, range: core::ops::Range<u16>, attrs: crate::attrs::Attrs) {
+        if attrs.bgcolor != crate::Color::Default && !range.is_empty() {
+            self.expand(range.end);
         }
+        for i in range {
+            self.erase(i, attrs);
+        }
+    }
+
+    /// Clears cell `i` (the line's size is `erase_range`'s).
+    pub fn erase(&mut self, i: u16, attrs: crate::attrs::Attrs) {
         self.invalidate(i);
         let wide = self.cells[usize::from(i)].is_wide();
         self.clear_wide(i);

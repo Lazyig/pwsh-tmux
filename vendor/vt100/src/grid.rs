@@ -215,15 +215,14 @@ impl Grid {
         // whose first cell is wider than the row leaves an empty row before it
         let (mut line_row, mut split) = (0usize, false);
         // gl->cellsize of the row being built (grid_reflow): a line moved across keeps
-        // its own (`base`), one others are joined onto grows to the cells it then has,
-        // the first part of a split line has exactly its cells and the rest of a line
-        // a join consumed part of exactly what was left; the other parts of a split
-        // line are written into new lines (`first` false)
+        // its own (`base`), one others are joined onto grows from it a cell at a time
+        // (grid_set_cell), the first part of a split line has exactly its cells and the
+        // rest of a line a join consumed part of exactly what was left; the other parts
+        // of a split line are written a cell at a time into new lines (`first` false)
         let (mut base, mut first, mut joined, mut start) = (0u16, true, false, 0usize);
-        let quantize = |n: u16| if n == 0 { 0 } else { crate::row::expanded_cellsize(n, cols) };
         macro_rules! cellsize {
             ($split:expr) => {
-                if $split && first { col } else if first && !joined { base } else { base.max(quantize(col)) }
+                if $split && first { col } else if first && !joined { base } else { crate::row::grown_cellsize(base, 0, col, cols) }
             };
         }
         // ends the row, `$split` if the line it is part of goes on in the next one, which
@@ -925,19 +924,13 @@ impl Grid {
             self.erase_row(attrs);
             return;
         }
-        let row = self.current_row_mut();
-        for col in pos.col..size.cols() {
-            row.erase(col, attrs);
-        }
+        self.current_row_mut().erase_range(pos.col..size.cols(), attrs);
     }
 
     pub fn erase_row_backward(&mut self, attrs: crate::attrs::Attrs) {
         let size = self.size;
         let pos = self.pos;
-        let row = self.current_row_mut();
-        for col in 0..=pos.col.min(size.cols() - 1) {
-            row.erase(col, attrs);
-        }
+        self.current_row_mut().erase_range(0..pos.col.min(size.cols() - 1) + 1, attrs);
     }
 
     pub fn insert_cells(&mut self, count: u16) {
@@ -961,11 +954,7 @@ impl Grid {
             self.clear_line(pos.row, attrs);
             return;
         }
-        let row = self.current_row_mut();
-        for col in pos.col..((pos.col.saturating_add(count)).min(size.cols()))
-        {
-            row.erase(col, attrs);
-        }
+        self.current_row_mut().erase_range(pos.col..pos.col.saturating_add(count).min(size.cols()), attrs);
     }
 
     pub fn insert_lines(&mut self, count: u16) {

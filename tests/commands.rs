@@ -1260,6 +1260,19 @@ fn capture_details(ctx: &Ctx) {
     assert_eq!(ctx.ok(&["capture-pane", "-p", "-M", "-t", "h"]), "48\n49\n50\n\n");
     assert_eq!(ctx.ok(&["capture-pane", "-p", "-M", "-S", "-30", "-E", "-27", "-t", "h"]), "18\n19\n20\n21\n");
     assert_eq!(ctx.ok(&["capture-pane", "-p", "-M", "-S", "-", "-E", "-", "-t", "h"]).lines().count(), 51);
+    // the mode's copy rewrapped for a new width keeps each line's cells (grid_reflow
+    // moves gl->cellsize across), so -M -N and -M -e still give the text (tmux 3.8:
+    // 20 40 60 20, then 20 40 80 20 at 100 columns)
+    ctx.ok(&["new-session", "-d", "-s", "w", "-x", "80", "-y", "6", "printf 'ab\\n\\033[31mabcdefghijklmnopqrstuvwxyz\\033[0m\\n%050d\\nq\\n' 0; sleep 100"]);
+    wait_for("lines", || ctx.capture("w").contains("q"));
+    ctx.ok(&["copy-mode", "-t", "w"]);
+    let widths = |args: &[&str]| -> Vec<usize> { let mut a = vec!["capture-pane", "-p", "-M", "-N", "-E", "3", "-t", "w"]; a.extend_from_slice(args); ctx.ok(&a).lines().map(str::len).collect() };
+    ctx.ok(&["resize-window", "-t", "w", "-x", "60"]);
+    assert_eq!(ctx.fmt("w", "#{pane_mode} #{pane_width}"), "copy-mode 60");
+    assert_eq!(widths(&[]), [20, 40, 60, 20]);
+    assert_eq!(ctx.ok(&["capture-pane", "-p", "-M", "-e", "-E", "1", "-t", "w"]), "ab\n\u{1b}[31mabcdefghijklmnopqrstuvwxyz\u{1b}[39m\n");
+    ctx.ok(&["resize-window", "-t", "w", "-x", "100"]);
+    assert_eq!(widths(&[]), [20, 40, 80, 20]);
 }
 
 fn empty_panes(ctx: &Ctx) {

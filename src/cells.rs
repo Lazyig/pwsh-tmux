@@ -65,7 +65,8 @@ impl Cell {
 /// `flags` are vt100's ROW_* line flags (OSC 133 marks, hyperlinks), `time` when the
 /// row entered the history (0 if not), `metadata` the row's hyperlinks and tabs by column,
 /// `cellsize` the cells tmux would have allocated for it (gl->cellsize, vt100's
-/// `Row::cellsize`; 0 for a line not read from a screen).
+/// `Row::cellsize`, which copy mode's reflow carries on as grid_reflow does; 0 for a
+/// line not read from a screen).
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Line {
     pub cells: Vec<Cell>,

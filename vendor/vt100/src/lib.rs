@@ -65,6 +65,7 @@ mod term;
 pub use attrs::Color;
 pub use callbacks::Callbacks;
 pub use cell::Cell;
+pub use row::grown_cellsize;
 pub use row::{ROW_START_OUTPUT, ROW_START_PROMPT, ROW_HYPERLINK, ROW_EXTENDED, ROW_START_COMMAND, ROW_END_OUTPUT, ROW_SECOND_PROMPT};
 pub use parser::Parser;
 pub use screen::{
@@ -160,6 +161,33 @@ mod metadata_tests {
         assert_eq!(all(&p)[..4], [20, 40, 100, 20]);
         resize(&mut p, 25);
         assert_eq!(all(&p)[..7], [20, 25, 12, 25, 25, 25, 20]);
+    }
+    #[test]
+    fn cellsize_grows_a_cell_at_a_time_where_tmux_does() {
+        // tmux 3.8's capture-pane -R: a tab's padding is set a cell at a time
+        // (grid_set_padding), ECH and EL 1 with a background colour expand the line once
+        // to the cells cleared (grid_clear), and grid_reflow writes the parts of a split
+        // line and the cells joined onto one a cell at a time (grid_set_cell), so a line
+        // written up to a quarter or half of the width stays there
+        let size = |p: &Parser, y: usize| p.screen().history_row(y).unwrap().cellsize();
+        let first = |cols: u16, text: &str| { let mut p = parser(4, cols); p.process(text.as_bytes()); size(&p, 0) };
+        assert_eq!([first(32, "\t"), first(64, "\x1b[9G\t"), first(80, "a\x1b[33G\t")], [8, 16, 40]);
+        assert_eq!([first(80, "\x1b[44m\x1b[20X"), first(80, "\x1b[44m\x1b[40X"), first(80, "\x1b[44m\x1b[19X")], [40, 80, 20]);
+        assert_eq!([first(80, "\x1b[20G\x1b[44m\x1b[1K"), first(80, "\x1b[40G\x1b[44m\x1b[1K")], [40, 80]);
+        let all = |p: &Parser| (0..p.screen().history_rows_len()).map(|y| size(p, y)).take_while(|&n| n > 0).collect::<alloc::vec::Vec<_>>();
+        let resize = |p: &mut Parser, cols: u16| p.set_size(NonZeroU16::new(8).unwrap(), NonZeroU16::new(cols).unwrap());
+        let zeros = |n: usize| "0".repeat(n);
+        let mut p = parser(8, 80);
+        p.process(alloc::format!("{}\r\n{}\r\n{}\r\n", zeros(50), zeros(60), zeros(70)).as_bytes());
+        resize(&mut p, 40);
+        assert_eq!(all(&p), [40, 10, 40, 20, 40, 40]);
+        resize(&mut p, 120);
+        assert_eq!(all(&p), [60, 60, 120]);
+        let mut p = parser(8, 80);
+        p.process(alloc::format!("{}\r\n{}\r\n", zeros(100), zeros(120)).as_bytes());
+        assert_eq!(all(&p), [80, 40, 80, 80]);
+        resize(&mut p, 200);
+        assert_eq!(all(&p), [100, 200]);
     }
     #[test]
     fn osc_marks_links_tabs_and_history() {

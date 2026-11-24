@@ -3659,17 +3659,32 @@ fn reflow_width(c: &Cell) -> usize {
     if c.is_continuation() { 1 } else { unicode_width::UnicodeWidthStr::width(c.text.as_str()).max(1) }
 }
 
+/// A row as grid_reflow works on it: its cells with their widths, whether it wraps and
+/// its gl->cellsize.
+type ReflowRow = (Vec<(Cell, usize)>, bool, u16);
+
+/// gl->cellsize of a reflowed row of `sx` columns once cells `from..to` are written to it
+/// one at a time (grid_set_cell).
+fn reflow_grow(cellsize: u16, from: usize, to: usize, sx: usize) -> u16 {
+    let n = |v: usize| u16::try_from(v).unwrap_or(u16::MAX);
+    vt100::grown_cellsize(cellsize, n(from), n(to), n(sx))
+}
+
 /// grid_reflow, with grid_reflow_move, _split and _join as tmux 3.8 has them: rows too
-/// wide are split, rows that wrap take what fits from the rows after them.
+/// wide are split, rows that wrap take what fits from the rows after them. Each row's
+/// gl->cellsize goes as tmux's does: a row moved across keeps its own, the first part
+/// of a split row has exactly its cells, the other parts and the cells joined onto a
+/// row are written a cell at a time, and the rest of a row a join took part of has
+/// exactly what is left.
 fn reflow(lines: &[Line], sx: usize) -> Vec<Line> {
     // each cell with its width: a tab is a cell of its width and its padding cells one
     // column each, as grid_reflow counts them
-    let mut src: Vec<(Vec<(Cell, usize)>, bool)> = lines.iter().map(|l| {
+    let mut src: Vec<ReflowRow> = lines.iter().map(|l| {
         let cells = l.cells[..cells_used(l).min(l.cells.len())].iter().enumerate();
-        (cells.map(|(x, c)| (c.clone(), l.metadata.get(&(x as u16)).filter(|m| m.tab_width > 0).map_or_else(|| reflow_width(c), |m| usize::from(m.tab_width)))).collect(), l.wrapped)
+        (cells.map(|(x, c)| (c.clone(), l.metadata.get(&(x as u16)).filter(|m| m.tab_width > 0).map_or_else(|| reflow_width(c), |m| usize::from(m.tab_width)))).collect(), l.wrapped, l.cellsize)
     }).collect();
     let mut dead = vec![false; src.len()];
-    let mut target: Vec<(Vec<(Cell, usize)>, bool)> = Vec::with_capacity(src.len());
+    let mut target: Vec<ReflowRow> = Vec::with_capacity(src.len());
     for yy in 0..src.len() {
         if dead[yy] {
             continue;
@@ -3683,13 +3698,14 @@ fn reflow(lines: &[Line], sx: usize) -> Vec<Line> {
         }
         if width > sx {
             // grid_reflow_split
-            let (cells, wrapped) = std::mem::take(&mut src[yy]);
+            let (cells, wrapped, _) = std::mem::take(&mut src[yy]);
             dead[yy] = true;
-            target.push((cells[..at].to_vec(), true));
-            let (mut line, mut width) = ((Vec::new(), false), 0);
+            target.push((cells[..at].to_vec(), true, u16::try_from(at).unwrap_or(u16::MAX)));
+            let (mut line, mut width): (ReflowRow, usize) = ((Vec::new(), false, 0), 0);
             for c in &cells[at..] {
                 if width + c.1 > sx {
                     line.1 = true;
+                    line.2 = reflow_grow(0, 0, line.0.len(), sx);
                     target.push(std::mem::take(&mut line));
                     width = 0;
                 }
@@ -3697,6 +3713,7 @@ fn reflow(lines: &[Line], sx: usize) -> Vec<Line> {
                 line.0.push(c.clone());
             }
             line.1 |= wrapped;
+            line.2 = reflow_grow(0, 0, line.0.len(), sx);
             target.push(line);
             if width < sx && wrapped {
                 reflow_join(&mut target, &mut src, &mut dead, sx, yy, width);
@@ -3709,12 +3726,12 @@ fn reflow(lines: &[Line], sx: usize) -> Vec<Line> {
             }
         }
     }
-    let mut output: Vec<Line> = target.into_iter().map(|(cells, wrapped)| {
+    let mut output: Vec<Line> = target.into_iter().map(|(cells, wrapped, cellsize)| {
         let mut cells: Vec<Cell> = cells.into_iter().map(|(c, _)| c).collect();
         if !wrapped {
             cells.resize(sx.max(cells.len()), Cell::default());
         }
-        Line { cells, wrapped, ..Default::default() }
+        Line { cells, wrapped, cellsize, ..Default::default() }
     }).collect();
     // Line flags and times stay on the row a line starts (grid_reflow_move/_split
     // copy the line, rows joined onto another lose theirs); cell metadata follows its
@@ -3770,8 +3787,10 @@ fn reflow(lines: &[Line], sx: usize) -> Vec<Line> {
 
 /// grid_reflow_join: the rows after `yy` are joined onto the last target row while they
 /// fit; a row taken only in part keeps the rest for later.
-fn reflow_join(target: &mut [(Vec<(Cell, usize)>, bool)], src: &mut [(Vec<(Cell, usize)>, bool)], dead: &mut [bool], sx: usize, yy: usize, mut width: usize) {
+fn reflow_join(target: &mut [ReflowRow], src: &mut [ReflowRow], dead: &mut [bool], sx: usize, yy: usize, mut width: usize) {
     let to = target.len() - 1;
+    // the joined cells are written after the row's own, a cell at a time
+    let at = target[to].0.len();
     let (mut lines, mut wrapped, mut from, mut want) = (0, true, None, 0);
     loop {
         let line = yy + 1 + lines;
@@ -3811,8 +3830,10 @@ fn reflow_join(target: &mut [(Vec<(Cell, usize)>, bool)], src: &mut [(Vec<(Cell,
         }
     }
     let Some(from) = from.filter(|_| lines > 0) else { return };
+    target[to].2 = reflow_grow(target[to].2, at, target[to].0.len(), sx);
     if want < src[from].0.len() {
         src[from].0.drain(..want);
+        src[from].2 = u16::try_from(src[from].0.len()).unwrap_or(u16::MAX);
         lines -= 1;
     } else if !wrapped {
         target[to].1 = false;
@@ -4844,6 +4865,53 @@ mod tests {
         // wider again the line is whole, the tab still a tab
         cm.resize(20, 4);
         assert_eq!(text(&cm.lines[1]).trim_end(), "a\tbzz");
+    }
+
+    #[test]
+    fn reflow_gives_each_row_the_cells_tmux_does() {
+        // gl->cellsize after window_copy_resize's grid_reflow, as tmux 3.8's capture-pane
+        // -R shows it for the pane itself: a line moved across keeps its size, the first
+        // part of a split line has exactly its cells, the other parts and the cells joined
+        // onto a line are written a cell at a time (so 10 cells at 40 columns is a quarter,
+        // and 20 a half, not the next size), the rest of a line a join took part of has
+        // what is left. capture-pane -M -N and -e read it (0 lost every line's text).
+        let nz = |n| std::num::NonZeroU16::new(n).unwrap();
+        let zeros = |n: usize| "0".repeat(n);
+        let text = format!("ab\r\nabcdefghijklmnopqrstuvwxyz\r\n{}\r\n{}\r\n{}\r\n{}\r\nq", zeros(50), zeros(60), zeros(70), zeros(100));
+        let sizes = |lines: &[Line]| lines.iter().map(|l| l.cellsize).take_while(|&n| n > 0).collect::<Vec<_>>();
+        let pane = |cols: u16| {
+            let mut p = vt100::Parser::new(nz(14), nz(80), 50);
+            p.process(text.as_bytes());
+            if cols != 80 {
+                p.set_size(nz(14), nz(cols));
+            }
+            sizes(&crate::cells::snapshot(p.screen()))
+        };
+        let mut p = vt100::Parser::new(nz(14), nz(80), 50);
+        p.process(text.as_bytes());
+        let mut cm = CopyMode::new(crate::cells::snapshot(p.screen()), 80, 14, (0, 0), true);
+        assert_eq!(sizes(&cm.lines.to_vec()), [20, 40, 80, 80, 80, 80, 40, 20]);
+        cm.resize(40, 14);
+        p.set_size(nz(14), nz(40));
+        let at40 = sizes(&cm.lines.to_vec());
+        assert_eq!(at40, [20, 40, 40, 10, 40, 20, 40, 40, 40, 40, 40, 20]);
+        assert_eq!(at40, sizes(&crate::cells::snapshot(p.screen())));
+        cm.resize(120, 14);
+        p.set_size(nz(14), nz(120));
+        let at120 = sizes(&cm.lines.to_vec());
+        assert_eq!(at120, [20, 40, 60, 60, 120, 120, 20]);
+        assert_eq!(at120, sizes(&crate::cells::snapshot(p.screen())));
+        // a line joined at 200 columns: 80 cells and 20 more is a half (tmux 100, not 200)
+        let mut q = vt100::Parser::new(nz(14), nz(80), 50);
+        q.process(text.as_bytes());
+        let mut cm = CopyMode::new(crate::cells::snapshot(q.screen()), 80, 14, (0, 0), true);
+        cm.resize(200, 14);
+        assert_eq!(sizes(&cm.lines.to_vec()), [20, 40, 80, 80, 80, 100, 20]);
+        assert_eq!(pane(200), [20, 40, 80, 80, 80, 100, 20]);
+        // copy-mode -s of the pane into one of another width rewraps it the same way
+        let cm = CopyMode::clone_from(crate::cells::snapshot(q.screen()), (80, 14), (6, 1), (40, 14), true, true);
+        assert_eq!(sizes(&cm.lines.to_vec()), at40);
+        assert_eq!(pane(40), at40);
     }
 
     #[test]
