@@ -4894,8 +4894,9 @@ mod tests {
         p.process(b"a\tb\x1b]8;;http://z\x07zz\x1b]8;;\x07\r\nxy");
         let lines = crate::cells::snapshot(p.screen());
         // each unwrapped line: its text and (offset, tab width, link) of its metadata
-        let unwrapped = |cm: &CopyMode| -> Vec<(String, Vec<(usize, u16, Option<String>)>)> {
-            let mut out: Vec<(String, Vec<(usize, u16, Option<String>)>)> = Vec::new();
+        type Unwrapped = (String, Vec<(usize, u16, Option<String>)>);
+        let unwrapped = |cm: &CopyMode| -> Vec<Unwrapped> {
+            let mut out: Vec<Unwrapped> = Vec::new();
             let mut open = false;
             for l in cm.lines.to_vec() {
                 if !open {
