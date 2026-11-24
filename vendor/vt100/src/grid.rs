@@ -214,12 +214,28 @@ impl Grid {
         // one does not fit, whose rest is then a line of its own (`line_row`); a split
         // whose first cell is wider than the row leaves an empty row before it
         let (mut line_row, mut split) = (0usize, false);
+        // gl->cellsize of the row being built (grid_reflow): a line moved across keeps
+        // its own (`base`), one others are joined onto grows to the cells it then has,
+        // the first part of a split line has exactly its cells and the rest of a line
+        // a join consumed part of exactly what was left; the other parts of a split
+        // line are written into new lines (`first` false)
+        let (mut base, mut first, mut joined, mut start) = (0u16, true, false, 0usize);
+        let quantize = |n: u16| if n == 0 { 0 } else { crate::row::expanded_cellsize(n, cols) };
+        macro_rules! cellsize {
+            ($split:expr) => {
+                if $split && first { col } else if first && !joined { base } else { base.max(quantize(col)) }
+            };
+        }
+        // ends the row, `$split` if the line it is part of goes on in the next one, which
+        // starts with cellsize `$base` (`$first` if it is a line of its own)
         macro_rules! wrap {
-            () => {{
+            ($split:expr, $base:expr, $first:expr, $start:expr) => {{
                 row.wrap(true);
+                row.set_cellsize(cellsize!($split));
                 emit(row, &mut out, &mut produced);
                 row = crate::row::Row::new(cols);
                 (col, used) = (0, 0);
+                (base, first, joined, start) = ($base, $first, false, $start);
             }};
         }
         for (index, mut old) in source.enumerate() {
@@ -235,7 +251,11 @@ impl Grid {
             }
             let end = if wrapped { old.used_len() } else { old.cols() };
             // rewrapped rows keep the time their line entered the history
-            if col == 0 && used == 0 { row.set_time(old.time()); row.set_flags(old.flags()); }
+            if col == 0 && used == 0 {
+                row.set_time(old.time());
+                row.set_flags(old.flags());
+                (base, first, joined, start) = (old.cellsize(), true, false, index);
+            }
             let mut x = 0u16;
             while x < end {
                 let Some(cell) = old.get(x) else { break };
@@ -254,14 +274,15 @@ impl Grid {
                     if index != line_row {
                         // the rest of a row a join stopped in keeps its line (flags, time)
                         (line_row, split) = (index, false);
-                        wrap!();
+                        // a row none of which was joined is its own line still
+                        wrap!(false, if x == 0 { old.cellsize() } else { end - x }, true, index);
                         row.set_time(old.time());
                         row.set_flags(old.flags());
                     } else {
-                        let first = !split;
+                        let first_part = !split;
                         split = true;
-                        wrap!();
-                        if first && width > cols { wrap!(); }
+                        wrap!(true, 0, false, index);
+                        if first_part && width > cols { wrap!(true, 0, false, index); }
                     }
                 }
                 // a cursor inside a tab keeps its offset, on a wide character its first half
@@ -277,14 +298,16 @@ impl Grid {
                             .unwrap_or_else(|| if tab > 0 { cell.clone() } else { let mut c = crate::Cell::new(); c.set_wide_continuation(true); c });
                         *row.get_mut_untracked(col + i).unwrap() = c;
                     }
+                    if index != start { joined = true; }
                     if let Some(m) = metadata { row.set_metadata(col, m); }
                     col += width.min(cols - col);
                     used = used.saturating_add(width);
                 }
                 for _ in 0..padding {
                     if used + 1 > cols {
-                        if index != line_row { (line_row, split) = (index, false); } else { split = true; }
-                        wrap!();
+                        let part = index == line_row;
+                        if !part { (line_row, split) = (index, false); } else { split = true; }
+                        wrap!(part, 0, false, index);
                     }
                     used += 1;
                 }
@@ -293,13 +316,14 @@ impl Grid {
             if index == cursor_row && self.pos.col >= x { cursor = (produced,col.saturating_add(self.pos.col-x).min(cols-1)); }
             if index == saved_row && self.saved_pos.col >= x { saved = (produced,col.saturating_add(self.saved_pos.col-x).min(cols-1)); }
             if !wrapped {
+                row.set_cellsize(cellsize!(false));
                 emit(row, &mut out, &mut produced);
                 row = crate::row::Row::new(cols);
                 (col, used) = (0, 0);
                 (line_row, split) = (index + 1, false);
             }
         }
-        if col > 0 || used > 0 { emit(row, &mut out, &mut produced); }
+        if col > 0 || used > 0 { row.set_cellsize(cellsize!(false)); emit(row, &mut out, &mut produced); }
         while out.len() < usize::from(size.rows()) {
             emit(crate::row::Row::new(size.cols()), &mut out, &mut produced);
         }
@@ -884,7 +908,7 @@ impl Grid {
         // (no cells, tmux's cellsize 0) with the default background is left alone, the
         // wrap of the line above included
         let row = self.current_row_mut();
-        if row.used_len() == 0 && row.metadata().next().is_none() && attrs.bgcolor == crate::Color::Default {
+        if row.cellsize() == 0 && row.used_len() == 0 && row.metadata().next().is_none() && attrs.bgcolor == crate::Color::Default {
             return;
         }
         let flags = row.flags() & !(crate::ROW_HYPERLINK | crate::ROW_EXTENDED);
@@ -1101,6 +1125,7 @@ impl Grid {
                     cell.set('E', crate::attrs::Attrs::default());
                 }
             }
+            row.expand(cols);
         }
         self.scroll_top = 0;
         self.scroll_bottom = self.size.rows() - 1;

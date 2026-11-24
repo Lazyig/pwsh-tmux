@@ -101,6 +101,67 @@ mod metadata_tests {
         Parser::new(NonZeroU16::new(rows).unwrap(), NonZeroU16::new(cols).unwrap(), 100)
     }
     #[test]
+    fn cellsize_is_what_tmux_allocates_for_the_line() {
+        // gl->cellsize as tmux 3.8's capture-pane -R shows it for each line, written at 80
+        // columns: a quarter, half or all of the width once a cell is written (printed
+        // spaces too), not less after EL from the cursor or a backspace; ICH and DCH move
+        // cells up to the end, ECH and EL with the default background clear only what
+        // the line has, with another colour up to the cells cleared; EL 2 empties it
+        let lines: [(&str, u16); 14] = [
+            ("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r50%\x1b[K", 80),
+            ("zzzzzzzzzzzzzzzzzzzzzzzzz\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x1b[K", 40),
+            ("ab                              ", 40),
+            ("xxxxxxxxxxxxxxxxxx\u{4e2d}", 20),
+            ("q", 20),
+            ("wide\u{4e2d}\u{4e2d}\x1b[3D\x1b[K", 20),
+            ("ich\x1b[5@", 80),
+            ("dch:abcdef\x1b[3D\x1b[2P", 80),
+            ("ech:abcdef\x1b[3D\x1b[2X", 20),
+            ("\x1b[44mbg\x1b[K\x1b[0m", 80),
+            ("el2:abc\x1b[2K", 0),
+            ("tab\tx", 20),
+            ("0000000000000000000000000000000000000000000000000000000000000000000000\x1b[1K", 80),
+            ("", 0),
+        ];
+        let mut p = parser(16, 80);
+        for (text, _) in &lines { p.process(text.as_bytes()); p.process(b"\r\n"); }
+        let size = |p: &Parser, y: usize| p.screen().history_row(y).unwrap().cellsize();
+        for (y, (text, want)) in lines.iter().enumerate() {
+            assert_eq!(size(&p, y), *want, "line {y} {text:?}");
+        }
+        // a run of printable characters (screen_write_collect_add) is written with one
+        // grid_set_cells, so one ending at a quarter of the width takes the line to a half;
+        // a run ends at anything but a printable character and at the end of a read
+        let mut p = parser(4, 20);
+        p.process(b"round\r\nl1\r\n");
+        for c in b"abcde" { p.process(&[*c]); }
+        p.process(b"\r\nabc\x1b[1mde");
+        assert_eq!([size(&p, 0), size(&p, 1), size(&p, 2), size(&p, 3)], [10, 5, 5, 5]);
+        // printed past the line's cells and then cleared, the line keeps them until EL 2
+        let mut p = parser(4, 80);
+        p.process(b"\x1b[60Gx\x1b[1K\r\n\x1b[2Kx");
+        assert_eq!((size(&p, 0), size(&p, 1)), (80, 20));
+        // DECALN fills every line
+        p.process(b"\x1b#8");
+        assert_eq!(size(&p, 3), 80);
+        // reflow (grid_reflow): a line moved across keeps its size, the first part of a
+        // split line has exactly its cells and the other parts what they are written
+        // with, a line joined onto grows (tmux 3.8, resized from 80 columns)
+        let mut p = parser(8, 80);
+        p.process(b"q\r\nab                              \r\n0000000000000000000000000000000000000000000000000000000000000000000000\r\nwide\xe4\xb8\xad");
+        let all = |p: &Parser| (0..p.screen().history_rows_len()).map(|y| size(p, y)).collect::<alloc::vec::Vec<_>>();
+        let resize = |p: &mut Parser, cols: u16| p.set_size(NonZeroU16::new(8).unwrap(), NonZeroU16::new(cols).unwrap());
+        assert_eq!(all(&p)[..4], [20, 40, 80, 20]);
+        resize(&mut p, 120);
+        assert_eq!(all(&p)[..4], [20, 40, 80, 20]);
+        resize(&mut p, 60);
+        assert_eq!(all(&p)[..5], [20, 40, 60, 15, 20]);
+        resize(&mut p, 200);
+        assert_eq!(all(&p)[..4], [20, 40, 100, 20]);
+        resize(&mut p, 25);
+        assert_eq!(all(&p)[..7], [20, 25, 12, 25, 25, 25, 20]);
+    }
+    #[test]
     fn osc_marks_links_tabs_and_history() {
         let mut p = parser(3, 20);
         p.screen_mut().set_time(123);

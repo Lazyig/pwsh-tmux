@@ -110,3 +110,20 @@ character completed from a split). Printable ASCII with wrapping on and insert
 mode off goes through `WrappedScreen::text_ascii`, the one-column case of
 `text` with a single row lookup. Neither changes the result. Tests:
 parser::tests, screen::tests.
+
+Local change: each row keeps tmux's gl->cellsize (`Row::cellsize`, read with
+`RowContents::cellsize`), the cells grid_expand_line gives a line: none until a
+cell is written, then a quarter, half or all of the width. Printed cells grow it
+(a run of printable ASCII in one step, as screen_write_collect_add writes it with
+one grid_set_cells, so a run ending at a quarter of the width takes the next
+size; other characters, tabs and DECALN a cell or line at a time), ICH and DCH
+grow it to the width (grid_move_cells), ECH and EL with a background colour to
+the cells cleared; with the default background they clear only what the line
+has, so a line redrawn with CR and EL keeps its size. Clearing a whole line
+(EL 2, ED, a scroll) empties it, or gives it the width with a background colour
+(grid_empty_line). Reflow keeps the size of a line moved across, gives the first
+part of a split line exactly its cells, the rest of a line a join took part of
+exactly what is left, and grows a line others are joined onto (grid_reflow).
+EL 2 on a line with no cells leaves it alone only while its size is 0
+(screen_write_clearline). capture-pane -N, -e and -R and history_bytes read it.
+Tests: lib.rs::metadata_tests (sizes from tmux 3.8's capture-pane -R).

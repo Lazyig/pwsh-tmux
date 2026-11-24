@@ -535,11 +535,14 @@ pub fn sgr_diff(last: &Style, cur: &Style) -> String {
 }
 
 /// The cells grid_string_cells reads from a line: with `allocated`
-/// (GRID_STRING_EMPTY_CELLS) what the line has room for (gl->cellsize, a quarter, half or
-/// all of the width once written), otherwise up to the last used one (gl->cellused).
+/// (GRID_STRING_EMPTY_CELLS) the cells the line has (gl->cellsize, kept by vt100 as tmux
+/// keeps it: a quarter, half or all of the width once written, not fewer after a part of
+/// the line is erased), otherwise up to the last used one (gl->cellused, from the cells).
 pub fn line_cells_end(line: &Line, allocated: bool) -> usize {
-    let used = (0..line.cells.len()).rposition(|x| line.cells[x].text != " " || line.cells[x].style != Style::default() || line.metadata.contains_key(&(x as u16))).map_or(0, |x| x + 1);
-    if allocated { super::vars::line_cellsize(line.cells.len(), used) } else { used }
+    if allocated {
+        return usize::from(line.cellsize).min(line.cells.len());
+    }
+    (0..line.cells.len()).rposition(|x| line.cells[x].text != " " || line.cells[x].style != Style::default() || line.metadata.contains_key(&(x as u16))).map_or(0, |x| x + 1)
 }
 
 /// capture-pane -e: a line with SGR escapes, after the lines before it (grid_string_cells keeps lastgc from

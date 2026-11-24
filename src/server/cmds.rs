@@ -6434,7 +6434,7 @@ fn glob_files(path: &str) -> Vec<String> {
 
 /// A history row as cells (see cells::line_at).
 fn row_line(row: &vt100::capture::RowContents, cols: u16) -> crate::cells::Line {
-    crate::cells::Line { cells: (0..cols).map(|c| row.cell(c).map(crate::cells::cell_from_vt).unwrap_or_default()).collect(), wrapped: row.wrapped(), flags: row.flags(), time: row.time(), metadata: row.metadata().map(|(x,m)| (x,m.clone())).collect() }
+    crate::cells::Line { cells: (0..cols).map(|c| row.cell(c).map(crate::cells::cell_from_vt).unwrap_or_default()).collect(), wrapped: row.wrapped(), flags: row.flags(), time: row.time(), metadata: row.metadata().map(|(x,m)| (x,m.clone())).collect(), cellsize: row.cellsize() }
 }
 
 /// One captured line: -e adds attribute sequences, `keep` (-N) keeps trailing spaces (up to
@@ -6458,7 +6458,8 @@ fn capture_line(line: &crate::cells::Line, escapes: bool, keep: bool, trim_unuse
     let text = if escapes {
         render::line_with_escapes_from(&line, last_link, allocated, keep)
     } else if keep && allocated {
-        // -N: the trailing spaces kept go on to what the line has room for, not the width
+        // -N: the trailing spaces kept go on to the cells the line has (gl->cellsize), not
+        // the width
         (0..render::line_cells_end(&line, true)).map(|x| line.cell_text(x)).collect()
     } else {
         (0..line.cells.len()).map(|x| line.cell_text(x)).collect()
@@ -6494,13 +6495,12 @@ fn capture_grid(screen: &vt100::Screen, limit: usize) -> String {
         let cells: Vec<Option<&vt100::Cell>> = (0..sx).map(|x| row.cell(x)).collect();
         // gl->cellused: a wide character's padding cell is written too
         let used = cells.iter().rposition(|c| c.is_some_and(|c| c.has_contents() || c.is_wide_continuation())).map_or(0, |i| i + 1);
-        let written = cells.iter().rposition(|c| c.is_some_and(|c| c.has_contents() || c.bgcolor() != vt100::Color::Default)).map_or(0, |i| i + 1);
         // GRID_LINE_* from the row's flags (the OSC 133 columns are not kept)
         let (marks, extended) = screen.history_row_flags(yy);
         let lflags = row.wrapped() as u32 | (extended as u32) << 1
             | [(vt100::ROW_START_PROMPT, 0x8), (vt100::ROW_SECOND_PROMPT, 0x10), (vt100::ROW_START_COMMAND, 0x20), (vt100::ROW_START_OUTPUT, 0x40), (vt100::ROW_END_OUTPUT, 0x80), (vt100::ROW_HYPERLINK, 0x100)]
                 .iter().filter(|(m, _)| marks & m != 0).map(|(_, f)| f).sum::<u32>();
-        let _ = writeln!(out, "\tL {yy} ({p}) flags={}[{lflags:x}] {used}/{}", names(lflags, &[(1, "WRAPPED"), (2, "EXTENDED"), (0x8, "START_PROMPT"), (0x10, "SECOND_PROMPT"), (0x20, "START_COMMAND"), (0x40, "START_OUTPUT"), (0x80, "END_OUTPUT"), (0x100, "HYPERLINK")]), super::vars::line_cellsize(cells.len(), written));
+        let _ = writeln!(out, "\tL {yy} ({p}) flags={}[{lflags:x}] {used}/{}", names(lflags, &[(1, "WRAPPED"), (2, "EXTENDED"), (0x8, "START_PROMPT"), (0x10, "SECOND_PROMPT"), (0x20, "START_COMMAND"), (0x40, "START_OUTPUT"), (0x80, "END_OUTPUT"), (0x100, "HYPERLINK")]), row.cellsize());
         let mut tab_end = 0;
         for (xx, c) in cells.iter().enumerate() {
             let meta = row.cell_metadata(xx as u16);
@@ -6567,6 +6567,37 @@ pub const VAR_NAMES: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_n_keeps_the_cells_the_line_was_given() {
+        // capture-pane -N (GRID_STRING_EMPTY_CELLS) reads a line up to gl->cellsize, which
+        // grows as cells are written and does not shrink when a line is redrawn over with
+        // CR and EL (a progress bar, a shell's line editor); widths from tmux 3.8
+        let lens = |cols: u16, out: &str| -> Vec<usize> {
+            let mut p = vt100::Parser::new(std::num::NonZeroU16::new(8).unwrap(), std::num::NonZeroU16::new(cols).unwrap(), 100);
+            p.process(out.as_bytes());
+            let screen = p.screen();
+            (0..4).map(|y| {
+                let line = crate::cells::line_at(screen, y);
+                let n = capture_line(&line, false, true, false, false, &mut render::EscState::default(), true);
+                let e = capture_line(&line, true, true, false, false, &mut render::EscState::default(), true);
+                assert_eq!(n, e, "-e adds no escapes to default cells");
+                n.chars().count()
+            }).collect()
+        };
+        let progress = format!("{}\r50%\x1b[K\r\n", "x".repeat(50));
+        assert_eq!(lens(80, &progress)[..1], [80]);
+        assert_eq!(lens(100, &format!("name{}\r\n{}\r\x1b[5C\x1b[K\r\n", " ".repeat(76), "0".repeat(60)))[..2], [100, 100]);
+        // printed spaces are cells, a wide character two (20 cells, its second half not
+        // a character), a cleared line none
+        assert_eq!(lens(80, "ab                              \r\nq\r\nabc\x1b[2K\r\n\x1b[10G\u{4e2d}\r\n"), [40, 20, 0, 19]);
+        // without -N trailing spaces go, without -e or -N up to the last used cell
+        let mut p = vt100::Parser::new(std::num::NonZeroU16::new(2).unwrap(), std::num::NonZeroU16::new(80).unwrap(), 0);
+        p.process(progress.as_bytes());
+        let line = crate::cells::line_at(p.screen(), 0);
+        assert_eq!(capture_line(&line, false, false, false, false, &mut render::EscState::default(), true), "50%");
+        assert_eq!(render::line_cells_end(&line, false), 3);
+    }
 
     #[test]
     fn names_from_commands_keep_backslashes_on_windows_only() {

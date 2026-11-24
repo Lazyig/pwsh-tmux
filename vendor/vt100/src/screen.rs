@@ -117,6 +117,12 @@ pub struct Screen {
     allow_alternate: bool,
     widths: Vec<(u32, u32, u16)>,
     variation_wide: bool,
+    /// The run of printable ASCII being written (screen_write_collect_add): its row,
+    /// the column after it and the row's cellsize before it. tmux writes a run with one
+    /// grid_set_cells, so the line grows to the run's end in one step (a run ending at a
+    /// quarter or half of the width gets the next size, one cell at a time would not);
+    /// anything but a printable character ends the run (input_parse).
+    print_run: Option<(u16, u16, u16)>,
 
     /// Cursor saved by entering the alternate screen with DECSET 1049 (tmux's
     /// saved_cx/saved_cy), as (row, col).
@@ -170,6 +176,7 @@ impl Screen {
             last_char: None,
             scroll_on_clear: false,
             allow_alternate: true, widths: Vec::new(), variation_wide: false,
+            print_run: None,
 
             alternate_saved: None,
             alternate_saved_attrs: crate::attrs::Attrs::default(),
@@ -180,6 +187,11 @@ impl Screen {
     /// Preserve cleared normal-screen rows in history, as tmux does.
     /// Pane policy for DEC alternate-screen modes.
     pub fn set_alternate_screen_allowed(&mut self, enabled: bool) { self.allow_alternate = enabled; }
+
+    /// Ends the run of printable characters being written (see `print_run`).
+    pub(crate) fn end_print_run(&mut self) {
+        self.print_run = None;
+    }
 
     /// Width ranges are applied in order; the last matching entry wins.
     pub fn set_codepoint_widths(&mut self, widths: Vec<(u32, u32, u16)>, variation_wide: bool) {
@@ -1427,6 +1439,8 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
 
     fn text_any(&mut self, c: char) {
         let screen = &mut self.screen;
+        // screen_write_cell: one cell at a time
+        screen.end_print_run();
         let pos = screen.grid().pos();
         let mut attrs = screen.attrs;
         attrs.set_charset(c.is_ascii() && screen.graphics_charset());
@@ -1536,6 +1550,11 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
             screen.grid().drawing_cell(base_pos).unwrap().is_wide();
 
         screen.text_cleanup(base_pos, cell_was_wide, cell_is_wide);
+        // grid_set_cell and grid_set_padding: the line has room for the character and
+        // its second half (screen_write_overwrite's blank after a half it replaced too)
+        let cols = screen.grid().size().cols();
+        let end = base_pos.col + if cell_is_wide || cell_was_wide { 2 } else { 1 };
+        screen.grid_mut().drawing_row_mut(base_pos.row).unwrap().expand(end.min(cols));
         let hyperlink = screen.hyperlink.clone();
         // grid_extended_cell: the line keeps GRID_LINE_EXTENDED once an extended cell is
         // written to it, even after the cell is overwritten
@@ -1568,7 +1587,17 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
         screen.grid_mut().col_inc(1);
         let cleanup_attrs = screen.attrs;
         let hyperlink = screen.hyperlink.clone();
+        let cols = screen.grid().size().cols();
+        // grid_set_cells over the run so far
+        let base = match screen.print_run {
+            Some((y, x, base)) if y == pos.row && x == pos.col => base,
+            _ => screen.grid().drawing_row(pos.row).map_or(0, crate::row::Row::cellsize),
+        };
+        screen.print_run = Some((pos.row, pos.col + 1, base));
         let row = screen.grid_mut().drawing_row_mut(pos.row).unwrap();
+        if pos.col + 1 > base {
+            row.set_cellsize(crate::row::expanded_cellsize(pos.col + 1, cols).max(row.cellsize()));
+        }
         let cell = row.get_mut(pos.col).unwrap();
         let cell_was_wide = cell.is_wide();
         // Cell::set clears the wide flags of a one column character
@@ -1582,6 +1611,7 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
             if let Some(next_cell) = row.get_mut(pos.col + 1) {
                 if next_cell.is_wide_continuation() {
                     next_cell.set(' ', cleanup_attrs);
+                    row.expand(pos.col + 2);
                 }
             }
         }
@@ -1626,6 +1656,7 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                 row.wrap(wrapped);
             }
             for x in col..next { row.get_mut(x).unwrap().set(' ', *first.attrs()); }
+            row.expand(next);
             row.set_metadata(col, crate::CellMetadata { tab_width: next - col, hyperlink });
         }
         self.screen.grid_mut().col_set(next);
@@ -2272,9 +2303,13 @@ mod tests {
                     0..=7 => {
                         let c = char::from(b' ' + next(95) as u8);
                         if !ws.screen.wrap_mode() || ws.screen.insert_mode() { continue; }
+                        // a run of printable characters grows its line in one step, `text_any`
+                        // a cell at a time: the same for the first character of a run
+                        ws.screen.end_print_run();
                         let mut other = WrappedScreen { screen: ws.screen.clone(), callbacks: ws.callbacks.clone() };
                         ws.text_ascii(c);
                         other.text_any(c);
+                        other.screen.print_run = ws.screen.print_run;
                         assert_eq!(alloc::format!("{:?}", ws.screen), alloc::format!("{:?}", other.screen));
                         assert_eq!(ws.callbacks.0, other.callbacks.0);
                         checked += 1;

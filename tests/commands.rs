@@ -1231,10 +1231,18 @@ fn capture_details(ctx: &Ctx) {
     assert!(ctx.fails(&["capture-pane", "-p", "-a", "-t", "c"]).contains("no alternate screen"));
     assert_eq!(ctx.ok(&["capture-pane", "-p", "-a", "-q", "-t", "c"]), "\n");
     assert!(ctx.ok(&["capture-pane", "-p", "-R", "-t", "c"]).starts_with("G 20x4 (0/"));
-    // -N keeps the trailing spaces a line has room for (gl->cellsize: a quarter, half or
-    // all of the width once written), not the whole width
+    // -N keeps the trailing spaces up to the cells the line was given (gl->cellsize: a
+    // quarter, half or all of the width once written, not fewer when part of it is
+    // cleared), not the whole width; -R shows the same sizes
     let kept = "l1   \nlong line wrapping a\nround     \n\\z   \n";
     assert_eq!(ctx.ok(&["capture-pane", "-p", "-N", "-t", "c"]), kept);
+    let sizes: Vec<String> = ctx.ok(&["capture-pane", "-p", "-R", "-t", "c"]).lines().filter(|l| l.starts_with("\tL ")).map(|l| l.rsplit(' ').next().unwrap().to_string()).collect();
+    assert_eq!(sizes, ["2/5", "20/20", "5/10", "2/5"]);
+    // a line drawn over with CR and EL keeps its cells (tmux 3.8: 100 and 100)
+    ctx.ok(&["new-session", "-d", "-s", "n", "-x", "100", "-y", "4", "printf 'name%76s\\n' ''; printf '%060d\\r\\033[5C\\033[K\\n' 0; sleep 100"]);
+    wait_for("redrawn line", || ctx.capture("n").contains("00000"));
+    let widths: Vec<usize> = ctx.ok(&["capture-pane", "-p", "-N", "-E", "1", "-t", "n"]).lines().map(str::len).collect();
+    assert_eq!(widths, [100, 100]);
     ctx.ok(&["copy-mode", "-t", "c"]);
     assert!(ctx.ok(&["capture-pane", "-p", "-M", "-t", "c"]).contains("long line"));
     assert_eq!(ctx.ok(&["capture-pane", "-p", "-M", "-N", "-t", "c"]), kept);

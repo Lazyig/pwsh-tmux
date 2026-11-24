@@ -63,7 +63,9 @@ impl Cell {
 
 /// One terminal row. `wrapped` means the row continues on the next one (soft wrap).
 /// `flags` are vt100's ROW_* line flags (OSC 133 marks, hyperlinks), `time` when the
-/// row entered the history (0 if not), `metadata` the row's hyperlinks and tabs by column.
+/// row entered the history (0 if not), `metadata` the row's hyperlinks and tabs by column,
+/// `cellsize` the cells tmux would have allocated for it (gl->cellsize, vt100's
+/// `Row::cellsize`; 0 for a line not read from a screen).
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Line {
     pub cells: Vec<Cell>,
@@ -71,6 +73,7 @@ pub struct Line {
     pub flags: u8,
     pub time: u64,
     pub metadata: std::collections::BTreeMap<u16, vt100::CellMetadata>,
+    pub cellsize: u16,
 }
 
 impl Line {
@@ -311,7 +314,7 @@ pub fn snapshot_texts(screen: &vt100::Screen, index: usize, width: usize, mut f:
 pub fn line_at(screen: &vt100::Screen, index: usize) -> Line {
     let cols = screen.size().1.get();
     match screen.history_row(index) {
-        Some(row) => Line { cells: (0..cols).map(|c| row.cell(c).map(cell_from_vt).unwrap_or_default()).collect(), wrapped: row.wrapped(), flags: row.flags(), time: row.time(), metadata: row.metadata().map(|(x,m)| (x,m.clone())).collect() },
+        Some(row) => Line { cells: (0..cols).map(|c| row.cell(c).map(cell_from_vt).unwrap_or_default()).collect(), wrapped: row.wrapped(), flags: row.flags(), time: row.time(), metadata: row.metadata().map(|(x,m)| (x,m.clone())).collect(), cellsize: row.cellsize() },
         None => Line { cells: vec![Cell::default(); cols as usize], wrapped: false, ..Default::default() },
     }
 }
