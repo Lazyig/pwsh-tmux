@@ -13,6 +13,51 @@ pub const BIN: &str = env!("CARGO_BIN_EXE_pwsh-tmux");
 pub fn binary() -> std::ffi::OsString {
     std::env::var_os("PT_TEST_BIN").unwrap_or_else(|| BIN.into())
 }
+
+/// An empty home directory for the binary under test, so a server started without -f
+/// does not read the user's ~/.pwsh-tmux.conf or ~/.config/pwsh-tmux/pwsh-tmux.conf.
+pub fn home() -> String {
+    static HOME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("pwsh-tmux-test-home-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // zsh starts its new-user wizard in a home without startup files, which would
+        // hold up every pane whose shell is zsh
+        let _ = std::fs::write(dir.join(".zshrc"), "");
+        let dir = if cfg!(unix) { std::fs::canonicalize(&dir).unwrap() } else { dir };
+        dir.to_string_lossy().into_owned()
+    })
+    .clone()
+}
+
+/// The environment every launch of the binary gets: the empty home, no XDG config
+/// directory and no outer tmux.
+pub fn test_env() -> Vec<(&'static str, Option<String>)> {
+    let mut env = vec![("HOME", Some(home())), ("XDG_CONFIG_HOME", None), ("PWSH_TMUX", None), ("PWSH_TMUX_PANE", None)];
+    if cfg!(windows) {
+        env.push(("USERPROFILE", Some(home())));
+    }
+    env
+}
+
+pub fn isolate(c: &mut Command) -> &mut Command {
+    for (k, v) in test_env() {
+        match v {
+            Some(v) => c.env(k, v),
+            None => c.env_remove(k),
+        };
+    }
+    c
+}
+
+pub fn isolate_pty(cb: &mut CommandBuilder) {
+    for (k, v) in test_env() {
+        match v {
+            Some(v) => cb.env(k, v),
+            None => cb.env_remove(k),
+        }
+    }
+}
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
 pub struct Ctx {
@@ -26,7 +71,7 @@ impl Ctx {
 
     pub fn command(&self) -> Command {
         let mut c = Command::new(binary());
-        c.env("PWSH_TMUX_SOCKET", &self.socket).env_remove("PWSH_TMUX").env_remove("PWSH_TMUX_PANE");
+        isolate(&mut c).env("PWSH_TMUX_SOCKET", &self.socket);
         c
     }
 
@@ -140,9 +185,8 @@ impl Term {
     pub fn attach_answering(ctx: &Ctx, args: &[&str], cols: u16, rows: u16, answers: &[(&[u8], &[u8])]) -> Term {
         let mut cb = CommandBuilder::new(binary());
         cb.args(args);
+        isolate_pty(&mut cb);
         cb.env("PWSH_TMUX_SOCKET", &ctx.socket);
-        cb.env_remove("PWSH_TMUX");
-        cb.env_remove("PWSH_TMUX_PANE");
         cb.env("TERM", "xterm-256color");
         // a known terminal: 256 colours, no truecolor unless a test asks for it
         cb.env_remove("COLORTERM");

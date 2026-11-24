@@ -433,6 +433,7 @@ fn progress_bar_preserves_dark_truecolor_background_on_blank_cells() {
     ctx.ok(&["new-session", "-d", "-s", "colors", python,
         fixture.to_str().unwrap(), "--ascii", "--progress-colors"]);
     let mut cb = portable_pty::CommandBuilder::new(binary());
+    common::isolate_pty(&mut cb);
     cb.args(["attach-session", "-t", "colors"]);
     cb.env("PWSH_TMUX_SOCKET", &ctx.socket);
     cb.env_remove("PWSH_TMUX");
@@ -513,6 +514,7 @@ fn attach_flags_environment_and_destroy() {
     ctx.ok(&["new-session", "-d", "-s", "a2"]);
     ctx.ok(&["set", "-g", "update-environment", "P1FIX_*"]);
     let mut cb = portable_pty::CommandBuilder::new(common::binary());
+    common::isolate_pty(&mut cb);
     cb.args(["attach-session", "-E", "-f", "ignore-size,no-detach-on-destroy,bogus", "-t", "a1"]);
     cb.env("PWSH_TMUX_SOCKET", &ctx.socket);
     cb.env_remove("PWSH_TMUX");

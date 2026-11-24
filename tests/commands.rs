@@ -3855,8 +3855,7 @@ fn spawn_directories_fall_back_to_home_and_resolve() {
     let dir = if cfg!(unix) { std::fs::canonicalize(tmp).unwrap() } else { tmp }.join(format!("{}-d", ctx.socket));
     std::fs::create_dir_all(dir.join("sub")).unwrap();
     let d = dir.to_string_lossy().into_owned();
-    let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap();
-    let home = if cfg!(unix) { std::fs::canonicalize(home).unwrap().to_string_lossy().into_owned() } else { home };
+    let home = common::home();
     ctx.ok(&["-f", sh("/dev/null", "NUL"), "new-session", "-d", "-s", "s", "-c", &d, "sleep 100"]);
     ctx.ok(&["new-window", "-d", "-n", "nx", "-c", &format!("{d}/nope"), "sleep 100"]);
     assert_eq!(ctx.fmt("s:nx", "#{pane_current_path}"), home);

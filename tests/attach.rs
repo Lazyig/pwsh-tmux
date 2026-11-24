@@ -20,7 +20,7 @@ impl Ctx {
     }
 
     fn cmd(&self, args: &[&str]) -> (bool, String) {
-        let out = Command::new(common::binary())
+        let out = common::isolate(&mut Command::new(common::binary()))
             .args(args)
             .env("PWSH_TMUX_SOCKET", &self.socket)
             .env_remove("PWSH_TMUX")
@@ -68,6 +68,7 @@ fn attach_split_type_detach() {
     let pty = native_pty_system();
     let pair = pty.openpty(PtySize { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 }).unwrap();
     let mut cb = CommandBuilder::new(common::binary());
+    common::isolate_pty(&mut cb);
     cb.args(["attach", "-t", "t"]);
     cb.env("PWSH_TMUX_SOCKET", &ctx.socket);
     cb.env_remove("PWSH_TMUX");
