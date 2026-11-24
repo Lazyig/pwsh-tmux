@@ -36,6 +36,11 @@ runtime on Windows, remaps local build paths, and records source and file hashes
 It supports native x86_64 Windows MSVC and Linux GNU builds. `--offline` reuses an
 existing Cargo cache. See [`VALIDATION.md`](VALIDATION.md) for release checks.
 
+Version 0.3.0 cuts key latency, CPU and memory use (see
+[`PERFORMANCE.md`](PERFORMANCE.md)), keeps a client that cannot keep up attached
+as tmux does, and widens the Windows named pipe buffers. The client and server
+messages are unchanged from 0.2.0; restart existing servers (`kill-server`) to use
+the new server.
 Version 0.2.0 moves the compatibility baseline from tmux 3.6a to tmux 3.8 (see
 [`COMPATIBILITY.md`](COMPATIBILITY.md)). The client and server messages changed, so
 upgrade both and restart existing servers (`kill-server`) after upgrading from 0.1.x.
