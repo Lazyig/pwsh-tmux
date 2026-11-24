@@ -97,6 +97,8 @@ jobs:
           cd latest
           # Copy what is on the release, checked against its .sha256 files.
           gh release download "$TAG" --pattern "tmux-$version-*"
+          # Archives built on Windows before 0.3.1 have CRLF .sha256 files.
+          sed -i 's/\r$//' ./*.sha256
           sha256sum -c ./*.sha256
           rm ./*.sha256
           count=0

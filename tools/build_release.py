@@ -137,7 +137,8 @@ def main():
                     entry.mode = 0o755 if path == 'tmux' else 0o644
                     bundle.addfile(entry, io.BytesIO(content))
     checksum = digest(archive.read_bytes())
-    Path(str(archive) + '.sha256').write_text(checksum + '  ' + archive.name + '\n')
+    # bytes, so Windows builds get LF line endings too (sha256sum -c rejects CRLF)
+    Path(str(archive) + '.sha256').write_bytes((checksum + '  ' + archive.name + '\n').encode())
     print(json.dumps(dict(archive=str(archive), sha256=checksum, target=target, windows_imports=imports), indent=2))
 
 
