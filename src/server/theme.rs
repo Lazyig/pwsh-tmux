@@ -656,6 +656,7 @@ mod tests {
             acl_readonly: false,
             io: Default::default(),
             pan: None,
+            block: Default::default(),
         });
         let c = srv.clients.get_mut(&1).unwrap();
         c.attached = true;

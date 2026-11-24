@@ -2464,7 +2464,7 @@ impl Server {
                     // a reply within 5 seconds makes a new buffer
                     if let Some(c) = self.clients.get_mut(&cid).filter(|c| c.attached && c.control == 0 && c.features.has("clipboard")) {
                         if c.clipboard_query.is_none_or(|d| Instant::now() >= d) {
-                            c.send(S_OUTPUT, b"\x1b]52;;?\x07");
+                            c.send_tty(b"\x1b]52;;?\x07");
                             c.clipboard_query = Some(Instant::now() + Duration::from_secs(5));
                         }
                     }

@@ -317,7 +317,8 @@ impl Server {
         for c in self.clients.values().filter(|c| c.attached && c.control == 0 && c.features.has("clipboard")) {
             let shown = c.session.and_then(|s| self.sessions.get(&s)).and_then(|s| s.links.get(&s.active)).is_some_and(|w| *w == wid);
             if shown {
-                c.send(S_OUTPUT, features::string_capability(&c.term_caps, "Ms", "\x1b]52;%p1%s;%p2%s\x07", &["", &enc]).as_bytes());
+                // dropped while blocked (tty_add), TTY_NOBLOCK otherwise (tty_set_selection)
+                c.send_noblock(features::string_capability(&c.term_caps, "Ms", "\x1b]52;%p1%s;%p2%s\x07", &["", &enc]).as_bytes());
             }
         }
         // window_copy_copy_buffer

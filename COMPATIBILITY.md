@@ -74,6 +74,71 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
 
 ## Intentional differences
 
+- **A client that cannot keep up.** As tmux does (server_client_check_redraw), a
+  terminal client is not drawn to while output is still queued for it: its next frame
+  waits until the queue has been written and then covers everything that changed in
+  between. Like tmux (TTY_BLOCK), when what it is not shown reaches 1 + width x height
+  x 8 bytes and its queue has not drained for 100 ms it is blocked, and every 100 ms the output of the panes drawn to it during
+  that time (not panes hidden by zoom, in a mode or held by a prompt) is added to
+  `#{client_discarded}`; when that is below 1 + width x height / 8 bytes and its
+  queue has drained it is unblocked and redrawn in full. A passthrough or OSC 52 (Ms)
+  sequence does not block the client while it is being written (TTY_NOBLOCK); both,
+  like a bell and an OSC 52 clipboard query, are dropped while it is blocked and
+  counted with that output at the next check (tty_add), so they can keep it blocked
+  as in tmux. Unlike tmux:
+  - Frames already queued are complete sequences and are still written, not dropped
+    (tmux empties its tty buffer when it blocks a client). The client therefore stays
+    blocked, and is sent nothing, until they have been written, however little is
+    discarded meanwhile: tmux unblocks a client into the buffer it emptied. A client
+    that stays stopped keeps its 100 ms check, as a tmux client that stays behind does.
+    The start threshold is capped at 2 MiB.
+  - A client whose queue has drained is also unblocked at a check while panes are
+    still writing, and then drawn as usual, not in full (no frame was dropped): it is
+    not sent more than it takes anyway, and it would otherwise show nothing until they
+    stop.
+  - A bell or OSC 52 clipboard query for a client that is not blocked is queued as it
+    comes, but a run of them that the writer has not started on stops at the start
+    threshold (counting each as its queue cost, below); the rest is dropped and added
+    to `#{client_discarded}`. In tmux they go into its buffer, which tty_block_maybe
+    empties at that size. This bounds them for a stopped client that is not blocked
+    yet, or cannot be because a passthrough or Ms sequence has not been written. A
+    client that reads gets to each run, so it is sent every bell.
+  - Every frame is a redraw of what changed, and this renderer has no scroll
+    optimisation, so one scrolled line rewrites every row of the pane. What counts
+    toward blocking is therefore the pane output not yet shown (what tmux would have
+    written), not frame bytes, and a terminal slower than the frames (a few tens of
+    KB/s) shows a steadily scrolling pane up to a frame and the terminal's own buffer
+    behind, where tmux keeps up.
+  - On Unix the connection of an attached terminal client gets a small socket send
+    buffer (SO_SNDBUF 4 KiB), so old frames held by the kernel do not keep a slow
+    terminal drawing after its panes have stopped; tmux writes to the terminal itself.
+    A Windows named pipe keeps the buffer it was created with.
+  - `#{client_written}` counts terminal output as it is queued, as tmux does, and is 0
+    for control clients, which have no tty.
+  - No client is disconnected for being slow. An attached terminal client has no write
+    deadline: a paused terminal, a console selection (Windows QuickEdit) or a stopped
+    client is kept for as long as it stays paused, as tmux keeps it. A client that has
+    not identified, a command client and a control client (whose pause-after and "too
+    far behind" rules are unchanged) must still take each frame within 10 seconds, so a
+    peer that is not an attached terminal cannot hold a connection by not reading. The
+    8 MiB limit on queued output stays for every client as a memory bound. Each frame
+    counts as its bytes, its 5-byte header and 64 bytes for its allocation and its slot
+    in the writer's channel (about 60 bytes measured for a bell), so the limit bounds
+    memory for small frames as well as large ones. An attached client stays far below
+    it: it is sent a frame only once the one before has been written, it is sent
+    nothing while blocked and stays blocked until it has read what was queued, and
+    bells and OSC 52 queries are bounded as above, so a stopped client holds about one
+    frame and the start threshold (some 30 KB at 120x32). With a 120x32 client stopped
+    for 120 s while bells rang without pause in another window, 449 bytes of bells were
+    queued for it, 406 KB were counted as discarded and the server's resident memory
+    stayed at 9.4 MB; with about a hundred bells a second in the pane it shows, 444
+    bytes were queued. The same run with a client that reads sent it every bell and
+    discarded nothing.
+    Passthrough or OSC 52 clipboard writes (Ms) that keep coming while the last one has
+    not been written do not block the client (TTY_NOBLOCK), so a stopped client sent
+    them without end still reaches the limit and is disconnected, where tmux's buffer
+    grows without one. On Windows a write that has waited for a second looks again
+    every 50 ms instead of every 5 ms.
 - **Shell and platform defaults.** `default-shell` is PowerShell, the project's purpose:
   `pwsh`, falling back to `powershell.exe` on Windows and to `$SHELL` (then `/bin/sh`)
   on Unix. On Unix a pane without a command runs its shell as a login shell (argv0 `-` and

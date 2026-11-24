@@ -4,6 +4,7 @@
 //! All state lives on the main loop thread; PTY readers, child waiters, shell jobs
 //! and client connections run on helper threads that only send `Event`s.
 
+mod block;
 mod cmds;
 mod control;
 mod copy;
@@ -97,6 +98,9 @@ pub enum Event {
     ClientUser(ClientId, Option<String>),
     /// Foreground programs looked up off the main thread.
     PaneInfo(Vec<PaneInfo>),
+    /// A client's writer has written all that was queued and its render was deferred
+    /// (see block.rs); the render after this event draws it.
+    Drained,
 }
 
 /// What a pane was running when looked up, and which pane state the lookup was for.
@@ -1114,12 +1118,27 @@ pub struct Client {
     /// refresh-client -L/-R/-U/-D: the window panned and the view's top left in it
     /// (pan_window, pan_ox, pan_oy).
     pub pan: Option<(WinId, u16, u16)>,
+    /// The client cannot keep up (TTY_BLOCK).
+    pub block: block::Block,
 }
 
 #[derive(Default)]
 pub struct ClientIo {
+    /// Terminal output queued for the client (tmux's c->written, which counts what goes
+    /// into the tty buffer).
     pub written: std::sync::atomic::AtomicU64,
+    /// Terminal output not sent: not drawn while blocked, or for a closed connection.
     pub discarded: std::sync::atomic::AtomicU64,
+    /// What every frame ever queued cost (transport::frame_cost; queued_bytes is what of
+    /// it is still waiting).
+    pub queued_total: std::sync::atomic::AtomicU64,
+    /// Writes to this client have no time limit: it has been an attached terminal
+    /// client, which tmux never drops for reading slowly (a paused terminal, a console
+    /// selection, a stopped client).
+    pub patient: std::sync::atomic::AtomicBool,
+    /// The main loop deferred a render until the queue drains: the writer sends
+    /// Event::Drained once it has.
+    pub drain_wake: std::sync::atomic::AtomicBool,
     /// The client has been sent its reply or exit (CLIENT_EXIT).
     pub exit_sent: std::sync::atomic::AtomicBool,
 }
@@ -1154,27 +1173,36 @@ impl Client {
         if kind == S_REPLY || kind == S_EXIT {
             self.io.exit_sent.store(true, Ordering::SeqCst);
         }
-        let len = payload.len().saturating_add(5);
+        let len = transport::frame_cost(payload.len());
+        // tty_add counts terminal output; a control client has no tty
+        let terminal = if kind == S_OUTPUT && self.control == 0 { payload.len() as u64 } else { 0 };
         if self.closed.is_closed() {
-            self.io.discarded.fetch_add(len as u64, Ordering::Relaxed);
+            self.io.discarded.fetch_add(terminal, Ordering::Relaxed);
             return;
         }
         #[allow(deprecated)]
         let reserved = self.queued_bytes.fetch_update(Ordering::SeqCst, Ordering::SeqCst,
             |n| n.checked_add(len).filter(|n| *n <= transport::MAX_OUTPUT_BACKLOG));
         if reserved.is_err() {
-            self.io.discarded.fetch_add(len as u64, Ordering::Relaxed);
+            self.io.discarded.fetch_add(terminal, Ordering::Relaxed);
             self.closed.close();
             return;
+        }
+        if self.attached && self.control == 0 {
+            self.io.patient.store(true, Ordering::SeqCst);
         }
         if self.pending.fetch_add(1, Ordering::SeqCst) == 0 {
             self.backlog_since.store(now_ms(), Ordering::SeqCst);
         }
+        self.io.queued_total.fetch_add(len as u64, Ordering::SeqCst);
         if self.tx.send(frame(kind, payload)).is_err() {
             self.queued_bytes.fetch_sub(len, Ordering::SeqCst);
             self.pending.fetch_sub(1, Ordering::SeqCst);
+            self.io.discarded.fetch_add(terminal, Ordering::Relaxed);
             self.closed.close();
+            return;
         }
+        self.io.written.fetch_add(terminal, Ordering::Relaxed);
     }
 
     /// How long output has been waiting to be written to this client.
@@ -1603,12 +1631,12 @@ pub fn run(config: Option<String>, cwd: Option<String>) -> io::Result<()> {
         let mut output_only = true;
         match rx.recv_timeout(timeout) {
             Ok(ev) => {
-                output_only &= matches!(ev, Event::PaneData(..));
+                output_only &= matches!(ev, Event::PaneData(..) | Event::Drained);
                 srv.handle(ev);
                 // Coalesce bursts of output into one render.
                 let deadline = Instant::now() + Duration::from_millis(4);
                 while let Some(ev) = next_in_burst(&rx, &srv.backlog, deadline) {
-                    output_only &= matches!(ev, Event::PaneData(..));
+                    output_only &= matches!(ev, Event::PaneData(..) | Event::Drained);
                     srv.handle(ev);
                     if Instant::now() > deadline {
                         break;
@@ -2034,6 +2062,7 @@ impl Server {
                 }
             }
             Event::ClientGone(cid) => self.client_gone(cid),
+            Event::Drained => {}
             Event::PaneData(id, generation, data, _credit) => self.pane_data(id, generation, &data),
             Event::PaneExit(id, generation, status) => {
                 if self.panes.get(&id).is_some_and(|p| p.generation == generation) {
@@ -2075,17 +2104,31 @@ impl Server {
         let reader_closed = closed.clone();
         let io = Arc::new(ClientIo::default());
         let writer_io = io.clone();
+        let wake = self.tx.clone();
         thread::spawn(move || {
             use std::sync::atomic::Ordering;
+            let mut shrunk = false;
             // The Client holds the only sender: this ends when it goes, or when a write
             // fails or is cancelled (a write after close fails at once).
             while let Ok(buf) = rx.recv() {
-                let mut send = transport::Io { stream: &stream, closed: &writer_closed, deadline: Some(Instant::now() + transport::IO_TIMEOUT) };
+                // a client not yet identified, a command client and a control client must
+                // keep reading; an attached terminal client may stop for as long as it
+                // likes (blocking keeps its queue small)
+                let patient = writer_io.patient.load(Ordering::SeqCst);
+                if patient && !std::mem::replace(&mut shrunk, true) {
+                    transport::shrink_send_buffer(&stream);
+                }
+                let deadline = (!patient).then(|| Instant::now() + transport::IO_TIMEOUT);
+                let mut send = transport::Io { stream: &stream, closed: &writer_closed, deadline };
                 if send.write_all(&buf).is_err() {
                     break;
                 }
-                writer_bytes.fetch_sub(buf.len(), Ordering::SeqCst);
-                writer_io.written.fetch_add(buf.len() as u64, Ordering::Relaxed);
+                // drained, and the main loop waits for that to render (block.rs): a full
+                // event queue means the main loop is about to look anyway
+                let cost = transport::frame_cost(buf.len() - 5);
+                if writer_bytes.fetch_sub(cost, Ordering::SeqCst) == cost && writer_io.drain_wake.swap(false, Ordering::SeqCst) {
+                    let _ = wake.try_send(Event::Drained);
+                }
                 // still behind: the backlog now starts at this write
                 if writer_pending.fetch_sub(1, Ordering::SeqCst) > 1 {
                     writer_since.store(now_ms(), Ordering::SeqCst);
@@ -2194,6 +2237,7 @@ impl Server {
                 acl_readonly: false,
                 io,
                 pan: None,
+                block: Default::default(),
             },
         );
     }
@@ -2212,7 +2256,9 @@ impl Server {
     }
 
     fn client_gone(&mut self, cid: ClientId) {
-        let Some(c) = self.clients.get(&cid) else { return };
+        let Some(c) = self.clients.get_mut(&cid) else { return };
+        c.block_flush();
+        let c = &self.clients[&cid];
         // server_client_lost: client-detached if attached, client-closed for terminals
         let detached = ((c.attached && c.session.is_some()) || self.ev.lost_attached.remove(&cid)).then(|| self.payload_client(cid));
         let closed = (c.control > 0 || c.ident.as_ref().is_some_and(|i| i.tty)).then(|| self.payload_client(cid));
@@ -2424,6 +2470,7 @@ impl Server {
         if !self.panes.get(&id).is_some_and(|p| p.generation == generation) {
             return;
         }
+        self.block_count(id, data.len());
         self.control_output(id, data);
         let scroll_on_clear = options::is_on(&self.opt_pane(id, "scroll-on-clear"));
         let alternate = options::is_on(&self.opt_pane(id, "alternate-screen"));
@@ -2611,7 +2658,8 @@ impl Server {
             for cid in cids {
                 if vis == "off" || vis == "both" {
                     if let Some(c) = self.clients.get(&cid) {
-                        c.send(S_OUTPUT, b"\x07");
+                        // tty_putcode(TTYC_BEL) goes through tty_add: dropped while blocked
+                        c.send_tty(b"\x07");
                     }
                 }
                 if vis != "off" {
@@ -2874,6 +2922,9 @@ impl Server {
         if self.waits_resumable() {
             t = Duration::ZERO;
         }
+        if let Some(d) = self.block_deadline() {
+            t = t.min(d.saturating_duration_since(now));
+        }
         let now_us = now_us();
         for (_, deadline, _) in self.silence_timers() {
             t = t.min(Duration::from_micros(deadline.saturating_sub(now_us)));
@@ -2914,6 +2965,7 @@ impl Server {
             self.cfg_release_jobs();
         }
         let now = Instant::now();
+        self.block_timers(now);
         let expired: Vec<_> = self.panes.iter_mut().filter_map(|(id, p)| {
             if p.scrollbar_until.is_some_and(|d| d <= now) { p.scrollbar_until = None; Some(*id) } else { None }
         }).collect();

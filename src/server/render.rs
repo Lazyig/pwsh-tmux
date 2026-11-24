@@ -844,7 +844,9 @@ impl Server {
 
     pub fn render_all(&mut self) {
         self.notify_pane_themes();
-        let ids: Vec<ClientId> = self.clients.iter().filter(|(_, c)| c.dirty && c.attached && !c.suspended && c.control == 0 && c.session.is_some()).map(|(id, _)| *id).collect();
+        // a blocked client is not drawn to until its timer unblocks it (TTY_BLOCK)
+        let ids: Vec<ClientId> = self.clients.iter_mut().filter(|(_, c)| c.dirty && c.attached && !c.suspended && c.control == 0 && c.session.is_some())
+            .filter_map(|(id, c)| (!c.block_maybe()).then_some(*id)).collect();
         for id in ids {
             // theme colours parsed without a client are drawn in this client's palette
             let palette = vars::VarCtx { srv: self, t: Target::default(), client: Some(id), extra: HashMap::new() }.theme_palette();
@@ -1885,6 +1887,7 @@ impl Server {
             out.push_str("\x1b[?2026l");
         }
         c.send(S_OUTPUT, out.as_bytes());
+        c.block_sent();
         c.keep_frame(next);
     }
 }
