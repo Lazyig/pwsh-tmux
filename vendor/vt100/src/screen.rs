@@ -1140,6 +1140,7 @@ impl Screen {
         self.grid.set_scrollback(0);
         self.alternate_grid.clear();
         self.alternate_grid.allocate_rows();
+        self.alternate_grid.take_screen_state(&self.grid);
         self.alternate_grid.set_pos_abs(pos);
         self.set_mode(MODE_ALTERNATE_SCREEN);
     }
@@ -1154,6 +1155,9 @@ impl Screen {
         if let Some((row, col)) = self.alternate_saved.filter(|_| cursor) {
             pos = crate::grid::Pos { row, col };
             self.attrs = self.alternate_saved_attrs;
+        }
+        if self.mode(MODE_ALTERNATE_SCREEN) {
+            self.grid.take_screen_state(&self.alternate_grid);
         }
         self.clear_mode(MODE_ALTERNATE_SCREEN);
         self.grid.set_pos_abs(pos);
@@ -1250,9 +1254,12 @@ impl Screen {
         let pos = self.grid().pos();
         let size = self.grid().size();
 
-        // codepoint-widths never applies to 7-bit characters (tmux does not look them up)
+        // codepoint-widths never applies to 7-bit characters (tmux does not look them up);
+        // after it, utf8_width's built-in table, then the Unicode width
         let width = self.widths.iter().rev().find(|(a, b, _)| !c.is_ascii() && (*a..=*b).contains(&(c as u32)))
-            .map(|(_, _, w)| *w as usize).or_else(|| c.width());
+            .map(|(_, _, w)| *w as usize)
+            .or_else(|| crate::default_width(c).map(usize::from))
+            .or_else(|| c.width());
         // utf8_width: C1 control characters are always zero width
         let width = if ('\u{80}'..='\u{9f}').contains(&c) { Some(width.unwrap_or(0)) } else { width };
         if width.is_none() && (u32::from(c)) < 256 {
@@ -1741,8 +1748,9 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
     }
 
     pub fn lf(&mut self) {
+        let blank = self.screen.attrs.blank();
         let on_row = Self::on_row(&self.screen, &mut self.callbacks);
-        self.screen.grid_mut().row_inc_scroll(1, on_row);
+        self.screen.grid_mut().row_inc_scroll_blank(1, on_row, blank);
     }
 
     pub fn vt(&mut self) {
@@ -1784,7 +1792,8 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
 
     // ESC M
     pub fn ri(&mut self) {
-        self.screen.grid_mut().row_dec_scroll(1);
+        let blank = self.screen.attrs.blank();
+        self.screen.grid_mut().row_dec_scroll(1, blank);
     }
 
     // ESC # 8
@@ -1852,7 +1861,8 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
 
     // CSI @
     pub fn ich(&mut self, count: u16) {
-        self.screen.grid_mut().insert_cells(count);
+        let blank = self.screen.attrs.blank();
+        self.screen.grid_mut().insert_cells(count, blank);
     }
 
     // CSI A
@@ -1877,8 +1887,9 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
 
     // ESC D (IND): a line feed without a carriage return
     pub fn ind(&mut self) {
+        let blank = self.screen.attrs.blank();
         let on_row = Self::on_row(&self.screen, &mut self.callbacks);
-        self.screen.grid_mut().row_inc_scroll(1, on_row);
+        self.screen.grid_mut().row_inc_scroll_blank(1, on_row, blank);
     }
 
     // ESC E (NEL)
@@ -1956,7 +1967,8 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
 
     // CSI J
     pub fn ed(&mut self, mode: u16, mut unhandled: impl FnMut(&mut Self)) {
-        let attrs = self.screen.attrs;
+        // tmux clears with the background colour only (grid_clear)
+        let attrs = self.screen.attrs.blank();
         match mode {
             0 if self.screen.scroll_on_clear && self.screen.grid().pos() == crate::grid::Pos { row: 0, col: 0 } => {
                 let on_row = Self::on_row(&self.screen, &mut self.callbacks);
@@ -1987,7 +1999,7 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
 
     // CSI K
     pub fn el(&mut self, mode: u16, mut unhandled: impl FnMut(&mut Self)) {
-        let attrs = self.screen.attrs;
+        let attrs = self.screen.attrs.blank();
         match mode {
             0 => self.screen.grid_mut().erase_row_forward(attrs),
             // screen_write_clearstartofline: to the last column it is the whole line
@@ -2005,33 +2017,39 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
 
     // CSI L
     pub fn il(&mut self, count: u16) {
-        self.screen.grid_mut().insert_lines(count);
+        let blank = self.screen.attrs.blank();
+        self.screen.grid_mut().insert_lines(count, blank);
     }
 
     // CSI M
     pub fn dl(&mut self, count: u16) {
-        self.screen.grid_mut().delete_lines(count);
+        let blank = self.screen.attrs.blank();
+        self.screen.grid_mut().delete_lines(count, blank);
     }
 
     // CSI P
     pub fn dch(&mut self, count: u16) {
-        self.screen.grid_mut().delete_cells(count);
+        let blank = self.screen.attrs.blank();
+        self.screen.grid_mut().delete_cells(count, blank);
     }
 
     // CSI S
     pub fn su(&mut self, count: u16) {
+        let blank = self.screen.attrs.blank();
         let on_row = Self::on_row(&self.screen, &mut self.callbacks);
-        self.screen.grid_mut().scroll_up(count, on_row);
+        self.screen.grid_mut().scroll_up_blank(count, on_row, blank);
     }
 
     // CSI T
     pub fn sd(&mut self, count: u16) {
-        self.screen.grid_mut().scroll_down(count);
+        let blank = self.screen.attrs.blank();
+        self.screen.grid_mut().scroll_down(count, blank);
     }
 
     // CSI X
     pub fn ech(&mut self, count: u16) {
-        let attrs = self.screen.attrs;
+        // screen_write_clearcharacter: the background colour, nothing else
+        let attrs = self.screen.attrs.blank();
         self.screen.grid_mut().erase_cells(count, attrs);
     }
 

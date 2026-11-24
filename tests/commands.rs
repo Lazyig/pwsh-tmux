@@ -3832,6 +3832,20 @@ fn resize_window_is_never_smaller_than_the_layout() {
 }
 
 #[test]
+fn new_session_can_be_one_cell_wide_and_high() {
+    // cmd_new_session_exec: -x and -y go down to 1 (a zero size becomes 1), with or
+    // without a status line
+    let ctx = Ctx::new("newsess1");
+    ctx.ok(&["new-session", "-d", "-s", "a", "-x", "1", "-y", "5"]);
+    assert_eq!(ctx.fmt("a:0", "#{window_width}x#{window_height} #{pane_width}x#{pane_height}"), "1x5 1x5");
+    ctx.ok(&["set", "-g", "status", "off"]);
+    ctx.ok(&["new-session", "-d", "-s", "b", "-x", "1", "-y", "1"]);
+    assert_eq!(ctx.fmt("b:0", "#{window_width}x#{window_height} #{pane_width}x#{pane_height}"), "1x1 1x1");
+    ctx.ok(&["new-session", "-d", "-s", "c", "-x", "3", "-y", "1"]);
+    assert_eq!(ctx.fmt("c:0", "#{pane_width}x#{pane_height}"), "3x1");
+}
+
+#[test]
 fn spawn_directories_fall_back_to_home_and_resolve() {
     // spawn: a -c directory that cannot be entered gives home; pane_current_path is the
     // process's real directory (osdep_get_cwd, on Unix only: Windows keeps the
@@ -4324,7 +4338,9 @@ fn pane_output_that_widens_a_cell_in_the_last_column_leaves_the_server_running()
             let _ = std::fs::remove_file(&go);
         } else {
             ctx.ok(&["new-session", "-d", "-s", &session, "-x", &cols, "-y", &rows, &shown(&file, &format!("@done{i}@"))]);
-            wait_for(&format!("{name} shown"), || ctx.ok(&["capture-pane", "-p", "-J", "-t", &session]).contains(&format!("@done{i}@")));
+            // from the history too: in panic-11.bin's one column pane the marker is taller
+            // than the screen
+            wait_for(&format!("{name} shown"), || ctx.ok(&["capture-pane", "-p", "-J", "-S", "-", "-t", &session]).contains(&format!("@done{i}@")));
         }
     }
     ctx.ok(&["has-session", "-t", "keep"]);

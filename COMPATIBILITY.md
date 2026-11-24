@@ -447,6 +447,11 @@ These do not match tmux 3.8 yet:
   replaces the binding of the other (after `bind 0x31 ...` and `bind 1 ...` only the
   second is left, where tmux keeps both).
 - **Sixel** is not implemented: `#{sixel_support}` is 0 and the DA1 reply has no `;4`.
+- **Character widths** outside tmux's own table (utf8.c, U+261D and the others, which
+  match) come from the Unicode tables, where tmux asks the system's `wcwidth` or
+  utf8proc, so a few characters can be a column apart from tmux on some systems.
+- **`CSI n;0r`:** the parser cannot tell a 0 from a missing parameter, so a bottom row of
+  0 means the last row (as in xterm); tmux reads it as 1 and ignores the region.
 - **`history_bytes` and `history_all_bytes`** on the alternate screen with a scroll region
   count one row of cells fewer than tmux.
 - **Silence alerts with equal deadlines** fire in window id order; tmux's order comes from

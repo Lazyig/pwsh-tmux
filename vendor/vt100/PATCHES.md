@@ -132,3 +132,27 @@ half of the new width stays there.
 EL 2 on a line with no cells leaves it alone only while its size is 0
 (screen_write_clearline). capture-pane -N, -e and -R and history_bytes read it.
 Tests: lib.rs::metadata_tests (sizes from tmux 3.8's capture-pane -R).
+
+Local change: erasing and blank cells as tmux 3.8 makes them. ED, EL and ECH
+clear with the background colour of the current style only (grid_clear_cell:
+no attributes, foreground or underline colour; `Attrs::blank`); upstream copied
+the whole style. ICH, DCH, IL, DL, SU, SD, a line feed (LF, VT, FF, IND, NEL)
+and RI bring in cells and rows with that background (tmux passes `bg` to all of
+them); a wrap scrolls in a default row (screen_write_linefeed(ctx, 1, 8)). With
+the default background rows stay empty and cheap. IL and DL with the cursor
+outside the scroll region move the rows from the cursor to the bottom of the
+screen (grid_view_insert_lines/delete_lines) instead of doing nothing.
+DECSTBM is screen_write_scrollregion: both rows are clamped to the screen, a
+region of less than two rows is ignored with the cursor left where it is, and a
+valid one sends the cursor to 0,0 whatever origin mode says (upstream reset the
+region for a bad one and homed to the region's top). vte reports an empty and
+a 0 parameter alike, so `CSI 3;0r` is the whole-height default here where tmux
+reads 0 as 1 and ignores it. The scroll region, origin mode and the cursor
+DECSC saved belong to the screen in tmux, so they carry over to and from the
+alternate screen (`Grid::take_screen_state`), and a resize resets the region
+only when the height changes (screen_resize_y). Width: utf8.c's built-in table
+(`utf8_default_width_cache`, src/tmux_width.rs, `default_width`) comes after
+codepoint-widths and before the Unicode width, so U+261D, U+26F9, U+270C,
+U+270D, U+1F3CB, U+1F3CC, U+1F574, U+1F575 and U+1F590 are two columns as in
+tmux 3.8 (the regional indicators, one column, already agree). Tests:
+lib.rs::tmux_screen_tests, tmux_width::tests.

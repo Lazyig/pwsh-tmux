@@ -61,11 +61,13 @@ mod row;
 mod row_cells;
 mod screen;
 mod term;
+mod tmux_width;
 
 pub use attrs::Color;
 pub use callbacks::Callbacks;
 pub use cell::Cell;
 pub use row::grown_cellsize;
+pub use tmux_width::default_width;
 pub use row::{ROW_START_OUTPUT, ROW_START_PROMPT, ROW_HYPERLINK, ROW_EXTENDED, ROW_START_COMMAND, ROW_END_OUTPUT, ROW_SECOND_PROMPT};
 pub use parser::Parser;
 pub use screen::{
@@ -514,3 +516,163 @@ mod metadata_tests {
     }
 }
 
+
+/// tmux 3.8's erase style, background colour erase, scroll region and width
+/// table (input.c, screen-write.c, grid.c, grid-view.c, screen.c, utf8.c).
+#[cfg(test)]
+mod tmux_screen_tests {
+    use super::*;
+    use alloc::{string::String, vec::Vec};
+    use core::num::NonZeroU16;
+
+    fn run(rows: u16, cols: u16, input: &str) -> Parser {
+        let mut p = Parser::new(NonZeroU16::new(rows).unwrap(), NonZeroU16::new(cols).unwrap(), 100);
+        p.process(input.as_bytes());
+        p
+    }
+    type Style = (String, bool, bool, bool, Color, Color);
+    /// A cell's text, bold, underline, inverse, foreground and background.
+    fn style(p: &Parser, row: u16, col: u16) -> Style {
+        let c = p.screen().cell(row, col).unwrap();
+        (c.contents().into(), c.bold(), c.underline(), c.inverse(), c.fgcolor(), c.bgcolor())
+    }
+    /// What grid_clear_cell and grid_empty_line leave: nothing but the background.
+    fn blank(bg: Color) -> Style {
+        (String::new(), false, false, false, Color::Default, bg)
+    }
+    fn rows(p: &Parser) -> Vec<String> {
+        p.screen().rows(0, p.screen().size().1.get()).collect()
+    }
+    fn row_is(p: &Parser, row: u16, want: &Style) -> bool {
+        (0..p.screen().size().1.get()).all(|x| style(p, row, x) == *want)
+    }
+
+    #[test]
+    fn erases_leave_only_the_background_colour() {
+        // ECH (screen_write_clearcharacter), EL and ED pass grid_clear only the
+        // current background: bold, underline, inverse and the foreground are not kept
+        let p = run(4, 10, "\x1b[1;4;31mab\x1b[5X\r\n\x1b[1;7;31;44mcd\x1b[3X\x1b[0m");
+        assert_eq!(style(&p, 0, 1), ("b".into(), true, true, false, Color::Idx(1), Color::Default));
+        assert!((2..10).all(|x| style(&p, 0, x) == blank(Color::Default)));
+        assert!((2..5).all(|x| style(&p, 1, x) == blank(Color::Idx(4))));
+        let p = run(4, 10, "\x1b[1;4;31;42mxy\x1b[K\r\n\x1b[1;7;43m\x1b[J");
+        assert!((2..10).all(|x| style(&p, 0, x) == blank(Color::Idx(2))));
+        assert!(row_is(&p, 1, &blank(Color::Idx(3))) && row_is(&p, 3, &blank(Color::Idx(3))));
+        // ECH over the whole line too
+        let p = run(2, 6, "abc\r\x1b[1;45m\x1b[9X");
+        assert!(row_is(&p, 0, &blank(Color::Idx(5))));
+    }
+
+    #[test]
+    fn inserts_deletes_and_scrolls_bring_in_the_background_colour() {
+        let bg = blank(Color::Idx(4));
+        let plain = |s: &str| -> Style { (s.into(), false, false, false, Color::Default, Color::Default) };
+        // ICH and DCH (grid_view_insert_cells, grid_view_delete_cells)
+        let p = run(6, 8, "abcdef\r\x1b[44;1m\x1b[2@");
+        assert_eq!((style(&p, 0, 0), style(&p, 0, 1), style(&p, 0, 2)), (bg.clone(), bg.clone(), plain("a")));
+        let p = run(6, 8, "abcdef\r\x1b[44;1m\x1b[2P");
+        assert_eq!((style(&p, 0, 0), style(&p, 0, 5), style(&p, 0, 6), style(&p, 0, 7)), (plain("c"), blank(Color::Default), bg.clone(), bg.clone()));
+        // in the last column ICH clears that cell; with a wrap pending it does nothing
+        let p = run(6, 8, "abcdefgh\x1b[8G\x1b[44m\x1b[3@");
+        assert_eq!((style(&p, 0, 6), style(&p, 0, 7)), (plain("g"), bg.clone()));
+        let p = run(6, 8, "abcdefgh\x1b[44m\x1b[3@\x1b[3P");
+        assert_eq!(style(&p, 0, 7), plain("h"));
+        // IL, DL, SU, SD, LF at the bottom, RI at the top
+        for (input, row, other) in [
+            ("a\r\nb\x1b[H\x1b[44m\x1b[L", 0, (1, "a")),
+            ("a\r\nb\x1b[H\x1b[44m\x1b[M", 5, (0, "b")),
+            ("a\r\nb\x1b[44m\x1b[S", 5, (0, "b")),
+            ("a\r\nb\x1b[44m\x1b[T", 0, (1, "a")),
+            ("a\r\nb\x1b[6;1H\x1b[44m\n", 5, (0, "b")),
+            ("a\r\nb\x1b[6;1H\x1b[44m\x1bD", 5, (0, "b")),
+            ("a\r\nb\x1b[6;1H\x1b[44m\x1bE", 5, (0, "b")),
+            ("a\r\nb\x1b[H\x1b[44m\x1bM", 0, (1, "a")),
+        ] {
+            let p = run(6, 8, input);
+            assert!(row_is(&p, row, &bg), "{input:?}");
+            assert_eq!(style(&p, other.0, 0), plain(other.1), "{input:?}");
+        }
+        // a wrap scrolls in a default line (screen_write_linefeed(ctx, 1, 8))
+        let p = run(6, 8, "\x1b[6;1H\x1b[44mabcdefghZ");
+        assert_eq!(style(&p, 5, 0).5, Color::Idx(4));
+        assert_eq!(style(&p, 5, 1), blank(Color::Default));
+        // with the default background nothing changes
+        let p = run(6, 8, "a\r\nb\x1b[1;31m\x1b[H\x1b[L\x1b[2@");
+        assert!(row_is(&p, 0, &blank(Color::Default)));
+    }
+
+    #[test]
+    fn insert_and_delete_lines_outside_the_region_reach_the_bottom() {
+        // screen_write_insertline and _deleteline: with the cursor outside the scroll
+        // region the lines from it to the bottom of the screen move
+        let p = run(6, 8, "1\r\n2\r\n3\r\n4\r\n5\x1b[2;3r\x1b[5;1H\x1b[L");
+        assert_eq!(rows(&p), ["1", "2", "3", "4", "", "5"]);
+        let p = run(6, 8, "1\r\n2\r\n3\r\n4\r\n5\r\n6\x1b[2;3r\x1b[4;1H\x1b[M");
+        assert_eq!(rows(&p), ["1", "2", "3", "5", "6", ""]);
+        // inside it, only the region
+        let p = run(6, 8, "1\r\n2\r\n3\r\n4\r\n5\x1b[2;3r\x1b[2;1H\x1b[L");
+        assert_eq!(rows(&p), ["1", "", "2", "4", "5", ""]);
+    }
+
+    #[test]
+    fn scroll_region_homes_the_cursor_and_ignores_one_line() {
+        // screen_write_scrollregion: the cursor goes to 0,0 (not the region's top, origin
+        // mode or not); a region of one line, or one that is so once kept on the screen,
+        // is ignored and the cursor stays
+        let p = run(6, 8, "1\r\n2\r\n3\r\n4\r\n5\x1b[3;5rZ");
+        assert_eq!((p.screen().scroll_region(), p.screen().cursor_position(), rows(&p)[0].as_str()), ((2, 4), (0, 1), "Z"));
+        let p = run(6, 8, "1\r\n2\r\n3\r\n4\r\n5\x1b[?6h\x1b[3;5rZ");
+        assert_eq!((p.screen().cursor_position(), rows(&p)[0].as_str()), ((0, 1), "Z"));
+        let mut p = run(6, 8, "\x1b[?6h\x1b[3;5r");
+        p.process(b"\x1b[H");
+        assert_eq!(p.screen().cursor_position(), (2, 0));
+        let p = run(6, 8, "1\r\n2\r\n3\r\n4\r\n5\x1b[3;9rZ");
+        assert_eq!((p.screen().scroll_region(), p.screen().cursor_position()), ((2, 5), (0, 1)));
+        for input in ["\x1b[2;4r\x1b[5;3H\x1b[7;9r", "\x1b[2;4r\x1b[5;3H\x1b[3;3r", "\x1b[2;4r\x1b[5;3H\x1b[5;2r"] {
+            let p = run(6, 8, input);
+            assert_eq!((p.screen().scroll_region(), p.screen().cursor_position()), ((1, 3), (4, 2)), "{input:?}");
+        }
+        // CSI r is the whole screen
+        let p = run(6, 8, "\x1b[2;4r\x1b[5;3H\x1b[r");
+        assert_eq!((p.screen().scroll_region(), p.screen().cursor_position()), ((0, 5), (0, 0)));
+    }
+
+    #[test]
+    fn region_origin_mode_and_saved_cursor_belong_to_the_screen() {
+        // tmux keeps the region and origin mode in the screen and DECSC's cursor in the
+        // input context: the alternate screen shares them
+        let p = run(6, 8, "\x1b[3;5r\x1b[?1049h");
+        assert_eq!((p.screen().alternate_screen(), p.screen().scroll_region()), (true, (2, 4)));
+        let p = run(6, 8, "\x1b[3;5r\x1b[?1049h\x1b[?1049l");
+        assert_eq!((p.screen().alternate_screen(), p.screen().scroll_region(), p.screen().cursor_position()), (false, (2, 4), (0, 0)));
+        let p = run(6, 8, "\x1b[?47h\x1b[3;5r\x1b[?47l");
+        assert_eq!(p.screen().scroll_region(), (2, 4));
+        let p = run(6, 8, "\x1b[3;5r\x1b[?6h\x1b[?1049h\x1b[2;1HZ");
+        assert_eq!((p.screen().origin_mode(), p.screen().cursor_position()), (true, (3, 1)));
+        let p = run(6, 8, "\x1b[3;4H\x1b7\x1b[?1049h\x1b[H\x1b8Z");
+        assert_eq!((p.screen().cursor_position(), style(&p, 2, 3).0.as_str()), ((2, 4), "Z"));
+        // screen_resize_y resets the region; a change of width alone keeps it
+        let mut p = run(6, 8, "\x1b[3;5r");
+        p.set_size(NonZeroU16::new(6).unwrap(), NonZeroU16::new(12).unwrap());
+        assert_eq!(p.screen().scroll_region(), (2, 4));
+        p.set_size(NonZeroU16::new(7).unwrap(), NonZeroU16::new(12).unwrap());
+        assert_eq!(p.screen().scroll_region(), (0, 6));
+    }
+
+    #[test]
+    fn tmux_width_table_comes_before_the_unicode_width() {
+        // utf8_default_width_cache: U+261D, U+26F9, U+270C, U+270D and others are two
+        // columns in tmux 3.8, one in the Unicode tables; codepoint-widths overrides them.
+        // U+261D is not one utf8_should_combine joins a skin tone to: 2 + 2 + 1
+        for (input, cursor) in [("a\u{261d}b", 4), ("\u{270c}x", 3), ("\u{1f590}x", 3), ("\u{261e}x", 2), ("\u{261d}\u{1f3fb}x", 5), ("\u{1f590}\u{1f3fb}x", 3), ("\u{270c}\u{fe0f}y", 3)] {
+            let p = run(2, 10, input);
+            assert_eq!(p.screen().cursor_position().1, cursor, "{input:?}");
+        }
+        let p = run(2, 10, "a\u{261d}b");
+        assert!(p.screen().cell(0, 1).unwrap().is_wide() && p.screen().cell(0, 2).unwrap().is_wide_continuation());
+        let mut p = run(2, 10, "");
+        p.screen_mut().set_codepoint_widths(alloc::vec![(0x261d, 0x261d, 1)], false);
+        p.process("a\u{261d}b".as_bytes());
+        assert_eq!(p.screen().cursor_position().1, 3);
+    }
+}
