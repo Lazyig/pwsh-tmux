@@ -420,16 +420,22 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
     // Only this loop reads the stream until it returns (wait_closed then only waits
     // for the end, so frames left in this buffer do not matter).
     let mut reader = BufReader::with_capacity(READ_BUFFER, &*stream);
+    // S_OUTPUT payload bytes written to the terminal (C_ACK)
+    let mut output_done: u64 = 0;
     loop {
         let frame = read_frame(&mut reader);
         match frame {
             Ok((S_OUTPUT, p)) => {
                 term::note_focus_mode(&p);
                 let _ = out.write_all(&p);
+                output_done += p.len() as u64;
                 // A run of output frames that has already arrived reaches the terminal
-                // in one flush.
+                // in one flush, and is acknowledged once the terminal has taken it.
                 if !output_frame_buffered(reader.buffer()) {
                     let _ = out.flush();
+                    if g.control == 0 {
+                        post(C_ACK, &output_done.to_le_bytes());
+                    }
                 }
                 if let Some(f) = output_copy.as_mut() {
                     let _ = f.write_all(&p);

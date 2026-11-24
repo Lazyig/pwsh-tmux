@@ -7,20 +7,28 @@
 //! never disconnected for being slow. tmux also defers a redraw while the buffer is not
 //! empty.
 //!
-//! Here the buffer is the client's queue of frames for its writer thread, and every
-//! frame is a redraw (a diff of what the client shows): a dirty client is not rendered
-//! while frames are still queued for it, and the writer wakes the main loop once its
-//! queue has drained, so the next frame covers everything that changed in between
-//! instead of every state in turn. A small socket send buffer (see
-//! [`transport::shrink_send_buffer`]) keeps what the kernel holds for a slow peer short.
-//! What a deferred client is not shown is the output of the panes it shows (tmux
-//! passes pane output to the terminal nearly as it comes); once that and the queue
-//! reach the start threshold and the queue has not drained for an interval, the client
-//! is blocked and the pane output is counted as discarded. Frames already queued are
-//! complete sequences and are written, not dropped, so the client stays blocked until
-//! they have been: tmux empties its buffer when it blocks a client and unblocks it into
-//! that empty buffer. A full frame diff is not a good measure: this renderer has no
-//! scroll optimisation, so one scrolled line rewrites every row.
+//! Here the buffer is the client's queue of frames for its writer thread, with what was
+//! written that the client has not yet passed to its terminal (it acknowledges what it
+//! has, C_ACK), and every frame is a redraw (a diff of what the client shows): a dirty
+//! client is not rendered while frames are still queued for it or on their way to its
+//! terminal, and the writer (or the client's acknowledgement) wakes the main loop once
+//! they are not, so the next frame covers everything that changed in between instead
+//! of every state in turn. Without the acknowledgement, the next frame would wait only
+//! for the connection to take the last one, behind what the connection and the client
+//! still hold for a slow terminal: on a terminal reading 100 KB/s that kept every frame
+//! about 0.3 s behind the pane. A small socket send buffer (see
+//! [`transport::shrink_send_buffer`]) keeps what the kernel holds for a client that does
+//! not acknowledge (an older one) short. What a deferred client is not shown is the
+//! output of the panes it shows (tmux passes pane output to the terminal nearly as it
+//! comes); once that and the queue reach the start threshold and the render has waited
+//! for [`BLOCK_BEHIND`] (a terminal that was slow for the frame before) or
+//! [`BLOCK_INTERVAL`] (one that kept up, see [`Block::slow`]), the client is blocked
+//! and the pane output is counted as discarded. Frames already queued are complete
+//! sequences and are written, not dropped, so the client stays blocked until they have
+//! been: tmux empties its buffer when it blocks a client and unblocks it into that
+//! empty buffer. A full frame diff is not a good measure: a pane beside another
+//! one is not scrolled on the terminal (render.rs, find_scroll), so one scrolled line
+//! rewrites every row of it.
 //!
 //! Output outside frames (a bell, an OSC 52 query) goes through tty_add in tmux: while
 //! the client is blocked it is counted as discarded like pane output, and otherwise it
@@ -32,6 +40,16 @@ use super::*;
 use std::sync::atomic::Ordering;
 
 pub const BLOCK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long a render may wait for the terminal to take the frames before it, with the
+/// start threshold of pane output come meanwhile, before the client is blocked, when
+/// its terminal was this slow for the frame before (see [`Block::slow`]). tmux blocks
+/// as soon as its buffer holds the threshold, which a flood fills in a few milliseconds
+/// once the terminal stops taking output; this allows for a frame being written to a
+/// terminal that keeps up. A terminal slower than a frame in this time is blocked like
+/// tmux's, so frames do not reach it as late as everything it was sent before them
+/// takes it to read.
+pub const BLOCK_BEHIND: Duration = Duration::from_millis(20);
 
 /// TTY_BLOCK_START, capped well below the queue limit so a huge client size still blocks
 /// before the limit would close the connection.
@@ -59,6 +77,14 @@ pub struct Block {
     pub deferred: bool,
     /// Since when renders have been deferred without the queue draining.
     pub deferred_since: Option<Instant>,
+    /// The terminal took [`BLOCK_BEHIND`] or longer for the last frame a render waited
+    /// for (or the client was blocked for it). A terminal that keeps up takes a few
+    /// milliseconds, but its client, its terminal or the server can be held up for
+    /// longer now and then on a busy machine, and a blocked client is shown nothing for
+    /// at least an interval: one that kept up is blocked only once a render has waited
+    /// [`BLOCK_INTERVAL`] (as long as before acknowledgements), one that was slow for
+    /// the frame before already after [`BLOCK_BEHIND`].
+    pub slow: bool,
     /// Output of the panes the client shows since its render was deferred: what tmux
     /// would have added to its buffer meanwhile.
     pub pending: u64,
@@ -80,6 +106,12 @@ impl Block {
 }
 
 impl Client {
+    /// Frames are queued, or output written has not been taken by the terminal yet
+    /// (C_ACK): tmux's tty buffer is not empty.
+    fn waiting(&self) -> bool {
+        self.queued_bytes.load(Ordering::SeqCst) > 0 || self.io.unacked() > 0
+    }
+
     /// What io.queued_total the writer has written up to.
     fn flushed(&self, queued: usize) -> u64 {
         self.io.queued_total.load(Ordering::SeqCst).saturating_sub(queued as u64)
@@ -145,22 +177,28 @@ impl Client {
             return true;
         }
         let queued = self.queued_bytes.load(Ordering::SeqCst);
-        if queued == 0 {
+        let now = Instant::now();
+        if queued == 0 && self.io.unacked() == 0 {
+            self.taken(now);
             self.block.deferred = false;
             self.block.deferred_since = None;
             self.block.pending = 0;
             return false;
         }
-        let now = Instant::now();
         let flushed = self.flushed(queued);
         // without the part of the last full redraw not yet written
         let backlog = queued.saturating_sub(self.block.redraw_until.saturating_sub(flushed) as usize) as u64 + self.block.pending;
         // A client that takes its frames is not blocked by a burst of output that came
         // while one was being written (pane output arrives far faster than frames are
         // sent to a terminal that keeps up): only one whose queue has not drained for an
-        // interval.
-        let behind = self.block.deferred_since.is_some_and(|t| now.duration_since(t) >= BLOCK_INTERVAL);
+        // interval, or for BLOCK_BEHIND when it was slow for the frame before.
+        let behind = self.block.deferred_since.is_some_and(|t| {
+            let waited = now.duration_since(t);
+            waited >= BLOCK_INTERVAL || (waited >= BLOCK_BEHIND && self.block.slow)
+        });
         if behind && flushed >= self.block.noblock_until.get() && backlog >= block_start(self.size) as u64 {
+            // the frame has taken this long so far
+            self.taken(now);
             self.block.tick = Some(now + BLOCK_INTERVAL);
             // tmux drains its buffer: here what it holds beyond the queue is pane output
             self.io.discarded.fetch_add(self.block.pending, Ordering::Relaxed);
@@ -175,14 +213,24 @@ impl Client {
         // set before looking again, so either this sees the queue drained or the writer
         // sees the flag
         self.io.drain_wake.store(true, Ordering::SeqCst);
-        if self.queued_bytes.load(Ordering::SeqCst) > 0 {
+        if self.waiting() {
             return true;
         }
         self.io.drain_wake.store(false, Ordering::SeqCst);
+        self.taken(now);
         self.block.deferred = false;
         self.block.deferred_since = None;
         self.block.pending = 0;
         false
+    }
+
+    /// The terminal has taken the frames a render waited for, or the client is blocked
+    /// for them: whether that was slow ([`Block::slow`]). A render that did not wait
+    /// leaves it as it was.
+    fn taken(&mut self, now: Instant) {
+        if let Some(t) = self.block.deferred_since {
+            self.block.slow = now.duration_since(t) >= BLOCK_BEHIND;
+        }
     }
 
     /// A frame was rendered and queued: if it is the redraw after unblocking, remember
@@ -202,30 +250,32 @@ impl Client {
     }
 
     /// tty_timer_callback. tmux unblocks a client into the buffer it emptied when it
-    /// blocked it; here the frames queued before the block are written instead, so the
-    /// client stays blocked, and what it is sent is dropped, until they have been. A
-    /// stopped client therefore keeps its timer, as a tmux client that stays behind does.
+    /// blocked it; here the frames queued before the block are written (and taken by the
+    /// terminal) instead, so the client stays blocked, and what it is sent is dropped,
+    /// until they have been. A stopped client therefore keeps its timer, as a tmux client
+    /// that stays behind does.
     ///
-    /// Unlike tmux, a client whose queue has drained is unblocked while panes are still
-    /// writing: it is not sent more than it takes anyway (frames wait for the queue), and
-    /// it would otherwise show nothing until the panes are quiet. That is drawn as any
-    /// frame (a diff): no frame was dropped, so the terminal shows the last one sent.
+    /// The first check marks the client for a full redraw, and from then on the panes'
+    /// output is not drawn to it, so not counted (tmux's CLIENT_REDRAWWINDOW makes
+    /// tty_client_ready skip it): a client is unblocked by the next check once the
+    /// terminal has taken what it was sent, even while the panes are still writing. It
+    /// is sent nothing meanwhile, so a slow terminal has had at least an interval to
+    /// catch up when the redraw comes, and it shows what the panes show then.
     fn block_timer(&mut self, now: Instant) {
         if !self.block.tick.is_some_and(|t| t <= now) {
             return;
         }
         let discarded = self.block_flush();
-        if self.queued_bytes.load(Ordering::SeqCst) != 0 {
+        // CLIENT_ALLREDRAWFLAGS: from here the panes' output is not drawn to the client
+        // (tty_client_ready), so not counted, until it has been redrawn in full
+        self.block.redraw = true;
+        self.prev = None;
+        self.dirty = true;
+        if self.waiting() || discarded >= block_stop(self.size) as u64 {
             self.block.tick = Some(now + BLOCK_INTERVAL);
-        } else if discarded < block_stop(self.size) as u64 {
-            // tty_invalidate and CLIENT_ALLREDRAWFLAGS
-            self.block.tick = None;
-            self.block.redraw = true;
-            self.prev = None;
-            self.dirty = true;
         } else {
+            // tty_invalidate
             self.block.tick = None;
-            self.dirty = true;
         }
     }
 
@@ -262,7 +312,10 @@ impl Server {
         for cid in shown {
             if let Some(c) = self.clients.get_mut(&cid) {
                 if c.block.active() {
-                    c.block.discarded += n as u64;
+                    // not drawn while a full redraw is due (CLIENT_REDRAWWINDOW)
+                    if !c.block.redraw {
+                        c.block.discarded += n as u64;
+                    }
                 } else {
                     c.block.pending += n as u64;
                 }
@@ -343,6 +396,51 @@ mod tests {
         }
     }
 
+    /// A frame that a terminal which kept up takes longer than BLOCK_BEHIND for (a busy
+    /// machine) does not block it before an interval; one slow for the frame before is
+    /// blocked after BLOCK_BEHIND.
+    #[test]
+    fn only_a_terminal_slow_before_is_blocked_early() {
+        for slow in [false, true] {
+            let (mut srv, _output, pane) = stopped();
+            let mut from = 0;
+            for _ in 0..3 {
+                from += 50;
+                feed(&mut srv, pane, from, 50);
+                srv.render_all();
+            }
+            let c = srv.clients.get_mut(&1).unwrap();
+            assert!(c.block.deferred && !c.block.active());
+            c.block.slow = slow;
+            // more than the start threshold, while the render has waited a little longer
+            // than BLOCK_BEHIND (and less than an interval, however slowly this runs)
+            for _ in 0..80 {
+                from += 50;
+                feed(&mut srv, pane, from, 50);
+                let c = srv.clients.get_mut(&1).unwrap();
+                if !c.block.active() {
+                    c.block.deferred_since = Some(Instant::now() - BLOCK_BEHIND - Duration::from_millis(5));
+                }
+                srv.render_all();
+            }
+            let c = &srv.clients[&1];
+            assert_eq!(c.block.active(), slow, "slow {slow}");
+            // blocking says it was slow
+            assert_eq!(c.block.slow, slow);
+            if !slow {
+                // an interval
+                behind(&mut srv);
+                for _ in 0..2 {
+                    from += 50;
+                    feed(&mut srv, pane, from, 50);
+                    srv.render_all();
+                }
+                assert!(srv.clients[&1].block.active() && srv.clients[&1].block.slow);
+            }
+            kill(&mut srv);
+        }
+    }
+
     /// While frames are queued nothing more is rendered; what the client is not shown
     /// meanwhile blocks it at the start threshold, it is not closed, what it does not get
     /// is counted, and once the pane is quiet and its queue has drained it is redrawn in
@@ -398,8 +496,9 @@ mod tests {
         kill(&mut srv);
     }
 
-    /// A blocked client that has read what was queued is unblocked and redrawn while the
-    /// pane keeps writing.
+    /// A blocked client that has read what was queued is unblocked and redrawn in full
+    /// while the pane keeps writing: after the first check the pane's output is no longer
+    /// drawn to it, so not counted (CLIENT_REDRAWWINDOW).
     #[test]
     fn a_client_that_catches_up_is_unblocked_while_output_goes_on() {
         let (mut srv, output, pane) = stopped();
@@ -412,15 +511,84 @@ mod tests {
         let now = Instant::now();
         feed(&mut srv, pane, n, 400);
         srv.block_timers(now + BLOCK_INTERVAL);
-        assert!(srv.clients[&1].block.active());
+        assert!(srv.clients[&1].block.active() && srv.clients[&1].block.redraw);
         let _ = frames(&output);
         drain(&srv);
         feed(&mut srv, pane, n + 400, 400);
+        assert_eq!(srv.clients[&1].block.discarded, 0);
         srv.block_timers(now + 2 * BLOCK_INTERVAL);
-        assert!(!srv.clients[&1].block.active() && !srv.clients[&1].block.redraw);
+        assert!(!srv.clients[&1].block.active() && srv.clients[&1].block.redraw);
         srv.render_all();
         let out = frames(&output);
-        assert!(out.contains(&format!("{}", n + 799)), "{out:?}");
+        assert!(out.contains("\x1b[0m\x1b[H") && out.contains(&format!("{}", n + 799)), "{out:?}");
+        kill(&mut srv);
+    }
+
+    /// tty_timer_callback while the panes keep writing to a client that reads: blocked,
+    /// then (whatever was written in the first interval) unblocked by the second check
+    /// with a full redraw, and sent nothing in between.
+    #[test]
+    fn a_flood_keeps_a_reading_client_blocked_for_two_checks_at_most() {
+        let (mut srv, output, pane) = stopped();
+        let mut n = 0;
+        while !srv.clients[&1].block.active() {
+            n = feed(&mut srv, pane, n, 50) + n;
+            srv.render_all();
+            behind(&mut srv);
+        }
+        drain(&srv);
+        let _ = frames(&output);
+        let now = Instant::now();
+        feed(&mut srv, pane, n, 400);
+        assert!(srv.clients[&1].block.discarded > block_stop((120, 32)) as u64);
+        srv.block_timers(now + BLOCK_INTERVAL);
+        assert!(srv.clients[&1].block.active());
+        feed(&mut srv, pane, n + 400, 400);
+        srv.render_all();
+        assert!(frames(&output).is_empty());
+        srv.block_timers(now + 2 * BLOCK_INTERVAL);
+        assert!(!srv.clients[&1].block.active());
+        srv.render_all();
+        let out = frames(&output);
+        assert!(out.contains("\x1b[0m\x1b[H") && out.contains(&format!("{}", n + 799)), "{out:?}");
+        kill(&mut srv);
+    }
+
+    /// A client that acknowledges its output (C_ACK) is not rendered to while what was
+    /// written to it has not reached its terminal, though the writer has emptied the
+    /// queue; its acknowledgement wakes the main loop. One that never acknowledges is
+    /// rendered to once the queue has drained.
+    #[test]
+    fn renders_wait_for_the_terminal_to_take_the_output_before() {
+        let (mut srv, output, pane) = stopped();
+        drain(&srv);
+        let _ = frames(&output);
+        srv.render_all();
+        let sent: usize = output.try_iter().filter(|f| f[0] == S_OUTPUT).map(|f| f.len() - 5).sum();
+        assert!(sent > 10);
+        let io = srv.clients[&1].io.clone();
+        // the writer wrote it all; an old client has not acknowledged anything
+        io.output_sent.store(sent as u64, Ordering::SeqCst);
+        drain(&srv);
+        assert_eq!(io.unacked(), 0);
+        // the client acknowledges part of it: the rest is on its way to the terminal
+        assert!(!io.ack(10, &srv.clients[&1].queued_bytes));
+        assert_eq!(io.unacked(), sent as u64 - 10);
+        feed(&mut srv, pane, 0, 5);
+        srv.render_all();
+        assert!(frames(&output).is_empty() && srv.clients[&1].block.deferred);
+        assert!(io.drain_wake.load(Ordering::SeqCst));
+        // a stale acknowledgement changes nothing
+        assert!(!io.ack(5, &srv.clients[&1].queued_bytes));
+        // the terminal has it all: the main loop is woken (once) and renders
+        assert!(io.ack(sent as u64, &srv.clients[&1].queued_bytes));
+        assert!(!io.ack(sent as u64, &srv.clients[&1].queued_bytes));
+        srv.render_all();
+        assert!(frames(&output).contains("\x1b[0;34m4"));
+        // nor while frames are still queued, however much was acknowledged
+        feed(&mut srv, pane, 5, 1);
+        srv.render_all();
+        assert!(!io.ack(u64::MAX, &srv.clients[&1].queued_bytes) && queued(&srv) > 0);
         kill(&mut srv);
     }
 
@@ -530,10 +698,12 @@ mod tests {
         let queued_bells = output.try_iter().filter(|f| *f == frame(S_OUTPUT, b"\x07")).count();
         assert!(queued_bells > 0 && queued_bells < 20_000, "{queued_bells}");
         assert!(c.io.discarded.load(Ordering::Relaxed) + c.block.tty_discarded.get() >= (20_000 - queued_bells) as u64);
-        // read: unblocked, and bells are queued again
+        // read: unblocked once an interval has gone by without as many bells dropped as
+        // the stop threshold, and bells are queued again
         drain(&srv);
         let now = Instant::now();
         srv.block_timers(now + BLOCK_INTERVAL);
+        srv.block_timers(now + 2 * BLOCK_INTERVAL);
         assert!(!srv.clients[&1].block.active());
         bell(&mut srv, pane);
         assert_eq!(bells(&output), 1);

@@ -7,6 +7,7 @@ not part of the build or `cargo test`.
 | File | Purpose |
 |---|---|
 | `bench.py` | The benchmark harness. It runs on the benchmark host and starts every implementation the same way. |
+| `render_latency.py` | How long pane output takes to reach an attached client's terminal (a pty it reads, optionally slowly with `READ_RATE`): the last line of a 50 MB `cat` and of `seq`, lines of a flood and of 100 lines/s, and key echo beside a flood. Runs on any Linux host. |
 | `summarize.py` | Turns one or more `bench.py` result files into a markdown table and `summary.json`. |
 | `gen_data.py` | Writes the input files `bench.py` reads (`text50`, `colour50`, `text60k`). The output is deterministic; the files are not committed. |
 | `capcmp.sh` | Feeds a file to a fresh pane and prints hashes of what capture-pane returns. Use it to compare two binaries. |

@@ -1136,11 +1136,42 @@ pub struct ClientIo {
     /// client, which tmux never drops for reading slowly (a paused terminal, a console
     /// selection, a stopped client).
     pub patient: std::sync::atomic::AtomicBool,
-    /// The main loop deferred a render until the queue drains: the writer sends
+    /// The main loop deferred a render until the queue drains (and the terminal has
+    /// taken what was written, see `unacked`): the writer, or the reader on C_ACK, sends
     /// Event::Drained once it has.
     pub drain_wake: std::sync::atomic::AtomicBool,
+    /// S_OUTPUT payload bytes the writer has taken from the queue to write.
+    pub output_sent: std::sync::atomic::AtomicU64,
+    /// S_OUTPUT payload bytes the client says it has written to its terminal (C_ACK).
+    pub output_acked: std::sync::atomic::AtomicU64,
+    /// The client acknowledges its output (it has sent C_ACK).
+    pub acks: std::sync::atomic::AtomicBool,
     /// The client has been sent its reply or exit (CLIENT_EXIT).
     pub exit_sent: std::sync::atomic::AtomicBool,
+}
+
+impl ClientIo {
+    /// Output written to the client's connection that its terminal has not taken yet:
+    /// in the connection, or held by the client while its terminal is full. Zero for a
+    /// client that does not acknowledge output.
+    pub fn unacked(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        if !self.acks.load(Ordering::SeqCst) {
+            return 0;
+        }
+        self.output_sent.load(Ordering::SeqCst).saturating_sub(self.output_acked.load(Ordering::SeqCst))
+    }
+
+    /// C_ACK: the terminal has taken `done` bytes of output. True when that is all that
+    /// was written, nothing is `queued` and the main loop waits for that. (Looked at
+    /// after the store, as the writer looks at this after emptying the queue: one of
+    /// them sees both.)
+    pub fn ack(&self, done: u64, queued: &std::sync::atomic::AtomicUsize) -> bool {
+        use std::sync::atomic::Ordering;
+        self.output_acked.fetch_max(done, Ordering::SeqCst);
+        self.acks.store(true, Ordering::SeqCst);
+        queued.load(Ordering::SeqCst) == 0 && self.unacked() == 0 && self.drain_wake.swap(false, Ordering::SeqCst)
+    }
 }
 
 #[cfg(unix)]
@@ -2120,13 +2151,18 @@ impl Server {
                 }
                 let deadline = (!patient).then(|| Instant::now() + transport::IO_TIMEOUT);
                 let mut send = transport::Io { stream: &stream, closed: &writer_closed, deadline };
+                if buf[0] == S_OUTPUT {
+                    writer_io.output_sent.fetch_add(buf.len() as u64 - 5, Ordering::SeqCst);
+                }
                 if send.write_all(&buf).is_err() {
                     break;
                 }
                 // drained, and the main loop waits for that to render (block.rs): a full
-                // event queue means the main loop is about to look anyway
+                // event queue means the main loop is about to look anyway. Output the
+                // terminal has not taken yet is waited for by the reader (C_ACK).
                 let cost = transport::frame_cost(buf.len() - 5);
-                if writer_bytes.fetch_sub(cost, Ordering::SeqCst) == cost && writer_io.drain_wake.swap(false, Ordering::SeqCst) {
+                if writer_bytes.fetch_sub(cost, Ordering::SeqCst) == cost && writer_io.unacked() == 0
+                    && writer_io.drain_wake.swap(false, Ordering::SeqCst) {
                     let _ = wake.try_send(Event::Drained);
                 }
                 // still behind: the backlog now starts at this write
@@ -2137,6 +2173,7 @@ impl Server {
             writer_closed.close();
         });
         let etx = self.tx.clone();
+        let (reader_io, reader_bytes) = (io.clone(), queued_bytes.clone());
         let owner = self.owner.clone();
         let allowed_users: Vec<String> = self.acl.iter().map(|a| a.0.clone()).collect();
         thread::spawn(move || {
@@ -2172,6 +2209,15 @@ impl Server {
                 Ok(())
             }) {
                 reader.deadline = None;
+                // taken here: it is frequent, and needs nothing of the main loop unless
+                // a render waits for it
+                if kind == C_ACK {
+                    if let Ok(done) = <[u8; 8]>::try_from(payload.as_slice())
+                        && reader_io.ack(u64::from_le_bytes(done), &reader_bytes) {
+                        let _ = etx.try_send(Event::Drained);
+                    }
+                    continue;
+                }
                 if etx.send(Event::ClientMsg(cid, kind, payload)).is_err() {
                     return;
                 }
