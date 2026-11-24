@@ -66,6 +66,13 @@ impl Attrs {
         }
     }
 
+    /// The cell tmux leaves where it erases, inserts or scrolls in blanks
+    /// (grid_clear_cell, grid_empty_line): only the background colour of the
+    /// current style, no attributes, foreground or underline colour.
+    pub const fn blank(&self) -> Self {
+        Self { bgcolor: self.bgcolor, ..Self::new() }
+    }
+
     pub fn bold(&self) -> bool {
         self.mode & TEXT_MODE_BOLD != 0
     }

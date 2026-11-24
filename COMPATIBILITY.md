@@ -460,6 +460,22 @@ These do not match tmux 3.8 yet:
   replaces the binding of the other (after `bind 0x31 ...` and `bind 1 ...` only the
   second is left, where tmux keeps both).
 - **Sixel** is not implemented: `#{sixel_support}` is 0 and the DA1 reply has no `;4`.
+- **Character widths** outside tmux's own table (utf8.c, U+261D and the others, which
+  match) come from the Unicode tables, where tmux asks the system's `wcwidth` or
+  utf8proc, so a few characters can be a column apart from tmux on some systems.
+- **`CSI n;0r`:** the parser cannot tell a 0 from a missing parameter, so a bottom row of
+  0 means the last row (as in xterm); tmux reads it as 1 and ignores the region.
+- **ICH (`CSI n @`) of more than half the rest of the line** leaves `n` blanks before the
+  moved cells, as the terminal shows it. tmux's grid (grid_view_insert_cells,
+  grid_move_cells) wipes only the cells that were not moved over, so some of the old
+  characters stay behind the blanks (`abcdefgh`, CR, `CSI 6 @` is `  cdefab`), and an
+  insert of the whole rest of the line changes nothing; the outer terminal gets the ICH
+  and shows blanks until tmux redraws the pane from its grid. Copying that would put
+  characters back that the application removed.
+- **Lines used before a clear with `scroll-on-clear`** are judged from the cells: a line
+  whose last characters were erased by ECH, DCH or an EL that starts past the first
+  column still counts in tmux (gl->cellused only grows until the whole line is cleared)
+  and goes into the history there; here a line with nothing but blanks left does not.
 - **`history_bytes` and `history_all_bytes`** on the alternate screen with a scroll region
   count one row of cells fewer than tmux.
 - **Silence alerts with equal deadlines** fire in window id order; tmux's order comes from

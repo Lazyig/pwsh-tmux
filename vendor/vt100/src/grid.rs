@@ -93,10 +93,13 @@ impl Grid {
             return;
         }
 
-        // xterm always resets the scroll region and scrollback offset when the
-        // screen is resized.
-        self.scroll_top = 0;
-        self.scroll_bottom = self.size.rows() - 1;
+        // screen_resize_y resets the scroll region when the height changes (a
+        // change of width alone keeps it); the scrollback offset always resets.
+        let height_changed = size.rows() != self.size.rows();
+        if height_changed {
+            self.scroll_top = 0;
+            self.scroll_bottom = self.size.rows() - 1;
+        }
         if let Some(scrollback) = &mut self.scrollback {
             scrollback.offset = 0;
         }
@@ -111,7 +114,7 @@ impl Grid {
         } else if size.rows() < self.size.rows() {
             let num_excess_bottom = self.size.rows() - self.pos.row - 1;
             let num_pushed = diff.saturating_sub(num_excess_bottom);
-            self.scroll_up_stamped(num_pushed, on_row, false);
+            self.scroll_up_stamped(num_pushed, on_row, false, crate::attrs::Attrs::new());
             self.rows.truncate(size.rows().into());
             num_pushed
         } else if let Some(scrollback) = &mut self.scrollback {
@@ -169,7 +172,9 @@ impl Grid {
         if reflow { self.reflow(size); self.history_counters.2 += 1; }
         self.pos.col = self.pos.col.min(size.cols() - 1);
         self.saved_pos.col = self.saved_pos.col.min(size.cols() - 1);
-        self.scroll_bottom = size.rows() - 1;
+        if height_changed {
+            self.scroll_bottom = size.rows() - 1;
+        }
         self.size = size;
 
         if !is_empty {
@@ -819,8 +824,9 @@ impl Grid {
     pub fn erase_all_into_history<F>(&mut self, attrs: crate::attrs::Attrs, on_row: F)
     where F: FnMut(&crate::row::Row) {
         if self.scrollback.is_some() {
-            let last = self.rows.iter().rposition(|r| (0..self.size.cols()).any(|x|
-                r.get(x).is_some_and(|c| *c != crate::cell::Cell::DEFAULT))).map_or(0, |i| i+1);
+            // grid_view_clear_history: up to the last line with a used cell (cellused),
+            // so lines only cleared or scrolled in with a background colour stay out
+            let last = self.rows.iter().rposition(|r| r.used_len() != 0).map_or(0, |i| i+1);
             let region = (self.scroll_top,self.scroll_bottom);
             self.scroll_top = 0;
             self.scroll_bottom = self.size.rows()-1;
@@ -933,17 +939,39 @@ impl Grid {
         self.current_row_mut().erase_range(0..pos.col.min(size.cols() - 1) + 1, attrs);
     }
 
-    pub fn insert_cells(&mut self, count: u16) {
-        let pos = self.pos;
-        let row = self.current_row_mut();
-        row.insert(pos.col, count);
-    }
-
-    pub fn delete_cells(&mut self, count: u16) {
+    /// ICH: the cells put in are `blank` (grid_view_insert_cells with the
+    /// background colour).
+    pub fn insert_cells(&mut self, count: u16, blank: crate::attrs::Attrs) {
         let size = self.size;
         let pos = self.pos;
         let row = self.current_row_mut();
-        row.remove(pos.col..pos.col.saturating_add(count).min(size.cols()));
+        row.insert(pos.col, count);
+        if blank.bgcolor != crate::Color::Default && pos.col < size.cols() {
+            row.erase_range(pos.col..pos.col.saturating_add(count.max(1)).min(size.cols()), blank);
+        }
+    }
+
+    /// DCH: the cells moved in at the end of the row are `blank`
+    /// (grid_view_delete_cells clears them with the background colour).
+    pub fn delete_cells(&mut self, count: u16, blank: crate::attrs::Attrs) {
+        let size = self.size;
+        let pos = self.pos;
+        let end = pos.col.saturating_add(count).min(size.cols());
+        let row = self.current_row_mut();
+        row.remove(pos.col..end);
+        if blank.bgcolor != crate::Color::Default && pos.col < end {
+            row.erase_range(size.cols() - (end - pos.col)..size.cols(), blank);
+        }
+    }
+
+    /// Rows scrolled or inserted in are cleared with the background colour
+    /// (grid_empty_line); with the default one they stay as they are, empty.
+    fn blank_rows(rows: &mut [crate::row::Row], blank: crate::attrs::Attrs) {
+        if blank.bgcolor != crate::Color::Default {
+            for row in rows {
+                row.clear(blank);
+            }
+        }
     }
 
     pub fn erase_cells(&mut self, count: u16, attrs: crate::attrs::Attrs) {
@@ -957,50 +985,68 @@ impl Grid {
         self.current_row_mut().erase_range(pos.col..pos.col.saturating_add(count).min(size.cols()), attrs);
     }
 
-    pub fn insert_lines(&mut self, count: u16) {
+    /// The last row IL and DL move rows within: the bottom of the scroll region,
+    /// or with the cursor outside it the bottom of the screen
+    /// (screen_write_insertline and _deleteline use grid_view_insert_lines and
+    /// grid_view_delete_lines there).
+    fn lines_bottom(&self) -> u16 {
+        if (self.scroll_top..=self.scroll_bottom).contains(&self.pos.row) {
+            self.scroll_bottom
+        } else {
+            self.size.rows() - 1
+        }
+    }
+
+    pub fn insert_lines(&mut self, count: u16, blank: crate::attrs::Attrs) {
         if count == 0 {
             return;
         }
-        if !(self.scroll_top..=self.scroll_bottom).contains(&self.pos.row) {
-            return;
-        }
+        let bottom = self.lines_bottom();
         let between = &mut self.rows
-            [usize::from(self.pos.row)..=usize::from(self.scroll_bottom)];
+            [usize::from(self.pos.row)..=usize::from(bottom)];
         let num_between = between.len();
         let num_removed = usize::from(count).min(num_between);
         between.rotate_right(num_removed);
         for row in &mut between[..num_removed] {
             row.reset();
         }
-        // self.scroll_bottom is maintained to always be a valid row
-        self.rows[usize::from(self.scroll_bottom)].wrap(false);
+        Self::blank_rows(&mut between[..num_removed], blank);
+        // bottom is always a valid row
+        self.rows[usize::from(bottom)].wrap(false);
     }
 
-    pub fn delete_lines(&mut self, count: u16) {
-        if !(self.scroll_top..=self.scroll_bottom).contains(&self.pos.row) {
-            return;
-        }
+    pub fn delete_lines(&mut self, count: u16, blank: crate::attrs::Attrs) {
+        let bottom = self.lines_bottom();
         let between = &mut self.rows
-            [usize::from(self.pos.row)..=usize::from(self.scroll_bottom)];
+            [usize::from(self.pos.row)..=usize::from(bottom)];
         let num_between = between.len();
         let num_removed = usize::from(count).min(num_between);
         for row in &mut between[..num_removed] {
             row.reset();
         }
         between.rotate_left(num_removed);
+        Self::blank_rows(&mut between[num_between - num_removed..], blank);
     }
 
     pub fn scroll_up<F>(&mut self, count: u16, on_row: F)
     where
         F: FnMut(&crate::row::Row),
     {
-        self.scroll_up_stamped(count, on_row, true);
+        self.scroll_up_stamped(count, on_row, true, crate::attrs::Attrs::new());
+    }
+
+    /// Scrolls up, the rows coming in at the bottom `blank`.
+    pub fn scroll_up_blank<F>(&mut self, count: u16, on_row: F, blank: crate::attrs::Attrs)
+    where
+        F: FnMut(&crate::row::Row),
+    {
+        self.scroll_up_stamped(count, on_row, true, blank);
     }
 
     /// Scrolls up; `stamp` gives the rows entering the history the current time
     /// (grid_scroll_history). Shrinking the screen moves rows into the history
     /// without one (screen_resize_y only grows hsize).
-    fn scroll_up_stamped<F>(&mut self, count: u16, mut on_row: F, stamp: bool)
+    fn scroll_up_stamped<F>(&mut self, count: u16, mut on_row: F, stamp: bool, blank: crate::attrs::Attrs)
     where
         F: FnMut(&crate::row::Row),
     {
@@ -1085,9 +1131,10 @@ impl Grid {
         // Finally, rotate the rows so the "removed" ones (which have now been
         // reset to empty) are at the bottom.
         between.rotate_left(num_removed);
+        Self::blank_rows(&mut between[num_between - num_removed..], blank);
     }
 
-    pub fn scroll_down(&mut self, count: u16) {
+    pub fn scroll_down(&mut self, count: u16, blank: crate::attrs::Attrs) {
         if count == 0 {
             return;
         }
@@ -1099,6 +1146,7 @@ impl Grid {
         for row in &mut between[..num_removed] {
             row.reset();
         }
+        Self::blank_rows(&mut between[..num_removed], blank);
         // self.scroll_bottom is maintained to always be a valid row
         self.rows[usize::from(self.scroll_bottom)].wrap(false);
     }
@@ -1121,17 +1169,30 @@ impl Grid {
         self.pos = Pos::default();
     }
 
+    /// screen_write_scrollregion: both rows are kept on the screen, a region
+    /// of less than two rows is ignored (the cursor stays), and otherwise the
+    /// cursor goes to the top left of the screen, origin mode or not.
     pub fn set_scroll_region(&mut self, top: u16, bottom: u16) {
-        let bottom = bottom.min(self.size().rows() - 1);
-        if top < bottom {
-            self.scroll_top = top;
-            self.scroll_bottom = bottom;
-        } else {
-            self.scroll_top = 0;
-            self.scroll_bottom = self.size().rows() - 1;
+        let last = self.size.rows() - 1;
+        let (top, bottom) = (top.min(last), bottom.min(last));
+        if top >= bottom {
+            return;
         }
-        self.pos.row = self.scroll_top;
-        self.pos.col = 0;
+        self.scroll_top = top;
+        self.scroll_bottom = bottom;
+        self.pos = Pos::default();
+    }
+
+    /// What tmux keeps per screen rather than per grid, so it carries over
+    /// between the normal and the alternate screen: the scroll region, origin
+    /// mode and the cursor DECSC saved (s->rupper, s->rlower, MODE_ORIGIN and
+    /// the input context's saved cursor).
+    pub fn take_screen_state(&mut self, other: &Self) {
+        self.scroll_top = other.scroll_top;
+        self.scroll_bottom = other.scroll_bottom;
+        self.origin_mode = other.origin_mode;
+        self.saved_pos = other.saved_pos;
+        self.saved_origin_mode = other.saved_origin_mode;
     }
 
     fn in_scroll_region(&self) -> bool {
@@ -1153,11 +1214,21 @@ impl Grid {
     where
         F: FnMut(&crate::row::Row),
     {
+        self.row_inc_scroll_blank(count, on_row, crate::attrs::Attrs::new())
+    }
+
+    /// A line feed (LF, IND, NEL): a row scrolled in is `blank`
+    /// (screen_write_linefeed with the background colour; a wrap uses the
+    /// default one).
+    pub fn row_inc_scroll_blank<F>(&mut self, count: u16, on_row: F, blank: crate::attrs::Attrs) -> u16
+    where
+        F: FnMut(&crate::row::Row),
+    {
         let in_scroll_region = self.in_scroll_region();
         self.pos.row = self.pos.row.saturating_add(count);
         let lines = self.row_clamp_bottom(in_scroll_region);
         if in_scroll_region {
-            self.scroll_up(lines, on_row);
+            self.scroll_up_blank(lines, on_row, blank);
             lines
         } else {
             0
@@ -1170,14 +1241,15 @@ impl Grid {
         self.row_clamp_top(in_scroll_region);
     }
 
-    pub fn row_dec_scroll(&mut self, count: u16) {
-        let in_scroll_region = self.in_scroll_region();
-        // need to account for clamping by both row_clamp_top and by
-        // saturating_sub
-        let extra_lines = count.saturating_sub(self.pos.row);
-        self.pos.row = self.pos.row.saturating_sub(count);
-        let lines = self.row_clamp_top(in_scroll_region);
-        self.scroll_down(lines + extra_lines);
+    /// `screen_write_reverseindex`: at the top of the scroll region the region scrolls
+    /// down, anywhere else the cursor goes up a row unless it is on the first row
+    /// (above the region too: the region is not scrolled from there).
+    pub fn reverse_index(&mut self, blank: crate::attrs::Attrs) {
+        if self.pos.row == self.scroll_top {
+            self.scroll_down(1, blank);
+        } else if self.pos.row > 0 {
+            self.pos.row -= 1;
+        }
     }
 
     pub fn row_set(&mut self, i: u16) {

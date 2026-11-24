@@ -1623,8 +1623,9 @@ impl Server {
                 links: BTreeMap::new(),
                 active: 0,
                 last: Vec::new(),
-                cols: cols.max(2),
-                rows: rows.max(2),
+                // cmd_new_session_exec: a session is at least 1x1 (WINDOW_MINIMUM)
+                cols: cols.max(1),
+                rows: rows.max(1),
                 cwd: cwd.clone(),
                 options: Options::default(),
                 env: senv,
@@ -1637,7 +1638,7 @@ impl Server {
             },
         );
         let status = self.status_lines(Some(sid));
-        let (sx, sy) = (cols.max(2), rows.max(2).saturating_sub(status).max(1));
+        let (sx, sy) = (cols.max(1), rows.max(1).saturating_sub(status).max(1));
         let pane = match self.spawn_pane(Some(sid), sx, sy, cmd, Some(&cwd), &[]) {
             Ok(p) => p,
             Err(e) => {

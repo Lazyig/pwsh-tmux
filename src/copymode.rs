@@ -2333,9 +2333,10 @@ impl CopyMode {
                     last.text = " ".into();
                 }
                 // padding a reflow moved off its tab's or wide character's row shows
-                // nothing in tmux; drawn as a blank, what follows keeps its column
+                // nothing in tmux; drawn as a blank, what follows keeps its column (the
+                // width as the pane draws it: tmux's table, U+261D is two columns)
                 for x in 0..line.cells.len() {
-                    if line.cells[x].text.is_empty() && (x == 0 || unicode_width::UnicodeWidthStr::width(line.cells[x - 1].text.as_str()) != 2) {
+                    if line.cells[x].text.is_empty() && (x == 0 || crate::width::str_width(&line.cells[x - 1].text) != 2) {
                         line.cells[x].text = " ".into();
                     }
                 }
@@ -3685,11 +3686,12 @@ fn unwrap_position(lines: &[Line], wx: Option<usize>, wy: usize) -> (usize, usiz
     }
 }
 
-/// A cell's width as grid_reflow reads it: a wide character's own width, 1 for anything
-/// else, including the padding cell after a wide character (it is stored as a compact
-/// cell, which grid_get_cell1 reads back as width 1).
+/// A cell's width as grid_reflow reads it: a wide character's own width (gc->data.width,
+/// from tmux's table and codepoint-widths as the pane wrote it), 1 for anything else,
+/// including the padding cell after a wide character (it is stored as a compact cell,
+/// which grid_get_cell1 reads back as width 1).
 fn reflow_width(c: &Cell) -> usize {
-    if c.is_continuation() { 1 } else { unicode_width::UnicodeWidthStr::width(c.text.as_str()).max(1) }
+    if c.is_continuation() { 1 } else { crate::width::str_width(&c.text).max(1) }
 }
 
 /// A row as grid_reflow works on it: its cells with their widths, whether it wraps and
@@ -5252,6 +5254,29 @@ mod tests {
         let cm = CopyMode::new(crate::cells::snapshot(p.screen()), 25, 2, (0, 0), true);
         let view = cm.render_with(&RenderStyle { position_text: Some(String::new()), ..RenderStyle::default() }).0;
         assert_eq!(view[0].cells.iter().map(|c| c.text.as_str()).collect::<String>(), "x".repeat(24) + " ");
+    }
+
+    #[test]
+    fn characters_tmux_makes_wide_draw_and_reflow_as_wide() {
+        // U+261D is two columns in tmux's table (utf8_default_width_cache), one in the
+        // Unicode tables: copy mode draws it as the pane does, its padding left empty
+        let nz = |n| std::num::NonZeroU16::new(n).unwrap();
+        let mut p = vt100::Parser::new(nz(2), nz(8), 0);
+        p.process("a\u{261d}b\u{4e00}c".as_bytes());
+        let cm = CopyMode::new(crate::cells::snapshot(p.screen()), 8, 2, (0, 0), true);
+        let view = cm.render_with(&RenderStyle { position_text: Some(String::new()), ..RenderStyle::default() }).0;
+        let texts: Vec<&str> = view[0].cells.iter().take(7).map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, ["a", "\u{261d}", "", "b", "\u{4e00}", "", "c"]);
+        // grid_reflow reads the cell's own width: rewrapped to 3 columns, the character
+        // does not fit after "ab" and moves on whole, as a CJK character does
+        let rewrapped = |ch: char| -> Vec<String> {
+            let mut p = vt100::Parser::new(nz(2), nz(6), 0);
+            p.process(format!("ab{ch}c").as_bytes());
+            let cm = CopyMode::clone_from(crate::cells::snapshot(p.screen()), (6, 2), (0, 0), (3, 4), true, false);
+            cm.lines.to_vec().iter().take(3).map(|l| l.cells.iter().map(|c| c.text.as_str()).collect::<String>().trim_end().replace(ch, "W")).collect()
+        };
+        assert_eq!(rewrapped('\u{261d}'), rewrapped('\u{4e00}'));
+        assert_eq!(rewrapped('\u{261d}')[..2], ["ab", "W"]);
     }
 
     #[test]

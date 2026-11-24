@@ -373,8 +373,9 @@ impl Row {
 
     /// Cells up to the last written one or the end of the last tab (tmux's cellused:
     /// a row wrapped early, before a wide character or tab that did not fit, ends there).
+    /// Blanks a clear or a scroll left, with a background colour or not, are not used.
     pub fn used_len(&self) -> u16 {
-        let cells = self.cells.iter().rposition(|c| *c != crate::cell::Cell::DEFAULT).map_or(0, |i| i + 1);
+        let cells = self.cells.iter().rposition(|c| !c.is_blank()).map_or(0, |i| i + 1);
         let tabs = self.metadata().map(|(x, m)| x.saturating_add(m.tab_width)).max().unwrap_or(0);
         (cells as u16).max(tabs.min(self.cols()))
     }
