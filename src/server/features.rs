@@ -300,6 +300,27 @@ mod tests {
         assert!(f.has("256") && f.colours() == 256);
     }
 
+    /// csr (render.rs scrolls a region with it): terminfo's, gone with `csr@` or a terminfo
+    /// entry without it, an override's otherwise.
+    #[test]
+    fn csr_from_terminfo_and_overrides() {
+        let mut f = Features::default();
+        let caps = |term: &str, table: &[&str], f: &mut Features| {
+            overrides(term, &table.iter().map(|s| s.to_string()).collect::<Vec<_>>(), f).get("csr").cloned()
+        };
+        // no terminfo (an unknown TERM, Windows): nothing, so the renderer's own
+        assert_eq!(caps("no-such-terminal-here", &[], &mut f), None);
+        assert_eq!(caps("no-such-terminal-here", &["no-such*:csr@"], &mut f).as_deref(), Some(""));
+        assert_eq!(caps("no-such-terminal-here", &["no-such*:csr=\\E[%i%p1%d;%p2%dr"], &mut f).as_deref(), Some("\x1b[%i%p1%d;%p2%dr"));
+        // terminfo is not installed everywhere these run
+        if terminfo_capabilities("xterm-256color").is_empty() || terminfo_capabilities("vt52").is_empty() {
+            return;
+        }
+        assert_eq!(caps("xterm-256color", &[], &mut f).as_deref(), Some("\x1b[%i%p1%d;%p2%dr"));
+        assert_eq!(caps("xterm-256color", &["xterm*:csr@"], &mut f).as_deref(), Some(""));
+        assert_eq!(caps("vt52", &[], &mut f).as_deref(), Some(""));
+    }
+
     #[test]
     fn colour_downgrade() {
         assert_eq!(rgb_to_256(255, 0, 0), 196);
@@ -317,6 +338,11 @@ mod tests {
 /// String capabilities are retained so an explicit Ss/Se is never replaced by cstyle.
 pub fn overrides(term: &str, table: &[String], features: &mut Features) -> std::collections::BTreeMap<String, String> {
     let mut caps = terminfo_capabilities(term);
+    // a terminfo entry without csr cannot scroll a region (render.rs, can_scroll); kept
+    // as `csr@` keeps it, which a later csr= override replaces
+    if !caps.is_empty() {
+        caps.entry("csr".into()).or_default();
+    }
     for entry in table {
         let parts = override_tokens(entry);
         let mut parts = parts.iter().map(String::as_str);

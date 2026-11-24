@@ -80,7 +80,8 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   to its terminal (the client acknowledges what it has written; tmux's tty buffer is
   what the terminal has not taken), and then covers everything that changed in
   between. Like tmux (TTY_BLOCK), when what it is not shown reaches 1 + width x height
-  x 8 bytes and its next frame has waited 20 ms it is blocked, and every 100 ms the
+  x 8 bytes and its next frame has waited 20 ms (100 ms when its terminal took the
+  frame before in less than 20 ms) it is blocked, and every 100 ms the
   output of the panes drawn to it during that time (not panes hidden by zoom, in a mode
   or held by a prompt) is added to `#{client_discarded}`; when that is below 1 + width
   x height / 8 bytes and what it was sent has reached its terminal it is unblocked and
@@ -108,13 +109,17 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
     client that reads gets to each run, so it is sent every bell.
   - Every frame is a redraw of what changed. Rows that moved up are scrolled on the
     terminal (a scroll region and line feeds, as tmux scrolls a pane) and only the
-    lines that came in are drawn, but only whole rows: a pane beside another one is
+    lines that came in are drawn, when the terminal has csr (from terminfo or
+    terminal-overrides; a TERM without terminfo, and Windows, get DECSTBM, as they get
+    every other VT sequence), but only whole rows: a pane beside another one is
     not scrolled (tmux uses left and right margins, DECSLRM, where the terminal has
     them), so one scrolled line there rewrites every row of the pane. What counts
     toward blocking is therefore the pane output not yet shown (what tmux would have
-    written), not frame bytes. A terminal that takes a frame in more than 20 ms is
-    blocked by a flood where tmux's is blocked as soon as its buffer fills: both then
-    show a fresh redraw every 200 ms or so.
+    written), not frame bytes. A terminal that takes two frames in a row in more than
+    20 ms each (or one in more than 100 ms) is blocked by a flood where tmux's is
+    blocked as soon as its buffer fills: both then show a fresh redraw every 200 ms or
+    so. A terminal that keeps up is not blocked by a single frame held up on a busy
+    machine (tmux has no client process and acknowledgement in between to be held up).
   - The client acknowledges the output it has written to its terminal (a message
     tmux's protocol does not have; a server that does not know it ignores it, and a
     client that does not send it is drawn to once the connection has taken its

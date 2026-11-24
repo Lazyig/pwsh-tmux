@@ -661,6 +661,17 @@ fn find_scroll(prev: &Frame, next: &Frame) -> Option<(u16, u16, u16)> {
     best.map(|(_, s)| s)
 }
 
+/// tty-term.c's csr, change-scroll-region: the VT one (DECSTBM) when the client has no
+/// terminfo (Windows, a TERM it does not know), as every other sequence the renderer sends.
+const CSR: &str = "\x1b[%i%p1%d;%p2%dr";
+
+/// Whether the terminal can scroll a region, tty_term_has(TTYC_CSR): not when its terminfo
+/// has no csr or terminal-overrides removes it (`csr@`), both kept as an empty value
+/// (features::overrides).
+fn can_scroll(caps: &std::collections::BTreeMap<String, String>) -> bool {
+    caps.get("csr").is_none_or(|v| !v.is_empty())
+}
+
 fn erasable(c: &Cell) -> bool {
     c.text == " " && c.style.bg == Color::Default && c.style.attrs & (UNDERLINE | INVERSE | STRIKE) == 0
 }
@@ -1820,12 +1831,15 @@ impl Server {
         }
         let mut changed = false;
         let hyperlinks = feats.has("hyperlinks") || c.term_caps.contains_key("Hls");
-        // scroll the rows that moved (DECSTBM, then LF at the bottom margin, in the
-        // default colours so the lines scrolled in are blank), and diff with what the
-        // terminal shows then
-        let scroll = prev.and_then(|p| find_scroll(&p.frame, &next.frame));
+        // scroll the rows that moved (csr, then LF at the bottom margin, in the default
+        // colours so the lines scrolled in are blank), and diff with what the terminal
+        // shows then. Only a terminal that can (tty_cmd_linefeed and tty_cmd_scrollup
+        // draw the region again without TTYC_CSR).
+        let scroll = prev.filter(|_| can_scroll(&c.term_caps)).and_then(|p| find_scroll(&p.frame, &next.frame));
         if let Some((top, bot, k)) = scroll {
-            let _ = write!(out, "\x1b[0m\x1b[{};{}r\x1b[{};1H{}\x1b[r", top + 1, bot + 1, bot + 1, "\n".repeat(k as usize));
+            let region = |top: u16, bot: u16| features::string_capability(&c.term_caps, "csr", CSR, &[&top.to_string(), &bot.to_string()]);
+            // tty_region_pane, the line feeds, then tty_region_off (the whole terminal)
+            let _ = write!(out, "\x1b[0m{}\x1b[{};1H{}{}", region(top, bot), bot + 1, "\n".repeat(k as usize), region(0, next.frame.h - 1));
             changed = true;
         }
         for y in 0..next.frame.h {
@@ -2535,9 +2549,11 @@ mod scroll_tests {
         srv.render_all();
         srv.clients[&1].queued_bytes.store(0, Ordering::SeqCst);
         let (mut bytes, mut scrolls) = (0, 0);
+        // a scroll ends with the region set back to the whole terminal
+        let whole = format!("\x1b[1;{}r", srv.clients[&1].size.1);
         for f in frames.try_iter().filter(|f| f[0] == S_OUTPUT) {
             let text = String::from_utf8_lossy(&f[5..]);
-            scrolls += text.contains("\x1b[r") as usize;
+            scrolls += text.contains(&whole) as usize;
             bytes += f.len() - 5;
             term.process(&f[5..]);
         }
@@ -2606,6 +2622,43 @@ mod scroll_tests {
             }
             assert_eq!(scrolls > 100, scrolled, "{splits:?}: {scrolls} scrolls, {bytes} bytes");
             same_as_full_redraw(&mut srv, &frames, &term, &format!("{splits:?}"));
+            kill(&mut srv);
+        }
+    }
+
+    /// A terminal without csr (its terminfo has none, or `csr@`) is never scrolled, and
+    /// is drawn as before; one whose csr differs from DECSTBM is sent its own.
+    #[test]
+    fn scrolls_only_with_csr() {
+        // the region set back to the whole terminal after each scroll
+        for (csr, whole) in [(Some(""), None), (Some("\x1b[%i%p1%02d;%p2%02dr"), Some("\x1b[01;24r")), (None, Some("\x1b[1;24r"))] {
+            let scrolled = whole.is_some();
+            let (mut srv, frames) = setup(80, 24, &[&["split-window", "-v", "-d", "-t", "s:0"][..]]);
+            if let Some(csr) = csr {
+                srv.clients.get_mut(&1).unwrap().term_caps.insert("csr".into(), csr.into());
+            }
+            let mut term = vt100::Parser::new(nz(24), nz(80), 0);
+            show(&mut srv, &frames, &mut term);
+            let pane = srv.windows.values().next().unwrap().active;
+            let generation = srv.panes[&pane].generation;
+            let (mut seed, mut scrolls, mut regions) = (0x2545_f491_4f6c_dd1d, 0, 0);
+            for step in 0..60 {
+                srv.pane_data(pane, generation, &lines(&mut seed, 1 + step % 3));
+                srv.render_all();
+                srv.clients[&1].queued_bytes.store(0, Ordering::SeqCst);
+                for f in frames.try_iter().filter(|f| f[0] == S_OUTPUT) {
+                    let text = String::from_utf8_lossy(&f[5..]);
+                    scrolls += whole.is_some_and(|w| text.contains(w)) as usize;
+                    // any scroll region (CSI top ; bottom r)
+                    regions += text.match_indices('r').filter(|(i, _)| text[..*i].rsplit("\x1b[").next().is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit() || b == b';'))).count();
+                    term.process(&f[5..]);
+                }
+            }
+            assert_eq!(scrolls > 30, scrolled, "csr {csr:?}: {scrolls} scrolls");
+            if !scrolled {
+                assert_eq!(regions, 0, "csr {csr:?}");
+            }
+            same_as_full_redraw(&mut srv, &frames, &term, &format!("csr {csr:?}"));
             kill(&mut srv);
         }
     }

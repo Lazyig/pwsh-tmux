@@ -157,11 +157,21 @@ Three changes:
   a frame waits until the terminal has taken the ones before, as tmux's redraw
   waits for its tty buffer to empty.
 - Rows that moved up are scrolled on the terminal and only the new lines are
-  drawn (whole rows only, so not for a pane beside another one).
+  drawn (whole rows only, so not for a pane beside another one, and only on a
+  terminal with csr).
 - A client is blocked once a frame has waited 20 ms with the start threshold of
-  pane output come meanwhile (100 ms before), and, as in tmux, the first check
+  pane output come meanwhile, if the frame before also took 20 ms or more, and
+  otherwise once it has waited 100 ms (as before), and, as in tmux, the first check
   marks it for a full redraw and stops counting its panes' output, so it is
   unblocked by the second check with a fresh redraw even while the panes write.
+
+Blocking after 20 ms whatever the frame before took also blocked a terminal
+that keeps up when one frame was held up on the busy host: 10 of 32 floods
+(190-325 ms without an update), against none of 32 for the build before.
+Requiring the frame before to have taken 20 ms too, in 18 floods only one was
+blocked. Same run, 9 floods each, fast terminal: age of the lines shown p90
+3.4 ms (before 3.7, 20 ms alone 4.2), longest gap between updates 21 ms (22,
+33). At 100 KB/s, 5 floods: age p50 / p90 112 / 198 ms (20 ms alone 99 / 193).
 
 ## Windows
 
