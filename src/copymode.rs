@@ -3736,9 +3736,16 @@ fn reflow(lines: &[Line], sx: usize) -> Vec<Line> {
     // Line flags and times stay on the row a line starts (grid_reflow_move/_split
     // copy the line, rows joined onto another lose theirs); cell metadata follows its
     // cell, and a tab's padding moved past the tab's row is padding there (shows
-    // nothing, as tmux's). One pass: rows only move on.
-    let (mut cy, mut base, mut offset) = (0, 0, 0);
-    let place = |output: &[Line], cy: &mut usize, base: &mut usize, wx: usize| -> (usize, usize) {
+    // nothing, as tmux's). One pass, rows moving on, except that a tab split by an
+    // earlier reflow keeps its metadata on the row of its own cell while its padding
+    // is on the rows after: placing that padding goes past where the next row starts,
+    // so a position before the current output row is looked for again from the
+    // start of its line.
+    let (mut cy, mut base, mut offset, mut start) = (0, 0, 0, 0);
+    let place = |output: &[Line], cy: &mut usize, base: &mut usize, start: usize, wx: usize| -> (usize, usize) {
+        if wx < *base {
+            (*cy, *base) = (start, 0);
+        }
         while *cy + 1 < output.len() && output[*cy].wrapped && wx >= *base + cells_used(&output[*cy]) {
             *base += cells_used(&output[*cy]);
             *cy += 1;
@@ -3749,16 +3756,16 @@ fn reflow(lines: &[Line], sx: usize) -> Vec<Line> {
         if cy >= output.len() {
             break;
         }
-        let (x, y) = place(&output, &mut cy, &mut base, offset);
+        let (x, y) = place(&output, &mut cy, &mut base, start, offset);
         if x == 0 {
             output[y].flags = line.flags;
             output[y].time = line.time;
         }
         for (&col, m) in &line.metadata {
-            let (x, y) = place(&output, &mut cy, &mut base, offset + usize::from(col));
+            let (x, y) = place(&output, &mut cy, &mut base, start, offset + usize::from(col));
             let m = m.clone();
             for pad in 1..usize::from(m.tab_width) {
-                let (px, py) = place(&output, &mut cy, &mut base, offset + usize::from(col) + pad);
+                let (px, py) = place(&output, &mut cy, &mut base, start, offset + usize::from(col) + pad);
                 if py != y {
                     if let Some(c) = output[py].cells.get_mut(px) {
                         c.text.clear();
@@ -3780,6 +3787,7 @@ fn reflow(lines: &[Line], sx: usize) -> Vec<Line> {
                 cy += 1;
             }
             (cy, base, offset) = (cy + 1, 0, 0);
+            start = cy;
         }
     }
     output
@@ -4865,6 +4873,49 @@ mod tests {
         // wider again the line is whole, the tab still a tab
         cm.resize(20, 4);
         assert_eq!(text(&cm.lines[1]).trim_end(), "a\tbzz");
+    }
+
+    #[test]
+    fn reflow_again_keeps_a_split_tab_and_links_on_their_cells() {
+        // a tab split by one resize keeps its metadata on its own cell's row with its
+        // padding on the next; a second resize to any width placed that padding past
+        // where the next row starts and underflowed (debug builds panicked). In tmux the
+        // tab flag and links are part of the cells, so whatever the widths each stays
+        // on its cell: the unwrapped line reads the same as after one resize.
+        let nz = |n| std::num::NonZeroU16::new(n).unwrap();
+        let mut p = vt100::Parser::new(nz(4), nz(20), 50);
+        p.process(b"a\tb\x1b]8;;http://z\x07zz\x1b]8;;\x07\r\nxy");
+        let lines = crate::cells::snapshot(p.screen());
+        // each unwrapped line: its text and (offset, tab width, link) of its metadata
+        let unwrapped = |cm: &CopyMode| -> Vec<(String, Vec<(usize, u16, Option<String>)>)> {
+            let mut out: Vec<(String, Vec<(usize, u16, Option<String>)>)> = Vec::new();
+            let mut open = false;
+            for l in cm.lines.to_vec() {
+                if !open {
+                    out.push(Default::default());
+                }
+                let (text, meta) = out.last_mut().unwrap();
+                let at = text.chars().count();
+                meta.extend(l.metadata.iter().map(|(&x, m)| (at + usize::from(x), m.tab_width, m.hyperlink.as_ref().map(|h| h.uri.clone()))));
+                text.extend((0..cells_used(&l)).map(|x| if l.is_padding(x) { '_' } else { l.cell_text(x).chars().next().unwrap_or(' ') }));
+                open = l.wrapped;
+            }
+            out.into_iter().filter(|(t, _)| !t.trim().is_empty()).collect()
+        };
+        let mut cm = CopyMode::new(lines.clone(), 20, 4, (0, 0), true);
+        let whole = unwrapped(&cm);
+        assert_eq!(whole[0].1, [(1, 7, None), (9, 0, Some("http://z".into())), (10, 0, Some("http://z".into()))]);
+        cm.resize(8, 4);
+        assert_eq!(cm.lines[0].tab_at(1), Some((1, 7)));
+        for width in 1..30 {
+            let mut twice = CopyMode::new(lines.clone(), 20, 4, (0, 0), true);
+            twice.resize(8, 4);
+            twice.resize(width, 4);
+            let mut once = CopyMode::new(lines.clone(), 20, 4, (0, 0), true);
+            once.resize(width, 4);
+            assert_eq!(unwrapped(&twice), unwrapped(&once), "8 then {width} columns");
+            assert_eq!(unwrapped(&twice)[0].1, whole[0].1, "8 then {width} columns");
+        }
     }
 
     #[test]
