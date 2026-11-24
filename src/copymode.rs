@@ -5879,12 +5879,16 @@ mod frozen_backing_tests {
 
     /// Everything a copy-mode command can show or give the server. The match count is left
     /// out with `count` false: counting stops on a clock (200 ms), which a loaded machine
-    /// can reach in one copy and not the other.
+    /// can reach in one copy and not the other. That leaves it out of the drawn position
+    /// indicator too ("(1000+ results)" in one copy, "(1234 results)" or nothing in the
+    /// other): the screen is drawn with the indicator's position part only.
     fn state(cm: &CopyMode, action: Action, count: bool) -> String {
+        let (pos, limit) = cm.position();
+        let style = RenderStyle { position_text: (!count).then(|| format!("#[align=right][{pos}/{limit}]")), ..RenderStyle::default() };
         format!(
             "{action:?} {:?} {} {} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {}",
             cm.cursor(), cm.view_top(), cm.line_count(), cm.position(), cm.selection_ends(), cm.search_count().filter(|_| count),
-            cm.search_match(), cm.cursor_word(), cm.cursor_line(), cm.render(), cm.top_line_time(),
+            cm.search_match(), cm.cursor_word(), cm.cursor_line(), cm.render_with(&style), cm.top_line_time(),
         )
     }
 
