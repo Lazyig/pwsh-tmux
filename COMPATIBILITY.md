@@ -78,10 +78,13 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   terminal client is not drawn to while output is still queued for it: its next frame
   waits until the queue has been written and then covers everything that changed in
   between. Like tmux (TTY_BLOCK), when what it is not shown reaches 1 + width x height
-  x 8 bytes it is blocked, and every 100 ms the output of the panes drawn to it during
+  x 8 bytes and its queue has not drained for 100 ms it is blocked, and every 100 ms the output of the panes drawn to it during
   that time (not panes hidden by zoom, in a mode or held by a prompt) is added to
   `#{client_discarded}`; when that is below 1 + width x height / 8 bytes it is
-  unblocked and redrawn in full, once its queue has drained. A passthrough or OSC 52
+  unblocked and redrawn in full, once its queue has drained. Unlike tmux, it is also
+  unblocked at a check where its queue has drained while panes are still writing, and
+  then drawn as usual, not in full (no frame was dropped): it is not sent more than it
+  takes anyway, and it would otherwise show nothing until they stop. A passthrough or OSC 52
   (Ms) sequence does not block the client while it is being written (TTY_NOBLOCK);
   both are dropped and counted as discarded while it is blocked. Unlike tmux:
   - Frames already queued are complete sequences and are still written, not dropped
