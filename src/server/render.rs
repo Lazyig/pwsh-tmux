@@ -2336,7 +2336,9 @@ mod frame_reuse_tests {
         };
         let text = |cells: &[Cell]| cells.iter().map(|c| c.text.as_str()).collect::<String>();
         feed(&mut srv, first, b"\x1b[2J\x1b[Hbefore");
-        run(&mut srv, 1, &["choose-tree", "-N", "-t", &format!("%{second}")]).unwrap();
+        // a fixed format: the default shows pane_current_command, which changes while the
+        // panes' shells start up and would make the two draws compared below differ
+        run(&mut srv, 1, &["choose-tree", "-N", "-F", "#{pane_id}", "-t", &format!("%{second}")]).unwrap();
         run(&mut srv, 1, &["display-message", "-d", "0", "message"]).unwrap();
         srv.render(1);
         let opened = region(&srv, &srv.clients[&1].prev.as_ref().unwrap().frame, second);
