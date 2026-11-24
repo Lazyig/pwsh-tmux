@@ -30,6 +30,18 @@ const STALLED_POLL: Duration = Duration::from_millis(50);
 #[cfg(unix)]
 const TERMINAL_SEND_BUFFER: libc::c_int = 4096;
 
+/// Refuses a connection over MAX_CLIENTS (tmux has no such limit) with an error reply,
+/// as an access refusal is, so the client prints it and exits 1 rather than printing
+/// "lost server". The main loop does this: one nonblocking write of a short frame to a
+/// new connection fits in its empty socket or pipe buffer at once (the deadline only
+/// bounds one that would not). Not logged: a client retrying in a loop would grow the
+/// log without end.
+pub fn refuse_full(stream: &Stream) {
+    let closed = Closer::default();
+    let mut io = Io { stream, closed: &closed, deadline: Some(Instant::now() + Duration::from_millis(20)) };
+    let _ = write_frame(&mut io, S_REPLY, &encode_reply(1, &format!("server has too many clients (limit is {MAX_CLIENTS})")));
+}
+
 /// Lowers the send buffer of an attached terminal client's connection (see
 /// TERMINAL_SEND_BUFFER). Best effort: the default buffer only makes the tail longer.
 pub fn shrink_send_buffer(stream: &Stream) {

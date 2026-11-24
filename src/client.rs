@@ -395,10 +395,10 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
             write_frame(&mut &*stream, kind, payload).is_ok()
         }
     };
-    if !post(C_IDENTIFY, &encode_args(&ident)) || !post(C_COMMAND, &command_payload) {
-        eprintln!("lost server");
-        return 1;
-    }
+    // A failed write is not yet "lost server": a server that refused the connection
+    // (access, too many clients) writes its reply and closes it, maybe before these
+    // writes. The loop below reads that reply, or prints "lost server" if there is none.
+    let _ = post(C_IDENTIFY, &encode_args(&ident)) && post(C_COMMAND, &command_payload);
 
     let mut raw: Option<term::RawMode> = None;
     let mut server_exiting = false;
