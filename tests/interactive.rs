@@ -713,8 +713,16 @@ fn menu_and_popup_lines_styles_and_closing_keys() {
     // -k: any key closes it once the command has exited
     let mut w3 = bg(&["display-popup", "-c", &client, "-k", "-b", "heavy", "-w", "30", "-h", "8", "echo POPUP-K"]);
     t.wait_screen("heavy popup", |s| s.contains('┏') && s.contains("POPUP-K"));
-    t.send(b"x");
-    t.wait_screen("popup closed by any key", |s| !s.contains('┏'));
+    // The output is on the screen before the popup has seen its command exit (on
+    // Windows that is after the process has ended and ConPTY's last output has been
+    // read, see Flow::settle), and until then a key goes to the command (popup_key_cb):
+    // the key is sent again until the popup closes.
+    t.wait("popup closed by any key", || {
+        if t.contents().contains('┏') {
+            t.send(b"x");
+        }
+        !t.contents().contains('┏')
+    });
     for w in [&mut w2, &mut w3] {
         wait_for("waiting command", || w.try_wait().unwrap().is_some());
     }
