@@ -30,10 +30,12 @@ Resource limits include 64 simultaneous connections, 1 MiB client frames, a
 and a 10-second output-write deadline for clients that are not attached terminals
 (before identification, command clients and control clients). Output overflow
 disconnects the client. An attached terminal client has no write deadline, as in
-tmux: it is not drawn to while it cannot keep up, so its queue stays near
-1 + width x height x 8 bytes (at most 2 MiB), and a stalled one keeps at most one
-connection's threads and that queue (see COMPATIBILITY.md, "A client that cannot
-keep up").
+tmux: a stalled one keeps its connection, the connection's two threads and its queued
+output for as long as it stays stalled, bounded by the 8 MiB limit like every other
+client. Its queue normally holds no more than one frame and the output sent outside
+frames, since it is not drawn to again until the queue has drained and passthrough and
+OSC 52 output are dropped while it is blocked (see COMPATIBILITY.md, "A client that
+cannot keep up").
 Command replies have a 4 MiB aggregate limit, including multi-command requests.
 `load-buffer -` preserves binary stdin, including NUL and non-UTF-8 bytes, by
 encoding the data before it enters argument framing. Encoded data and arguments

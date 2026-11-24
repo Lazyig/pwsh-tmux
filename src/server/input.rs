@@ -628,7 +628,8 @@ impl Server {
         let Some(c) = self.clients.get(&cid) else { return };
         if !c.attached || c.suspended || c.control != 0 || !c.features.has("clipboard") { return; }
         let encoded = super::cmds::base64(data);
-        c.send(S_OUTPUT, features::string_capability(&c.term_caps, "Ms", "\x1b]52;%p1%s;%p2%s\x07", &[clip, &encoded]).as_bytes());
+        // dropped while blocked (tty_add), TTY_NOBLOCK otherwise
+        c.send_noblock(features::string_capability(&c.term_caps, "Ms", "\x1b]52;%p1%s;%p2%s\x07", &[clip, &encoded]).as_bytes());
     }
 
     /// The OSC 52 queries, sets and passthrough of one read of output; returns
@@ -688,15 +689,17 @@ impl Server {
                 let visible = c.session.is_some_and(|s| { let w = &self.windows[&self.sessions[&s].active_window()]; w.panes().contains(&pane) && (!w.zoomed || w.active == pane) });
                 if !linked || (allow != "all" && !visible) { continue; }
                 if c.block.active() {
-                    // tty_add drops it while blocked; output of a pane on screen is counted
-                    // with the pane's other output
-                    if !visible {
+                    // tty_add drops it while blocked; output of a pane drawn to the client
+                    // is counted with the pane's other output (block_count)
+                    if !self.pane_drawn(c, pane) {
                         let n: usize = passthrough.iter().map(|d| d.len()).sum();
                         c.io.discarded.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                     }
                     continue;
                 }
                 for data in &passthrough { c.send(S_OUTPUT, data); }
+                // tty_cmd_rawstring: TTY_NOBLOCK
+                if !passthrough.is_empty() { c.noblock(); }
             }
         }
         set

@@ -74,31 +74,42 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
 
 ## Intentional differences
 
-- **A client that cannot keep up.** Like tmux (TTY_BLOCK), a terminal client whose
-  queued output reaches 1 + width x height x 8 bytes is blocked: it is not drawn to,
-  and every 100 ms the output of the panes it shows during that time is added to
-  `#{client_discarded}`; when that is below 1 + width x height / 8 bytes, and the client
-  has also read what was queued, it is unblocked and redrawn in full. Unlike tmux:
+- **A client that cannot keep up.** As tmux does (server_client_check_redraw), a
+  terminal client is not drawn to while output is still queued for it: its next frame
+  waits until the queue has been written and then covers everything that changed in
+  between. Like tmux (TTY_BLOCK), when what it is not shown reaches 1 + width x height
+  x 8 bytes it is blocked, and every 100 ms the output of the panes drawn to it during
+  that time (not panes hidden by zoom, in a mode or held by a prompt) is added to
+  `#{client_discarded}`; when that is below 1 + width x height / 8 bytes it is
+  unblocked and redrawn in full, once its queue has drained. A passthrough or OSC 52
+  (Ms) sequence does not block the client while it is being written (TTY_NOBLOCK);
+  both are dropped and counted as discarded while it is blocked. Unlike tmux:
   - Frames already queued are complete sequences and are still written, not dropped
     (tmux empties its tty buffer). The start threshold is capped at 2 MiB.
-  - What is counted while blocked is the panes' output, not frames. That is about
-    what tmux would have written, while one frame of this renderer, which has no
-    scroll optimisation, rewrites every row of a scrolled pane.
-  - Blocking is checked before each frame is rendered, not after each write. tmux only
-    checks once a write goes through, so its buffer keeps growing while the terminal is
-    stopped. tmux also defers redraws while its buffer is not empty, which keeps split
-    panes small without blocking; here every client is limited by the threshold.
+  - Every frame is a redraw of what changed, and this renderer has no scroll
+    optimisation, so one scrolled line rewrites every row of the pane. What counts
+    toward blocking is therefore the pane output not yet shown (what tmux would have
+    written), not frame bytes, and a terminal slower than the frames (a few tens of
+    KB/s) shows a steadily scrolling pane up to a frame and the terminal's own buffer
+    behind, where tmux keeps up.
+  - On Unix the connection of an attached terminal client gets a small socket send
+    buffer (SO_SNDBUF 4 KiB), so old frames held by the kernel do not keep a slow
+    terminal drawing after its panes have stopped; tmux writes to the terminal itself.
+    A Windows named pipe keeps the buffer it was created with.
   - `#{client_written}` counts terminal output as it is queued, as tmux does, and is 0
     for control clients, which have no tty.
   - No client is disconnected for being slow. An attached terminal client has no write
     deadline: a paused terminal, a console selection (Windows QuickEdit) or a stopped
-    client is kept for as long as it stays paused. A client that has not identified, a
-    command client and a control client (whose pause-after and "too far behind" rules
-    are unchanged) must still take each frame within 10 seconds. The 8 MiB limit on
-    queued output stays for every client as a memory bound. With blocking, an attached
-    client stays well below it unless other output, such as a single very large
-    clipboard sequence, fills it. Passthrough output is dropped while a client is
-    blocked, as in tmux.
+    client is kept for as long as it stays paused, as tmux keeps it. A client that has
+    not identified, a command client and a control client (whose pause-after and "too
+    far behind" rules are unchanged) must still take each frame within 10 seconds, so a
+    peer that is not an attached terminal cannot hold a connection by not reading. The
+    8 MiB limit on queued output stays for every client as a memory bound; an attached
+    client stays far below it, since it is sent a frame only once the one before has
+    been written and output outside frames that could add up (passthrough, OSC 52) is
+    dropped while it is blocked. Once blocked and quiet, a client that stays stopped
+    costs no timer: the writer wakes the server when it has drained. On Windows a
+    write that has waited for a second looks again every 50 ms instead of every 5 ms.
 - **Shell and platform defaults.** `default-shell` is PowerShell, the project's purpose:
   `pwsh`, falling back to `powershell.exe` on Windows and to `$SHELL` (then `/bin/sh`)
   on Unix. On Unix a pane without a command runs its shell as a login shell (argv0 `-` and

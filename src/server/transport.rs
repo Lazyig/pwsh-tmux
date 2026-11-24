@@ -9,6 +9,33 @@ pub const MAX_OUTPUT_BACKLOG: usize = 8 << 20;
 pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often a wait that nothing can wake looks at the cancel flag.
 const CANCEL_POLL: Duration = Duration::from_millis(5);
+/// How often a write to a peer that has not read for a while looks again, where nothing
+/// can wake it (a paused or stopped terminal client has no write deadline).
+#[cfg(not(unix))]
+const STALLED_POLL: Duration = Duration::from_millis(50);
+/// What the kernel may hold for an attached terminal client (SO_SNDBUF; Linux doubles
+/// it). Frames in the socket buffer are out of reach of the deferred redraw and of
+/// blocking (block.rs): a slow terminal would draw the default ~200 KiB of old frames
+/// after its panes had stopped, where tmux writes to the terminal itself.
+#[cfg(unix)]
+const TERMINAL_SEND_BUFFER: libc::c_int = 4096;
+
+/// Lowers the send buffer of an attached terminal client's connection (see
+/// TERMINAL_SEND_BUFFER). Best effort: the default buffer only makes the tail longer.
+pub fn shrink_send_buffer(stream: &Stream) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let Stream::UdSocket(socket) = stream;
+        let size = TERMINAL_SEND_BUFFER;
+        unsafe {
+            libc::setsockopt(socket.inner().as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF,
+                (&size as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = stream;
+}
 
 /// A connection's cancel flag. On Unix, `close` also wakes a reader or writer waiting
 /// for the socket, which then sees the flag at once. Without a wake pipe (Windows, or
@@ -57,6 +84,8 @@ impl Io<'_> {
     /// Runs `operation` until it does not report WouldBlock, the connection is closed or
     /// the deadline passes. `events` is what to wait for between tries (POLLIN, POLLOUT).
     fn retry<T>(&self, events: i16, mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+        #[cfg(not(unix))]
+        let since = Instant::now();
         loop {
             if self.closed.is_closed() {
                 return Err(io::ErrorKind::BrokenPipe.into());
@@ -69,11 +98,10 @@ impl Io<'_> {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     #[cfg(unix)]
                     self.wait(events);
+                    // a write stalled for a second (a stopped client, a console selection)
+                    // looks less often; a read stays quick for the next key
                     #[cfg(not(unix))]
-                    {
-                        let _ = events;
-                        thread::sleep(CANCEL_POLL)
-                    }
+                    thread::sleep(if events == WRITE && since.elapsed() >= Duration::from_secs(1) { STALLED_POLL } else { CANCEL_POLL });
                 }
                 result => return result,
             }
@@ -110,7 +138,7 @@ const WRITE: i16 = libc::POLLOUT;
 #[cfg(not(unix))]
 const READ: i16 = 0;
 #[cfg(not(unix))]
-const WRITE: i16 = 0;
+const WRITE: i16 = 1;
 
 impl Read for Io<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
