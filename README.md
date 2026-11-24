@@ -23,7 +23,16 @@ not affiliated with the tmux project.
 
 ## Install
 
-Build a release archive with its licenses, checksums and build information:
+Prebuilt archives for x86_64 Windows (MSVC) and Linux (GNU) are on the
+[releases page](https://github.com/Lazyig/pwsh-tmux/releases). These links always get the
+latest release:
+
+- Windows: [`tmux-x86_64-pc-windows-msvc.zip`](https://github.com/Lazyig/pwsh-tmux/releases/latest/download/tmux-x86_64-pc-windows-msvc.zip)
+- Linux: [`tmux-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/Lazyig/pwsh-tmux/releases/latest/download/tmux-x86_64-unknown-linux-gnu.tar.gz)
+
+Add `.sha256` to a link for the archive's checksum.
+
+To build a release archive yourself, with its licenses, checksums and build information:
 
 ```
 python tools/build_release.py
