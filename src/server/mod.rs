@@ -2657,7 +2657,8 @@ impl Server {
             for cid in cids {
                 if vis == "off" || vis == "both" {
                     if let Some(c) = self.clients.get(&cid) {
-                        c.send(S_OUTPUT, b"\x07");
+                        // tty_putcode(TTYC_BEL) goes through tty_add: dropped while blocked
+                        c.send_tty(b"\x07");
                     }
                 }
                 if vis != "off" {

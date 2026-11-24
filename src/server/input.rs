@@ -674,7 +674,7 @@ impl Server {
                             if c.input_state.clipboard.len() < 64 {
                                 c.input_state.clipboard.push((pane, Instant::now(), bel));
                                 // tty_clipboard_query asks with an empty selection parameter
-                                c.send(S_OUTPUT, features::string_capability(&c.term_caps, "Ms", "\x1b]52;%p1%s;%p2%s\x07", &["", "?"]).as_bytes());
+                                c.send_tty(features::string_capability(&c.term_caps, "Ms", "\x1b]52;%p1%s;%p2%s\x07", &["", "?"]).as_bytes());
                             }
                         }
                     }

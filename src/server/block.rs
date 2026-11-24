@@ -76,15 +76,24 @@ impl Client {
         self.block.noblock_until.set(self.io.queued_total.load(Ordering::SeqCst));
     }
 
-    /// tty_add for output outside frames that tmux drops while blocked (Ms): counted as
-    /// discarded then, otherwise queued without blocking the client.
-    pub fn send_noblock(&self, data: &[u8]) {
+    /// tty_add for terminal output outside frames (a bell, an OSC 52 query): dropped and
+    /// counted as discarded while the client is blocked, so a stopped peer's queue does not
+    /// grow with it; queued otherwise. Returns whether it was queued.
+    pub fn send_tty(&self, data: &[u8]) -> bool {
         if self.block.active() {
             self.io.discarded.fetch_add(data.len() as u64, Ordering::Relaxed);
-            return;
+            return false;
         }
         self.send(S_OUTPUT, data);
-        self.noblock();
+        true
+    }
+
+    /// [`Client::send_tty`] for Ms, which is also queued without blocking the client
+    /// (TTY_NOBLOCK).
+    pub fn send_noblock(&self, data: &[u8]) {
+        if self.send_tty(data) {
+            self.noblock();
+        }
     }
 
     /// Before a frame is rendered: true when nothing is to be drawn now, because the
@@ -438,6 +447,43 @@ mod tests {
         srv.block_timers(now + BLOCK_INTERVAL);
         assert!(!srv.clients[&1].block.active());
         let _ = frames(&output);
+        kill(&mut srv);
+    }
+
+    /// A bell rings through tty_add like any other terminal output: a stopped client is
+    /// blocked by a pane that only rings, and bells then are dropped and counted, so its
+    /// queue stays near the start threshold instead of growing to the limit.
+    #[test]
+    fn bells_are_dropped_while_blocked() {
+        let (mut srv, output, pane) = stopped();
+        srv.render_all();
+        let start = block_start((120, 32));
+        let mut most = 0;
+        for i in 0..20_000 {
+            let generation = srv.panes[&pane].generation;
+            srv.pane_data(pane, generation, b"\x07");
+            srv.render_all();
+            if i % 100 == 0 {
+                behind(&mut srv);
+            }
+            most = most.max(queued(&srv));
+        }
+        let c = &srv.clients[&1];
+        assert!(c.block.active() && !c.closed.is_closed());
+        assert!(most < 2 * start, "queued {most} (threshold {start})");
+        // what was queued is the first frame and bells up to the threshold
+        let queued_bells = output.try_iter().filter(|f| *f == frame(S_OUTPUT, b"\x07")).count();
+        assert!(queued_bells > 0 && queued_bells < 20_000, "{queued_bells}");
+        assert!(c.io.discarded.load(Ordering::Relaxed) >= (20_000 - queued_bells) as u64);
+        // quiet, unblocked and read: bells are queued again
+        let now = Instant::now();
+        srv.block_timers(now + BLOCK_INTERVAL);
+        srv.block_timers(now + 2 * BLOCK_INTERVAL);
+        assert!(!srv.clients[&1].block.active());
+        drain(&srv);
+        let generation = srv.panes[&pane].generation;
+        srv.pane_data(pane, generation, b"\x07");
+        assert_eq!(output.try_iter().filter(|f| *f == frame(S_OUTPUT, b"\x07")).count(), 1);
         kill(&mut srv);
     }
 }

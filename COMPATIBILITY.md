@@ -86,7 +86,8 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   then drawn as usual, not in full (no frame was dropped): it is not sent more than it
   takes anyway, and it would otherwise show nothing until they stop. A passthrough or OSC 52
   (Ms) sequence does not block the client while it is being written (TTY_NOBLOCK);
-  both are dropped and counted as discarded while it is blocked. Unlike tmux:
+  both, like a bell and an OSC 52 clipboard query, are dropped and counted as
+  discarded while it is blocked (tty_add). Unlike tmux:
   - Frames already queued are complete sequences and are still written, not dropped
     (tmux empties its tty buffer). The start threshold is capped at 2 MiB.
   - Every frame is a redraw of what changed, and this renderer has no scroll
@@ -109,8 +110,11 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
     peer that is not an attached terminal cannot hold a connection by not reading. The
     8 MiB limit on queued output stays for every client as a memory bound; an attached
     client stays far below it, since it is sent a frame only once the one before has
-    been written and output outside frames that could add up (passthrough, OSC 52) is
-    dropped while it is blocked. Once blocked and quiet, a client that stays stopped
+    been written and output outside frames that could add up (passthrough, OSC 52,
+    bells) is dropped while it is blocked. Passthrough that keeps coming while the
+    last one has not been written does not block the client (TTY_NOBLOCK), so a stopped
+    client sent that without end still reaches the limit, where tmux's buffer grows
+    without one. Once blocked and quiet, a client that stays stopped
     costs no timer: the writer wakes the server when it has drained. On Windows a
     write that has waited for a second looks again every 50 ms instead of every 5 ms.
 - **Shell and platform defaults.** `default-shell` is PowerShell, the project's purpose:
