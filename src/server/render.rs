@@ -44,12 +44,24 @@ fn terminal_text(text: &str) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 thread_local! { static OLD_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
-#[derive(Clone)]
 pub struct Frame {
     pub w: u16,
     pub h: u16,
     pub cells: Vec<Cell>,
     links: std::collections::BTreeMap<usize, std::sync::Arc<vt100::Hyperlink>>,
+}
+
+impl Clone for Frame {
+    fn clone(&self) -> Self {
+        Frame { w: self.w, h: self.h, cells: self.cells.clone(), links: self.links.clone() }
+    }
+    /// Copies into this frame's cells (and their text buffers) in place.
+    fn clone_from(&mut self, source: &Self) {
+        self.w = source.w;
+        self.h = source.h;
+        self.cells.clone_from(&source.cells);
+        self.links.clone_from(&source.links);
+    }
 }
 
 impl Frame {
@@ -1176,11 +1188,13 @@ impl Server {
 
     #[cfg(test)]
     pub(super) fn compose(&self, cid: ClientId) -> Option<RenderState> {
-        self.compose_into(cid, None)
+        self.compose_into(cid, None, self.clients.get(&cid).and_then(|c| c.prev.as_ref()).and_then(|p| p.frozen.clone()))
     }
 
-    /// [`Server::compose`] into `spare` (see [`Frame::reuse`]).
-    fn compose_into(&self, cid: ClientId, spare: Option<Frame>) -> Option<RenderState> {
+    /// [`Server::compose`] into `spare` (see [`Frame::reuse`]). `frozen` is the previous
+    /// render's [`RenderState::frozen`], taken from it: the panes held while the client is
+    /// frozen, whose buffer is reused (see [`Server::freeze_panes`]).
+    fn compose_into(&self, cid: ClientId, spare: Option<Frame>, frozen: Option<Frame>) -> Option<RenderState> {
         let _widths = self.width_context();
         let c = self.clients.get(&cid)?;
         let sid = c.session?;
@@ -1255,7 +1269,7 @@ impl Server {
             let cr = self.content_rect(wid, *r);
             self.draw_pane_body(&mut f, cid, wid, *id, (cr.x as i32 - pxi, cr.y as i32 - pyi, cr.w, cr.h), (cw, area_h), oy, &mut modes, &mut cursor);
         }
-        let (freeze, frozen, held) = self.freeze_panes(c, &mut f, wid, &rects, (px, py), (cw, area_h), oy);
+        let (freeze, frozen, held) = self.freeze_panes(c, &mut f, frozen, wid, &rects, (px, py), (cw, area_h), oy);
 
         for (id, r) in &rects {
             if let Some(sb) = self.pane_scrollbar(wid, *id, *r) { super::display::draw_scrollbar(&mut f, sb, (-pxi, -pyi), (cw, area_h), oy); }
@@ -1526,10 +1540,12 @@ impl Server {
     /// now; so does a pane in clock or tree mode, whose mode redraws it (PANE_REDRAW).
     /// What is drawn over the panes (borders, pane status lines and prompts, floating
     /// panes, menus, the status lines) is drawn as it is; a popup's content is held with
-    /// the panes. Returns the freeze key, the panes held and whether they were held as
-    /// they were (not redrawn).
+    /// the panes. `frozen` is the previous render's held panes (taken from `c.prev`); its
+    /// cells are written in place, so holding the panes frame after frame (a pane writing
+    /// all the time behind a prompt) copies cells without allocating. Returns the freeze
+    /// key, the panes held and whether they were held as they were (not redrawn).
     #[allow(clippy::too_many_arguments)]
-    fn freeze_panes(&self, c: &Client, f: &mut Frame, wid: WinId, rects: &[(PaneId, Rect)], (px, py): (u16, u16), (cw, area_h): (u16, u16), oy: u16) -> (Option<String>, Option<Frame>, bool) {
+    fn freeze_panes(&self, c: &Client, f: &mut Frame, frozen: Option<Frame>, wid: WinId, rects: &[(PaneId, Rect)], (px, py): (u16, u16), (cw, area_h): (u16, u16), oy: u16) -> (Option<String>, Option<Frame>, bool) {
         let prompt = c.prompt.as_ref().filter(|p| p.freeze && !p.incremental && p.copy_incremental.is_none() && p.host.is_none());
         let message = c.message.is_some() && !c.message_no_freeze;
         if prompt.is_none() && !message {
@@ -1544,22 +1560,32 @@ impl Server {
             (*p, *r, pane.and_then(|p| p.mode.as_ref()).map(std::mem::discriminant), pr)
         }).collect();
         let key = format!("{wid:?} {:?} {panes:?} {px} {py} {:?} {:?} {}", win.active, c.prompt.as_ref().map(|p| p.id), c.overlay.as_ref().map(|Overlay::Popup(p)| (p.pane, p.x, p.y, p.w, p.h)), self.menus.contains_key(&wid));
-        let held = c.prev.as_ref().filter(|p| {
+        let holds = c.prev.as_ref().is_some_and(|p| {
             p.freeze.as_ref() == Some(&key) && (p.message.is_none() || p.message == c.message)
-        }).and_then(|p| p.frozen.as_ref()).filter(|h| h.w == f.w && h.h == f.h);
-        let was_held = held.is_some();
-        if let Some(held) = held {
-            let now = std::mem::replace(f, held.clone());
-            for (_, r) in rects.iter().filter(|(p, _)| live(p)) {
-                let cr = self.content_rect(wid, *r);
-                let (x0, y0) = ((cr.x as i32 - px as i32).max(0), (cr.y as i32 - py as i32).max(0));
-                let (x1, y1) = ((cr.x as i32 + cr.w as i32 - px as i32).min(cw as i32), (cr.y as i32 + cr.h as i32 - py as i32).min(area_h as i32));
-                if x0 < x1 && y0 < y1 {
-                    f.copy_rect(&now, x0 as u16, y0 as u16 + oy, (x1 - x0) as u16, (y1 - y0) as u16);
+        });
+        let frozen = match frozen {
+            // held as they were: the panes in clock or tree mode (drawn now, in `f`) go
+            // over the held ones, and the frame drawn is the held panes
+            Some(mut held) if holds && held.w == f.w && held.h == f.h => {
+                for (_, r) in rects.iter().filter(|(p, _)| live(p)) {
+                    let cr = self.content_rect(wid, *r);
+                    let (x0, y0) = ((cr.x as i32 - px as i32).max(0), (cr.y as i32 - py as i32).max(0));
+                    let (x1, y1) = ((cr.x as i32 + cr.w as i32 - px as i32).min(cw as i32), (cr.y as i32 + cr.h as i32 - py as i32).min(area_h as i32));
+                    if x0 < x1 && y0 < y1 {
+                        held.copy_rect(f, x0 as u16, y0 as u16 + oy, (x1 - x0) as u16, (y1 - y0) as u16);
+                    }
                 }
+                f.clone_from(&held);
+                return (Some(key), Some(held), true);
             }
-        }
-        (Some(key), Some(f.clone()), was_held)
+            // drawn as they are now, and held from here
+            Some(mut buf) => {
+                buf.clone_from(f);
+                buf
+            }
+            None => f.clone(),
+        };
+        (Some(key), Some(frozen), false)
     }
 
     /// prompt_draw: while a prompt has the cursor it takes prompt-cursor-style and
@@ -1696,7 +1722,8 @@ impl Server {
         self.update_view(cid);
         // the frame before the previous one is drawn over (the previous one is diffed with)
         let spare = self.clients.get_mut(&cid).and_then(|c| c.prev.as_mut()).and_then(|p| p.spare.take());
-        let Some(next) = self.compose_into(cid, spare) else { return };
+        let frozen = self.clients.get_mut(&cid).and_then(|c| c.prev.as_mut()).and_then(|p| p.frozen.take());
+        let Some(next) = self.compose_into(cid, spare, frozen) else { return };
         // window title
         let mut title_update = None;
         if let Some(sid) = self.client_session(cid) {
@@ -2140,6 +2167,7 @@ mod frame_reuse_tests {
     fn same(a: &RenderState, b: &RenderState) -> bool {
         a.frame.w == b.frame.w && a.frame.h == b.frame.h && a.frame.cells == b.frame.cells && a.frame.links == b.frame.links
             && a.cursor == b.cursor && a.park == b.park && a.modes == b.modes && a.status_ranges == b.status_ranges
+            && a.freeze == b.freeze && a.frozen.as_ref().map(|f| (f.w, f.h, &f.cells, &f.links)) == b.frozen.as_ref().map(|f| (f.w, f.h, &f.cells, &f.links))
     }
 
     /// Composes client 1 with Frame::new and Frame::set, then into a used frame (`spare`)
@@ -2149,9 +2177,10 @@ mod frame_reuse_tests {
         OLD_PATH.set(true);
         let old = srv.compose(1).unwrap();
         OLD_PATH.set(false);
-        let new = srv.compose_into(1, spare).unwrap();
+        let frozen = || srv.clients[&1].prev.as_ref().and_then(|p| p.frozen.clone());
+        let new = srv.compose_into(1, spare, frozen()).unwrap();
         assert!(same(&old, &new), "{what}: a reused frame differs");
-        let new = srv.compose_into(1, Some(dirty(old.frame.w, old.frame.h, seed))).unwrap();
+        let new = srv.compose_into(1, Some(dirty(old.frame.w, old.frame.h, seed)), frozen()).unwrap();
         assert!(same(&old, &new), "{what}: a dirty frame differs");
         let text: String = old.frame.cells.iter().map(|c| c.text.as_str()).collect();
         assert!(!text.trim().is_empty(), "{what}: nothing drawn");
@@ -2284,6 +2313,48 @@ mod frame_reuse_tests {
         let text = shown(&srv);
         assert!(text.contains("after 2") && !text.contains("message"), "{text}");
         assert!(srv.clients[&1].prev.as_ref().is_some_and(|p| p.frozen.is_none()));
+        kill(&mut srv);
+    }
+
+    #[test]
+    fn a_pane_in_tree_mode_is_drawn_over_the_held_panes() {
+        // the held panes' buffer is written in place: a pane in tree mode (PANE_REDRAW)
+        // is drawn as it is now over the others as they were held
+        let (mut srv, _ev) = clients((60, 20), None);
+        run(&mut srv, 1, &["new-session", "-d", "-s", "s", "-x", "60", "-y", "19"]).unwrap();
+        let sid = *srv.sessions.keys().next().unwrap();
+        srv.attach_client(1, sid);
+        let first = srv.client_active_pane(1).unwrap();
+        run(&mut srv, 1, &["new-window", "-d"]).unwrap();
+        run(&mut srv, 1, &["split-window", "-h", "-d"]).unwrap();
+        let wid = srv.client_window(1).unwrap();
+        let second = *srv.windows[&wid].panes().iter().find(|p| **p != first).unwrap();
+        let region = |srv: &Server, f: &Frame, pane: PaneId| {
+            let r = srv.rects(wid).0.into_iter().find(|(p, _)| *p == pane).unwrap().1;
+            let cr = srv.content_rect(wid, r);
+            (cr.y..cr.y + cr.h).flat_map(|y| (cr.x..cr.x + cr.w).map(move |x| (x, y))).map(|(x, y)| f.get(x, y).cloned().unwrap()).collect::<Vec<_>>()
+        };
+        let text = |cells: &[Cell]| cells.iter().map(|c| c.text.as_str()).collect::<String>();
+        feed(&mut srv, first, b"\x1b[2J\x1b[Hbefore");
+        run(&mut srv, 1, &["choose-tree", "-N", "-t", &format!("%{second}")]).unwrap();
+        run(&mut srv, 1, &["display-message", "-d", "0", "message"]).unwrap();
+        srv.render(1);
+        let opened = region(&srv, &srv.clients[&1].prev.as_ref().unwrap().frame, second);
+        for (i, key) in ["Down", "Down", "Up"].into_iter().enumerate() {
+            feed(&mut srv, first, format!("\r\nafter {i}").as_bytes());
+            run(&mut srv, 1, &["send-keys", "-t", &format!("%{second}"), key]).unwrap();
+            srv.render(1);
+            assert!(srv.clients[&1].prev.as_ref().is_some_and(|p| p.frozen.is_some() && p.spare.is_some()));
+        }
+        let shown = srv.clients[&1].prev.as_ref().unwrap().frame.clone();
+        let held = text(&region(&srv, &shown, first));
+        assert!(held.contains("before") && !held.contains("after"), "{held}");
+        // the tree pane is as a client that is not frozen draws it, and it moved
+        srv.clients.get_mut(&1).unwrap().message = None;
+        let now = srv.compose(1).unwrap().frame;
+        assert!(region(&srv, &now, second) == region(&srv, &shown, second), "the tree pane differs");
+        assert!(region(&srv, &now, second) != opened, "the tree selection did not move");
+        assert!(text(&region(&srv, &now, first)).contains("after 2"));
         kill(&mut srv);
     }
 

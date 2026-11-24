@@ -42,11 +42,23 @@ pub fn acs_char(c: char) -> Option<&'static str> {
     })
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(PartialEq, Debug)]
 pub struct Cell {
     /// Grapheme text; " " for blank, empty for the right half of a wide character.
     pub text: String,
     pub style: Style,
+}
+
+impl Clone for Cell {
+    fn clone(&self) -> Self {
+        Cell { text: self.text.clone(), style: self.style }
+    }
+    /// Copies into the cell's own text buffer, so copying frames over frames
+    /// (`clone_from_slice`, `Vec::clone_from`) does not allocate per cell.
+    fn clone_from(&mut self, source: &Self) {
+        self.text.clone_from(&source.text);
+        self.style = source.style;
+    }
 }
 
 impl Default for Cell {
