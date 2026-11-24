@@ -4,6 +4,7 @@
 //! All state lives on the main loop thread; PTY readers, child waiters, shell jobs
 //! and client connections run on helper threads that only send `Event`s.
 
+mod block;
 mod cmds;
 mod control;
 mod copy;
@@ -1114,12 +1115,24 @@ pub struct Client {
     /// refresh-client -L/-R/-U/-D: the window panned and the view's top left in it
     /// (pan_window, pan_ox, pan_oy).
     pub pan: Option<(WinId, u16, u16)>,
+    /// The client cannot keep up (TTY_BLOCK).
+    pub block: block::Block,
 }
 
 #[derive(Default)]
 pub struct ClientIo {
+    /// Terminal output queued for the client (tmux's c->written, which counts what goes
+    /// into the tty buffer).
     pub written: std::sync::atomic::AtomicU64,
+    /// Terminal output not sent: not drawn while blocked, or for a closed connection.
     pub discarded: std::sync::atomic::AtomicU64,
+    /// Every byte ever queued, frame headers included (queued_bytes is what of it is
+    /// still waiting).
+    pub queued_total: std::sync::atomic::AtomicU64,
+    /// Writes to this client have no time limit: it has been an attached terminal
+    /// client, which tmux never drops for reading slowly (a paused terminal, a console
+    /// selection, a stopped client).
+    pub patient: std::sync::atomic::AtomicBool,
     /// The client has been sent its reply or exit (CLIENT_EXIT).
     pub exit_sent: std::sync::atomic::AtomicBool,
 }
@@ -1155,26 +1168,35 @@ impl Client {
             self.io.exit_sent.store(true, Ordering::SeqCst);
         }
         let len = payload.len().saturating_add(5);
+        // tty_add counts terminal output; a control client has no tty
+        let terminal = if kind == S_OUTPUT && self.control == 0 { payload.len() as u64 } else { 0 };
         if self.closed.is_closed() {
-            self.io.discarded.fetch_add(len as u64, Ordering::Relaxed);
+            self.io.discarded.fetch_add(terminal, Ordering::Relaxed);
             return;
         }
         #[allow(deprecated)]
         let reserved = self.queued_bytes.fetch_update(Ordering::SeqCst, Ordering::SeqCst,
             |n| n.checked_add(len).filter(|n| *n <= transport::MAX_OUTPUT_BACKLOG));
         if reserved.is_err() {
-            self.io.discarded.fetch_add(len as u64, Ordering::Relaxed);
+            self.io.discarded.fetch_add(terminal, Ordering::Relaxed);
             self.closed.close();
             return;
+        }
+        if self.attached && self.control == 0 {
+            self.io.patient.store(true, Ordering::SeqCst);
         }
         if self.pending.fetch_add(1, Ordering::SeqCst) == 0 {
             self.backlog_since.store(now_ms(), Ordering::SeqCst);
         }
+        self.io.queued_total.fetch_add(len as u64, Ordering::SeqCst);
         if self.tx.send(frame(kind, payload)).is_err() {
             self.queued_bytes.fetch_sub(len, Ordering::SeqCst);
             self.pending.fetch_sub(1, Ordering::SeqCst);
+            self.io.discarded.fetch_add(terminal, Ordering::Relaxed);
             self.closed.close();
+            return;
         }
+        self.io.written.fetch_add(terminal, Ordering::Relaxed);
     }
 
     /// How long output has been waiting to be written to this client.
@@ -2080,12 +2102,15 @@ impl Server {
             // The Client holds the only sender: this ends when it goes, or when a write
             // fails or is cancelled (a write after close fails at once).
             while let Ok(buf) = rx.recv() {
-                let mut send = transport::Io { stream: &stream, closed: &writer_closed, deadline: Some(Instant::now() + transport::IO_TIMEOUT) };
+                // a client not yet identified, a command client and a control client must
+                // keep reading; an attached terminal client may stop for as long as it
+                // likes (blocking keeps its queue small)
+                let deadline = (!writer_io.patient.load(Ordering::SeqCst)).then(|| Instant::now() + transport::IO_TIMEOUT);
+                let mut send = transport::Io { stream: &stream, closed: &writer_closed, deadline };
                 if send.write_all(&buf).is_err() {
                     break;
                 }
                 writer_bytes.fetch_sub(buf.len(), Ordering::SeqCst);
-                writer_io.written.fetch_add(buf.len() as u64, Ordering::Relaxed);
                 // still behind: the backlog now starts at this write
                 if writer_pending.fetch_sub(1, Ordering::SeqCst) > 1 {
                     writer_since.store(now_ms(), Ordering::SeqCst);
@@ -2194,6 +2219,7 @@ impl Server {
                 acl_readonly: false,
                 io,
                 pan: None,
+                block: Default::default(),
             },
         );
     }
@@ -2424,6 +2450,7 @@ impl Server {
         if !self.panes.get(&id).is_some_and(|p| p.generation == generation) {
             return;
         }
+        self.block_count(id, data.len());
         self.control_output(id, data);
         let scroll_on_clear = options::is_on(&self.opt_pane(id, "scroll-on-clear"));
         let alternate = options::is_on(&self.opt_pane(id, "alternate-screen"));
@@ -2874,6 +2901,9 @@ impl Server {
         if self.waits_resumable() {
             t = Duration::ZERO;
         }
+        if let Some(d) = self.block_deadline() {
+            t = t.min(d.saturating_duration_since(now));
+        }
         let now_us = now_us();
         for (_, deadline, _) in self.silence_timers() {
             t = t.min(Duration::from_micros(deadline.saturating_sub(now_us)));
@@ -2914,6 +2944,7 @@ impl Server {
             self.cfg_release_jobs();
         }
         let now = Instant::now();
+        self.block_timers(now);
         let expired: Vec<_> = self.panes.iter_mut().filter_map(|(id, p)| {
             if p.scrollbar_until.is_some_and(|d| d <= now) { p.scrollbar_until = None; Some(*id) } else { None }
         }).collect();

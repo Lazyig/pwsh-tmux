@@ -27,7 +27,13 @@ client, and authorization runs after its header, before its body is allocated.
 
 Resource limits include 64 simultaneous connections, 1 MiB client frames, a
 64-event input queue, 8 MiB queued output per client, a 10-second identify deadline
-and a 10-second output-write deadline. Output overflow disconnects the client.
+and a 10-second output-write deadline for clients that are not attached terminals
+(before identification, command clients and control clients). Output overflow
+disconnects the client. An attached terminal client has no write deadline, as in
+tmux: it is not drawn to while it cannot keep up, so its queue stays near
+1 + width x height x 8 bytes (at most 2 MiB), and a stalled one keeps at most one
+connection's threads and that queue (see COMPATIBILITY.md, "A client that cannot
+keep up").
 Command replies have a 4 MiB aggregate limit, including multi-command requests.
 `load-buffer -` preserves binary stdin, including NUL and non-UTF-8 bytes, by
 encoding the data before it enters argument framing. Encoded data and arguments

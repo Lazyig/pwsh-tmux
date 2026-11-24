@@ -686,7 +686,17 @@ impl Server {
             for c in self.clients.values().filter(|c| c.attached && !c.suspended && c.control == 0) {
                 let linked = c.session.is_some_and(|s| self.sessions[&s].links.values().any(|w| self.windows[w].panes().contains(&pane)));
                 let visible = c.session.is_some_and(|s| { let w = &self.windows[&self.sessions[&s].active_window()]; w.panes().contains(&pane) && (!w.zoomed || w.active == pane) });
-                if linked && (allow == "all" || visible) { for data in &passthrough { c.send(S_OUTPUT, data); } }
+                if !linked || (allow != "all" && !visible) { continue; }
+                if c.block.active() {
+                    // tty_add drops it while blocked; output of a pane on screen is counted
+                    // with the pane's other output
+                    if !visible {
+                        let n: usize = passthrough.iter().map(|d| d.len()).sum();
+                        c.io.discarded.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    continue;
+                }
+                for data in &passthrough { c.send(S_OUTPUT, data); }
             }
         }
         set

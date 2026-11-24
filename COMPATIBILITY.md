@@ -74,6 +74,31 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
 
 ## Intentional differences
 
+- **A client that cannot keep up.** Like tmux (TTY_BLOCK), a terminal client whose
+  queued output reaches 1 + width x height x 8 bytes is blocked: it is not drawn to,
+  and every 100 ms the output of the panes it shows during that time is added to
+  `#{client_discarded}`; when that is below 1 + width x height / 8 bytes, and the client
+  has also read what was queued, it is unblocked and redrawn in full. Unlike tmux:
+  - Frames already queued are complete sequences and are still written, not dropped
+    (tmux empties its tty buffer). The start threshold is capped at 2 MiB.
+  - What is counted while blocked is the panes' output, not frames. That is about
+    what tmux would have written, while one frame of this renderer, which has no
+    scroll optimisation, rewrites every row of a scrolled pane.
+  - Blocking is checked before each frame is rendered, not after each write. tmux only
+    checks once a write goes through, so its buffer keeps growing while the terminal is
+    stopped. tmux also defers redraws while its buffer is not empty, which keeps split
+    panes small without blocking; here every client is limited by the threshold.
+  - `#{client_written}` counts terminal output as it is queued, as tmux does, and is 0
+    for control clients, which have no tty.
+  - No client is disconnected for being slow. An attached terminal client has no write
+    deadline: a paused terminal, a console selection (Windows QuickEdit) or a stopped
+    client is kept for as long as it stays paused. A client that has not identified, a
+    command client and a control client (whose pause-after and "too far behind" rules
+    are unchanged) must still take each frame within 10 seconds. The 8 MiB limit on
+    queued output stays for every client as a memory bound. With blocking, an attached
+    client stays well below it unless other output, such as a single very large
+    clipboard sequence, fills it. Passthrough output is dropped while a client is
+    blocked, as in tmux.
 - **Shell and platform defaults.** `default-shell` is PowerShell, the project's purpose:
   `pwsh`, falling back to `powershell.exe` on Windows and to `$SHELL` (then `/bin/sh`)
   on Unix. On Unix a pane without a command runs its shell as a login shell (argv0 `-` and
