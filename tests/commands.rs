@@ -4229,29 +4229,58 @@ fn pane_output_that_widens_a_cell_in_the_last_column_leaves_the_server_running()
     // indicators made the cell in the last column wide and the cell was written over
     let ctx = Ctx::new("wide-last-column");
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pane-output-crash");
-    // Shows the file, then the marker (if any). The output can leave other character
-    // sets in use (DEC special graphics draws "@done1@" as "@␍⎺┼␊1@"), so the
-    // terminal goes back to ASCII before the marker.
+    // Unix: shows the file, then the marker (if any). The output can leave other
+    // character sets in use (DEC special graphics draws "@done1@" as "@␍⎺┼␊1@"), so
+    // RIS goes before the marker.
     let shown = |file: &std::path::Path, marker: &str| -> String {
-        let path = file.display().to_string();
-        if cfg!(windows) {
-            // without RIS: designate ASCII into G0-G3 (so whichever set is shifted in
-            // is ASCII, in conhost and in the pane's parser) and shift in G0 (SI)
-            let marker = if marker.is_empty() { String::new() } else { format!("$e = [string][char]27; [Console]::Write($e + '(B' + $e + ')B' + $e + '*B' + $e + '+B' + [char]15 + '{marker}'); ") };
-            format!("$b = [IO.File]::ReadAllBytes('{path}'); $o = [Console]::OpenStandardOutput(); $o.Write($b, 0, $b.Length); $o.Flush(); {marker}Start-Sleep 100")
-        } else {
-            let marker = if marker.is_empty() { String::new() } else { format!("\\033c{marker}") };
-            // the replies to its queries are not echoed over the screen
-            format!("stty -echo; cat '{path}'; printf '{marker}'; sleep 100")
-        }
+        let marker = if marker.is_empty() { String::new() } else { format!("\\033c{marker}") };
+        // the replies to its queries are not echoed over the screen
+        format!("stty -echo; cat '{}'; printf '{marker}'; sleep 100", file.display())
     };
     ctx.ok(&["new-session", "-d", "-s", "keep"]);
     for (i, (name, cols, rows, history)) in [("crash-5x25.bin", 25, 5, 0), ("panic-11.bin", 1, 6, 7), ("panic-1712.bin", 18, 8, 7), ("panic-1861.bin", 25, 5, 14)].into_iter().enumerate() {
         let (session, cols, rows, history) = (format!("w{i}"), cols.to_string(), rows.to_string(), history.to_string());
         ctx.ok(&["set", "-g", "history-limit", &history]);
-        let script = shown(&dir.join(name), &format!("@done{i}@"));
-        ctx.ok(&["new-session", "-d", "-s", &session, "-x", &cols, "-y", &rows, &script]);
-        wait_for(&format!("{name} shown"), || ctx.ok(&["capture-pane", "-p", "-J", "-t", &session]).contains(&format!("@done{i}@")));
+        let file = dir.join(name);
+        if cfg!(windows) {
+            // No marker on the screen: ConPTY passes the start of a DCS in the output
+            // ("ESC P tmux; ESC ESC x" in panic-1712 and panic-1861) through but not the
+            // ST that ends it (nor an ESC \ or CAN written after it), so the pane's
+            // parser, like tmux's, stays in the DCS and takes everything after it. What
+            // pipe-pane gets has been through the parser (Server::pane_data), so the
+            // output is consumed once pipe-pane has the title the pane sets after it:
+            // conhost sends a console title as OSC 0, whatever its screen and its own
+            // parser hold. The pane waits for pipe-pane, and gives conhost time to send
+            // the output before the title.
+            let tmp = std::env::temp_dir();
+            let (go, piped) = (tmp.join(format!("{}-go{i}", ctx.socket)), tmp.join(format!("{}-piped{i}.bin", ctx.socket)));
+            let _ = std::fs::remove_file(&go);
+            let _ = std::fs::remove_file(&piped);
+            let title = format!("pwsh-tmux-consumed-{i}");
+            let script = format!(
+                "while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 20 }}; $b = [IO.File]::ReadAllBytes('{}'); $o = [Console]::OpenStandardOutput(); $o.Write($b, 0, $b.Length); $o.Flush(); Start-Sleep -Milliseconds 500; [Console]::Title = '{title}'; Start-Sleep 100",
+                go.display(),
+                file.display()
+            );
+            ctx.ok(&["new-session", "-d", "-s", &session, "-x", &cols, "-y", &rows, &script]);
+            // the raw bytes, as they come
+            let copy = format!(
+                "$i = [Console]::OpenStandardInput(); $f = [IO.File]::Open('{}', 'Create', 'Write', 'ReadWrite'); $b = New-Object byte[] 65536; while (($n = $i.Read($b, 0, $b.Length)) -gt 0) {{ $f.Write($b, 0, $n); $f.Flush() }}",
+                piped.display()
+            );
+            ctx.ok(&["pipe-pane", "-t", &session, &copy]);
+            std::fs::write(&go, b"").unwrap();
+            wait_for(&format!("{name} consumed"), || std::fs::read(&piped).is_ok_and(|b| b.windows(title.len()).any(|w| w == title.as_bytes())));
+            // the server is still there, and so is the pane
+            ctx.ok(&["has-session", "-t", &session]);
+            assert_eq!(ctx.fmt(&session, "#{pane_dead}"), "0");
+            ctx.ok(&["capture-pane", "-p", "-t", &session]);
+            ctx.ok(&["pipe-pane", "-t", &session]);
+            let _ = std::fs::remove_file(&go);
+        } else {
+            ctx.ok(&["new-session", "-d", "-s", &session, "-x", &cols, "-y", &rows, &shown(&file, &format!("@done{i}@"))]);
+            wait_for(&format!("{name} shown"), || ctx.ok(&["capture-pane", "-p", "-J", "-t", &session]).contains(&format!("@done{i}@")));
+        }
     }
     ctx.ok(&["has-session", "-t", "keep"]);
     // the screen tmux 3.8 shows (ConPTY draws the output again on Windows)
