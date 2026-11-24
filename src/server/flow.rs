@@ -13,7 +13,7 @@
 use super::{Event, PaneId};
 use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -249,15 +249,30 @@ pub fn read_pane(mut reader: Box<dyn Read + Send>, more: Pending, flow: Arc<Flow
         };
         let Some(credit) = flow.end_read(true) else { break };
         // until the chunk is queued (a full queue included)
-        let h = held.take().unwrap_or_else(|| backlog.hold());
+        let mut h = Some(held.take().unwrap_or_else(|| backlog.hold()));
         if !flow.wait_credit() {
             break;
         }
-        if tx.send(Event::PaneData(id, generation, buf[..n].to_vec(), credit)).is_err() {
-            return;
+        // Held on after it is queued, until the next chunk is read, only while the
+        // terminal has more (wait_output). Let go before it is queued otherwise: the main
+        // loop, woken by the chunk, would find it held and wait for the next chunk that
+        // is not coming (next_in_burst) until it looked again.
+        let more_now = more.any();
+        if !more_now {
+            h = None;
         }
-        // until the next chunk is read, unless the terminal has nothing (wait_output)
-        held = Some(h);
+        match tx.try_send(Event::PaneData(id, generation, buf[..n].to_vec(), credit)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(ev)) => {
+                // waiting on a full queue holds the chunk
+                h.get_or_insert_with(|| backlog.hold());
+                if tx.send(ev).is_err() {
+                    return;
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => return,
+        }
+        held = h.filter(|_| more_now);
     }
     drop(held);
     // The pane has gone. Keep reading to the end: a pseudoconsole being closed waits for

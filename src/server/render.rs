@@ -169,6 +169,16 @@ impl Frame {
         let start = y as usize * self.w as usize;
         self.links.range(start..start + self.w as usize)
     }
+    /// Whether row `y` is the same as row `oy` of `other` (as wide), links included.
+    fn row_eq(&self, y: u16, other: &Frame, oy: u16) -> bool {
+        let w = self.w as usize;
+        self.row(y) == other.row(oy) && self.row_links(y).map(|(i, l)| (i % w, l)).eq(other.row_links(oy).map(|(i, l)| (i % w, l)))
+    }
+    /// Whether row `y` is what a terminal shows in a line scrolled in: blank cells in the
+    /// default style, no link.
+    fn row_blank(&self, y: u16) -> bool {
+        self.row(y).iter().all(|c| c.text == " " && c.style == Style::default()) && self.row_links(y).next().is_none()
+    }
     pub fn get(&self, x: u16, y: u16) -> Option<&Cell> {
         (x < self.w && y < self.h).then(|| &self.cells[y as usize * self.w as usize + x as usize])
     }
@@ -615,6 +625,41 @@ fn style_link(uri: &str) -> std::sync::Arc<vt100::Hyperlink> {
 
 /// tty-features.c's Hls (the hyperlinks feature).
 const HLS: &str = "\x1b]8;%?%p1%l%tid=%p1%s%;;%p2%s\x1b\\";
+
+/// A scroll of the terminal that turns most of `prev` (what it shows) into `next`: rows
+/// `top..=bot` move up `k` rows. tmux scrolls the terminal for a pane that scrolls
+/// (tty_cmd_linefeed, tty_cmd_scrollup) instead of drawing its lines again; here every
+/// frame is a diff, and without this a pane that scrolls one line rewrites all of its
+/// rows, which a slow terminal (or link) takes many times longer to show. Only whole
+/// rows are moved, so a pane beside another one is drawn as before (tmux needs left and
+/// right margins, DECSLRM, for that). Returned when it saves drawing at least two
+/// changed rows; the rows it scrolls in are blank and are drawn as any changed row.
+fn find_scroll(prev: &Frame, next: &Frame) -> Option<(u16, u16, u16)> {
+    let h = next.h;
+    let mut best: Option<(usize, (u16, u16, u16))> = None;
+    // the first few changed rows that are not blank, in where they were before
+    let anchors = (0..h).filter(|&y| !next.row_eq(y, prev, y) && !next.row_blank(y)).take(2);
+    for y0 in anchors {
+        for j in y0 + 1..h {
+            if !next.row_eq(y0, prev, j) {
+                continue;
+            }
+            let k = j - y0;
+            let mut len = 1;
+            while y0 + len + k < h && next.row_eq(y0 + len, prev, j + len) {
+                len += 1;
+            }
+            let saved = (y0..y0 + len).filter(|&y| !next.row_eq(y, prev, y)).count();
+            if saved >= 2 && best.is_none_or(|(s, _)| saved > s) {
+                best = Some((saved, (y0, y0 + len - 1 + k, k)));
+            }
+        }
+        if best.is_some() {
+            break;
+        }
+    }
+    best.map(|(_, s)| s)
+}
 
 fn erasable(c: &Cell) -> bool {
     c.text == " " && c.style.bg == Color::Default && c.style.attrs & (UNDERLINE | INVERSE | STRIKE) == 0
@@ -1775,9 +1820,22 @@ impl Server {
         }
         let mut changed = false;
         let hyperlinks = feats.has("hyperlinks") || c.term_caps.contains_key("Hls");
+        // scroll the rows that moved (DECSTBM, then LF at the bottom margin, in the
+        // default colours so the lines scrolled in are blank), and diff with what the
+        // terminal shows then
+        let scroll = prev.and_then(|p| find_scroll(&p.frame, &next.frame));
+        if let Some((top, bot, k)) = scroll {
+            let _ = write!(out, "\x1b[0m\x1b[{};{}r\x1b[{};1H{}\x1b[r", top + 1, bot + 1, bot + 1, "\n".repeat(k as usize));
+            changed = true;
+        }
         for y in 0..next.frame.h {
             let row = next.frame.row(y);
-            if prev.is_some_and(|p| p.frame.row(y) == row && p.frame.row_links(y).eq(next.frame.row_links(y))) {
+            let shown = |p: &RenderState| match scroll {
+                Some((top, bot, k)) if y >= top && y + k <= bot => next.frame.row_eq(y, &p.frame, y + k),
+                Some((top, bot, _)) if y >= top && y <= bot => next.frame.row_blank(y),
+                _ => next.frame.row_eq(y, &p.frame, y),
+            };
+            if prev.is_some_and(shown) {
                 continue;
             }
             changed = true;
@@ -2445,5 +2503,136 @@ mod frame_reuse_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+    use super::super::pan::tests::{clients, kill, run};
+    use std::sync::atomic::Ordering;
+
+    /// Client 1 (w x h) attached to a session split by `splits`, its frames sent here.
+    fn setup(w: u16, h: u16, splits: &[&[&str]]) -> (Server, mpsc::Receiver<Vec<u8>>) {
+        let (mut srv, _) = clients((w, h), None);
+        let (tx, frames) = mpsc::channel();
+        let c = srv.clients.get_mut(&1).unwrap();
+        c.tx = tx;
+        c.closed = Default::default();
+        let (ws, hs) = (w.to_string(), h.to_string());
+        run(&mut srv, 1, &["new-session", "-d", "-s", "s", "-x", &ws, "-y", &hs]).unwrap();
+        for args in splits {
+            run(&mut srv, 1, args).unwrap();
+        }
+        let sid = *srv.sessions.keys().next().unwrap();
+        srv.attach_client(1, sid);
+        (srv, frames)
+    }
+
+    /// Renders, lets the writer have written it, and passes the frames to `term`; returns
+    /// what they cost and how many scrolled.
+    fn show(srv: &mut Server, frames: &mpsc::Receiver<Vec<u8>>, term: &mut vt100::Parser) -> (usize, usize) {
+        srv.render_all();
+        srv.clients[&1].queued_bytes.store(0, Ordering::SeqCst);
+        let (mut bytes, mut scrolls) = (0, 0);
+        for f in frames.try_iter().filter(|f| f[0] == S_OUTPUT) {
+            let text = String::from_utf8_lossy(&f[5..]);
+            scrolls += text.contains("\x1b[r") as usize;
+            bytes += f.len() - 5;
+            term.process(&f[5..]);
+        }
+        (bytes, scrolls)
+    }
+
+    /// The terminal fed every frame shows what it would after a full redraw.
+    fn same_as_full_redraw(srv: &mut Server, frames: &mpsc::Receiver<Vec<u8>>, term: &vt100::Parser, what: &str) {
+        let (w, h) = srv.clients[&1].size;
+        let c = srv.clients.get_mut(&1).unwrap();
+        c.prev = None;
+        c.dirty = true;
+        let mut full = vt100::Parser::new(nz(h), nz(w), 0);
+        show(srv, frames, &mut full);
+        assert_eq!(term.screen().contents_formatted_basic(), full.screen().contents_formatted_basic(), "{what}");
+    }
+
+    /// Lines of every length (wrapped ones too), in colours, with wide characters and links.
+    fn lines(seed: &mut u64, n: usize) -> Vec<u8> {
+        let mut out = String::new();
+        for _ in 0..n {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            let r = *seed;
+            let text = match r % 7 {
+                0 => String::new(),
+                1 => format!("\x1b[4{}mbg {r}\x1b[K\x1b[m", r % 8),
+                2 => "あい".repeat((r % 50) as usize),
+                3 => format!("\x1b]8;;https://e/{}\x1b\\link {r}\x1b]8;;\x1b\\", r % 3),
+                _ => format!("\x1b[3{}m{}\x1b[m", r % 8, "x".repeat((r % 150) as usize)),
+            };
+            out.push_str(&text);
+            out.push_str("\r\n");
+        }
+        out.into_bytes()
+    }
+
+    /// A pane that scrolls is scrolled on the terminal, and only the lines that came in
+    /// are drawn; whatever scrolls, the terminal ends up as a full redraw would leave it.
+    #[test]
+    fn scrolled_panes_end_up_as_a_full_redraw() {
+        for (splits, scrolled) in [
+            (&[][..], true),
+            (&[&["split-window", "-v", "-d", "-t", "s:0"][..], &["split-window", "-v", "-d", "-t", "s:0.1"][..]][..], true),
+            (&[&["split-window", "-h", "-d", "-t", "s:0"][..]][..], false),
+        ] {
+            let (mut srv, frames) = setup(80, 24, splits);
+            let mut term = vt100::Parser::new(nz(24), nz(80), 0);
+            show(&mut srv, &frames, &mut term);
+            let panes: Vec<PaneId> = srv.windows.values().next().unwrap().panes().to_vec();
+            let mut seed = 0x9e37_79b9_7f4a_7c15;
+            let (mut bytes, mut scrolls) = (0, 0);
+            for step in 0..300 {
+                let pane = panes[step % panes.len()];
+                let n = [1, 1, 2, 3, 7, 30][step % 6];
+                let generation = srv.panes[&pane].generation;
+                srv.pane_data(pane, generation, &lines(&mut seed, n));
+                let (b, s) = show(&mut srv, &frames, &mut term);
+                bytes += b;
+                scrolls += s;
+                let shown: Vec<String> = term.screen().rows(0, 80).map(|r| r.trim_end().to_string()).collect();
+                let f = &srv.clients[&1].prev.as_ref().unwrap().frame;
+                let want: Vec<String> = (0..f.h).map(|y| f.row(y).iter().map(|c| c.text.as_str()).collect::<String>().trim_end().to_string()).collect();
+                assert_eq!(shown, want, "{splits:?} step {step}");
+            }
+            assert_eq!(scrolls > 100, scrolled, "{splits:?}: {scrolls} scrolls, {bytes} bytes");
+            same_as_full_redraw(&mut srv, &frames, &term, &format!("{splits:?}"));
+            kill(&mut srv);
+        }
+    }
+
+    /// One line at a time to a full-screen pane: each frame is that line and the scroll,
+    /// not the whole pane.
+    #[test]
+    fn a_line_scrolled_in_costs_a_line() {
+        let (mut srv, frames) = setup(120, 40, &[]);
+        let mut term = vt100::Parser::new(nz(40), nz(120), 0);
+        let pane = srv.windows.values().next().unwrap().active;
+        let generation = srv.panes[&pane].generation;
+        for i in 0..60 {
+            srv.pane_data(pane, generation, format!("\x1b[3{}mline {i:04} {}\x1b[m\r\n", i % 8, "y".repeat(90)).as_bytes());
+            show(&mut srv, &frames, &mut term);
+        }
+        let (mut bytes, mut scrolls) = (0, 0);
+        for i in 60..100 {
+            srv.pane_data(pane, generation, format!("\x1b[3{}mline {i:04} {}\x1b[m\r\n", i % 8, "y".repeat(90)).as_bytes());
+            let (b, s) = show(&mut srv, &frames, &mut term);
+            bytes += b;
+            scrolls += s;
+        }
+        assert_eq!(scrolls, 40);
+        // the line, the scroll, the status line and the cursor: not 39 lines of 100 bytes
+        assert!(bytes / 40 < 400, "{} bytes a line", bytes / 40);
+        same_as_full_redraw(&mut srv, &frames, &term, "one line");
+        kill(&mut srv);
     }
 }

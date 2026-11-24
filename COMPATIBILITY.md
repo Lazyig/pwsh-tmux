@@ -75,13 +75,20 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
 ## Intentional differences
 
 - **A client that cannot keep up.** As tmux does (server_client_check_redraw), a
-  terminal client is not drawn to while output is still queued for it: its next frame
-  waits until the queue has been written and then covers everything that changed in
+  terminal client is not drawn to while output is still on its way to its terminal:
+  its next frame waits until the queue has been written and the client has passed it
+  to its terminal (the client acknowledges what it has written; tmux's tty buffer is
+  what the terminal has not taken), and then covers everything that changed in
   between. Like tmux (TTY_BLOCK), when what it is not shown reaches 1 + width x height
-  x 8 bytes and its queue has not drained for 100 ms it is blocked, and every 100 ms the output of the panes drawn to it during
-  that time (not panes hidden by zoom, in a mode or held by a prompt) is added to
-  `#{client_discarded}`; when that is below 1 + width x height / 8 bytes and its
-  queue has drained it is unblocked and redrawn in full. A passthrough or OSC 52 (Ms)
+  x 8 bytes and its next frame has waited 20 ms it is blocked, and every 100 ms the
+  output of the panes drawn to it during that time (not panes hidden by zoom, in a mode
+  or held by a prompt) is added to `#{client_discarded}`; when that is below 1 + width
+  x height / 8 bytes and what it was sent has reached its terminal it is unblocked and
+  redrawn in full. As in tmux, the first check marks it for that redraw and the panes'
+  output is no longer counted from then (tty_client_ready skips a client with
+  CLIENT_REDRAWWINDOW), so a client that has taken what it was sent is unblocked at the
+  second check at the latest, even while panes keep writing; a slow terminal has had
+  that time to catch up, so the redraw shows what the panes show then. A passthrough or OSC 52 (Ms)
   sequence does not block the client while it is being written (TTY_NOBLOCK); both,
   like a bell and an OSC 52 clipboard query, are dropped while it is blocked and
   counted with that output at the next check (tty_add), so they can keep it blocked
@@ -92,10 +99,6 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
     discarded meanwhile: tmux unblocks a client into the buffer it emptied. A client
     that stays stopped keeps its 100 ms check, as a tmux client that stays behind does.
     The start threshold is capped at 2 MiB.
-  - A client whose queue has drained is also unblocked at a check while panes are
-    still writing, and then drawn as usual, not in full (no frame was dropped): it is
-    not sent more than it takes anyway, and it would otherwise show nothing until they
-    stop.
   - A bell or OSC 52 clipboard query for a client that is not blocked is queued as it
     comes, but a run of them that the writer has not started on stops at the start
     threshold (counting each as its queue cost, below); the rest is dropped and added
@@ -103,16 +106,21 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
     empties at that size. This bounds them for a stopped client that is not blocked
     yet, or cannot be because a passthrough or Ms sequence has not been written. A
     client that reads gets to each run, so it is sent every bell.
-  - Every frame is a redraw of what changed, and this renderer has no scroll
-    optimisation, so one scrolled line rewrites every row of the pane. What counts
+  - Every frame is a redraw of what changed. Rows that moved up are scrolled on the
+    terminal (a scroll region and line feeds, as tmux scrolls a pane) and only the
+    lines that came in are drawn, but only whole rows: a pane beside another one is
+    not scrolled (tmux uses left and right margins, DECSLRM, where the terminal has
+    them), so one scrolled line there rewrites every row of the pane. What counts
     toward blocking is therefore the pane output not yet shown (what tmux would have
-    written), not frame bytes, and a terminal slower than the frames (a few tens of
-    KB/s) shows a steadily scrolling pane up to a frame and the terminal's own buffer
-    behind, where tmux keeps up.
-  - On Unix the connection of an attached terminal client gets a small socket send
-    buffer (SO_SNDBUF 4 KiB), so old frames held by the kernel do not keep a slow
-    terminal drawing after its panes have stopped; tmux writes to the terminal itself.
-    A Windows named pipe keeps the buffer it was created with.
+    written), not frame bytes. A terminal that takes a frame in more than 20 ms is
+    blocked by a flood where tmux's is blocked as soon as its buffer fills: both then
+    show a fresh redraw every 200 ms or so.
+  - The client acknowledges the output it has written to its terminal (a message
+    tmux's protocol does not have; a server that does not know it ignores it, and a
+    client that does not send it is drawn to once the connection has taken its
+    frames). On Unix the connection of an attached terminal client also gets a small
+    socket send buffer (SO_SNDBUF 4 KiB), which bounds what the kernel holds for such
+    a client. A Windows named pipe keeps the buffer it was created with.
   - `#{client_written}` counts terminal output as it is queued, as tmux does, and is 0
     for control clients, which have no tty.
   - No client is disconnected for being slow. An attached terminal client has no write

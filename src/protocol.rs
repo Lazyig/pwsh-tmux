@@ -14,6 +14,11 @@ pub const C_IDENTIFY: u8 = 5;
 pub const C_RESUMED: u8 = 6;
 /// Control mode: one command line typed by the client (empty = detach).
 pub const C_CONTROL_LINE: u8 = 7;
+/// Terminal client: the S_OUTPUT payload bytes it has written to its terminal so far
+/// (u64 LE), sent after each flush. A server holds the next frame until the terminal
+/// has taken the ones before (tmux defers a redraw while its tty buffer is not empty);
+/// a server that does not know it ignores it.
+pub const C_ACK: u8 = 8;
 
 // server -> client
 pub const S_OUTPUT: u8 = 10;

@@ -126,6 +126,43 @@ Lower is better. The last column is the after musl build divided by tmux.
   allocation-heavy paths, such as copy-mode search and floods. The glibc
   build, which is what the Linux release uses, is faster than tmux there.
 
+## Render latency to a slow terminal (2026-11-25)
+
+`tools/perf/render_latency.py` measures how long pane output takes to reach the
+pty an attached 120x40 client writes to. It ran on a shared 8-CPU Linux host
+(load average 15-70 from other work, so only same-run numbers compare) against
+tmux 3.4 (`/usr/bin/tmux`; 3.8 was not installed there) and the build before
+this change (9e7e433). Medians of 3-5 runs, in ms.
+
+| Terminal reads | Test | before | after | tmux 3.4 |
+|---|---|---|---|---|
+| as fast as it can | last line of a 50 MB `cat` | 1.1 | 1.7 | 1.1 |
+| | server CPU for that `cat` (s) | 2.17 | 2.30 | 4.94 |
+| | 100 lines/s, p50 / p90 | 0.88 / 1.6 | 0.91 / 2.1 | 0.14 / 0.26 |
+| | flood, age of the lines shown, p50 / p90 | 1.7 / 3.4 | 1.9 / 4.3 | 1.4 / 3.0 |
+| | key echo beside a flood, p50 / p90 | 3.8 / 9.8 | 3.5 / 9.6 | 2.0 / 4.1 |
+| 100 KB/s | 100 lines/s, p50 / p90 | 297 / 351 | 1.3 / 7.3 | 0.15 / 0.77 |
+| | flood, age of the lines shown, p50 / p90 | 282 / 321 | 101 / 197 | 15 / 175 |
+| | last line of a flood | 185 | 116 | 41 |
+| | last line of `seq 1 2000000` | 219 | 96 | 62 |
+| 500 KB/s | flood, age of the lines shown, p50 | 2.1 | 2.3 | 9.5 |
+
+A terminal that keeps up saw no difference. One slower than the frames fell
+behind by everything queued on the way to it: the next frame waited only for
+the connection to take the last one, while the client and the terminal's pty
+still held earlier frames, and a pane that scrolled one line rewrote every row.
+Three changes:
+
+- The client acknowledges the output it has written to its terminal (C_ACK), and
+  a frame waits until the terminal has taken the ones before, as tmux's redraw
+  waits for its tty buffer to empty.
+- Rows that moved up are scrolled on the terminal and only the new lines are
+  drawn (whole rows only, so not for a pane beside another one).
+- A client is blocked once a frame has waited 20 ms with the start threshold of
+  pane output come meanwhile (100 ms before), and, as in tmux, the first check
+  marks it for a full redraw and stops counting its panes' output, so it is
+  unblocked by the second check with a fresh redraw even while the panes write.
+
 ## Windows
 
 None of these numbers were measured on Windows. Only `cargo check` and clippy
