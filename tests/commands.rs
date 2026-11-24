@@ -4263,6 +4263,9 @@ fn pane_output_that_widens_a_cell_in_the_last_column_leaves_the_server_running()
                 file.display()
             );
             ctx.ok(&["new-session", "-d", "-s", &session, "-x", &cols, "-y", &rows, &script]);
+            // A pane that dies stays (so its status can be read) rather than taking its
+            // session with it; the pane is still waiting for the go file here.
+            ctx.ok(&["set", "-p", "-t", &session, "remain-on-exit", "on"]);
             // the raw bytes, as they come
             let copy = format!(
                 "$i = [Console]::OpenStandardInput(); $f = [IO.File]::Open('{}', 'Create', 'Write', 'ReadWrite'); $b = New-Object byte[] 65536; while (($n = $i.Read($b, 0, $b.Length)) -gt 0) {{ $f.Write($b, 0, $n); $f.Flush() }}",
@@ -4270,12 +4273,54 @@ fn pane_output_that_widens_a_cell_in_the_last_column_leaves_the_server_running()
             );
             ctx.ok(&["pipe-pane", "-t", &session, &copy]);
             std::fs::write(&go, b"").unwrap();
-            wait_for(&format!("{name} consumed"), || std::fs::read(&piped).is_ok_and(|b| b.windows(title.len()).any(|w| w == title.as_bytes())));
-            // the server is still there, and so is the pane
+            // what pipe-pane got and the panes' state, for a failure
+            let report = |what: &str| -> String {
+                let bytes = std::fs::read(&piped).unwrap_or_default();
+                let tail = bytes[bytes.len().saturating_sub(256)..].escape_ascii().to_string();
+                let (_, panes) = ctx.cmd(&["list-panes", "-a", "-F", "#{session_name} dead=#{pane_dead} status=#{pane_dead_status}"]);
+                format!("{what}; {} has {} bytes, ending \"{tail}\"; panes:\n{panes}", piped.display(), bytes.len())
+            };
+            // Only panic-1861: the pane's headless conhost (OpenConsole --headless) exits
+            // part way through it (from byte 4424, a plain 'n' after the OSC 52 at 4310:
+            // conhost's state, not one sequence; not when the pane writes it as soon as
+            // it starts). PowerShell's Write and [Console]::Title then fail ("pipe has no
+            // process on the other end") and the pane exits with status 1 and no title.
+            // That is conhost going, not the server: the other fixtures must show the title.
+            let conhost_may_exit = name == "panic-1861.bin";
+            let has_title = || std::fs::read(&piped).is_ok_and(|b| b.windows(title.len()).any(|w| w == title.as_bytes()));
+            let start = std::time::Instant::now();
+            // the title, or the pane gone first
+            let consumed = loop {
+                if has_title() {
+                    break true;
+                }
+                let (ok, dead) = ctx.cmd(&["display-message", "-p", "-t", &session, "#{pane_dead}"]);
+                assert!(ok, "{}", report(&format!("{name}: display-message failed: {dead}")));
+                if dead.trim() == "1" {
+                    break has_title();
+                }
+                assert!(start.elapsed() < Duration::from_secs(20), "{}", report(&format!("timed out waiting for {name} consumed")));
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            // the server is still there, and so is the session
             ctx.ok(&["has-session", "-t", &session]);
-            assert_eq!(ctx.fmt(&session, "#{pane_dead}"), "0");
-            ctx.ok(&["capture-pane", "-p", "-t", &session]);
-            ctx.ok(&["pipe-pane", "-t", &session]);
+            ctx.ok(&["has-session", "-t", "keep"]);
+            if consumed {
+                // and so is the pane
+                assert_eq!(ctx.fmt(&session, "#{pane_dead}"), "0", "{}", report(name));
+                ctx.ok(&["capture-pane", "-p", "-t", &session]);
+                ctx.ok(&["pipe-pane", "-t", &session]);
+            } else {
+                assert!(conhost_may_exit, "{}", report(&format!("{name}: the pane died before the title")));
+                // the pane's own write failed: PowerShell's exit status, not a signal
+                let status = ctx.fmt(&session, "#{pane_dead_status}");
+                assert!(status.parse::<i32>().is_ok_and(|s| s != 0), "{}", report(&format!("{name}: pane dead with status \"{status}\"")));
+                // and the server still answers for it and for the others
+                assert_eq!(ctx.ok(&["list-panes", "-t", &session, "-F", "#{pane_dead}"]).trim(), "1", "{}", report(name));
+                ctx.ok(&["capture-pane", "-p", "-t", &session]);
+                ctx.ok(&["kill-session", "-t", &session]);
+                ctx.ok(&["list-panes", "-t", "keep"]);
+            }
             let _ = std::fs::remove_file(&go);
         } else {
             ctx.ok(&["new-session", "-d", "-s", &session, "-x", &cols, "-y", &rows, &shown(&file, &format!("@done{i}@"))]);
