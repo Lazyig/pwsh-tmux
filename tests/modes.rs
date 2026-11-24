@@ -293,7 +293,8 @@ fn menus_belong_to_the_window_and_do_not_block() {
     ctx.ok(&["select-window", "-t", "w:0"]);
     t.wait_screen("menu again", |s| s.contains("Two (2)"));
     t.send(b"2");
-    wait_for("chosen", || ctx.ok(&["show", "-gv", "@m"]).trim() == "two");
+    // -q: @m is unset until the key is handled
+    wait_for("chosen", || ctx.ok(&["show", "-gqv", "@m"]).trim() == "two");
     // bad -b and -C values
     assert!(ctx.fails(&["display-menu", "-c", &c1, "-b", "bogus", "a", "a", ""]).contains("menu-border-lines unknown value: bogus"));
     assert!(ctx.fails(&["display-menu", "-c", &c1, "-C", "9x", "a", "a", ""]).contains("starting choice invalid"));
