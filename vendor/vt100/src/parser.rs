@@ -163,6 +163,9 @@ impl<CB: crate::Callbacks> Parser<CB> {
                 self.screen.screen.empty_sgr = false;
             }
         }
+        // the end of what was read ends a run of printable characters (input_parse_buffer
+        // ends with screen_write_stop)
+        self.screen.screen.end_print_run();
     }
 
     fn string_push(&mut self, b: u8) {

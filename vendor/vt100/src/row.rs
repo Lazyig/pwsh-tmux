@@ -12,6 +12,10 @@ pub struct Row {
     flags: u8,
     /// Hyperlinks and tabs by column, only for rows that have any.
     metadata: Option<alloc::boxed::Box<alloc::collections::BTreeMap<u16, crate::CellMetadata>>>,
+    /// The cells tmux would have allocated for the line (gl->cellsize): none until a
+    /// cell is written, then a quarter, half or all of the width (grid_expand_line),
+    /// never fewer until the whole line is cleared (`expand`, `clear`, `reset`).
+    cellsize: u16,
 }
 
 /// The line has the start of a shell prompt (OSC 133;A, N or P).
@@ -30,6 +34,27 @@ pub const ROW_END_OUTPUT: u8 = 32;
 /// OSC 133 P;k=s continuation prompt.
 pub const ROW_SECOND_PROMPT: u8 = 64;
 
+/// grid_expand_line's size for a line of a `cols` wide grid that needs `sx` cells.
+pub fn expanded_cellsize(sx: u16, cols: u16) -> u16 {
+    if sx < cols / 4 {
+        cols / 4
+    } else if sx < cols / 2 {
+        cols / 2
+    } else {
+        sx.max(cols)
+    }
+}
+
+/// The size of a line of size `cellsize` once cells `from..to` are written one at a time
+/// (grid_set_cell expands the line for each cell, so a line written up to a quarter or
+/// half of the width stays there, where one grid_expand_line to it takes the next size).
+pub fn grown_cellsize(mut cellsize: u16, from: u16, to: u16, cols: u16) -> u16 {
+    while from < to && cellsize < to {
+        cellsize = expanded_cellsize((cellsize + 1).max(from + 1), cols);
+    }
+    cellsize
+}
+
 impl Row {
     pub fn new(cols: u16) -> Self {
         Self {
@@ -38,7 +63,30 @@ impl Row {
             time: 0,
             flags: 0,
             metadata: None,
+            cellsize: 0,
         }
+    }
+
+    /// tmux's gl->cellsize (see the field).
+    pub fn cellsize(&self) -> u16 {
+        self.cellsize
+    }
+
+    pub(crate) fn set_cellsize(&mut self, cellsize: u16) {
+        self.cellsize = cellsize;
+    }
+
+    /// grid_expand_line: the line has room for at least `sx` cells, rounded up to a
+    /// quarter, half or all of the row's width.
+    pub fn expand(&mut self, sx: u16) {
+        if sx > self.cellsize {
+            self.cellsize = expanded_cellsize(sx, self.cols());
+        }
+    }
+
+    /// grid_set_cell for each of cells `from..to` in turn (see `grown_cellsize`).
+    pub fn expand_cells(&mut self, from: u16, to: u16) {
+        self.cellsize = grown_cellsize(self.cellsize, from, to, self.cols());
     }
 
     pub fn flags(&self) -> u8 {
@@ -87,6 +135,8 @@ impl Row {
         self.wrapped = false;
         self.flags = 0;
         self.metadata = None;
+        // grid_empty_line: a line cleared with a background colour has all its cells
+        self.cellsize = if attrs.bgcolor == crate::Color::Default { 0 } else { self.cols() };
     }
 
     pub fn reset(&mut self) {
@@ -95,6 +145,7 @@ impl Row {
         self.time = 0;
         self.flags = 0;
         self.metadata = None;
+        self.cellsize = 0;
     }
 
     fn cells(&self) -> impl Iterator<Item = &crate::Cell> {
@@ -163,6 +214,11 @@ impl Row {
     /// Cells at the end are dropped.
     pub fn insert(&mut self, i: u16, count: u16) {
         let count = usize::from(count).min(self.cells.len() - usize::from(i));
+        // grid_view_insert_cells moves the cells after the inserted ones up to the end
+        // of the row (grid_move_cells expands the line to all of it)
+        if usize::from(i) + count < self.cells.len() {
+            self.expand(self.cols());
+        }
         if count == 0 {
             // Always "truncate", even when `count` is 0. However, because we
             // didn't actually insert any cells, we don't need to follow the
@@ -208,6 +264,11 @@ impl Row {
         if range.start >= range.end {
             return;
         }
+        // grid_view_delete_cells moves the cells after the deleted ones (grid_move_cells
+        // expands the line to the end of the row)
+        if range.end < self.cols() {
+            self.expand(self.cols());
+        }
 
         self.clear_wide(range.start);
         let last = range.end - 1;
@@ -233,6 +294,19 @@ impl Row {
         }
     }
 
+    /// grid_clear of cells `range`: with the default background only the cells the
+    /// line has are cleared, with another the line grows to the cells cleared, in one
+    /// grid_expand_line.
+    pub fn erase_range(&mut self, range: core::ops::Range<u16>, attrs: crate::attrs::Attrs) {
+        if attrs.bgcolor != crate::Color::Default && !range.is_empty() {
+            self.expand(range.end);
+        }
+        for i in range {
+            self.erase(i, attrs);
+        }
+    }
+
+    /// Clears cell `i` (the line's size is `erase_range`'s).
     pub fn erase(&mut self, i: u16, attrs: crate::attrs::Attrs) {
         self.invalidate(i);
         let wide = self.cells[usize::from(i)].is_wide();

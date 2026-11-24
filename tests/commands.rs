@@ -1231,11 +1231,48 @@ fn capture_details(ctx: &Ctx) {
     assert!(ctx.fails(&["capture-pane", "-p", "-a", "-t", "c"]).contains("no alternate screen"));
     assert_eq!(ctx.ok(&["capture-pane", "-p", "-a", "-q", "-t", "c"]), "\n");
     assert!(ctx.ok(&["capture-pane", "-p", "-R", "-t", "c"]).starts_with("G 20x4 (0/"));
+    // -N keeps the trailing spaces up to the cells the line was given (gl->cellsize: a
+    // quarter, half or all of the width once written, not fewer when part of it is
+    // cleared), not the whole width; -R shows the same sizes
+    let kept = "l1   \nlong line wrapping a\nround     \n\\z   \n";
+    assert_eq!(ctx.ok(&["capture-pane", "-p", "-N", "-t", "c"]), kept);
+    let sizes: Vec<String> = ctx.ok(&["capture-pane", "-p", "-R", "-t", "c"]).lines().filter(|l| l.starts_with("\tL ")).map(|l| l.rsplit(' ').next().unwrap().to_string()).collect();
+    assert_eq!(sizes, ["2/5", "20/20", "5/10", "2/5"]);
+    // a line drawn over with CR and EL keeps its cells (tmux 3.8: 100 and 100)
+    ctx.ok(&["new-session", "-d", "-s", "n", "-x", "100", "-y", "4", "printf 'name%76s\\n' ''; printf '%060d\\r\\033[5C\\033[K\\n' 0; sleep 100"]);
+    wait_for("redrawn line", || ctx.capture("n").contains("00000"));
+    let widths: Vec<usize> = ctx.ok(&["capture-pane", "-p", "-N", "-E", "1", "-t", "n"]).lines().map(str::len).collect();
+    assert_eq!(widths, [100, 100]);
     ctx.ok(&["copy-mode", "-t", "c"]);
     assert!(ctx.ok(&["capture-pane", "-p", "-M", "-t", "c"]).contains("long line"));
+    assert_eq!(ctx.ok(&["capture-pane", "-p", "-M", "-N", "-t", "c"]), kept);
     // -M reads the mode's copy of the pane, not its scrolled view, nor the selection
     ctx.ok(&["send-keys", "-X", "-t", "c", "begin-selection"]);
     assert_eq!(ctx.ok(&["capture-pane", "-p", "-M", "-S", "1", "-E", "1", "-t", "c"]), "long line wrapping a\n");
+    // scrolled up, -M still gives the bottom of that copy (tmux 3.8 cmd-capture-pane.c:
+    // gd->hsize to hsize + sy - 1 of window_copy_get_screen's backing grid); the lines
+    // in view are reached with -S/-E counted back from the copy's history
+    ctx.ok(&["new-session", "-d", "-s", "h", "-x", "20", "-y", "4", "seq 1 50; sleep 100"]);
+    wait_for("seq", || ctx.capture("h").contains("50"));
+    ctx.ok(&["copy-mode", "-t", "h"]);
+    ctx.ok(&["send-keys", "-X", "-t", "h", "goto-line", "30"]);
+    assert_eq!(ctx.fmt("h", "#{pane_mode} #{scroll_position}"), "copy-mode 30");
+    assert_eq!(ctx.ok(&["capture-pane", "-p", "-M", "-t", "h"]), "48\n49\n50\n\n");
+    assert_eq!(ctx.ok(&["capture-pane", "-p", "-M", "-S", "-30", "-E", "-27", "-t", "h"]), "18\n19\n20\n21\n");
+    assert_eq!(ctx.ok(&["capture-pane", "-p", "-M", "-S", "-", "-E", "-", "-t", "h"]).lines().count(), 51);
+    // the mode's copy rewrapped for a new width keeps each line's cells (grid_reflow
+    // moves gl->cellsize across), so -M -N and -M -e still give the text (tmux 3.8:
+    // 20 40 60 20, then 20 40 80 20 at 100 columns)
+    ctx.ok(&["new-session", "-d", "-s", "w", "-x", "80", "-y", "6", "printf 'ab\\n\\033[31mabcdefghijklmnopqrstuvwxyz\\033[0m\\n%050d\\nq\\n' 0; sleep 100"]);
+    wait_for("lines", || ctx.capture("w").contains("q"));
+    ctx.ok(&["copy-mode", "-t", "w"]);
+    let widths = |args: &[&str]| -> Vec<usize> { let mut a = vec!["capture-pane", "-p", "-M", "-N", "-E", "3", "-t", "w"]; a.extend_from_slice(args); ctx.ok(&a).lines().map(str::len).collect() };
+    ctx.ok(&["resize-window", "-t", "w", "-x", "60"]);
+    assert_eq!(ctx.fmt("w", "#{pane_mode} #{pane_width}"), "copy-mode 60");
+    assert_eq!(widths(&[]), [20, 40, 60, 20]);
+    assert_eq!(ctx.ok(&["capture-pane", "-p", "-M", "-e", "-E", "1", "-t", "w"]), "ab\n\u{1b}[31mabcdefghijklmnopqrstuvwxyz\u{1b}[39m\n");
+    ctx.ok(&["resize-window", "-t", "w", "-x", "100"]);
+    assert_eq!(widths(&[]), [20, 40, 80, 20]);
 }
 
 fn empty_panes(ctx: &Ctx) {

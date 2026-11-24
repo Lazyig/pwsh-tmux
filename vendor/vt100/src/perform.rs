@@ -11,6 +11,7 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
     }
 
     fn execute(&mut self, b: u8) {
+        self.screen.end_print_run();
         match b {
             7 => self.callbacks.audible_bell(&mut self.screen),
             8 => self.bs(),
@@ -30,6 +31,7 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, b: u8) {
+        self.screen.end_print_run();
         if intermediates == b"#" && b == b'8' {
             self.decaln();
         } else if matches!(intermediates, b"(" | b")") && matches!(b, b'0' | b'B') {
@@ -76,6 +78,7 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
         _ignore: bool,
         c: char,
     ) {
+        self.screen.end_print_run();
         let unhandled = |screen: &mut Self| {
             screen.callbacks.unhandled_csi(
                 &mut screen.screen,
@@ -205,6 +208,7 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], bel_terminated: bool) {
+        self.screen.end_print_run();
         match params {
             [b"8", options, uri @ ..] if !uri.is_empty() => {
                 self.screen.set_hyperlink(options, &uri.join(&b';'));

@@ -40,8 +40,8 @@ const GRID_CELL: usize = 5;
 const GRID_EXTD: usize = 23;
 
 /// What tmux's grid would hold for the pane's history and screen: (lines, cells, extended
-/// cells). tmux allocates a line's cells up to the last one written, in steps of a quarter,
-/// half and the full width; cells with wide or non-ASCII text or 256/RGB colours are extended.
+/// cells). A line has the cells tmux allocated for it (gl->cellsize, vt100's
+/// `Row::cellsize`); cells with wide or non-ASCII text or 256/RGB colours are extended.
 fn history_usage(screen: &vt100::Screen) -> (usize, usize, usize) {
     let width = screen.size().1.get() as usize;
     let (mut cells, mut ext) = (0, 0);
@@ -49,31 +49,16 @@ fn history_usage(screen: &vt100::Screen) -> (usize, usize, usize) {
     let lines = screen.base_history_len();
     for i in 0..lines {
         let Some(row) = screen.base_history_row(i) else { continue };
-        let mut used = 0;
         for x in 0..width {
             let Some(c) = row.cell(x as u16) else { break };
-            if c.has_contents() || c.bgcolor() != vt100::Color::Default {
-                used = x + 1;
-            }
             let wide_colour = |c: vt100::Color| matches!(c, vt100::Color::Rgb(..)) || matches!(c, vt100::Color::Idx(i) if i >= 16);
             if c.is_wide() || !c.contents().is_ascii() || c.contents().len() > 1 || wide_colour(c.fgcolor()) || wide_colour(c.bgcolor()) {
                 ext += 1;
             }
         }
-        cells += line_cellsize(width, used);
+        cells += usize::from(row.cellsize());
     }
     (lines, cells, ext)
-}
-
-/// A grid line's allocated cells (gl->cellsize): none until written, then grid_expand_line
-/// rounds up to a quarter, half or all of the width.
-pub fn line_cellsize(width: usize, used: usize) -> usize {
-    match used {
-        0 => 0,
-        u if u < width / 4 => width / 4,
-        u if u < width / 2 => width / 2,
-        _ => width,
-    }
 }
 
 /// tmux's pane_private_modes: the DEC private modes the application has turned on.

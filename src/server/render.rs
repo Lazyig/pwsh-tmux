@@ -546,6 +546,17 @@ pub fn sgr_diff(last: &Style, cur: &Style) -> String {
     out
 }
 
+/// The cells grid_string_cells reads from a line: with `allocated`
+/// (GRID_STRING_EMPTY_CELLS) the cells the line has (gl->cellsize, kept by vt100 as tmux
+/// keeps it: a quarter, half or all of the width once written, not fewer after a part of
+/// the line is erased), otherwise up to the last used one (gl->cellused, from the cells).
+pub fn line_cells_end(line: &Line, allocated: bool) -> usize {
+    if allocated {
+        return usize::from(line.cellsize).min(line.cells.len());
+    }
+    (0..line.cells.len()).rposition(|x| line.cells[x].text != " " || line.cells[x].style != Style::default() || line.metadata.contains_key(&(x as u16))).map_or(0, |x| x + 1)
+}
+
 /// capture-pane -e: a line with SGR escapes, after the lines before it (grid_string_cells keeps lastgc from
 /// line to line: a line goes on with the attributes and link the line before ended in,
 /// though each line closes the link it opened). With `allocated`
@@ -555,8 +566,7 @@ pub fn sgr_diff(last: &Style, cur: &Style) -> String {
 pub fn line_with_escapes_from(line: &Line, st: &mut EscState, allocated: bool, keep: bool) -> String {
     let mut out = String::new();
     let mut open = false;
-    let used = (0..line.cells.len()).rposition(|x| line.cells[x].text != " " || line.cells[x].style != Style::default() || line.metadata.contains_key(&(x as u16))).map_or(0, |x| x + 1);
-    let end = if allocated { super::vars::line_cellsize(line.cells.len(), used) } else { used };
+    let end = line_cells_end(line, allocated);
     for (x, c) in line.cells.iter().enumerate().take(end) {
         if line.is_padding(x) {
             continue;

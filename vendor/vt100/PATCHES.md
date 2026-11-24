@@ -110,3 +110,25 @@ character completed from a split). Printable ASCII with wrapping on and insert
 mode off goes through `WrappedScreen::text_ascii`, the one-column case of
 `text` with a single row lookup. Neither changes the result. Tests:
 parser::tests, screen::tests.
+
+Local change: each row keeps tmux's gl->cellsize (`Row::cellsize`, read with
+`RowContents::cellsize`), the cells grid_expand_line gives a line: none until a
+cell is written, then a quarter, half or all of the width. Printed cells grow it
+(a run of printable ASCII in one step when the run ends, as
+screen_write_collect_add writes it with one grid_set_cells, so a run ending at a
+quarter of the width takes the next size; a character of a run only notes where
+the run ends; other characters and DECALN a cell or line at a time, a tab its
+padding cells one at a time and then its own cell, as screen_write_cell sets
+them), ICH and DCH grow it to the width (grid_move_cells), ECH, EL and EL 1 with
+a background colour to the cells cleared in one step (grid_clear); with the
+default background they clear only what the line has, so a line redrawn with CR
+and EL keeps its size. Clearing a whole line (EL 2, ED, a scroll) empties it, or
+gives it the width with a background colour (grid_empty_line). Reflow keeps the
+size of a line moved across, gives the first part of a split line exactly its
+cells, the rest of a line a join took part of exactly what is left, and writes
+the other parts of a split line and the cells joined onto a line a cell at a
+time (grid_reflow_split and _join with grid_set_cell), so a part of a quarter or
+half of the new width stays there.
+EL 2 on a line with no cells leaves it alone only while its size is 0
+(screen_write_clearline). capture-pane -N, -e and -R and history_bytes read it.
+Tests: lib.rs::metadata_tests (sizes from tmux 3.8's capture-pane -R).

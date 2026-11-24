@@ -62,6 +62,8 @@ impl RowContents<'_> {
     pub fn hyperlink_at(&self, col: u16) -> Option<&alloc::sync::Arc<crate::Hyperlink>> { self.0.hyperlink_at(col) }
     /// Cells up to the last written one or the end of the last tab (tmux's cellused).
     pub fn used_len(&self) -> u16 { self.0.used_len() }
+    /// tmux's gl->cellsize: the cells the line has room for (see `Row::cellsize`).
+    pub fn cellsize(&self) -> u16 { self.0.cellsize() }
     /// The row's ROW_* flags (OSC 133 marks, hyperlinks).
     pub fn flags(&self) -> u8 { self.0.flags() }
     /// Time this row entered history.
