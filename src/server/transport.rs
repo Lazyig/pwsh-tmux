@@ -6,6 +6,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub const MAX_CLIENTS: usize = 64;
 pub const MAX_CLIENT_FRAME: usize = crate::protocol::MAX_CLIENT_FRAME;
 pub const MAX_OUTPUT_BACKLOG: usize = 8 << 20;
+/// What holding a queued frame takes besides its bytes: its allocation's header and
+/// rounding and its slot in the writer's channel (about 60 bytes measured for a bell).
+pub const FRAME_OVERHEAD: usize = 64;
+
+/// What a queued frame of `payload` bytes counts against MAX_OUTPUT_BACKLOG: its bytes
+/// (with the 5-byte header) and FRAME_OVERHEAD, so the limit bounds memory for small
+/// frames too.
+pub fn frame_cost(payload: usize) -> usize {
+    payload.saturating_add(5 + FRAME_OVERHEAD)
+}
 pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often a wait that nothing can wake looks at the cancel flag.
 const CANCEL_POLL: Duration = Duration::from_millis(5);

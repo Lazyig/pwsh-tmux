@@ -32,11 +32,16 @@ and a 10-second output-write deadline for clients that are not attached terminal
 disconnects the client. An attached terminal client has no write deadline, as in
 tmux: a stalled one keeps its connection, the connection's two threads and its queued
 output for as long as it stays stalled, bounded by the 8 MiB limit like every other
-client. Its queue normally holds no more than one frame and the output sent outside
-frames, since it is not drawn to again until the queue has drained and passthrough,
-OSC 52 output and bells are dropped while it is blocked; only passthrough that keeps
-coming before the last one is written (which does not block the client, TTY_NOBLOCK)
-can still fill it to the limit (see COMPATIBILITY.md, "A client that cannot keep up").
+client. The limit counts each queued frame as its bytes plus 69 bytes (header,
+allocation and channel slot), so it bounds memory for many small frames, such as
+bells, as well as for large ones. A stalled client's queue holds about one frame and
+the block start threshold (1 + width x height x 8 bytes, at most 2 MiB): it is not drawn
+to again until the queue has drained, a blocked client stays blocked and is sent
+nothing until it has read what was queued, and a run of bells and OSC 52 queries the
+writer has not reached is cut at that threshold. Only passthrough or OSC 52 clipboard
+writes (Ms) that keep coming before the last one is written (which do not block the
+client, TTY_NOBLOCK) can still fill it to the limit, which then disconnects the client
+(see COMPATIBILITY.md, "A client that cannot keep up").
 Command replies have a 4 MiB aggregate limit, including multi-command requests.
 `load-buffer -` preserves binary stdin, including NUL and non-UTF-8 bytes, by
 encoding the data before it enters argument framing. Encoded data and arguments

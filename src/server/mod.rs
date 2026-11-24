@@ -1129,8 +1129,8 @@ pub struct ClientIo {
     pub written: std::sync::atomic::AtomicU64,
     /// Terminal output not sent: not drawn while blocked, or for a closed connection.
     pub discarded: std::sync::atomic::AtomicU64,
-    /// Every byte ever queued, frame headers included (queued_bytes is what of it is
-    /// still waiting).
+    /// What every frame ever queued cost (transport::frame_cost; queued_bytes is what of
+    /// it is still waiting).
     pub queued_total: std::sync::atomic::AtomicU64,
     /// Writes to this client have no time limit: it has been an attached terminal
     /// client, which tmux never drops for reading slowly (a paused terminal, a console
@@ -1173,7 +1173,7 @@ impl Client {
         if kind == S_REPLY || kind == S_EXIT {
             self.io.exit_sent.store(true, Ordering::SeqCst);
         }
-        let len = payload.len().saturating_add(5);
+        let len = transport::frame_cost(payload.len());
         // tty_add counts terminal output; a control client has no tty
         let terminal = if kind == S_OUTPUT && self.control == 0 { payload.len() as u64 } else { 0 };
         if self.closed.is_closed() {
@@ -2125,7 +2125,8 @@ impl Server {
                 }
                 // drained, and the main loop waits for that to render (block.rs): a full
                 // event queue means the main loop is about to look anyway
-                if writer_bytes.fetch_sub(buf.len(), Ordering::SeqCst) == buf.len() && writer_io.drain_wake.swap(false, Ordering::SeqCst) {
+                let cost = transport::frame_cost(buf.len() - 5);
+                if writer_bytes.fetch_sub(cost, Ordering::SeqCst) == cost && writer_io.drain_wake.swap(false, Ordering::SeqCst) {
                     let _ = wake.try_send(Event::Drained);
                 }
                 // still behind: the backlog now starts at this write

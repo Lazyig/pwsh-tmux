@@ -16,9 +16,18 @@
 //! What a deferred client is not shown is the output of the panes it shows (tmux
 //! passes pane output to the terminal nearly as it comes); once that and the queue
 //! reach the start threshold and the queue has not drained for an interval, the client
-//! is blocked and the pane output is counted as discarded. Frames already queued are complete sequences and are written, not
-//! dropped. A full frame diff is not a good measure: this renderer has no scroll
-//! optimisation, so one scrolled line rewrites every row.
+//! is blocked and the pane output is counted as discarded. Frames already queued are
+//! complete sequences and are written, not dropped, so the client stays blocked until
+//! they have been: tmux empties its buffer when it blocks a client and unblocks it into
+//! that empty buffer. A full frame diff is not a good measure: this renderer has no
+//! scroll optimisation, so one scrolled line rewrites every row.
+//!
+//! Output outside frames (a bell, an OSC 52 query) goes through tty_add in tmux: while
+//! the client is blocked it is counted as discarded like pane output, and otherwise it
+//! is added to a buffer that tty_block_maybe empties once it holds the start threshold.
+//! Here it is queued, and a run of it the writer has not started on is dropped beyond
+//! that threshold, so neither a client that is never blocked (TTY_NOBLOCK) nor one
+//! between two blocks queues it without bound.
 use super::*;
 use std::sync::atomic::Ordering;
 
@@ -56,6 +65,12 @@ pub struct Block {
     /// io.queued_total once the last passthrough or Ms sequence was queued: until the
     /// writer is past it, the client is not blocked (TTY_NOBLOCK).
     pub noblock_until: std::cell::Cell<u64>,
+    /// Output outside frames dropped while blocked since the last check (tty_add adds it
+    /// to tty->discarded); added to `discarded` by the check.
+    pub tty_discarded: std::cell::Cell<u64>,
+    /// The run of output outside frames queued since the writer last got to one: the
+    /// io.queued_total where it starts and what it costs against the queue limit.
+    pub tty_run: std::cell::Cell<(u64, usize)>,
 }
 
 impl Block {
@@ -76,22 +91,48 @@ impl Client {
         self.block.noblock_until.set(self.io.queued_total.load(Ordering::SeqCst));
     }
 
-    /// tty_add for terminal output outside frames (a bell, an OSC 52 query): dropped and
-    /// counted as discarded while the client is blocked, so a stopped peer's queue does not
-    /// grow with it; queued otherwise. Returns whether it was queued.
-    pub fn send_tty(&self, data: &[u8]) -> bool {
+    /// tty_add while blocked: the output is dropped and counted toward the next check, as
+    /// pane output drawn to the client is.
+    fn tty_blocked(&self, data: &[u8]) -> bool {
         if self.block.active() {
+            self.block.tty_discarded.set(self.block.tty_discarded.get() + data.len() as u64);
+        }
+        self.block.active()
+    }
+
+    /// tty_add for terminal output outside frames (a bell, an OSC 52 query): dropped and
+    /// counted as discarded while the client is blocked; otherwise queued unless the run
+    /// of such output the writer has not started on already costs the block start
+    /// threshold, which is as much as tmux's buffer holds before tty_block_maybe empties
+    /// it. A client that is reading gets to each run, so nothing it is sent is dropped;
+    /// a stopped one that cannot be blocked (TTY_NOBLOCK), or is between two blocks,
+    /// does not queue it without bound. Returns whether it was queued.
+    pub fn send_tty(&self, data: &[u8]) -> bool {
+        if self.tty_blocked(data) {
+            return false;
+        }
+        let queued = self.queued_bytes.load(Ordering::SeqCst);
+        let (mut from, mut run) = self.block.tty_run.get();
+        if queued == 0 || self.flushed(queued) > from {
+            (from, run) = (self.io.queued_total.load(Ordering::SeqCst), 0);
+        }
+        let cost = transport::frame_cost(data.len());
+        if run + cost > block_start(self.size) {
             self.io.discarded.fetch_add(data.len() as u64, Ordering::Relaxed);
+            self.block.tty_run.set((from, run));
             return false;
         }
         self.send(S_OUTPUT, data);
+        self.block.tty_run.set((from, run + cost));
         true
     }
 
-    /// [`Client::send_tty`] for Ms, which is also queued without blocking the client
+    /// Ms (tty_set_selection): dropped and counted while the client is blocked, otherwise
+    /// queued however long it is, without blocking the client while it is written
     /// (TTY_NOBLOCK).
     pub fn send_noblock(&self, data: &[u8]) {
-        if self.send_tty(data) {
+        if !self.tty_blocked(data) {
+            self.send(S_OUTPUT, data);
             self.noblock();
         }
     }
@@ -155,13 +196,15 @@ impl Client {
     /// What was discarded since the last check goes to client_discarded (the client is
     /// going, or tty_timer_callback).
     pub fn block_flush(&mut self) -> u64 {
-        let discarded = std::mem::take(&mut self.block.discarded);
+        let discarded = std::mem::take(&mut self.block.discarded) + self.block.tty_discarded.take();
         self.io.discarded.fetch_add(discarded, Ordering::Relaxed);
         discarded
     }
 
-    /// tty_timer_callback. Once unblocked, the redraw waits for the queue to drain like
-    /// any other frame, so a client that stays stopped needs no timer.
+    /// tty_timer_callback. tmux unblocks a client into the buffer it emptied when it
+    /// blocked it; here the frames queued before the block are written instead, so the
+    /// client stays blocked, and what it is sent is dropped, until they have been. A
+    /// stopped client therefore keeps its timer, as a tmux client that stays behind does.
     ///
     /// Unlike tmux, a client whose queue has drained is unblocked while panes are still
     /// writing: it is not sent more than it takes anyway (frames wait for the queue), and
@@ -172,17 +215,17 @@ impl Client {
             return;
         }
         let discarded = self.block_flush();
-        if discarded < block_stop(self.size) as u64 {
+        if self.queued_bytes.load(Ordering::SeqCst) != 0 {
+            self.block.tick = Some(now + BLOCK_INTERVAL);
+        } else if discarded < block_stop(self.size) as u64 {
             // tty_invalidate and CLIENT_ALLREDRAWFLAGS
             self.block.tick = None;
             self.block.redraw = true;
             self.prev = None;
             self.dirty = true;
-        } else if self.queued_bytes.load(Ordering::SeqCst) == 0 {
+        } else {
             self.block.tick = None;
             self.dirty = true;
-        } else {
-            self.block.tick = Some(now + BLOCK_INTERVAL);
         }
     }
 
@@ -312,6 +355,12 @@ mod tests {
         let mut fed = 0;
         for i in 0..400 {
             fed += feed(&mut srv, pane, i * 50, 50);
+            if i <= 100 {
+                // less than an interval since the render was deferred, however slowly
+                // this runs
+                let c = srv.clients.get_mut(&1).unwrap();
+                c.block.deferred_since = c.block.deferred_since.map(|_| Instant::now());
+            }
             srv.render_all();
             // a burst while a frame is written does not block
             assert!(!srv.clients[&1].block.active() || i > 100);
@@ -334,14 +383,15 @@ mod tests {
         assert!(c.block.active());
         let discarded = c.io.discarded.load(Ordering::Relaxed);
         assert!(discarded > (fed / 2) as u64, "discarded {discarded} of {fed}");
-        // quiet: unblocked, but nothing has been read, so the redraw waits (no timer)
+        // quiet, but nothing has been read: still blocked, so nothing more is queued
         srv.block_timers(now + 2 * BLOCK_INTERVAL);
-        assert!(!srv.clients[&1].block.active() && srv.block_deadline().is_none());
+        assert!(srv.clients[&1].block.active() && srv.block_deadline().is_some());
         srv.render_all();
         assert!(frames(&output).is_empty());
-        assert!(srv.clients[&1].io.drain_wake.load(Ordering::SeqCst));
-        // the peer reads everything: redrawn in full
+        // the peer reads everything: unblocked at the next check and redrawn in full
         drain(&srv);
+        srv.block_timers(now + 3 * BLOCK_INTERVAL);
+        assert!(!srv.clients[&1].block.active() && srv.block_deadline().is_none());
         srv.render_all();
         let out = frames(&output);
         assert!(out.contains("\x1b[0m\x1b[H") && out.contains("19999"), "{out:?}");
@@ -438,14 +488,19 @@ mod tests {
         assert_eq!(discarded(&srv), 0, "a pane in copy mode");
         feed(&mut srv, first, 0, 1);
         assert!(discarded(&srv) > 0, "a pane on screen");
-        // Ms is dropped and counted
+        // Ms is dropped and counted at the next check
         srv.clients.get_mut(&1).unwrap().features.add("clipboard");
         let (before, total) = (queued(&srv), srv.clients[&1].io.discarded.load(Ordering::Relaxed));
         srv.set_selection(1, "", &[b'y'; 3000]);
         assert_eq!(queued(&srv), before);
-        assert!(srv.clients[&1].io.discarded.load(Ordering::Relaxed) >= total + 4000);
+        assert!(srv.clients[&1].block.tty_discarded.get() >= 4000);
+        // once the queue has drained
         srv.block_timers(now + BLOCK_INTERVAL);
+        assert!(srv.clients[&1].block.active());
+        drain(&srv);
+        srv.block_timers(now + 2 * BLOCK_INTERVAL);
         assert!(!srv.clients[&1].block.active());
+        assert!(srv.clients[&1].io.discarded.load(Ordering::Relaxed) >= total + 4000);
         let _ = frames(&output);
         kill(&mut srv);
     }
@@ -474,16 +529,137 @@ mod tests {
         // what was queued is the first frame and bells up to the threshold
         let queued_bells = output.try_iter().filter(|f| *f == frame(S_OUTPUT, b"\x07")).count();
         assert!(queued_bells > 0 && queued_bells < 20_000, "{queued_bells}");
-        assert!(c.io.discarded.load(Ordering::Relaxed) >= (20_000 - queued_bells) as u64);
-        // quiet, unblocked and read: bells are queued again
+        assert!(c.io.discarded.load(Ordering::Relaxed) + c.block.tty_discarded.get() >= (20_000 - queued_bells) as u64);
+        // read: unblocked, and bells are queued again
+        drain(&srv);
         let now = Instant::now();
         srv.block_timers(now + BLOCK_INTERVAL);
-        srv.block_timers(now + 2 * BLOCK_INTERVAL);
         assert!(!srv.clients[&1].block.active());
-        drain(&srv);
+        bell(&mut srv, pane);
+        assert_eq!(bells(&output), 1);
+        kill(&mut srv);
+    }
+
+    fn bell(srv: &mut Server, pane: PaneId) {
         let generation = srv.panes[&pane].generation;
         srv.pane_data(pane, generation, b"\x07");
-        assert_eq!(output.try_iter().filter(|f| *f == frame(S_OUTPUT, b"\x07")).count(), 1);
+    }
+
+    fn bells(output: &mpsc::Receiver<Vec<u8>>) -> usize {
+        output.try_iter().filter(|f| *f == frame(S_OUTPUT, b"\x07")).count()
+    }
+
+    /// Rings `n` bells in `pane`, rendering after each; a deferred render has waited for an
+    /// interval at every `behind_every`th, and the timer runs (100 ms later each time) at every
+    /// `tick`th. Returns the most that was queued.
+    fn ring(srv: &mut Server, pane: PaneId, n: usize, behind_every: usize, tick: usize) -> usize {
+        let t0 = Instant::now();
+        let mut most = 0;
+        for i in 0..n {
+            bell(srv, pane);
+            srv.render_all();
+            // (a render deferred for an interval: a blocked client is not rendered)
+            let c = &srv.clients[&1];
+            if i % behind_every == behind_every / 2 && c.block.deferred && !c.block.active() {
+                behind(srv);
+            }
+            if i % tick == 0 {
+                srv.block_timers(t0 + BLOCK_INTERVAL * (i / tick + 1) as u32);
+            }
+            most = most.max(queued(srv));
+        }
+        most
+    }
+
+    /// Bells from a window the client does not show are not pane output drawn to it, so
+    /// at each check while it is blocked only the bells dropped (tty_add) count: below
+    /// the stop threshold. A stopped client is still not unblocked while its queue has
+    /// not drained, so the bells do not pile up behind the frames it has not read.
+    #[test]
+    fn background_bells_to_a_stopped_client_stay_bounded() {
+        let (mut srv, output, _) = stopped();
+        run(&mut srv, &["new-window", "-d"]);
+        let shown = srv.client_window(1).unwrap();
+        let other = srv.windows.iter().find(|(w, _)| **w != shown).map(|(_, w)| w.active).unwrap();
+        srv.render_all();
+        let start = block_start((120, 32));
+        let most = ring(&mut srv, other, 40_000, 100, 100);
+        assert!(most < 2 * start, "queued {most} (threshold {start})");
+        let c = &srv.clients[&1];
+        assert!(c.block.active() && !c.closed.is_closed());
+        assert!(bells(&output) < 1000);
+        // the client reads: unblocked at the next check, and a bell is sent at once
+        drain(&srv);
+        srv.block_timers(Instant::now() + BLOCK_INTERVAL * 1000);
+        assert!(!srv.clients[&1].block.active());
+        bell(&mut srv, other);
+        assert_eq!(bells(&output), 1);
+        kill(&mut srv);
+    }
+
+    /// Fewer bells an interval than the stop threshold from the pane the client shows:
+    /// each check sees too little discarded to keep it blocked, but its queue has not
+    /// drained, so it stays blocked and the bells are not queued.
+    #[test]
+    fn slow_bells_to_a_stopped_client_stay_bounded() {
+        let (mut srv, output, pane) = stopped();
+        srv.render_all();
+        let start = block_start((120, 32));
+        let most = ring(&mut srv, pane, 20_000, 1, 1);
+        assert!(most < 2 * start, "queued {most} (threshold {start})");
+        let c = &srv.clients[&1];
+        assert!(c.block.active() && !c.closed.is_closed());
+        assert!(bells(&output) < 1000);
+        kill(&mut srv);
+    }
+
+    /// A client that cannot be blocked because the Ms it was sent has not been written
+    /// (TTY_NOBLOCK) does not queue bells without bound either: a run of output outside
+    /// frames the writer has not started on stops at the start threshold.
+    #[test]
+    fn bells_behind_an_unwritten_ms_stay_bounded() {
+        let (mut srv, output, pane) = stopped();
+        srv.render_all();
+        drain(&srv);
+        let _ = frames(&output);
+        srv.clients.get_mut(&1).unwrap().features.add("clipboard");
+        srv.set_selection(1, "", &[b'y'; 30_000]);
+        let ms = queued(&srv);
+        let start = block_start((120, 32));
+        let most = ring(&mut srv, pane, 20_000, 1, 1);
+        let c = &srv.clients[&1];
+        assert!(!c.block.active() && !c.closed.is_closed());
+        assert!(most < ms + 2 * start, "queued {most} (Ms {ms}, threshold {start})");
+        let discarded = c.io.discarded.load(Ordering::Relaxed);
+        assert!(discarded > 15_000, "discarded {discarded}");
+        kill(&mut srv);
+    }
+
+    /// A client that reads gets every bell as it rings, whether or not a frame is still
+    /// being written to it.
+    #[test]
+    fn a_reading_client_gets_every_bell() {
+        let (mut srv, output, pane) = stopped();
+        srv.render_all();
+        for _ in 0..2_000 {
+            bell(&mut srv, pane);
+            srv.render_all();
+            drain(&srv);
+        }
+        assert_eq!(bells(&output), 2_000);
+        // while a frame is being written: the writer takes a little more than a bell
+        // between two bells
+        feed(&mut srv, pane, 0, 40);
+        srv.render_all();
+        assert!(queued(&srv) > 0);
+        for n in 1..=2_000 {
+            bell(&mut srv, pane);
+            assert_eq!(bells(&output), 1, "bell {n}");
+            let c = &srv.clients[&1];
+            let q = c.queued_bytes.load(Ordering::SeqCst);
+            c.queued_bytes.fetch_sub(q.min(transport::frame_cost(1) + 30), Ordering::SeqCst);
+        }
+        assert!(!srv.clients[&1].block.active());
         kill(&mut srv);
     }
 }
