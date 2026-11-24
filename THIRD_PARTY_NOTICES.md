@@ -9,6 +9,11 @@ The bundled `vendor/portable-pty` is portable-pty 0.9.0 with a local
 `CommandBuilder::raw_arg` (an argument put on the Windows command line as it is).
 See `vendor/portable-pty/PATCHES.md` and its MIT `LICENSE.md`.
 
+The bundled `vendor/interprocess` is interprocess 2.4.7 with 64 KiB Windows
+named pipe buffers for local socket listeners (upstream: 512 bytes).
+See `vendor/interprocess/PATCHES.md` and its `LICENSE-0BSD.txt` and
+`LICENSE-APACHE.txt`.
+
 ## tmux
 
 pwsh-tmux contains no tmux source code, but it reproduces tmux's interface: command and option names, default option values and formats, the default key bindings, and the default menus. tmux is distributed under the ISC license:

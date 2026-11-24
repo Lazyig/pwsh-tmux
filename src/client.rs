@@ -5,13 +5,27 @@ use crate::ipc;
 use crate::protocol::*;
 use crate::term;
 use interprocess::local_socket::Stream;
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 /// Names a file the client appends its terminal output to (used by the tests).
 pub const OUTPUT_COPY: &str = "PWSH_TMUX_OUTPUT_COPY";
+
+/// How much the client reads from the server at once. One read can take many
+/// frames, so the server, whose writes do not wait, finds room in the pipe sooner
+/// (a Windows pipe hands a write straight to a waiting read of this size).
+const READ_BUFFER: usize = 64 * 1024;
+
+/// Whether `buffered` (what the reader holds) starts with a whole output frame.
+/// Its handling flushes the terminal, so the frame before it need not.
+fn output_frame_buffered(buffered: &[u8]) -> bool {
+    match buffered {
+        [kind, a, b, c, d, rest @ ..] if *kind == S_OUTPUT => rest.len() >= u32::from_le_bytes([*a, *b, *c, *d]) as usize,
+        _ => false,
+    }
+}
 
 pub struct Global {
     pub config: Option<String>,
@@ -279,6 +293,29 @@ mod tests {
     }
 
     #[test]
+    fn buffered_reader_keeps_frames_and_sees_whole_output_frames() {
+        let mut wire = frame(S_OUTPUT, b"one");
+        wire.extend(frame(S_OUTPUT, b"two"));
+        wire.extend(frame(S_REPLY, b"x"));
+        wire.extend(frame(S_OUTPUT, b""));
+        // a tiny buffer, so frames straddle reads
+        let mut reader = BufReader::with_capacity(4, &wire[..]);
+        let mut frames = Vec::new();
+        while let Ok(f) = read_frame(&mut reader) {
+            frames.push(f);
+        }
+        assert_eq!(frames, [(S_OUTPUT, b"one".to_vec()), (S_OUTPUT, b"two".to_vec()), (S_REPLY, b"x".to_vec()), (S_OUTPUT, Vec::new())]);
+
+        assert!(output_frame_buffered(&frame(S_OUTPUT, b"abc")));
+        assert!(output_frame_buffered(&frame(S_OUTPUT, b"")));
+        let whole = frame(S_OUTPUT, b"abc");
+        assert!(!output_frame_buffered(&whole[..whole.len() - 1]));
+        assert!(!output_frame_buffered(&whole[..4]));
+        assert!(!output_frame_buffered(&frame(S_REPLY, b"abc")));
+        assert!(!output_frame_buffered(&[]));
+    }
+
+    #[test]
     fn native_windows_console_does_not_inherit_dumb_color_capabilities() {
         assert_eq!(terminal_name("dumb".into(), true), "");
         assert_eq!(terminal_name("xterm-256color".into(), true), "xterm-256color");
@@ -380,13 +417,20 @@ pub fn main(mut args: Vec<String>, g: Global) -> i32 {
         let _ = out.write_all(if alternate { b"\x1b[?1049l" } else { b"\x1b[H\x1b[2J" });
         let _ = out.flush();
     };
+    // Only this loop reads the stream until it returns (wait_closed then only waits
+    // for the end, so frames left in this buffer do not matter).
+    let mut reader = BufReader::with_capacity(READ_BUFFER, &*stream);
     loop {
-        let frame = read_frame(&mut &*stream);
+        let frame = read_frame(&mut reader);
         match frame {
             Ok((S_OUTPUT, p)) => {
                 term::note_focus_mode(&p);
                 let _ = out.write_all(&p);
-                let _ = out.flush();
+                // A run of output frames that has already arrived reaches the terminal
+                // in one flush.
+                if !output_frame_buffered(reader.buffer()) {
+                    let _ = out.flush();
+                }
                 if let Some(f) = output_copy.as_mut() {
                     let _ = f.write_all(&p);
                 }
