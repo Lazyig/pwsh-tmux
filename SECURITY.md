@@ -43,6 +43,10 @@ writes (Ms) that keep coming before the last one is written (which do not block 
 client, TTY_NOBLOCK) can still fill it to the limit, which then disconnects the client
 (see COMPATIBILITY.md, "A client that cannot keep up").
 Command replies have a 4 MiB aggregate limit, including multi-command requests.
+A connection over the 64-connection limit (tmux has none) is closed at once with the
+reply "server has too many clients (limit is 64)", which the client prints to stderr
+before it exits with status 1; it does not start another server. Connections that have
+not identified count too until their identify deadline closes them.
 `load-buffer -` preserves binary stdin, including NUL and non-UTF-8 bytes, by
 encoding the data before it enters argument framing. Encoded data and arguments
 must fit in the 1 MiB command frame (roughly 768 KiB of raw stdin, less argument

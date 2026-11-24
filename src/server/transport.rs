@@ -30,6 +30,18 @@ const STALLED_POLL: Duration = Duration::from_millis(50);
 #[cfg(unix)]
 const TERMINAL_SEND_BUFFER: libc::c_int = 4096;
 
+/// Refuses a connection over MAX_CLIENTS (tmux has no such limit) with an error reply,
+/// as an access refusal is, so the client prints it and exits 1 rather than printing
+/// "lost server". The main loop does this: one nonblocking write of a short frame to a
+/// new connection fits in its empty socket or pipe buffer at once (the deadline only
+/// bounds one that would not). Not logged: a client retrying in a loop would grow the
+/// log without end.
+pub fn refuse_full(stream: &Stream) {
+    let closed = Closer::default();
+    let mut io = Io { stream, closed: &closed, deadline: Some(Instant::now() + Duration::from_millis(20)) };
+    let _ = write_frame(&mut io, S_REPLY, &encode_reply(1, &format!("server has too many clients (limit is {MAX_CLIENTS})")));
+}
+
 /// Lowers the send buffer of an attached terminal client's connection (see
 /// TERMINAL_SEND_BUFFER). Best effort: the default buffer only makes the tail longer.
 pub fn shrink_send_buffer(stream: &Stream) {
@@ -401,6 +413,55 @@ mod tests {
                 if gone { break; }
             }
             assert!(srv.clients.is_empty());
+        }
+    }
+
+    /// A connection over MAX_CLIENTS gets the refusal and then end of file, on a Unix
+    /// socket and on a named pipe: the server has written the reply and closed its end
+    /// (on Windows a plain CloseHandle, nothing lingering) before the client reads it,
+    /// and the client's own first write may come after that close. The clients already
+    /// connected stay connected and keep working.
+    #[test]
+    fn connection_over_the_limit_reads_refusal_after_server_closes() {
+        let (tx, events) = mpsc::sync_channel(4 * MAX_CLIENTS);
+        let mut srv = Server::new(tx);
+        let mut peers = Vec::new();
+        for _ in 0..MAX_CLIENTS {
+            let (server, peer) = pair();
+            srv.accept(server);
+            peers.push(peer);
+        }
+        assert_eq!(srv.clients.len(), MAX_CLIENTS);
+
+        let (server, mut peer) = pair();
+        srv.accept(server);
+        assert_eq!(srv.clients.len(), MAX_CLIENTS, "the refused connection was kept");
+        // read on another thread so a missing reply or a connection left open fails
+        // the test instead of hanging it
+        let (done, result) = mpsc::channel();
+        thread::spawn(move || {
+            // like the client, which writes before reading and ignores a failed write
+            let _ = write_frame(&mut peer, C_IDENTIFY, b"");
+            let reply = read_frame(&mut peer);
+            let after = read_frame(&mut peer).map(|(kind, _)| kind);
+            let _ = done.send((reply, after));
+        });
+        let (reply, after) = result.recv_timeout(Duration::from_secs(5)).expect("refused client hung");
+        let (kind, payload) = reply.expect("refusal reply");
+        assert_eq!(kind, S_REPLY);
+        assert_eq!(decode_reply(&payload), (1, format!("server has too many clients (limit is {MAX_CLIENTS})")));
+        assert!(after.is_err(), "connection still open after the refusal: {after:?}");
+
+        // an existing client is unaffected
+        write_frame(&mut peers[0], C_IDENTIFY, b"").unwrap();
+        loop {
+            let event = events.recv_timeout(Duration::from_secs(2)).expect("existing client identify");
+            assert!(!matches!(event, Event::ClientGone(_)), "an existing client was dropped");
+            if matches!(event, Event::ClientMsg(_, C_IDENTIFY, _)) { break; }
+        }
+        assert_eq!(srv.clients.len(), MAX_CLIENTS);
+        for client in srv.clients.values() {
+            client.closed.close();
         }
     }
 

@@ -2117,7 +2117,11 @@ impl Server {
     }
 
     fn accept(&mut self, stream: Stream) {
-        if self.clients.len() >= transport::MAX_CLIENTS || stream.set_nonblocking(true).is_err() {
+        if stream.set_nonblocking(true).is_err() {
+            return;
+        }
+        if self.clients.len() >= transport::MAX_CLIENTS {
+            transport::refuse_full(&stream);
             return;
         }
         let cid = self.id();
