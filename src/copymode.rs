@@ -3457,6 +3457,13 @@ impl CopyMode {
                 self.cy = y;
                 self.cx = x;
                 self.lastcx = x;
+                // a match ending in the last cell wraps the cursor to the first cell,
+                // where tmux leaves the view as it was: its cursor is then above the
+                // view (copy_cursor_y is -hsize) and tmux 3.4 spins on the next cursor
+                // command. The view goes up to the cursor instead.
+                if self.cy < self.top {
+                    self.top = self.cy;
+                }
                 self.pinned = slots.map(|(s, e)| ((y, x), s, e));
             }
         }
@@ -5825,6 +5832,30 @@ mod tests {
 #[cfg(test)]
 mod display_search_tests {
     use super::*;
+    #[test]
+    fn emacs_search_ending_in_the_last_cell_wraps_with_the_view() {
+        // emacs search-forward leaves the cursor after the match; after the last cell of
+        // the grid that is the first cell (window_copy_move_right with wrap-search). tmux
+        // 3.8 moves the cursor there and leaves the view at the bottom (tmux 3.4 live:
+        // copy_cursor_y -4, then cursor-right spins the server); here the view follows
+        let row = |s: &str| Line { cells: s.chars().map(|c| crate::cells::Cell { text: c.to_string(), style: Default::default() }).collect(), wrapped: false, ..Default::default() };
+        let lines: Vec<Line> = ["l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8", "abx"].into_iter().map(row).collect();
+        let mut cm = CopyMode::new(lines.clone(), 3, 5, (4, 2), false);
+        assert_eq!((cm.cy, cm.top), (8, 4));
+        cm.run("search-forward", &["x".into()]);
+        assert_eq!((cm.cy, cm.cx, cm.top, cm.cursor()), (0, 0, 0, (0, 0)));
+        cm.run("cursor-right", &[]);
+        assert_eq!(cm.cursor(), (1, 0));
+        // again from there finds it again and wraps the same way
+        cm.run("search-again", &[]);
+        assert_eq!((cm.cy, cm.cx, cm.top), (0, 0, 0));
+        // without wrap-search the cursor stays on the match's last cell
+        let mut cm = CopyMode::new(lines, 3, 5, (4, 2), false);
+        cm.wrap_search = false;
+        cm.run("search-forward", &["x".into()]);
+        assert_eq!((cm.cy, cm.cx, cm.top), (8, 2, 4));
+    }
+
     #[test]
     fn wrap_search_can_be_disabled() {
         let lines: Vec<Line> = ["target", "middle", "target"].into_iter().map(|s| Line { cells: s.chars().map(|c| crate::cells::Cell { text: c.to_string(), style: Default::default() }).collect(), wrapped: false, ..Default::default() }).collect();
