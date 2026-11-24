@@ -747,6 +747,11 @@ pub struct CopyMode {
     wrap_search: bool,
     /// tmux's searchdirection: the last search went down.
     searched_down: bool,
+    /// An emacs forward search found a match ending in the grid's last cell and, with
+    /// wrap-search, tmux moved its cursor on to the first cell (above the view). The
+    /// cursor stays drawn on the last cell; searches and their highlights use the first
+    /// cell while it is there (search_cursor).
+    search_wrapped: bool,
     exit_on_bottom: bool,
     /// tmux's lastcx / lastsx: the column to return to and the length of the line it was on,
     /// for vertical motion and scrolling (both start at 0).
@@ -814,6 +819,7 @@ impl CopyMode {
             pane_search_regex: true,
             wrap_search: true,
             searched_down: false,
+            search_wrapped: false,
             exit_on_bottom: false,
             tlastcx: 0,
             tlastsx: 0,
@@ -1070,6 +1076,7 @@ impl CopyMode {
     /// new content (unless the last search timed out), and incremental searches restart
     /// from here.
     fn size_changed(&mut self) {
+        self.search_wrapped = false;
         let search = self.search_marks;
         self.clear_selection();
         self.clear_marks();
@@ -1387,12 +1394,13 @@ impl CopyMode {
 
     /// search_match: the match under the cursor.
     pub fn search_match(&self) -> Option<String> {
-        if !self.search_present() || self.cy < self.top || self.cy >= self.top + self.height {
+        let (cy, cx) = self.search_cursor();
+        if !self.search_present() || cy < self.top || cy >= self.top + self.height {
             return None;
         }
         let needle = &self.search.as_ref()?.0;
-        let at = self.cy * self.width + self.cx;
-        let (start, end) = self.visible_matches(self.cy, needle).into_iter()
+        let at = cy * self.width + cx;
+        let (start, end) = self.visible_matches(cy, needle).into_iter()
             .find(|&(a, b)| at >= a && at < b)
             .or_else(|| at.checked_sub(1).and_then(|prev| self.visible_matches(prev / self.width, needle).into_iter()
                 .find(|&(a, b)| prev >= a && prev < b)))?;
@@ -1639,6 +1647,9 @@ impl CopyMode {
     /// (from digit keys or `send-keys -N`) is applied and consumed.
     pub fn run(&mut self, command: &str, args: &[String]) -> Action {
         self.count_open = false;
+        if !command.starts_with("search-") {
+            self.search_wrapped = false;
+        }
         // most commands update the selection from the cursor again; these leave it (or
         // update it only when they move the cursor)
         const KEEP: &[&str] = &[
@@ -2298,6 +2309,8 @@ impl CopyMode {
         let cur_row = self.cy - self.top;
         let screen_sel = self.screen_selection();
         let text_x = lnw.min(self.width - 1);
+        // the cursor line and the current match follow tmux's cursor (search_cursor)
+        let (search_cy, search_cx) = self.search_cursor();
         for row in 0..self.height {
             if !rows.contains(&row) {
                 out.push(Line::default());
@@ -2328,7 +2341,7 @@ impl CopyMode {
                 }
             }
             line.cells.resize(content, Cell::default());
-            if y == self.cy
+            if y == search_cy
                 && let Some(cl) = st.current_line
             {
                 for c in &mut line.cells {
@@ -2354,9 +2367,9 @@ impl CopyMode {
                 for (start, end) in self.visible_matches(y, needle) {
                     let x0 = start.saturating_sub(y * self.width);
                     let x1 = end.saturating_sub(y * self.width).min(self.width);
-                    let at = self.cy * self.width + self.cx;
+                    let at = search_cy * self.width + search_cx;
                     let at = if !self.vi && self.searched_down { at.saturating_sub(1) } else { at };
-                    let current = self.cy >= self.top && self.cy < self.top + self.height && at >= start && at < end;
+                    let current = search_cy >= self.top && search_cy < self.top + self.height && at >= start && at < end;
                     let ms = if current { st.current_match } else { st.matched };
                     for (x, c) in line.cells.iter_mut().enumerate().take(x1.min(content)).skip(x0) {
                         let inv = mark_row && x == self.mark.1;
@@ -3390,22 +3403,31 @@ impl CopyMode {
         }
     }
 
+    /// Where tmux's cursor is for searching: the first cell after an emacs search wrapped
+    /// it there (search_wrapped) while the cursor is still on the last cell, otherwise
+    /// the cursor.
+    fn search_cursor(&self) -> Pos {
+        let last = (self.lines.len() - 1, self.width - 1);
+        if self.search_wrapped && (self.cy, self.cx) == last { (0, 0) } else { (self.cy, self.cx) }
+    }
+
     /// window_copy_search_jump: the next match (row and columns). Forward, vi starts after
     /// the match under the cursor (or the next cell), emacs at the cursor; backward starts
     /// left of the cursor. Wraps around with wrap-search.
     fn find_match(&self, needle: &str, forward: bool) -> Option<(usize, (usize, usize))> {
         let total = self.lines.len();
-        let at = self.cy * self.width + self.cx;
+        let (cy, cx) = self.search_cursor();
+        let at = cy * self.width + cx;
         let from = if forward && self.vi {
-            self.search_present().then(|| self.visible_matches(self.cy, needle).into_iter()
+            self.search_present().then(|| self.visible_matches(cy, needle).into_iter()
                 .find(|&(a, b)| at >= a && at < b).map(|(_, b)| b)).flatten().unwrap_or(at + 1)
         } else { at };
         // the matches of a whole wrapped line are found once (window_copy_search_jump looks
         // at each row once; per-row searches of long wrapped lines would be quadratic)
         let mut line: Option<(usize, usize, Vec<(usize, usize)>)> = None;
         for i in 0..=total {
-            if !self.wrap_search && ((forward && self.cy + i >= total) || (!forward && i > self.cy)) { break; }
-            let y = if forward { (self.cy + i) % total } else { (self.cy + total * 2 - i) % total };
+            if !self.wrap_search && ((forward && cy + i >= total) || (!forward && i > cy)) { break; }
+            let y = if forward { (cy + i) % total } else { (cy + total * 2 - i) % total };
             if !line.as_ref().is_some_and(|(a, b, _)| (*a..=*b).contains(&y)) {
                 let (first, last) = (self.logical_start(y), self.logical_end(y));
                 line = Some((first, last, self.all_match_spans(first, last, needle)));
@@ -3444,6 +3466,7 @@ impl CopyMode {
             self.searched_down = forward;
             let Some((y, (x0, x1))) = self.find_match(needle, forward) else { break };
             found = true;
+            self.search_wrapped = false;
             self.scroll_to((y, x0));
             self.search_marks = true;
             let started = std::time::Instant::now();
@@ -3452,18 +3475,21 @@ impl CopyMode {
                 // the selection was updated at the match; the cursor moves on without it
                 let slots = self.slots().filter(|_| self.frozen.is_none());
                 let end = (y * self.width + x1).min((self.top + self.height) * self.width);
-                let (y, x) = if end < self.lines.len() * self.width { (end / self.width, end % self.width) }
-                    else if self.wrap_search { (0, 0) } else { (self.lines.len() - 1, self.width - 1) };
+                // a match ending in the last cell (the view is then at the bottom) wraps
+                // tmux's cursor to the first cell with wrap-search, and tmux leaves the
+                // view as it is. With history above the view its cursor is then above
+                // the view (copy_cursor_y is -hsize, drawn clamped to the bottom row;
+                // tmux 3.4 spins on the next cursor command): the cursor stays on the
+                // last cell instead, in view next to the match, and the next search
+                // starts from the first cell as tmux's does.
+                let last = (self.lines.len() - 1, self.width - 1);
+                let wrapped = end >= self.lines.len() * self.width;
+                let (y, x) = if !wrapped { (end / self.width, end % self.width) }
+                    else if self.wrap_search && self.top == 0 { (0, 0) } else { last };
+                self.search_wrapped = wrapped && self.wrap_search && self.top > 0;
                 self.cy = y;
                 self.cx = x;
                 self.lastcx = x;
-                // a match ending in the last cell wraps the cursor to the first cell,
-                // where tmux leaves the view as it was: its cursor is then above the
-                // view (copy_cursor_y is -hsize) and tmux 3.4 spins on the next cursor
-                // command. The view goes up to the cursor instead.
-                if self.cy < self.top {
-                    self.top = self.cy;
-                }
                 self.pinned = slots.map(|(s, e)| ((y, x), s, e));
             }
         }
@@ -5834,27 +5860,53 @@ mod tests {
 mod display_search_tests {
     use super::*;
     #[test]
-    fn emacs_search_ending_in_the_last_cell_wraps_with_the_view() {
+    fn emacs_search_ending_in_the_last_cell_keeps_the_view() {
         // emacs search-forward leaves the cursor after the match; after the last cell of
-        // the grid that is the first cell (window_copy_move_right with wrap-search). tmux
-        // 3.8 moves the cursor there and leaves the view at the bottom (tmux 3.4 live:
-        // copy_cursor_y -4, then cursor-right spins the server); here the view follows
+        // the grid that is the first cell (window_copy_move_after_search_mark wraps with
+        // window_copy_move_right). tmux 3.8 leaves the view on the match, so with history
+        // its cursor is above the view (tmux 3.4 live: copy_cursor_y -4). Here the cursor
+        // stays on the last cell and searches go on from the first cell like tmux's.
         let row = |s: &str| Line { cells: s.chars().map(|c| crate::cells::Cell { text: c.to_string(), style: Default::default() }).collect(), wrapped: false, ..Default::default() };
-        let lines: Vec<Line> = ["l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8", "abx"].into_iter().map(row).collect();
+        let lines: Vec<Line> = ["x1", "l2", "l3", "l4", "l5", "l6", "l7", "l8", "abx"].into_iter().map(row).collect();
         let mut cm = CopyMode::new(lines.clone(), 3, 5, (4, 2), false);
-        assert_eq!((cm.cy, cm.top), (8, 4));
+        assert_eq!((cm.cy, cm.cx, cm.top), (8, 2, 4));
         cm.run("search-forward", &["x".into()]);
-        assert_eq!((cm.cy, cm.cx, cm.top, cm.cursor()), (0, 0, 0, (0, 0)));
-        cm.run("cursor-right", &[]);
-        assert_eq!(cm.cursor(), (1, 0));
-        // again from there finds it again and wraps the same way
+        assert_eq!((cm.cy, cm.cx, cm.top, cm.cursor()), (8, 2, 4, (2, 4)));
+        // the match stays in view; tmux's cursor is not on it, so it is not the current
+        // match and search_match is empty (window_copy_search_mark_at fails above the view)
+        let (view, _) = cm.render();
+        assert_eq!(view[4].cells[2].style.bg, CYAN);
+        assert_eq!(cm.search_match(), None);
+        // search-again goes on from the first cell: the match there, the view follows
         cm.run("search-again", &[]);
-        assert_eq!((cm.cy, cm.cx, cm.top), (0, 0, 0));
-        // without wrap-search the cursor stays on the match's last cell
+        assert_eq!((cm.cy, cm.cx, cm.top), (0, 1, 0));
+        // backward from the first cell wraps to the last match
+        let mut cm = CopyMode::new(lines.clone(), 3, 5, (4, 2), false);
+        cm.run("search-forward", &["x".into()]);
+        cm.run("search-reverse", &[]);
+        assert_eq!((cm.cy, cm.cx, cm.top), (8, 2, 4));
+        // any other command moves on from the cursor as drawn
+        let mut cm = CopyMode::new(lines.clone(), 3, 5, (4, 2), false);
+        cm.run("search-forward", &["x".into()]);
+        cm.run("cursor-left", &[]);
+        cm.run("cursor-right", &[]);
+        cm.run("search-again", &[]);
+        assert_eq!((cm.cy, cm.cx, cm.top), (8, 2, 4));
+        // without wrap-search the cursor stays on the match's last cell (tmux too) and
+        // searches go on from there
         let mut cm = CopyMode::new(lines, 3, 5, (4, 2), false);
         cm.wrap_search = false;
         cm.run("search-forward", &["x".into()]);
         assert_eq!((cm.cy, cm.cx, cm.top), (8, 2, 4));
+        assert!(!cm.search_wrapped);
+        // with no history the first cell is in view and the cursor goes there as in tmux
+        let lines: Vec<Line> = ["x1", "l2", "l3", "l4", "abx"].into_iter().map(row).collect();
+        let mut cm = CopyMode::new(lines, 3, 5, (4, 2), false);
+        assert_eq!((cm.cy, cm.cx, cm.top), (4, 2, 0));
+        cm.run("search-forward", &["x".into()]);
+        assert_eq!((cm.cy, cm.cx, cm.top, cm.cursor()), (0, 0, 0, (0, 0)));
+        cm.run("search-again", &[]);
+        assert_eq!((cm.cy, cm.cx, cm.top), (0, 1, 0));
     }
 
     #[test]
