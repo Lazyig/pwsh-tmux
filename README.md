@@ -49,6 +49,11 @@ existing Cargo cache. There is no macOS archive: build it with `cargo build --re
 another name such as `pwsh-tmux`; its socket directory, config file and pane
 environment variables do not overlap with tmux's. See [`VALIDATION.md`](VALIDATION.md) for release checks.
 
+Version 0.3.2 adds macOS: `#{pane_current_command}`, `#{pane_current_path}` and
+automatic-rename follow the pane there as in tmux. The server also removes its
+socket's lock file once it listens and keeps its log below 1 MiB. The client and
+server messages are unchanged from 0.3.1; restart existing servers (`kill-server`)
+to use the new server.
 Version 0.3.1 keeps the screen current on slow terminals: the client acknowledges
 output, the server waits for it before the next frame and scrolls pane regions instead
 of redrawing them. It also fixes terminal differences from tmux 3.8 (erase and
