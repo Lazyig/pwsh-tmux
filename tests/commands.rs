@@ -3463,7 +3463,7 @@ fn startup_config_runs_in_the_client_directory_and_keeps_its_errors() {
     let real = if cfg!(windows) { dir.to_string_lossy().into_owned() } else { std::fs::canonicalize(&dir).unwrap().to_string_lossy().into_owned() };
     assert_eq!(std::fs::read_to_string(dir.join("runpwd.txt")).unwrap().trim_end(), real);
     assert_eq!(ctx.ok(&["show-options", "-gv", "@c"]).trim_end(), "1");
-    assert_eq!(ctx.fmt("cfg", "#{pane_current_path}"), dir.to_string_lossy());
+    assert_eq!(ctx.fmt("cfg", "#{pane_current_path}"), real);
     assert_eq!(ctx.ok(&["show-options", "-gv", "@x"]).trim_end(), "1");
     assert!(ctx.ok(&["show-options", "-gqv", "@y"]).is_empty());
     assert_eq!(ctx.ok(&["show-options", "-gv", "@z"]).trim_end(), "1");

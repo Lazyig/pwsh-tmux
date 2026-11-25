@@ -59,10 +59,18 @@ pub type ClientId = u32;
 /// The environment level of the global environment (session ids start at 0).
 pub const GLOBAL_ENV: SessId = SessId::MAX - 1;
 
+/// The server log is kept below this size: a larger one becomes server.log.old.
+const LOG_LIMIT: u64 = 1 << 20;
+
 pub fn log(msg: &str) {
     if let Ok(dir) = ipc::runtime_dir() {
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("server.log")) {
-            let _ = writeln!(f, "[{}] {msg}", std::process::id());
+        let path = dir.join("server.log");
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_LIMIT) {
+            let _ = std::fs::rename(&path, dir.join("server.log.old"));
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            // one write, so the lines of servers sharing the log do not interleave
+            let _ = f.write_all(format!("[{}] {msg}\n", std::process::id()).as_bytes());
         }
     }
 }
@@ -3165,7 +3173,7 @@ impl Server {
         #[cfg(unix)]
         {
             let Some(p) = self.panes.get(&pane).filter(|p| p.dead.is_none()) else { return false };
-            let Some(cmd) = procinfo::pane_programs(&[(p.pid, p.fg_pgrp())]).pop().and_then(|r| r.0) else { return false };
+            let Some(cmd) = procinfo::pane_program(p.pid, p.fg_pgrp()) else { return false };
             let generation = p.generation;
             self.panes.get_mut(&pane).unwrap().current_cmd = cmd;
             self.name_known.insert((pane, generation));

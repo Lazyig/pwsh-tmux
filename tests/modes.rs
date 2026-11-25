@@ -163,7 +163,7 @@ fn customize_mode_groups_changed_only_and_keys() {
     // e edits the value with the editor option's program, in a popup
     #[cfg(unix)]
     {
-        ctx.ok(&["set", "-s", "editor", "sed -i s/value-2/value-3/"]);
+        ctx.ok(&["set", "-s", "editor", "perl -pi -e s/value-2/value-3/"]);
         t.send(b"e");
         wait_for("edited", || ctx.ok(&["show", "-v", "-t", "c", "@mine"]).trim() == "value-3");
     }
@@ -376,6 +376,9 @@ fn buffer_editor_keeps_the_final_newline_like_window_buffer_edit_close_cb() {
     ctx.ok(&["set", "-s", "editor", "printf 'new\\n' >"]);
     ctx.ok(&["deleteb", "-b", "nl"]);
     ctx.ok(&["setb", "-b", "nonl", "old"]);
+    // modes are updated as the status line is redrawn (server_client_check_modes),
+    // which a buffer change does not do: without this the list waits for status-interval
+    ctx.ok(&["refresh-client", "-S", "-t", &client(&ctx)]);
     wait_for("list", || t.contents().contains("(0) nonl"));
     t.send(b"e");
     wait_for("edited", || ctx.ok(&["show-buffer", "-b", "nonl"]) == "new");

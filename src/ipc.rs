@@ -123,12 +123,27 @@ pub fn listen_exclusive(extra_users: &[String]) -> io::Result<Option<Listener>> 
         // Serialise check + bind so two autostarting clients can't both bind.
         let mut lock_path = socket_path()?.into_os_string();
         lock_path.push(".lock");
-        let lock = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&lock_path)?;
-        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+        // The server that made the socket removes the lock file (below): a lock taken on
+        // a file that is no longer at the path is taken again on the one there now, so
+        // a client that opened the old file and one that made a new one cannot both bind.
+        let lock = loop {
+            use std::os::unix::fs::MetadataExt;
+            let lock = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&lock_path)?;
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+            let held = lock.metadata()?;
+            if std::fs::metadata(&lock_path).is_ok_and(|m| m.dev() == held.dev() && m.ino() == held.ino()) {
+                break lock;
+            }
+        };
         if connect().is_ok() {
             return Ok(None);
         }
-        listen(extra_users).map(Some)
+        let listener = listen(extra_users)?;
+        // server_start: the lock file goes once the socket is there (a client waiting on
+        // it then connects to this server; a later one makes a new one and connects)
+        let _ = std::fs::remove_file(&lock_path);
+        drop(lock);
+        Ok(Some(listener))
     }
     #[cfg(windows)]
     {

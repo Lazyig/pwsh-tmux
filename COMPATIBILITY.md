@@ -243,7 +243,10 @@ From the [3.8 CHANGES](https://github.com/tmux/tmux/blob/3.8/CHANGES) (3.6b to 3
   command line as `pane_start_command` shows it (each argument escaped), and
   `pane_current_command` is parse_window_name of the first word of the foreground
   program's command line (`/proc/PID/cmdline`, so `/p/-l` is `-l` and a long name is not
-  cut to 15 bytes); `automatic-rename` compares the expanded
+  cut to 15 bytes). On macOS it is the kernel's name for the foreground process group
+  and `pane_current_path` its current directory, both from libproc as tmux's
+  osdep-darwin.c reads them (so a name is at most 16 bytes and a login shell is `zsh`).
+  `automatic-rename` compares the expanded
   `automatic-rename-format` with the window's name and, when they differ, sets it
   through clean_name again (window_set_name), so a program named `a\b` gives a window
   named `a\\\\b`, and fires `window-renamed` even when that is the name it had. On both,

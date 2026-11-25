@@ -75,7 +75,10 @@ Default strict Clippy style checks still report existing style and complexity
 warnings; they are not represented as a clean all-warning lint result. No
 correctness/suspicious-group failure remains in the current validation.
 Windows Server 2022, macOS, BSD, ARM and real distinct Windows logon accounts
-were not validated in this run. Platform support must not be inferred from
+were not validated in this run. (Later, on 2026-11-26, the full suite was run on macOS
+15.3 on Apple silicon (arm64) with Rust 1.100, together with the project Clippy
+lint set, and tmux 3.8 was compared by hand for pane programs and paths; see
+COMPATIBILITY.md for the macOS details.) Platform support must not be inferred from
 Linux UID tests alone. No independent human security certification is claimed.
 
 ## Repeating the checks

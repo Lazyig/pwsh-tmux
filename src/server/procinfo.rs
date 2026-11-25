@@ -378,32 +378,16 @@ pub fn program_name(argv0: &str) -> String {
 /// What each pane runs, for (shell pid, pty foreground process group) pairs: the
 /// foreground program's name and, where it can be read, its working directory.
 ///
-/// On Unix that is the pty's foreground process group, and the name is the first word
-/// of its command line (osdep_get_name), such as `-bash` or `/usr/bin/vim`. On Windows it is the deepest
-/// descendant of the pane's shell, found in one process snapshot shared by all panes.
-/// This can be slow on a busy system, so the server calls it off its main thread.
+/// On Unix that is the pty's foreground process group. On Linux the name is the first
+/// word of its command line (osdep_get_name), such as `-bash` or `/usr/bin/vim`; on
+/// macOS it is the kernel's name for it (osdep-darwin.c), such as `zsh` or `vim`. On
+/// Windows it is the deepest descendant of the pane's shell, found in one process
+/// snapshot shared by all panes. This can be slow on a busy system, so the server calls
+/// it off its main thread.
 pub fn pane_programs(panes: &[(Option<u32>, Option<i32>)]) -> Vec<(Option<String>, Option<String>)> {
     #[cfg(unix)]
     {
-        panes
-            .iter()
-            .map(|&(pid, fg_pgrp)| {
-                let Some(p) = fg_pgrp.map(|p| p as u32).or(pid) else { return (None, None) };
-                if exec_pending(p) {
-                    return (None, None);
-                }
-                // osdep_get_name: the first word of its command line as it is (the
-                // name of the program a pane runs is parse_window_name of it), else its
-                // name from the kernel
-                let argv0 = std::fs::read(format!("/proc/{p}/cmdline")).ok().and_then(|c| {
-                    let first = c.split(|&b| b == 0).next().unwrap_or_default();
-                    (!first.is_empty()).then(|| String::from_utf8_lossy(first).into_owned())
-                });
-                let name = argv0.or_else(|| std::fs::read_to_string(format!("/proc/{p}/comm")).ok().map(|c| c.trim().to_string()));
-                let cwd = std::fs::read_link(format!("/proc/{p}/cwd")).ok().map(|p| p.to_string_lossy().into_owned());
-                (name, cwd)
-            })
-            .collect()
+        panes.iter().map(|&(pid, fg_pgrp)| fg_pgrp.map(|p| p as u32).or(pid).map_or((None, None), |p| unix_program(p, true))).collect()
     }
     #[cfg(windows)]
     {
@@ -416,13 +400,44 @@ pub fn pane_programs(panes: &[(Option<u32>, Option<i32>)]) -> Vec<(Option<String
     }
 }
 
+/// The name of what one pane runs, without its directory: the lookup the server makes
+/// on its main thread on Unix as tmux does (a name check, `#{pane_current_command}`).
+#[cfg(unix)]
+pub fn pane_program(pid: Option<u32>, fg_pgrp: Option<i32>) -> Option<String> {
+    unix_program(fg_pgrp.map(|p| p as u32).or(pid)?, false).0
+}
+
+#[cfg(unix)]
+fn unix_program(p: u32, with_cwd: bool) -> (Option<String>, Option<String>) {
+    if exec_pending(p) {
+        return (None, None);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // osdep_get_name and osdep_get_cwd in osdep-darwin.c
+        (darwin::name(p), if with_cwd { darwin::cwd(p) } else { None })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // osdep_get_name: the first word of its command line as it is (the name of the
+        // program a pane runs is parse_window_name of it), else its name from the kernel
+        let argv0 = std::fs::read(format!("/proc/{p}/cmdline")).ok().and_then(|c| {
+            let first = c.split(|&b| b == 0).next().unwrap_or_default();
+            (!first.is_empty()).then(|| String::from_utf8_lossy(first).into_owned())
+        });
+        let name = argv0.or_else(|| std::fs::read_to_string(format!("/proc/{p}/comm")).ok().map(|c| c.trim().to_string()));
+        let cwd = if with_cwd { std::fs::read_link(format!("/proc/{p}/cwd")).ok().map(|p| p.to_string_lossy().into_owned()) } else { None };
+        (name, cwd)
+    }
+}
+
 /// A pane's process that has not finished exec yet: what it runs is not known (the
 /// caller uses the pane's start command). Between fork and exec it still runs the
 /// server's image (its program and command line are the server's own) with the name of
 /// the server thread that forked it, and during exec it has the new program but no
 /// arguments yet and still the old name (the kernel sets the name before the arguments).
 /// Checked before the name is read.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn exec_pending(pid: u32) -> bool {
     use std::sync::OnceLock;
     static SERVER: OnceLock<Option<(std::path::PathBuf, Vec<u8>)>> = OnceLock::new();
@@ -434,6 +449,85 @@ pub fn exec_pending(pid: u32) -> bool {
         return false;
     };
     cmdline == *own && std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|e| e == *exe)
+}
+
+/// On macOS a process between fork and exec runs the server's executable with the
+/// server's arguments and name; exec replaces all of them at once. The executable is
+/// compared first (cheap), then the arguments, so that another copy of this program
+/// with other arguments (a client run in a pane) is not taken for one.
+#[cfg(target_os = "macos")]
+pub fn exec_pending(pid: u32) -> bool {
+    use std::sync::OnceLock;
+    static SERVER: OnceLock<Option<(Vec<u8>, Vec<u8>)>> = OnceLock::new();
+    let Some((exe, own)) = SERVER.get_or_init(|| {
+        let me = std::process::id();
+        Some((darwin::path(me)?, darwin::procargs(me)?))
+    }) else {
+        return false;
+    };
+    darwin::path(pid).is_some_and(|p| p == *exe) && darwin::procargs(pid).is_some_and(|a| a == *own)
+}
+
+/// Process details from the Darwin kernel (libproc), as osdep-darwin.c reads them.
+#[cfg(target_os = "macos")]
+mod darwin {
+    use std::mem::{size_of, MaybeUninit};
+
+    fn c_str(bytes: &[libc::c_char]) -> Option<Vec<u8>> {
+        let bytes: Vec<u8> = bytes.iter().map(|&c| c as u8).take_while(|&b| b != 0).collect();
+        (!bytes.is_empty()).then_some(bytes)
+    }
+
+    /// proc_pidinfo for a fixed-size answer: the struct when the kernel filled all of it.
+    fn pidinfo<T>(pid: u32, flavor: libc::c_int) -> Option<T> {
+        let mut out = MaybeUninit::<T>::zeroed();
+        let size = size_of::<T>() as libc::c_int;
+        // SAFETY: out is size bytes and proc_pidinfo writes at most that many
+        let n = unsafe { libc::proc_pidinfo(pid as libc::c_int, flavor, 0, out.as_mut_ptr().cast(), size) };
+        // SAFETY: zeroed, then filled by the kernel; plain C data
+        (n == size).then(|| unsafe { out.assume_init() })
+    }
+
+    /// osdep_get_name: pbsi_comm of PROC_PIDT_SHORTBSDINFO (up to 16 characters).
+    pub fn name(pid: u32) -> Option<String> {
+        let info: libc::proc_bsdshortinfo = pidinfo(pid, libc::PROC_PIDT_SHORTBSDINFO)?;
+        c_str(&info.pbsi_comm).map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+
+    /// osdep_get_cwd: the current directory of PROC_PIDVNODEPATHINFO.
+    pub fn cwd(pid: u32) -> Option<String> {
+        let info: libc::proc_vnodepathinfo = pidinfo(pid, libc::PROC_PIDVNODEPATHINFO)?;
+        // (libc declares the MAXPATHLEN path as 32 rows of 32)
+        c_str(info.pvi_cdir.vip_path.as_flattened()).map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+
+    /// The process's executable (proc_pidpath).
+    pub fn path(pid: u32) -> Option<Vec<u8>> {
+        let mut buf = vec![0 as libc::c_char; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: buf holds PROC_PIDPATHINFO_MAXSIZE bytes
+        let n = unsafe { libc::proc_pidpath(pid as libc::c_int, buf.as_mut_ptr().cast(), buf.len() as u32) };
+        if n <= 0 {
+            return None;
+        }
+        c_str(&buf[..n as usize])
+    }
+
+    /// KERN_PROCARGS2: argc, the executable path, then the arguments and environment.
+    pub fn procargs(pid: u32) -> Option<Vec<u8>> {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+        let mut len: libc::size_t = 0;
+        // SAFETY: a size query with a null buffer
+        if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0) } != 0 || len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; len];
+        // SAFETY: buf holds len bytes
+        if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) } != 0 {
+            return None;
+        }
+        buf.truncate(len);
+        Some(buf)
+    }
 }
 
 #[cfg(windows)]
@@ -653,8 +747,9 @@ pub mod win {
     }
 }
 
-// (Linux only: the process's program, arguments and name are read from /proc)
-#[cfg(all(test, target_os = "linux"))]
+// (Linux and macOS: the process's program, arguments and name are read from /proc or
+// libproc)
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
 

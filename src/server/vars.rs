@@ -474,7 +474,10 @@ impl Vars for VarCtx<'_> {
             // through parse_window_name on Unix (Windows finds program names already, and
             // keeps a path's backslashes)
             "pane_current_command" => pane.map(|p| {
-                let now = if cfg!(unix) && p.dead.is_none() { procinfo::pane_programs(&[(p.pid, p.fg_pgrp())]).pop().and_then(|r| r.0) } else { None };
+                #[cfg(unix)]
+                let now = if p.dead.is_none() { procinfo::pane_program(p.pid, p.fg_pgrp()) } else { None };
+                #[cfg(not(unix))]
+                let now: Option<String> = None;
                 let cmd = now.filter(|c| !c.is_empty()).unwrap_or_else(|| p.current_cmd.clone());
                 if cfg!(windows) { cmd } else { super::cmds::parse_window_name(&cmd) }
             }),
