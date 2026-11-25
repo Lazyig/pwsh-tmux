@@ -4374,3 +4374,15 @@ fn a_pane_without_a_command_runs_a_login_shell() {
     let pid = ctx.fmt("l:2", "#{pane_pid}");
     wait_for("sleep", || std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default() == b"sleep\x0030\0");
 }
+
+/// format_cb_current_path reads the directory (osdep_get_cwd) as the format is
+/// expanded: once the pane runs its program the path is where it runs, without waiting
+/// for the background lookup.
+#[cfg(unix)]
+#[test]
+fn pane_current_path_is_read_as_the_format_is_expanded() {
+    let ctx = Ctx::new("curpath");
+    ctx.ok(&["new-session", "-d", "-s", "cp", "sh -c 'cd / && exec sleep 30'"]);
+    wait_for("sleep runs", || ctx.fmt("cp", "#{pane_current_command}") == "sleep");
+    assert_eq!(ctx.fmt("cp", "#{pane_current_path}"), "/");
+}

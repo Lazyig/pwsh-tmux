@@ -407,6 +407,29 @@ pub fn pane_program(pid: Option<u32>, fg_pgrp: Option<i32>) -> Option<String> {
     unix_program(fg_pgrp.map(|p| p as u32).or(pid)?, false).0
 }
 
+/// The working directory of what one pane runs (osdep_get_cwd), read as a format
+/// uses it on Unix.
+#[cfg(unix)]
+pub fn pane_path(pid: Option<u32>, fg_pgrp: Option<i32>) -> Option<String> {
+    let p = fg_pgrp.map(|p| p as u32).or(pid)?;
+    if exec_pending(p) {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        darwin::cwd(p)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        proc_cwd(p)
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn proc_cwd(p: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{p}/cwd")).ok().map(|p| p.to_string_lossy().into_owned())
+}
+
 #[cfg(unix)]
 fn unix_program(p: u32, with_cwd: bool) -> (Option<String>, Option<String>) {
     if exec_pending(p) {
@@ -426,8 +449,7 @@ fn unix_program(p: u32, with_cwd: bool) -> (Option<String>, Option<String>) {
             (!first.is_empty()).then(|| String::from_utf8_lossy(first).into_owned())
         });
         let name = argv0.or_else(|| std::fs::read_to_string(format!("/proc/{p}/comm")).ok().map(|c| c.trim().to_string()));
-        let cwd = if with_cwd { std::fs::read_link(format!("/proc/{p}/cwd")).ok().map(|p| p.to_string_lossy().into_owned()) } else { None };
-        (name, cwd)
+        (name, if with_cwd { proc_cwd(p) } else { None })
     }
 }
 

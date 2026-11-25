@@ -468,7 +468,15 @@ impl Vars for VarCtx<'_> {
             }),
             "pane_id" => t.pane.map(|p| format!("%{p}")),
             "pane_title" => pane.map(|p| p.title.clone()),
-            "pane_current_path" => pane.map(|p| p.current_path.clone()),
+            // format_cb_current_path: osdep_get_cwd as the format is expanded on Unix
+            // (else, and where it cannot be read, what was last found or reported)
+            "pane_current_path" => pane.map(|p| {
+                #[cfg(unix)]
+                let now = if p.dead.is_none() { procinfo::pane_path(p.pid, p.fg_pgrp()) } else { None };
+                #[cfg(not(unix))]
+                let now: Option<String> = None;
+                now.unwrap_or_else(|| p.current_path.clone())
+            }),
             // format_cb_current_command: osdep_get_name as the format is expanded (read now
             // on Unix, where it is quick; else what the background lookup last found),
             // through parse_window_name on Unix (Windows finds program names already, and
